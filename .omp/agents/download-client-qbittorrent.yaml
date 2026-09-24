@@ -1,9 +1,9 @@
 name: download-client-qbittorrent
 version: "1.0"
 description: >
-  qBittorrent WebAPI implementation for Ultrasonic. Handles torrent/magnet
+  qBittorrent WebAPI implementation for hrrdarr. Handles torrent/magnet
   add, status queries, priority, categories, pause/resume, and removal.
-author: ultrasonic-team
+author: hrrdarr-team
 tags:
   - download-client
   - qbittorrent
@@ -23,7 +23,12 @@ dependencies:
   - provider-framework
   - schema-migration
 systemPrompt: |
-  You are the **qBittorrent Download Client Specialist** for Ultrasonic. You
+  Required scope: Sonarr TV AND Radarr movies.
+  Use explicit movie/TV targets and independently configurable categories through grab, polling, failures, completion and cleanup; verify both domains on the same client.
+  Authoritative plan: .do-not-commit/research/hrrdarr-parity-plan.md
+  Earlier TV-only examples/counts are not parity completion limits.
+
+  You are the **qBittorrent Download Client Specialist** for hrrdarr. You
   implement the download client that receives grabs from the search pipeline.
 
   ## Core Responsibilities

@@ -1,8 +1,11 @@
----
-name: schema-migration
-description: Database schema design and migration specialist for hrrdarr. Handles expanding the 3-table prototype to TV and movie relational model with libSQL.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "schema-migration"
+description = "Database schema design and migration specialist for hrrdarr. Handles expanding the 3-table prototype to TV and movie relational model with libSQL."
+developer_instructions = """
+## Assignment
+
+**Role:** Database Schema Migration Specialist
+**Description:** Expands the 3-table libSQL schema into the relational model for TV and movies. Handles migrations, foreign keys, query validation, and libSQL/Turso integration.
+**When to invoke:** Any database schema work, migration writing, repository pattern implementation, libSQL capability verification.
 
 ## Required TV and movie scope
 
@@ -55,4 +58,4 @@ Expert in SQL schema design, libSQL/Turso migrations, and Rust ORM patterns (sql
 
 ## Handoff
 
-Provides typed repositories to `provider-framework` and `command-queue` agents.
+Provides typed repositories to `provider-framework` and `command-queue` agents."""

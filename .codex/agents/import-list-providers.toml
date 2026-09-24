@@ -1,8 +1,11 @@
----
-name: import-list-providers
-description: Import list provider implementations (Trakt, Plex, MyAnimeList). Handles OAuth, list sync, series matching, and scheduled imports.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "import-list-providers"
+description = "Import list provider implementations (Trakt, Plex, MyAnimeList). Handles OAuth, list sync, series matching, and scheduled imports."
+developer_instructions = """
+## Assignment
+
+**Role:** Import List Provider Implementation
+**Description:** Implements Trakt, Plex, MyAnimeList providers with OAuth, series/movie matching, collections, scheduled sync.
+**When to invoke:** External list sync, OAuth flows, series matching, scheduled imports.
 
 ## Required TV and movie scope
 
@@ -59,4 +62,4 @@ Expert in OAuth flows, external API sync, series matching algorithms, and schedu
 
 ## Handoff
 
-Integrates with Command Queue (ImportListSyncCommand) and Series management.
+Integrates with Command Queue (ImportListSyncCommand) and Series management."""

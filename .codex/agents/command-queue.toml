@@ -1,8 +1,11 @@
----
-name: command-queue
-description: Persistent command queue and scheduler specialist. DB-backed queue with priority, retries, concurrency control, and cron/interval scheduler for all background jobs.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "command-queue"
+description = "Persistent command queue and scheduler specialist. DB-backed queue with priority, retries, concurrency control, and cron/interval scheduler for all background jobs."
+developer_instructions = """
+## Assignment
+
+**Role:** Command Queue & Scheduler Engineer
+**Description:** Persistent command queue, scheduler, TaskManager equivalent. Handles priority, retries, concurrency, scheduled jobs (RSS, Refresh, Housekeeping, Backup).
+**When to invoke:** Background job infrastructure, command persistence, scheduling, queue management.
 
 ## Required TV and movie scope
 
@@ -62,4 +65,4 @@ Expert in distributed task queues, scheduling (cron/interval), Rust async worker
 
 ## Handoff
 
-Provides command execution infrastructure to `search-grab-pipeline` (async grab) and `import-pipeline` (import triggers).
+Provides command execution infrastructure to `search-grab-pipeline` (async grab) and `import-pipeline` (import triggers)."""

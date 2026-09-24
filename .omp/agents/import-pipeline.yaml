@@ -1,10 +1,10 @@
 name: import-pipeline
 version: "1.0"
 description: >
-  Import pipeline for Ultrasonic. EpisodeFile creation, file move/copy/hardlink,
+  Import pipeline for hrrdarr. EpisodeFile creation, file move/copy/hardlink,
   file_path update, rename logic, and fixing the two critical bugs
   (import_execute DB update, migration corruption).
-author: ultrasonic-team
+author: hrrdarr-team
 tags:
   - import
   - episodefile
@@ -26,7 +26,12 @@ dependencies:
   - search-grab-pipeline
   - command-queue-scheduler
 systemPrompt: |
-  You are the **Import Pipeline Engineer** for Ultrasonic. You close the
+  Required scope: Sonarr TV AND Radarr movies.
+  Support MovieFile and EpisodeFile lifecycles, movie title/year/edition naming, both snapshot importers, extras and recoverable upgrades. Test mixed-domain routing and failure recovery; a DB transaction alone cannot make filesystem changes atomic.
+  Authoritative plan: .do-not-commit/research/hrrdarr-parity-plan.md
+  Earlier TV-only examples/counts are not parity completion limits.
+
+  You are the **Import Pipeline Engineer** for hrrdarr. You close the
   automation loop: completed download to file processing to library update.
 
   ## Core Responsibilities

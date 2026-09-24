@@ -1,6 +1,6 @@
 version: "1.0"
-project: ultrasonic
-description: Agent registry for Ultrasonic PVR - Sonarr parity
+project: hrrdarr
+description: Agent registry for hrrdarr PVR - Sonarr TV and Radarr movie parity
 agents:
   - name: schema-migration
     file: schema-migration.yaml
@@ -8,28 +8,24 @@ agents:
     priority: critical
     parallelizable: false
     depends_on: []
-    estimated_weeks: 2
   - name: provider-framework
     file: provider-framework.yaml
     slice: 1
     priority: critical
     parallelizable: false
     depends_on: [schema-migration]
-    estimated_weeks: 2
   - name: indexer-torznab
     file: indexer-torznab.yaml
     slice: 1
     priority: high
     parallelizable: true
     depends_on: [provider-framework]
-    estimated_weeks: 2
   - name: download-client-qbittorrent
     file: download-client-qbittorrent.yaml
     slice: 1
     priority: high
     parallelizable: true
     depends_on: [provider-framework]
-    estimated_weeks: 2
   - name: command-queue-scheduler
     file: command-queue-scheduler.yaml
     slice: 2
@@ -38,7 +34,6 @@ agents:
     depends_on:
       - schema-migration
       - provider-framework
-    estimated_weeks: 2
   - name: search-grab-pipeline
     file: search-grab-pipeline.yaml
     slice: 3
@@ -49,7 +44,6 @@ agents:
       - indexer-torznab
       - download-client-qbittorrent
       - command-queue-scheduler
-    estimated_weeks: 3
   - name: import-pipeline
     file: import-pipeline.yaml
     slice: 4
@@ -59,7 +53,6 @@ agents:
       - schema-migration
       - search-grab-pipeline
       - command-queue-scheduler
-    estimated_weeks: 1
   - name: ui-feature-parity
     file: ui-feature-parity.yaml
     slice: 5
@@ -69,7 +62,6 @@ agents:
       - search-grab-pipeline
       - import-pipeline
       - command-queue-scheduler
-    estimated_weeks: 4
   - name: horizontal-expansion
     file: horizontal-expansion.yaml
     slice: "5+"
@@ -78,7 +70,8 @@ agents:
     depends_on:
       - provider-framework
       - import-pipeline
-    estimated_weeks: 10
+parity_scope: [Sonarr TV, Radarr movies]
+authoritative_plan: .do-not-commit/research/hrrdarr-parity-plan.md
 execution_order:
   critical_path:
     - schema-migration
@@ -93,14 +86,13 @@ execution_order:
     slice_5_expansion:
       - ui-feature-parity
       - horizontal-expansion
-total_critical_path_weeks: 10
-total_with_parallel_weeks: 14
+estimates_status: Re-estimate combined TV and movie scope after contract validation
 key_risks:
   - libSQL migration support unverified
-  - Sonarr Parser port (73KB C#) - highest technical risk
+  - Independent TV and movie parsing and matching - highest technical risk
   - GPLv3 license boundary - implement from specs, not source
   - File operation atomicity across filesystems
 license_notice: >
-  Sonarr is GPLv3. Treat as requirements document only.
+  Sonarr and Radarr are requirements references only.
   Implement from Torznab spec, qBittorrent/SABnzbd API docs,
   observed behavior. Do NOT port C# logic directly.

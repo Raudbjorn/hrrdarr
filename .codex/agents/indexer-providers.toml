@@ -1,8 +1,11 @@
----
-name: indexer-providers
-description: Concrete indexer provider implementations (Torznab, Newznab, Jackett). Handles RSS feed parsing, search API, category mapping, rate limiting, and capability detection.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "indexer-providers"
+description = "Concrete indexer provider implementations (Torznab, Newznab, Jackett). Handles RSS feed parsing, search API, category mapping, rate limiting, and capability detection."
+developer_instructions = """
+## Assignment
+
+**Role:** Torznab/Newznab/Jackett Indexer Implementation
+**Description:** Implements indexer providers per Torznab spec: RSS sync, search, capability detection, category mapping, release parsing.
+**When to invoke:** Indexer protocol work, RSS parsing, search implementation, release normalization.
 
 ## Required TV and movie scope
 
@@ -59,4 +62,4 @@ Expert in HTTP client patterns, XML/JSON parsing, Torznab/Newznab specifications
 
 ## Handoff
 
-Provides `Release` model and search capability to `search-grab-pipeline` agent.
+Provides `Release` model and search capability to `search-grab-pipeline` agent."""

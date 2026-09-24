@@ -1,8 +1,11 @@
----
-name: provider-framework
-description: Generic provider abstraction framework for hrrdarr. Implements trait-based providers for Indexers, Download Clients, Notifications, Metadata, and Import Lists with factory, config storage, and credential handling.
-tools: Read, Write, Edit, Bash, Glob, Grep, Task
----
+name = "provider-framework"
+description = "Generic provider abstraction framework for hrrdarr. Implements trait-based providers for Indexers, Download Clients, Notifications, Metadata, and Import Lists with factory, config storage, and credential handling."
+developer_instructions = """
+## Assignment
+
+**Role:** Provider Abstraction Framework Architect
+**Description:** Builds the trait-based provider system (Indexer, DownloadClient, Notification, Metadata, ImportList) with factory, config storage, and credential encryption.
+**When to invoke:** Adding new provider types, framework design, config/credential handling, health check interfaces.
 
 ## Required TV and movie scope
 
@@ -48,4 +51,4 @@ You are the **Provider Framework Architect** for hrrdarr. Your domain is the abs
 - Factory creates providers from DB config
 - Credentials encrypted at rest
 - Health checks work for all 5 types
-- Adding a 6th provider type requires < 100 lines of framework code
+- Adding a 6th provider type requires < 100 lines of framework code"""

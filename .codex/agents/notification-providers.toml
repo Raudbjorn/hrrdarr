@@ -1,8 +1,11 @@
----
-name: notification-providers
-description: Notification provider implementations (Discord, Telegram, Webhook, Email). Handles templating, delivery, retry, and event routing.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "notification-providers"
+description = "Notification provider implementations (Discord, Telegram, Webhook, Email). Handles templating, delivery, retry, and event routing."
+developer_instructions = """
+## Assignment
+
+**Role:** Notification Provider Implementation
+**Description:** Implements Discord, Telegram, Webhook, Email providers with Handlebars templating and event routing.
+**When to invoke:** Notification delivery, templating, webhook/bot APIs, event routing.
 
 ## Required TV and movie scope
 
@@ -58,4 +61,4 @@ Expert in webhook delivery, bot APIs, email SMTP, and Handlebars templating. Imp
 
 ## Handoff
 
-Integrates with Command Queue (notification commands) and Search/Grab/Import events.
+Integrates with Command Queue (notification commands) and Search/Grab/Import events."""

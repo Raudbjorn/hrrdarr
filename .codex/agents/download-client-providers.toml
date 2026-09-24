@@ -1,8 +1,11 @@
----
-name: download-client-providers
-description: Concrete download client implementations (qBittorrent, SABnzbd, Transmission). Handles add torrent/nzb/magnet, status polling, category management, and API version compatibility.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "download-client-providers"
+description = "Concrete download client implementations (qBittorrent, SABnzbd, Transmission). Handles add torrent/nzb/magnet, status polling, category management, and API version compatibility."
+developer_instructions = """
+## Assignment
+
+**Role:** qBittorrent/SABnzbd/Transmission Download Client Implementation
+**Description:** Implements download client providers: add torrent/magnet/nzb, status queries, priority, categories, pause/resume, completion detection.
+**When to invoke:** Download client protocol work, torrent lifecycle, WebAPI integration.
 
 ## Required TV and movie scope
 
@@ -61,4 +64,4 @@ Expert in HTTP/WebSocket APIs, torrent/usenet client protocols, and async status
 
 ## Handoff
 
-Provides download client capability to `search-grab-pipeline` (GrabExecutor) and `import-pipeline` (ImportTrigger).
+Provides download client capability to `search-grab-pipeline` (GrabExecutor) and `import-pipeline` (ImportTrigger)."""

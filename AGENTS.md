@@ -1,131 +1,95 @@
-# Ultrasonic Agents for Codex
+# hrrdarr development guide
 
-This file defines the agent personas available to Codex for the Ultrasonic project. Each agent is a specialized subagent that can be invoked via the `@agent` syntax.
+## Scope and source of truth
 
-## Agent Registry (12 agents)
+Deliver the union of Sonarr's TV and Radarr's movie feature sets: library management, automation, every concrete provider, UI, settings and system operations. Deferring a feature changes its delivery slice, not the parity requirement. Both domains must pass the first automation gate.
 
-### schema-migration
+Before planning or changing domain behavior, read the [combined parity plan](.do-not-commit/research/hrrdarr-parity-plan.md). Its scope, slice numbering and acceptance criteria supersede older TV-only estimates, fixed table counts, skip lists and conflicting agent instructions.
 
-**Role:** Database Schema Migration Specialist
-**Description:** Expands the 3-table libSQL schema into the full 40+ table relational model. Handles migrations, foreign keys, sqlx compile-time checks, and libSQL/Turso integration.
-**When to invoke:** Any database schema work, migration writing, repository pattern implementation, libSQL capability verification.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+Read the relevant research when working on:
 
-### provider-framework
+| Task | Reference |
+| --- | --- |
+| Feature coverage, missing workflows and movie requirements | [Feature inventory](.do-not-commit/research/2026-09-24-sonarr-feature-parity.md) |
+| Workstream dependencies and integration risks | [TV decomposition](.do-not-commit/research/sonarr-parity-decomposition.md), subject to the combined plan |
+| Schema, snapshot import, filesystem consistency, backups or storage topology | [Persistence review](.do-not-commit/research/sonarr-persistence-review.md) |
+| UI state, API types, routing or live updates | [Frontend review](.do-not-commit/research/sonarr-frontend-architecture-review.md) |
 
-**Role:** Provider Abstraction Framework Architect
-**Description:** Builds the trait-based provider system (Indexer, DownloadClient, Notification, Metadata, ImportList) with factory, config storage, and credential encryption.
-**When to invoke:** Adding new provider types, framework design, config/credential handling, health check interfaces.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+Research and upstream checkouts under `.do-not-commit/` are Git-ignored local references; do not commit them. If unavailable, identify the missing evidence and use this guide's constraints; do not invent reference behavior or claim parity verification.
 
-### indexer-providers
+Use upstream trees only to establish requirements. Implement independently from protocol specifications, naming conventions and observed behavior; do not copy or translate upstream C# or frontend code. The research pins Sonarr to `76c684e097f16ac216e6213845e5cac372774995` and Radarr to `c90668a520664ad0c91812cfee57c41928ad2148`. Source inspection establishes inventory, not runtime equivalence; Sonarr-specific findings do not automatically apply to Radarr.
 
-**Role:** Torznab/Newznab/Jackett Indexer Implementation
-**Description:** Implements indexer providers per Torznab spec: RSS sync, search, capability detection, category mapping, release parsing.
-**When to invoke:** Indexer protocol work, RSS parsing, search implementation, release normalization.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+## Current implementation and blockers
 
-### download-client-providers
+Baseline checked on 2026-09-24; inspect current code before relying on these observations:
 
-**Role:** qBittorrent/SABnzbd/Transmission Download Client Implementation
-**Description:** Implements download client providers: add torrent/magnet/nzb, status queries, priority, categories, pause/resume, completion detection.
-**When to invoke:** Download client protocol work, torrent lifecycle, WebAPI integration.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+- [src/main.rs](src/main.rs) contains the Axum API, three-table initialization (`series`, `episodes`, `operations`), five routes, import execution and the Sonarr snapshot importer.
+- [frontend/src/App.svelte](frontend/src/App.svelte) lists series/episodes and creates import previews. The UI does not execute imports. Movie support and the automated search/download loop are still missing.
+- `import_execute` changes the filesystem and marks the operation complete without updating episode/file associations.
+- `migrate` stores `EpisodeFileId` as a path string and deletes destination series/episodes before inserting source rows, without a transaction. Use isolated copies for importer work; the current endpoint is not safe for existing libraries.
 
-### command-queue
+Keep Rust/Axum, libSQL and Svelte/Vite. Read [Cargo.toml](Cargo.toml), [Cargo.lock](Cargo.lock) and [frontend/package.json](frontend/package.json) for actual dependencies. Planned modules and libraries in research or agent prompts are not installed infrastructure. Add modules and dependencies as delivered behavior needs them; pin the toolchain/frontend versions before establishing reproducible parity tests.
 
-**Role:** Command Queue & Scheduler Engineer
-**Description:** Persistent command queue, scheduler, TaskManager equivalent. Handles priority, retries, concurrency, scheduled jobs (RSS, Refresh, Housekeeping, Backup).
-**When to invoke:** Background job infrastructure, command persistence, scheduling, queue management.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+## Delivery order
 
-### search-grab-pipeline
+| Slice | Deliverable and exit condition |
+| --- | --- |
+| 0 | Schema and API contracts for both domains. Fresh/upgrade paths preserve data; equal numeric movie/episode IDs remain distinct; both snapshot formats are mapped and unsupported data reported. |
+| 1 | Manual libraries and initial providers. Add/edit/monitor one series and movie, import both safely, test an indexer/client, and fix the existing import/path bugs. Start with Torznab/Newznab and qBittorrent. |
+| 2 | Persistent commands, scheduler, RSS and download polling. Retries/restarts preserve targets and avoid duplicate external actions; errors and progress surface through APIs/UI. |
+| 3 | TV/movie search, decisions and grab. Verify matching, rejection reasons, availability/delay, the explicit user-invoked-search exception, and cutoff/upgrade behavior. |
+| 4 | Complete automation and minimal Activity/Settings UI. Both Add → Search/RSS → Grab → Download → Import → Library flows pass restart/failure recovery; failed replacement preserves original files. |
+| 5 | Domain breadth: collections/discovery/credits, advanced TV numbering/packs, profiles/custom formats/delays, lists, metadata, notifications and full shared UI. |
+| 6 | Full parity closure: evidence for every remaining provider, command, API/UI workflow and system/recovery requirement in both references. |
 
-**Role:** Search & Grab Pipeline Engineer
-**Description:** Core PVR loop: release search → decision engine (quality profiles, custom formats) → grab → download client. Highest risk: 73KB parser port.
-**When to invoke:** Search logic, release parsing, quality profiles, decision specifications, grab handoff.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+Build complete vertical slices. Concrete indexer/client work can proceed in parallel once contracts are stable; UI, metadata, lists and notifications can proceed against stable APIs. Coordinate shared migrations and API contracts before concurrent edits. Use the 12 specialist definitions in [.codex/agents/](.codex/agents/) for matching work; give each delegated task explicit file ownership and acceptance criteria.
 
-### import-pipeline
+## Domain and API boundaries
 
-**Role:** Import Pipeline Engineer
-**Description:** Closes the loop: completed download → EpisodeFile creation → file move/copy/hardlink → rename → library update. Fixes the two critical bugs in main.rs.
-**When to invoke:** Import logic, EpisodeFile model, file operations, rename, bug fixes for import_execute/migration.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+- Model TV (`Series`, `Season`, `Episode`, `EpisodeFile`) and movies (`Movie`, catalog metadata, `MovieFile`, collections) separately. Movies are not synthetic episodes. Catalog/discovery entries can exist without library membership; one TV file can serve several episodes.
+- Give shared commands, operations, queue/history/blocklist entries and events typed media targets. Enforce valid relationships and domain-specific uniqueness in storage; an unqualified integer must never choose between a movie and episode.
+- Scope profiles, naming, roots, provider categories, monitoring and availability policies to their media domain. Share transports where behavior matches. Preserve TV standard/daily/anime/special/pack semantics and movie title/year/ID/edition/release-date semantics.
+- Distinguish background movie availability/delay rules from the explicit user-invoked-search exception. Edition recognition alone does not establish support for multiple simultaneous movie editions.
+- Specify pagination, bulk actions, errors and command progress before UI work. Shared Calendar distinguishes TV air dates from cinema/digital/physical movie releases. Sonarr/Radarr V3 wire compatibility requires a separate explicit decision and contract tests.
 
-### ui-features
+## Persistence, imports and recovery
 
-**Role:** UI Feature Parity Engineer
-**Description:** Svelte pages for Calendar, Wanted, Activity, Settings, System. TanStack Query + Svelte stores, real-time via WebSocket, type-safe API client.
-**When to invoke:** Frontend pages, state management, real-time updates, API client generation, component library.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+- Use ordered, transactional migrations with version/checksum tracking, one migration owner, integrity checks and recovery tests. Validate SQL against the actual libSQL engine/topology. Keep topology changes separate from domain expansion; remote or synchronized storage does not provide filesystem ownership or atomic side effects.
+- Use separate Sonarr/Radarr snapshot readers and a validated destination writer. Read immutable backup copies, detect supported schema versions, namespace source IDs by application/snapshot and remap them without clearing existing libraries. Resolve file IDs through file records and library roots; convert no-file sentinels to absent associations.
+- Preserve monitoring, profiles/custom formats, tags, collections, history, providers, mappings and exclusions. Retain/report unknown settings and produce a dry-run reconciliation report for mapped, conflicting, unsupported and missing-file records. Reruns must be idempotent; source databases/media stay intact.
+- Treat serialized settings, enums, timestamps and job names as versioned contracts. Keep queried relationships relational and provider-specific settings structured; query JSON structurally rather than matching its formatting.
+- Journal import intent and progress, stage/validate transfers, commit file associations and required history together, then safely retire old files. Recover both disk-before-DB and DB-before-cleanup failures. A database transaction cannot roll back a file move or download submission; a timeout/cancellation does not prove an operation never happened.
+- Keep one active worker per library until distributed ownership is explicitly designed and tested. Bound scans/imports/retries, keep blocking work off async executors, and avoid holding DB transactions across network calls or media transfers. Reuse durable operations/commands for retryable effects where sufficient.
+- Validate external paths, path mappings, permissions and copy/move/hardlink behavior, including cross-device and missing-mount cases. Destructive list cleanup and media deletion require explicit user intent.
+- Publish backups only after validating a consistent snapshot and manifest; prune old backups after success. Validate restores before replacing live state, retain a recoverable original and test restoration into an isolated instance. Record included DB/config/key material; database backups do not include media. Protect private state and redact secrets at their source.
 
-### notification-providers
+## Frontend implementation
 
-**Role:** Notification Provider Implementation
-**Description:** Implements Discord, Telegram, Webhook, Email providers with Handlebars templating and event routing.
-**When to invoke:** Notification delivery, templating, webhook/bot APIs, event routing.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+Keep Svelte and build from real API contracts. Establish one generated Rust/API-to-TypeScript contract as the API grows; avoid independently maintained response shapes. Separate server data/cache from local UI state, and colocate feature components and data access. TanStack Query and WebSockets are planned options, not existing dependencies; polling is sufficient for initial live status.
 
-### metadata-providers
+Ship accessible loading, error and empty states, keyboard interactions and meaningful failure/progress feedback. Verify user workflows through real endpoints; a rendered page or successful bundle is not evidence that import, monitoring or search works.
 
-**Role:** Metadata Provider Implementation
-**Description:** Implements TVDB, TMDB, TVMaze, NFO generation, artwork download/resize, scheduled refresh.
-**When to invoke:** Metadata scraping, NFO generation, artwork handling, Plex/Jellyfin compatibility.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
+## Verification and completion
 
-### import-list-providers
+Run checks appropriate to changed code, from the repository root:
 
-**Role:** Import List Provider Implementation
-**Description:** Implements Trakt, Plex, MyAnimeList providers with OAuth, series matching, scheduled sync.
-**When to invoke:** External list sync, OAuth flows, series matching, scheduled imports.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
-
-### testing-verification
-
-**Role:** Testing & Verification Specialist
-**Description:** Integration tests, contract tests, migration testing, parser test corpus, CI/CD pipeline. Runs parallel to all agents.
-**When to invoke:** Test writing, CI/CD setup, contract testing, migration verification, E2E flows.
-**Tools:** Read, Write, Edit, Bash, Glob, Grep
-
-## Dependency Graph (Critical Path)
-
-```
-Slice 0: schema-migration (2 weeks)           ← START HERE
-    ↓
-Slice 1: provider-framework (2 weeks)
-    ↓         ↙               ↘
-    indexer-providers    download-client-providers  (2 weeks, parallel)
-    ↓
-Slice 2: command-queue (2 weeks)
-    ↓
-Slice 3: search-grab-pipeline (3 weeks)      ← HIGHEST RISK
-    ↓
-Slice 4: import-pipeline (1 week)            ← FIRST WORKING AUTOMATION
-    ↓
-Slice 5+: All parallel agents:
-    ├── ui-features (4 weeks)
-    ├── notification-providers (2 weeks)
-    ├── metadata-providers (2 weeks)
-    └── import-list-providers (2 weeks)
-
-Total Critical Path: ~10 weeks to working automation
-Parallel After Slice 4: All remaining providers, UI pages, jobs, metadata
+```sh
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+npm --prefix frontend run build
+git diff --check
 ```
 
-## Key Files to Know
+Frontend dependencies must be installed before building. The current frontend has no test/type-check script; the Vite build does not establish either. Documentation-only changes need link/content checks and `git diff --check`, not application builds.
 
-- `src/main.rs` — Current Axum API (4 endpoints, 2 bugs)
-- `src/db/schema.rs` — Rust type definitions (to be created)
-- `frontend/src/App.svelte` — Current UI (Series list only)
+For behavior changes, leave focused runnable regression evidence for the affected contract. At the corresponding slice gates, cover:
 
-## License Notice
+- Fresh/upgraded DBs; Sonarr-only, Radarr-only and combined imports; ID collisions, unknown settings, absent files, rollback and reruns.
+- Separate TV/movie parser and decision cases, including ambiguous years, numbering/packs, availability transitions and manual-search exceptions.
+- A shared client processing both domains without cross-imports; restart/retry, path mapping, failed upgrades and interruption between filesystem/DB steps.
+- Collections/list defaults and exclusions, shared UI media filters, secret redaction and isolated backup/restore.
 
-Sonarr is GPLv3. Treat as requirements document only. Implement from:
+Track each workflow/controller, command, concrete provider and route with reference path/commit, implementation owner/API/UI, slice, status (`Missing`, `Partial`, `Verified`, `Blocked`) and test evidence. A shared implementation satisfies both domains only after both contracts pass. External-service blockers remain incomplete; a passing build alone never establishes parity.
 
-- Torznab spec (github.com/Sonarr/Torznab-Spec)
-- qBittorrent WebAPI / SABnzbd API documentation
-- Observed API behavior
-- PVR domain knowledge
-
-Do NOT port C# logic directly.
+Every PR body must end with a **Not claimed** section stating what was not tested, what verification does not prove, residual risks and newly introduced state/dependencies. Distinguish verified-from-source findings from observed-once behavior, and record reasoning beside changed test assertions.

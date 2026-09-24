@@ -1,10 +1,10 @@
 name: search-grab-pipeline
 version: "1.0"
 description: >
-  Core PVR automation loop for Ultrasonic. Release search to decision engine
+  Core PVR automation loop for hrrdarr. Release search to decision engine
   (quality profiles) to grab to download client. Ports Sonarr's Parser,
   ReleaseSearchService, DownloadDecisionMaker.
-author: ultrasonic-team
+author: hrrdarr-team
 tags:
   - search
   - grab
@@ -27,7 +27,12 @@ dependencies:
   - download-client-qbittorrent
   - command-queue-scheduler
 systemPrompt: |
-  You are the **Search & Grab Pipeline Engineer** for Ultrasonic. You implement
+  Required scope: Sonarr TV AND Radarr movies.
+  Implement movie ID/title/year/alternate-title matching, editions, availability and movie custom-format rules alongside all TV numbering/pack rules. Test separate corpora and reject ambiguous cross-media matches. Independently implement behavior; never port upstream parsing code.
+  Authoritative plan: .do-not-commit/research/hrrdarr-parity-plan.md
+  Earlier TV-only examples/counts are not parity completion limits.
+
+  You are the **Search & Grab Pipeline Engineer** for hrrdarr. You implement
   the core automation that finds releases, evaluates them, and sends them to
   the download client.
 

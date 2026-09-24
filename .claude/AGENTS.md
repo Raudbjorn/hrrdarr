@@ -1,13 +1,17 @@
-# Ultrasonic Agents for Claude Code
+# hrrdarr Agents for Claude Code
 
-This directory contains agent definitions for the Ultrasonic PVR project. Each agent is a specialized subagent that can be invoked via the agent system.
+## Product scope
 
-## Agent Registry (13 agents)
+hrrdarr must cover the full feature sets of Sonarr (TV) and Radarr (movies). The authoritative plan is [hrrdarr-parity-plan.md](../.do-not-commit/research/hrrdarr-parity-plan.md). Both domains must pass the automation gate; later slices defer features, not remove them from parity. Treat both upstream trees as requirements references only; do not port their code.
+
+This directory contains agent definitions for the hrrdarr PVR project. Each agent is a specialized subagent that can be invoked via the agent system.
+
+## Agent Registry (12 agents)
 
 ### schema-migration
 
 **Role:** Database Schema Migration Specialist  
-**Description:** Expands the 3-table libSQL schema into the full 40+ table relational model. Handles migrations, foreign keys, sqlx compile-time checks, and libSQL/Turso integration.  
+**Description:** Expands the 3-table libSQL schema into the relational model for TV and movies. Handles migrations, foreign keys, query validation, and libSQL/Turso integration.
 **Slice:** 0 (Critical Path - Foundation)  
 **File:** `schema-migration.md`
 
@@ -46,7 +50,7 @@ This directory contains agent definitions for the Ultrasonic PVR project. Each a
 ### search-grab-pipeline
 
 **Role:** Search & Grab Pipeline Engineer  
-**Description:** Core PVR loop: release search → decision engine (quality profiles, custom formats) → grab → download client. Highest risk: 73KB parser port.  
+**Description:** Core PVR loop: release search → decision engine (quality profiles, custom formats) → grab → download client. Highest risk: independently implementing TV and movie parsing and matching.
 **Slice:** 3 (Critical Path)  
 **Depends on:** schema-migration, indexer-providers, download-client-providers, command-queue  
 **File:** `search-grab-pipeline.md`
@@ -54,7 +58,7 @@ This directory contains agent definitions for the Ultrasonic PVR project. Each a
 ### import-pipeline
 
 **Role:** Import Pipeline Engineer  
-**Description:** Closes the loop: completed download → EpisodeFile creation → file move/copy/hardlink → rename → library update. Fixes the two critical bugs in main.rs.  
+**Description:** Closes the loop: completed download → EpisodeFile/MovieFile creation → file move/copy/hardlink → rename → library update. Fixes the two critical bugs in main.rs.
 **Slice:** 4 (Critical Path - First Working Automation)  
 **Depends on:** schema-migration, search-grab-pipeline, command-queue  
 **File:** `import-pipeline.md`
@@ -62,7 +66,7 @@ This directory contains agent definitions for the Ultrasonic PVR project. Each a
 ### ui-features
 
 **Role:** UI Feature Parity Engineer  
-**Description:** Svelte pages for Calendar, Wanted, Activity, Settings, System. TanStack Query + Svelte stores, real-time via WebSocket, type-safe API client.  
+**Description:** Svelte pages for Series, Movies, Collections, Discover, Calendar, Wanted, Activity, Settings, System. TanStack Query + Svelte stores, real-time via WebSocket, type-safe API client.
 **Slice:** 5 (Parallel after API stable)  
 **Depends on:** search-grab-pipeline, import-pipeline, command-queue  
 **File:** `ui-features.md`
@@ -86,7 +90,7 @@ This directory contains agent definitions for the Ultrasonic PVR project. Each a
 ### import-list-providers
 
 **Role:** Import List Provider Implementation  
-**Description:** Implements Trakt, Plex, MyAnimeList providers with OAuth, series matching, scheduled sync.  
+**Description:** Implements Trakt, Plex, MyAnimeList providers with OAuth, series/movie matching, collections, scheduled sync.
 **Slice:** 5 (Parallel)  
 **Depends on:** provider-framework, schema-migration  
 **File:** `import-list-providers.md`
@@ -101,25 +105,25 @@ This directory contains agent definitions for the Ultrasonic PVR project. Each a
 ## Dependency Graph (Critical Path)
 
 ```
-Slice 0: schema-migration (2 weeks)           ← START HERE
+Slice 0: schema-migration           ← START HERE
     ↓
-Slice 1: provider-framework (2 weeks)
+Slice 1: provider-framework
     ↓         ↙               ↘
     indexer-providers    download-client-providers  (2 weeks, parallel)
     ↓
-Slice 2: command-queue (2 weeks)
+Slice 2: command-queue
     ↓
-Slice 3: search-grab-pipeline (3 weeks)      ← HIGHEST RISK
+Slice 3: search-grab-pipeline      ← HIGHEST RISK
     ↓
-Slice 4: import-pipeline (1 week)            ← FIRST WORKING AUTOMATION
+Slice 4: import-pipeline            ← FIRST WORKING TV + MOVIE AUTOMATION
     ↓
 Slice 5+: All parallel agents:
-    ├── ui-features (4 weeks)
-    ├── notification-providers (2 weeks)
-    ├── metadata-providers (2 weeks)
-    └── import-list-providers (2 weeks)
+    ├── ui-features
+    ├── notification-providers
+    ├── metadata-providers
+    └── import-list-providers
 
-Total Critical Path: ~10 weeks to working automation
+Combined-scope estimates: pending contract and parser validation
 Parallel After Slice 4: All remaining providers, UI pages, jobs, metadata
 ```
 
@@ -131,7 +135,7 @@ Parallel After Slice 4: All remaining providers, UI pages, jobs, metadata
 
 ## License Notice
 
-Sonarr is GPLv3. Treat as requirements document only. Implement from:
+Sonarr and Radarr are requirements references only. Follow the independent-implementation boundary for both. Implement from:
 
 - Torznab spec (github.com/Sonarr/Torznab-Spec)
 - qBittorrent WebAPI / SABnzbd API documentation

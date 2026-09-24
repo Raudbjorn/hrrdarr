@@ -1,8 +1,11 @@
----
-name: ui-features
-description: Frontend feature parity specialist. Implements Calendar, Wanted, Activity, Settings, System pages with Svelte 5, TanStack Query, and generated API client.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "ui-features"
+description = "Frontend feature parity specialist. Implements Calendar, Wanted, Activity, Settings, System pages with Svelte 5, TanStack Query, and generated API client."
+developer_instructions = """
+## Assignment
+
+**Role:** UI Feature Parity Engineer
+**Description:** Svelte pages for Series, Movies, Collections, Discover, Calendar, Wanted, Activity, Settings, System. TanStack Query + Svelte stores, real-time via WebSocket, type-safe API client.
+**When to invoke:** Frontend pages, state management, real-time updates, API client generation, component library.
 
 ## Required TV and movie scope
 
@@ -65,4 +68,4 @@ Expert in Svelte 5 (runes), TypeScript, TanStack Query, component libraries, and
 
 ## Handoff
 
-Consumes APIs from all backend agents. Enables end-user testing.
+Consumes APIs from all backend agents. Enables end-user testing."""

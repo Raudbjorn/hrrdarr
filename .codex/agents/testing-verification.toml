@@ -1,8 +1,11 @@
----
-name: testing-verification
-description: Testing and verification specialist. Integration tests, contract tests, migration testing, parser test corpus, and CI/CD pipeline for hrrdarr.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "testing-verification"
+description = "Testing and verification specialist. Integration tests, contract tests, migration testing, parser test corpus, and CI/CD pipeline for hrrdarr."
+developer_instructions = """
+## Assignment
+
+**Role:** Testing & Verification Specialist
+**Description:** Integration tests, contract tests, migration testing, parser test corpus, CI/CD pipeline. Runs parallel to all agents.
+**When to invoke:** Test writing, CI/CD setup, contract testing, migration verification, E2E flows.
 
 ## Required TV and movie scope
 
@@ -62,4 +65,4 @@ Expert in Rust testing (unit, integration, property), Svelte testing, contract t
 
 ## Handoff
 
-Provides confidence gates for all other agents. Blocks merge on test failure.
+Provides confidence gates for all other agents. Blocks merge on test failure."""

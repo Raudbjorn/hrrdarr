@@ -1,8 +1,11 @@
----
-name: metadata-providers
-description: Metadata provider implementations (TVDB, TMDB, TVMaze, NFO, Artwork). Handles scraping, NFO generation, image download/resize, and scheduled refresh.
-tools: Read, Write, Edit, Bash, Grep, Glob
----
+name = "metadata-providers"
+description = "Metadata provider implementations (TVDB, TMDB, TVMaze, NFO, Artwork). Handles scraping, NFO generation, image download/resize, and scheduled refresh."
+developer_instructions = """
+## Assignment
+
+**Role:** Metadata Provider Implementation
+**Description:** Implements TVDB, TMDB, TVMaze, NFO generation, artwork download/resize, scheduled refresh.
+**When to invoke:** Metadata scraping, NFO generation, artwork handling, Plex/Jellyfin compatibility.
 
 ## Required TV and movie scope
 
@@ -62,4 +65,4 @@ Expert in media metadata APIs, NFO/XML generation, image processing, and schedul
 
 ## Handoff
 
-Integrates with Import Pipeline (post-import) and Command Queue (scheduled refresh).
+Integrates with Import Pipeline (post-import) and Command Queue (scheduled refresh)."""

@@ -9,9 +9,9 @@
   loadSeries();
 </script>
 
-<svelte:head><title>Ultrasonic</title></svelte:head>
+<svelte:head><title>hrrdarr</title></svelte:head>
 <main>
-  <header><span class="mark">U</span><div><h1>Ultrasonic</h1><p>Library control</p></div></header>
+  <header><span class="mark">h</span><div><h1>hrrdarr</h1><p>Library control</p></div></header>
   {#if error}<p class="error">{error}</p>{/if}
   <section class="layout">
     <aside><h2>Series</h2>{#each series as item}<button class:active={selected?.id === item.id} onclick={() => select(item)}>{item.title}<small>{item.year ?? ''}</small></button>{:else}<p class="muted">Import a Sonarr library to begin.</p>{/each}</aside>

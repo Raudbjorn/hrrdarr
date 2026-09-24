@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         libsql::Builder::new_remote(url, token).build().await?
     } else {
-        let path = env::var("ULTRASONIC_DATABASE_PATH").unwrap_or_else(|_| "ultrasonic.db".into());
+        let path = env::var("HRRDARR_DATABASE_PATH").unwrap_or_else(|_| "hrrdarr.db".into());
         libsql::Builder::new_local(path).build().await?
     };
     let db = Arc::new(db);
@@ -84,11 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/imports/{id}/execute", post(import_execute))
         .route("/api/v1/migrations", post(migrate))
         .with_state(state);
-    let addr: SocketAddr = env::var("ULTRASONIC_BIND")
+    let addr: SocketAddr = env::var("HRRDARR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("Ultrasonic listening on http://{addr}");
+    println!("hrrdarr listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
