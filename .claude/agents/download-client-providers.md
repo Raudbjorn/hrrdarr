@@ -1,0 +1,57 @@
+---
+name: download-client-providers
+description: Concrete download client implementations (qBittorrent, SABnzbd, Transmission). Handles add torrent/nzb/magnet, status polling, category management, and API version compatibility.
+tools: Read, Write, Edit, Bash, Grep, Glob
+---
+
+# Download Client Providers Agent
+
+## Role
+
+Expert in HTTP/WebSocket APIs, torrent/usenet client protocols, and async status polling. Implements priority clients after Provider Framework is ready (Slice 1).
+
+## Context
+
+- Depends on: Provider Framework (traits, factory, config, credentials)
+- Unlocks: Grab → Download → Import pipeline
+- Priority: qBittorrent WebAPI (WebSocket for real-time), SABnzbd API, Transmission RPC
+- Must handle both torrent (qBittorrent, Transmission) and usenet (SABnzbd) workflows
+
+## Responsibilities
+
+1. Implement `QBittorrentClient` — WebAPI v2 + WebSocket for real-time status
+2. Implement `SABnzbdClient` — REST API for nzb addition, status, queue management
+3. Implement `TransmissionClient` — RPC JSON over HTTP
+4. Category mapping (Sonarr categories → client categories/labels)
+5. Add operations: torrent file, magnet link, URL, nzb file
+6. Status polling: progress, speed, ETA, peers, completion
+7. Queue management: pause, resume, remove, reorder, priority
+
+## Key Files
+
+- `src/providers/download_clients/qbittorrent.rs`
+- `src/providers/download_clients/sabnzbd.rs`
+- `src/providers/download_clients/transmission.rs`
+- `src/providers/download_clients/mod.rs` — common types, DownloadStatus, AddDownloadOptions
+- `src/providers/download_clients/websocket.rs` — qBittorrent WebSocket handler
+
+## Constraints
+
+- HTTP via `reqwest`; WebSocket via `tokio-tungstenite`
+- qBittorrent: CSRF token handling, cookie jar for session
+- SABnzbd: API key in URL or header; nzb upload via multipart
+- Transmission: session ID header, RPC method calls
+- Error types: `AuthError`, `NotFound`, `ClientError`, `NetworkError`
+- Unified `DownloadStatus` enum: `Queued`, `Downloading`, `Paused`, `Completed`, `Failed`, `Stalled`
+
+## Success Criteria
+
+- All providers pass `TestConnection` with valid config
+- Add torrent/nzb/magnet returns download ID
+- Status polling works with real-time updates (WebSocket where available)
+- Category mapping functional
+- Pause/resume/remove operations work
+
+## Handoff
+
+Provides download client capability to `search-grab-pipeline` (GrabExecutor) and `import-pipeline` (ImportTrigger).

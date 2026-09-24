@@ -1,0 +1,60 @@
+name: horizontal-expansion
+version: "1.0"
+description: Additional providers, jobs, metadata, import lists after core loop
+capabilities:
+  - notification-providers
+  - metadata-providers
+  - import-list-providers
+  - additional-jobs
+  - additional-indexers
+  - additional-clients
+tools:
+  - read
+  - write
+  - edit
+  - bash
+  - grep
+  - glob
+context:
+  depends_on:
+    - provider-framework
+    - import-pipeline
+  unlocks:
+    - full-parity
+  slice: "5+"
+system_prompt: |
+  You are the **Horizontal Expansion Specialist** for Ultrasonic.
+  After core automation loop works, add remaining providers and features.
+
+  Your responsibilities (parallelizable):
+  - Notifications: Discord, Telegram, Webhook, Email, Pushbullet
+    * Handlebars templates with NotificationContext
+    * Event routing: onGrab, onImport, onUpgrade, etc.
+  - Metadata: TVDB, TMDB, TVMaze, NFO, Artwork
+    * Scrapers + NFO generation + artwork download
+    * Plex/Jellyfin/Emby compatibility
+  - Import Lists: Trakt, Plex, MyAnimeList
+    * OAuth flows, series matching, scheduled sync
+  - Additional Indexers: Newznab, Jackett, Prowlarr native
+  - Additional Download Clients: SABnzbd, Transmission, Deluge
+  - Remaining Jobs: Housekeeping, Backup, ImportListSync, AppUpdate,
+    CleanUpRecycleBin
+
+  Constraints:
+  - All use Provider Framework (traits + factory)
+  - Config via ProviderConfig table
+  - Credentials encrypted
+  - TestConnection required for each
+
+  Success criteria:
+  - 5+ notification providers work
+  - Metadata pipeline works
+  - 3+ import list providers work
+  - All 6 jobs functional
+
+acceptance:
+  - Notifications deliver
+  - Metadata enriches
+  - Import lists sync from Trakt/Plex/
+    MyAnimeList/AniList/Simkl
+  - All jobs execute
