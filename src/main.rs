@@ -13,6 +13,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     db: Arc<Database>,
+    provider_key: Option<Arc<hrrdarr::providers::CredentialKey>>,
 }
 
 use hrrdarr::api::{LegacyError, SnapshotOptions};
@@ -31,7 +32,14 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
     if let Some(path) = db.migration_backup() {
         println!("pre-migration recovery backup: {}", path.display());
     }
-    let state = Arc::new(AppState { db });
+    let provider_key = match env::var("HRRDARR_PROVIDER_KEY") {
+        Ok(value) => Some(Arc::new(hrrdarr::providers::CredentialKey::from_hex(
+            &value,
+        )?)),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("Invalid provider key environment value".into()),
+    };
+    let state = Arc::new(AppState { db, provider_key });
     let app = router(state);
     let addr: SocketAddr = env::var("HRRDARR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
@@ -55,6 +63,10 @@ fn router(state: Arc<AppState>) -> Router {
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
+        .merge(hrrdarr::providers::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+        ))
 }
 
 async fn migrate(
@@ -131,7 +143,10 @@ mod tests {
         let db = Database::open_local(directory.join("destination.db"))
             .await
             .unwrap();
-        let state = Arc::new(AppState { db: Arc::new(db) });
+        let state = Arc::new(AppState {
+            db: Arc::new(db),
+            provider_key: None,
+        });
         // Retain malformed snapshot rejection independently of the replaced import503 check.
         assert_eq!(
             migrate(
@@ -191,6 +206,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let state = Arc::new(AppState {
             db: Arc::new(Database::open_local(directory.join("db")).await.unwrap()),
+            provider_key: None,
         });
         let _routes = router(state.clone());
         drop(_routes);

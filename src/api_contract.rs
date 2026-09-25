@@ -33,6 +33,11 @@ pub fn render() -> String {
     };
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::providers::ProviderInput,
+        crate::providers::ProviderUpdate,
+        crate::providers::ProviderQuery,
+        crate::providers::ProviderRevision,
+        crate::api::ApiPage<crate::providers::Provider>,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,

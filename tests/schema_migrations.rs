@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        8 // The import journal is additive; existing previews and library records survive upgrades.
+        9 // Provider configuration is additive; legacy imports and library records survive upgrades.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 9 remains unknown now that migration 8 is a supported additive journal.
+    // Version 10 remains unknown now that migration 9 adds provider configuration.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (9,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (10,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        8
+        9 // Opening the old import fixture now also applies the additive provider migration.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -611,6 +611,223 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     assert_eq!(
         scalar(&db.connect().await?, "SELECT count(*) FROM import_history").await,
         2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'TV','/tv');
+        INSERT INTO seasons VALUES(1,1,1); INSERT INTO episode_files VALUES(7,1,'/tv/file');
+        INSERT INTO episodes(id,series_id,season,number,title,episode_file_id) VALUES(1,1,1,1,'Episode',7);
+        INSERT INTO operations VALUES('kept','episode',1,NULL,'/source','copy','/tv/file','complete','');
+        INSERT INTO import_journal(operation_id,plan_json,stage_json,phase) VALUES('kept','{}','{}','staging');
+        INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES('kept','episode',1,7,'/source','/tv/file',10,printf('%064d',0));
+        UPDATE import_journal SET phase='complete' WHERE operation_id='kept';").await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!(
+        "../migrations/0009_provider_configuration.sql"
+    ))
+    .await?;
+    assert!(tx.execute("INSERT INTO providers VALUES('bad','unused-family','Bad',1,1,1,1,'https://example.test',NULL)",()).await.is_err());
+    tx.rollback().await?;
+    assert_eq!(scalar(&c,"SELECT count(*) FROM sqlite_schema WHERE name IN ('providers','provider_scopes','provider_revision_step')").await,0);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM import_history WHERE operation_id='kept'"
+        )
+        .await,
+        1
+    );
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        9
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM import_journal WHERE operation_id='kept' AND phase='complete'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT episode_file_id FROM episodes WHERE id=1").await,
+        7
+    );
+    // These envelopes test SQL byte/type bounds only; authenticated encryption belongs to the service tests.
+    c.execute_batch("INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000001','torznab','Indexer',1,1,1,1,'https://indexer.test',zeroblob(29));
+        INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000002','qbittorrent','Client',1,50,1,1,'https://client.test',NULL);
+        INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES
+        ('00000000-0000-0000-0000-000000000001','torznab','tv','[5000,5030]','[5070]'),
+        ('00000000-0000-0000-0000-000000000001','torznab','movies','[2000]','[]');
+        INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority) VALUES
+        ('00000000-0000-0000-0000-000000000002','qbittorrent','tv','tv','tv-imported',1,0),
+        ('00000000-0000-0000-0000-000000000002','qbittorrent','movies','movies',NULL,0,0);").await?;
+    for sql in [
+        "UPDATE providers SET name='Unversioned' WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+2 WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,implementation='newznab' WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,credentials='plaintext' WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,credentials=zeroblob(28) WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,credentials=zeroblob(16385) WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,priority=101 WHERE implementation='torznab'",
+        "UPDATE providers SET revision=revision+1,settings_version=2 WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET implementation='newznab' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='[1,1]' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='[1.5]' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='[\"1\"]' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='[0]' WHERE implementation='torznab'",
+        // Pinned Newznab Category.Id is a signed 32-bit integer, not a JS-sized integer.
+        "UPDATE provider_scopes SET categories='[2147483648]' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='[null]' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET categories='{}' WHERE implementation='torznab'",
+        "UPDATE provider_scopes SET anime_categories='[5070]' WHERE media_type='movies' AND implementation='torznab'",
+        "UPDATE provider_scopes SET category='tv' WHERE media_type='movies' AND implementation='qbittorrent'",
+        // Pinned qBittorrent priority is the closed enum Last=0 / First=1.
+        "UPDATE provider_scopes SET recent_priority=2 WHERE implementation='qbittorrent'",
+        "UPDATE provider_scopes SET older_priority=-1 WHERE implementation='qbittorrent'",
+        "UPDATE provider_scopes SET categories='[5000]' WHERE implementation='qbittorrent'",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    // The positive signed-32-bit boundary is accepted, then restored for the rollback fixture.
+    c.execute("UPDATE provider_scopes SET categories='[2147483647]' WHERE implementation='torznab' AND media_type='tv'",()).await?;
+    // Structural category validation accepts formatting changes while preserving real values.
+    c.execute("UPDATE provider_scopes SET categories='[ 5000 , 5030 ]' WHERE implementation='torznab' AND media_type='tv'",()).await?;
+    let tx = c.transaction().await?;
+    tx.execute("UPDATE providers SET revision=2,name='Changed',credentials=zeroblob(64) WHERE implementation='torznab' AND revision=1",()).await?;
+    tx.execute(
+        "DELETE FROM provider_scopes WHERE implementation='torznab'",
+        (),
+    )
+    .await?;
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES('00000000-0000-0000-0000-000000000001','torznab','tv','[5000]','[]')",()).await?;
+    assert!(tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES('00000000-0000-0000-0000-000000000001','torznab','movies','[]','[]')",()).await.is_err());
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT revision FROM providers WHERE implementation='torznab'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT length(credentials) FROM providers WHERE implementation='torznab'"
+        )
+        .await,
+        29
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM providers WHERE name='Indexer'").await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM provider_scopes WHERE implementation='torznab'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(scalar(&c,"SELECT json_array_length(categories) FROM provider_scopes WHERE implementation='torznab' AND media_type='tv'").await,2);
+    c.execute("UPDATE providers SET revision=2,credentials=NULL WHERE implementation='torznab' AND revision=1",()).await?;
+    assert_eq!(c.execute("UPDATE providers SET revision=2,name='Stale' WHERE implementation='torznab' AND revision=1",()).await?,0);
+    c.execute(
+        "DELETE FROM providers WHERE implementation='qbittorrent'",
+        (),
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM provider_scopes WHERE implementation='qbittorrent'"
+        )
+        .await,
+        0
+    );
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT revision FROM providers WHERE implementation='torznab' AND credentials IS NULL"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM import_history WHERE operation_id='kept'"
+        )
+        .await,
+        1
     );
     Ok(())
 }

@@ -49,6 +49,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "manual_import_journal",
         include_str!("../../migrations/0008_manual_import_journal.sql"),
     ),
+    (
+        "provider_configuration",
+        include_str!("../../migrations/0009_provider_configuration.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

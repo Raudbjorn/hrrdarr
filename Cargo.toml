@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+url = "=2.5.8"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 ring = "0.17.14"
 rustix = { version = "=0.38.44", features = ["fs"] }

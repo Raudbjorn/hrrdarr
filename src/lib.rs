@@ -10,3 +10,5 @@ pub mod snapshots;
 pub mod api_contract;
 
 pub mod import;
+
+pub mod providers;
