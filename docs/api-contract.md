@@ -20,6 +20,7 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 
 | Route and method | Request | Success body |
 | --- | --- | --- |
+| GET `/history` | `HistoryQuery` | `ApiPage<HistoryEvent>` (immutable initial-import facts) |
 | POST `/commands` | `CommandInput` | `Command` (202; active scope deduplication) |
 | GET `/commands` | `CommandQuery` | `ApiPage<Command>` |
 | GET `/commands/{id}` | none | `Command` |
@@ -100,3 +101,5 @@ The `no-serde-warnings` feature suppresses unsupported-attribute warnings after 
 These declarations are compile-time contracts, not runtime response validators. The frontend checks transport status, JSON, byte/time bounds and numeric safety, then trusts its own backend's structural contract. The specimen test samples shipped shapes; it does not exhaust every possible field value or establish Sonarr/Radarr V3 compatibility. No migrations or physical import/deletion behavior are introduced. Code generation adds the pinned ts-rs dependency and its locked transitive packages.
 
 Durable command and queue semantics, ownership, limits and verification scope are documented in [download refresh](download-refresh.md).
+
+Native history filtering, event semantics and evidence limits are documented in [history](history.md).

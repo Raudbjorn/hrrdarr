@@ -81,6 +81,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "download_refresh",
         include_str!("../../migrations/0016_download_refresh.sql"),
     ),
+    (
+        "import_history_order",
+        include_str!("../../migrations/0017_import_history_order.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -469,3 +473,6 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_tests;
+
+#[cfg(test)]
+mod history_tests;

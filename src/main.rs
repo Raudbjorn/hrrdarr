@@ -84,7 +84,8 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
-        .merge(hrrdarr::commands::router(state.db.clone()));
+        .merge(hrrdarr::commands::router(state.db.clone()))
+        .merge(hrrdarr::history::router(state.db.clone()));
     (app, refresh)
 }
 

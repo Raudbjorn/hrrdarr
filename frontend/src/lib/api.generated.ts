@@ -114,6 +114,14 @@ export type FilesystemPath = { path: string, };
 
 export type FilesystemType = { type: FilesystemKind, };
 
+export type HistoricalFile = { media_type: MediaDomain, id: number, };
+
+export type HistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
+
+export type HistoryEventType = "file_imported";
+
+export type HistoryQuery = { media_type?: MediaDomain, episode_id?: number, movie_id?: number, series_id?: number, season?: number, from?: string, to?: string, limit?: number, offset?: number, };
+
 export type ImportInput = ManualImportRequest | ImportRequest;
 
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };
