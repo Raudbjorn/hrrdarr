@@ -1,7 +1,7 @@
 //! Domain-scoped quality catalog and mutable definition settings (MiB/minute).
 use crate::db::Database;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -118,21 +118,45 @@ pub(crate) fn body<T>(result: std::result::Result<Json<T>, JsonRejection>) -> Re
 }
 
 pub fn router(db: Arc<Database>) -> Router {
-    Router::new()
-        .route("/api/v1/{media}/quality-definitions", get(list))
-        .route("/api/v1/{media}/quality-definitions/limits", get(limits))
+    let mut router = Router::new();
+    for media in ["tv", "movies"] {
+        let prefix = format!("/api/v1/{media}/quality-definitions");
+        router = router.merge(
+            Router::new()
+                .route(&format!("{prefix}"), get(list))
+                .route(&format!("{prefix}/limits"), get(limits))
+                .route(&format!("{prefix}/defaults"), get(defaults))
+                .route(&format!("{prefix}/bulk"), put(bulk))
+                .route(&format!("{prefix}/reset"), post(reset))
+                .route(&format!("{prefix}/{{id}}"), get(detail).put(update))
+                .layer(Extension(media.to_owned()))
+                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+                .with_state(db.clone()),
+        );
+    }
+    // Keep documented JSON errors for unsupported domains; real domains use static prefixes.
+    router
+        .route("/api/v1/{media}/quality-definitions", get(unknown_domain))
+        .route(
+            "/api/v1/{media}/quality-definitions/limits",
+            get(unknown_domain),
+        )
         .route(
             "/api/v1/{media}/quality-definitions/defaults",
-            get(defaults),
+            get(unknown_domain),
         )
-        .route("/api/v1/{media}/quality-definitions/bulk", put(bulk))
-        .route("/api/v1/{media}/quality-definitions/reset", post(reset))
+        .route(
+            "/api/v1/{media}/quality-definitions/bulk",
+            put(unknown_domain),
+        )
+        .route(
+            "/api/v1/{media}/quality-definitions/reset",
+            post(unknown_domain),
+        )
         .route(
             "/api/v1/{media}/quality-definitions/{id}",
-            get(detail).put(update),
+            get(unknown_domain).put(unknown_domain),
         )
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(db)
 }
 
 async fn fetch(c: &Connection, media: &str, defaults: bool) -> Result<Vec<Definition>> {
@@ -166,14 +190,14 @@ async fn fetch(c: &Connection, media: &str, defaults: bool) -> Result<Vec<Defini
 }
 async fn list(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
 ) -> Result<Json<Vec<Definition>>> {
     domain(&media)?;
     Ok(Json(fetch(&db.connect().await?, &media, false).await?))
 }
 async fn defaults(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
 ) -> Result<Json<Vec<Definition>>> {
     domain(&media)?;
     Ok(Json(fetch(&db.connect().await?, &media, true).await?))
@@ -185,7 +209,7 @@ pub struct Limits {
     pub max: i64,
     pub unit: &'static str,
 }
-async fn limits(Path(media): Path<String>) -> Result<Json<Limits>> {
+async fn limits(Extension(media): Extension<String>) -> Result<Json<Limits>> {
     Ok(Json(Limits {
         min: 0,
         max: domain(&media)? as i64,
@@ -194,7 +218,8 @@ async fn limits(Path(media): Path<String>) -> Result<Json<Limits>> {
 }
 async fn detail(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<Definition>> {
     domain(&media)?;
     let id = id
@@ -288,7 +313,7 @@ async fn edit(db: &Database, media: &str, updates: Vec<Update>) -> Result<Vec<De
 }
 async fn bulk(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     payload: std::result::Result<Json<Vec<Update>>, JsonRejection>,
 ) -> Result<Json<Vec<Definition>>> {
     domain(&media)?;
@@ -296,7 +321,8 @@ async fn bulk(
 }
 async fn update(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
     payload: std::result::Result<Json<Update>, JsonRejection>,
 ) -> Result<Json<Definition>> {
     domain(&media)?;
@@ -317,7 +343,7 @@ async fn update(
 }
 async fn reset(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     payload: std::result::Result<Json<Reset>, JsonRejection>,
 ) -> Result<Json<Vec<Definition>>> {
     domain(&media)?;
@@ -344,4 +370,12 @@ async fn reset(
             Err(error)
         }
     }
+}
+
+async fn unknown_domain() -> Error {
+    Error(
+        StatusCode::NOT_FOUND,
+        "media_type_not_found",
+        "Media domain must be tv or movies",
+    )
 }

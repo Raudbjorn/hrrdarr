@@ -2,7 +2,7 @@
 pub(crate) mod media_info;
 use crate::db::Database;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
         DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
@@ -76,13 +76,29 @@ fn domain(s: &str) -> Result<Domain> {
     }
 }
 pub fn router(db: Arc<Database>) -> Router {
-    Router::new()
-        .route("/api/v1/{media}/files", get(list))
-        .route("/api/v1/{media}/files/bulk", put(bulk))
-        .route("/api/v1/{media}/files/editor", put(editor))
-        .route("/api/v1/{media}/files/{id}", get(detail).put(update))
-        .layer(DefaultBodyLimit::max(256 * 1024))
-        .with_state(db)
+    let mut router = Router::new();
+    for media in ["tv", "movies"] {
+        let prefix = format!("/api/v1/{media}/files");
+        router = router.merge(
+            Router::new()
+                .route(&format!("{prefix}"), get(list))
+                .route(&format!("{prefix}/bulk"), put(bulk))
+                .route(&format!("{prefix}/editor"), put(editor))
+                .route(&format!("{prefix}/{{id}}"), get(detail).put(update))
+                .layer(Extension(media.to_owned()))
+                .layer(DefaultBodyLimit::max(256 * 1024))
+                .with_state(db.clone()),
+        );
+    }
+    // Keep documented JSON errors for unsupported domains; real domains use static prefixes.
+    router
+        .route("/api/v1/{media}/files", get(unknown_domain))
+        .route("/api/v1/{media}/files/bulk", put(unknown_domain))
+        .route("/api/v1/{media}/files/editor", put(unknown_domain))
+        .route(
+            "/api/v1/{media}/files/{id}",
+            get(unknown_domain).put(unknown_domain),
+        )
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -118,7 +134,7 @@ fn placeholders(n: usize) -> String {
 }
 async fn list(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     q: std::result::Result<Query<Select>, QueryRejection>,
 ) -> Result<Json<crate::api::ApiPage<FileResource>>> {
     let d = domain(&media)?;
@@ -169,7 +185,8 @@ async fn list(
 }
 async fn detail(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<FileResource>> {
     let d = domain(&media)?;
     let id = parse_id(&id)?;
@@ -305,7 +322,8 @@ fn patch_json(p: FilePatch) -> Result<JsonValue> {
 }
 async fn update(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
     b: std::result::Result<Json<FilePatch>, JsonRejection>,
 ) -> Result<Json<FileResource>> {
     let d = domain(&media)?;
@@ -316,7 +334,7 @@ async fn update(
 }
 async fn bulk(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     b: std::result::Result<Json<FileBulk>, JsonRejection>,
 ) -> Result<Json<Vec<FileResource>>> {
     let d = domain(&media)?;
@@ -332,7 +350,7 @@ async fn bulk(
 }
 async fn editor(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     b: std::result::Result<Json<FileEditor>, JsonRejection>,
 ) -> Result<Json<Vec<FileResource>>> {
     let d = domain(&media)?;
@@ -697,4 +715,8 @@ pub struct FileEditor {
     pub file_ids: Vec<i64>,
     #[serde(flatten)]
     pub patch: FilePatch,
+}
+
+async fn unknown_domain() -> Error {
+    bad("Media domain must be tv or movies")
 }

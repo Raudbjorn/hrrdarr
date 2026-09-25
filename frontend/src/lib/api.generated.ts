@@ -290,9 +290,11 @@ export type QualityDefinitionReset = { reset_titles?: boolean, };
 
 export type QualityDefinitionUpdate = { id: number, title: string, min_size?: number | null, max_size?: number | null, preferred_size?: number | null, };
 
-export type QualityProfile = { id: number, media_type: MediaDomain, name: string, items: Array<QualityProfileItem>, };
+export type QualityProfile = { id: number, media_type: MediaDomain, name: string, items: Array<QualityProfileItem>, policy: QualityProfilePolicy | null, };
 
-export type QualityProfileInput = { name: string, items: Array<QualityProfileItemInput>, };
+export type QualityProfileCutoff = { "kind": "quality", quality_id: number, } | { "kind": "group", position: number, };
+
+export type QualityProfileInput = { name: string, items: Array<QualityProfileItemInput>, policy?: QualityProfilePolicy | null, };
 
 export type QualityProfileItem = { "kind": "quality" } & QualityProfileLeaf | { "kind": "group", name: string, allowed: boolean, items: Array<QualityProfileLeaf>, };
 
@@ -303,6 +305,8 @@ export type QualityProfileLeaf = { quality_id: number, allowed: boolean, min_siz
 export type QualityProfileLeafInput = { quality_id: number, allowed: boolean, min_size?: number | null, max_size?: number | null, preferred_size?: number | null, };
 
 export type QualityProfilePage = { media_type: MediaDomain, items: Array<QualityProfileSummary>, total: number, offset: number, limit: number, };
+
+export type QualityProfilePolicy = { upgrade_allowed: boolean, cutoff: QualityProfileCutoff, min_format_score: number, cutoff_format_score: number, min_upgrade_format_score: number, language_id?: number | null, format_items: [], };
 
 export type QualityProfileQuery = { offset?: number, limit?: number, };
 

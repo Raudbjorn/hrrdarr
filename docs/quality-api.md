@@ -137,7 +137,7 @@ The native `/api/v1/{media}/quality-profiles` API supports actual profile editin
 | PUT `/{id}` | Profile input | HTTP 200, complete replaced profile |
 
 Names are unique per media domain, nonblank, 1–100 characters without controls.
-Profile inputs contain `name` and `items`; unknown fields are rejected. Full
+Profile inputs contain `name`, `items` and optional `policy`; unknown fields are rejected. Full
 responses add `id` and `media_type`. Groups have one level and contain quality
 leaves, never nested groups. A quality may appear only once per profile, even
 across groups. Catalog identities must exist in the chosen domain. Profiles may
@@ -191,9 +191,65 @@ profiles, nullable single/bulk propagation, all-null exclusion, movie isolation,
 late-profile-write rollback, replacement rollback, API round trips and reopened
 persistence. The existing quality contract tests continue to cover reset differences.
 
-This is an item/group foundation, not complete quality-profile parity (`api.023`).
-Cutoffs, upgrade policy, format scoring, profile-to-library assignments, default
-profile generation, profile deletion and search decisions remain separate work.
+This supports profile structure and stored policy, not complete quality-profile parity (`api.023`).
+Custom-format definitions/relationships and scoring, default profile generation,
+profile deletion and search decisions remain separate work. Native library assignments
+exist separately; snapshot-to-profile assignments remain unsupported.
 No durable `ResetQualityDefinitionsCommand`, SignalR/change events, browser
 settings flow, remote database verification, snapshot-to-active-profile mapping,
 or release size-decision enforcement is claimed here.
+
+## Explicit stored profile policy
+
+Detail reads return `policy: null` for an unconfigured profile. Migration 19 leaves
+all existing profiles unconfigured, retaining items, groups and library assignments
+without inventing defaults. A new profile may omit policy or supply null. Once
+configured, every PUT must supply a complete nonnull policy alongside the complete
+item graph; omitted/null policy is rejected without changing the profile. Clearing
+a configured policy is not provided by this contract.
+
+```json
+{
+  "upgrade_allowed": false,
+  "cutoff": { "kind": "group", "position": 1 },
+  "min_format_score": 0,
+  "cutoff_format_score": 0,
+  "min_upgrade_format_score": 1,
+  "language_id": null,
+  "format_items": []
+}
+```
+
+The cutoff is either `{ "kind": "quality", "quality_id": 20 }` for an allowed
+root quality, or `{ "kind": "group", "position": 1 }` for an allowed group at
+that zero-based index in the supplied root `items` array. A grouped child quality
+cannot be selected directly. The same validation applies when upgrades are disabled;
+toggling `upgrade_allowed` preserves the explicitly supplied cutoff. Group positions
+refer to the request, not upstream or database IDs. The transaction allocates groups
+and resolves the cutoff to a profile-owned relational foreign key. Replacing the
+graph and policy is atomic; an invalid cutoff or late write error preserves both.
+
+All score fields are signed 32-bit integers. `min_upgrade_format_score` must be at
+least 1. No score ordering is imposed. With the currently empty custom-format
+catalog, `min_format_score` must be at most zero. `format_items` is a closed empty
+array (`[]`), not a generic JSON extension point; nonempty arrays are unsupported
+and rejected with HTTP 400. No format definitions, condition evaluation or phantom
+foreign-key targets are created. A positive cutoff-format threshold can be retained
+as configuration, but no current worker evaluates it.
+
+TV policy requires `language_id` absent or null. Movie policy requires an explicit
+ID in -2..57: -2 means Original, -1 Any, 0 Unknown, and 1..57 are the pinned concrete
+language identities. This differs from file language arrays; a missing movie
+language never becomes a guessed language. Unknown policy/cutoff fields, malformed
+scalars, overflow and a cutoff outside the supplied allowed roots are rejected.
+
+The fields are stored and editable; they are **not evaluated** by search, upgrade,
+import or cutoff-unmet logic in this unit. Existing native subset-catalog profiles
+and single-child groups remain supported; the stricter upstream whole-catalog and
+multiple-child editor rules are not claimed as V3 equivalence. Source requirements
+were checked against both pinned `Profiles/Qualities/QualityProfile.cs`, V3
+`Profiles/Quality/QualityCutoffValidator.cs`, and Radarr `Languages/Language.cs`.
+`tests/profile_policy.rs` covers both-domain HTTP round trips and rejection/rollback;
+`src/db/profile_policy_tests.rs` covers real schema18 upgrade, rollback, constraints,
+preservation and reopen using the installed libSQL engine and scratch databases.
+No snapshot profile reconstruction or assignment is introduced by migration 19.

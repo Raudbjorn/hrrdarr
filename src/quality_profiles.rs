@@ -1,10 +1,10 @@
-//! Persisted quality item/group editing and size settings; not cutoff/scoring/search policy.
+//! Profile structure and explicit policy storage; evaluation/search remains separate.
 use crate::{
     db::Database,
     qualities::{Error, Result, body, domain, invalid, validate_sizes, validate_title},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
         DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
@@ -41,12 +41,35 @@ pub enum Item {
         items: Vec<Leaf>,
     },
 }
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(rename = "QualityProfileCutoff")]
+pub enum Cutoff {
+    Quality { quality_id: i64 },
+    Group { position: usize },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "QualityProfilePolicy")]
+pub struct Policy {
+    pub upgrade_allowed: bool,
+    pub cutoff: Cutoff,
+    pub min_format_score: i32,
+    pub cutoff_format_score: i32,
+    pub min_upgrade_format_score: i32,
+    #[ts(optional = nullable)]
+    pub language_id: Option<i32>,
+    pub format_items: [(); 0],
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(rename="QualityProfileInput",optional_fields=nullable)]
 pub struct ProfileInput {
     pub name: String,
     pub items: Vec<Item>,
+    pub policy: Option<Policy>,
 }
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "QualityProfile")]
@@ -55,6 +78,7 @@ pub struct Profile {
     pub media_type: crate::api::MediaDomain,
     pub name: String,
     pub items: Vec<ProfileItem>,
+    pub policy: Option<Policy>,
 }
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "QualityProfileSummary")]
@@ -79,14 +103,34 @@ fn page_limit() -> u16 {
 }
 
 pub fn router(db: Arc<Database>) -> Router {
-    Router::new()
-        .route("/api/v1/{media}/quality-profiles", get(list).post(create))
+    let mut router = Router::new();
+    for media in ["tv", "movies"] {
+        let prefix = format!("/api/v1/{media}/quality-profiles");
+        router = router.merge(
+            Router::new()
+                .route(&prefix, get(list).post(create))
+                .route(&format!("{prefix}/{{id}}"), get(read).put(replace))
+                .layer(Extension(media.to_owned()))
+                .layer(DefaultBodyLimit::max(32 * 1024))
+                .with_state(db.clone()),
+        );
+    }
+    router
+        .route(
+            "/api/v1/{media}/quality-profiles",
+            get(unknown_domain).post(unknown_domain),
+        )
         .route(
             "/api/v1/{media}/quality-profiles/{id}",
-            get(read).put(replace),
+            get(unknown_domain).put(unknown_domain),
         )
-        .layer(DefaultBodyLimit::max(32 * 1024))
-        .with_state(db)
+}
+async fn unknown_domain() -> Error {
+    Error(
+        StatusCode::NOT_FOUND,
+        "media_type_not_found",
+        "Media domain must be tv or movies",
+    )
 }
 fn missing() -> Error {
     Error(
@@ -203,11 +247,12 @@ async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
         media_type: crate::api::MediaDomain::parse(media).map_err(invalid)?,
         name: row.get(0)?,
         items: roots.into_values().collect(),
+        policy: fetch_policy(conn, media, id).await?,
     })
 }
 async fn list(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     page: std::result::Result<Query<Page>, QueryRejection>,
 ) -> Result<Json<ProfilePage>> {
     domain(&media)?;
@@ -249,7 +294,8 @@ async fn list(
 }
 async fn read(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<Profile>> {
     domain(&media)?;
     let id = path_id(&id)?;
@@ -266,12 +312,16 @@ async fn persist(
     input: ProfileInput,
 ) -> Result<Profile> {
     validate(&input, domain(media)?)?;
+    validate_policy(&input, media)?;
     let conn = db.connect().await?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
     let result:Result<Profile>=async {
-        if let Some(id)=id {fetch(&tx,media,id).await?;}
+        if let Some(id)=id {
+            let old=fetch(&tx,media,id).await?;
+            if old.policy.is_some() && input.policy.is_none() { return Err(invalid("Configured profiles require a complete policy on replacement")); }
+        }
         if tx.query("SELECT id FROM quality_profiles WHERE media_type=?1 AND name=?2 AND id!=?3",params![media,input.name.clone(),id.unwrap_or(0)]).await?.next().await?.is_some(){return Err(Error(StatusCode::CONFLICT,"profile_name_conflict","Profile name is already used in this media domain"));}
         // Validate catalog membership before replacing any old state; FKs enforce the same domain.
         let mut available=BTreeSet::new();let mut rows=tx.query("SELECT quality_id FROM quality_definitions WHERE media_type=?1",params![media]).await?;
@@ -283,6 +333,7 @@ async fn persist(
         let id=match id {
             Some(id)=>{
                 tx.execute("UPDATE quality_profiles SET name=?1 WHERE id=?2",params![input.name,id]).await?;
+                tx.execute("DELETE FROM quality_profile_policies WHERE profile_id=?1",params![id]).await?;
                 tx.execute("DELETE FROM quality_profile_items WHERE profile_id=?1",params![id]).await?;
                 tx.execute("DELETE FROM quality_profile_groups WHERE profile_id=?1",params![id]).await?;id
             }
@@ -298,6 +349,7 @@ async fn persist(
                 }
             }
         }
+        if let Some(policy)=input.policy { insert_policy(&tx,media,id,policy).await?; }
         fetch(&tx,media,id).await
     }.await;
     match result {
@@ -324,23 +376,24 @@ async fn insert_leaf(
 }
 async fn create(
     State(db): State<Arc<Database>>,
-    Path(media): Path<String>,
+    Extension(media): Extension<String>,
     payload: std::result::Result<Json<ProfileInput>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Profile>)> {
     domain(&media)?;
     Ok((
         StatusCode::CREATED,
-        Json(persist(&db, &media, None, body(payload)?).await?),
+        Json(persist(&db, &media, None, profile_body(payload)?).await?),
     ))
 }
 async fn replace(
     State(db): State<Arc<Database>>,
-    Path((media, id)): Path<(String, String)>,
+    Extension(media): Extension<String>,
+    Path(id): Path<String>,
     payload: std::result::Result<Json<ProfileInput>, JsonRejection>,
 ) -> Result<Json<Profile>> {
     domain(&media)?;
     Ok(Json(
-        persist(&db, &media, Some(path_id(&id)?), body(payload)?).await?,
+        persist(&db, &media, Some(path_id(&id)?), profile_body(payload)?).await?,
     ))
 }
 
@@ -372,4 +425,84 @@ pub struct ProfilePage {
     pub total: i64,
     pub offset: u32,
     pub limit: u16,
+}
+
+fn validate_policy(input: &ProfileInput, media: &str) -> Result<()> {
+    let Some(policy) = &input.policy else {
+        return Ok(());
+    };
+    if policy.min_format_score > 0 {
+        return Err(invalid(
+            "Minimum format score is unsatisfiable without custom formats",
+        ));
+    }
+    if policy.min_upgrade_format_score < 1 {
+        return Err(invalid("Minimum upgrade format score must be at least one"));
+    }
+    if (media == "tv" && policy.language_id.is_some())
+        || (media == "movies" && !policy.language_id.is_some_and(|id| (-2..=57).contains(&id)))
+    {
+        return Err(invalid("Invalid profile language for this media domain"));
+    }
+    let valid=match policy.cutoff {
+        Cutoff::Quality{quality_id}=>input.items.iter().any(|item| matches!(item,Item::Quality(leaf) if leaf.quality_id==quality_id && leaf.allowed)),
+        Cutoff::Group{position}=>matches!(input.items.get(position),Some(Item::Group{allowed:true,..})),
+    };
+    if !valid {
+        return Err(invalid(
+            "Cutoff must select an allowed top-level quality or group",
+        ));
+    }
+    Ok(())
+}
+async fn fetch_policy(conn: &Connection, media: &str, id: i64) -> Result<Option<Policy>> {
+    let row=conn.query("SELECT p.upgrade_allowed,p.cutoff_quality_id,g.position,p.min_format_score,p.cutoff_format_score,p.min_upgrade_format_score,p.language_id FROM quality_profile_policies p LEFT JOIN quality_profile_groups g ON g.id=p.cutoff_group_id AND g.profile_id=p.profile_id WHERE p.profile_id=? AND p.media_type=?",params![id,media]).await?.next().await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let cutoff = match row.get::<Option<i64>>(1)? {
+        Some(quality_id) => Cutoff::Quality { quality_id },
+        None => Cutoff::Group {
+            position: row.get::<i64>(2)? as usize,
+        },
+    };
+    Ok(Some(Policy {
+        upgrade_allowed: row.get::<i64>(0)? != 0,
+        cutoff,
+        min_format_score: row.get(3)?,
+        cutoff_format_score: row.get(4)?,
+        min_upgrade_format_score: row.get(5)?,
+        language_id: row.get(6)?,
+        format_items: [],
+    }))
+}
+async fn insert_policy(conn: &Connection, media: &str, id: i64, policy: Policy) -> Result<()> {
+    let (quality, group) = match policy.cutoff {
+        Cutoff::Quality { quality_id } => (Some(quality_id), None),
+        Cutoff::Group { position } => {
+            let group = conn
+                .query(
+                    "SELECT id FROM quality_profile_groups WHERE profile_id=? AND position=?",
+                    params![id, position as i64],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(|| invalid("Cutoff group is absent"))?
+                .get::<i64>(0)?;
+            (None, Some(group))
+        }
+    };
+    conn.execute("INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,cutoff_group_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id) VALUES(?,?,?,?,?,?,?,?,?)",params![id,media,i64::from(policy.upgrade_allowed),quality,group,policy.min_format_score,policy.cutoff_format_score,policy.min_upgrade_format_score,policy.language_id]).await?;
+    Ok(())
+}
+
+fn profile_body(
+    payload: std::result::Result<Json<ProfileInput>, JsonRejection>,
+) -> Result<ProfileInput> {
+    body(payload).map_err(|error| {
+        if error.0==StatusCode::BAD_REQUEST {
+            invalid("Expected the documented profile fields and types; nonempty custom format lists are unsupported")
+        } else { error }
+    })
 }
