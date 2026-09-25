@@ -1,11 +1,11 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{OriginalUri, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
-use hrrdarr::{db::Database, episodes, import, library};
+use hrrdarr::{db::Database, episodes, import, library, providers};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -153,6 +153,58 @@ async fn movie_search(
         Json(json!([film()])).into_response()
     }
 }
+const PROVIDER_SECRET: &str = "GATE_PROVIDER_PRIVATE_SENTINEL";
+#[derive(Default)]
+struct ProviderMock {
+    fail: AtomicU8,
+    requests: Mutex<Vec<(String, HashMap<String, String>)>>,
+}
+async fn provider_upstream(
+    State(s): State<Arc<ProviderMock>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    let params: HashMap<String, String> =
+        url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    s.requests
+        .lock()
+        .unwrap()
+        .push((uri.path().into(), params.clone()));
+    if matches!(uri.path(), "/torznab" | "/newznab") {
+        assert_eq!(
+            params.get("apikey").map(String::as_str),
+            Some(PROVIDER_SECRET)
+        );
+        if params.get("t").is_some_and(|v| v == "caps") {
+            return ([("content-type","application/xml")],r#"<caps><limits max="100" default="10"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,tvdbid,season,ep"/><movie-search available="yes" supportedParams="q,imdbid,tmdbid"/></searching><categories><category id="5000"><subcat id="5030"/></category><category id="2000"/></categories></caps>"#).into_response();
+        }
+        if s.fail.load(Ordering::SeqCst) == 1 {
+            return (
+                [("content-type", "application/xml")],
+                format!("<error code=\"100\" description=\"{PROVIDER_SECRET}\"/>"),
+            )
+                .into_response();
+        }
+        return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
+    }
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        &format!("Bearer {PROVIDER_SECRET}")
+    );
+    if s.fail.load(Ordering::SeqCst) == 1 {
+        return (StatusCode::UNAUTHORIZED, PROVIDER_SECRET).into_response();
+    }
+    match uri.path() {
+        "/api/v2/app/webapiVersion" => "2.8.3".into_response(),
+        "/api/v2/app/version" => "v4.6.0".into_response(),
+        "/api/v2/torrents/info" => Json(json!([])).into_response(),
+        "/api/v2/app/preferences" => Json(json!({"queueing_enabled":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/torrents/categories" => Json(json!({"tv":{"savePath":"/private/tv"},"movies":{"savePath":"/private/movies"}})).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -176,6 +228,7 @@ async fn request(
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
     assert!(!text.contains("PRIVATE_UPSTREAM_ERROR"));
+    assert!(!text.contains(PROVIDER_SECRET));
     (
         status,
         serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON {status}: {text}")),
@@ -214,16 +267,86 @@ async fn lookup_selected_add_and_safe_import_create_both_domain_targets() {
     let path = scratch.0.join("library.db");
     let db = Arc::new(Database::open_local(&path).await.unwrap());
     let c = db.connect().await.unwrap();
+    let provider_mock = Arc::new(ProviderMock::default());
+    let (provider_origin, provider_task) = serve(
+        Router::new()
+            .fallback(provider_upstream)
+            .with_state(provider_mock.clone()),
+    )
+    .await;
+    let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let app = library::router(db.clone())
         .merge(library::metadata_router(db.clone(), metadata))
         .merge(episodes::router(db.clone()))
-        .merge(import::router(db.clone()));
+        .merge(import::router(db.clone()))
+        .merge(providers::router(db.clone(), Some(key.clone())));
     let (base, api_task) = serve(app).await;
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap();
+    let mut provider_results = Vec::new();
+    for implementation in ["torznab", "newznab", "qbittorrent"] {
+        let endpoint = if implementation == "qbittorrent" {
+            provider_origin.clone()
+        } else {
+            format!("{provider_origin}/{implementation}")
+        };
+        let settings = if implementation == "qbittorrent" {
+            let scope = |category| json!({"category":category,"imported_category":null,"recent_priority":0,"older_priority":1});
+            json!({"implementation":implementation,"endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")})
+        } else {
+            json!({"implementation":implementation,"endpoint":endpoint,"tv":{"categories":[5030],"anime_categories":[]},"movies":{"categories":[2000]}})
+        };
+        let (status,created)=request(&client,&base,"POST","/api/v1/providers",Some(json!({"name":implementation,"enabled":true,"priority":1,"settings":settings,"credentials":{"kind":"api_key","api_key":PROVIDER_SECRET}}))).await;
+        assert_eq!(status, 201, "{created}");
+        assert_eq!(created["test_status"], "never_tested");
+        let route = format!("/api/v1/providers/{}", created["id"].as_str().unwrap());
+        provider_mock.fail.store(1, Ordering::SeqCst);
+        let (status, error) = request(&client, &base, "POST", &format!("{route}/test"), None).await;
+        assert_eq!(status, 502, "{error}");
+        let (_, failed) = request(&client, &base, "GET", &route, None).await;
+        assert_eq!(failed["test_status"], "failure");
+        assert_eq!(failed["revision"], 1);
+        provider_mock.fail.store(0, Ordering::SeqCst);
+        let (status, tested) =
+            request(&client, &base, "POST", &format!("{route}/test"), None).await;
+        assert_eq!(status, 200, "{tested}");
+        assert_eq!(tested["result"]["domains"], json!(["tv", "movies"]));
+        let (_, saved) = request(&client, &base, "GET", &route, None).await;
+        assert_eq!(saved["test_status"], "success");
+        assert_eq!(saved["last_test"]["revision"], 1);
+        provider_results.push((route, saved));
+    }
+    {
+        let requests = provider_mock.requests.lock().unwrap();
+        for implementation in ["torznab", "newznab"] {
+            for category in ["5030", "2000"] {
+                assert!(
+                    requests
+                        .iter()
+                        .any(|(path, q)| path == &format!("/{implementation}")
+                            && q.get("cat").is_some_and(|v| v == category)),
+                    "missing {implementation}/{category} authenticated feed probe"
+                );
+            }
+        }
+        assert!(
+            requests
+                .iter()
+                .any(|(path, _)| path == "/api/v2/torrents/categories")
+        );
+        for category in ["tv", "movies"] {
+            assert!(
+                requests
+                    .iter()
+                    .any(|(path, q)| path == "/api/v2/torrents/info"
+                        && q.get("category").is_some_and(|v| v == category)),
+                "missing client scope probe {category}"
+            );
+        }
+    }
     let tv_root = scratch.0.join("tv");
     let movie_root = scratch.0.join("movie");
     let incoming = scratch.0.join("incoming");
@@ -496,7 +619,7 @@ async fn lookup_selected_add_and_safe_import_create_both_domain_targets() {
     let _ = api_task.await;
     drop(c);
     drop(db);
-    let reopened = Database::open_local(&path).await.unwrap();
+    let reopened = Arc::new(Database::open_local(&path).await.unwrap());
     let c = reopened.connect().await.unwrap();
     for (table, expected) in [
         ("series", 2),
@@ -508,6 +631,37 @@ async fn lookup_selected_add_and_safe_import_create_both_domain_targets() {
     ] {
         assert_eq!(count(&c, table).await, expected);
     }
+    let (reopened_base, reopened_task) = serve(
+        providers::router(reopened.clone(), Some(key)).merge(library::router(reopened.clone())),
+    )
+    .await;
+    for (route, expected) in provider_results {
+        assert_eq!(
+            request(&client, &reopened_base, "GET", &route, None).await,
+            (200, expected)
+        );
+    }
+    for route in [
+        format!("/api/v1/tv/series/{tv_id}"),
+        format!("/api/v1/movies/{movie_id}"),
+    ] {
+        let (status, item) = request(&client, &reopened_base, "GET", &route, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(item["statistics"]["file_count"], 1);
+        assert_eq!(item["monitored"], false);
+    }
+    assert_eq!(
+        std::fs::read(tv_root.join("imported.mkv")).unwrap(),
+        b"isolated episode media"
+    );
+    assert_eq!(
+        std::fs::read(movie_root.join("imported.mkv")).unwrap(),
+        b"isolated movie media"
+    );
+    reopened_task.abort();
+    let _ = reopened_task.await;
+    provider_task.abort();
+    let _ = provider_task.await;
     upstream_task.abort();
     let _ = upstream_task.await;
 }
