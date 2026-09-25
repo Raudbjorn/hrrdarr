@@ -1,1 +1,16 @@
-{"private":true,"type":"module","scripts":{"dev":"vite","build":"vite build"},"devDependencies":{"@sveltejs/vite-plugin-svelte":"latest","svelte":"latest","typescript":"latest","vite":"latest"}}
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.1",
+    "svelte": "5.57.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.1",
+    "svelte-check": "4.7.6"
+  }
+}
