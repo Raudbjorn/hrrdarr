@@ -1,7 +1,12 @@
 use super::*;
 use crate::import::{OwnedImport, prepare_owned};
 
-async fn fixture(dir: &Scratch, db: &Arc<Database>, movie: bool, shared: bool) -> OwnedImport {
+pub(super) async fn fixture(
+    dir: &Scratch,
+    db: &Arc<Database>,
+    movie: bool,
+    shared: bool,
+) -> OwnedImport {
     dir.setup(db).await;
     let c = db.connect().await.unwrap();
     c.execute_batch("UPDATE episodes SET runtime=45; UPDATE movie_metadata SET year=2020,runtime=100; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',1,0,1),(1,'tv',3,1,1),(2,'movies',1,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=3;").await.unwrap();

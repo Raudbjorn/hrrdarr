@@ -194,6 +194,17 @@ impl Plan {
         mode: Mode,
         id: &str,
     ) -> Result<Self> {
+        Self::preview_replacement(owner_id, root, source, destination, mode, id, None)
+    }
+    pub(super) fn preview_replacement(
+        owner_id: i64,
+        root: String,
+        source: String,
+        destination: String,
+        mode: Mode,
+        id: &str,
+        old: Option<&OldFile>,
+    ) -> Result<Self> {
         for path in [&root, &source, &destination] {
             validate_path(path)?;
         }
@@ -207,9 +218,17 @@ impl Plan {
         let (dp, dn) = parts(&destination)?;
         let source_parent = directory(sp)?;
         let destination_parent = directory(dp)?;
-        check(optional(&destination_parent, dn)?.is_none())?;
+        if let Some(old) = old {
+            check(old.path == destination)?;
+            old.verify_original()?;
+        } else {
+            check(optional(&destination_parent, dn)?.is_none())?;
+        }
         let source_fd = child(&source_parent, sn, OFlags::RDONLY)?;
         let source_identity = Identity::read(&source_fd)?;
+        if let Some(old) = old {
+            check(!source_identity.same(&old.file))?;
+        }
         check(source_identity.size > 0 && source_identity.size <= MAX_FILE_BYTES)?;
         if mode == Mode::Hardlink {
             check(source_identity.dev == Identity::read(&destination_parent)?.dev)?;
@@ -558,6 +577,9 @@ impl OldFile {
     }
     pub(super) fn prepare_retirement(&self) -> Result<Retirement> {
         self.verify_original()?;
+        self.prepare_retirement_directory()
+    }
+    fn prepare_retirement_directory(&self) -> Result<Retirement> {
         let parent = self.parent()?;
         fs::mkdirat(
             &parent,
@@ -623,5 +645,131 @@ impl OldFile {
         }
         // A re-created original pathname is never touched on retry.
         self.verify(&mut child(&dir, "original", OFlags::RDONLY)?)
+    }
+}
+
+impl Plan {
+    /// Stage/media remains the immutable new-byte witness throughout the exchange.
+    pub(super) fn exchange(&self, stage: &Stage, old: &OldFile) -> Result<()> {
+        check(old.path == self.destination)?;
+        let (_, parent) = self.parents()?;
+        let dir = self.stage_dir(stage, &parent)?;
+        verify(&mut child(&dir, "media", OFlags::RDONLY)?, stage)?;
+        let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
+        let current = Identity::read(&destination)?;
+        if stage.file.same(&current) {
+            verify(&mut destination, stage)?;
+            old.verify(&mut child(&dir, "original", OFlags::RDONLY)?)?;
+            sync(&dir)?;
+            return sync(&parent);
+        }
+        old.verify(&mut destination)?;
+        if optional(&dir, "original")?.is_none() {
+            fs::linkat(&dir, "media", &dir, "original", AtFlags::empty()).map_err(io)?;
+            sync(&dir)?;
+        }
+        verify(&mut child(&dir, "original", OFlags::RDONLY)?, stage)?;
+        // Catch detectable writes between validation and publication. An external
+        // same-UID writer is outside the exclusive filesystem ownership contract.
+        check(current.unchanged(&Identity::read(&destination)?))?;
+        fs::renameat_with(
+            &dir,
+            "original",
+            &parent,
+            parts(&self.destination)?.1,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io)?;
+        sync(&dir)?;
+        sync(&parent)?;
+        verify(
+            &mut child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?,
+            stage,
+        )?;
+        old.verify(&mut child(&dir, "original", OFlags::RDONLY)?)
+    }
+    pub(super) fn restore_exchange(&self, stage: &Stage, old: &OldFile) -> Result<()> {
+        check(old.path == self.destination)?;
+        let (_, parent) = self.parents()?;
+        let dir = self.stage_dir(stage, &parent)?;
+        verify(&mut child(&dir, "media", OFlags::RDONLY)?, stage)?;
+        let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
+        if old.file.same(&Identity::read(&destination)?) {
+            old.verify(&mut destination)?;
+            if let Some(mut original) = optional(&dir, "original")? {
+                verify(&mut original, stage)?;
+            }
+            sync(&dir)?;
+            return sync(&parent);
+        }
+        let mut original = child(&dir, "original", OFlags::RDONLY)?;
+        let before = Identity::read(&original)?;
+        verify(&mut destination, stage)?;
+        old.verify(&mut original)?;
+        check(before.unchanged(&Identity::read(&original)?))?;
+        fs::renameat_with(
+            &dir,
+            "original",
+            &parent,
+            parts(&self.destination)?.1,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io)?;
+        sync(&dir)?;
+        sync(&parent)?;
+        old.verify(&mut child(
+            &parent,
+            parts(&self.destination)?.1,
+            OFlags::RDONLY,
+        )?)?;
+        verify(&mut child(&dir, "original", OFlags::RDONLY)?, stage)
+    }
+}
+impl OldFile {
+    pub(super) fn prepare_exchange_retirement(
+        &self,
+        plan: &Plan,
+        stage: &Stage,
+    ) -> Result<Retirement> {
+        let (_, parent) = plan.parents()?;
+        let dir = plan.stage_dir(stage, &parent)?;
+        self.verify(&mut child(&dir, "original", OFlags::RDONLY)?)?;
+        self.prepare_retirement_directory()
+    }
+    pub(super) fn retire_exchanged(
+        &self,
+        plan: &Plan,
+        stage: &Stage,
+        checkpoint: &Retirement,
+    ) -> Result<()> {
+        let (_, parent) = plan.parents()?;
+        let source = plan.stage_dir(stage, &parent)?;
+        let destination: File = fs::openat(
+            &self.parent()?,
+            self.quarantine_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Permissions::empty(),
+        )
+        .map_err(io)?
+        .into();
+        check(checkpoint.directory.same(&Identity::read(&destination)?))?;
+        if optional(&destination, "original")?.is_none() {
+            let mut original = child(&source, "original", OFlags::RDONLY)?;
+            let before = Identity::read(&original)?;
+            self.verify(&mut original)?;
+            check(before.unchanged(&Identity::read(&original)?))?;
+            fs::renameat_with(
+                &source,
+                "original",
+                &destination,
+                "original",
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io)?;
+        }
+        sync(&source)?;
+        sync(&destination)?;
+        self.verify(&mut child(&destination, "original", OFlags::RDONLY)?)?;
+        check(optional(&source, "original")?.is_none())
     }
 }

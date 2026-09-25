@@ -140,12 +140,22 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         return Err(Error::bad("Invalid file facts"));
     }
     let own = ownership(&c, &input.target).await?;
-    destination_free(&c, &input.destination).await?;
     source_unmanaged(&c, &input.source).await?;
     let old = match own.3 {
         Some(fid) => Some((fid, old_record(&c, &input.target, fid).await?)),
         None => None,
     };
+    let same_path = old
+        .as_ref()
+        .is_some_and(|(_, (path, _))| path == &input.destination);
+    destination_available(
+        &c,
+        &input.target,
+        &input.destination,
+        old.as_ref().map(|v| v.0),
+        same_path,
+    )
+    .await?;
     let operation = Uuid::new_v4().to_string();
     let op = operation.clone();
     let root = own.1.clone();
@@ -154,16 +164,24 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     let mode = input.mode;
     let expected = input.expected_size;
     let (plan, old) = blocking(move || {
-        let plan = Plan::preview(own.0, root.clone(), source, destination, mode, &op)?;
+        let old = old
+            .map(|(fid, (path, metadata))| OldFile::capture(fid, path, metadata, &root, &op))
+            .transpose()?;
+        let plan = Plan::preview_replacement(
+            own.0,
+            root.clone(),
+            source,
+            destination,
+            mode,
+            &op,
+            if same_path { old.as_ref() } else { None },
+        )?;
         if plan.source_size() != expected {
             return Err(Error::conflict(
                 "source_changed",
                 "Downloaded file size changed",
             ));
         }
-        let old = old
-            .map(|(fid, (path, metadata))| OldFile::capture(fid, path, metadata, &root, &op))
-            .transpose()?;
         if let Some(old) = &old {
             old.recovery_path()?;
         }
@@ -225,7 +243,14 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             "Downloaded file policy facts changed",
         ));
     }
-    destination_free(&tx, &plan.destination).await?;
+    destination_available(
+        &tx,
+        &input.target,
+        &plan.destination,
+        old.as_ref().map(|v| v.file_id),
+        same_path,
+    )
+    .await?;
     source_unmanaged(&tx, &plan.source).await?;
     let domain = match input.target {
         MediaTarget::Episode(_) => "tv",
@@ -286,7 +311,16 @@ pub(super) async fn retire(
     }
     if facts.retirement.is_none() {
         let original = old.clone();
-        let checkpoint = leased(lease, move || original.prepare_retirement()).await?;
+        let p = plan.clone();
+        let s = stage.clone();
+        let checkpoint = leased(lease, move || {
+            if original.path == p.destination {
+                original.prepare_exchange_retirement(&p, &s)
+            } else {
+                original.prepare_retirement()
+            }
+        })
+        .await?;
         c.execute("UPDATE rss_candidate_imports SET retirement_json=? WHERE operation_id=? AND retirement_state='pending'",params![json(&checkpoint)?,operation]).await?;
         facts.retirement = Some(checkpoint);
     }
@@ -297,7 +331,11 @@ pub(super) async fn retire(
     let checkpoint = facts.retirement.ok_or_else(Error::internal)?;
     leased(lease, move || {
         p.verify_destination(&s)?;
-        original.retire(&checkpoint)
+        if original.path == p.destination {
+            original.retire_exchanged(&p, &s, &checkpoint)
+        } else {
+            original.retire(&checkpoint)
+        }
     })
     .await?;
     let tx = c
@@ -320,13 +358,14 @@ pub(super) async fn retire(
                 "Old file acquired another association; retained recovery artifact requires inspection",
             ));
         }
-        if tx
-            .execute(
-                "UPDATE episode_files SET path=? WHERE id=? AND path=?",
-                params![old.recovery_path()?, old.file_id, old.path],
-            )
-            .await?
-            != 1
+        if old.path != plan.destination
+            && tx
+                .execute(
+                    "UPDATE episode_files SET path=? WHERE id=? AND path=?",
+                    params![old.recovery_path()?, old.file_id, old.path],
+                )
+                .await?
+                != 1
         {
             return Err(Error::conflict(
                 "target_changed",
@@ -336,5 +375,183 @@ pub(super) async fn retire(
     }
     tx.execute("UPDATE rss_candidate_imports SET retirement_state='quarantined' WHERE operation_id=? AND retirement_state='pending'",[operation]).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+pub(super) async fn destination_available(
+    c: &Connection,
+    target: &MediaTarget,
+    path: &str,
+    old: Option<i64>,
+    same_path: bool,
+) -> Result<()> {
+    if !same_path {
+        return destination_free(c, path).await;
+    }
+    let fid = old.ok_or_else(Error::internal)?;
+    let (old_path, _) = old_record(c, target, fid).await?;
+    if old_path != path {
+        return Err(Error::conflict(
+            "target_changed",
+            "Original file path changed",
+        ));
+    }
+    if let MediaTarget::Episode(episode) = target {
+        let count: i64 = c
+            .query(
+                "SELECT count(*) FROM episodes WHERE episode_file_id=? AND id!=?",
+                params![fid, *episode],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(Error::internal)?
+            .get(0)?;
+        if count != 0 {
+            return Err(Error::conflict(
+                "shared_file_conflict",
+                "Same-path replacement would change another episode's file",
+            ));
+        }
+    }
+    Ok(())
+}
+pub(super) async fn placement_old(
+    c: &Connection,
+    operation: &str,
+    plan: &Plan,
+) -> Result<Option<OldFile>> {
+    Ok(facts(c, operation)
+        .await?
+        .and_then(|v| v.old)
+        .filter(|old| old.path == plan.destination))
+}
+pub(super) async fn available(
+    c: &Connection,
+    operation: &str,
+    target: &MediaTarget,
+    plan: &Plan,
+) -> Result<()> {
+    let old = placement_old(c, operation, plan).await?;
+    destination_available(
+        c,
+        target,
+        &plan.destination,
+        old.as_ref().map(|v| v.file_id),
+        old.is_some(),
+    )
+    .await
+}
+pub(super) async fn install(
+    c: &Connection,
+    operation: &str,
+    target: &MediaTarget,
+    plan: &Plan,
+    stage: &Stage,
+    lease: &Arc<Permit>,
+) -> Result<()> {
+    let Some(old) = placement_old(c, operation, plan).await? else {
+        return Err(Error::internal());
+    };
+    before(c, operation, target).await?;
+    available(c, operation, target, plan).await?;
+    let state = c
+        .query(
+            "SELECT state FROM same_path_replacements WHERE operation_id=?",
+            [operation],
+        )
+        .await?
+        .next()
+        .await?
+        .map(|r| r.get::<String>(0))
+        .transpose()?;
+    if state.as_deref() == Some("restore_intent") {
+        let p = plan.clone();
+        let s = stage.clone();
+        let o = old.clone();
+        leased(lease, move || p.restore_exchange(&s, &o)).await?;
+        c.execute(
+            "UPDATE same_path_replacements SET state='restored' WHERE operation_id=?",
+            [operation],
+        )
+        .await?;
+    }
+    if state.is_none() {
+        c.execute(
+            "INSERT INTO same_path_replacements(operation_id)VALUES(?)",
+            [operation],
+        )
+        .await?;
+    }
+    c.execute("UPDATE same_path_replacements SET state='exchange_intent' WHERE operation_id=? AND state='restored'",[operation]).await?;
+    let p = plan.clone();
+    let s = stage.clone();
+    let installed = state.as_deref() == Some("installed");
+    leased(lease, move || {
+        if installed {
+            p.verify_destination(&s)?;
+        }
+        p.exchange(&s, &old)
+    })
+    .await?;
+    c.execute(
+        "UPDATE same_path_replacements SET state='installed' WHERE operation_id=?",
+        [operation],
+    )
+    .await?;
+    Ok(())
+}
+/// Fresh durable read is mandatory: commit errors do not establish rollback.
+pub(super) async fn restore_uncommitted(
+    db: &Database,
+    operation: &str,
+    lease: &Arc<Permit>,
+) -> Result<()> {
+    let c = db.connect().await?;
+    let record = load(&c, operation).await?;
+    if matches!(record.phase.as_str(), "committed" | "complete")
+        || c.query(
+            "SELECT 1 FROM import_history WHERE operation_id=?",
+            [operation],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let Some(plan) = record.plan else {
+        return Ok(());
+    };
+    let Some(stage) = record.stage else {
+        return Ok(());
+    };
+    let Some(old) = placement_old(&c, operation, &plan).await? else {
+        return Ok(());
+    };
+    let Some(row) = c
+        .query(
+            "SELECT state FROM same_path_replacements WHERE operation_id=?",
+            [operation],
+        )
+        .await?
+        .next()
+        .await?
+    else {
+        return Ok(());
+    };
+    let state: String = row.get(0)?;
+    drop(row);
+    if state == "restored" {
+        return Ok(());
+    }
+    c.execute("UPDATE same_path_replacements SET state='restore_intent' WHERE operation_id=? AND state IN ('exchange_intent','installed')",[operation]).await?;
+    leased(lease, move || plan.restore_exchange(&stage, &old)).await?;
+    c.execute(
+        "UPDATE same_path_replacements SET state='restored' WHERE operation_id=?",
+        [operation],
+    )
+    .await?;
     Ok(())
 }

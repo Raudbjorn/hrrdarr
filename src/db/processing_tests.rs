@@ -6,7 +6,7 @@ impl Drop for Scratch {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
 }
-async fn observed(
+pub(super) async fn observed(
     c: &Connection,
     command: &str,
     client: &str,
@@ -45,7 +45,12 @@ async fn preview(c: &Connection, domain: &str) -> Result<String, Error> {
 fn old_file(op: &str, domain: &str) -> String {
     serde_json::json!({"version":1,"file_id":1,"path":format!("/{domain}/old.mkv"),"metadata":null,"parent":{"dev":1,"ino":2,"size":0,"mtime":0,"mtime_ns":0,"ctime":0,"ctime_ns":0},"file":{"dev":1,"ino":3,"size":1,"mtime":0,"mtime_ns":0,"ctime":0,"ctime_ns":0},"quarantine_name":format!(".hrrdarr-replaced-{op}")}).to_string()
 }
-async fn link(c: &Connection, candidate: &str, op: &str, domain: &str) -> Result<(), Error> {
+pub(super) async fn link(
+    c: &Connection,
+    candidate: &str,
+    op: &str,
+    domain: &str,
+) -> Result<(), Error> {
     c.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json,old_episode_file_id,old_movie_file_id,old_file_json) VALUES(?,?,1,?, '{}',?,?,?)",params![candidate,op,r#"{"version":1,"real":0,"is_repack":false}"#,(domain=="tv").then_some(1),(domain=="movies").then_some(1),old_file(op,domain)]).await?;
     Ok(())
 }
@@ -98,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 27); // Latest open adds targeted search authority; fixed predecessors remain unchanged.
+    assert_eq!(version(&c).await?, 28); // Latest open adds same-path exchange authority; fixed predecessors remain unchanged.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,
@@ -179,10 +184,12 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
         "UPDATE movie_files SET path='/tv/old.mkv' WHERE id=1",
     ] {
         let error = c.execute(sql, ()).await.unwrap_err();
+        // Migration 28 recreates the old-row guard; either overlapping ownership
+        // constraint may fire first, while all four mutations must remain denied.
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("file path is owned by unfinished download import"),
+            message.contains("file path is owned by unfinished download import")
+                || message.contains("replaced episode path requires retirement checkpoint"),
             "{error}"
         );
     }

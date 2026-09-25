@@ -562,6 +562,18 @@ async fn leased<T: Send + 'static>(
     .await
 }
 async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Operation> {
+    let outcome = run_inner(db.clone(), opid, lease).await;
+    if outcome.is_err() {
+        if let Err(error) = owned::restore_uncommitted(&db, opid, lease).await {
+            eprintln!(
+                "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
+                opid, error.code, error.diagnostic
+            );
+        }
+    }
+    outcome
+}
+async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Operation> {
     let c = db.connect().await?;
     let mut rec = load(&c, opid).await?;
     let plan = rec.plan.take().ok_or_else(|| {
@@ -587,7 +599,7 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
                 "Library path changed since preview",
             ));
         }
-        destination_free(&c, &plan.destination).await?;
+        owned::available(&c, opid, &rec.target, &plan).await?;
         checkpoint(&c, opid, "staging", None).await?;
         rec.phase = "staging".into();
     }
@@ -606,6 +618,10 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
         rec.phase = "staged".into();
     }
     let mut stage = rec.stage.ok_or_else(Error::internal)?;
+    let same_path = owned::placement_old(&c, opid, &plan).await?.is_some();
+    if same_path && matches!(rec.phase.as_str(), "staged" | "published") {
+        owned::install(&c, opid, &rec.target, &plan, &stage, lease).await?;
+    }
     if rec.phase == "staged" {
         let own = owned::before(&c, opid, &rec.target).await?;
         if own.0 != plan.owner_id || own.1 != plan.root {
@@ -614,10 +630,12 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
                 "Library path changed since preview",
             ));
         }
-        destination_free(&c, &plan.destination).await?;
+        owned::available(&c, opid, &rec.target, &plan).await?;
         let p = plan.clone();
         let s = stage.clone();
-        leased(lease, move || p.publish(&s)).await?;
+        if !same_path {
+            leased(lease, move || p.publish(&s)).await?;
+        }
         checkpoint(&c, opid, "published", Some(&stage)).await?;
         rec.phase = "published".into();
     }
@@ -658,14 +676,22 @@ async fn commit(
         .await?;
     let outcome=async {
         let (owner_id,root,season)=owned::before(&tx,opid,t).await?;let facts=owned::facts(&tx,opid).await?;let old_id=facts.as_ref().and_then(|f|f.old.as_ref()).map(|o|o.file_id);if owner_id!=plan.owner_id || root!=plan.root{return Err(Error::conflict("target_changed","Library ownership changed before commit"));}
-        destination_free(&tx,&plan.destination).await?;
+        owned::available(&tx,opid,t,plan).await?;
+        let same_path=facts.as_ref().and_then(|f|f.old.as_ref()).is_some_and(|o|o.path==plan.destination);
+        let mut expected_old=old_id;
+        if same_path && matches!(t,MediaTarget::Episode(_)) {
+            let old=facts.as_ref().and_then(|f|f.old.as_ref()).ok_or_else(Error::internal)?;
+            if tx.execute("UPDATE episodes SET episode_file_id=NULL WHERE id=? AND episode_file_id=?",params![id(t),old.file_id]).await?!=1{return Err(Error::conflict("target_changed","Episode association changed"));}
+            if tx.execute("UPDATE episode_files SET path=? WHERE id=? AND path=?",params![old.recovery_path()?,old.file_id,old.path.clone()]).await?!=1{return Err(Error::conflict("target_changed","Old file path changed"));}
+            expected_old=None;
+        }
         let size=i64::try_from(stage.size()).map_err(|_|Error::internal())?;
         let (domain,episode,movie)=target(t);
         let (file_episode,file_movie)=match t {
             MediaTarget::Episode(episode)=>{
                 tx.execute("INSERT INTO episode_files(series_id,path)VALUES(?,?)",params![owner_id,plan.destination.clone()]).await?;let fid=tx.last_insert_rowid();
                 tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,size,date_added,season_number)VALUES('tv',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?)",params![fid,size,season]).await?;
-                if tx.execute("UPDATE episodes SET episode_file_id=? WHERE id=? AND episode_file_id IS ?",params![fid,*episode,old_id]).await?!=1{return Err(Error::conflict("target_changed","Episode association changed"));}(Some(fid),None)
+                if tx.execute("UPDATE episodes SET episode_file_id=? WHERE id=? AND episode_file_id IS ?",params![fid,*episode,expected_old]).await?!=1{return Err(Error::conflict("target_changed","Episode association changed"));}(Some(fid),None)
             },MediaTarget::Movie(movie)=>{
                 let fid=if let Some(old)=old_id {tx.execute("UPDATE movie_files SET path=?,edition=NULL WHERE id=? AND movie_id=?",params![plan.destination.clone(),old,*movie]).await?;tx.execute("DELETE FROM file_metadata WHERE movie_file_id=?",[old]).await?;old}else{tx.execute("INSERT INTO movie_files(movie_id,path)VALUES(?,?)",params![*movie,plan.destination.clone()]).await?;tx.last_insert_rowid()};
                 tx.execute("INSERT INTO file_metadata(media_type,movie_file_id,size,date_added,original_file_path)VALUES('movies',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?)",params![fid,size,plan.source.clone()]).await?;(None,Some(fid))

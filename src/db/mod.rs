@@ -125,6 +125,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "targeted_search",
         include_str!("../../migrations/0027_targeted_search.sql"),
     ),
+    (
+        "same_path_replacements",
+        include_str!("../../migrations/0028_same_path_replacements.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -540,3 +544,6 @@ mod processing_tests;
 
 #[cfg(test)]
 mod search_tests;
+
+#[cfg(test)]
+mod same_path_tests;

@@ -956,4 +956,242 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
         }
     }
     runtime.shutdown().await;
+    same_basename_http().await;
+}
+
+// Runs after the existing HTTP scenario in the same test so the global import lease is serial.
+async fn same_basename_http() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-same-path-http-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let state = Arc::new(Remote::default());
+    let (origin, _upstream) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(state.clone()),
+    )
+    .await;
+    *state.endpoint.lock().unwrap() = origin.clone();
+    let metadata = Arc::new(
+        hrrdarr::metadata::MetadataClient::with_origins(
+            &format!("{origin}/"),
+            &format!("{origin}/"),
+        )
+        .unwrap(),
+    );
+    let key = Arc::new(providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
+    let (base, _api) = serve(
+        router
+            .merge(commands::router(db.clone()))
+            .merge(hrrdarr::library::router(db.clone()))
+            .merge(hrrdarr::library::metadata_router(
+                db.clone(),
+                metadata.clone(),
+            ))
+            .merge(hrrdarr::remote_paths::router(db.clone()))
+            .merge(hrrdarr::import::router(db.clone()))
+            .merge(hrrdarr::media_files::router(db.clone()))
+            .merge(hrrdarr::history::router(db.clone())),
+    )
+    .await;
+    let c = db.connect().await.unwrap();
+    c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',1,0,1),(1,'tv',3,1,1),(2,'movies',1,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    let (indexer, download) = providers(&base, &origin).await;
+    let mut paths = Vec::new();
+    for (i, media) in ["tv", "movies"].iter().enumerate() {
+        let root = scratch.0.join(media);
+        let source = scratch.0.join(format!("source-{media}"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(source.join("batch")).unwrap();
+        let name = if i == 0 {
+            "Harbor.S01E01.1080p.WEB-DL.mkv"
+        } else {
+            "Harbor.2020.1080p.WEB-DL.mkv"
+        };
+        let new = if i == 0 {
+            source.join("batch").join(name)
+        } else {
+            source.join(name)
+        };
+        std::fs::write(&new, vec![9u8; 1048576]).unwrap();
+        let old_source = scratch.0.join(format!("original-{media}"));
+        std::fs::write(&old_source, b"original-same-path-media").unwrap();
+        let route = if i == 0 {
+            "/api/v1/tv/series/lookup"
+        } else {
+            "/api/v1/movies/lookup"
+        };
+        let add = if i == 0 {
+            json!({"tvdb_id":101,"path":root,"settings":{"quality_profile_id":1,"series_type":"standard","use_scene_numbering":false,"monitored":true}})
+        } else {
+            json!({"tmdb_id":201,"path":root,"settings":{"quality_profile_id":2,"minimum_availability":"released","monitored":true}})
+        };
+        let (code, v) = request(&base, "POST", route, add).await;
+        assert_eq!(code, 201, "{v}");
+        let (code,op)=request(&base,"POST","/api/v1/imports",json!({"target":{"media_type":if i==0{"episode"}else{"movie"},"id":1},"source":old_source,"destination":root.join(name),"mode":"copy"})).await;
+        assert_eq!(code, 202, "{op}");
+        let (code, v) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/imports/{}/execute", op["id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        // The existing filename is not authoritative quality metadata: a native user correction
+        // makes this an eligible upgrade without unsupported proper/repack semantics.
+        let (code, v) = request(
+            &base,
+            "PUT",
+            &format!("/api/v1/{media}/files/1"),
+            json!({"quality":{"quality_id":1,"revision":{"version":1,"real":0,"is_repack":false}}}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let (code, v) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/{media}/remote-path-mappings"),
+            json!({"host":"127.0.0.1","remote_path":"/remote","local_path":source}),
+        )
+        .await;
+        assert_eq!(code, 201, "{v}");
+        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":if i==0{"copy"}else{"hardlink"}})).await;
+        assert_eq!(code, 200, "{v}");
+        paths.push((root.join(name), new));
+    }
+    let runtime = commands::start_with_metadata(db.clone(), client, metadata)
+        .await
+        .unwrap();
+    for (i, media) in ["tv", "movies"].iter().enumerate() {
+        let command = enqueue(&base, target(&indexer, &download, media)).await;
+        let done = wait_status(
+            &base,
+            &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+            "succeeded",
+        )
+        .await;
+        assert_eq!(done["observed"], 1, "{done}");
+        let (code, v) = request(
+            &base,
+            "GET",
+            &format!(
+                "/api/v1/rss/candidates?command_id={}",
+                command["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        let receipt = v["items"][0]["id"].clone();
+        state.completed.store(1, Ordering::SeqCst);
+        c.execute_batch("CREATE TRIGGER same_path_http_failure BEFORE INSERT ON import_history BEGIN SELECT RAISE(ABORT,'same path failure'); END;").await.unwrap();
+        let(code,v)=request(&base,"POST","/api/v1/download-processing",json!({"provider_id":download["id"],"provider_revision":download["revision"],"media_type":media,"receipt_ids":[receipt]})).await;
+        assert_eq!(code, 202, "{v}");
+        let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (_, v) = request(&base, "GET", &path, Value::Null).await;
+                if v["error_code"] == "import_failed" {
+                    break v;
+                }
+                assert_ne!(v["status"], "blocked", "{v}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&paths[i].0).unwrap(),
+            b"original-same-path-media"
+        );
+        let association = if i == 0 {
+            "SELECT episode_file_id FROM episodes WHERE id=1"
+        } else {
+            "SELECT id FROM movie_files WHERE movie_id=1"
+        };
+        assert_eq!(
+            c.query(association, ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            1,
+            "failed same-path commit retains original association"
+        );
+        let file_column = if i == 0 {
+            "episode_file_id"
+        } else {
+            "movie_file_id"
+        };
+        assert_eq!(
+            c.query(
+                &format!("SELECT quality_id FROM file_metadata WHERE {file_column}=1"),
+                ()
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+            1,
+            "failed commit retains corrected original quality"
+        );
+        c.execute_batch("DROP TRIGGER same_path_http_failure;")
+            .await
+            .unwrap();
+        let(code,v)=request(&base,"POST","/api/v1/download-processing",json!({"provider_id":download["id"],"provider_revision":download["revision"],"media_type":media,"receipt_ids":[receipt]})).await;
+        assert_eq!(code, 202, "{v}");
+        let done = wait_status(&base, &path, "imported").await;
+        assert_eq!(done["operation_id"], failed["operation_id"]);
+        let old_json: String = c
+            .query(
+                "SELECT old_file_json FROM rss_candidate_imports WHERE operation_id=?",
+                [done["operation_id"].as_str().unwrap()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let old: Value = serde_json::from_str(&old_json).unwrap();
+        let retained = paths[i]
+            .0
+            .parent()
+            .unwrap()
+            .join(old["quarantine_name"].as_str().unwrap())
+            .join("original");
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            b"original-same-path-media"
+        );
+        assert_eq!(std::fs::read(&paths[i].0).unwrap(), vec![9u8; 1048576]);
+        assert_eq!(std::fs::read(&paths[i].1).unwrap(), vec![9u8; 1048576]);
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(&paths[i].0).unwrap();
+        let b = std::fs::metadata(&paths[i].1).unwrap();
+        assert_eq!((a.dev(), a.ino()) == (b.dev(), b.ino()), i == 1);
+    }
+    let (code, v) = request(&base, "GET", "/api/v1/history", Value::Null).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        v["total"], 4,
+        "two native originals plus two same-path upgrades"
+    );
+    assert_eq!(state.adds.lock().unwrap().len(), 2);
+    runtime.shutdown().await;
 }

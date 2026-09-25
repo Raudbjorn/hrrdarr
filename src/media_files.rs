@@ -21,7 +21,7 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // only a journaled replacement retirement removes a file from library views.
 pub(crate) fn active_file_sql(media: &str) -> &'static str {
     if media == "tv" {
-        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND ri.retirement_state='quarantined')"
+        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND (ri.retirement_state='quarantined' OR EXISTS(SELECT 1 FROM same_path_replacements sp JOIN import_journal sj ON sj.operation_id=sp.operation_id WHERE sp.operation_id=ri.operation_id AND sp.state='installed' AND sj.phase IN ('committed','complete'))))"
     } else {
         "1"
     }
