@@ -528,6 +528,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
 
     // A second real RSS grab upgrades the completed target; original torrent ownership remains retained.
     state.mode.store(6, Ordering::SeqCst);
+    let mut upgrades = Vec::new();
     for (i, media) in ["tv", "movies"].iter().enumerate() {
         let name = if *media == "tv" {
             "Harbor.S01E01.1080p.Bluray.mkv"
@@ -624,11 +625,194 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
         // Disabled automation cannot strand recovery of a linked, already-published local operation.
         let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":1,"enabled":false,"mode":if *media=="tv"{"copy"}else{"hardlink"}})).await;
         assert_eq!(code, 200, "{v}");
+        upgrades.push((receipt.clone(), failed["operation_id"].clone(), old_id));
+    }
+    // Both real producer operations are unfinished at publication. This is a backend
+    // shutdown/database reopen, not a browser reload or completed-operation replay.
+    runtime.shutdown().await;
+    _api.stop().await;
+    drop(c);
+    assert_eq!(
+        Arc::strong_count(&db),
+        1,
+        "all runtime/API database owners released"
+    );
+    drop(db);
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let key = Arc::new(providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
+    let (base, _api) = serve(
+        router
+            .merge(commands::router(db.clone()))
+            .merge(hrrdarr::history::router(db.clone())),
+    )
+    .await;
+    let runtime = commands::start(db.clone(), client).await.unwrap();
+    let c = db.connect().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        state.adds.lock().unwrap().len(),
+        4,
+        "restart cannot resubmit an owned release"
+    );
+    let (_, history) = request(&base, "GET", "/api/v1/history", Value::Null).await;
+    assert_eq!(
+        history["total"], 2,
+        "failed replacements have no committed history"
+    );
+    c.execute_batch("CREATE TRIGGER test_retirement_failure BEFORE UPDATE OF retirement_state ON rss_candidate_imports WHEN NEW.retirement_state='quarantined' BEGIN SELECT RAISE(ABORT,'retirement checkpoint unavailable'); END;").await.unwrap();
+    for (i, media) in ["tv", "movies"].iter().enumerate() {
+        let (receipt, operation, old_id) = &upgrades[i];
+        let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+        let (code, parked) = request(&base, "GET", &path, Value::Null).await;
+        assert_eq!(code, 200);
+        assert_eq!(parked["operation_id"], *operation);
+        assert_eq!(
+            parked["target"],
+            if *media == "tv" {
+                json!({"media_type":"tv","series_id":1,"episode_ids":[1]})
+            } else {
+                json!({"media_type":"movies","movie_id":1})
+            }
+        );
+        assert_eq!(parked["import_phase"], "published");
+        assert_eq!(parked["error_code"], "import_failed");
+        assert_eq!(parked["resume_requested"], false);
+        let association_sql = if *media == "tv" {
+            "SELECT episode_file_id FROM episodes WHERE id=1"
+        } else {
+            "SELECT id FROM movie_files WHERE movie_id=1"
+        };
+        assert_eq!(
+            c.query(association_sql, ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            *old_id
+        );
+        let original = if *media == "tv" {
+            "Harbor.S01E01.1080p.WEB-DL.mkv"
+        } else {
+            "Harbor.2020.1080p.WEB-DL.mkv"
+        };
+        assert_eq!(
+            std::fs::read(roots[i].join(original)).unwrap(),
+            vec![if *media == "tv" { 1 } else { 2 }; 1048576]
+        );
+        let name = if *media == "tv" {
+            "Harbor.S01E01.1080p.Bluray.mkv"
+        } else {
+            "Harbor.2020.1080p.Bluray.mkv"
+        };
         let(code,v)=request(&base,"POST","/api/v1/download-processing",json!({"provider_id":download["id"],"provider_revision":download["revision"],"media_type":media,"receipt_ids":[receipt]})).await;
         assert_eq!(code, 202, "{v}");
-        assert_eq!(v[0]["operation_id"], failed["operation_id"]);
+        assert_eq!(v[0]["operation_id"], *operation);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (_, row) = request(&base, "GET", &path, Value::Null).await;
+                if row["error_code"] == "import_failed" && row["import_phase"] == "committed" {
+                    assert_eq!(row["operation_id"], *operation);
+                    assert_eq!(row["retirement_state"], "pending");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("postcommit retirement failure");
+        assert_eq!(
+            std::fs::read(roots[i].join(name)).unwrap(),
+            vec![3; 1048576]
+        );
+        let retained = roots[i]
+            .join(format!(".hrrdarr-replaced-{}", operation.as_str().unwrap()))
+            .join("original");
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            vec![if *media == "tv" { 1 } else { 2 }; 1048576]
+        );
+    }
+    // Both associations/history are committed and originals renamed, but retirement
+    // checkpoint persistence failed. Reopen before authorizing the same operations again.
+    c.execute_batch("DROP TRIGGER test_retirement_failure;")
+        .await
+        .unwrap();
+    runtime.shutdown().await;
+    _api.stop().await;
+    drop(c);
+    assert_eq!(Arc::strong_count(&db), 1);
+    drop(db);
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let key = Arc::new(providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
+    let (base, _api) = serve(
+        router
+            .merge(commands::router(db.clone()))
+            .merge(hrrdarr::history::router(db.clone())),
+    )
+    .await;
+    let runtime = commands::start(db.clone(), client).await.unwrap();
+    let c = db.connect().await.unwrap();
+    for (i, media) in ["tv", "movies"].iter().enumerate() {
+        let (receipt, operation, old_id) = &upgrades[i];
+        let name = if *media == "tv" {
+            "Harbor.S01E01.1080p.Bluray.mkv"
+        } else {
+            "Harbor.2020.1080p.Bluray.mkv"
+        };
+        let association_sql = if *media == "tv" {
+            "SELECT episode_file_id FROM episodes WHERE id=1"
+        } else {
+            "SELECT id FROM movie_files WHERE movie_id=1"
+        };
+        let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+        let (_, parked) = request(&base, "GET", &path, Value::Null).await;
+        assert_eq!(parked["operation_id"], *operation);
+        assert_eq!(parked["import_phase"], "committed");
+        assert_eq!(parked["error_code"], "import_failed");
+        let file_sql = if *media == "tv" {
+            "SELECT f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=1"
+        } else {
+            "SELECT path FROM movie_files WHERE movie_id=1"
+        };
+        assert_eq!(
+            c.query(file_sql, ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            roots[i].join(name).to_str().unwrap()
+        );
+        assert_eq!(
+            c.query(
+                "SELECT count(*) FROM import_history WHERE operation_id=?",
+                [operation.as_str().unwrap()]
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+            1,
+            "commit already published one history fact before retirement recovery"
+        );
+        let(code,v)=request(&base,"POST","/api/v1/download-processing",json!({"provider_id":download["id"],"provider_revision":download["revision"],"media_type":media,"receipt_ids":[receipt]})).await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v[0]["operation_id"], *operation);
         let imported = wait_status(&base, &path, "imported").await;
-        assert_eq!(imported["operation_id"], failed["operation_id"]);
+        assert_eq!(imported["operation_id"], *operation);
         assert_eq!(imported["retirement_state"], "quarantined");
         assert_eq!(imported["recovery_bytes_retained"], true);
         assert!(!imported["resume_requested"].as_bool().unwrap());
@@ -657,7 +841,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
                     .unwrap()
                     .get::<i64>(0)
                     .unwrap(),
-                old_id,
+                *old_id,
                 "movie replacement retains its file identity"
             )
         }
@@ -722,5 +906,54 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
             .unwrap(),
         4
     );
+    for operation in operations
+        .iter()
+        .chain(upgrades.iter().map(|(_, operation, _)| operation))
+    {
+        let row = c
+            .query(
+                "SELECT count(*) FROM import_history WHERE operation_id=?",
+                [operation.as_str().unwrap()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            1,
+            "each original/upgrade operation has exactly one history fact"
+        );
+    }
+    for (i, media) in ["tv", "movies"].iter().enumerate() {
+        for (receipt, hash) in [
+            (
+                &receipts[i],
+                if i == 0 {
+                    TV.to_owned()
+                } else {
+                    MOVIE.to_owned()
+                },
+            ),
+            (
+                &upgrades[i].0,
+                if i == 0 {
+                    "3".repeat(40)
+                } else {
+                    "4".repeat(40)
+                },
+            ),
+        ] {
+            let row = c.query("SELECT h.hash,r.media_type,h.client_id FROM rss_hash_claims h JOIN rss_candidates r ON r.id=h.candidate_id WHERE h.candidate_id=?", [receipt.as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), hash);
+            assert_eq!(row.get::<String>(1).unwrap(), *media);
+            assert_eq!(
+                row.get::<String>(2).unwrap(),
+                download["id"].as_str().unwrap()
+            );
+        }
+    }
     runtime.shutdown().await;
 }
