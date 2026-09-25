@@ -94,12 +94,137 @@ pub enum ProviderImplementation {
     Torznab,
 }
 #[derive(Serialize, ts_rs::TS)]
+#[serde(tag = "media_type", rename_all = "snake_case")]
+pub enum PresetScope {
+    Tv { settings: TvIndexerScope },
+    Movies { settings: MovieIndexerScope },
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderPreset {
+    pub key: String,
+    pub name: String,
+    pub implementation: ProviderImplementation,
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub endpoint_hint: Option<String>,
+    pub defaults: PresetScope,
+}
+fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
+    match media {
+        MediaDomain::Tv => PresetScope::Tv {
+            settings: TvIndexerScope {
+                categories: if finder {
+                    vec![5030, 5040, 5045]
+                } else {
+                    vec![5030, 5040]
+                },
+                anime_categories: vec![],
+                anime_standard_format_search: false,
+            },
+        },
+        MediaDomain::Movies => PresetScope::Movies {
+            settings: MovieIndexerScope {
+                categories: if finder {
+                    vec![2030, 2040, 2045, 2050, 2060, 2070]
+                } else {
+                    vec![2000, 2010, 2020, 2030, 2040, 2045, 2050, 2060]
+                },
+                remove_year: false,
+            },
+        },
+    }
+}
+// Historical catalog metadata from both pinned references. No endpoint is contacted here.
+fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<ProviderPreset> {
+    match implementation {
+        ProviderImplementation::Qbittorrent => vec![],
+        ProviderImplementation::Torznab => {
+            if media == MediaDomain::Movies {
+                vec![ProviderPreset {
+            key: "torznab-jackett".into(), name: "Jackett".into(), implementation: ProviderImplementation::Torznab,
+            enabled: false, endpoint: None,
+            endpoint_hint: Some("Enter your Jackett host and indexer-specific Torznab endpoint; replace YOURINDEXER in /api/v2.0/indexers/YOURINDEXER/results/torznab/.".into()),
+            defaults: preset_scope(media,false),
+        }]
+            } else {
+                vec![]
+            }
+        }
+        ProviderImplementation::Newznab => [
+            ("dognzb", "DOGnzb", "https://api.dognzb.cr/api", None),
+            (
+                "drunkenslug",
+                "DrunkenSlug",
+                "https://drunkenslug.com/api",
+                None,
+            ),
+            (
+                "nzb-life",
+                "Nzb.life",
+                "https://api.nzb.life/api",
+                Some(MediaDomain::Tv),
+            ),
+            (
+                "nzb-su",
+                "Nzb.su",
+                "https://api.nzb.su/api",
+                Some(MediaDomain::Movies),
+            ),
+            ("nzbcat", "NZBCat", "https://nzb.cat/api", None),
+            (
+                "nzbfinder",
+                "NZBFinder.ws",
+                "https://nzbfinder.ws/api",
+                None,
+            ),
+            ("nzbgeek", "NZBgeek", "https://api.nzbgeek.info/api", None),
+            (
+                "nzbplanet",
+                "nzbplanet.net",
+                "https://api.nzbplanet.net/api",
+                None,
+            ),
+            (
+                "simplynzbs",
+                "SimplyNZBs",
+                "https://simplynzbs.com/api",
+                None,
+            ),
+            (
+                "tabula-rasa",
+                "Tabula Rasa",
+                "https://www.tabula-rasa.pw/api/v1/api",
+                None,
+            ),
+            (
+                "usenet-crawler",
+                "Usenet Crawler",
+                "https://www.usenet-crawler.com/api",
+                Some(MediaDomain::Movies),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, _, _, listed)| listed.is_none_or(|domain| domain == media))
+        .map(|(key, name, endpoint, _)| ProviderPreset {
+            key: format!("newznab-{key}"),
+            name: name.into(),
+            implementation: ProviderImplementation::Newznab,
+            enabled: false,
+            endpoint: Some(endpoint.into()),
+            endpoint_hint: None,
+            defaults: preset_scope(media, key == "nzbfinder"),
+        })
+        .collect(),
+    }
+}
+#[derive(Serialize, ts_rs::TS)]
 pub struct ProviderTemplate {
     pub implementation: ProviderImplementation,
     pub supported_media: Vec<MediaDomain>,
     pub enabled: bool,
     pub priority: u8,
     pub defaults: ProviderDefaults,
+    pub presets: Vec<ProviderPreset>,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct ProviderSchema {
@@ -116,6 +241,7 @@ pub(super) async fn schema(
         ]
         .into_iter()
         .map(|implementation| ProviderTemplate {
+            presets: presets(&implementation, filter.media_type),
             implementation,
             supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
             enabled: false,
@@ -135,6 +261,7 @@ pub(super) async fn schema(
         .collect(),
         ProviderKind::DownloadClient => vec![ProviderTemplate {
             implementation: ProviderImplementation::Qbittorrent,
+            presets: vec![],
             supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
             enabled: false,
             priority: 1,

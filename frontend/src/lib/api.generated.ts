@@ -190,6 +190,8 @@ export type MovieIndexerScope = { categories: Array<number>, remove_year?: boole
 
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
 
+export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
+
 export type Provider = { id: string, revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, has_credentials: boolean, test_supported: boolean, test_status: TestStatus, last_test: ProviderTestObservation | null, };
 
 export type ProviderBatchItem = { provider_id: string, revision: number, outcome: ProviderBatchOutcome, };
@@ -230,6 +232,8 @@ export type ProviderPathInput = { media_type: MediaDomain, remote_path: string, 
 
 export type ProviderPathPreview = { provider_id: string, provider_revision: number, resolution: Resolution, };
 
+export type ProviderPreset = { key: string, name: string, implementation: ProviderImplementation, enabled: boolean, endpoint: string | null, endpoint_hint: string | null, defaults: PresetScope, };
+
 export type ProviderQuery = { limit?: number, offset?: number, media_type?: MediaDomain, };
 
 export type ProviderRevision = { revision: number, };
@@ -244,7 +248,7 @@ export type ProviderSelectionItem = { id: string, revision: number, };
 
 export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, };
 
-export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, };
+export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
