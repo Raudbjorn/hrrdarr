@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-const MAX_NODES: usize = 64;
+pub(crate) const MAX_NODES: usize = 64;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +63,7 @@ pub struct Policy {
     pub format_items: [(); 0],
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, ts_rs::TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(rename="QualityProfileInput",optional_fields=nullable)]
 pub struct ProfileInput {
@@ -176,7 +176,7 @@ fn validate(input: &ProfileInput, limit: f64) -> Result<()> {
     }
     Ok(())
 }
-async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
+pub(crate) async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
     let row = conn
         .query(
             "SELECT name FROM quality_profiles WHERE id=?1 AND media_type=?2",
@@ -311,47 +311,11 @@ async fn persist(
     id: Option<i64>,
     input: ProfileInput,
 ) -> Result<Profile> {
-    validate(&input, domain(media)?)?;
-    validate_policy(&input, media)?;
     let conn = db.connect().await?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let result:Result<Profile>=async {
-        if let Some(id)=id {
-            let old=fetch(&tx,media,id).await?;
-            if old.policy.is_some() && input.policy.is_none() { return Err(invalid("Configured profiles require a complete policy on replacement")); }
-        }
-        if tx.query("SELECT id FROM quality_profiles WHERE media_type=?1 AND name=?2 AND id!=?3",params![media,input.name.clone(),id.unwrap_or(0)]).await?.next().await?.is_some(){return Err(Error(StatusCode::CONFLICT,"profile_name_conflict","Profile name is already used in this media domain"));}
-        // Validate catalog membership before replacing any old state; FKs enforce the same domain.
-        let mut available=BTreeSet::new();let mut rows=tx.query("SELECT quality_id FROM quality_definitions WHERE media_type=?1",params![media]).await?;
-        while let Some(row)=rows.next().await? {available.insert(row.get::<i64>(0)?);}
-        for item in &input.items {
-            let leaves=match item{Item::Quality(leaf)=>std::slice::from_ref(leaf),Item::Group{items,..}=>items.as_slice()};
-            if leaves.iter().any(|l|!available.contains(&l.quality_id)){return Err(invalid("Profile contains an unknown quality for this media domain"));}
-        }
-        let id=match id {
-            Some(id)=>{
-                tx.execute("UPDATE quality_profiles SET name=?1 WHERE id=?2",params![input.name,id]).await?;
-                tx.execute("DELETE FROM quality_profile_policies WHERE profile_id=?1",params![id]).await?;
-                tx.execute("DELETE FROM quality_profile_items WHERE profile_id=?1",params![id]).await?;
-                tx.execute("DELETE FROM quality_profile_groups WHERE profile_id=?1",params![id]).await?;id
-            }
-            None=>{tx.execute("INSERT INTO quality_profiles(media_type,name) VALUES(?1,?2)",params![media,input.name]).await?;tx.last_insert_rowid()},
-        };
-        for (position,item) in input.items.into_iter().enumerate() {
-            match item {
-                Item::Quality(leaf)=>insert_leaf(&tx,media,id,None,position,leaf).await?,
-                Item::Group{name,allowed,items}=>{
-                    tx.execute("INSERT INTO quality_profile_groups(profile_id,name,position,allowed) VALUES(?1,?2,?3,?4)",params![id,name,position as i64,i64::from(allowed)]).await?;
-                    let group=tx.last_insert_rowid();
-                    for (pos,leaf) in items.into_iter().enumerate(){insert_leaf(&tx,media,id,Some(group),pos,leaf).await?;}
-                }
-            }
-        }
-        if let Some(policy)=input.policy { insert_policy(&tx,media,id,policy).await?; }
-        fetch(&tx,media,id).await
-    }.await;
+    let result = persist_on_connection(&tx, media, id, input).await;
     match result {
         Ok(profile) => {
             tx.commit().await?;
@@ -505,4 +469,149 @@ fn profile_body(
             invalid("Expected the documented profile fields and types; nonempty custom format lists are unsupported")
         } else { error }
     })
+}
+
+pub(crate) async fn persist_on_connection(
+    conn: &Connection,
+    media: &str,
+    id: Option<i64>,
+    input: ProfileInput,
+) -> Result<Profile> {
+    validate_input(&input, media)?;
+
+    if let Some(id) = id {
+        let old = fetch(conn, media, id).await?;
+        if old.policy.is_some() && input.policy.is_none() {
+            return Err(invalid(
+                "Configured profiles require a complete policy on replacement",
+            ));
+        }
+    }
+    if conn
+        .query(
+            "SELECT id FROM quality_profiles WHERE media_type=?1 AND name=?2 AND id!=?3",
+            params![media, input.name.clone(), id.unwrap_or(0)],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some()
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "profile_name_conflict",
+            "Profile name is already used in this media domain",
+        ));
+    }
+    // Validate catalog membership before replacing any old state; FKs enforce the same domain.
+    let mut available = BTreeSet::new();
+    let mut rows = conn
+        .query(
+            "SELECT quality_id FROM quality_definitions WHERE media_type=?1",
+            params![media],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        available.insert(row.get::<i64>(0)?);
+    }
+    for item in &input.items {
+        let leaves = match item {
+            Item::Quality(leaf) => std::slice::from_ref(leaf),
+            Item::Group { items, .. } => items.as_slice(),
+        };
+        if leaves.iter().any(|l| !available.contains(&l.quality_id)) {
+            return Err(invalid(
+                "Profile contains an unknown quality for this media domain",
+            ));
+        }
+    }
+    let id = match id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE quality_profiles SET name=?1 WHERE id=?2",
+                params![input.name, id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM quality_profile_policies WHERE profile_id=?1",
+                params![id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM quality_profile_items WHERE profile_id=?1",
+                params![id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM quality_profile_groups WHERE profile_id=?1",
+                params![id],
+            )
+            .await?;
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO quality_profiles(media_type,name) VALUES(?1,?2)",
+                params![media, input.name],
+            )
+            .await?;
+            conn.last_insert_rowid()
+        }
+    };
+    for (position, item) in input.items.into_iter().enumerate() {
+        match item {
+            Item::Quality(leaf) => insert_leaf(conn, media, id, None, position, leaf).await?,
+            Item::Group {
+                name,
+                allowed,
+                items,
+            } => {
+                conn.execute("INSERT INTO quality_profile_groups(profile_id,name,position,allowed) VALUES(?1,?2,?3,?4)",params![id,name,position as i64,i64::from(allowed)]).await?;
+                let group = conn.last_insert_rowid();
+                for (pos, leaf) in items.into_iter().enumerate() {
+                    insert_leaf(conn, media, id, Some(group), pos, leaf).await?;
+                }
+            }
+        }
+    }
+    if let Some(policy) = input.policy {
+        insert_policy(conn, media, id, policy).await?;
+    }
+    fetch(conn, media, id).await
+}
+
+pub(crate) fn validate_input(input: &ProfileInput, media: &str) -> Result<()> {
+    validate(input, domain(media)?)?;
+    validate_policy(input, media)
+}
+pub(crate) fn as_input(profile: Profile) -> ProfileInput {
+    ProfileInput {
+        name: profile.name,
+        policy: profile.policy,
+        items: profile
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ProfileItem::Quality(leaf) => Item::Quality(input_leaf(leaf)),
+                ProfileItem::Group {
+                    name,
+                    allowed,
+                    items,
+                } => Item::Group {
+                    name,
+                    allowed,
+                    items: items.into_iter().map(input_leaf).collect(),
+                },
+            })
+            .collect(),
+    }
+}
+fn input_leaf(leaf: ProfileLeaf) -> Leaf {
+    Leaf {
+        quality_id: leaf.quality_id,
+        allowed: leaf.allowed,
+        min_size: leaf.min_size,
+        max_size: leaf.max_size,
+        preferred_size: leaf.preferred_size,
+    }
 }

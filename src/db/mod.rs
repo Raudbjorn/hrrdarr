@@ -93,6 +93,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "profile_policy",
         include_str!("../../migrations/0019_profile_policy.sql"),
     ),
+    (
+        "snapshot_profiles",
+        include_str!("../../migrations/0020_snapshot_profiles.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -487,3 +491,6 @@ mod history_tests;
 
 #[cfg(test)]
 mod profile_policy_tests;
+
+#[cfg(test)]
+mod snapshot_profile_tests;

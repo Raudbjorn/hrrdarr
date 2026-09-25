@@ -66,7 +66,7 @@ media. Mounts, permissions, availability of media, and path mappings are unverif
 including extra fields on mapped rows, are archived as typed JSON. This preserves
 SQL nulls and binary values as hex. Profile assignments, custom formats, tags,
 collections, history, providers, path mappings, list exclusions, unknown settings,
-and richer metadata are archival only except the explicit History, provider, root-folder and path-mapping reconstructions below. They have not gained runtime
+and richer metadata are archival only except the explicit profile, History, provider, root-folder and path-mapping reconstructions below. They have not gained runtime
 semantics by being retained. There is no archive-reading API.
 
 Archives can contain credentials. Import requires a local Unix destination database
@@ -239,3 +239,66 @@ backfill/rollback/reopen test and mixed-page query-plan test in
 `src/db/history_tests.rs`, and `tests/history_api.rs`. These use synthetic snapshots;
 real exported backup compatibility, unsupported History payload semantics, source
 History mutation endpoints and complete ancillary snapshot parity remain unverified.
+
+
+## Quality profile reconstruction
+
+Whole representable quality profiles and their library assignments are reconstructed
+in the same snapshot transaction. Sonarr 233 reads `QualityProfiles` and
+`Series.QualityProfileId`; Radarr 206 reads `Profiles` and `Movies.ProfileId`, while
+242 reads `QualityProfiles` and `Movies.QualityProfileId`. Radarr migration 230
+renamed these fields. Version 206 predates `MinUpgradeFormatScore`; its value is
+normalized to 1 using the explicit default introduced by migration 239. Sonarr 233
+and Radarr 242 require their stored value. No other policy defaults are invented.
+
+Eligible profiles must have fully representable names, ordered quality/group items,
+allowed flags, TV size overrides, upgrade/cutoff/score policy and movie language.
+Serialized items accept source camelCase field names case-insensitively, numeric
+quality identities, and omitted or zero leaf IDs. Source group IDs identify only
+that profile's root groups. Cutoff must identify exactly one allowed root quality
+or group; ambiguous identities are unsupported. The writer resolves groups through
+native request positions and allocates destination IDs inside the import transaction.
+
+The source must include an observed-empty `CustomFormats` table and each profile's
+`FormatItems` must be exactly `[]`. Both pinned applications synchronize global
+custom formats into profiles, including zero-score entries; a missing catalog does
+not prove independence. Missing/nonempty catalogs, nonempty format lists, unknown
+policy fields, unsupported nesting, catalog IDs or policy values leave the **whole
+profile** archived and reported. Its source assignment remains unsupported; no
+truncated native profile is created. Malformed serialized JSON or duplicate source
+profile IDs fails the entire import with a static error. Unknown field names and
+values from policy JSON never appear in reports. Static source assignment column
+names (`QualityProfileId`/`ProfileId`) identify unresolved assignments.
+
+Profile names are candidate keys only within a media domain. An existing candidate
+must match the complete canonical ordered graph and policy, including sizes,
+language and thresholds. An unconfigured native `policy: null` is not equal to an
+imported policy. Same-name differences conflict without overwriting either profile;
+matching defaults are never inferred from their labels. TV/movie profile IDs remain
+independent even when source IDs and names are equal.
+
+Migration 20 adds a profile activation version to snapshot provenance. It leaves
+existing archives inactive until an exact re-upload. Backfill first requires intact
+library-settings mappings and existing null assignments, then verifies core/settings
+through normal reconciliation before attaching the resolved profiles. A missing
+mapping/row or a local nonnull assignment conflicts and survives unchanged. Later
+exact replays require intact mapped profiles with equal graph/policy and the expected
+assignment; edits, deletions or missing mappings are not silently repaired. A new
+fingerprint can reuse an exactly equal profile; inconsistent existing library
+settings cause a conflict. Unsupported profiles never clear local assignments.
+
+Native profile validation and persistence are shared through connection-aware
+helpers, so the snapshot writer never opens a nested transaction or calls an API
+handler. Profiles, assignments, core rows, private archives, History and optional
+provider reconstruction commit or roll back together. Dry runs persist nothing.
+Uploads allow at most 256 profile rows and each profile at most 64 total group/quality
+nodes; oversized row counts fail explicitly and unsupported graphs stay archived.
+Quality catalog membership is loaded once per import domain for adapter validation.
+
+Evidence: `tests/profile_snapshots.rs` covers synthetic Sonarr 233/Radarr 206/242
+activation, both-domain policy readback, unsupported/privacy cases, replay, local
+edits and late-write rollback. `src/db/snapshot_profile_tests.rs` constructs actual
+schema-19 archives through the prior core writer, checks migration rollback, performs
+both-domain exact-upload backfill and tests missing mappings/rows, local assignments
+and reopen. These do not establish real-backup equivalence, custom-format support,
+policy evaluation or the complete snapshot parity gate.

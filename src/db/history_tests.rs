@@ -136,8 +136,7 @@ async fn history_order_upgrade_rollback_preserves_facts_and_uses_index() -> Resu
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    // Latest open also creates source History storage; predecessor assertions stay unchanged.
-    assert_eq!(version(&conn).await?, 19); // Latest schema adds explicit profile policy; predecessor checks remain fixed.
+    assert_eq!(version(&conn).await?, 20); // Latest open adds profile activation provenance; predecessor stays unchanged.
     assert_eq!(rows(&conn).await?, before);
     for predicate in [
         "",
@@ -228,6 +227,7 @@ async fn mixed_history_page_uses_covering_candidate_indices() -> Result<(), Erro
 
 #[tokio::test]
 async fn source_history_predecessor_backfill_rollback_and_reopen() -> Result<(), Error> {
+    let _guard = crate::snapshots::IMPORT_TEST_LOCK.lock().await;
     let files = Sandbox(
         std::env::temp_dir().join(format!("hrrdarr-history-upgrade-{}", uuid::Uuid::new_v4())),
     );
@@ -268,13 +268,13 @@ CREATE TABLE History(Id INTEGER,MovieId INTEGER,Date TEXT,EventType INTEGER);INS
         .await?;
     }
     let tx = conn.transaction().await?;
-    crate::snapshots::write_pre_history_fixture(
+    crate::snapshots::write_core_snapshot_fixture(
         &tx,
         crate::snapshots::Application::Sonarr,
         bytes.clone(),
     )
     .await?;
-    crate::snapshots::write_pre_history_fixture(
+    crate::snapshots::write_core_snapshot_fixture(
         &tx,
         crate::snapshots::Application::Radarr,
         movie_bytes.clone(),
@@ -321,7 +321,7 @@ CREATE TABLE History(Id INTEGER,MovieId INTEGER,Date TEXT,EventType INTEGER);INS
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 19); // Latest schema adds explicit profile policy; predecessor checks remain fixed.
+    assert_eq!(version(&conn).await?, 20); // Latest open adds profile activation provenance; predecessor stays unchanged.
     assert_eq!(
         scalar(&conn, "SELECT history_version FROM snapshot_imports").await?,
         0

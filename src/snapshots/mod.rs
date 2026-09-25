@@ -2,6 +2,7 @@
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
 mod history;
+mod profiles;
 mod providers;
 mod readers;
 
@@ -185,6 +186,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let profile_plan = profiles::read(&source, app, &mut plan.unsupported)?;
     let history_plan = history::read(&source, app, &mut plan.unsupported)?;
     let provider_plan = if reconstruct_providers {
         providers::read(&source, app, &mut plan.unsupported)?
@@ -203,17 +205,20 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library and supported source History facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library, whole supported profiles and assignments, and supported source History facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported source History facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported whole profiles/assignments, source History facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
     let result = async {
+        let prepared =
+            profiles::prepare(&tx, &profile_plan, &mut plan.entities, &mut report).await?;
         write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
+        profiles::finish(&tx, prepared, &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         providers::write(&tx, &provider_plan, key, &mut report).await
     }
@@ -623,7 +628,8 @@ async fn write_seasons(
 }
 
 #[cfg(test)]
-pub(crate) async fn write_pre_history_fixture(
+// Construct prior core+archive state only; fixtures independently choose omitted ancillary tables.
+pub(crate) async fn write_core_snapshot_fixture(
     conn: &Connection,
     app: Application,
     bytes: Vec<u8>,
@@ -652,3 +658,6 @@ pub(crate) async fn write_pre_history_fixture(
     assert_eq!(report.conflicts, 0);
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) static IMPORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

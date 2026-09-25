@@ -784,8 +784,8 @@ fn add_library_settings(plan: &mut Plan, row: &Record, media: &'static str, id: 
     let tv = media == "tv";
     let target = if tv { "series_id" } else { "movie_id" };
     let core = if tv { "series" } else { "movies" };
-    // Source profile identities are not destination identities. Until profile adapters
-    // exist, preserve/report those assignments privately instead of guessing a match.
+    // Base NULL assignments let old archives validate before backfill. The profiles
+    // adapter resolves supported identities and overrides or attaches them atomically.
     let mut fields = vec![
         ("media_type", val(media)),
         (target, Field::Reference(core, id)),
