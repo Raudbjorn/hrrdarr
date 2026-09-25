@@ -5,8 +5,9 @@ The combined parity plan's exact acceptance is:
 > User can add one series and one movie, import each safely, and test an indexer/client; existing import/path-corruption bugs fixed
 
 **The whole slice-1 gate is not passed.** The connected native HTTP path below is
-exercised, but the frontend does not provide the complete user-facing add, import
-execution and provider-test workflow. API evidence does not substitute for that
+exercised, and the library/import browser workflow now has [runnable evidence](library-ui.md).
+The frontend still lacks provider configuration and testing, so the complete
+user-facing workflow remains unfinished. API evidence does not substitute for that
 workflow or its error/reconciliation feedback.
 
 The pending scope remains visible in the local
@@ -67,8 +68,9 @@ It does not establish upstream runtime or V3 wire equivalence.
 
 ## Not claimed
 
-- No connected browser workflow, accessibility/interaction validation or complete
-  slice-1 gate. Existing UI rows remain incomplete.
+- No complete slice-1 browser workflow or gate. Library/import interactions have
+  separate browser evidence; provider UI and full accessibility validation remain
+  incomplete. Existing UI rows are not closed by this report.
 - No live metadata/indexer/client, real credentials, production database/media,
   download submission, automatic polling/search/grab/import or remote storage.
 - Copy evidence here does not prove failed replacement recovery, cross-device

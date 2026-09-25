@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport } from '../src/lib/api.ts';
+import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -115,4 +115,80 @@ test('exactly 8 MiB JSON remains usable across UTF-8 chunk boundaries', async ()
       controller.close();
     },
   })), async () => assert.deepEqual(await loadSeries(), { ok: true, data: ['é'] }));
+});
+
+// Native wrappers add status/code for actionable UI recovery; legacy assertions above stay exact.
+test('native library calls retain domain, encoded selection, pagination and false/null patches', async () => {
+  const calls = [];
+  const page = { items: [], total: 0, limit: 25, offset: 25 };
+  await withFetch(async (path, options) => {
+    calls.push([path, options.method, options.body ? JSON.parse(options.body) : undefined]);
+    return json(page);
+  }, async () => {
+    assert.deepEqual(await listLibrary('tv', 25), { ok: true, data: page });
+    await listLibrary('movies');
+    await getLibrary('movies', 1);
+    await lookupLibrary('tv', 'Show & year:2024');
+    await addLibrary('tv', 101, '/tv', { monitored: false });
+    await addLibrary('movies', 101, '/movies', { quality_profile_id: null });
+    await updateLibrary('tv', 1, { monitored: false });
+    await listEpisodes(1, 25);
+    await monitorEpisode(1, false);
+  });
+  assert.deepEqual(calls, [
+    ['/api/v1/tv/series?limit=25&offset=25', undefined, undefined],
+    ['/api/v1/movies?limit=25&offset=0', undefined, undefined],
+    ['/api/v1/movies/1', undefined, undefined],
+    ['/api/v1/tv/series/lookup?term=Show+%26+year%3A2024', undefined, undefined],
+    ['/api/v1/tv/series/lookup', 'POST', { tvdb_id: 101, path: '/tv', settings: { monitored: false } }],
+    ['/api/v1/movies/lookup', 'POST', { tmdb_id: 101, path: '/movies', settings: { quality_profile_id: null } }],
+    ['/api/v1/tv/series/1', 'PUT', { monitored: false }],
+    ['/api/v1/episodes?series_id=1&limit=25&offset=25', undefined, undefined],
+    ['/api/v1/episodes/1', 'PUT', { monitored: false }],
+  ]);
+});
+
+test('native failures expose static HTTP code/status and preserve nullable success facts', async () => {
+  await withFetch(async () => json({ error: { code: 'library_conflict', message: 'Conflict' } }, 409), async () => {
+    assert.deepEqual(await addLibrary('movies', 1, '/movies'), { ok: false, error: 'Conflict', code: 'library_conflict', status: 409 });
+  });
+  const item = { id: 1, media_type: 'movies', year: null, is_available: null, statistics: { size_on_disk: null } };
+  await withFetch(async () => json(item), async () => assert.deepEqual(await getLibrary('movies', 1), { ok: true, data: item }));
+});
+
+test('typed import execution never retries uncertain mutations and uses readback for recovery', async () => {
+  const id = '0d3a11d1-4aba-4dd7-913d-d4b50a9065b3';
+  const body = { target: { media_type: 'movie', id: 1 }, source: '/incoming/movie', destination: '/movies/movie', mode: 'copy' };
+  const operation = { id, target: body.target, status: 'complete', message: 'Done' };
+  const calls = [];
+  await withFetch(async (path, options) => {
+    calls.push([path, options.method, options.body]);
+    if (path.endsWith('/execute')) throw new DOMException('Request timed out', 'TimeoutError');
+    return json(operation);
+  }, async () => {
+    assert.equal((await previewManualImport(body)).ok, true);
+    assert.deepEqual(await executeImport(id), { ok: false, error: 'Request timed out' });
+    assert.deepEqual(await getImport(id), { ok: true, data: operation });
+  });
+  assert.deepEqual(calls, [
+    ['/api/v1/imports', 'POST', JSON.stringify(body)],
+    [`/api/v1/imports/${id}/execute`, 'POST', undefined],
+    [`/api/v1/imports/${id}`, undefined, undefined],
+  ]);
+});
+
+test('native invalid identities fail before fetch including operation path injection', async () => {
+  let calls = 0;
+  await withFetch(async () => { calls++; throw new Error('unexpected fetch'); }, async () => {
+    for (const id of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN]) {
+      for (const run of [() => getLibrary('tv', id), () => addLibrary('movies', id, '/m'), () => updateLibrary('tv', id, {}), () => listEpisodes(id), () => monitorEpisode(id, false), () => previewManualImport({target:{media_type:'episode',id},source:'/s',destination:'/d',mode:'copy'})]) {
+        assert.equal((await run()).ok, false);
+      }
+    }
+    for (const id of ['', '../movie/1', 'uuid?execute=true']) {
+      assert.equal((await getImport(id)).ok, false);
+      assert.equal((await executeImport(id)).ok, false);
+    }
+  });
+  assert.equal(calls, 0);
 });
