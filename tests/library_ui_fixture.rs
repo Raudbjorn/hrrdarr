@@ -5,14 +5,19 @@ use axum::{
     extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use hrrdarr::{db::Database, episodes, import, library, metadata::MetadataClient, providers};
+use hrrdarr::{
+    commands, db::Database, episodes, import, library, metadata::MetadataClient, providers,
+};
 use serde_json::json;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -88,7 +93,20 @@ async fn search(Query(q): Query<HashMap<String, String>>) -> Response {
 }
 
 #[derive(Default)]
-struct ProviderObservations(Mutex<Vec<serde_json::Value>>);
+struct ProviderObservations(Mutex<Vec<serde_json::Value>>, AtomicU8);
+async fn mode(
+    State(state): State<Arc<ProviderObservations>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let value = match query.get("mode").map(String::as_str) {
+        Some("0") => 0,
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    state.1.store(value, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
 async fn observations(
     State(state): State<Arc<ProviderObservations>>,
 ) -> Json<Vec<serde_json::Value>> {
@@ -160,12 +178,25 @@ async fn provider_mock(
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
     }
+    if uri.path() == "/api/v2/torrents/info" {
+        match state.1.load(Ordering::SeqCst) {
+            1 => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "PRIVATE_FIXTURE_REFRESH_FAILURE",
+                )
+                    .into_response();
+            }
+            2 => tokio::time::sleep(Duration::from_secs(3)).await,
+            _ => {}
+        }
+    }
     match uri.path() {
         "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
         "/api/v2/app/version"=>"v4.6.0".into_response(),
         "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
         "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
-        "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([])).into_response(),
+        "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([{"hash":"1111111111111111111111111111111111111111","category":query.get("category"),"name":"Fixture download","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0}])).into_response(),
         _=>StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -208,17 +239,21 @@ async fn library_ui_fixture() {
     let (provider_origin, _providers) = serve(
         Router::new()
             .route("/fixture-observations", get(observations))
+            .route("/fixture-mode", post(mode))
             .fallback(provider_mock)
             .with_state(Arc::new(ProviderObservations::default())),
     )
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
+    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let worker = commands::start(db.clone(), refresh).await.unwrap();
     let (api, _api) = serve(
         library::router(db.clone())
             .merge(library::metadata_router(db.clone(), client))
             .merge(episodes::router(db.clone()))
             .merge(import::router(db.clone()))
-            .merge(providers::router(db, Some(key))),
+            .merge(provider_routes)
+            .merge(commands::router(db)),
     )
     .await;
     let shutdown = scratch.0.join("shutdown");
@@ -232,6 +267,7 @@ async fn library_ui_fixture() {
     }
     // Join aborted servers before removing their database and scratch files.
     _api.stop().await;
+    worker.shutdown().await;
     _metadata.stop().await;
     _providers.stop().await;
 }

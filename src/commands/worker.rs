@@ -175,13 +175,22 @@ async fn step(db: &Arc<Database>, client: &RefreshClient) -> Result<()> {
             tokio::select! {
                 value=&mut probe=>break value,
                 _=cancellation.tick()=>{
-                    let current=read_command(&connection(db).await?,id).await?;
+                    let Some(current)=retained_command(&connection(db).await?,id).await? else {return Ok(())};
                     if !matches!(current.status,CommandStatus::Running){return Ok(())}
                 }
             }
         }
     };
     publish(db, command, result).await
+}
+// Active rows cannot be deleted through the API. A missing claimed row therefore
+// means its terminal history was explicitly removed after cancellation.
+async fn retained_command(c: &Connection, id: Uuid) -> Result<Option<Command>> {
+    match read_command(c, id).await {
+        Ok(command) => Ok(Some(command)),
+        Err(Error(StatusCode::NOT_FOUND, "command_not_found")) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 async fn publish(
     db: &Database,
@@ -193,7 +202,7 @@ async fn publish(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async{
-        let current=read_command(&tx,command.id).await?;
+        let Some(current)=retained_command(&tx,command.id).await? else {return Ok(None)};
         if !matches!(current.status,CommandStatus::Running){return Ok(None)}
         let result=if valid_provider(&tx,command.target,command.provider_revision).await?{result}else{Err(RefreshError{code:"provider_changed",retryable:false,retry_after_seconds:None})};
         let timestamp=now()?;
@@ -245,4 +254,126 @@ async fn fail(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("scratch cleanup failed: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_deleted_history_is_terminal_during_probe_and_publication() {
+        let path = std::env::temp_dir().join(format!("hrrdarr-cancel-delete-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _scratch = Scratch(path.clone());
+        let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let remote = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let signal = signal.clone();
+            async move {
+                if uri.path().ends_with("webapiVersion") {
+                    return "2.8.3";
+                }
+                assert!(uri.path().ends_with("torrents/info"));
+                signal.notify_one();
+                std::future::pending::<&'static str>().await
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let remote_task = tokio::spawn(async move { axum::serve(listener, remote).await.unwrap() });
+        let (app, client) = crate::providers::router_with_refresh(db.clone(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let scope = json!({"category":"tv","imported_category":null,"recent_priority":0,"older_priority":1});
+        let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap()
+            .post(format!("{base}/api/v1/providers")).header("content-type", "application/json").body(json!({"name":"cancel-delete", "enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope,"movies":null},"credentials":null}).to_string()).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let provider: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        let c = connection(&db).await.unwrap();
+        let command = enqueue(
+            &c,
+            CommandInput {
+                name: CommandName::RefreshDownloads,
+                target: RefreshTarget {
+                    provider_id: Uuid::parse_str(provider["id"].as_str().unwrap()).unwrap(),
+                    media_type: MediaDomain::Tv,
+                },
+                provider_revision: provider["revision"].as_i64().unwrap(),
+                priority: CommandPriority::Normal,
+            },
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut work = Box::pin(step(&db, &client));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut work => panic!("probe unexpectedly settled: {}", result.is_ok()),
+                _ = started.notified() => (),
+            }
+        })
+        .await
+        .unwrap();
+        let running = read_command(&c, command.id).await.unwrap();
+        assert!(matches!(running.status, CommandStatus::Running));
+        // Polling is paused here so the real handlers delete before the next cancellation tick.
+        let _ = cancel(
+            State(db.clone()),
+            Path(command.id.to_string()),
+            Ok(Query(Empty {})),
+        )
+        .await
+        .unwrap();
+        delete(
+            State(db.clone()),
+            Path(command.id.to_string()),
+            Ok(Query(Empty {})),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_command(&c, command.id).await,
+            Err(Error(StatusCode::NOT_FOUND, "command_not_found"))
+        ));
+        // Missing history is a supported cancellation outcome, not a storage error/retry.
+        tokio::time::timeout(Duration::from_secs(2), &mut work)
+            .await
+            .unwrap()
+            .unwrap();
+        // The other race: HTTP completes before the cancellation tick and reaches publication.
+        publish(&db, running, Ok(vec![])).await.unwrap();
+        assert_eq!(
+            c.query("SELECT count(*) FROM download_refresh_snapshots", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        server.abort();
+        let _ = server.await;
+        remote_task.abort();
+        let _ = remote_task.await;
+        drop(c);
+        drop(work);
+        drop(client);
+        drop(db);
+    }
 }

@@ -1,4 +1,4 @@
-import type { Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -95,3 +95,18 @@ export const createProvider = (input: ProviderInput) => request<Provider>('/api/
 export const updateProvider = (id: string, input: ProviderUpdate) => validOperation(id) && validId(input.revision) ? request<Provider>(`/api/v1/providers/${id}`, input, 'PUT', true) : invalidProvider<Provider>();
 export const deleteProvider = (id: string, revision: number) => validOperation(id) && validId(revision) ? request<void>(`/api/v1/providers/${id}?revision=${revision}`, undefined, 'DELETE', true) : invalidProvider<void>();
 export const testProvider = (id: string) => validOperation(id) ? request<ProviderTestResult>(`/api/v1/providers/${id}/test`, undefined, 'POST', true, 35_000) : invalidProvider<ProviderTestResult>();
+
+export const listCommands = (query: CommandQuery = {}) => {
+  const params = new URLSearchParams({limit:String(query.limit ?? 25),offset:String(query.offset ?? 0)});
+  if (query.media_type) params.set('media_type', query.media_type);
+  if (query.status) params.set('status', query.status);
+  return request<ApiPage<Command>>(`/api/v1/commands?${params}`, undefined, undefined, true);
+};
+export const getCommand = (id: string) => validOperation(id) ? request<Command>(`/api/v1/commands/${id}`, undefined, undefined, true) : invalidProvider<Command>();
+export const createCommand = (input: CommandInput) => validOperation(input.target.provider_id) && validId(input.provider_revision) ? request<Command>('/api/v1/commands', input, 'POST', true) : invalidProvider<Command>();
+export const cancelCommand = (id: string) => validOperation(id) ? request<Command>(`/api/v1/commands/${id}/cancel`, undefined, 'POST', true) : invalidProvider<Command>();
+export const deleteCommand = (id: string) => validOperation(id) ? request<void>(`/api/v1/commands/${id}`, undefined, 'DELETE', true) : invalidProvider<void>();
+export const listRefreshSchedules = () => request<RefreshSchedule[]>('/api/v1/download-refresh/schedules', undefined, undefined, true);
+export const saveRefreshSchedule = (input: RefreshScheduleInput) => validOperation(input.target.provider_id) && validId(input.provider_revision) && (input.revision === null || validId(input.revision)) ? request<RefreshSchedule>('/api/v1/download-refresh/schedules', input, 'PUT', true) : invalidProvider<RefreshSchedule>();
+export const deleteRefreshSchedule = (input: RefreshScheduleDelete) => validOperation(input.target.provider_id) && validId(input.revision) ? request<void>('/api/v1/download-refresh/schedules', input, 'DELETE', true) : invalidProvider<void>();
+export const getQueueSnapshot = (target: RefreshTarget, offset = 0) => validOperation(target.provider_id) ? request<QueueSnapshot>(`/api/v1/queue?${new URLSearchParams({provider_id:target.provider_id,media_type:target.media_type,limit:'25',offset:String(offset)})}`, undefined, undefined, true) : invalidProvider<QueueSnapshot>();

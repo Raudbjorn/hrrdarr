@@ -730,3 +730,164 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
     drop(db);
     stop(upstream).await;
 }
+
+// Executed only by the ownership regression below, in a separate OS process.
+#[tokio::test]
+async fn command_owner_child() {
+    let Ok(path) = std::env::var("HRRDARR_COMMAND_OWNER_DB") else {
+        return;
+    };
+    let ready = std::env::var("HRRDARR_COMMAND_OWNER_READY").unwrap();
+    if std::env::var_os("HRRDARR_COMMAND_OWNER_REJECT").is_some() {
+        let error = match Database::open_local(path).await {
+            Ok(_) => panic!("competing process acquired the database"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("already owned or cannot be locked")
+        );
+        std::fs::write(ready, "rejected").unwrap();
+        return;
+    }
+    let db = Arc::new(Database::open_local(path).await.unwrap());
+    let (app, client) = providers::router_with_refresh(db.clone(), None);
+    let (base, _server) = serve(app.merge(commands::router(db.clone()))).await;
+    let _runtime = commands::start(db, client).await.unwrap();
+    std::fs::write(ready, base).unwrap();
+    std::future::pending::<()>().await;
+}
+
+fn owner_child(
+    db: &std::path::Path,
+    ready: &std::path::Path,
+    reject: bool,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "command_owner_child", "--nocapture"])
+        .env("HRRDARR_COMMAND_OWNER_DB", db)
+        .env("HRRDARR_COMMAND_OWNER_READY", ready)
+        .kill_on_drop(true);
+    if reject {
+        command.env("HRRDARR_COMMAND_OWNER_REJECT", "1");
+    }
+    command.spawn().unwrap()
+}
+
+async fn child_ready(path: &std::path::Path) -> String {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(path).await {
+                if !value.is_empty() {
+                    return value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("child did not become ready")
+}
+
+#[tokio::test]
+async fn process_ownership_rejects_competitor_and_recovers_killed_reads_in_both_domains() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("db");
+        let state = Arc::new(Remote::default());
+        state.mode.store(2, Ordering::SeqCst);
+        let (endpoint, upstream) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(state.clone()),
+        )
+        .await;
+        let db = Arc::new(Database::open_local(&path).await.unwrap());
+        let (app, _) = providers::router_with_refresh(db.clone(), None);
+        let (base, setup) = serve(app.merge(commands::router(db.clone()))).await;
+        let scope = |category| json!({"category":category,"imported_category":null,"recent_priority":0,"older_priority":1});
+        let (code, provider) = request(&base, "POST", "/api/v1/providers", json!({
+            "name":"owned-process", "enabled":true,"priority":1,
+            "settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null
+        })).await;
+        assert_eq!(code, 201, "{provider}");
+        let command = submit(&base, &provider, media).await;
+        let id = command["id"].as_str().unwrap();
+        stop(setup).await;
+        drop(db);
+
+        let ready = scratch.0.join("first-ready");
+        let mut first = owner_child(&path, &ready, false);
+        let base = child_ready(&ready).await;
+        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+            .await
+            .unwrap();
+        let running = until(&base, id, "running").await;
+        assert_eq!(running["attempts"], 1);
+        assert_eq!(running["target"], command["target"]);
+        let before = state.calls.lock().unwrap().len();
+
+        let rejected = scratch.0.join("rejected");
+        let mut competitor = owner_child(&path, &rejected, true);
+        assert_eq!(child_ready(&rejected).await, "rejected");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), competitor.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        // Rejection must precede startup recovery: it cannot claim/reset the live owner's row.
+        let unchanged = until(&base, id, "running").await;
+        assert_eq!(unchanged["attempts"], 1);
+        assert_eq!(state.calls.lock().unwrap().len(), before);
+
+        // Child::kill terminates without Runtime::shutdown or Database destructors.
+        first.kill().await.unwrap();
+        assert!(!first.wait().await.unwrap().success());
+        state.mode.store(0, Ordering::SeqCst);
+        state.release.add_permits(1);
+        let reopened = scratch.0.join("second-ready");
+        let mut second = owner_child(&path, &reopened, false);
+        let base = child_ready(&reopened).await;
+        let completed = until(&base, id, "succeeded").await;
+        // Exact identity and count prove real persisted recovery, not replacement enqueue.
+        assert_eq!(completed["id"], command["id"]);
+        assert_eq!(completed["target"], command["target"]);
+        assert_eq!(completed["attempts"], 2);
+        let (code, queue) = request(
+            &base,
+            "GET",
+            &format!(
+                "/api/v1/queue?provider_id={}&media_type={media}",
+                provider["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, 200, "{queue}");
+        assert_eq!(queue["command_id"], command["id"]);
+        assert_eq!(queue["target"], command["target"]);
+        let peer = if media == "tv" { "movies" } else { "tv" };
+        // Shared provider identity must not publish the observation into its other scope.
+        assert_eq!(
+            request(
+                &base,
+                "GET",
+                &format!(
+                    "/api/v1/queue?provider_id={}&media_type={peer}",
+                    provider["id"].as_str().unwrap()
+                ),
+                Value::Null
+            )
+            .await
+            .0,
+            404
+        );
+        second.kill().await.unwrap();
+        second.wait().await.unwrap();
+        stop(upstream).await;
+    }
+}

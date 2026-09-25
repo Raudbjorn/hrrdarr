@@ -81,6 +81,112 @@ async function verifyProviders() {
     assert.equal(await page.getByLabel('Priority',{exact:true}).inputValue(),'3');
   }
 }
+
+async function verifyActivity() {
+  const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
+  // Reuse the provider created through this browser, enabling its durable read worker.
+  await page.getByLabel('Enabled',{exact:true}).check();
+  await page.getByRole('button',{name:'Save provider',exact:true}).click();
+  await page.getByRole('button',{name:'Test saved provider',exact:true}).waitFor();
+  await page.waitForFunction(()=>!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Test saved provider')?.disabled);
+  const providers=await (await page.request.get(`${origin}/api/v1/providers`)).json();
+  const provider=providers.items.find(p=>p.name==='Browser qbittorrent');
+  assert.equal(provider.enabled,true);
+  const mode=async(value)=>assert.equal((await page.request.post(`${providerOrigin}/fixture-mode?mode=${value}`)).status(),204);
+  const commands=async()=> (await (await page.request.get(`${origin}/api/v1/commands`)).json()).items;
+  const waitCommand=async(id,status)=>{
+    for(let i=0;i<120;i++) {
+      const result=await (await page.request.get(`${origin}/api/v1/commands/${id}`)).json();
+      if(result.status===status)return result;
+      await page.waitForTimeout(250);
+    }
+    assert.fail(`Command ${id} did not reach ${status}`);
+  };
+  const trigger=async()=>{
+    const response=page.waitForResponse(r=>r.url().endsWith('/api/v1/commands')&&r.request().method()==='POST');
+    await page.getByRole('button',{name:'Refresh downloads',exact:true}).click();
+    const result=await response;assert.equal(result.status(),202);
+    return result.json();
+  };
+  await page.getByRole('button',{name:'Activity',exact:true}).click();
+  await page.getByLabel('Download client').selectOption(provider.id);
+  await page.getByText('No successful snapshot yet. Download contents are unknown.',{exact:true}).waitFor();
+  for(const media of ['tv','movies']) {
+    await page.getByLabel('Refresh media').selectOption(media);
+    const command=await trigger();
+    assert.equal(command.target.media_type,media);
+    const completed=await waitCommand(command.id,'succeeded');assert.equal(completed.attempts,1);
+    const queue=await (await page.request.get(`${origin}/api/v1/queue?provider_id=${provider.id}&media_type=${media}`)).json();
+    assert.equal(queue.items.length,1);assert.equal(queue.items[0].association,null);
+    assert.equal(queue.items[0].download.category,media);
+  }
+  await page.getByRole('button',{name:'Reload activity',exact:true}).click();
+  await page.getByRole('cell',{name:/Fixture download/}).waitFor();
+  await mode(1);
+  const failing=await trigger();
+  await waitCommand(failing.id,'retry_wait');
+  await page.getByRole('button',{name:'Reload activity',exact:true}).click();
+  await page.getByRole('heading',{name:'refresh_downloads: retry_wait',exact:true}).waitFor();
+  const failed=await waitCommand(failing.id,'failed');assert.equal(failed.attempts,3);
+  await page.getByRole('button',{name:'Reload activity',exact:true}).click();
+  await page.getByText(failed.error_code,{exact:false}).first().waitFor();
+  assert.doesNotMatch(await page.locator('body').innerText(),/PRIVATE_FIXTURE/);
+  assert.ok(await page.getByRole('cell',{name:/Fixture download/}).isVisible(),'Failed read must retain dated successful observation');
+  await mode(2);
+  const cancelling=await trigger();await waitCommand(cancelling.id,'running');
+  await page.getByRole('button',{name:'Cancel command',exact:true}).click();
+  await waitCommand(cancelling.id,'cancelled');
+  await mode(0);
+  await page.getByRole('button',{name:'Delete command history',exact:true}).click();
+  await page.getByRole('button',{name:'Confirm delete history',exact:true}).click();
+  await page.getByText('Terminal command history deleted. Downloads and media were not deleted.',{exact:true}).waitFor();
+  assert.equal((await page.request.get(`${origin}/api/v1/commands/${cancelling.id}`)).status(),404);
+  let posted=0, lostId;
+  await page.route('**/api/v1/commands',async route=>{
+    if(route.request().method()!=='POST')return route.continue();
+    posted++;
+    const response=await route.fetch();lostId=(await response.json()).id;
+    await route.abort('failed');
+  });
+  await page.getByRole('button',{name:'Refresh downloads',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:/may have committed/}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Refresh downloads',exact:true}).isDisabled(),true);
+  await page.unroute('**/api/v1/commands');
+  await waitCommand(lostId,'succeeded');
+  await page.getByRole('button',{name:'Reload activity',exact:true}).click();
+  await page.getByRole('button',{name:`Inspect command ${lostId}`,exact:true}).waitFor();
+  assert.equal(posted,1,'Unknown request outcome must not automatically replay');
+  // Explicit schedule creation is the only point that enables repeated refreshes.
+  await page.getByLabel('Interval seconds',{exact:true}).fill('86400');
+  await page.getByLabel('Enable schedule',{exact:true}).check();
+  await page.getByRole('button',{name:'Save refresh schedule',exact:true}).click();
+  await page.getByText('Refresh schedule saved.',{exact:true}).waitFor();
+  let schedules=await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json();
+  assert.equal(schedules.length,1);assert.equal(schedules[0].target.media_type,'movies');
+  assert.equal(schedules[0].enabled,true);assert.equal(schedules[0].interval_seconds,86400);
+  const before=await commands();
+  await page.reload();await page.getByRole('button',{name:'Activity',exact:true}).click();
+  await page.getByLabel('Download client').selectOption(provider.id);
+  await page.getByLabel('Refresh media').selectOption('movies');
+  await page.waitForFunction(()=>Array.from(document.querySelectorAll('input[type=number]')).some(input=>input.value==='86400'));
+  assert.equal(await page.getByLabel('Interval seconds',{exact:true}).inputValue(),'86400');
+  assert.equal(await page.getByLabel('Enable schedule',{exact:true}).isChecked(),true);
+  await page.getByLabel('Enable schedule',{exact:true}).uncheck();
+  await page.getByRole('button',{name:'Save refresh schedule',exact:true}).click();
+  await page.getByText('Refresh schedule saved.',{exact:true}).waitFor();
+  schedules=await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json();
+  assert.equal(schedules[0].enabled,false);assert.equal(schedules[0].revision,2);
+  await page.getByRole('button',{name:'Delete schedule',exact:true}).click();
+  await page.getByRole('button',{name:'Confirm delete schedule',exact:true}).click();
+  await page.getByText('Refresh schedule deleted.',{exact:true}).waitFor();
+  assert.deepEqual(await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json(),[]);
+  // Reads/reload must not enqueue; only the immediately due saved schedule may add one command.
+  assert.ok((await commands()).length<=before.length+1);
+  const filtered=page.waitForResponse(r=>r.url().includes('/api/v1/commands?')&&r.url().includes('media_type=tv'));
+  await page.getByLabel('Command media').selectOption('tv');
+  assert.ok((await (await filtered).json()).items.every(command=>command.target.media_type==='tv'));
+}
+
 try {
   await page.goto(origin);
   await add('tv', 'Fixture series', `${scratch}/tv`);
@@ -154,9 +260,14 @@ try {
   await page.getByRole('button', {name:'Monitor Second episode', exact:true}).waitFor();
   assert.match(await page.getByRole('article').innerText(), /pilot.mkv/);
   await verifyProviders();
+  await verifyActivity();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, mobile overflow and browser errors');
+} catch (error) {
+  console.error('Browser errors:',errors);
+  if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});
+  throw error;
 } finally { await browser.close(); }

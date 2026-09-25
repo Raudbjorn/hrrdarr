@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider } from '../src/lib/api.ts';
+import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -236,5 +236,37 @@ test('provider revision conflicts remain actionable and uncertain tests do not r
     assert.equal((await updateProvider(id,{revision:Number.MAX_SAFE_INTEGER+1})).ok,false);
     assert.equal((await getProvider('../providers')).ok,false);
     assert.equal((await testProvider('invalid')).ok,false);
+  });
+});
+
+
+test('activity requests retain typed targets, schedule revisions and command-only actions', async () => {
+  const id='0d3a11d1-4aba-4dd7-913d-d4b50a9065b3';
+  const target={provider_id:id,media_type:'movies'};
+  const command={name:'refresh_downloads',target,provider_revision:7,priority:'normal'};
+  const schedule={target,provider_revision:7,revision:null,enabled:true,interval_seconds:60};
+  const calls=[];
+  await withFetch(async(path,options)=>{
+    calls.push([path,options.method,options.body?JSON.parse(options.body):undefined]);
+    return options.method==='DELETE'?new Response(null,{status:204}):json({id});
+  },async()=>{
+    await listCommands({media_type:'movies',status:'failed',offset:25,limit:25});
+    await getCommand(id); await createCommand(command); await cancelCommand(id);
+    assert.equal((await deleteCommand(id)).ok,true);
+    await listRefreshSchedules(); await saveRefreshSchedule(schedule);
+    await saveRefreshSchedule({...schedule,revision:3,enabled:false});
+    assert.equal((await deleteRefreshSchedule({target,revision:4})).ok,true);
+    await getQueueSnapshot(target,25);
+  });
+  assert.equal(calls[0][0],'/api/v1/commands?limit=25&offset=25&media_type=movies&status=failed');
+  assert.deepEqual(calls[2],['/api/v1/commands','POST',command]);
+  assert.deepEqual(calls[3],[`/api/v1/commands/${id}/cancel`,'POST',undefined]);
+  assert.deepEqual(calls[4],[`/api/v1/commands/${id}`,'DELETE',undefined]);
+  assert.deepEqual(calls[6],['/api/v1/download-refresh/schedules','PUT',schedule]);
+  assert.equal(calls[7][2].revision,3);
+  assert.deepEqual(calls[8],['/api/v1/download-refresh/schedules','DELETE',{target,revision:4}]);
+  assert.equal(calls[9][0],`/api/v1/queue?provider_id=${id}&media_type=movies&limit=25&offset=25`);
+  await withFetch(async()=>json({error:{code:'queue_snapshot_unavailable',message:'No observation'}},404),async()=>{
+    assert.deepEqual(await getQueueSnapshot(target),{ok:false,error:'No observation',status:404,code:'queue_snapshot_unavailable'});
   });
 });
