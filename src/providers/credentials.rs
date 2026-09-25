@@ -83,8 +83,113 @@ fn context(id: &str, implementation: &str) -> String {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(rename = "ProviderCredentials")]
 pub enum Credentials {
-    ApiKey { api_key: String },
-    UsernamePassword { username: String, password: String },
+    ApiKey {
+        api_key: String,
+    },
+    UsernamePassword {
+        username: String,
+        password: String,
+    },
+    Indexer {
+        #[serde(default)]
+        #[ts(optional=nullable)]
+        api_key: Option<String>,
+        #[serde(default)]
+        #[ts(as = "Option<Vec<IndexerParameter>>", optional)]
+        tv_parameters: Vec<IndexerParameter>,
+        #[serde(default)]
+        #[ts(as = "Option<Vec<IndexerParameter>>", optional)]
+        movie_parameters: Vec<IndexerParameter>,
+    },
+}
+/// Write-only additional query parameters; names and values never enter public configuration.
+#[derive(Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct IndexerParameter {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Default)]
+pub struct IndexerAccess<'a> {
+    pub api_key: Option<&'a str>,
+    pub tv_parameters: &'a [IndexerParameter],
+    pub movie_parameters: &'a [IndexerParameter],
+}
+impl<'a> IndexerAccess<'a> {
+    pub(super) fn validate(&self) -> bool {
+        self.api_key.is_none_or(|key| {
+            !key.is_empty() && key.len() <= 4096 && !key.chars().any(char::is_control)
+        }) && valid_parameters(self.tv_parameters)
+            && valid_parameters(self.movie_parameters)
+    }
+
+    pub(super) fn from_credentials(credentials: &'a Option<Credentials>) -> Self {
+        match credentials {
+            Some(Credentials::ApiKey { api_key }) => Self {
+                api_key: Some(api_key),
+                ..Self::default()
+            },
+            Some(Credentials::Indexer {
+                api_key,
+                tv_parameters,
+                movie_parameters,
+            }) => Self {
+                api_key: api_key.as_deref(),
+                tv_parameters,
+                movie_parameters,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+fn valid_parameters(parameters: &[IndexerParameter]) -> bool {
+    const RESERVED: &[&str] = &[
+        "t",
+        "apikey",
+        "api_key",
+        "api-key",
+        "cat",
+        "categories",
+        "q",
+        "title",
+        "tvdbid",
+        "tvmazeid",
+        "rid",
+        "rageid",
+        "imdbid",
+        "imdbtitle",
+        "imdbyear",
+        "tmdbid",
+        "traktid",
+        "doubanid",
+        "year",
+        "season",
+        "ep",
+        "episode",
+        "offset",
+        "limit",
+        "extended",
+        "o",
+        "attrs",
+        "id",
+        "r",
+    ];
+    let mut names = std::collections::BTreeSet::new();
+    parameters.len() <= 16
+        && parameters.iter().all(|p| {
+            let name = p.name.to_ascii_lowercase();
+            !name.is_empty()
+                && name.len() <= 64
+                && name.as_bytes()[0].is_ascii_alphabetic()
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+                && !RESERVED.contains(&name.as_str())
+                && names.insert(name)
+                && p.value.len() <= 1024
+                && !p.value.chars().any(char::is_control)
+        })
 }
 impl Credentials {
     pub(super) fn valid(&self, implementation: &str) -> bool {
@@ -94,6 +199,19 @@ impl Credentials {
         }
         match self {
             Self::ApiKey { api_key } => valid(api_key),
+            Self::Indexer {
+                api_key,
+                tv_parameters,
+                movie_parameters,
+            } => {
+                matches!(implementation, "torznab" | "newznab")
+                    && api_key.as_ref().is_none_or(|key| valid(key))
+                    && (api_key.is_some()
+                        || !tv_parameters.is_empty()
+                        || !movie_parameters.is_empty())
+                    && valid_parameters(tv_parameters)
+                    && valid_parameters(movie_parameters)
+            }
             Self::UsernamePassword { username, password } => {
                 implementation == "qbittorrent" && valid(username) && valid(password)
             }
@@ -104,6 +222,90 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_indexer_parameters_validate_and_roundtrip_without_changing_old_credentials() {
+        let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+        let input = r#"{"kind":"indexer","api_key":null,"tv_parameters":[{"name":"passkey","value":"PRIVATE_QUERY_SENTINEL"}]}"#;
+        let credentials: Credentials = serde_json::from_str(input).unwrap();
+        assert!(credentials.valid("torznab"));
+        assert!(!credentials.valid("qbittorrent"));
+        let bytes = key.seal("provider", "torznab", &credentials).unwrap();
+        assert!(
+            !bytes
+                .windows(b"PRIVATE_QUERY_SENTINEL".len())
+                .any(|w| w == b"PRIVATE_QUERY_SENTINEL")
+        );
+        let opened = Some(key.open("provider", "torznab", &bytes).unwrap());
+        let access = IndexerAccess::from_credentials(&opened);
+        assert!(access.validate());
+        assert_eq!(access.tv_parameters[0].value, "PRIVATE_QUERY_SENTINEL");
+        assert!(access.movie_parameters.is_empty());
+        let old: Credentials =
+            serde_json::from_str(r#"{"kind":"api_key","api_key":"old-key"}"#).unwrap();
+        let old_bytes = key.seal("provider", "torznab", &old).unwrap();
+        let old = Some(key.open("provider", "torznab", &old_bytes).unwrap());
+        assert_eq!(
+            IndexerAccess::from_credentials(&old).api_key,
+            Some("old-key")
+        );
+        for reserved in [
+            "T",
+            "apiKey",
+            "API_KEY",
+            "q",
+            "cat",
+            "offset",
+            "limit",
+            "imdbtitle",
+            "imdbyear",
+            "tvdbid",
+        ] {
+            assert!(!valid_parameters(&[IndexerParameter {
+                name: reserved.into(),
+                value: "private".into()
+            }]));
+        }
+        assert!(!valid_parameters(&[
+            IndexerParameter {
+                name: "passkey".into(),
+                value: "first".into()
+            },
+            IndexerParameter {
+                name: "PASSKEY".into(),
+                value: "second".into()
+            }
+        ]));
+        assert!(!valid_parameters(&[IndexerParameter {
+            name: "filter".into(),
+            value: "x".repeat(1025)
+        }]));
+        assert!(valid_parameters(&[IndexerParameter {
+            name: "filter".into(),
+            value: String::new()
+        }]));
+        let too_many = (0..17)
+            .map(|n| IndexerParameter {
+                name: format!("filter{n}"),
+                value: String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!valid_parameters(&too_many));
+        let large = Credentials::Indexer {
+            api_key: Some("x".repeat(4096)),
+            tv_parameters: (0..16)
+                .map(|n| IndexerParameter {
+                    name: format!("filter{n}"),
+                    value: "x".repeat(1024),
+                })
+                .collect(),
+            movie_parameters: vec![],
+        };
+        assert!(
+            !large.valid("newznab"),
+            "Complete serialized payload must still fit the existing 16 KiB authenticated envelope"
+        );
+    }
     #[test]
     fn credentials_are_authenticated_randomized_and_identity_bound() {
         let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();

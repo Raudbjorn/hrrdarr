@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        9 // Provider configuration is additive; legacy imports and library records survive upgrades.
+        11 // Additive scope options now also apply; existing imports/configuration survive.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 10 remains unknown now that migration 9 adds provider configuration.
+    // Version 12 remains unknown now that migration 11 adds scoped indexer options.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (10,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (12,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        9 // Opening the old import fixture now also applies the additive provider migration.
+        11 // Opening the old fixture also applies provider configuration, tests and scope options.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        9
+        11 // Opening schema 8 also applies configuration, test-result and scope-option migrations.
     );
     assert_eq!(
         scalar(
@@ -714,12 +714,13 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
         scalar(&c, "SELECT episode_file_id FROM episodes WHERE id=1").await,
         7
     );
+    // Latest-schema writes supply applicable false options; old-schema upgrade fixtures retain their old shape.
     // These envelopes test SQL byte/type bounds only; authenticated encryption belongs to the service tests.
     c.execute_batch("INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000001','torznab','Indexer',1,1,1,1,'https://indexer.test',zeroblob(29));
         INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000002','qbittorrent','Client',1,50,1,1,'https://client.test',NULL);
-        INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES
-        ('00000000-0000-0000-0000-000000000001','torznab','tv','[5000,5030]','[5070]'),
-        ('00000000-0000-0000-0000-000000000001','torznab','movies','[2000]','[]');
+        INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES
+        ('00000000-0000-0000-0000-000000000001','torznab','tv','[5000,5030]','[5070]',0,NULL),
+        ('00000000-0000-0000-0000-000000000001','torznab','movies','[2000]','[]',NULL,0);
         INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority) VALUES
         ('00000000-0000-0000-0000-000000000002','qbittorrent','tv','tv','tv-imported',1,0),
         ('00000000-0000-0000-0000-000000000002','qbittorrent','movies','movies',NULL,0,0);").await?;
@@ -761,8 +762,8 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
         (),
     )
     .await?;
-    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES('00000000-0000-0000-0000-000000000001','torznab','tv','[5000]','[]')",()).await?;
-    assert!(tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES('00000000-0000-0000-0000-000000000001','torznab','movies','[]','[]')",()).await.is_err());
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES('00000000-0000-0000-0000-000000000001','torznab','tv','[5000]','[]',0,NULL)",()).await?;
+    assert!(tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES('00000000-0000-0000-0000-000000000001','torznab','movies','[]','[]',NULL,0)",()).await.is_err());
     tx.rollback().await?;
     assert_eq!(
         scalar(
@@ -829,5 +830,403 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
         .await,
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000001','torznab','Kept',1,1,1,1,'https://example.test/api',zeroblob(29));
+        INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000002','qbittorrent','Untested client',1,1,1,1,'https://example.test/client',NULL);
+        INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES('00000000-0000-0000-0000-000000000001','torznab','tv','[5000]','[]');
+        INSERT INTO series(id,title,path) VALUES(1,'Kept TV','/tv');").await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!("../migrations/0010_provider_test_results.sql"))
+        .await?;
+    assert!(
+        tx.execute(
+            "INSERT INTO provider_tests VALUES('absent',1,1,'success',NULL)",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(scalar(&c,"SELECT count(*) FROM sqlite_schema WHERE name IN ('provider_tests','provider_test_insert_owner','provider_configuration_invalidates_test')").await,0);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE name='Kept' AND revision=1 AND length(credentials)=29").await,1);
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        11 // Opening schema 9 also applies the additive scope-option migration.
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE title='Kept TV'").await,
+        1
+    );
+    for sql in [
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',2,1,'success',NULL)",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000002',1,1,'success',NULL)",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,-1,'success',NULL)",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1.5,'success',NULL)",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1,'success','timeout')",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1,'failure',NULL)",
+        "INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1,'failure','SENTINEL_UPSTREAM_SECRET')",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    c.execute("INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1720000000,'success',NULL)",()).await?;
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT tested_at FROM provider_tests WHERE status='success'"
+        )
+        .await,
+        1720000000
+    );
+    assert!(
+        c.execute("UPDATE provider_tests SET config_revision=2", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE provider_tests SET provider_id='00000000-0000-0000-0000-000000000002'",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    // An aborted config transaction restores both the old revision and its valid observation.
+    let tx = c.transaction().await?;
+    tx.execute(
+        "UPDATE providers SET revision=2,name='Uncommitted' WHERE implementation='torznab'",
+        (),
+    )
+    .await?;
+    assert_eq!(scalar(&tx, "SELECT count(*) FROM provider_tests").await, 0);
+    assert!(
+        tx.execute(
+            "UPDATE providers SET revision=3,priority=101 WHERE implementation='torznab'",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM provider_tests WHERE config_revision=1 AND status='success'"
+        )
+        .await,
+        1
+    );
+    c.execute(
+        "UPDATE providers SET revision=2,name='Changed' WHERE implementation='torznab'",
+        (),
+    )
+    .await?;
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
+    // This is the service's post-network CAS pattern: a stale completion writes zero rows.
+    let cas = "INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,1720000001,'failure','timeout' FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code";
+    assert_eq!(
+        c.execute(cas, params!["00000000-0000-0000-0000-000000000001", 1])
+            .await?,
+        0
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
+    assert_eq!(
+        c.execute(cas, params!["00000000-0000-0000-0000-000000000001", 2])
+            .await?,
+        1
+    );
+    assert_eq!(
+        c.execute(cas, params!["00000000-0000-0000-0000-000000000001", 2])
+            .await?,
+        1
+    );
+    assert_eq!(scalar(&c,"SELECT count(*) FROM provider_tests WHERE config_revision=2 AND status='failure' AND error_code='timeout'").await,1);
+    assert!(
+        c.execute("UPDATE provider_tests SET config_revision=1", ())
+            .await
+            .is_err()
+    );
+    // Scope maintenance invalidates existing observations too; runtime replacements also bump revision.
+    c.execute(
+        "UPDATE provider_scopes SET categories='[5030]' WHERE implementation='torznab'",
+        (),
+    )
+    .await?;
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
+    c.execute(cas, params!["00000000-0000-0000-0000-000000000001", 2])
+        .await?;
+    c.execute("DELETE FROM providers WHERE implementation='torznab'", ())
+        .await?;
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 0);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM providers WHERE implementation='qbittorrent'"
+        )
+        .await,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+
+    // Actual schema 10 has no option columns. Preserve both protocols/domains and client scopes.
+    for (id, implementation) in [(1, "torznab"), (2, "newznab"), (3, "qbittorrent")] {
+        let id = format!("00000000-0000-0000-0000-{id:012}");
+        c.execute(
+            "INSERT INTO providers VALUES(?,?,?,1,1,1,1,'https://example.test/api',zeroblob(29))",
+            params![id.clone(), implementation, implementation],
+        )
+        .await?;
+        for domain in ["tv", "movies"] {
+            if implementation == "qbittorrent" {
+                c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority) VALUES(?,?,?,?,0,0)",params![id.clone(),implementation,domain,domain]).await?;
+            } else {
+                c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES(?,?,?,'[2000]','[]')",params![id.clone(),implementation,domain]).await?;
+            }
+        }
+        if implementation != "qbittorrent" {
+            c.execute(
+                "INSERT INTO provider_tests VALUES(?,1,1720000000,'success',NULL)",
+                [id],
+            )
+            .await?;
+        }
+    }
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!("../migrations/0011_indexer_scope_options.sql"))
+        .await?;
+    assert!(
+        tx.execute(
+            "UPDATE provider_scopes SET remove_year=2 WHERE media_type='movies'",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(scalar(&c,"SELECT count(*) FROM pragma_table_info('provider_scopes') WHERE name IN ('remove_year','anime_standard_format_search')").await,0);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 2);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        10
+    );
+    assert_eq!(scalar(&c,"SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='provider_scope_update_invalidates_test'").await,1);
+    // Rollback restores the old trigger's behavior, not merely its name.
+    let tx = c.transaction().await?;
+    tx.execute(
+        "UPDATE provider_scopes SET categories='[2001]' WHERE implementation='torznab'",
+        (),
+    )
+    .await?;
+    assert_eq!(scalar(&tx, "SELECT count(*) FROM provider_tests").await, 1);
+    tx.rollback().await?;
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        11
+    );
+    assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND categories='[2000]' AND anime_categories='[]' AND ((media_type='tv' AND anime_standard_format_search=0 AND remove_year IS NULL) OR (media_type='movies' AND remove_year=0 AND anime_standard_format_search IS NULL))").await,4);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM provider_scopes WHERE implementation='qbittorrent' AND category=media_type AND anime_standard_format_search IS NULL AND remove_year IS NULL").await,2);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM provider_tests WHERE config_revision=1 AND tested_at=1720000000 AND status='success' AND error_code IS NULL").await,2);
+    for (column, domain) in [
+        ("anime_standard_format_search", "tv"),
+        ("remove_year", "movies"),
+    ] {
+        for value in ["NULL", "2", "-1", "0.5", "'true'", "x'00'"] {
+            let sql = format!(
+                "UPDATE provider_scopes SET {column}={value} WHERE implementation='torznab' AND media_type='{domain}'"
+            );
+            assert!(c.execute(&sql, ()).await.is_err(), "accepted {sql}");
+            let (anime, year) = if domain == "tv" {
+                (value, "NULL")
+            } else {
+                ("NULL", value)
+            };
+            let sql = format!(
+                "INSERT OR REPLACE INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES('00000000-0000-0000-0000-000000000001','torznab','{domain}','[2000]','[]',{anime},{year})"
+            );
+            assert!(c.execute(&sql, ()).await.is_err(), "accepted {sql}");
+        }
+        let opposite = if domain == "tv" { "movies" } else { "tv" };
+        assert!(
+            c.execute(
+                &format!("UPDATE provider_scopes SET {column}=0 WHERE media_type='{opposite}'"),
+                ()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            c.execute(
+                &format!(
+                    "UPDATE provider_scopes SET {column}=0 WHERE implementation='qbittorrent'"
+                ),
+                ()
+            )
+            .await
+            .is_err()
+        );
+    }
+    for sql in [
+        "INSERT OR REPLACE INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES('00000000-0000-0000-0000-000000000001','torznab','tv','[2000]','[]',0,0)",
+        "INSERT OR REPLACE INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES('00000000-0000-0000-0000-000000000001','torznab','movies','[2000]','[]',0,0)",
+        "INSERT OR REPLACE INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,anime_standard_format_search) VALUES('00000000-0000-0000-0000-000000000003','qbittorrent','tv','tv',0,0,0)",
+        "INSERT OR REPLACE INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,remove_year) VALUES('00000000-0000-0000-0000-000000000003','qbittorrent','movies','movies',0,0,0)",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 2);
+    c.execute("UPDATE provider_scopes SET anime_standard_format_search=1 WHERE implementation='torznab' AND media_type='tv'",()).await?;
+    c.execute("UPDATE provider_scopes SET remove_year=1 WHERE implementation='newznab' AND media_type='movies'",()).await?;
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(scalar(&c,"SELECT count(*) FROM provider_scopes WHERE anime_standard_format_search=1 OR remove_year=1").await,2);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 0);
     Ok(())
 }

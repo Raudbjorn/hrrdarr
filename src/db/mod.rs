@@ -53,6 +53,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "provider_configuration",
         include_str!("../../migrations/0009_provider_configuration.sql"),
     ),
+    (
+        "provider_test_results",
+        include_str!("../../migrations/0010_provider_test_results.sql"),
+    ),
+    (
+        "indexer_scope_options",
+        include_str!("../../migrations/0011_indexer_scope_options.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

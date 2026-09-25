@@ -1,5 +1,7 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
 mod credentials;
+pub mod http;
+pub mod indexer;
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -15,17 +17,33 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-pub use credentials::{CredentialKey, Credentials};
+pub use credentials::{CredentialKey, Credentials, IndexerAccess, IndexerParameter};
 use libsql::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug)]
-struct Error(StatusCode, &'static str, &'static str);
+enum Error {
+    Plain(StatusCode, &'static str, &'static str),
+    RateLimited(u32),
+}
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.0, Json(ApiErrorEnvelope::new(self.1, self.2))).into_response()
+        match self {
+            Self::Plain(status, code, message) => {
+                (status, Json(ApiErrorEnvelope::new(code, message))).into_response()
+            }
+            Self::RateLimited(seconds) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, seconds.to_string())],
+                Json(ApiErrorEnvelope::new(
+                    "rate_limited",
+                    "Provider is rate limited; retry after the indicated interval",
+                )),
+            )
+                .into_response(),
+        }
     }
 }
 impl From<libsql::Error> for Error {
@@ -34,7 +52,7 @@ impl From<libsql::Error> for Error {
             "{}",
             serde_json::json!({"level":"ERROR","event":"provider_database_error","correlation_id":Uuid::new_v4(),"error_class":format!("{:?}",std::mem::discriminant(&error))})
         );
-        Self(
+        Self::Plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             "provider_database_error",
             "Provider operation failed; no partial configuration committed",
@@ -43,35 +61,35 @@ impl From<libsql::Error> for Error {
 }
 type Result<T> = std::result::Result<T, Error>;
 fn bad() -> Error {
-    Error(
+    Error::Plain(
         StatusCode::BAD_REQUEST,
         "invalid_provider_config",
         "Invalid provider configuration",
     )
 }
 fn conflict() -> Error {
-    Error(
+    Error::Plain(
         StatusCode::CONFLICT,
         "provider_revision_conflict",
         "Provider revision or immutable implementation conflicts",
     )
 }
 fn missing() -> Error {
-    Error(
+    Error::Plain(
         StatusCode::NOT_FOUND,
         "provider_not_found",
         "Provider does not exist",
     )
 }
 fn locked() -> Error {
-    Error(
+    Error::Plain(
         StatusCode::SERVICE_UNAVAILABLE,
         "provider_credentials_locked",
         "Provider credentials cannot be unlocked; check the independently stored key",
     )
 }
 fn corrupt() -> Error {
-    Error(
+    Error::Plain(
         StatusCode::INTERNAL_SERVER_ERROR,
         "invalid_stored_provider",
         "Stored provider configuration is invalid",
@@ -83,11 +101,17 @@ fn corrupt() -> Error {
 pub struct TvIndexerScope {
     pub categories: Vec<u32>,
     pub anime_categories: Vec<u32>,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub anime_standard_format_search: bool,
 }
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct MovieIndexerScope {
     pub categories: Vec<u32>,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub remove_year: bool,
 }
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -242,12 +266,36 @@ pub struct Provider {
     pub has_credentials: bool,
     pub test_supported: bool,
     pub test_status: TestStatus,
+    pub last_test: Option<ProviderTestObservation>,
 }
-#[derive(Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TestStatus {
     NeverTested,
+    Success,
+    Failure,
 }
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderTestObservation {
+    pub revision: i64,
+    pub tested_at: i64,
+    pub status: TestStatus,
+    pub error_code: Option<String>,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderTestResult {
+    pub provider_id: Uuid,
+    pub revision: i64,
+    pub tested_at: i64,
+    pub result: indexer::IndexerTest,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderSearchResult {
+    pub provider_id: Uuid,
+    pub revision: i64,
+    pub page: indexer::IndexerPage,
+}
+
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderQuery {
@@ -277,6 +325,7 @@ pub struct ProviderRevision {
 struct Context {
     db: Arc<Database>,
     key: Option<Arc<CredentialKey>>,
+    transport: Arc<std::result::Result<http::HttpClient, http::HttpError>>,
 }
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
     Router::new()
@@ -286,8 +335,13 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
             get(detail).put(update).delete(delete),
         )
         .route("/api/v1/providers/{id}/test", post(test))
+        .route("/api/v1/providers/{id}/search", post(search))
         .layer(DefaultBodyLimit::max(32 * 1024))
-        .with_state(Context { db, key })
+        .with_state(Context {
+            db,
+            key,
+            transport: Arc::new(http::HttpClient::new()),
+        })
 }
 fn id(value: String) -> Result<String> {
     Uuid::parse_str(&value)
@@ -310,11 +364,18 @@ fn validate(input: &ProviderInput) -> Result<()> {
     }
     Ok(())
 }
+fn stored_bool(value: i64) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(corrupt()),
+    }
+}
 async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)> {
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -339,11 +400,15 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             if media == "tv" {
                 tv_index = Some(TvIndexerScope {
                     categories: cats,
+                    anime_standard_format_search: stored_bool(scope.get::<i64>(7)?)?,
                     anime_categories: serde_json::from_str(&scope.get::<String>(2)?)
                         .map_err(|_| corrupt())?,
                 })
             } else {
-                movie_index = Some(MovieIndexerScope { categories: cats })
+                movie_index = Some(MovieIndexerScope {
+                    categories: cats,
+                    remove_year: stored_bool(scope.get::<i64>(8)?)?,
+                })
             }
         }
     }
@@ -367,6 +432,12 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     };
     settings.validate().map_err(|_| corrupt())?;
     let credentials: Option<Vec<u8>> = row.get(6)?;
+    let revision: i64 = row.get(4)?;
+    let last_test=conn.query("SELECT config_revision,tested_at,status,error_code FROM provider_tests WHERE provider_id=? AND config_revision=?",params![id,revision]).await?.next().await?.map(|r|->Result<ProviderTestObservation>{Ok(ProviderTestObservation{revision:r.get(0)?,tested_at:r.get(1)?,status:match r.get::<String>(2)?.as_str(){"success"=>TestStatus::Success,"failure"=>TestStatus::Failure,_=>return Err(corrupt())},error_code:r.get(3)?})}).transpose()?;
+    let test_status = last_test
+        .as_ref()
+        .map_or(TestStatus::NeverTested, |t| t.status);
+
     Ok((
         Provider {
             id: Uuid::parse_str(id).map_err(|_| corrupt())?,
@@ -376,8 +447,9 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             priority: row.get::<i64>(3)?.try_into().map_err(|_| corrupt())?,
             settings,
             has_credentials: credentials.is_some(),
-            test_supported: false,
-            test_status: TestStatus::NeverTested,
+            test_supported: implementation != "qbittorrent",
+            test_status,
+            last_test,
         },
         credentials,
     ))
@@ -389,14 +461,30 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
     match settings {
         ProviderSettings::Torznab { tv, movies, .. }
         | ProviderSettings::Newznab { tv, movies, .. } => {
-            for (domain, categories, anime) in tv
+            for (domain, categories, anime, standard, remove_year) in tv
                 .iter()
-                .map(|s| ("tv", &s.categories, s.anime_categories.as_slice()))
-                .chain(movies.iter().map(|s| ("movies", &s.categories, &[][..])))
+                .map(|s| {
+                    (
+                        "tv",
+                        &s.categories,
+                        s.anime_categories.as_slice(),
+                        Some(i64::from(s.anime_standard_format_search)),
+                        None::<i64>,
+                    )
+                })
+                .chain(movies.iter().map(|s| {
+                    (
+                        "movies",
+                        &s.categories,
+                        &[][..],
+                        None,
+                        Some(i64::from(s.remove_year)),
+                    )
+                }))
             {
                 let categories = serde_json::to_string(categories).map_err(|_| bad())?;
                 let anime = serde_json::to_string(anime).map_err(|_| bad())?;
-                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories) VALUES(?,?,?,?,?)",params![id,implementation,domain,categories,anime]).await?;
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year]).await?;
             }
         }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -579,20 +667,11 @@ async fn delete(
     .await;
     finish(tx, outcome).await
 }
-async fn test(State(context): State<Context>, Path(value): Path<String>) -> Result<StatusCode> {
-    let _ = detail(State(context), Path(value)).await?;
-    Err(Error(
-        StatusCode::NOT_IMPLEMENTED,
-        "provider_test_not_implemented",
-        "No network test is implemented for this provider yet",
-    ))
-}
-
 // Bound serialization too, so future configuration fields cannot silently expand responses.
 fn bounded<T: Serialize>(value: T) -> Result<Json<T>> {
     const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
     if serde_json::to_vec(&value).map_err(|_| corrupt())?.len() > MAX_RESPONSE_BYTES {
-        return Err(Error(
+        return Err(Error::Plain(
             StatusCode::INTERNAL_SERVER_ERROR,
             "provider_response_too_large",
             "Provider response exceeds the size limit",
@@ -694,4 +773,246 @@ mod tests {
             .is_err()
         );
     }
+}
+
+fn unsupported_test() -> Error {
+    Error::Plain(
+        StatusCode::NOT_IMPLEMENTED,
+        "provider_test_not_implemented",
+        "No network test is implemented for this provider yet",
+    )
+}
+async fn network_snapshot(context: &Context, id: &str) -> Result<(Provider, Option<Credentials>)> {
+    let conn = context.db.connect().await?;
+    let tx = conn.transaction().await?;
+    let (provider, bytes) = read(&tx, id).await?;
+    tx.commit().await?;
+    if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        return Err(unsupported_test());
+    }
+    let credentials = bytes
+        .map(|bytes| {
+            context
+                .key
+                .as_ref()
+                .ok_or_else(locked)?
+                .open(id, provider.settings.implementation(), &bytes)
+                .map_err(|_| locked())
+        })
+        .transpose()?;
+    if credentials
+        .as_ref()
+        .is_some_and(|c| !c.valid(provider.settings.implementation()))
+    {
+        return Err(locked());
+    }
+    Ok((provider, credentials))
+}
+fn http_error(error: http::HttpError) -> (Error, &'static str) {
+    use http::HttpError as H;
+    match error {
+        H::InvalidRequest => (bad(), "invalid_request"),
+        H::Authentication => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "authentication",
+                "Provider rejected authentication",
+            ),
+            "authentication",
+        ),
+        H::RateLimited {
+            retry_after_seconds,
+        } => (
+            Error::RateLimited(retry_after_seconds.unwrap_or(60)),
+            "rate_limited",
+        ),
+        H::Busy => (
+            Error::Plain(
+                StatusCode::TOO_MANY_REQUESTS,
+                "provider_busy",
+                "Provider operation capacity is busy; retry later",
+            ),
+            "rate_limited",
+        ),
+        H::Timeout => (
+            Error::Plain(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "Provider operation timed out",
+            ),
+            "timeout",
+        ),
+        H::Redirect => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "redirect_rejected",
+                "Provider redirect was rejected",
+            ),
+            "redirect_rejected",
+        ),
+        H::ResponseTooLarge => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "response_too_large",
+                "Provider response exceeds the size limit",
+            ),
+            "response_too_large",
+        ),
+        H::InvalidResponse => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "invalid_response",
+                "Provider response is invalid",
+            ),
+            "invalid_response",
+        ),
+        H::Transport => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "transport_error",
+                "Provider connection failed",
+            ),
+            "transport_error",
+        ),
+    }
+}
+fn indexer_error(
+    error: indexer::IndexerError,
+    operation: &http::HttpOperation<'_>,
+) -> (Error, &'static str) {
+    use indexer::IndexerError as I;
+    match error {
+        I::InvalidRequest => (bad(), "invalid_request"),
+        I::Unsupported => (
+            Error::Plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported",
+                "Provider does not support the requested scope or search",
+            ),
+            "unsupported",
+        ),
+        I::Authentication => http_error(http::HttpError::Authentication),
+        I::RateLimited {
+            retry_after_seconds,
+        } => http_error(operation.rate_limit(retry_after_seconds)),
+        I::InvalidResponse => http_error(http::HttpError::InvalidResponse),
+        I::Transport(error) => http_error(error),
+    }
+}
+async fn current_revision(db: &Database, provider: &Provider) -> Result<()> {
+    let conn = db.connect().await?;
+    if conn
+        .query(
+            "SELECT 1 FROM providers WHERE id=? AND revision=?",
+            params![provider.id.to_string(), provider.revision],
+        )
+        .await?
+        .next()
+        .await?
+        .is_none()
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
+async fn record_test(
+    db: &Database,
+    provider: &Provider,
+    code: Option<&'static str>,
+) -> Result<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| corrupt())?
+        .as_secs();
+    let tested_at = i64::try_from(now).map_err(|_| corrupt())?;
+    let conn = db.connect().await?;
+    let status = if code.is_none() { "success" } else { "failure" };
+    let changed=conn.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,?,?,? FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code",params![tested_at,status,code,provider.id.to_string(),provider.revision]).await?;
+    if changed != 1 {
+        return Err(conflict());
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"level":if code.is_none(){"INFO"}else{"ERROR"},"event":"provider_test_completed","provider_id":provider.id,"revision":provider.revision,"result":status,"error_code":code,"correlation_id":Uuid::new_v4()})
+    );
+    Ok(tested_at)
+}
+async fn test(
+    State(context): State<Context>,
+    Path(value): Path<String>,
+) -> Result<Json<ProviderTestResult>> {
+    let id = id(value)?;
+    let (provider, credentials) = network_snapshot(&context, &id).await?;
+    let transport = context
+        .transport
+        .as_ref()
+        .as_ref()
+        .map_err(|e| http_error(*e).0)?;
+    let operation = transport
+        .operation(provider.id)
+        .map_err(|e| http_error(e).0)?;
+    let work = async {
+        let result = indexer::test(
+            &operation,
+            &provider.settings,
+            &IndexerAccess::from_credentials(&credentials),
+        )
+        .await;
+        operation.ensure_active().map_err(|e| http_error(e).0)?;
+        match result {
+            Ok(result) => {
+                let tested_at = record_test(&context.db, &provider, None).await?;
+                bounded(ProviderTestResult {
+                    provider_id: provider.id,
+                    revision: provider.revision,
+                    tested_at,
+                    result,
+                })
+            }
+            Err(error) => {
+                let (error, code) = indexer_error(error, &operation);
+                record_test(&context.db, &provider, Some(code)).await?;
+                Err(error)
+            }
+        }
+    };
+    tokio::time::timeout_at(operation.deadline(), work)
+        .await
+        .map_err(|_| http_error(http::HttpError::Timeout).0)?
+}
+async fn search(
+    State(context): State<Context>,
+    Path(value): Path<String>,
+    input: std::result::Result<Json<indexer::IndexerSearch>, JsonRejection>,
+) -> Result<Json<ProviderSearchResult>> {
+    let id = id(value)?;
+    let input = input.map_err(|_| bad())?.0;
+    let (provider, credentials) = network_snapshot(&context, &id).await?;
+    let transport = context
+        .transport
+        .as_ref()
+        .as_ref()
+        .map_err(|e| http_error(*e).0)?;
+    let operation = transport
+        .operation(provider.id)
+        .map_err(|e| http_error(e).0)?;
+    let work = async {
+        let result = indexer::search(
+            &operation,
+            &provider.settings,
+            &IndexerAccess::from_credentials(&credentials),
+            &input,
+        )
+        .await;
+        operation.ensure_active().map_err(|e| http_error(e).0)?;
+        current_revision(&context.db, &provider).await?;
+        bounded(ProviderSearchResult {
+            provider_id: provider.id,
+            revision: provider.revision,
+            page: result.map_err(|e| indexer_error(e, &operation).0)?,
+        })
+    };
+    tokio::time::timeout_at(operation.deadline(), work)
+        .await
+        .map_err(|_| http_error(http::HttpError::Timeout).0)?
 }

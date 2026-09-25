@@ -10,6 +10,8 @@ export type ApiErrorEnvelope = { error: ApiErrorDetail, };
 
 export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset: number, };
 
+export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
+
 export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, };
 
 export type Episode = { id: number, series_id: number, season: number, number: number, title: string, monitored: boolean, episode_file_id: number | null, has_file: boolean, file_path: string | null, tvdb_id: number | null, air_date: string | null, air_date_utc: string | null, last_search_time: string | null, runtime: number | null, finale_type: string | null, overview: string | null, absolute_episode_number: number | null, scene_absolute_episode_number: number | null, scene_episode_number: number | null, scene_season_number: number | null, unverified_scene_numbering: boolean | null, series?: EpisodeSeriesProjection, episode_file?: EpisodeFileProjection, images?: Array<EpisodeCover> | null, };
@@ -51,6 +53,22 @@ export type FileUpdate = { id: number, quality?: FileQualityInput | null, langua
 export type ImportInput = ManualImportRequest | ImportRequest;
 
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };
+
+export type IndexerCategory = { id: number, parent_id: number | null, };
+
+export type IndexerContinuation = { query_index: number, offset: number, };
+
+export type IndexerItemWarning = { index: number, code: IndexerItemWarningCode, };
+
+export type IndexerItemWarningCode = "invalid_item";
+
+export type IndexerPage = { warnings: Array<IndexerItemWarning>, query_index: number, query_count: number, next_query: IndexerContinuation | null, media_type: MediaDomain, items: Array<ReleaseMetadata>, offset: number, limit: number, total: number | null, next_offset: number | null, };
+
+export type IndexerParameter = { name: string, value: string, };
+
+export type IndexerSearch = { "kind": "rss", media_type: MediaDomain, offset?: number, query_index?: number, limit?: number, } | { "kind": "tv", title: string, aliases?: Array<string>, tvdb_id?: number | null, tvmaze_id?: number | null, rage_id?: number | null, imdb_id?: string | null, tmdb_id?: number | null, numbering: TvNumbering, search_mode?: TvSearchMode, offset?: number, query_index?: number, limit?: number, } | { "kind": "movie", title: string, aliases?: Array<string>, year?: number | null, imdb_id?: string | null, tmdb_id?: number | null, offset?: number, query_index?: number, limit?: number, };
+
+export type IndexerTest = { capabilities: Capabilities, domains: Array<MediaDomain>, };
 
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
 
@@ -102,13 +120,13 @@ export type MonitorNewItems = "all" | "none";
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type MovieIndexerScope = { categories: Array<number>, };
+export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
 
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
 
-export type Provider = { id: string, revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, has_credentials: boolean, test_supported: boolean, test_status: TestStatus, };
+export type Provider = { id: string, revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, has_credentials: boolean, test_supported: boolean, test_status: TestStatus, last_test: ProviderTestObservation | null, };
 
-export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, };
+export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -116,7 +134,13 @@ export type ProviderQuery = { limit?: number, offset?: number, media_type?: Medi
 
 export type ProviderRevision = { revision: number, };
 
+export type ProviderSearchResult = { provider_id: string, revision: number, page: IndexerPage, };
+
 export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, };
+
+export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
+
+export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: IndexerTest, };
 
 export type ProviderUpdate = { revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -148,6 +172,12 @@ export type QualityProfileQuery = { offset?: number, limit?: number, };
 
 export type QualityProfileSummary = { id: number, name: string, item_count: number, group_count: number, };
 
+export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
+
+export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
+
+export type SearchEngine = "raw" | "sphinx";
+
 export type SeriesType = "standard" | "daily" | "anime";
 
 export type SnapshotApplication = "sonarr" | "radarr";
@@ -158,8 +188,12 @@ export type SnapshotReport = { application: SnapshotApplication, fingerprint: st
 
 export type SnapshotUnsupported = { table: string, rows: number, columns: Array<string>, };
 
-export type TestStatus = "never_tested";
+export type TestStatus = "never_tested" | "success" | "failure";
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, };
+export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
+
+export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
+
+export type TvSearchMode = "default" | "ids" | "titles" | "both";

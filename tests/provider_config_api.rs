@@ -85,12 +85,14 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     let key = Arc::new(providers::CredentialKey::from_hex(&"12".repeat(32)).unwrap());
     let (address, server) = serve(db.clone(), Some(key.clone())).await;
     let route = "/api/v1/providers";
-    let base = json!({"name":"Shared indexer","enabled":true,"priority":10,"settings":{"implementation":"torznab","endpoint":"http://127.0.0.1:1/api","tv":{"categories":[5030],"anime_categories":[5070]},"movies":{"categories":[2000]}},"credentials":{"kind":"api_key","api_key":SECRET}});
+    // Even declaration-only endpoints target our owned listener if a future connector starts probing.
+    let base = json!({"name":"Shared indexer","enabled":true,"priority":10,"settings":{"implementation":"torznab","endpoint":format!("http://{address}/not-provider-api"),"tv":{"categories":[5030],"anime_categories":[5070]},"movies":{"categories":[2000]}},"credentials":{"kind":"api_key","api_key":SECRET}});
     let (status, created) = request(address, "POST", route, &base.to_string()).await;
     assert_eq!(status, 201, "{created}");
     assert!(!created.to_string().contains(SECRET));
     assert_eq!(created["has_credentials"], true);
-    assert_eq!(created["test_supported"], false);
+    // Concrete indexers now advertise tests; configuration creation itself still does no I/O.
+    assert_eq!(created["test_supported"], true);
     assert_eq!(created["test_status"], "never_tested");
     let id = created["id"].as_str().unwrap();
     let detail = format!("{route}/{id}");
@@ -200,9 +202,6 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
         task.abort();
         let _ = task.await;
     }
-    let (status, error) = request(address, "POST", &format!("{detail}/test"), "").await;
-    assert_eq!(status, 501);
-    assert_eq!(error["error"]["code"], "provider_test_not_implemented");
     let mut clear = update.clone();
     clear["credentials"] = Value::Null;
     clear["name"] = json!("Cleared");
@@ -211,13 +210,23 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     assert_eq!(cleared["has_credentials"], false);
     assert_eq!(cleared["revision"], 3);
     let scope = |category: &str| json!({"category":category,"imported_category":null,"recent_priority":1,"older_priority":0});
-    let client = json!({"name":"Shared client","enabled":false,"priority":20,"settings":{"implementation":"qbittorrent","endpoint":"http://127.0.0.1:1","tv":scope("tv"),"movies":scope("movies")},"credentials":{"kind":"username_password","username":"PRIVATE_USER_SENTINEL","password":SECRET}});
+    let client = json!({"name":"Shared client","enabled":false,"priority":20,"settings":{"implementation":"qbittorrent","endpoint":format!("http://{address}/not-provider-api"),"tv":scope("tv"),"movies":scope("movies")},"credentials":{"kind":"username_password","username":"PRIVATE_USER_SENTINEL","password":SECRET}});
     let (status, download) = request(address, "POST", route, &client.to_string()).await;
     assert_eq!(status, 201, "{download}");
     assert!(!download.to_string().contains(SECRET));
     assert!(!download.to_string().contains("PRIVATE_USER_SENTINEL"));
     assert_eq!(download["settings"]["tv"]["category"], "tv");
     assert_eq!(download["settings"]["movies"]["category"], "movies");
+    // qBittorrent retains the unsupported test path; never call the declaration-only indexer endpoint.
+    let (status, error) = request(
+        address,
+        "POST",
+        &format!("{route}/{}/test", download["id"].as_str().unwrap()),
+        "",
+    )
+    .await;
+    assert_eq!(status, 501);
+    assert_eq!(error["error"]["code"], "provider_test_not_implemented");
     let mut collision = client.clone();
     collision["settings"]["movies"] = scope("tv");
     assert_eq!(
@@ -295,9 +304,9 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     let mut newznab_ids = Vec::new();
     for media in ["tv", "movies"] {
         let settings = if media == "tv" {
-            json!({"implementation":"newznab","endpoint":"http://127.0.0.1:1/api","tv":{"categories":[],"anime_categories":[5070]},"movies":null})
+            json!({"implementation":"newznab","endpoint":format!("http://{address}/not-provider-api"),"tv":{"categories":[],"anime_categories":[5070]},"movies":null})
         } else {
-            json!({"implementation":"newznab","endpoint":"http://127.0.0.1:1/api","tv":null,"movies":{"categories":[2000]}})
+            json!({"implementation":"newznab","endpoint":format!("http://{address}/not-provider-api"),"tv":null,"movies":{"categories":[2000]}})
         };
         let body = json!({"name":format!("Newznab {media}"),"enabled":false,"priority":30,"settings":settings});
         let (status, created) = request(address, "POST", route, &body.to_string()).await;
@@ -305,8 +314,117 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
         let nid = created["id"].as_str().unwrap().to_owned();
         let (status, read) = request(address, "GET", &format!("{route}/{nid}"), "").await;
         assert_eq!(status, 200);
-        assert_eq!(read["settings"], settings);
+        // Additive persisted options default false for old native request bodies.
+        let mut expected_settings = settings.clone();
+        let flag = if media == "tv" {
+            "anime_standard_format_search"
+        } else {
+            "remove_year"
+        };
+        expected_settings[media][flag] = json!(false);
+        assert_eq!(read["settings"], expected_settings);
         assert_eq!(read["has_credentials"], false);
+        let mut update = body.clone();
+        update["revision"] = json!(1);
+        update["settings"][media][flag] = json!(true);
+        update["credentials"] = json!({"kind":"indexer","api_key":null,"tv_parameters":[{"name":"passkey","value":"PRIVATE_PARAMETER_SENTINEL"}],"movie_parameters":[{"name":"filter","value":"PRIVATE_MOVIE_SENTINEL"}]});
+        let (status, updated) = request(
+            address,
+            "PUT",
+            &format!("{route}/{nid}"),
+            &update.to_string(),
+        )
+        .await;
+        assert_eq!(status, 200, "{updated}");
+        assert_eq!(updated["settings"][media][flag], true);
+        assert_eq!(updated["has_credentials"], true);
+        assert!(!updated.to_string().contains("PRIVATE_PARAMETER_SENTINEL"));
+        assert!(!updated.to_string().contains("passkey"));
+        let row = c
+            .query(
+                "SELECT credentials FROM providers WHERE id=?",
+                [nid.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap();
+        let encrypted: Vec<u8> = row.get(0)?;
+        assert!(
+            !encrypted
+                .windows(b"PRIVATE_PARAMETER_SENTINEL".len())
+                .any(|w| w == b"PRIVATE_PARAMETER_SENTINEL")
+        );
+        // Release the read statement before asking another connection to commit the update.
+        drop(row);
+        let mut preserved = update.clone();
+        preserved["revision"] = json!(2);
+        preserved.as_object_mut().unwrap().remove("credentials");
+        assert_eq!(
+            request(
+                address,
+                "PUT",
+                &format!("{route}/{nid}"),
+                &preserved.to_string()
+            )
+            .await
+            .0,
+            200
+        );
+        let current = c
+            .query(
+                "SELECT credentials FROM providers WHERE id=?",
+                [nid.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get::<Vec<u8>>(0)?;
+        assert_eq!(
+            current, encrypted,
+            "Omitted private parameter bundle preserves its existing ciphertext exactly"
+        );
+        preserved["revision"] = json!(3);
+        for locked_key in [
+            None,
+            Some(Arc::new(
+                providers::CredentialKey::from_hex(&"cd".repeat(32)).unwrap(),
+            )),
+        ] {
+            let (locked, task) = serve(db.clone(), locked_key).await;
+            assert_eq!(
+                request(locked, "GET", &format!("{route}/{nid}"), "")
+                    .await
+                    .0,
+                200
+            );
+            assert_eq!(
+                request(
+                    locked,
+                    "PUT",
+                    &format!("{route}/{nid}"),
+                    &preserved.to_string()
+                )
+                .await
+                .0,
+                503
+            );
+            task.abort();
+            let _ = task.await;
+        }
+        let mut reserved = preserved;
+        reserved["credentials"] = json!({"kind":"indexer","tv_parameters":[{"name":"APIKEY","value":"PRIVATE_PARAMETER_SENTINEL"}]});
+        let (status, error) = request(
+            address,
+            "PUT",
+            &format!("{route}/{nid}"),
+            &reserved.to_string(),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(!error.to_string().contains("PRIVATE_PARAMETER_SENTINEL"));
+
         newznab_ids.push(nid);
     }
     let mut api_key_client = client.clone();
