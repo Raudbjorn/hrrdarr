@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 14 remains unknown after migration 13 adds provider snapshot mappings.
+    // Version 15 remains unknown after migration 14 adds configured root folders.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (14,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (15,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        13
+        14 // Latest-schema opens also add domain-scoped configured roots.
     );
     assert_eq!(
         scalar(
@@ -1590,5 +1590,176 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
         scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
         2
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_roots_upgrade_rollback_domains_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Kept','/tv/Kept');INSERT INTO movie_metadata(id,title) VALUES(1,'Movie');INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movies/Movie');").await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!("../migrations/0014_root_folders.sql"))
+        .await?;
+    assert!(
+        tx.execute(
+            "INSERT INTO root_folders(media_type,path) VALUES('other','/media')",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sqlite_schema WHERE name='root_folders'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        13
+    );
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM series WHERE id=1 AND path='/tv/Kept'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movies WHERE id=1 AND path='/movies/Movie'"
+        )
+        .await,
+        1
+    );
+    for path in [
+        "/",
+        "relative",
+        "/media/",
+        "/media//tv",
+        "/media/../tv",
+        "/media/./tv",
+        "/media\\tv",
+        "/media\ntv",
+    ] {
+        assert!(
+            c.execute(
+                "INSERT INTO root_folders(media_type,path) VALUES('tv',?)",
+                [path]
+            )
+            .await
+            .is_err(),
+            "accepted {path}"
+        );
+    }
+    c.execute_batch(
+        "INSERT INTO root_folders(media_type,path) VALUES('tv','/media'),('movies','/media');",
+    )
+    .await?;
+    assert!(
+        c.execute(
+            "INSERT INTO root_folders(media_type,path) VALUES('tv','/media')",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    let old = scalar(&c, "SELECT id FROM root_folders WHERE media_type='tv'").await;
+    c.execute("DELETE FROM root_folders WHERE media_type='tv'", ())
+        .await?;
+    c.execute(
+        "INSERT INTO root_folders(media_type,path) VALUES('tv','/media')",
+        (),
+    )
+    .await?;
+    assert!(scalar(&c, "SELECT id FROM root_folders WHERE media_type='tv'").await > old);
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(scalar(&c, "SELECT count(*) FROM root_folders").await, 2);
     Ok(())
 }

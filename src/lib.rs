@@ -12,3 +12,5 @@ pub mod api_contract;
 pub mod import;
 
 pub mod providers;
+
+pub mod root_folders;

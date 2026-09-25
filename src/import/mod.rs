@@ -1,5 +1,10 @@
 //! Initial manual imports. Replacement and multi-episode selection require a later contract.
 mod fs;
+
+// Share the existing descriptor-relative, no-symlink directory walk with root observations.
+pub(crate) fn root_directory(path: &std::path::Path) -> Option<std::fs::File> {
+    fs::directory(path).ok()
+}
 use crate::{
     api::{ApiErrorEnvelope, ImportRequest, Operation},
     db::{Database, MediaTarget},

@@ -31,6 +31,10 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | PUT `/{base}/{id}` | `LibraryPatch` | `LibraryItem` |
 | PUT `/{base}/bulk` | `LibraryBulk` (`items` with `id` and `patch`) | `LibraryItem[]` |
 | PUT `/{base}/editor` | `LibraryEditor` | `LibraryItem[]` |
+| GET `/{media}/root-folders` | `RootQuery` | `ApiPage<RootFolder>` |
+| POST `/{media}/root-folders` | `RootInput` | `RootFolder` (201) |
+| GET `/{media}/root-folders/{id}` | none | `RootFolder` |
+| DELETE `/{media}/root-folders/{id}` | none | empty (204; configuration only) |
 | GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
 | GET `/episodes/{id}` | none (all projections included) | `Episode` |
 | PUT `/episodes/{id}` | `EpisodeMonitor` | `Episode` |

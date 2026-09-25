@@ -127,7 +127,7 @@ pub fn validate_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
-fn directory(path: &Path) -> Result<File> {
+pub(super) fn directory(path: &Path) -> Result<File> {
     let mut fd: File = fs::open(
         "/",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,

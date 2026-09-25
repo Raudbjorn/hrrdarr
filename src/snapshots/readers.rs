@@ -279,6 +279,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             keys: vec![vec!["series_id", "season", "number"]],
         });
     }
+    add_root_folders(source, &mut plan, "tv")?;
     Ok(plan)
 }
 
@@ -421,6 +422,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
         .keys()
         .filter(|id| !found.contains(id))
         .count();
+    add_root_folders(source, &mut plan, "movies")?;
     Ok(plan)
 }
 
@@ -862,5 +864,41 @@ fn add_library_settings(plan: &mut Plan, row: &Record, media: &'static str, id: 
         fields,
         keys: vec![vec![target]],
     });
+    Ok(())
+}
+
+fn add_root_folders(source: &Source, plan: &mut Plan, media: &'static str) -> Result<()> {
+    if !source.tables.contains_key("RootFolders") {
+        return Ok(());
+    }
+    let rows = table(source, "RootFolders", &["Id", "Path"])?;
+    if rows.rows.len() > 1000 {
+        return Err(ImportError("snapshot exceeds root folder limit"));
+    }
+    plan.unsupported.retain(|u| u.table != "RootFolders");
+    let columns = rows
+        .columns
+        .iter()
+        .filter(|c| !matches!(c.as_str(), "Id" | "Path"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !columns.is_empty() {
+        plan.unsupported.push(Unsupported {
+            table: "RootFolders".into(),
+            rows: rows.rows.len(),
+            columns,
+        });
+    }
+    for row in &rows.rows {
+        let id = positive(row, "Id")?;
+        let path = crate::library::normalized_path(text(row, "Path")?)
+            .ok_or(ImportError("invalid source root folder path"))?;
+        plan.entities.push(Entity {
+            table: "root_folders",
+            source_id: id,
+            fields: vec![("media_type", val(media)), ("path", val(path))],
+            keys: vec![vec!["media_type", "path"]],
+        });
+    }
     Ok(())
 }

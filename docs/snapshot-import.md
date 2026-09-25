@@ -178,3 +178,8 @@ cover synthetic both-app/version imports, source-table collisions, defaults,
 credential privacy/key failures, disabled state, exact/new-backup replay, local
 edits/deletions, late rollback and reopening. These do not establish real exported
 backup compatibility, external-service equivalence or full ancillary snapshot parity.
+
+Configured `RootFolders.Id/Path` are also mapped for both applications, scoped by
+media domain and reconciled by normalized path. This performs no filesystem access:
+missing paths remain unobserved declarations. See [root folders](root-folders.md)
+for supported path boundaries, replay/deletion conflicts and verification limits.

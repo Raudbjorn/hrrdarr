@@ -69,6 +69,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "snapshot_provider_mappings",
         include_str!("../../migrations/0013_snapshot_provider_mappings.sql"),
     ),
+    (
+        "root_folders",
+        include_str!("../../migrations/0014_root_folders.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

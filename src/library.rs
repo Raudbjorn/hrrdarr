@@ -952,6 +952,10 @@ async fn persist(ctx: &Context, items: Vec<Update>) -> Result<Vec<LibraryItem>> 
     }
 }
 
+pub(crate) fn normalized_path(raw: &str) -> Option<String> {
+    path(raw).ok()
+}
+
 fn path(raw: &str) -> Result<String> {
     if raw.len() > 4096
         || !raw.starts_with('/')

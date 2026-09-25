@@ -33,6 +33,10 @@ pub fn render() -> String {
     };
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::root_folders::RootInput,
+        crate::root_folders::RootQuery,
+        crate::root_folders::RootFolder,
+        crate::api::ApiPage<crate::root_folders::RootFolder>,
         crate::providers::indexer::IndexerSearch,
         crate::providers::ProviderSearchResult,
         crate::providers::ProviderTestResult,

@@ -202,6 +202,14 @@ export type QualityProfileSummary = { id: number, name: string, item_count: numb
 
 export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
 
+export type RootFolder = { id: number, media_type: MediaDomain, path: string, observation: RootObservationStatus, accessible: boolean | null, writable: boolean | null, free_space: number | null, total_space: number | null, unmapped_folders: Array<UnmappedFolder> | null, };
+
+export type RootInput = { path: string, };
+
+export type RootObservationStatus = "available" | "inaccessible" | "timeout" | "busy" | "limited";
+
+export type RootQuery = { limit?: number, offset?: number, };
+
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
 export type SearchEngine = "raw" | "sphinx";
@@ -225,3 +233,5 @@ export type TvIndexerScope = { categories: Array<number>, anime_categories: Arra
 export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
+
+export type UnmappedFolder = { name: string, path: string, relative_path: string, };
