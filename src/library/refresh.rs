@@ -116,7 +116,95 @@ async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
             return Err(Error::Conflict);
         }
     }
-    Ok(c.execute("UPDATE movie_metadata SET title=?1,year=COALESCE(?2,year),imdb_id=COALESCE(?3,imdb_id) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR imdb_id IS NOT COALESCE(?3,imdb_id))",params![detail.title,detail.year,detail.imdb_id,id]).await? as u16)
+    let facts_changed = movie_facts(c, id, &detail, true).await?;
+    let changed=c.execute("UPDATE movie_metadata SET title=?1,year=COALESCE(?2,year),imdb_id=COALESCE(?3,imdb_id) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR imdb_id IS NOT COALESCE(?3,imdb_id))",params![detail.title,detail.year,detail.imdb_id,id]).await?;
+    Ok(u16::from(facts_changed || changed > 0))
+}
+
+/// Caller owns the transaction. Sparse facts preserve prior values; an explicit
+/// alias set replaces the complete set. Catalog adoption rejects existing conflicts.
+pub(crate) async fn movie_facts(
+    c: &Connection,
+    id: i64,
+    detail: &MovieDetails,
+    replace: bool,
+) -> Result<bool> {
+    const FIELDS: &str = "runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language";
+    let supplied: Vec<Value> = vec![
+        detail.runtime.into(),
+        detail.status.clone().into(),
+        detail.in_cinemas.clone().into(),
+        detail.digital_release.clone().into(),
+        detail.physical_release.clone().into(),
+        detail.secondary_year.into(),
+        detail.original_language.into(),
+    ];
+    let row = c
+        .query(
+            &format!("SELECT {FIELDS} FROM movie_metadata WHERE id=?"),
+            [id],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or(Error::TargetChanged)?;
+    let mut changed = false;
+    let mut values = Vec::with_capacity(8);
+    for (i, incoming) in supplied.into_iter().enumerate() {
+        let prior = row.get_value(i as i32)?;
+        let value = if incoming == Value::Null {
+            prior.clone()
+        } else {
+            incoming
+        };
+        if !replace && prior != Value::Null && value != prior {
+            return Err(Error::Conflict);
+        }
+        changed |= value != prior;
+        values.push(value);
+    }
+    drop(row);
+    let mut aliases_changed = false;
+    let aliases = if let Some(titles) = &detail.alternative_titles {
+        if titles.len() > 64 {
+            return Err(Error::Conflict);
+        }
+        let desired = titles.iter().cloned().collect::<BTreeSet<_>>();
+        let mut rows=c.query("SELECT title FROM movie_alternative_titles WHERE metadata_id=? ORDER BY title LIMIT 65",[id]).await?;
+        let mut prior = BTreeSet::new();
+        while let Some(row) = rows.next().await? {
+            prior.insert(row.get::<String>(0)?);
+        }
+        if prior.len() > 64 {
+            return Err(Error::Conflict);
+        }
+        aliases_changed = prior != desired;
+        if !replace && !prior.is_empty() && aliases_changed {
+            return Err(Error::Conflict);
+        }
+        Some(desired)
+    } else {
+        None
+    };
+    if changed {
+        values.push(id.into());
+        c.execute("UPDATE movie_metadata SET runtime=?,status=?,in_cinemas=?,digital_release=?,physical_release=?,secondary_year=?,original_language=? WHERE id=?",values).await?;
+    }
+    if aliases_changed {
+        c.execute(
+            "DELETE FROM movie_alternative_titles WHERE metadata_id=?",
+            [id],
+        )
+        .await?;
+        for title in aliases.unwrap_or_default() {
+            c.execute(
+                "INSERT INTO movie_alternative_titles(metadata_id,title) VALUES(?,?)",
+                params![id, title],
+            )
+            .await?;
+        }
+    }
+    Ok(changed || aliases_changed)
 }
 
 struct StoredEpisode {

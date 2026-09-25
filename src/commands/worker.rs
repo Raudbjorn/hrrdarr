@@ -78,6 +78,9 @@ pub async fn start_with_metadata(
     tokio::time::timeout(Duration::from_secs(10), recover(&db, "interrupted"))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;
+    tokio::time::timeout(Duration::from_secs(10), recover_rss(&db, "interrupted"))
+        .await
+        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;
     let task = tokio::spawn(async move {
         let _owner = owner;
         // ponytail: one worker per locally owned DB; add weighted concurrency only with real jobs needing it.
@@ -89,10 +92,20 @@ pub async fn start_with_metadata(
                 tokio::time::timeout(Duration::from_secs(45), step(&db, &client, &metadata)).await;
             if !matches!(result, Ok(Ok(()))) {
                 eprintln!("event=command_worker_error code=storage_error");
+                if !matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        recover_rss(&db, "storage_error")
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    eprintln!("event=rss_recovery_error code=storage_error");
+                }
                 // The failed future is gone. External GETs can repeat; metadata facts and success
                 // commit together; local clears likewise commit tombstones and success together.
-                // Only uncommitted effects retry. Attempts never reset;
-                // this policy never applies implicitly to future external mutations.
+                // Only uncommitted local effects retry. RSS recovery separately fences
+                // dispatched submissions into read-only reconciliation; attempts never reset.
                 if !matches!(
                     tokio::time::timeout(Duration::from_secs(10), recover(&db, "storage_error"))
                         .await,
@@ -104,6 +117,9 @@ pub async fn start_with_metadata(
         }
     });
     Ok(Runtime { task: Some(task) })
+}
+async fn recover_rss(db: &Database, code: &str) -> Result<()> {
+    rss::recover(&connection(db).await?, now()?, code).await
 }
 async fn recover(db: &Database, code: &str) -> Result<()> {
     let c = connection(db).await?;
@@ -147,6 +163,8 @@ enum Claimed {
     Downloads(Command),
     Metadata(metadata::MetadataCommand),
     Blocklist(blocklist::BlocklistClearCommand),
+    Rss(rss::RssCommand),
+    RssCandidate(Uuid),
 }
 async fn claim(db: &Database) -> Result<Option<Claimed>> {
     let c = connection(db).await?;
@@ -158,9 +176,12 @@ async fn claim(db: &Database) -> Result<Option<Claimed>> {
         tx.execute("UPDATE commands SET status='failed',completed_at=?,error_code='provider_changed' WHERE status IN ('queued','retry_wait') AND NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=commands.provider_id AND p.revision=commands.provider_revision AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=commands.media_type)",[timestamp]).await?;
         schedule_due(&tx,timestamp).await?;
         metadata::sweep(&tx,timestamp).await?;
-        let row=tx.query("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",params![timestamp,timestamp,timestamp]).await?.next().await?;
+        rss::schedule_due(&tx,timestamp).await?;
+        let row=tx.query("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,3 kind,priority,created_at FROM rss_commands WHERE status IN ('queued','retry_wait','running') AND next_attempt_at<=? UNION ALL SELECT id,4 kind,0 priority,created_at FROM rss_candidates WHERE status IN ('pending','prepared','reconciling') AND (not_before IS NULL OR not_before<=?) AND (command_id IS NULL OR NOT EXISTS(SELECT 1 FROM rss_commands c WHERE c.id=rss_candidates.command_id AND c.status IN ('queued','running','retry_wait')))) ORDER BY priority DESC,created_at,id LIMIT 1",params![timestamp,timestamp,timestamp,timestamp,timestamp]).await?.next().await?;
         let Some(row)=row else{return Ok(None)};
         let id=Uuid::parse_str(&row.get::<String>(0)?).map_err(|_|bad())?;
+        if row.get::<i64>(1)?==4 {return Ok(Some(Claimed::RssCandidate(id)))}
+        if row.get::<i64>(1)?==3 {return Ok(Some(Claimed::Rss(rss::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==2 {return Ok(Some(Claimed::Blocklist(blocklist::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==1 {return Ok(Some(Claimed::Metadata(metadata::claim(&tx,id,timestamp).await?)))}
         let command=read_command(&tx,id).await?;
@@ -189,6 +210,8 @@ async fn step(
         Claimed::Downloads(command) => command,
         Claimed::Metadata(command) => return metadata::run(db, metadata_client, command).await,
         Claimed::Blocklist(command) => return blocklist::run(db, command).await,
+        Claimed::Rss(command) => return rss::run(db, client, command).await,
+        Claimed::RssCandidate(id) => return rss::run_due(db, client, id).await,
     };
     let id = command.id;
     let result = if !snapshot_capacity(&connection(db).await?, command.target).await? {

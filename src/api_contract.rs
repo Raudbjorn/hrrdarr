@@ -33,6 +33,17 @@ pub fn render() -> String {
     };
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::commands::rss::RssTarget,
+        crate::commands::rss::RssInput,
+        crate::api::ApiPage<crate::commands::rss::RssCommand>,
+        crate::api::ApiPage<crate::commands::rss::RssCandidate>,
+        crate::commands::rss::RssScheduleInput,
+        crate::commands::rss::RssSchedule,
+        crate::commands::rss::RssCandidateQuery,
+        crate::commands::rss::RssScheduleDelete,
+        crate::search::ReleaseSearchInput,
+        crate::search::ReleaseSearchPage,
+        crate::search::ReleasePolicy,
         crate::commands::blocklist::BlocklistClearInput,
         crate::api::ApiPage<crate::commands::blocklist::BlocklistClearCommand>,
         crate::blocklist::BlocklistQuery,

@@ -87,6 +87,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
             post(migrate).layer(DefaultBodyLimit::max(snapshots::MAX_SNAPSHOT_BYTES)),
         )
         .with_state(state.clone())
+        .merge(hrrdarr::search::router(state.db.clone(), refresh.clone()))
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))

@@ -96,6 +96,73 @@ async function verifyProviders() {
   }
 }
 
+async function verifyReleaseSearch() {
+  const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
+  let indexer=providers.find(p=>p.name==='Browser torznab');
+  const enabled=await page.request.put(`${origin}/api/v1/providers/${indexer.id}`,{data:{revision:indexer.revision,name:indexer.name,enabled:true,priority:indexer.priority,settings:indexer.settings}});
+  assert.equal(enabled.status(),200);indexer=await enabled.json();
+  for(const domain of ['tv','movies']){
+    const profileResponse=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Browser ${domain} WEB`,items:[{kind:'quality',quality_id:3,allowed:true}],policy:{upgrade_allowed:true,cutoff:{kind:'quality',quality_id:3},min_format_score:0,cutoff_format_score:0,min_upgrade_format_score:1,language_id:domain==='movies'?-2:null,format_items:[]}}});
+    assert.equal(profileResponse.status(),201,await profileResponse.text());const profile=await profileResponse.json();
+    await page.getByRole('button',{name:'Library',exact:true}).click();
+    await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();
+    await page.getByRole('button',{name:new RegExp(`Fixture ${domain==='tv'?'series':'movie'}.*1 files`)}).click();
+    await page.getByText('Library settings',{exact:true}).click();
+    await page.getByLabel('Quality profile',{exact:true}).selectOption(String(profile.id));
+    if(domain==='tv'){await page.getByLabel('Series type',{exact:true}).selectOption('standard');await page.getByLabel('Scene numbering',{exact:true}).selectOption('false');}
+    else await page.getByLabel('Minimum availability',{exact:true}).selectOption('released');
+    const saved=page.waitForResponse(r=>r.request().method()==='PUT'&&r.url().includes(domain==='tv'?'/api/v1/tv/series/':'/api/v1/movies/'));
+    await page.getByRole('button',{name:'Save settings',exact:true}).click();
+    assert.equal((await saved).status(),200);
+    const collection=domain==='tv'?'/api/v1/tv/series':'/api/v1/movies';
+    const item=(await (await page.request.get(`${origin}${collection}`)).json()).items.find(i=>i.title.startsWith('Fixture'));
+    assert.equal(item.settings.quality_profile_id,profile.id,'Profile selection must persist through the real library writer');
+    await page.reload();await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();
+    await page.getByRole('button',{name:new RegExp(`Fixture ${domain==='tv'?'series':'movie'}.*1 files`)}).click();
+    await page.getByText('Library settings',{exact:true}).click();assert.equal(await page.getByLabel('Quality profile',{exact:true}).inputValue(),String(profile.id));
+    await page.getByRole('button',{name:domain==='tv'?'Search releases for Second episode':'Search movie releases',exact:true}).click();
+    const panel=page.getByRole('region',{name:'Release search'});
+    await panel.getByLabel('Search indexer').selectOption(indexer.id);
+    const response=page.waitForResponse(r=>r.url().endsWith('/api/v1/release-search'));
+    await panel.getByRole('button',{name:'Find releases',exact:true}).click();
+    const releases=await response;assert.equal(releases.status(),200);const result=await releases.json();assert.equal(result.items.length,1);
+    assert.equal(result.items[0].decision.target.media_type,domain);
+    await panel.getByText('1 releases on this page.',{exact:true}).waitFor();
+    await panel.getByText(`Background release delays · ${domain==='tv'?'TV':'Movies'}`,{exact:true}).click();
+    await panel.getByLabel('Torrent delay (minutes)').fill('60');await panel.getByLabel('Usenet delay (minutes)').fill('30');
+    await panel.getByRole('button',{name:'Save release delays',exact:true}).click();await panel.getByText('Release delay settings saved.',{exact:true}).waitFor();
+    assert.deepEqual(await (await page.request.get(`${origin}/api/v1/release-policies/${domain}`)).json(),{torrent_delay_minutes:60,usenet_delay_minutes:30,availability_delay_days:0});
+  }
+}
+
+async function verifyRss() {
+  const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
+  const indexer=providers.find(p=>p.name==='Browser torznab'),client=providers.find(p=>p.name==='Browser qbittorrent');
+  await page.getByRole('button',{name:'RSS',exact:true}).click();
+  const panel=page.getByRole('region',{name:'RSS automation'});
+  for(const domain of ['tv','movies']){
+    await panel.getByLabel('RSS media').selectOption(domain);
+    await panel.getByLabel('RSS indexer').selectOption(indexer.id);await panel.getByLabel('RSS download client').selectOption(client.id);
+    await panel.getByRole('button',{name:'Save RSS schedule',exact:true}).click();await panel.getByText('RSS schedule saved.',{exact:true}).waitFor();
+    const schedules=await (await page.request.get(`${origin}/api/v1/rss/schedules`)).json();
+    assert.ok(schedules.some(s=>s.target.media_type===domain&&!s.enabled&&s.interval_seconds===900));
+    const created=page.waitForResponse(r=>r.url().endsWith('/api/v1/rss/commands')&&r.request().method()==='POST');
+    await panel.getByRole('button',{name:'Run RSS now',exact:true}).click();const response=await created;assert.equal(response.status(),202);const command=await response.json();
+    assert.equal(command.target.media_type,domain);await waitForCommand('/api/v1/rss/commands',command.id,'succeeded');
+    await panel.getByRole('button',{name:'Check RSS status',exact:true}).click();
+    await panel.getByText('1 receipts for '+domain+'.',{exact:true}).waitFor();
+    const candidates=await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`)).json();
+    assert.equal(candidates.items[0].source.media_type,domain);assert.equal(candidates.items[0].status,'rejected');
+  }
+  let posts=0;
+  await page.route('**/api/v1/rss/commands',async route=>{if(route.request().method()!=='POST')return route.continue();posts++;const response=await route.fetch();assert.equal(response.status(),202);await route.abort('failed');});
+  await panel.getByRole('button',{name:'Run RSS now',exact:true}).click();
+  await panel.getByRole('alert').filter({hasText:'request may have committed'}).waitFor();
+  assert.equal(await panel.getByRole('button',{name:'Run RSS now',exact:true}).isDisabled(),true);assert.equal(posts,1);
+  await page.unroute('**/api/v1/rss/commands');await panel.getByRole('button',{name:'Check RSS status',exact:true}).click();
+  await panel.getByText('RSS status checked. Inspect recorded commands and receipts before another action.',{exact:true}).waitFor();
+}
+
 async function verifyActivity() {
   const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
   // Reuse the provider created through this browser, enabling its durable read worker.
@@ -478,6 +545,12 @@ try {
   assert.match(await page.getByRole('article').innerText(), /pilot.mkv/);
   await verifyProviders();
   await verifyActivity();
+  await verifyReleaseSearch();
+  await verifyRss();
+  await page.setViewportSize({width:390,height:844});
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'RSS receipts must wrap at mobile width');
+  if(process.env.UI_SCREENSHOT)await page.screenshot({path:`${process.env.UI_SCREENSHOT}.rss.png`,fullPage:true});
+  await page.setViewportSize({width:1280,height:720});
   await verifyMetadataRefresh();
   await verifyBlocklist();
   await verifyClearBlocklist();
@@ -485,7 +558,7 @@ try {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});

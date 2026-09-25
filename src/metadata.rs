@@ -123,6 +123,15 @@ pub struct MovieDetails {
     pub title: String,
     pub year: Option<i64>,
     pub imdb_id: Option<String>,
+    pub runtime: Option<i64>,
+    pub status: Option<String>,
+    pub in_cinemas: Option<String>,
+    pub digital_release: Option<String>,
+    pub physical_release: Option<String>,
+    pub secondary_year: Option<i64>,
+    pub original_language: Option<i64>,
+    // None is absent metadata; Some([]) is an explicitly empty title set.
+    pub alternative_titles: Option<Vec<String>>,
 }
 pub struct MetadataClient {
     http: HttpClient,
@@ -503,6 +512,87 @@ struct Movie {
     title: String,
     year: Option<i64>,
     imdb_id: Option<String>,
+    runtime: Option<i64>,
+    in_cinema: Option<String>,
+    digital_release: Option<String>,
+    physical_release: Option<String>,
+    premier: Option<String>,
+    original_language: Option<String>,
+    alternative_titles: Option<Vec<AlternativeTitle>>,
+}
+#[derive(Deserialize)]
+struct AlternativeTitle {
+    title: String,
+}
+fn original_language(value: Option<String>) -> Result<Option<i64>> {
+    let Some(value) = value else { return Ok(None) };
+    if !(2..=3).contains(&value.len()) || !value.bytes().all(|c| c.is_ascii_alphabetic()) {
+        return Err(MetadataError::InvalidResponse);
+    }
+    // ISO language identities mapped to the existing native movie language catalog.
+    // Unrepresented languages remain unknown; never guess English.
+    let languages = [
+        ("en", 1),
+        ("fr", 2),
+        ("es", 3),
+        ("de", 4),
+        ("it", 5),
+        ("da", 6),
+        ("nl", 7),
+        ("ja", 8),
+        ("is", 9),
+        ("zh", 10),
+        ("ru", 11),
+        ("pl", 12),
+        ("vi", 13),
+        ("sv", 14),
+        ("no", 15),
+        ("nb", 15),
+        ("nn", 15),
+        ("fi", 16),
+        ("tr", 17),
+        ("pt", 18),
+        ("el", 20),
+        ("ko", 21),
+        ("hu", 22),
+        ("he", 23),
+        ("lt", 24),
+        ("cs", 25),
+        ("hi", 26),
+        ("ro", 27),
+        ("th", 28),
+        ("bg", 29),
+        ("ar", 31),
+        ("uk", 32),
+        ("fa", 33),
+        ("bn", 34),
+        ("sk", 35),
+        ("lv", 36),
+        ("ca", 38),
+        ("hr", 39),
+        ("sr", 40),
+        ("bs", 41),
+        ("et", 42),
+        ("ta", 43),
+        ("id", 44),
+        ("te", 45),
+        ("mk", 46),
+        ("sl", 47),
+        ("ml", 48),
+        ("kn", 49),
+        ("sq", 50),
+        ("af", 51),
+        ("mr", 52),
+        ("tl", 53),
+        ("ur", 54),
+        ("rm", 55),
+        ("mn", 56),
+        ("ka", 57),
+    ];
+    Ok(languages
+        .iter()
+        .find(|(code, _)| *code == value.to_ascii_lowercase())
+        .map(|(_, id)| *id))
 }
 impl Movie {
     fn details(self) -> Result<MovieDetails> {
@@ -512,11 +602,45 @@ impl Movie {
         if year.is_some_and(|year| !(1..=9999).contains(&year)) {
             return Err(MetadataError::InvalidResponse);
         }
+        let runtime = self.runtime.filter(|n| *n != 0);
+        if runtime.is_some_and(|n| !(1..=10080).contains(&n)) {
+            return Err(MetadataError::InvalidResponse);
+        }
+        let premier = timestamp(self.premier)?;
+        let secondary_year = premier
+            .as_ref()
+            .and_then(|v| v.get(..4))
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| Some(*v) != year);
+        let alternative_titles = self
+            .alternative_titles
+            .map(|titles| {
+                if titles.len() > 64 {
+                    return Err(MetadataError::InvalidResponse);
+                }
+                let mut result = BTreeSet::new();
+                for item in titles {
+                    text(&item.title, 1024, false)?;
+                    result.insert(item.title);
+                }
+                Ok(result.into_iter().collect::<Vec<_>>())
+            })
+            .transpose()?;
         Ok(MovieDetails {
             tmdb_id: self.tmdb_id,
             title: self.title,
             year,
             imdb_id: imdb(self.imdb_id)?,
+            runtime,
+            // TMDb wire status is not Radarr's home-release status. Eligibility is
+            // computed from factual dates at decision time, never cached wall-clock state.
+            status: None,
+            in_cinemas: timestamp(self.in_cinema)?,
+            digital_release: timestamp(self.digital_release)?,
+            physical_release: timestamp(self.physical_release)?,
+            secondary_year,
+            original_language: original_language(self.original_language)?,
+            alternative_titles,
         })
     }
 }

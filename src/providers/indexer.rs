@@ -195,7 +195,7 @@ pub enum IndexerSearch {
         limit: u32,
     },
 }
-#[derive(Serialize, ts_rs::TS)]
+#[derive(Deserialize, Serialize, ts_rs::TS)]
 pub struct ReleaseMetadata {
     pub title: Option<String>,
     pub size_bytes: Option<u64>,
@@ -214,6 +214,45 @@ pub struct Release {
     pub download_url: String,
     pub attributes: BTreeMap<String, Vec<String>>,
 }
+// Dedicated private persistence shape. Release itself deliberately remains non-serializable.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateRelease {
+    metadata: ReleaseMetadata,
+    guid: Option<String>,
+    facts: ReleaseFacts,
+    download_url: String,
+    attributes: BTreeMap<String, Vec<String>>,
+}
+pub(crate) fn encode_private(release: Release) -> Result<Vec<u8>> {
+    let value = PrivateRelease {
+        metadata: release.metadata,
+        guid: release.guid,
+        facts: release.facts,
+        download_url: release.download_url,
+        attributes: release.attributes,
+    };
+    let bytes = serde_json::to_vec(&value).map_err(|_| IndexerError::InvalidResponse)?;
+    if bytes.len() > 65536 {
+        return Err(IndexerError::InvalidResponse);
+    }
+    Ok(bytes)
+}
+pub(crate) fn decode_private(bytes: &[u8]) -> Result<Release> {
+    if bytes.len() > 65536 {
+        return Err(IndexerError::InvalidResponse);
+    }
+    let value: PrivateRelease =
+        serde_json::from_slice(bytes).map_err(|_| IndexerError::InvalidResponse)?;
+    Ok(Release {
+        metadata: value.metadata,
+        guid: value.guid,
+        facts: value.facts,
+        download_url: value.download_url,
+        attributes: value.attributes,
+    })
+}
+#[derive(Deserialize, Serialize)]
 pub enum ReleaseIdentifiers {
     Tv {
         tvdb_id: Option<u32>,
@@ -227,6 +266,7 @@ pub enum ReleaseIdentifiers {
         imdb_id: Option<String>,
     },
 }
+#[derive(Deserialize, Serialize)]
 pub struct TorrentFacts {
     pub info_hash: Option<String>,
     pub magnet_url: Option<String>,
@@ -236,6 +276,7 @@ pub struct TorrentFacts {
     pub minimum_seed_seconds: Option<u64>,
     pub internal: Option<bool>,
 }
+#[derive(Deserialize, Serialize)]
 pub struct ReleaseFacts {
     pub identifiers: ReleaseIdentifiers,
     pub scene: Option<bool>,
@@ -269,6 +310,19 @@ pub struct IndexerPage {
     pub next_query: Option<IndexerContinuation>,
     pub media_type: MediaDomain,
     pub items: Vec<ReleaseMetadata>,
+    pub offset: u32,
+    pub limit: u32,
+    pub total: Option<u32>,
+    pub next_offset: Option<u32>,
+}
+/// Private transport result: contains locators and must never be serialized into API responses.
+pub(crate) struct RawIndexerPage {
+    pub warnings: Vec<IndexerItemWarning>,
+    pub query_index: u32,
+    pub query_count: u32,
+    pub next_query: Option<IndexerContinuation>,
+    pub media_type: MediaDomain,
+    pub items: Vec<Release>,
     pub offset: u32,
     pub limit: u32,
     pub total: Option<u32>,
@@ -1930,12 +1984,12 @@ pub async fn test(
         domains,
     })
 }
-pub async fn search(
+pub(crate) async fn raw_search(
     operation: &super::http::HttpOperation<'_>,
     settings: &ProviderSettings,
     access: &IndexerAccess<'_>,
     request: &IndexerSearch,
-) -> Result<IndexerPage> {
+) -> Result<RawIndexerPage> {
     if !access.validate() {
         return Err(IndexerError::InvalidRequest);
     }
@@ -1982,12 +2036,9 @@ pub async fn search(
     } else {
         None
     };
-    let mut items = page
-        .items
-        .into_iter()
-        .map(|r| r.metadata)
-        .collect::<Vec<_>>();
-    for key in access
+    let mut page = page;
+    // Raw locators remain private, but metadata may later appear in decision receipts.
+    for secret in access
         .api_key
         .into_iter()
         .chain(
@@ -1997,23 +2048,49 @@ pub async fn search(
                 .chain(access.movie_parameters)
                 .map(|p| p.value.as_str()),
         )
-        .filter(|s| !s.is_empty())
+        .filter(|v| !v.is_empty())
     {
-        for item in &mut items {
-            if let Some(title) = &mut item.title {
-                *title = title.replace(key, "[redacted]");
+        for item in &mut page.items {
+            if let Some(title) = &mut item.metadata.title {
+                *title = title.replace(secret, "[redacted]");
             }
-            for language in &mut item.languages {
-                *language = language.replace(key, "[redacted]");
+            for language in &mut item.metadata.languages {
+                *language = language.replace(secret, "[redacted]");
             }
         }
     }
-    Ok(IndexerPage {
+    Ok(RawIndexerPage {
         warnings: page.warnings,
         query_index: selected as u32,
         query_count: plans.len() as u32,
         next_query,
         media_type: plan.media_type,
+        items: page.items,
+        offset: page.offset,
+        limit: page.limit,
+        total: page.total,
+        next_offset: page.next_offset,
+    })
+}
+
+pub async fn search(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+    request: &IndexerSearch,
+) -> Result<IndexerPage> {
+    let page = raw_search(operation, settings, access, request).await?;
+    let items = page
+        .items
+        .into_iter()
+        .map(|r| r.metadata)
+        .collect::<Vec<_>>();
+    Ok(IndexerPage {
+        warnings: page.warnings,
+        query_index: page.query_index,
+        query_count: page.query_count,
+        next_query: page.next_query,
+        media_type: page.media_type,
         items,
         offset: page.offset,
         limit: page.limit,

@@ -99,10 +99,24 @@ history deletion, retry errors, stale selection and reload without command creat
 It uses the fixture's owned catalogue modes; this does not establish live catalogue
 behavior or process-restart recovery. Native backend recovery evidence is separate.
 
+## Release decisions and RSS
+
+Library settings now page domain-scoped quality profiles and persist assignments.
+Selected episodes and movies expose read-only release decisions plus explicit
+background delay settings. The RSS workspace selects an indexer/client pair, saves
+revision-fenced schedules, and polls persisted commands and release receipts.
+A succeeded command means its feed/decision pass ended; delayed receipts can later
+fail or need attention. Receipt status and live counters are authoritative for
+submission outcomes, not evidence of download completion or import.
+
+See [library-browser.md](library-browser.md) for added browser evidence and limits.
+
 ## Not claimed
 
 Initial provider setup and the [slice 1 gate](slice-1-gate.md) are now delivered;
-full provider/settings breadth remains incomplete. Full add/detail/import routes, profile selection, artwork, discovery,
+full provider/settings breadth remains incomplete. Quality-profile assignment is now
+available in both library editors; full profile editing remains incomplete. Full
+add/detail/import routes, artwork, discovery,
 replacement, bulk import, search-on-add and complete controller parity remain
 required later work. This workspace does not introduce a routing framework, query
 cache, schema migration or dependency. Browser verification uses the observed

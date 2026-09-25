@@ -1,4 +1,4 @@
-//! Durable, locally owned download and catalog refresh. Neither authorizes client mutations.
+//! Durable locally owned commands, including guarded RSS submission receipts.
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 pub mod blocklist;
 pub mod metadata;
+pub mod rss;
 mod worker;
 pub use worker::{Runtime, start, start_with_metadata};
 
@@ -317,7 +318,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Ok(current)
     }
     let count = c
-        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)", ())
+        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)", ())
         .await?
         .next()
         .await?
@@ -334,6 +335,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
 pub fn router(db: Arc<Database>) -> Router {
     let metadata = metadata::router(db.clone());
     let blocklist = blocklist::router(db.clone());
+    let rss = rss::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -347,6 +349,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .with_state(db)
         .merge(metadata)
         .merge(blocklist)
+        .merge(rss)
 }
 async fn create(
     State(db): State<Arc<Database>>,
@@ -528,26 +531,39 @@ async fn queue(
         ));
     }
     let total = downloads.len() as u16;
+    let provider_revision: i64 = row.get(0)?;
+    let observed_at: i64 = row.get(1)?;
+    let command_id = row
+        .get::<Option<String>>(2)?
+        .map(|v| Uuid::parse_str(&v).map_err(|_| bad()))
+        .transpose()?;
+    let mut items = Vec::new();
+    for download in downloads
+        .into_iter()
+        .skip(q.offset as usize)
+        .take(q.limit as usize)
+    {
+        let association=if let Some(receipt)=c.query("SELECT r.movie_id,e.episode_id FROM rss_candidates r LEFT JOIN rss_candidate_episodes e ON e.candidate_id=r.id WHERE r.client_id=? AND r.observed_hash=? AND r.client_revision=? AND r.media_type=? AND r.status='observed'",params![q.provider_id.to_string(),download.hash.clone(),provider_revision,domain(q.media_type)]).await?.next().await? {
+            match (receipt.get::<Option<i64>>(0)?,receipt.get::<Option<i64>>(1)?) {
+                (Some(id),None)=>Some(crate::db::MediaTarget::Movie(id)),
+                (None,Some(id))=>Some(crate::db::MediaTarget::Episode(id)),
+                _=>None,
+            }
+        }else{None};
+        items.push(QueueObservation {
+            association,
+            download,
+        });
+    }
     bounded(QueueSnapshot {
         target: RefreshTarget {
             provider_id: q.provider_id,
             media_type: q.media_type,
         },
-        provider_revision: row.get(0)?,
-        observed_at: row.get(1)?,
-        command_id: row
-            .get::<Option<String>>(2)?
-            .map(|v| Uuid::parse_str(&v).map_err(|_| bad()))
-            .transpose()?,
-        items: downloads
-            .into_iter()
-            .skip(q.offset as usize)
-            .take(q.limit as usize)
-            .map(|download| QueueObservation {
-                association: None,
-                download,
-            })
-            .collect(),
+        provider_revision,
+        observed_at,
+        command_id,
+        items,
         total,
         limit: q.limit,
         offset: q.offset,

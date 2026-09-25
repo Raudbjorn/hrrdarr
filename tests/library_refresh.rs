@@ -71,6 +71,14 @@ fn movie() -> MovieDetails {
         title: "New Movie".into(),
         year: None,
         imdb_id: None,
+        runtime: None,
+        status: None,
+        in_cinemas: None,
+        digital_release: None,
+        physical_release: None,
+        secondary_year: None,
+        original_language: None,
+        alternative_titles: None,
     }
 }
 async fn apply(

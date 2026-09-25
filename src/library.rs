@@ -1330,6 +1330,7 @@ async fn selected(
     // Every external request completes before opening the write transaction.
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
+    let mut movie_facts = None;
     match ctx.domain {
         Domain::Tv => {
             let detail = ctx
@@ -1364,10 +1365,11 @@ async fn selected(
                 .movie(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
-            req.title = Some(detail.title);
+            req.title = Some(detail.title.clone());
             req.year = detail.year;
             req.tmdb_id = Some(detail.tmdb_id);
-            req.imdb_id = detail.imdb_id;
+            req.imdb_id = detail.imdb_id.clone();
+            movie_facts = Some(detail);
         }
     }
     validate_create(ctx.domain, &req).map_err(IntoResponse::into_response)?;
@@ -1388,6 +1390,9 @@ async fn selected(
             if tx.query(&format!("SELECT 1 FROM episodes WHERE tvdb_id IN ({}) LIMIT 1",placeholders(values.len())),values).await?.next().await?.is_some(){return Err(conflict());}
         }
         let item=create_record(&tx,ctx.domain,&mut req,&path).await?;
+        if let Some(detail)=movie_facts {
+            refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
+        }
         for episode in episodes {
             let monitored=monitoring.get(&episode.season).ok_or_else(||bad("Episode season is absent from selected catalog"))?;
             tx.execute("INSERT INTO episodes(series_id,season,number,title,monitored,tvdb_id,air_date,air_date_utc,absolute_episode_number,runtime,overview,finale_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![item.id,episode.season,episode.number,episode.title,i64::from(*monitored),episode.tvdb_id,episode.air_date,episode.air_date_utc,episode.absolute_episode_number,episode.runtime,episode.overview,episode.finale_type]).await?;

@@ -64,6 +64,8 @@ export type CommandStatus = "queued" | "running" | "retry_wait" | "succeeded" | 
 
 export type Direction = "remote_to_local" | "local_to_remote";
 
+export type Disposition = "accept" | "reject" | "delay";
+
 export type DownloadContentLayout = "default" | "original" | "subfolder";
 
 export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state";
@@ -105,6 +107,8 @@ export type EpisodeMonitorMany = { episode_ids: Array<number>, monitored: boolea
 export type EpisodeQuery = { series_id?: number, season?: number, episode_ids?: string, episode_file_id?: number, offset?: number, limit?: number, include_series?: boolean, include_episode_file?: boolean, include_images?: boolean, };
 
 export type EpisodeSeriesProjection = { id: number, tvdb_id: number | null, title: string, year: number | null, path: string, poster: string | null, monitored: boolean, };
+
+export type EvaluatedRelease = { metadata: ReleaseMetadata, decision: ReleaseDecision, };
 
 export type FileBulk = { files: Array<FileUpdate>, };
 
@@ -246,7 +250,7 @@ export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
-export type MovieDetails = { tmdb_id: number, title: string, year: number | null, imdb_id: string | null, };
+export type MovieDetails = { tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, };
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
@@ -256,7 +260,11 @@ export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: Library
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
+export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
+
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
+
+export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, };
 
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
 
@@ -372,7 +380,17 @@ export type RefreshScheduleInput = { target: RefreshTarget, revision: number | n
 
 export type RefreshTarget = { provider_id: string, media_type: MediaDomain, };
 
+export type ReleaseDecision = { target: ReleaseTarget | null, disposition: Disposition, reasons: Array<string>, not_before: number | null, quality_id: number | null, parsed: ParsedRelease | null, };
+
 export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
+
+export type ReleasePolicy = { torrent_delay_minutes: number, usenet_delay_minutes: number, availability_delay_days: number, };
+
+export type ReleaseSearchInput = { provider_id: string, provider_revision: number, target: MediaTarget, offset: number, query_index: number, limit: number, };
+
+export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: IndexerContinuation | null, };
+
+export type ReleaseTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
 export type Resolution = { input: string, output: string, mapping_id: number | null, mapping_revision: number | null, lexical_only: boolean, };
 
@@ -385,6 +403,22 @@ export type RootInput = { path: string, };
 export type RootObservationStatus = "available" | "inaccessible" | "timeout" | "busy" | "limited";
 
 export type RootQuery = { limit?: number, offset?: number, };
+
+export type RssCandidate = { id: string, command_id: string | null, source: RssTarget, title: string, target: ReleaseTarget | null, status: string, reasons: Array<string>, not_before: number | null, attempts: number, created_at: number, updated_at: number, error_code: string | null, };
+
+export type RssCandidateQuery = { media_type?: MediaDomain, command_id?: string, status?: string, limit?: number, offset?: number, };
+
+export type RssCommand = { id: string, target: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, evaluated: number, rejected: number, pending: number, observed: number, uncertain: number, fetch_complete: boolean, };
+
+export type RssInput = { target: RssTarget, priority: CommandPriority, };
+
+export type RssSchedule = { id: string, target: RssTarget, revision: number, interval_seconds: number, enabled: boolean, next_run_at: number, last_run_at: number | null, error_code: string | null, created_at: number, };
+
+export type RssScheduleDelete = { revision: number, };
+
+export type RssScheduleInput = { revision?: number, target: RssTarget, interval_seconds: number, enabled: boolean, };
+
+export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_id: string, client_revision: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 

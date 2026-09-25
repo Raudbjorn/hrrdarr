@@ -236,3 +236,27 @@ both domains, local state preservation, identical replay, identity conflicts and
 rollback; the schema regression covers upgrade preservation, shared command capacity and
 reopen. These scratch tests do not establish live provider equivalence, rescans, artwork,
 metadata schedules or complete refresh-job parity.
+
+## Movie facts used by release decisions
+
+Selected metadata add and metadata refresh persist validated runtime, cinema/digital/
+physical release timestamps, original language and alternative titles in the movie
+catalog. A differing premiere year is retained as a secondary year. Timestamps retain
+UTC precision rather than being truncated to a calendar day. Runtime zero and missing
+optional facts remain unknown; unknown ISO language codes do not become English.
+The native status column remains unknown when the metadata service supplies only a
+TMDb status: that value does not establish home-release availability. Decision code
+uses factual dates at its supplied current time rather than a cached time-derived status.
+
+A missing alternative-title array preserves prior aliases during refresh; an explicit
+empty array clears them. The complete validated set has at most 64 distinct titles,
+each at most 1,024 UTF-8 bytes. Catalog adoption during selected add rejects conflicting
+existing facts, and all catalog/alias changes share the library or refresh transaction.
+`tests/movie_catalog.rs` exercises the actual metadata HTTP producer, selected add,
+sparse refresh, clearing, invalid input, conflicting adoption and late-write rollback.
+
+Migration 24 adds nullable facts and an unconfigured per-domain release-delay policy;
+no legacy eligibility or policy defaults are invented. Existing Sonarr/Radarr snapshot
+readers still archive/report these newer movie catalog fields as unsupported, rather
+than claiming reconstruction. An actual metadata refresh can populate them. Full
+metadata/status/translation/alias provenance parity remains incomplete.

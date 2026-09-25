@@ -24,6 +24,54 @@ impl CredentialKey {
         bytes.fill(0);
         Ok(Self(aead::LessSafeKey::new(key)))
     }
+    /// Separate AEAD purpose from provider credentials; payloads never have a plaintext fallback.
+    pub(super) fn seal_release(
+        &self,
+        context: &str,
+        plain: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if plain.len() > 65536 || context.len() > 512 {
+            return Err("invalid_release");
+        }
+        let mut nonce = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "key_unavailable")?;
+        let mut body = plain.to_vec();
+        self.0
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(format!("hrrdarr/rss-private-release/v1/{context}")),
+                &mut body,
+            )
+            .map_err(|_| "key_unavailable")?;
+        let mut envelope = vec![1];
+        envelope.extend_from_slice(&nonce);
+        envelope.extend(body);
+        Ok(envelope)
+    }
+    pub(super) fn open_release(
+        &self,
+        context: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if !(29..=65565).contains(&envelope.len()) || envelope[0] != 1 || context.len() > 512 {
+            return Err("invalid_release");
+        }
+        let nonce: [u8; 12] = envelope[1..13].try_into().map_err(|_| "invalid_release")?;
+        let mut body = envelope[13..].to_vec();
+        let length = self
+            .0
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(format!("hrrdarr/rss-private-release/v1/{context}")),
+                &mut body,
+            )
+            .map_err(|_| "key_unavailable")?
+            .len();
+        body.truncate(length);
+        Ok(body)
+    }
     pub(super) fn seal(
         &self,
         id: &str,
@@ -335,5 +383,43 @@ mod tests {
         assert!(key.open("id-one", "torznab", &unknown).is_err());
         assert!(CredentialKey::from_hex(&"z".repeat(64)).is_err());
         assert!(CredentialKey::from_hex("short").is_err());
+    }
+    #[test]
+    fn release_envelopes_are_bounded_randomized_and_purpose_separated() {
+        let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+        let wrong = CredentialKey::from_hex(&"cd".repeat(32)).unwrap();
+        let context = "candidate/indexer/1/client/1/tv";
+        let private = b"https://owned.invalid/torrent?passkey=private-release-key";
+        let first = key.seal_release(context, private).unwrap();
+        assert_ne!(
+            first,
+            key.seal_release(context, private).unwrap(),
+            "fresh nonces protect repeated pending payloads"
+        );
+        assert_eq!(key.open_release(context, &first).unwrap(), private);
+        assert!(!first.windows(private.len()).any(|w| w == private));
+        assert!(
+            key.open_release("candidate/indexer/1/client/1/movies", &first)
+                .is_err()
+        );
+        assert!(wrong.open_release(context, &first).is_err());
+        let mut tampered = first.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(key.open_release(context, &tampered).is_err());
+        assert!(key.open("id", "torznab", &first).is_err());
+        let credentials = key
+            .seal(
+                "id",
+                "torznab",
+                &Credentials::ApiKey {
+                    api_key: "secret".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            key.open_release(context, &credentials).is_err(),
+            "credential envelopes cannot be repurposed as release payloads"
+        );
+        assert!(key.seal_release(context, &vec![0; 65537]).is_err());
     }
 }

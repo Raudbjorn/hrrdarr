@@ -1,4 +1,4 @@
-import type { BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -145,3 +145,17 @@ export const createBlocklistClearCommand = (input:BlocklistClearInput) => reques
 export const getBlocklistClearCommand = (id:string) => validOperation(id)?request<BlocklistClearCommand>(`/api/v1/blocklist/clear-commands/${id}`,undefined,undefined,true):invalidBlocklist<BlocklistClearCommand>();
 export const cancelBlocklistClearCommand = (id:string) => validOperation(id)?request<BlocklistClearCommand>(`/api/v1/blocklist/clear-commands/${id}/cancel`,undefined,'POST',true):invalidBlocklist<BlocklistClearCommand>();
 export const deleteBlocklistClearCommand = (id:string) => validOperation(id)?request<void>(`/api/v1/blocklist/clear-commands/${id}`,undefined,'DELETE',true):invalidBlocklist<void>();
+
+export const listQualityProfiles = (domain: MediaDomain, offset = 0) => request<QualityProfilePage>(`/api/v1/${domain}/quality-profiles?limit=50&offset=${offset}`, undefined, undefined, true);
+
+export const getReleasePolicy = (domain: MediaDomain) => request<ReleasePolicy | null>(`/api/v1/release-policies/${domain}`, undefined, undefined, true);
+export const saveReleasePolicy = (domain: MediaDomain, input: ReleasePolicy) => request<ReleasePolicy>(`/api/v1/release-policies/${domain}`, input, 'PUT', true);
+export const searchReleases = (input: ReleaseSearchInput) => validId(input.target.id) && validOperation(input.provider_id) && validId(input.provider_revision) ? request<ReleaseSearchPage>('/api/v1/release-search', input, 'POST', true, 45_000) : invalidProvider<ReleaseSearchPage>();
+
+const validRssTarget = (target:RssTarget) => validOperation(target.indexer_id) && validId(target.indexer_revision) && validOperation(target.client_id) && validId(target.client_revision);
+export const listRssCommands = (domain:MediaDomain, offset=0) => request<ApiPage<RssCommand>>(`/api/v1/rss/commands?media_type=${domain}&limit=25&offset=${offset}`,undefined,undefined,true);
+export const createRssCommand = (input:RssInput) => validRssTarget(input.target)?request<RssCommand>('/api/v1/rss/commands',input,'POST',true):invalidProvider<RssCommand>();
+export const cancelRssCommand = (id:string) => validOperation(id)?request<RssCommand>(`/api/v1/rss/commands/${id}/cancel`,undefined,'POST',true):invalidProvider<RssCommand>();
+export const listRssCandidates = (domain:MediaDomain,offset=0) => request<ApiPage<RssCandidate>>(`/api/v1/rss/candidates?media_type=${domain}&limit=25&offset=${offset}`,undefined,undefined,true);
+export const listRssSchedules = () => request<RssSchedule[]>('/api/v1/rss/schedules',undefined,undefined,true);
+export const saveRssSchedule = (input:RssScheduleInput) => validRssTarget(input.target)?request<RssSchedule>('/api/v1/rss/schedules',input,'POST',true):invalidProvider<RssSchedule>();

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
+import { listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -346,4 +346,30 @@ test('clear deadline exposes ambiguous server timeout for explicit readback',asy
  let count=0;await withFetch(async()=>{count++;return json({error:{code:'blocklist_clear_timeout',message:'Command request timed out'}},503);},async()=>{
  const result=await createBlocklistClearCommand({target:{media_type:'tv'},priority:'normal'});assert.equal(result.ok,false);assert.equal(result.status,503);assert.equal(result.code,'blocklist_clear_timeout');
  });assert.equal(count,1);
+});
+
+
+test('release and RSS clients preserve explicit scopes, revisions, targets and unknown outcomes',async()=>{
+  const provider='00000000-0000-0000-0000-000000000001',client='00000000-0000-0000-0000-000000000002';
+  const seen=[];
+  await withFetch(async(path,options)=>{seen.push([path,options.method,options.body?JSON.parse(options.body):null]);return json({});},async()=>{
+    for(const domain of ['tv','movies']){
+      await listQualityProfiles(domain,50);await getReleasePolicy(domain);
+      await saveReleasePolicy(domain,{torrent_delay_minutes:60,usenet_delay_minutes:30,availability_delay_days:0});
+      await searchReleases({provider_id:provider,provider_revision:3,target:{media_type:domain==='tv'?'episode':'movie',id:1},offset:25,query_index:1,limit:25});
+      const target={media_type:domain,indexer_id:provider,indexer_revision:3,client_id:client,client_revision:4};
+      await createRssCommand({target,priority:'normal'});await listRssCommands(domain,25);await listRssCandidates(domain,25);
+      await saveRssSchedule({target,interval_seconds:900,enabled:false,revision:2});
+    }
+    await listRssSchedules();await cancelRssCommand(provider);
+  });
+  assert.ok(seen.some(([path])=>path==='/api/v1/movies/quality-profiles?limit=50&offset=50'));
+  assert.deepEqual(seen.filter(([path])=>path==='/api/v1/release-search').map(([,method,body])=>[method,body.target,body.query_index,body.offset]),[['POST',{media_type:'episode',id:1},1,25],['POST',{media_type:'movie',id:1},1,25]]);
+  assert.deepEqual(seen.filter(([path,method])=>path==='/api/v1/rss/commands'&&method==='POST').map(([, ,body])=>body.target.media_type),['tv','movies']);
+  let calls=0;
+  await withFetch(async()=>{calls++;throw new Error('lost response');},async()=>{
+    const result=await createRssCommand({target:{media_type:'tv',indexer_id:provider,indexer_revision:3,client_id:client,client_revision:4},priority:'normal'});
+    assert.equal(result.ok,false);assert.equal(result.status,undefined);
+  });
+  assert.equal(calls,1,'The client must not automatically repeat an uncertain RSS mutation');
 });

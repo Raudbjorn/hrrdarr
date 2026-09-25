@@ -9,7 +9,7 @@ use axum::{
 };
 use hrrdarr::{
     blocklist, commands, db::Database, episodes, import, library, metadata::MetadataClient,
-    providers, snapshots,
+    providers, quality_profiles, search as releases, snapshots,
 };
 use serde_json::json;
 use std::{
@@ -55,10 +55,10 @@ async fn serve(router: Router) -> (String, Server) {
     )
 }
 fn show() -> serde_json::Value {
-    json!({"tvdbId":101,"title":"Fixture series","firstAired":"2020-01-01","seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":501,"seasonNumber":1,"episodeNumber":1,"title":"Pilot","airDate":"2020-01-01"},{"tvdbId":502,"seasonNumber":1,"episodeNumber":2,"title":"Second episode","airDate":"2020-01-02"}]})
+    json!({"tvdbId":101,"title":"Fixture series","firstAired":"2020-01-01","seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":501,"seasonNumber":1,"episodeNumber":1,"title":"Pilot","airDate":"2020-01-01","airDateUtc":"2020-01-01T00:00:00Z","runtime":45},{"tvdbId":502,"seasonNumber":1,"episodeNumber":2,"title":"Second episode","airDate":"2020-01-02","airDateUtc":"2020-01-02T00:00:00Z","runtime":45}]})
 }
 fn movie() -> serde_json::Value {
-    json!({"tmdbId":101,"title":"Fixture movie","year":2021,"imdbId":"tt7654321"})
+    json!({"tmdbId":101,"title":"Fixture movie","year":2021,"imdbId":"tt7654321","runtime":100,"digitalRelease":"2021-01-01T00:00:00Z"})
 }
 async fn metadata_mode(
     State(state): State<Arc<AtomicU8>>,
@@ -190,7 +190,23 @@ async fn provider_mock(
         {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
+        if uri.path() == "/newznab" {
+            return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
+        }
+        let tv = query.get("cat").is_some_and(|c| c.starts_with('5'));
+        let title = if tv {
+            "Fixture.series.S01E02.1080p.WEB-DL"
+        } else {
+            "Fixture.movie.2021.1080p.WEB-DL"
+        };
+        let category = if tv { "5030" } else { "2000" };
+        let identity = if tv { "tvdbid" } else { "tmdbid" };
+        let hash = if tv {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        } else {
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        };
+        return ([("content-type", "application/xml")],format!(r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="1"/><item><title>{title}</title><guid>fixture-{category}</guid><pubDate>Thu, 24 Sep 2026 12:00:00 +0000</pubDate><link>magnet:?xt=urn:btih:{hash}</link><x:attr name="category" value="{category}"/><x:attr name="{identity}" value="101"/><x:attr name="size" value="1073741824"/></item></channel></rss>"#)).into_response();
     }
     if uri.path() == "/api/v2/auth/login" {
         let fields: HashMap<String, String> =
@@ -379,7 +395,7 @@ async fn library_ui_fixture() {
     let clear_root = scratch.0.join("clear-source");
     std::fs::create_dir(&clear_root).unwrap();
     let clear_fixture = blocklist_fixture(db.clone(), &clear_root, 902).await;
-    let worker = commands::start_with_metadata(db.clone(), refresh, client.clone())
+    let worker = commands::start_with_metadata(db.clone(), refresh.clone(), client.clone())
         .await
         .unwrap();
     let (api, _api) = serve(
@@ -389,6 +405,8 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(releases::router(db.clone(), refresh))
+            .merge(quality_profiles::router(db.clone()))
             .merge(blocklist::router(db))
             .merge(
                 Router::new()

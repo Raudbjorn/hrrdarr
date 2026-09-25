@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 23);
+    assert_eq!(version(&c).await?, 25); // Latest open adds RSS intent/catalog contracts; predecessor stays22.
     for (i, table) in tables.iter().enumerate() {
         assert_eq!(rows(&c, table).await?, before[i]);
     }

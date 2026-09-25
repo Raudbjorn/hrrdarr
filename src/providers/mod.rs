@@ -444,6 +444,7 @@ pub(crate) struct RefreshError {
     pub retryable: bool,
     pub retry_after_seconds: Option<u32>,
 }
+pub(crate) type AutomationError = RefreshError;
 impl RefreshError {
     fn new(code: &'static str, retryable: bool) -> Self {
         Self {
@@ -485,6 +486,242 @@ fn refresh_error(error: Error) -> RefreshError {
 impl RefreshClient {
     pub(crate) fn matches_database(&self, db: &Arc<Database>) -> bool {
         Arc::ptr_eq(&self.0.db, db)
+    }
+
+    pub(crate) fn seal_release(
+        &self,
+        context: &str,
+        plain: &[u8],
+    ) -> std::result::Result<Vec<u8>, AutomationError> {
+        self.0
+            .key
+            .as_ref()
+            .ok_or_else(|| RefreshError::new("key_unavailable", false))?
+            .seal_release(context, plain)
+            .map_err(|code| RefreshError::new(code, false))
+    }
+    pub(crate) fn open_release(
+        &self,
+        context: &str,
+        envelope: &[u8],
+    ) -> std::result::Result<Vec<u8>, AutomationError> {
+        self.0
+            .key
+            .as_ref()
+            .ok_or_else(|| RefreshError::new("key_unavailable", false))?
+            .open_release(context, envelope)
+            .map_err(|code| RefreshError::new(code, false))
+    }
+    pub(crate) async fn prepare_download(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        target: crate::db::MediaTarget,
+        source: qbittorrent::AddSource,
+        recent: bool,
+        options: qbittorrent::QbitOptions,
+    ) -> std::result::Result<qbittorrent::PreparedDownload, AutomationError> {
+        let context = &self.0;
+        let (provider, _credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
+            let scope = match &target {
+                crate::db::MediaTarget::Episode(_) => tv.as_ref(),
+                crate::db::MediaTarget::Movie(_) => movies.as_ref(),
+            };
+            if scope.is_some_and(|s| s.recent_priority != s.older_priority) {
+                return Err(RefreshError::new("unsupported_target", false));
+            }
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = qbittorrent::prepare(
+                &operation,
+                &provider.settings,
+                target,
+                source,
+                recent,
+                options,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0));
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+    pub(crate) async fn submit_download(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        prepared: qbittorrent::PreparedDownload,
+    ) -> std::result::Result<qbittorrent::AddOutcome, AutomationError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = qbittorrent::submit(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                prepared,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0));
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+    pub(crate) async fn reconcile_download(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        identity: &qbittorrent::SubmissionIdentity,
+    ) -> std::result::Result<qbittorrent::Reconciliation, AutomationError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = qbittorrent::reconcile(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                identity,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0));
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+    /// Raw release facts are internal; callers must project/redact before exposing them.
+    pub(crate) async fn raw_search(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        request: &indexer::IndexerSearch,
+    ) -> std::result::Result<indexer::RawIndexerPage, AutomationError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = indexer::raw_search(
+                &operation,
+                &provider.settings,
+                &IndexerAccess::from_credentials(&credentials),
+                request,
+            )
+            .await
+            .map_err(|e| refresh_error(indexer_error(e, &operation).0));
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
     }
 
     /// A bounded observation, not proof of remote absence: client pagination is not atomic.

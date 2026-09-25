@@ -1,37 +1,49 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, MediaDomain, MediaTarget, SeriesType, MinimumAvailability } from './lib/api.generated';
-  import { listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode } from './lib/api';
+  import type { QualityProfilePage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, MediaDomain, MediaTarget, SeriesType, MinimumAvailability } from './lib/api.generated';
+  import { listQualityProfiles, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode } from './lib/api';
+  import RssPanel from './lib/RssPanel.svelte';
+  import ReleaseSearchPanel from './lib/ReleaseSearchPanel.svelte';
   import ImportPanel from './lib/ImportPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
   import ActivityPanel from './lib/ActivityPanel.svelte';
   import BlocklistPanel from './lib/BlocklistPanel.svelte';
   import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
-  let view = $state<'library' | 'providers' | 'activity' | 'blocklist'>('library');
+  let searchTarget: MediaTarget | null = $state(null);
+  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss'>('library');
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
   let episodes: Episode[] = $state([]), episodeTotal = $state(0), episodeOffset = $state(0), episodeId: number | null = $state(null);
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
   let adding = $state(false), term = $state(''), results: LookupResult[] = $state([]), choice: LookupResult | null = $state(null), path = $state(''), searching = $state(false), searched = $state(false);
   let seriesType = $state(''), seasonFolder = $state(''), sceneNumbering = $state(''), newItems = $state(''), availability = $state('');
+  let profiles: QualityProfilePage | null = $state(null), profileId: number | null = $state(null), profilesLoading = $state(false), profilesError = $state('');
+  let profileVersion = 0;
   let listVersion = 0, detailVersion = 0, searchVersion = 0, alive = true;
   const target: MediaTarget | null = $derived.by(() => selected ? domain === 'movies' ? selected.statistics.file_count === 0 ? {media_type:'movie',id:selected.id} : null : episodeId !== null && episodes.some(e => e.id === episodeId && !e.has_file) ? {media_type:'episode',id:episodeId} : null : null);
   const targetLabel = $derived.by(() => selected ? domain === 'movies' ? selected.title : `${selected.title}: ${episodes.find(e => e.id === episodeId)?.title ?? ''}` : '');
-  function fields(item: LibraryItem) { seriesType = item.settings.series_type ?? ''; seasonFolder = item.settings.season_folder === null ? '' : String(item.settings.season_folder); sceneNumbering = item.settings.use_scene_numbering === null ? '' : String(item.settings.use_scene_numbering); newItems = item.settings.monitor_new_items ?? ''; availability = item.settings.minimum_availability ?? ''; }
+  function fields(item: LibraryItem) { profileId = item.settings.quality_profile_id; seriesType = item.settings.series_type ?? ''; seasonFolder = item.settings.season_folder === null ? '' : String(item.settings.season_folder); sceneNumbering = item.settings.use_scene_numbering === null ? '' : String(item.settings.use_scene_numbering); newItems = item.settings.monitor_new_items ?? ''; availability = item.settings.minimum_availability ?? ''; }
   async function load(offset = 0) {
     const version = ++listVersion, scope = domain; loading = true; error = '';
     const result = await listLibrary(scope, offset);
     if (!alive || version !== listVersion) return;
     loading = false; if (result.ok) page = result.data; else error = result.error;
   }
+  async function loadProfiles(offset = 0) {
+    const version = ++profileVersion, scope = domain; profilesLoading = true; profilesError = '';
+    const result = await listQualityProfiles(scope, offset);
+    if (!alive || version !== profileVersion || scope !== domain) return;
+    profilesLoading = false;
+    if (result.ok) profiles = result.data; else profilesError = result.error;
+  }
   function changeDomain(next: MediaDomain) {
-    domain = next; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
+    searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
   }
   async function select(id: number, offset = 0) {
-    const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
+    searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
     const result = await getLibrary(scope, id);
     if (!alive || version !== detailVersion) return;
     if (!result.ok) { detailLoading = false; selected = null; error = result.error; return; }
-    selected = result.data; fields(selected); episodes = []; episodeOffset = offset;
+    selected = result.data; fields(selected); if (!profiles && !profilesLoading) void loadProfiles(); episodes = []; episodeOffset = offset;
     if (scope === 'tv') {
       const rows = await listEpisodes(id, offset);
       if (!alive || version !== detailVersion) return;
@@ -72,16 +84,17 @@
     else error = result.error;
   }
   function saveSettings() {
-    void patch(domain === 'tv' ? {series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {minimum_availability: (availability || null) as MinimumAvailability | null});
+    void patch(domain === 'tv' ? {quality_profile_id: profileId, series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {quality_profile_id: profileId, minimum_availability: (availability || null) as MinimumAvailability | null});
   }
   function refreshAfterImport() { void load(page?.offset ?? 0); if (selected) void select(selected.id, episodeOffset); }
-  onMount(() => { alive = true; void load(); return () => {alive = false; ++listVersion; ++detailVersion; ++searchVersion;}; });
+  onMount(() => { alive = true; void load(); return () => {alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
 </script>
 
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button></nav>
+  {#if view === 'rss'}<RssPanel />{/if}
   {#if view === 'providers'}<ProviderPanel />{/if}
   {#if view === 'activity'}<ActivityPanel />{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
@@ -110,14 +123,24 @@
         <button disabled={saving} onclick={() => patch({monitored: !selected!.monitored})}>{selected.monitored ? 'Unmonitor' : 'Monitor'} {domain === 'tv' ? 'series' : 'movie'}</button>
         {#if view === 'library'}{#key `${selected.media_type}:${selected.id}`}<MetadataRefreshPanel target={selected.media_type === 'tv' ? {media_type:'tv',series_id:selected.id} : {media_type:'movies',movie_id:selected.id}} onreload={() => {if(selected) {void load(page?.offset ?? 0); void select(selected.id,episodeOffset);}}} />{/key}{/if}
         <details><summary>Library settings</summary><form onsubmit={(event) => {event.preventDefault(); saveSettings();}}>
-          {#if domain === 'tv'}<label>Series type<select bind:value={seriesType}><option value="">Unknown</option><option value="standard">Standard</option><option value="daily">Daily</option><option value="anime">Anime</option></select></label><label>Season folders<select bind:value={seasonFolder}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Scene numbering<select bind:value={sceneNumbering}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Monitor new seasons<select bind:value={newItems}><option value="">Unknown</option><option value="all">All</option><option value="none">None</option></select></label>
-          {:else}<label>Minimum availability<select bind:value={availability}><option value="">Unknown</option><option value="tba">To be announced</option><option value="announced">Announced</option><option value="in_cinemas">In cinemas</option><option value="released">Released</option></select></label><p>Availability is a saved policy. Current release availability is not yet calculated.</p>{/if}
-          <p>Quality profile: {selected.settings.profile_name ?? 'Unassigned'}</p><button disabled={saving}>Save settings</button></form></details>
+          {#if domain === 'tv'}<label>Series type<select aria-label="Series type" bind:value={seriesType}><option value="">Unknown</option><option value="standard">Standard</option><option value="daily">Daily</option><option value="anime">Anime</option></select></label><label>Season folders<select aria-label="Season folders" bind:value={seasonFolder}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Scene numbering<select aria-label="Scene numbering" bind:value={sceneNumbering}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Monitor new seasons<select aria-label="Monitor new seasons" bind:value={newItems}><option value="">Unknown</option><option value="all">All</option><option value="none">None</option></select></label>
+          {:else}<label>Minimum availability<select aria-label="Minimum availability" bind:value={availability}><option value="">Unknown</option><option value="tba">To be announced</option><option value="announced">Announced</option><option value="in_cinemas">In cinemas</option><option value="released">Released</option></select></label><p>Background release decisions use this policy and the known release dates.</p>{/if}
+          <label>Quality profile<select aria-label="Quality profile" bind:value={profileId} disabled={profilesLoading}>
+            <option value={null}>Unassigned</option>
+            {#if profileId !== null && !profiles?.items.some(item => item.id === profileId)}<option value={profileId}>{profileId === selected.settings.quality_profile_id ? selected.settings.profile_name ?? `Profile ${profileId}` : `Profile ${profileId}`}</option>{/if}
+            {#each profiles?.items ?? [] as profile (profile.id)}<option value={profile.id}>{profile.name}</option>{/each}
+          </select></label>
+          {#if profilesLoading}<p role="status">Loading quality profiles…</p>{/if}
+          {#if profilesError}<p role="alert" class="error">{profilesError}</p><button type="button" onclick={() => loadProfiles()}>Retry quality profiles</button>{/if}
+          {#if profiles}<div class="actions"><button type="button" disabled={profilesLoading || profiles.offset === 0} onclick={() => loadProfiles(Math.max(0, profiles!.offset - 50))}>Previous profiles</button><button type="button" disabled={profilesLoading || profiles.offset + profiles.limit >= profiles.total} onclick={() => loadProfiles(profiles!.offset + profiles!.limit)}>Next profiles</button></div>{/if}
+          <button disabled={saving || profilesLoading}>Save settings</button></form></details>
         {#if domain === 'tv'}
           <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={saving} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
-          <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={saving} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
+          <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={saving} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
           <div class="pagination"><button disabled={episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
         {:else if selected.statistics.file_count > 0}<p>This movie already has a file association. Initial import will not replace it.</p>{/if}
+        {#if domain === 'movies'}<button onclick={() => searchTarget = {media_type:'movie',id:selected!.id}}>Search movie releases</button>{/if}
+        {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} />{/key}{/if}
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
     </article>
   </div>
