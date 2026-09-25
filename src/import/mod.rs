@@ -5,6 +5,10 @@ mod fs;
 pub(crate) fn root_directory(path: &std::path::Path) -> Option<std::fs::File> {
     fs::directory(path).ok()
 }
+// The same anchored walk, retaining OS error classification for read-only browsing.
+pub(crate) fn filesystem_directory(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    fs::directory_io(path)
+}
 use crate::{
     api::{ApiErrorEnvelope, ImportRequest, Operation},
     db::{Database, MediaTarget},

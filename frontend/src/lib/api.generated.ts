@@ -74,6 +74,24 @@ export type FileRevision = { version: number, real: number, is_repack: boolean, 
 
 export type FileUpdate = { id: number, quality?: FileQualityInput | null, languages?: Array<number> | null, release_group?: string | null, edition?: string | null, indexer_flags?: number | null, release_type?: number | null, };
 
+export type FilesystemContents = { path: string, parent: string | null, directories: Array<FilesystemEntry>, files: Array<FilesystemEntry>, };
+
+export type FilesystemEntry = { type: FilesystemKind, name: string, path: string, extension: string | null, size: number | null, last_modified: string | null, };
+
+export type FilesystemKind = "file" | "folder";
+
+export type FilesystemLookup = { path?: string, include_files?: boolean, allow_folders_without_trailing_slashes?: boolean, };
+
+export type FilesystemMediaFile = { path: string, relative_path: string, name: string, };
+
+export type FilesystemMediaFiles = { path: string, media_type: MediaDomain, files: Array<FilesystemMediaFile>, };
+
+export type FilesystemMediaQuery = { path: string, media_type: MediaDomain, };
+
+export type FilesystemPath = { path: string, };
+
+export type FilesystemType = { type: FilesystemKind, };
+
 export type ImportInput = ManualImportRequest | ImportRequest;
 
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };

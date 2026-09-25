@@ -63,6 +63,7 @@ fn router(state: Arc<AppState>) -> Router {
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
         .merge(hrrdarr::root_folders::router(state.db.clone()))
+        .merge(hrrdarr::filesystem::router())
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(hrrdarr::providers::router(

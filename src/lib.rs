@@ -16,3 +16,5 @@ pub mod providers;
 pub mod root_folders;
 
 pub mod remote_paths;
+
+pub mod filesystem;

@@ -22,6 +22,9 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | --- | --- | --- |
 | GET `/series` | none | `LegacySeries[]` |
 | GET `/series/{id}/episodes` | none | `LegacyEpisode[]` |
+| GET `/filesystem` | `FilesystemLookup` query | `FilesystemContents` |
+| GET `/filesystem/type` | `FilesystemPath` query | `FilesystemType` (UI classification hint) |
+| GET `/filesystem/media-files` | `FilesystemMediaQuery` query | `FilesystemMediaFiles` |
 | POST `/imports` | `ImportRequest` | `Operation` (202 preview) |
 | POST `/imports/{id}/execute` | none | No success yet; existing execution guard returns 503 |
 | POST `/migrations` | `SnapshotOptions` query; raw SQLite backup bytes | `SnapshotReport` |

@@ -23,11 +23,13 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
-const BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const BUDGET: Duration = Duration::from_secs(5);
 const MAX_ENTRIES: usize = 10_000;
 const MAX_RESPONSE: usize = 1024 * 1024;
 // ponytail: two blocking observations process-wide; retain permits until actual workers finish.
-static OBSERVERS: Semaphore = Semaphore::const_new(2);
+pub(crate) static OBSERVERS: Semaphore = Semaphore::const_new(2);
+#[cfg(test)]
+pub(crate) static OBSERVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Debug)]
 struct Error(StatusCode, &'static str);
 type Result<T> = std::result::Result<T, Error>;
@@ -500,6 +502,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn observation_limits_and_busy_are_not_empty_successes() {
+        let _test_guard = OBSERVER_TEST_LOCK.lock().await;
         let path =
             std::env::temp_dir().join(format!("hrrdarr-root-bounds-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();

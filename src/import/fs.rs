@@ -128,12 +128,14 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 pub(super) fn directory(path: &Path) -> Result<File> {
+    directory_io(path).map_err(io)
+}
+pub(super) fn directory_io(path: &Path) -> std::io::Result<File> {
     let mut fd: File = fs::open(
         "/",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Permissions::empty(),
-    )
-    .map_err(io)?
+    )?
     .into();
     for c in path.components() {
         match c {
@@ -144,11 +146,10 @@ pub(super) fn directory(path: &Path) -> Result<File> {
                     name,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Permissions::empty(),
-                )
-                .map_err(io)?
+                )?
                 .into()
             }
-            _ => return Err(changed()),
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
         }
     }
     Ok(fd)
