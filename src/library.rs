@@ -991,6 +991,25 @@ async fn create(
     no_query(query)?;
     let mut req = body(b)?;
     let d = ctx.domain;
+    let path = validate_create(d, &req)?;
+    let c = ctx.db.connect().await?;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let outcome = create_record(&tx, d, &mut req, &path).await;
+    match outcome {
+        Ok(item) => {
+            tx.commit().await?;
+            Ok((StatusCode::CREATED, Json(item)))
+        }
+        Err(e) => {
+            tx.rollback().await?;
+            Err(e)
+        }
+    }
+}
+
+fn validate_create(d: Domain, req: &Create) -> Result<String> {
     let path = path(&req.path)?;
     if req.year.is_some_and(|v| !(1..=9999).contains(&v)) {
         return Err(bad("Year must be 1 to 9999 or null"));
@@ -1010,21 +1029,7 @@ async fn create(
         return Err(bad("Catalog identity belongs to another domain"));
     }
     patch_fields(d, &req.settings)?;
-    let c = ctx.db.connect().await?;
-    let tx = c
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-        .await?;
-    let outcome = create_record(&tx, d, &mut req, &path).await;
-    match outcome {
-        Ok(item) => {
-            tx.commit().await?;
-            Ok((StatusCode::CREATED, Json(item)))
-        }
-        Err(e) => {
-            tx.rollback().await?;
-            Err(e)
-        }
-    }
+    Ok(path)
 }
 
 async fn create_record(
@@ -1178,6 +1183,229 @@ mod tests {
         ] {
             let patch: Patch = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(patch).unwrap(), value);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MetadataContext {
+    db: Arc<Database>,
+    client: Arc<crate::metadata::MetadataClient>,
+    domain: Domain,
+}
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "MetadataLookupQuery")]
+pub struct LookupQuery {
+    pub term: String,
+}
+#[derive(Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "SeriesLookupAdd")]
+pub struct SeriesLookupAdd {
+    pub tvdb_id: i64,
+    pub path: String,
+    #[serde(default)]
+    #[ts(as = "Option<Patch>", optional)]
+    pub settings: Patch,
+}
+#[derive(Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "MovieLookupAdd")]
+pub struct MovieLookupAdd {
+    pub tmdb_id: i64,
+    pub path: String,
+    #[serde(default)]
+    #[ts(as = "Option<Patch>", optional)]
+    pub settings: Patch,
+}
+
+type LookupHttp<T> = std::result::Result<T, Response>;
+/// Inject one bounded metadata client; fixed production origins or owned loopback test origins.
+pub fn metadata_router(db: Arc<Database>, client: Arc<crate::metadata::MetadataClient>) -> Router {
+    Router::new()
+        .route(
+            "/api/v1/tv/series/lookup",
+            get(metadata_search).post(selected_tv),
+        )
+        .route("/api/v1/tv/series/lookup/{id}", get(metadata_detail))
+        .with_state(MetadataContext {
+            db: db.clone(),
+            client: client.clone(),
+            domain: Domain::Tv,
+        })
+        .merge(
+            Router::new()
+                .route(
+                    "/api/v1/movies/lookup",
+                    get(metadata_search).post(selected_movie),
+                )
+                .route("/api/v1/movies/lookup/{id}", get(metadata_detail))
+                .with_state(MetadataContext {
+                    db,
+                    client,
+                    domain: Domain::Movies,
+                }),
+        )
+        .layer(DefaultBodyLimit::max(256 * 1024))
+}
+async fn metadata_search(
+    State(ctx): State<MetadataContext>,
+    query: std::result::Result<Query<LookupQuery>, QueryRejection>,
+) -> LookupHttp<Json<Vec<crate::metadata::LookupResult>>> {
+    let query = query
+        .map_err(|_| bad("Expected one bounded metadata lookup term").into_response())?
+        .0;
+    let result = match ctx.domain {
+        Domain::Tv => ctx.client.lookup_tv(&query.term).await,
+        Domain::Movies => ctx.client.lookup_movie(&query.term).await,
+    };
+    result.map(Json).map_err(IntoResponse::into_response)
+}
+async fn metadata_detail(
+    State(ctx): State<MetadataContext>,
+    Path(raw): Path<String>,
+    query: RawQuery,
+) -> LookupHttp<Response> {
+    no_query(query).map_err(IntoResponse::into_response)?;
+    let id = raw
+        .parse::<i64>()
+        .ok()
+        .filter(|id| (1..=9007199254740991).contains(id))
+        .ok_or_else(|| bad("Invalid selected metadata identity").into_response())?;
+    match ctx.domain {
+        Domain::Tv => ctx
+            .client
+            .series(id)
+            .await
+            .map(|detail| Json(detail).into_response())
+            .map_err(IntoResponse::into_response),
+        Domain::Movies => ctx
+            .client
+            .movie(id)
+            .await
+            .map(|detail| Json(detail).into_response())
+            .map_err(IntoResponse::into_response),
+    }
+}
+async fn selected_tv(
+    State(ctx): State<MetadataContext>,
+    query: RawQuery,
+    payload: std::result::Result<Json<SeriesLookupAdd>, JsonRejection>,
+) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
+    no_query(query).map_err(IntoResponse::into_response)?;
+    let input = body(payload).map_err(IntoResponse::into_response)?;
+    selected(ctx, input.tvdb_id, input.path, input.settings).await
+}
+async fn selected_movie(
+    State(ctx): State<MetadataContext>,
+    query: RawQuery,
+    payload: std::result::Result<Json<MovieLookupAdd>, JsonRejection>,
+) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
+    no_query(query).map_err(IntoResponse::into_response)?;
+    let input = body(payload).map_err(IntoResponse::into_response)?;
+    selected(ctx, input.tmdb_id, input.path, input.settings).await
+}
+async fn selected(
+    ctx: MetadataContext,
+    external_id: i64,
+    rawpath: String,
+    settings: Patch,
+) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
+    if !(1..=9007199254740991).contains(&external_id) {
+        return Err(bad("Invalid selected metadata identity").into_response());
+    }
+    let mut req = Create {
+        title: None,
+        year: None,
+        tvdb_id: None,
+        tmdb_id: None,
+        imdb_id: None,
+        metadata_id: None,
+        path: rawpath,
+        settings,
+    };
+    let path = validate_create(ctx.domain, &req).map_err(IntoResponse::into_response)?;
+    // Every external request completes before opening the write transaction.
+    let mut episodes = Vec::new();
+    let mut monitoring = BTreeMap::new();
+    match ctx.domain {
+        Domain::Tv => {
+            let detail = ctx
+                .client
+                .series(external_id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            req.title = Some(detail.title);
+            req.year = detail.year;
+            req.tvdb_id = Some(detail.tvdb_id);
+            monitoring.extend(detail.seasons.into_iter().map(|number| (number, true)));
+            for season in req.settings.seasons.take().unwrap_or_default() {
+                let flag = monitoring.get_mut(&season.number).ok_or_else(|| {
+                    bad("Season override is absent from selected catalog").into_response()
+                })?;
+                *flag = season.monitored;
+            }
+            req.settings.seasons = Some(
+                monitoring
+                    .iter()
+                    .map(|(number, monitored)| SeasonInput {
+                        number: *number,
+                        monitored: *monitored,
+                    })
+                    .collect(),
+            );
+            episodes = detail.episodes;
+        }
+        Domain::Movies => {
+            let detail = ctx
+                .client
+                .movie(external_id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            req.title = Some(detail.title);
+            req.year = detail.year;
+            req.tmdb_id = Some(detail.tmdb_id);
+            req.imdb_id = detail.imdb_id;
+        }
+    }
+    validate_create(ctx.domain, &req).map_err(IntoResponse::into_response)?;
+    let c = ctx
+        .db
+        .connect()
+        .await
+        .map_err(|error| Error::from(error).into_response())?;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(|error| Error::from(error).into_response())?;
+    let outcome:Result<LibraryItem>=async {
+        // Legacy rows need not be globally unique, but a new series must not
+        // adopt an external episode already present in any library series.
+        for chunk in episodes.chunks(MAX_IDS) {
+            let values=chunk.iter().map(|episode|Value::Integer(episode.tvdb_id)).collect::<Vec<_>>();
+            if tx.query(&format!("SELECT 1 FROM episodes WHERE tvdb_id IN ({}) LIMIT 1",placeholders(values.len())),values).await?.next().await?.is_some(){return Err(conflict());}
+        }
+        let item=create_record(&tx,ctx.domain,&mut req,&path).await?;
+        for episode in episodes {
+            let monitored=monitoring.get(&episode.season).ok_or_else(||bad("Episode season is absent from selected catalog"))?;
+            tx.execute("INSERT INTO episodes(series_id,season,number,title,monitored,tvdb_id,air_date,air_date_utc,absolute_episode_number,runtime,overview,finale_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![item.id,episode.season,episode.number,episode.title,i64::from(*monitored),episode.tvdb_id,episode.air_date,episode.air_date_utc,episode.absolute_episode_number,episode.runtime,episode.overview,episode.finale_type]).await?;
+        }
+        // Refresh association-based counts only after every episode has been inserted.
+        fetch(&tx,ctx.domain,"r.id=?",vec![item.id.into()],1,0,true).await?.pop().ok_or_else(missing)
+    }.await;
+    match outcome {
+        Ok(item) => {
+            tx.commit()
+                .await
+                .map_err(|error| Error::from(error).into_response())?;
+            Ok((StatusCode::CREATED, Json(item)))
+        }
+        Err(error) => {
+            tx.rollback()
+                .await
+                .map_err(|error| Error::from(error).into_response())?;
+            Err(error.into_response())
         }
     }
 }

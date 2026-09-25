@@ -66,6 +66,8 @@ export type EpisodeCover = { coverType: EpisodeCoverType, url?: string | null, r
 
 export type EpisodeCoverType = "unknown" | "poster" | "banner" | "fanart" | "screenshot" | "headshot" | "clearlogo";
 
+export type EpisodeDetails = { tvdb_id: number, season: number, number: number, title: string, air_date: string | null, air_date_utc: string | null, absolute_episode_number: number | null, runtime: number | null, overview: string | null, finale_type: string | null, };
+
 export type EpisodeFileProjection = { id: number, series_id: number, path: string, };
 
 export type EpisodeIncludes = { include_series?: boolean, include_episode_file?: boolean, include_images?: boolean, };
@@ -176,6 +178,8 @@ export type LibraryStatistics = { total_episode_count: number | null, episode_co
 
 export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
+export type LookupResult = { media_type: MediaDomain, external_id: number, title: string, year: number | null, imdb_id: string | null, };
+
 export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
 
 export type Mapping = { id: number, media_type: MediaDomain, host: string, remote_path: string, local_path: string, revision: number, };
@@ -198,15 +202,21 @@ export type MediaInfoSubtitleStream = { language: string | null, format: string 
 
 export type MediaTarget = { "media_type": "episode", "id": number } | { "media_type": "movie", "id": number };
 
+export type MetadataLookupQuery = { term: string, };
+
 export type MinimumAvailability = "tba" | "announced" | "in_cinemas" | "released";
 
 export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
+export type MovieDetails = { tmdb_id: number, title: string, year: number | null, imdb_id: string | null, };
+
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
 export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
+
+export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
@@ -343,6 +353,10 @@ export type RootQuery = { limit?: number, offset?: number, };
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
 export type SearchEngine = "raw" | "sphinx";
+
+export type SeriesDetails = { tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
+
+export type SeriesLookupAdd = { tvdb_id: number, path: string, settings?: LibraryPatch, };
 
 export type SeriesType = "standard" | "daily" | "anime";
 

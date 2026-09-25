@@ -148,10 +148,64 @@ upgrade/replay/dry runs, edited/deleted mapping conflicts, private/unknown setti
 constraints and late-failure rollback for both applications. Existing older upgrade,
 file/episode snapshot and frontend compatibility checks remain applicable.
 
-Not claimed: external lookup/refresh/search-on-add, bulk disk/library discovery,
+Not claimed: full metadata refresh/search-on-add, bulk disk/library discovery,
 provider-derived rich catalog data/translations/alternative titles/tags, folder
 naming/rename previews, root-policy services, physical move/delete/list exclusions,
 availability/scoring policy, realtime events, browser flows or live services.
-Nested lookup/import/folder/editor deletion and movie alternatives/rename remain
+Remaining lookup breadth/import/folder/editor deletion and movie alternatives/rename remain
 required work, whether tracked in these rows or separately. This manual foundation
 does not complete either full controller or the combined slice 0/1 gates.
+
+
+## Metadata lookup and selected add
+
+The existing manual POST still accepts explicit catalog facts. Selected metadata adds
+are a separate server-validated workflow:
+
+| Route | Contract |
+| --- | --- |
+| GET `/api/v1/tv/series/lookup?term=...` | Bounded TV lookup results; `external_id` is TVDB |
+| GET `/api/v1/movies/lookup?term=...` | Bounded movie lookup results; `external_id` is TMDB |
+| GET `/api/v1/tv/series/lookup/{id}` | Validated series details, seasons and episode catalog |
+| GET `/api/v1/movies/lookup/{id}` | Validated movie catalog details |
+| POST `/api/v1/tv/series/lookup` | `{tvdb_id,path,settings?}`; HTTP 201 library resource |
+| POST `/api/v1/movies/lookup` | `{tmdb_id,path,settings?}`; HTTP 201 library resource |
+
+Lookup results include `media_type` so equal TV/movie external IDs remain distinct.
+POST accepts a canonical selected ID, never a caller-supplied title/episode payload
+or an upstream URL. The server fetches details again, validating the complete catalog
+before opening a write transaction. Query fields/effect flags are rejected on detail
+and add routes; POST uses the existing 256 KiB library body bound and closed request
+fields. Client construction errors fail startup rather than silently disabling lookup.
+Production origins are fixed; tests inject owned loopback origins through the client.
+
+A TV selected add creates the series, library settings, every returned season and
+all returned episodes together. A validated empty upcoming catalog is allowed;
+missing, contradictory, duplicate or oversized metadata is rejected. Every source
+season defaults to monitored, independently from series-level monitoring. Explicit
+`settings.seasons` overrides must identify distinct seasons present in that catalog
+and determine the initial episode flags for those seasons. `monitor_new_items` does
+not reinterpret this initial graph. All nullable episode facts remain absent when
+not supplied. TVDB identities, dates, absolute numbers, runtime, overview and finale
+type are retained where supported by existing columns; no file association is invented.
+TV IMDb metadata has no current series storage field and is not persisted.
+
+Movie selected add uses the existing separate catalog/membership logic: exactly
+matching catalog facts can be adopted, while conflicting metadata or existing library
+membership returns 409. Series/catalog/path conflicts and TV episode identities already
+stored in another series also fail without replacing existing state. Episode identities
+are checked in bounded batches inside the write transaction. Repeating an already
+successful add returns a conflict rather than creating duplicate library records.
+
+The transaction rolls back series/movie membership, new catalog rows, settings,
+seasons and episodes together on any late failure. Returned TV statistics are fetched
+after episode insertion. Lookup/add does not touch media, create directories, refresh
+an existing library or submit downloads/searches. Public episode reads now provide
+real targets for the existing safe initial-import API without SQL fixture seeding.
+
+`tests/metadata_lookup.rs` exercises owned metadata mocks, selected both-domain adds,
+actual initial imports and library readback without SQL-created library/episode targets,
+plus malformed catalog, duplicate add and late-write rollback. Existing library and
+import tests remain applicable. These are native recorded-protocol tests; live metadata
+services, full upstream lookup/refresh behavior and full controller parity remain
+unverified. Complete `api.035`/`api.040` scope remains Partial.

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
+    metadata: Arc<hrrdarr::metadata::MetadataClient>,
     db: Arc<Database>,
     provider_key: Option<Arc<hrrdarr::providers::CredentialKey>>,
 }
@@ -39,7 +40,12 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
         Err(env::VarError::NotPresent) => None,
         Err(_) => return Err("Invalid provider key environment value".into()),
     };
-    let state = Arc::new(AppState { db, provider_key });
+    let metadata = Arc::new(hrrdarr::metadata::MetadataClient::new()?);
+    let state = Arc::new(AppState {
+        db,
+        provider_key,
+        metadata,
+    });
     let (app, refresh) = router_parts(state.clone());
     let addr: SocketAddr = env::var("HRRDARR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
@@ -79,6 +85,10 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
+        .merge(hrrdarr::library::metadata_router(
+            state.db.clone(),
+            state.metadata.clone(),
+        ))
         .merge(hrrdarr::root_folders::router(state.db.clone()))
         .merge(hrrdarr::filesystem::router())
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
@@ -178,6 +188,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(AppState {
+            metadata: Arc::new(hrrdarr::metadata::MetadataClient::new().unwrap()),
             db: Arc::new(db),
             provider_key: None,
         });
@@ -243,6 +254,7 @@ mod tests {
         assert_eq!(missing_key.status, StatusCode::BAD_REQUEST);
         assert!(!missing_key.message.contains("SNAPSHOT_SECRET"));
         let keyed_state = Arc::new(AppState {
+            metadata: Arc::new(hrrdarr::metadata::MetadataClient::new().unwrap()),
             db: state.db.clone(),
             provider_key: Some(Arc::new(
                 hrrdarr::providers::CredentialKey::from_hex(&"ab".repeat(32)).unwrap(),
@@ -309,6 +321,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("hrrdarr-routes-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let state = Arc::new(AppState {
+            metadata: Arc::new(hrrdarr::metadata::MetadataClient::new().unwrap()),
             db: Arc::new(Database::open_local(directory.join("db")).await.unwrap()),
             provider_key: None,
         });

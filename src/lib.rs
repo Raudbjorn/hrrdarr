@@ -22,3 +22,5 @@ pub mod filesystem;
 pub mod commands;
 
 pub mod history;
+
+pub mod metadata;
