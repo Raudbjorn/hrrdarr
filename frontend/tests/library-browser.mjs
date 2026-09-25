@@ -26,10 +26,10 @@ async function waitForCommand(route, id, status, recordsRemoved) {
   }
   assert.fail(`Command ${id} did not reach ${status}: ${JSON.stringify(last)}`);
 }
-async function add(domain, title, path) {
+async function add(domain, title, path, query = 'Fixture') {
   await page.getByRole('button', {name: domain === 'tv' ? 'TV' : 'Movies', exact:true}).click();
   await page.getByRole('button', {name: domain === 'tv' ? 'Add series' : 'Add movie', exact:true}).click();
-  await page.getByLabel('Search catalogue').fill('Fixture');
+  await page.getByLabel('Search catalogue').fill(query);
   await page.getByRole('button', {name:'Search', exact:true}).click();
   await page.getByRole('button', {name:new RegExp(title+' .*')} ).click();
   await page.getByLabel('Existing library directory').fill(path);
@@ -122,7 +122,7 @@ async function verifyReleaseSearch() {
     await page.getByText('Library settings',{exact:true}).click();assert.equal(await page.getByLabel('Quality profile',{exact:true}).inputValue(),String(profile.id));
     await page.getByRole('button',{name:domain==='tv'?'Search releases for Second episode':'Search movie releases',exact:true}).click();
     const panel=page.getByRole('region',{name:'Release search'});
-    await panel.getByLabel('Search indexer').selectOption(indexer.id);
+    await panel.getByLabel(/^Search indexer/).selectOption(indexer.id);
     const response=page.waitForResponse(r=>r.url().endsWith('/api/v1/release-search'));
     await panel.getByRole('button',{name:'Find releases',exact:true}).click();
     const releases=await response;assert.equal(releases.status(),200);const result=await releases.json();assert.equal(result.items.length,1);
@@ -246,6 +246,56 @@ async function verifyDownloadProcessing() {
     if(domain==='tv')assert.equal((await stat(`${scratch}/tv/${filename}`)).ino,(await stat(`${scratch}/incoming/${filename}`)).ino,'TV hardlink preserves source inode');
   }
   const added=await (await page.request.get(`${providerOrigin}/fixture-completed`)).json();assert.equal(added.length,2,'Retry/recovery must not add torrents again');assert.deepEqual(added.map(r=>r.category).sort(),['movies','tv']);
+}
+
+async function verifySearchGrab() {
+  const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
+  assert.equal((await page.request.post(`${providerOrigin}/fixture-search`)).status(),204);
+  const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
+  const indexer=providers.find(p=>p.name==='Browser torznab'),client=providers.find(p=>p.name==='Browser qbittorrent');
+  let expectedAdds=2;
+  for(const domain of ['tv','movies']) {
+    const created=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Target search ${domain}`,items:[{kind:'quality',quality_id:5,allowed:true},{kind:'quality',quality_id:3,allowed:true}],policy:{upgrade_allowed:true,cutoff:{kind:'quality',quality_id:3},min_format_score:0,cutoff_format_score:0,min_upgrade_format_score:1,language_id:domain==='movies'?-2:null,format_items:[]}}});
+    assert.equal(created.status(),201,await created.text());const profile=await created.json();
+    for(const [external,mode] of [[202,'interactive'],[203,'automatic']]) {
+      const title=`Search ${domain==='tv'?'series':'movie'} ${external}`;
+      await page.getByRole('button',{name:'Library',exact:true}).click();
+      await add(domain,title,`${scratch}/search-${domain}-${external}`,`Search ${external}`);
+      const collection=domain==='tv'?'/api/v1/tv/series':'/api/v1/movies';
+      const item=(await (await page.request.get(`${origin}${collection}`)).json()).items.find(r=>r.title===title);assert.ok(item);
+      const updated=await page.request.put(`${origin}${collection}/${item.id}`,{data:{quality_profile_id:profile.id,...(domain==='tv'?{series_type:'standard',use_scene_numbering:false}:{minimum_availability:'released'})}});assert.equal(updated.status(),200,await updated.text());
+      await page.getByRole('button',{name:domain==='tv'?'Search releases for Search pilot':'Search movie releases',exact:true}).click();
+      let panel=page.getByRole('region',{name:'Search and download',exact:true});
+      await panel.getByLabel('Download search indexer').selectOption(indexer.id);await panel.getByLabel('Search download client').selectOption(client.id);
+      let creates=0,command;
+      if(mode==='interactive') await page.route('**/api/v1/search/commands',async route=>{if(route.request().method()!=='POST')return route.continue();creates++;const response=await route.fetch();assert.equal(response.status(),202);command=await response.json();await route.abort('failed');});
+      const accepted=mode==='automatic'?page.waitForResponse(r=>r.url().endsWith('/api/v1/search/commands')&&r.request().method()==='POST'):null;
+      await panel.getByRole('button',{name:mode==='interactive'?'Search to choose a download':'Search and download best match',exact:true}).click();
+      if(mode==='interactive') {
+        await panel.getByText('The request may have committed. Check search status before another action.',{exact:true}).waitFor();assert.equal(creates,1);assert.equal(await panel.getByRole('button',{name:'Search to choose a download',exact:true}).isDisabled(),true);
+        await page.unroute('**/api/v1/search/commands');await panel.getByRole('button',{name:'Check search status',exact:true}).click();
+      } else {const response=await accepted;assert.equal(response.status(),202);command=await response.json();}
+      await waitForCommand('/api/v1/search/commands',command.id,'succeeded');
+      await panel.getByRole('button',{name:'Check search status',exact:true}).click();
+      await panel.getByText(/reject:.*wrong_media_category/).waitFor();
+      if(mode==='interactive') {
+        assert.equal((await (await page.request.get(`${providerOrigin}/fixture-completed`)).json()).length,expectedAdds,'Listing retained offers must not submit');
+        let grabs=0;
+        await page.route('**/api/v1/search/results/*/grab',async route=>{grabs++;const response=await route.fetch();assert.ok(response.status()>=200&&response.status()<300);await route.abort('failed');});
+        await panel.getByRole('button',{name:new RegExp('^Download .*720p')}).click();
+        await panel.getByText('The request may have committed. Check search status before another action.',{exact:true}).waitFor();assert.equal(grabs,1);
+        await page.unroute('**/api/v1/search/results/*/grab');await panel.getByRole('button',{name:'Check search status',exact:true}).click();
+      }
+      const deadline=Date.now()+15000;let last;
+      while(Date.now()<deadline){const response=await page.request.get(`${origin}/api/v1/search/commands/${command.id}`,{timeout:Math.max(1,deadline-Date.now())});assert.equal(response.status(),200);last=await response.json();if(last.selected_candidate_status==='observed')break;await new Promise(r=>setTimeout(r,100));}
+      assert.equal(last.selected_candidate_status,'observed',JSON.stringify(last));
+      const digit=domain==='tv'?(mode==='interactive'?'1':'6'):(mode==='interactive'?'3':'8');
+      const added=await (await page.request.get(`${providerOrigin}/fixture-completed`)).json();expectedAdds++;assert.equal(added.length,expectedAdds);assert.equal(added.at(-1).hash,digit.repeat(40));assert.equal(added.at(-1).category,domain);
+      await page.reload();await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();await page.getByRole('button',{name:new RegExp(`${title}.*0 files`)}).click();await page.getByRole('button',{name:domain==='tv'?'Search releases for Search pilot':'Search movie releases',exact:true}).click();
+      panel=page.getByRole('region',{name:'Search and download',exact:true});await panel.getByText(new RegExp(`Download ${last.selected_candidate_id}: observed`)).waitFor();
+      await page.setViewportSize({width:390,height:844});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Search receipt and rejected offers must fit mobile');await page.setViewportSize({width:1280,height:720});
+    }
+  }
 }
 
 async function verifyActivity() {
@@ -640,11 +690,12 @@ try {
   await verifyBlocklist();
   await verifyClearBlocklist();
   await verifyDownloadProcessing();
+  await verifySearchGrab();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, both-domain automatic/interactive search and exact grab, lost create/grab reply readback and retained history, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import SearchGrabPanel from './SearchGrabPanel.svelte';
   import type { ApiPage, Provider, MediaTarget, ReleaseSearchPage, IndexerContinuation, ReleasePolicy } from './api.generated';
   import { listProviders, searchReleases, getReleasePolicy, saveReleasePolicy } from './api';
   let {target}: {target:MediaTarget} = $props();
@@ -43,7 +44,7 @@
   onMount(()=>{alive=true;void loadProviders();void readPolicy();return()=>{alive=false;};});
 </script>
 <section aria-label="Release search" class="release-search">
-  <h2>Release search</h2><p>Review releases for {target.media_type} {target.id}. This search does not download. User searches bypass background availability and delay rules.</p>
+  <h2>Release search</h2><p>Review releases for {target.media_type} {target.id}. Find releases only reviews results. Use Search and download below to choose or automatically download a release. User searches bypass background availability and delay rules.</p>
   <label>Search indexer<select bind:value={providerId} disabled={busy||loading} onchange={()=>{chosen=providers?.items.find(p=>p.id===providerId)??null;result=null;}}><option value="">Choose an indexer</option>{#if chosen&&!providers?.items.some(p=>p.id===chosen!.id)}<option value={chosen.id}>{chosen.name}</option>{/if}{#each providers?.items.filter(eligible)??[] as provider (provider.id)}<option value={provider.id}>{provider.name} · revision {provider.revision}</option>{/each}</select></label>
   {#if loading}<p role="status">Loading indexers…</p>{/if}
   {#if providers}<div class="actions"><button disabled={loading||busy||providers.offset===0} onclick={()=>loadProviders(Math.max(0,providers!.offset-25))}>Previous search providers</button><button disabled={loading||busy||providers.offset+providers.limit>=providers.total} onclick={()=>loadProviders(providers!.offset+providers!.limit)}>Next search providers</button><button disabled={loading||busy} onclick={()=>loadProviders(providers!.offset)}>Reload search providers</button></div>{/if}
@@ -54,5 +55,6 @@
     {#if policyError}<p role="alert" class="error">{policyError}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
     <form onsubmit={e=>{e.preventDefault();void savePolicy();}}><label>Torrent delay (minutes)<input type="number" min="0" max="10080" step="1" required bind:value={torrent}/></label><label>Usenet delay (minutes)<input type="number" min="0" max="10080" step="1" required bind:value={usenet}/></label>{#if domain==='movies'}<label>Availability adjustment (days)<input type="number" min="-365" max="365" step="1" required bind:value={days}/></label>{/if}<div class="actions"><button disabled={policyBusy||!policyReady}>Save release delays</button><button type="button" disabled={policyBusy} onclick={readPolicy}>Read saved release delays</button></div></form>
   </details>
+  <SearchGrabPanel {target}/>
 </section>
 <style>.release-search{border-top:2px solid #245ba8;margin-top:1.5rem;padding-top:1rem}ul{padding-left:1.25rem}li{border-bottom:1px solid #cbd5de;padding:.5rem 0;overflow-wrap:anywhere}.actions{margin:.8rem 0}details{margin-top:1rem}</style>

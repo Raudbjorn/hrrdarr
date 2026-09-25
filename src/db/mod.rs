@@ -121,6 +121,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "download_processing",
         include_str!("../../migrations/0026_download_processing.sql"),
     ),
+    (
+        "targeted_search",
+        include_str!("../../migrations/0027_targeted_search.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -533,3 +537,6 @@ mod rss_tests;
 
 #[cfg(test)]
 mod processing_tests;
+
+#[cfg(test)]
+mod search_tests;

@@ -25,6 +25,7 @@ pub mod blocklist;
 pub mod metadata;
 pub mod processing;
 pub mod rss;
+pub mod search;
 mod worker;
 pub use worker::{Runtime, start, start_with_metadata};
 
@@ -319,7 +320,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Ok(current)
     }
     let count = c
-        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)", ())
+        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)", ())
         .await?
         .next()
         .await?

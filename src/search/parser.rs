@@ -1,7 +1,7 @@
 //! Independently implemented token grammar. Unrecognized numbering never becomes a guess.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Numbering {
     Episodes { season: i64, episodes: Vec<i64> },
@@ -9,7 +9,7 @@ pub enum Numbering {
     Daily { date: String },
     Absolute { episode: i64 },
 }
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ParsedRelease {
     pub title: String,
     pub year: Option<i64>,

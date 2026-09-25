@@ -402,25 +402,7 @@ pub(super) async fn apply_quality(
             let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
                 .await
                 .map_err(|_| SearchError("release_profile_error"))?;
-            let mut ranked = Vec::new();
-            for (rank, item) in profile.items.iter().enumerate() {
-                match item {
-                    ProfileItem::Quality(l) => {
-                        ranked.push((l.quality_id, rank, l.allowed, l.min_size, l.max_size))
-                    }
-                    ProfileItem::Group { allowed, items, .. } => {
-                        for l in items {
-                            ranked.push((
-                                l.quality_id,
-                                rank,
-                                *allowed && l.allowed,
-                                l.min_size,
-                                l.max_size,
-                            ))
-                        }
-                    }
-                }
-            }
+            let ranked = profile_ranks(&profile.items);
             if let Some((_, rank, allowed, min, max)) =
                 ranked.iter().find(|(id, ..)| *id == quality_id)
             {
@@ -494,4 +476,64 @@ pub(super) async fn apply_quality(
         result.deny("quality_unknown")
     }
     Ok(())
+}
+
+fn profile_ranks(items: &[ProfileItem]) -> Vec<(i64, usize, bool, Option<f64>, Option<f64>)> {
+    let mut ranked = Vec::new();
+    for (rank, item) in items.iter().enumerate() {
+        match item {
+            ProfileItem::Quality(l) => {
+                ranked.push((l.quality_id, rank, l.allowed, l.min_size, l.max_size))
+            }
+            ProfileItem::Group { allowed, items, .. } => {
+                for l in items {
+                    ranked.push((
+                        l.quality_id,
+                        rank,
+                        *allowed && l.allowed,
+                        l.min_size,
+                        l.max_size,
+                    ));
+                }
+            }
+        }
+    }
+    ranked
+}
+pub(crate) async fn target_ranks(
+    c: &Connection,
+    target: &crate::db::MediaTarget,
+) -> Result<Vec<(i64, usize)>> {
+    let (media, column, id) = match target {
+        crate::db::MediaTarget::Episode(id) => (
+            MediaDomain::Tv,
+            "series_id",
+            c.query("SELECT series_id FROM episodes WHERE id=?", [*id])
+                .await?
+                .next()
+                .await?
+                .ok_or(SearchError("release_target_missing"))?
+                .get::<i64>(0)?,
+        ),
+        crate::db::MediaTarget::Movie(id) => (MediaDomain::Movies, "movie_id", *id),
+    };
+    let profile = c
+        .query(
+            &format!("SELECT quality_profile_id FROM library_settings WHERE {column}=?"),
+            [id],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or(SearchError("release_profile_error"))?
+        .get::<Option<i64>>(0)?
+        .ok_or(SearchError("release_profile_error"))?;
+    let profile = crate::quality_profiles::fetch(c, domain(media), profile)
+        .await
+        .map_err(|_| SearchError("release_profile_error"))?;
+    Ok(profile_ranks(&profile.items)
+        .into_iter()
+        .filter(|(_, _, allowed, ..)| *allowed)
+        .map(|(id, rank, ..)| (id, rank))
+        .collect())
 }

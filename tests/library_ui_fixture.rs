@@ -60,6 +60,12 @@ fn show() -> serde_json::Value {
 fn movie() -> serde_json::Value {
     json!({"tmdbId":101,"title":"Fixture movie","year":2021,"imdbId":"tt7654321","runtime":100,"digitalRelease":"2021-01-01T00:00:00Z"})
 }
+fn search_show(id: u32) -> serde_json::Value {
+    json!({"tvdbId":id,"title":format!("Search series {id}"),"seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":id*10,"seasonNumber":1,"episodeNumber":1,"title":"Search pilot","airDateUtc":"2099-01-01T00:00:00Z","runtime":45}]})
+}
+fn search_movie(id: u32) -> serde_json::Value {
+    json!({"tmdbId":id,"title":format!("Search movie {id}"),"year":2030,"runtime":100,"digitalRelease":"2099-01-01T00:00:00Z"})
+}
 async fn metadata_mode(
     State(state): State<Arc<AtomicU8>>,
     Query(query): Query<HashMap<String, String>>,
@@ -75,6 +81,9 @@ async fn metadata_mode(
     StatusCode::NO_CONTENT
 }
 async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
+    if let Ok(id @ (202 | 203)) = id.parse::<u32>() {
+        return Json(search_show(id)).into_response();
+    }
     let mode = state.load(Ordering::SeqCst);
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -96,6 +105,9 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
     }
 }
 async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
+    if let Ok(id @ (202 | 203)) = id.parse::<u32>() {
+        return Json(search_movie(id)).into_response();
+    }
     let mode = state.load(Ordering::SeqCst);
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -120,6 +132,18 @@ async fn search(Query(q): Query<HashMap<String, String>>) -> Response {
         .get(if tv { "term" } else { "q" })
         .map(String::as_str)
         .unwrap_or("");
+    if let Some(id) = term
+        .strip_prefix("Search ")
+        .and_then(|id| id.parse::<u32>().ok())
+        .filter(|id| matches!(id, 202 | 203))
+    {
+        return Json(json!([if tv {
+            search_show(id)
+        } else {
+            search_movie(id)
+        }]))
+        .into_response();
+    }
     if term == "slow" {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -155,6 +179,10 @@ async fn mode(
 }
 async fn processing_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCode {
     state.2.store(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+async fn search_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCode {
+    state.2.store(2, Ordering::SeqCst);
     StatusCode::NO_CONTENT
 }
 async fn completed_observations(
@@ -224,6 +252,49 @@ async fn provider_mock(
             return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
         }
         let tv = query.get("cat").is_some_and(|c| c.starts_with('5'));
+        if state.2.load(Ordering::SeqCst) == 2 {
+            let external = query
+                .get(if tv { "tvdbid" } else { "tmdbid" })
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or_else(|| {
+                    if query.get("q").is_some_and(|s| s.contains("203")) {
+                        203
+                    } else {
+                        202
+                    }
+                });
+            if !matches!(external, 202 | 203) {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let offset = query
+                .get("offset")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let mut entries = String::new();
+            if offset == 0 {
+                for (quality, wrong) in [("720p", false), ("1080p", false), ("1080p", true)] {
+                    let title = if tv {
+                        format!("Search.series.{external}.S01E01.{quality}.WEB-DL")
+                    } else {
+                        format!("Search.movie.{external}.2030.{quality}.WEB-DL")
+                    };
+                    let digit = match (tv, external, quality) {
+                        (true, 202, "720p") => "1",
+                        (true, 202, _) => "2",
+                        (false, 202, "720p") => "3",
+                        (false, 202, _) => "4",
+                        (true, 203, "720p") => "5",
+                        (true, 203, _) => "6",
+                        (false, 203, "720p") => "7",
+                        _ => "8",
+                    };
+                    let hash = digit.repeat(40);
+                    let category = if tv != wrong { 5030 } else { 2000 };
+                    entries.push_str(&format!(r#"<item><title>{title}</title><guid>search-{external}-{hash}-{wrong}</guid><pubDate>Thu, 24 Sep 2026 12:00:00 +0000</pubDate><link>magnet:?xt=urn:btih:{hash}</link><x:attr name="category" value="{category}"/><x:attr name="size" value="1073741824"/></item>"#));
+                }
+            }
+            return ([("content-type","application/xml")],format!(r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="{offset}" total="3"/>{entries}</channel></rss>"#)).into_response();
+        }
         let title = match (tv, state.2.load(Ordering::SeqCst)) {
             (true, 0) => "Fixture.series.S01E02.1080p.WEB-DL",
             (false, 0) => "Fixture.movie.2021.1080p.WEB-DL",
@@ -284,7 +355,7 @@ async fn provider_mock(
             _ => {}
         }
     }
-    if state.2.load(Ordering::SeqCst) == 1 {
+    if state.2.load(Ordering::SeqCst) >= 1 {
         let name = |tv| {
             if tv {
                 "Refreshed.series.S01E02.1080p.WEB-DL.mkv"
@@ -302,8 +373,23 @@ async fn provider_mock(
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let tv = category == "tv";
-            let hash = if tv { "a".repeat(40) } else { "b".repeat(40) };
-            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":name(tv),"state":"uploading","progress":1.0,"size":1048576,"amount_left":0,"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{}",name(tv))}));
+            let hash = if state.2.load(Ordering::SeqCst) == 2 {
+                let magnet = url::Url::parse(fields.get("urls").unwrap()).unwrap();
+                magnet
+                    .query_pairs()
+                    .find(|(key, _)| key == "xt")
+                    .unwrap()
+                    .1
+                    .strip_prefix("urn:btih:")
+                    .unwrap()
+                    .to_string()
+            } else if tv {
+                "a".repeat(40)
+            } else {
+                "b".repeat(40)
+            };
+            let searching = state.2.load(Ordering::SeqCst) == 2;
+            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":name(tv),"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{}",name(tv))}));
             return "Ok.".into_response();
         }
         if uri.path() == "/api/v2/torrents/setForceStart" {
@@ -461,6 +547,11 @@ async fn library_ui_fixture() {
     for dir in [&tv, &movies, &incoming] {
         std::fs::create_dir(dir).unwrap();
     }
+    for id in [202, 203] {
+        for domain in ["tv", "movies"] {
+            std::fs::create_dir(scratch.0.join(format!("search-{domain}-{id}"))).unwrap();
+        }
+    }
     for name in [
         "Refreshed.series.S01E02.1080p.WEB-DL.mkv",
         "Refreshed.movie.2021.1080p.WEB-DL.mkv",
@@ -496,6 +587,7 @@ async fn library_ui_fixture() {
             .route("/fixture-observations", get(observations))
             .route("/fixture-mode", post(mode))
             .route("/fixture-processing", post(processing_mode))
+            .route("/fixture-search", post(search_mode))
             .route("/fixture-completed", get(completed_observations))
             .fallback(provider_mock)
             .with_state(Arc::new(ProviderObservations::default())),

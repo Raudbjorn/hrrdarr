@@ -18,7 +18,8 @@ use axum::{
     routing::{get, post},
 };
 pub use decision::evaluate;
-use libsql::params;
+pub(crate) use decision::target_ranks;
+use libsql::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ pub enum Disposition {
     Reject,
     Delay,
 }
-#[derive(Debug, Serialize, ts_rs::TS)]
+#[derive(Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct ReleaseDecision {
     pub target: Option<ReleaseTarget>,
     pub disposition: Disposition,
@@ -65,7 +66,7 @@ impl ReleaseDecision {
             parsed: None,
         }
     }
-    fn deny(&mut self, code: &str) {
+    pub(crate) fn deny(&mut self, code: &str) {
         self.disposition = Disposition::Reject;
         self.reasons.push(code.into());
     }
@@ -157,6 +158,7 @@ struct SearchState {
     client: RefreshClient,
 }
 pub fn router(db: Arc<Database>, client: RefreshClient) -> Router {
+    let commands = crate::commands::search::router(db.clone(), client.clone());
     Router::new()
         .route("/api/v1/release-search", post(search))
         .route(
@@ -165,6 +167,7 @@ pub fn router(db: Arc<Database>, client: RefreshClient) -> Router {
         )
         .layer(DefaultBodyLimit::max(8192))
         .with_state(SearchState { db, client })
+        .merge(commands)
 }
 fn media(value: &str) -> Result<MediaDomain> {
     match value {
@@ -248,34 +251,149 @@ async fn search(
     {
         return Err(SearchError("invalid_release_search"));
     }
-    tokio::time::timeout(std::time::Duration::from_secs(40),async {
-        let c=s.db.connect().await.map_err(|_|SearchError("release_storage_error"))?;
-        let (request,media)=match &input.target {
-            crate::db::MediaTarget::Episode(id)=>{
-                let r=c.query("SELECT s.title,s.tvdb_id,e.season,e.number,l.series_type,e.air_date,e.absolute_episode_number,l.use_scene_numbering FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN library_settings l ON l.series_id=s.id WHERE e.id=?",[*id]).await?.next().await?.ok_or(SearchError("release_target_missing"))?;
-                if r.get::<Option<i64>>(7)?==Some(1){return Err(SearchError("scene_search_unsupported"))}
-                let standard=TvNumbering::Episode{season:u32::try_from(r.get::<i64>(2)?).map_err(|_|SearchError("invalid_episode_number"))?,episode:u32::try_from(r.get::<i64>(3)?).map_err(|_|SearchError("invalid_episode_number"))?};
-                let numbering=match r.get::<Option<String>>(4)?.as_deref(){Some("standard")=>standard,Some("daily")=>TvNumbering::Daily{date:r.get::<Option<String>>(5)?.ok_or(SearchError("daily_date_unknown"))?},Some("anime")=>TvNumbering::Anime{absolute_episode:u32::try_from(r.get::<Option<i64>>(6)?.ok_or(SearchError("absolute_number_unknown"))?).map_err(|_|SearchError("invalid_episode_number"))?,season:None,episode:None},_=>return Err(SearchError("series_type_unconfigured"))};
-                (IndexerSearch::Tv{title:r.get(0)?,aliases:vec![],tvdb_id:r.get::<Option<i64>>(1)?.and_then(|v|u32::try_from(v).ok()),tvmaze_id:None,rage_id:None,imdb_id:None,tmdb_id:None,numbering,search_mode:TvSearchMode::Default,offset:input.offset,query_index:input.query_index,limit:input.limit},MediaDomain::Tv)
-            },
-            crate::db::MediaTarget::Movie(id)=>{
-                let r=c.query("SELECT d.title,d.year,d.tmdb_id,d.imdb_id,d.id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.id=?",[*id]).await?.next().await?.ok_or(SearchError("release_target_missing"))?;
-                let mut aliases=Vec::new();let mut rows=c.query("SELECT title FROM movie_alternative_titles WHERE metadata_id=? ORDER BY title LIMIT 65",[r.get::<i64>(4)?]).await?;
-                while let Some(a)=rows.next().await?{aliases.push(a.get(0)?)}if aliases.len()>64{return Err(SearchError("movie_alias_limit"))}
-                (IndexerSearch::Movie{title:r.get(0)?,aliases,year:r.get::<Option<i64>>(1)?.and_then(|v|u16::try_from(v).ok()),tmdb_id:r.get::<Option<i64>>(2)?.and_then(|v|u32::try_from(v).ok()),imdb_id:r.get(3)?,offset:input.offset,query_index:input.query_index,limit:input.limit},MediaDomain::Movies)
-            }
-        };
-        let page=s.client.raw_search(&input.provider_id.to_string(),input.provider_revision,&request).await.map_err(|e|SearchError(e.code))?;
-        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_|SearchError("clock_error"))?.as_secs() as i64;
-        let mut items=Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(40), async {
+        let c =
+            s.db.connect()
+                .await
+                .map_err(|_| SearchError("release_storage_error"))?;
+        let (request, media) = target_request(
+            &c,
+            &input.target,
+            input.offset,
+            input.query_index,
+            input.limit,
+        )
+        .await?;
+        let page = s
+            .client
+            .raw_search(
+                &input.provider_id.to_string(),
+                input.provider_revision,
+                &request,
+            )
+            .await
+            .map_err(|e| SearchError(e.code))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SearchError("clock_error"))?
+            .as_secs() as i64;
+        let mut items = Vec::new();
         for release in page.items {
-            let mut decision=evaluate(&c,media,&release,SearchContext::UserSearch,now).await?;
-            let matches=match (&input.target,&decision.target){(crate::db::MediaTarget::Episode(id),Some(ReleaseTarget::Tv{episode_ids,..}))=>episode_ids.contains(id),(crate::db::MediaTarget::Movie(id),Some(ReleaseTarget::Movies{movie_id}))=>id==movie_id,_=>false};
-            if !matches{decision.deny("requested_target_mismatch")}
-            items.push(EvaluatedRelease{metadata:release.metadata,decision});
+            let mut decision =
+                evaluate(&c, media, &release, SearchContext::UserSearch, now).await?;
+            let matches = match (&input.target, &decision.target) {
+                (
+                    crate::db::MediaTarget::Episode(id),
+                    Some(ReleaseTarget::Tv { episode_ids, .. }),
+                ) => episode_ids.contains(id),
+                (crate::db::MediaTarget::Movie(id), Some(ReleaseTarget::Movies { movie_id })) => {
+                    id == movie_id
+                }
+                _ => false,
+            };
+            if !matches {
+                decision.deny("requested_target_mismatch")
+            }
+            items.push(EvaluatedRelease {
+                metadata: release.metadata,
+                decision,
+            });
         }
-        let result=ReleaseSearchPage{items,next_query:page.next_query};
-        if serde_json::to_vec(&result).map_err(|_|SearchError("release_storage_error"))?.len()>1024*1024{return Err(SearchError("release_result_limit"))}
+        let result = ReleaseSearchPage {
+            items,
+            next_query: page.next_query,
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|_| SearchError("release_storage_error"))?
+            .len()
+            > 1024 * 1024
+        {
+            return Err(SearchError("release_result_limit"));
+        }
         Ok(Json(result))
-    }).await.map_err(|_|SearchError("release_search_timeout"))?
+    })
+    .await
+    .map_err(|_| SearchError("release_search_timeout"))?
+}
+
+pub(crate) async fn target_request(
+    c: &Connection,
+    target: &crate::db::MediaTarget,
+    offset: u32,
+    query_index: u32,
+    limit: u32,
+) -> Result<(IndexerSearch, MediaDomain)> {
+    Ok(match target {
+        crate::db::MediaTarget::Episode(id) => {
+            let r=c.query("SELECT s.title,s.tvdb_id,e.season,e.number,l.series_type,e.air_date,e.absolute_episode_number,l.use_scene_numbering FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN library_settings l ON l.series_id=s.id WHERE e.id=?",[*id]).await?.next().await?.ok_or(SearchError("release_target_missing"))?;
+            if r.get::<Option<i64>>(7)? == Some(1) {
+                return Err(SearchError("scene_search_unsupported"));
+            }
+            let standard = TvNumbering::Episode {
+                season: u32::try_from(r.get::<i64>(2)?)
+                    .map_err(|_| SearchError("invalid_episode_number"))?,
+                episode: u32::try_from(r.get::<i64>(3)?)
+                    .map_err(|_| SearchError("invalid_episode_number"))?,
+            };
+            let numbering = match r.get::<Option<String>>(4)?.as_deref() {
+                Some("standard") => standard,
+                Some("daily") => TvNumbering::Daily {
+                    date: r
+                        .get::<Option<String>>(5)?
+                        .ok_or(SearchError("daily_date_unknown"))?,
+                },
+                Some("anime") => TvNumbering::Anime {
+                    absolute_episode: u32::try_from(
+                        r.get::<Option<i64>>(6)?
+                            .ok_or(SearchError("absolute_number_unknown"))?,
+                    )
+                    .map_err(|_| SearchError("invalid_episode_number"))?,
+                    season: None,
+                    episode: None,
+                },
+                _ => return Err(SearchError("series_type_unconfigured")),
+            };
+            (
+                IndexerSearch::Tv {
+                    title: r.get(0)?,
+                    aliases: vec![],
+                    tvdb_id: r.get::<Option<i64>>(1)?.and_then(|v| u32::try_from(v).ok()),
+                    tvmaze_id: None,
+                    rage_id: None,
+                    imdb_id: None,
+                    tmdb_id: None,
+                    numbering,
+                    search_mode: TvSearchMode::Default,
+                    offset: offset,
+                    query_index: query_index,
+                    limit: limit,
+                },
+                MediaDomain::Tv,
+            )
+        }
+        crate::db::MediaTarget::Movie(id) => {
+            let r=c.query("SELECT d.title,d.year,d.tmdb_id,d.imdb_id,d.id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.id=?",[*id]).await?.next().await?.ok_or(SearchError("release_target_missing"))?;
+            let mut aliases = Vec::new();
+            let mut rows=c.query("SELECT title FROM movie_alternative_titles WHERE metadata_id=? ORDER BY title LIMIT 65",[r.get::<i64>(4)?]).await?;
+            while let Some(a) = rows.next().await? {
+                aliases.push(a.get(0)?)
+            }
+            if aliases.len() > 64 {
+                return Err(SearchError("movie_alias_limit"));
+            }
+            (
+                IndexerSearch::Movie {
+                    title: r.get(0)?,
+                    aliases,
+                    year: r.get::<Option<i64>>(1)?.and_then(|v| u16::try_from(v).ok()),
+                    tmdb_id: r.get::<Option<i64>>(2)?.and_then(|v| u32::try_from(v).ok()),
+                    imdb_id: r.get(3)?,
+                    offset: offset,
+                    query_index: query_index,
+                    limit: limit,
+                },
+                MediaDomain::Movies,
+            )
+        }
+    })
 }

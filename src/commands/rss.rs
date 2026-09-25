@@ -40,6 +40,7 @@ pub struct RssCommand {
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct RssCandidate {
+    pub origin: super::search::CandidateOrigin,
     pub id: Uuid,
     pub command_id: Option<Uuid>,
     pub source: RssTarget,
@@ -120,7 +121,7 @@ async fn read(c: &Connection, id: Uuid) -> Result<RssCommand> {
         .await?
         .ok_or(Error(StatusCode::NOT_FOUND, "rss_command_not_found"))?)
 }
-async fn valid_target(c: &Connection, t: RssTarget) -> Result<bool> {
+pub(super) async fn valid_target(c: &Connection, t: RssTarget) -> Result<bool> {
     if t.indexer_revision <= 0
         || t.client_revision <= 0
         || t.indexer_revision > MAX_REVISION
@@ -161,7 +162,7 @@ async fn enqueue(c: &Connection, input: RssInput, timestamp: i64) -> Result<RssC
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     if let Some(r)=c.query(&format!("SELECT {COLUMNS} FROM rss_commands WHERE indexer_id=? AND client_id=? AND media_type=? AND status IN ('queued','running','retry_wait')"),params![t.indexer_id.to_string(),t.client_id.to_string(),domain(t.media_type)]).await?.next().await?{return row(r)}
-    if c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
+    if c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
     let id = Uuid::new_v4();
     c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at)VALUES(?,'rss_sync',?,?,?,?,?,?,'queued',0,?,?)",params![id.to_string(),domain(t.media_type),t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,input.priority.number(),timestamp,timestamp]).await?;
     read(c, id).await
@@ -261,7 +262,7 @@ async fn delete(
     .await;
     finish(tx, outcome).await
 }
-fn payload_context(id: Uuid, t: RssTarget) -> String {
+pub(super) fn payload_context(id: Uuid, t: RssTarget) -> String {
     format!(
         "{id}/{}/{}/{}/{}/{}",
         t.indexer_id,
@@ -271,7 +272,7 @@ fn payload_context(id: Uuid, t: RssTarget) -> String {
         domain(t.media_type)
     )
 }
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .iter()
@@ -395,7 +396,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
                 let existing_id:String=existing.get(0)?;let status:String=existing.get(1)?;
                 if matches!(status.as_str(),"rejected"|"cancelled") {tx.execute("DELETE FROM rss_candidates WHERE id=?",[existing_id]).await?;}else{continue}
             }
-            if tx.query("SELECT count(*)>=1024 OR COALESCE(sum(length(private_payload)),0)+?>16777216 FROM rss_candidates",[payload.as_ref().map_or(0,Vec::len) as i64]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"candidate_limit"))}
+            if tx.query("SELECT count(*)>=1024 OR COALESCE(sum(length(private_payload)),0)+(SELECT COALESCE(sum(length(private_payload)),0) FROM search_results)+?>16777216 FROM rss_candidates",[payload.as_ref().map_or(0,Vec::len) as i64]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"candidate_limit"))}
             let (series,movie,episode)=match decision.target{Some(ReleaseTarget::Tv{series_id,episode_ids}) if episode_ids.len()==1=>(Some(series_id),None,episode_ids.first().copied()),Some(ReleaseTarget::Movies{movie_id})=>(None,Some(movie_id),None),_=>(None,None,None)};
             let status=if matches!(decision.disposition,Disposition::Reject){"rejected"}else{"pending"};
             let reasons=serde_json::to_string(&decision.reasons).map_err(|_|bad())?;
@@ -449,6 +450,7 @@ async fn candidate(c: &Connection, id: Uuid) -> Result<CandidateWork> {
     let series: Option<i64> = row.get(7)?;
     let movie: Option<i64> = row.get(8)?;
     let mut public = RssCandidate {
+        origin: super::search::origin(c, id).await?,
         id,
         command_id: row
             .get::<Option<String>>(0)?
@@ -488,6 +490,9 @@ async fn candidate(c: &Connection, id: Uuid) -> Result<CandidateWork> {
         payload,
         identity,
     })
+}
+pub(super) async fn public_candidate(c: &Connection, id: Uuid) -> Result<RssCandidate> {
+    Ok(candidate(c, id).await?.public)
 }
 async fn candidate_state(
     c: &Connection,
@@ -571,7 +576,7 @@ async fn process_candidate(
         &c,
         p.source.media_type,
         &release,
-        SearchContext::Rss,
+        super::search::authority(&c, p.id).await?,
         now()?,
     )
     .await
@@ -653,7 +658,7 @@ async fn process_candidate(
         if current.public.status!=p.status{return Ok(false)}
         if !valid_target(&tx,p.source).await?{candidate_state(&tx,p.id,"rejected",Some("provider_changed"),None).await?;return Ok(false)}
         // Recheck all current local decision facts after preparation's network reads.
-        let latest=crate::search::evaluate(&tx,p.source.media_type,&release,SearchContext::Rss,now()?).await.map_err(|e|Error(StatusCode::INTERNAL_SERVER_ERROR,e.0))?;
+        let latest=crate::search::evaluate(&tx,p.source.media_type,&release,super::search::authority(&tx,p.id).await?,now()?).await.map_err(|e|Error(StatusCode::INTERNAL_SERVER_ERROR,e.0))?;
         if !matches!(latest.disposition,Disposition::Accept) || latest.target.as_ref()!=Some(&target) {
             candidate_state(&tx,p.id,"rejected",Some("target_changed"),None).await?;return Ok(false)
         }
@@ -786,6 +791,12 @@ async fn delete_candidate(
         if !matches!(
             candidate(&tx, id).await?.public.status.as_str(),
             "rejected" | "cancelled"
+        ) {
+            return Err(conflict());
+        }
+        if !matches!(
+            super::search::origin(&tx, id).await?,
+            super::search::CandidateOrigin::Rss
         ) {
             return Err(conflict());
         }
@@ -970,6 +981,7 @@ pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> 
     if let Err(error) = process_candidate(db, client, candidate(&c, id).await?).await {
         let code = match error.1 {
             "key_unavailable"
+            | "target_changed"
             | "provider_changed"
             | "provider_unavailable"
             | "refresh_timeout"

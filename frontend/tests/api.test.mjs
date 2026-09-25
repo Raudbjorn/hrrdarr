@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getProcessingPolicy, saveProcessingPolicy, listDownloadProcessing, processDownloads, cancelDownloadProcessing, listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
+import { listSearchCommands, getSearchCommand, createSearchCommand, cancelSearchCommand, listSearchResults, grabSearchResult, getProcessingPolicy, saveProcessingPolicy, listDownloadProcessing, processDownloads, cancelDownloadProcessing, listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -395,4 +395,25 @@ test('processing policy and receipt requests retain domains, revisions and uncer
     assert.equal(result.ok,false);assert.equal(result.status,undefined);
   });
   assert.equal(calls,1,'An uncertain import authorization must be read back, never automatically replayed');
+});
+
+test('search command requests preserve typed identities and result-only grab authority without replay',async()=>{
+  const request_id='00000000-0000-0000-0000-000000000001',indexer_id='00000000-0000-0000-0000-000000000002',client_id='00000000-0000-0000-0000-000000000003';
+  const seen=[];
+  await withFetch(async(path,options)=>{seen.push([path,options.method,options.body?JSON.parse(options.body):null]);return json({});},async()=>{
+    for(const media_type of ['episode','movie']){
+      const target={media_type,id:1};
+      await listSearchCommands(target,25);
+      await createSearchCommand({request_id,mode:'automatic',target,indexer_id,indexer_revision:2,client_id,client_revision:3,priority:'normal'});
+    }
+    await getSearchCommand(request_id);await listSearchResults(request_id,25);await grabSearchResult(request_id);await cancelSearchCommand(request_id);
+  });
+  assert.deepEqual(seen.filter(([path,method])=>path==='/api/v1/search/commands'&&method==='POST').map(([, ,body])=>body.target),[{media_type:'episode',id:1},{media_type:'movie',id:1}]);
+  assert.ok(seen.some(([path])=>path.includes('target_type=movie&target_id=1&limit=25&offset=25')));
+  assert.deepEqual(seen.find(([path])=>path.endsWith('/grab')),[`/api/v1/search/results/${request_id}/grab`,'POST',{}],'Only a server-issued result identity authorizes selection; the client supplies no replacement URL or target');
+  let calls=0;
+  await withFetch(async()=>{calls++;throw new Error('accepted response lost');},async()=>{
+    const response=await grabSearchResult(request_id);assert.equal(response.ok,false);assert.equal(response.status,undefined);
+  });
+  assert.equal(calls,1,'Unknown selection outcome requires explicit readback, never automatic replay');
 });

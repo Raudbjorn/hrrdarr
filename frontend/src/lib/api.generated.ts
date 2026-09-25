@@ -36,6 +36,8 @@ export type BlocklistSortDirection = "asc" | "desc";
 
 export type BlocklistTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
+export type CandidateOrigin = { "kind": "rss" } | { "kind": "search", command_id: string, result_id: string, mode: SearchMode, };
+
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
 
 export type CategoryDiscoveryError = { code: string, message: string, retry_after_seconds: number | null, };
@@ -418,7 +420,7 @@ export type RootObservationStatus = "available" | "inaccessible" | "timeout" | "
 
 export type RootQuery = { limit?: number, offset?: number, };
 
-export type RssCandidate = { id: string, command_id: string | null, source: RssTarget, title: string, target: ReleaseTarget | null, status: string, reasons: Array<string>, not_before: number | null, attempts: number, created_at: number, updated_at: number, error_code: string | null, };
+export type RssCandidate = { origin: CandidateOrigin, id: string, command_id: string | null, source: RssTarget, title: string, target: ReleaseTarget | null, status: string, reasons: Array<string>, not_before: number | null, attempts: number, created_at: number, updated_at: number, error_code: string | null, };
 
 export type RssCandidateQuery = { media_type?: MediaDomain, command_id?: string, status?: string, limit?: number, offset?: number, };
 
@@ -436,7 +438,17 @@ export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_r
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
+export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, };
+
+export type SearchCommandInput = { request_id: string, mode: SearchMode, target: MediaTarget, indexer_id: string, indexer_revision: number, client_id: string, client_revision: number, priority: CommandPriority, };
+
+export type SearchCommandQuery = { target_type?: string, target_id?: number, status?: CommandStatus, limit?: number, offset?: number, };
+
 export type SearchEngine = "raw" | "sphinx";
+
+export type SearchMode = "automatic" | "interactive";
+
+export type SearchResult = { id: string, command_id: string, metadata: ReleaseMetadata, decision: ReleaseDecision, expires_at: number, selected_candidate_id: string | null, };
 
 export type SeriesDetails = { tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
