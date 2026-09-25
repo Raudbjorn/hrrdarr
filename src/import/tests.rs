@@ -252,7 +252,9 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     );
-    let lease = Arc::new(Permit { _db: db.clone() });
+    let lease = Arc::new(Permit {
+        _db: Some(db.clone()),
+    });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let task = tokio::spawn(async move {

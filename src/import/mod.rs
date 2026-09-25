@@ -367,10 +367,12 @@ pub async fn status(db: Arc<Database>, opid: &str) -> Result<Operation> {
 // ponytail: one import at a time per process; per-library workers when throughput requires it.
 static EXECUTING: AtomicBool = AtomicBool::new(false);
 struct Permit {
-    _db: Arc<Database>,
+    _db: Option<Arc<Database>>,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
+        // Release the worker's database ownership before publishing that it has finished.
+        drop(self._db.take());
         EXECUTING.store(false, Ordering::Release);
     }
 }
@@ -386,7 +388,9 @@ pub async fn execute(db: Arc<Database>, opid: &str) -> Result<Operation> {
             "Another import is executing; retry this operation",
         ));
     }
-    let permit = Arc::new(Permit { _db: db.clone() });
+    let permit = Arc::new(Permit {
+        _db: Some(db.clone()),
+    });
     let opid = opid.to_owned();
     // The task owns the permit. Cancelling an HTTP request cannot admit another worker while
     // its blocking transfer is still running.
