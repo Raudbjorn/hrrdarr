@@ -208,7 +208,7 @@ async fn schema5_file_metadata_activation_is_private_atomic_and_idempotent() -> 
     ] {
         let dry = snapshots::import(&db, app, bytes.clone(), true).await?;
         assert!(!dry.applied);
-        assert_eq!(dry.mapped, 1);
+        assert_eq!(dry.mapped, 2); // Schema7 also adds the absent library-settings sidecar.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM file_metadata").await,
             if matches!(app, Application::Sonarr) {
@@ -219,7 +219,7 @@ async fn schema5_file_metadata_activation_is_private_atomic_and_idempotent() -> 
         );
         let result = snapshots::import(&db, app, bytes.clone(), false).await?;
         assert!(result.applied);
-        assert_eq!(result.mapped, 1);
+        assert_eq!(result.mapped, 2); // File metadata plus optional library settings activate atomically.
         assert!(!serde_json::to_string(&result)?.contains("SENTINEL_FILE_SECRET"));
         let again = snapshots::import(&db, app, bytes, false).await?;
         assert!(again.applied);

@@ -124,6 +124,8 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
     let series = table(source, "Series", SERIES)?;
     let episodes = table(source, "Episodes", EPISODES)?;
     let files = table(source, "EpisodeFiles", FILES)?;
+    let mut series_columns = SERIES.to_vec();
+    series_columns.extend(TV_SETTINGS.iter().map(|(source, _)| *source));
     let mut file_columns = FILES.to_vec();
     file_columns.extend(FILE_METADATA.iter().map(|(source, _)| *source));
     let mut episode_columns = EPISODES.to_vec();
@@ -135,7 +137,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
         unsupported: unsupported(
             source,
             &[
-                ("Series", SERIES),
+                ("Series", &series_columns),
                 ("Episodes", &episode_columns),
                 ("EpisodeFiles", &file_columns),
             ],
@@ -159,6 +161,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             ],
             keys: vec![vec!["tvdb_id"], vec!["path"]],
         });
+        add_library_settings(&mut plan, row, "tv", id)?;
         let season_rows: serde_json::Value = serde_json::from_str(text(row, "Seasons")?)
             .map_err(|_| ImportError("invalid serialized seasons"))?;
         for season in season_rows
@@ -311,6 +314,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
     let mut file_columns = FILES.to_vec();
     file_columns.extend(FILE_METADATA.iter().map(|(source, _)| *source));
     let mut movie_columns = CORE.to_vec();
+    movie_columns.extend(MOVIE_SETTINGS.iter().map(|(source, _)| *source));
     if modern {
         movie_columns.push("MovieMetadataId");
     } else {
@@ -376,6 +380,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
             ],
             keys: vec![vec!["metadata_id"], vec!["path"]],
         });
+        add_library_settings(&mut plan, row, "movies", id)?;
     }
     let mut found = BTreeSet::new();
     for row in &files.rows {
@@ -753,6 +758,106 @@ fn add_file_metadata(plan: &mut Plan, row: &Record, media: &'static str, id: i64
     }
     plan.entities.push(Entity {
         table: "file_metadata",
+        source_id: id,
+        fields,
+        keys: vec![vec![target]],
+    });
+    Ok(())
+}
+
+const TV_SETTINGS: &[(&str, &str)] = &[
+    ("SeriesType", "series_type"),
+    ("SeasonFolder", "season_folder"),
+    ("UseSceneNumbering", "use_scene_numbering"),
+    ("MonitorNewItems", "monitor_new_items"),
+    ("Added", "added"),
+];
+const MOVIE_SETTINGS: &[(&str, &str)] = &[
+    ("MinimumAvailability", "minimum_availability"),
+    ("Added", "added"),
+];
+fn add_library_settings(plan: &mut Plan, row: &Record, media: &'static str, id: i64) -> Result<()> {
+    let tv = media == "tv";
+    let target = if tv { "series_id" } else { "movie_id" };
+    let core = if tv { "series" } else { "movies" };
+    // Source profile identities are not destination identities. Until profile adapters
+    // exist, preserve/report those assignments privately instead of guessing a match.
+    let mut fields = vec![
+        ("media_type", val(media)),
+        (target, Field::Reference(core, id)),
+        ("quality_profile_id", Field::Value(Value::Null)),
+    ];
+    let mut unsupported = vec![];
+    for (source, dest) in if tv { TV_SETTINGS } else { MOVIE_SETTINGS } {
+        let raw = row.get(*source).unwrap_or(&Value::Null);
+        let value = match raw {
+            Value::Null => Value::Null,
+            _ => match *source {
+                "Added" => {
+                    let Value::Text(raw) = raw else {
+                        return Err(ImportError("invalid source library added date"));
+                    };
+                    if raw.trim().is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Text(
+                            crate::episodes::normalize_utc(raw)
+                                .ok_or(ImportError("invalid source library added date"))?,
+                        )
+                    }
+                }
+                "SeasonFolder" | "UseSceneNumbering" => match raw {
+                    Value::Integer(0 | 1) => raw.clone(),
+                    _ => return Err(ImportError("invalid source library boolean")),
+                },
+                _ => {
+                    let variants: &[(&str, &str)] = match *source {
+                        "SeriesType" => &[
+                            ("standard", "standard"),
+                            ("daily", "daily"),
+                            ("anime", "anime"),
+                        ],
+                        "MonitorNewItems" => &[("all", "all"), ("none", "none")],
+                        "MinimumAvailability" => &[
+                            ("tba", "tba"),
+                            ("announced", "announced"),
+                            ("inCinemas", "in_cinemas"),
+                            ("released", "released"),
+                        ],
+                        _ => unreachable!(),
+                    };
+                    let mapped = match raw {
+                        Value::Integer(n) => usize::try_from(*n)
+                            .ok()
+                            .and_then(|n| variants.get(n))
+                            .map(|(_, native)| *native),
+                        Value::Text(s) => variants
+                            .iter()
+                            .find(|(source, _)| *source == s)
+                            .map(|(_, native)| *native),
+                        _ => return Err(ImportError("invalid source library enum")),
+                    };
+                    match mapped {
+                        Some(v) => Value::Text(v.into()),
+                        None => {
+                            unsupported.push(source.to_string());
+                            Value::Null
+                        }
+                    }
+                }
+            },
+        };
+        fields.push((dest, Field::Value(value)));
+    }
+    if !unsupported.is_empty() {
+        plan.unsupported.push(Unsupported {
+            table: if tv { "Series" } else { "Movies" }.into(),
+            rows: 1,
+            columns: unsupported,
+        });
+    }
+    plan.entities.push(Entity {
+        table: "library_settings",
         source_id: id,
         fields,
         keys: vec![vec![target]],

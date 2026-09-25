@@ -3,7 +3,7 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::post,
 };
 use hrrdarr::{
     db::{Database, MediaTarget},
@@ -17,15 +17,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     db: Arc<Database>,
-}
-
-#[derive(Debug, Serialize)]
-struct Series {
-    id: i64,
-    title: String,
-    year: Option<i64>,
-    path: String,
-    poster: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +62,6 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
 
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/api/v1/series", get(series))
         .route("/api/v1/imports", post(import_preview))
         .route("/api/v1/imports/{id}/execute", post(import_execute))
         .route(
@@ -83,27 +73,7 @@ fn router(state: Arc<AppState>) -> Router {
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
-}
-
-async fn series(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Series>>, ApiError> {
-    let conn = state.db.connect().await?;
-    let mut rows = conn
-        .query(
-            "SELECT id, title, year, path, poster FROM series ORDER BY title",
-            (),
-        )
-        .await?;
-    let mut result = Vec::new();
-    while let Some(r) = rows.next().await? {
-        result.push(Series {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            year: r.get(2)?,
-            path: r.get(3)?,
-            poster: r.get(4)?,
-        });
-    }
-    Ok(Json(result))
+        .merge(hrrdarr::library::router(state.db.clone()))
 }
 
 async fn import_preview(
@@ -272,9 +242,23 @@ mod tests {
             .unwrap()
             .0;
             assert_eq!(response.applied, !dry_run);
-            assert_eq!(response.mapped, 1);
-            let listed = series(State(state.clone())).await.unwrap().0;
-            assert_eq!(listed.len(), usize::from(!dry_run));
+            assert_eq!(response.mapped, 2); // The series and its optional settings sidecar map independently.
+            // The legacy series route is exercised over HTTP in tests/library_api.rs.
+            let count = state
+                .db
+                .connect()
+                .await
+                .unwrap()
+                .query("SELECT count(*) FROM series", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap();
+            assert_eq!(count, i64::from(!dry_run));
         }
         assert_eq!(bytes, std::fs::read(source_path).unwrap());
         drop(state);

@@ -40,6 +40,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "file_metadata",
         include_str!("../../migrations/0006_file_metadata.sql"),
     ),
+    (
+        "library_settings",
+        include_str!("../../migrations/0007_library_settings.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
