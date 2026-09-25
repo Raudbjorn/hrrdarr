@@ -5,6 +5,8 @@ use hrrdarr::{
 use libsql::{Connection, params};
 use std::path::PathBuf;
 
+static IMPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Sandbox(PathBuf);
 impl Sandbox {
     fn new() -> Self {
@@ -59,7 +61,7 @@ const MOVIES: &str = r#"
 CREATE TABLE VersionInfo (Version INTEGER); INSERT INTO VersionInfo VALUES(242);
 CREATE TABLE MovieMetadata (Id INTEGER PRIMARY KEY,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER,CollectionTmdbId INTEGER);
 INSERT INTO MovieMetadata VALUES(101,1001,'tt1001','Film',2024,88),(102,1002,NULL,'Catalog only',2025,NULL),(103,1003,'','Missing',2023,NULL),(104,1004,NULL,'No file',2022,NULL);
-CREATE TABLE Movies (Id INTEGER PRIMARY KEY,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER,ProfileId INTEGER);
+CREATE TABLE Movies (Id INTEGER PRIMARY KEY,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER,QualityProfileId INTEGER);
 INSERT INTO Movies VALUES(1,101,'/movies/Film',0,11,9),(2,103,'/movies/Missing',1,99,9),(3,104,'/movies/No file',1,0,9);
 CREATE TABLE MovieFiles (Id INTEGER PRIMARY KEY,MovieId INTEGER,RelativePath TEXT,Edition TEXT);
 INSERT INTO MovieFiles VALUES(11,1,'Film.mkv','Extended');
@@ -77,6 +79,7 @@ INSERT INTO MovieFiles VALUES(11,1,'Older.mkv',NULL);
 #[tokio::test]
 async fn both_snapshot_adapters_reconcile_without_data_loss_or_secret_disclosure()
 -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
     let files = Sandbox::new();
     let tv = fixture(&files, "sonarr.db", TV).await;
     let films = fixture(&files, "radarr.db", MOVIES).await;
@@ -402,5 +405,229 @@ async fn both_snapshot_adapters_reconcile_without_data_loss_or_secret_disclosure
         .contains("SENTINEL_SECRET"),
         true
     );
+    Ok(())
+}
+
+async fn gate_state(c: &Connection) -> Vec<Vec<Vec<libsql::Value>>> {
+    let mut state = Vec::new();
+    for table in [
+        "series",
+        "episodes",
+        "episode_files",
+        "seasons",
+        "operations",
+        "movies",
+        "movie_metadata",
+        "movie_files",
+        "library_settings",
+        "file_metadata",
+        "snapshot_imports",
+        "snapshot_mappings",
+        "snapshot_records",
+    ] {
+        let mut rows = c
+            .query(&format!("SELECT * FROM {table} ORDER BY rowid"), ())
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            values.push(
+                (0..row.column_count())
+                    .map(|i| row.get_value(i).unwrap())
+                    .collect(),
+            );
+        }
+        state.push(values);
+    }
+    state
+}
+
+async fn original_tv(c: &Connection) -> Vec<libsql::Value> {
+    let row = c.query("SELECT s.id,s.title,s.year,s.path,s.poster,e.id,e.series_id,e.season,e.number,e.title,f.path,o.id,o.episode_id,o.source,o.mode,o.destination,o.status,o.message,o.media_type,o.movie_id FROM series s JOIN episodes e ON e.series_id=s.id JOIN episode_files f ON f.id=e.episode_file_id JOIN operations o ON o.episode_id=e.id WHERE o.id='original'", ()).await.unwrap().next().await.unwrap().unwrap();
+    let mut values: Vec<_> = (0..row.column_count())
+        .map(|i| row.get_value(i).unwrap())
+        .collect();
+    drop(row);
+    let mut rows = c.query("SELECT e.id,e.series_id,e.season,e.number,e.title,f.path FROM episodes e LEFT JOIN episode_files f ON f.id=e.episode_file_id WHERE e.series_id=7 ORDER BY e.id", ()).await.unwrap();
+    while let Some(row) = rows.next().await.unwrap() {
+        values.extend((0..row.column_count()).map(|i| row.get_value(i).unwrap()));
+    }
+    values
+}
+
+#[tokio::test]
+async fn slice0_fresh_isolated_and_combined_imports_follow_actual_prototype_upgrade()
+-> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let files = Sandbox::new();
+    // Radarr242 uses QualityProfileId; ProfileId belongs to the older206 contract.
+    let sources = [
+        (
+            Application::Sonarr,
+            "gate-tv.db",
+            fixture(&files, "gate-tv.db", TV).await,
+        ),
+        (
+            Application::Radarr,
+            "gate-206.db",
+            fixture(&files, "gate-206.db", OLD_MOVIES).await,
+        ),
+        (
+            Application::Radarr,
+            "gate-242.db",
+            fixture(&files, "gate-242.db", MOVIES).await,
+        ),
+    ];
+    for (name, selected, upgraded) in [
+        ("tv-only", vec![0], false),
+        ("movie206-only", vec![1], false),
+        ("movie242-only", vec![2], false),
+        ("combined", vec![0, 1, 2], false),
+        ("upgraded-combined", vec![0, 1, 2], true),
+    ] {
+        let path = files.0.join(format!("{name}.db"));
+        if upgraded {
+            let raw = libsql::Builder::new_local(&path).build().await?;
+            let c = raw.connect()?;
+            c.execute_batch(include_str!("../migrations/0001_prototype.sql"))
+                .await?;
+            c.execute_batch("INSERT INTO series VALUES(7,'Original TV',1999,'/original','original-poster');INSERT INTO episodes VALUES(1,7,0,1,'Original episode','/original/pack.mkv'),(2,7,0,2,'Original second','/original/pack.mkv'),(3,7,1,1,'Original absent',NULL);INSERT INTO operations VALUES('original',1,'/source/original','move','/original/future.mkv','preview','Original message');").await?;
+            drop(c);
+            drop(raw);
+        }
+        // Existing prototype files must meet the archive's private-state permission gate.
+        #[cfg(unix)]
+        if upgraded {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let db = Database::open_local(&path).await?;
+        assert_eq!(db.migration_backup().is_some(), upgraded);
+        let c = db.connect().await?;
+        let original = if upgraded {
+            let expected: Vec<libsql::Value> = vec![
+                7.into(),
+                "Original TV".into(),
+                1999.into(),
+                "/original".into(),
+                "original-poster".into(),
+                1.into(),
+                7.into(),
+                0.into(),
+                1.into(),
+                "Original episode".into(),
+                "/original/pack.mkv".into(),
+                "original".into(),
+                1.into(),
+                "/source/original".into(),
+                "move".into(),
+                "/original/future.mkv".into(),
+                "preview".into(),
+                "Original message".into(),
+                "episode".into(),
+                libsql::Value::Null,
+                // All original episodes, including shared-file and absent-file records.
+                1.into(),
+                7.into(),
+                0.into(),
+                1.into(),
+                "Original episode".into(),
+                "/original/pack.mkv".into(),
+                2.into(),
+                7.into(),
+                0.into(),
+                2.into(),
+                "Original second".into(),
+                "/original/pack.mkv".into(),
+                3.into(),
+                7.into(),
+                1.into(),
+                1.into(),
+                "Original absent".into(),
+                libsql::Value::Null,
+            ];
+            assert_eq!(original_tv(&c).await, expected);
+            Some(expected)
+        } else {
+            None
+        };
+        for index in &selected {
+            let (app, _, bytes) = &sources[*index];
+            let before = gate_state(&c).await;
+            let dry = snapshots::import(&db, *app, bytes.clone(), true).await?;
+            assert!(!dry.applied && dry.conflicts == 0);
+            assert_eq!(gate_state(&c).await, before, "dryrun changed {name}");
+            // Abort after preceding core inserts, preserving both earlier imports and prototype facts.
+            let target = if *index == 0 { "episodes" } else { "movies" };
+            c.execute_batch(&format!("CREATE TRIGGER gate_failure BEFORE INSERT ON {target} BEGIN SELECT RAISE(ABORT,'PRIVATE_FAILURE'); END;")).await?;
+            let failure = snapshots::import(&db, *app, bytes.clone(), false)
+                .await
+                .unwrap_err();
+            assert!(!failure.to_string().contains("PRIVATE_FAILURE"));
+            assert_eq!(gate_state(&c).await, before, "failed import changed {name}");
+            c.execute("DROP TRIGGER gate_failure", ()).await?;
+            let report = snapshots::import(&db, *app, bytes.clone(), false).await?;
+            assert!(report.applied && report.conflicts == 0);
+            assert_eq!(report.missing_file_records, if *index == 1 { 0 } else { 1 });
+            assert!(!serde_json::to_string(&report)?.contains("SENTINEL_SECRET"));
+            if *index == 0 {
+                assert!(
+                    report
+                        .unsupported
+                        .iter()
+                        .any(|u| u.table == "DownloadClients")
+                );
+                assert_eq!(count(&c,"SELECT count(*) FROM snapshot_records WHERE source_table='Config' AND instr(record_json,'SENTINEL_SECRET')>0").await,1);
+                assert_eq!(count(&c,"SELECT count(*) FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE f.path='/tv/TV/Specials/pack.mkv'").await,2);
+                assert_eq!(count(&c,"SELECT count(*) FROM episodes e JOIN series s ON s.id=e.series_id WHERE s.tvdb_id=777 AND e.episode_file_id IS NULL").await,3);
+            } else if *index == 2 {
+                assert!(report.unsupported.iter().any(|u| u.table == "Collections"));
+                assert_eq!(count(&c,"SELECT count(*) FROM movie_files WHERE path='/movies/Film/Film.mkv' AND edition='Extended'").await,1);
+            }
+            let applied = gate_state(&c).await;
+            let replay = snapshots::import(&db, *app, bytes.clone(), false).await?;
+            assert!(replay.applied && replay.mapped == 0 && replay.conflicts == 0);
+            assert_eq!(gate_state(&c).await, applied, "replay changed {name}");
+            if let Some(expected) = &original {
+                assert_eq!(&original_tv(&c).await, expected);
+            }
+        }
+        if selected.len() == 1 {
+            assert_eq!(
+                count(
+                    &c,
+                    if selected[0] == 0 {
+                        "SELECT count(*) FROM movies"
+                    } else {
+                        "SELECT count(*) FROM episodes"
+                    }
+                )
+                .await,
+                0
+            );
+        } else {
+            // Numeric identity1 is simultaneously a movie and episode; no unqualified target is used.
+            assert_eq!(
+                count(&c, "SELECT count(*) FROM episodes WHERE id=1").await,
+                1
+            );
+            assert_eq!(count(&c, "SELECT count(*) FROM movies WHERE id=1").await, 1);
+            assert_eq!(count(&c,"SELECT count(*) FROM snapshot_mappings WHERE source_id=1 AND destination_table IN ('episodes','movies')").await,3);
+            assert_eq!(count(&c, "SELECT count(*) FROM movies").await, 4);
+        }
+        let before_reopen = gate_state(&c).await;
+        drop(c);
+        drop(db);
+        let reopened = Database::open_local(&path).await?;
+        assert!(reopened.migration_backup().is_none());
+        let c = reopened.connect().await?;
+        assert_eq!(gate_state(&c).await, before_reopen);
+        if let Some(expected) = &original {
+            assert_eq!(&original_tv(&c).await, expected);
+        }
+        for (_, filename, bytes) in &sources {
+            assert_eq!(&std::fs::read(files.0.join(filename))?, bytes);
+        }
+    }
     Ok(())
 }
