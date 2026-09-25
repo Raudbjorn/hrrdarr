@@ -45,6 +45,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "library_settings",
         include_str!("../../migrations/0007_library_settings.sql"),
     ),
+    (
+        "manual_import_journal",
+        include_str!("../../migrations/0008_manual_import_journal.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -127,6 +131,12 @@ impl Database {
         {
             false
         }
+    }
+
+    /// A held local database ownership lock is required before managing local media.
+    /// Remote storage does not confer filesystem ownership.
+    pub fn permits_local_imports(&self) -> bool {
+        self._owner.is_some()
     }
 
     pub fn migration_backup(&self) -> Option<&Path> {

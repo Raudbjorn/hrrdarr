@@ -5,12 +5,9 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
-use hrrdarr::{
-    db::{Database, MediaTarget},
-    snapshots,
-};
-use libsql::params;
+use hrrdarr::{db::Database, snapshots};
 use std::{env, net::SocketAddr, sync::Arc};
+#[cfg(test)]
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -18,7 +15,7 @@ struct AppState {
     db: Arc<Database>,
 }
 
-use hrrdarr::api::{ImportRequest, LegacyError, Operation, SnapshotOptions};
+use hrrdarr::api::{LegacyError, SnapshotOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), hrrdarr::db::Error> {
@@ -47,8 +44,6 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
 
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/api/v1/imports", post(import_preview))
-        .route("/api/v1/imports/{id}/execute", post(import_execute))
         .route(
             "/api/v1/migrations",
             post(migrate).layer(DefaultBodyLimit::max(snapshots::MAX_SNAPSHOT_BYTES)),
@@ -59,59 +54,7 @@ fn router(state: Arc<AppState>) -> Router {
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
-}
-
-async fn import_preview(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ImportRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    if req.source.trim().is_empty()
-        || req.destination.trim().is_empty()
-        || !matches!(req.mode.as_str(), "copy" | "move" | "hardlink")
-    {
-        return Err(ApiError::bad_request(
-            "source, destination, and mode (copy|move|hardlink) are required",
-        ));
-    }
-    let id = Uuid::new_v4();
-    let message = format!(
-        "episode {}: {} {} -> {}",
-        req.episode_id, req.mode, req.source, req.destination
-    );
-    let conn = state.db.connect().await?;
-    if conn
-        .query(
-            "SELECT id FROM episodes WHERE id = ?1",
-            params![req.episode_id],
-        )
-        .await?
-        .next()
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::not_found("episode not found"));
-    }
-    conn.execute(
-        "INSERT INTO operations (id, media_type, episode_id, source, mode, destination, status, message) VALUES (?1, 'episode', ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id.to_string(), req.episode_id, req.source, req.mode, req.destination, "preview", message.clone()],
-    )
-    .await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(Operation {
-            id,
-            target: MediaTarget::Episode(req.episode_id),
-            status: "preview",
-            message,
-        }),
-    ))
-}
-
-// Keep execution unavailable until file and database recovery is implemented.
-async fn import_execute() -> Result<Json<Operation>, ApiError> {
-    Err(ApiError::unavailable(
-        "import execution is unavailable until recoverable file/DB imports are implemented; previews are retained",
-    ))
+        .merge(hrrdarr::import::router(state.db.clone()))
 }
 
 async fn migrate(
@@ -142,18 +85,6 @@ impl ApiError {
             message: message.into(),
         }
     }
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
-    }
-    fn unavailable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.into(),
-        }
-    }
 }
 impl From<libsql::Error> for ApiError {
     fn from(e: libsql::Error) -> Self {
@@ -179,11 +110,6 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_unknown_transfer_mode() {
-        assert!(!matches!("replace", "copy" | "move" | "hardlink"));
-    }
-
     #[tokio::test]
     async fn snapshot_handler_previews_then_applies_uploaded_core_library() {
         let directory = std::env::temp_dir().join(format!("hrrdarr-upload-{}", Uuid::new_v4()));
@@ -206,6 +132,21 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(AppState { db: Arc::new(db) });
+        // Retain malformed snapshot rejection independently of the replaced import503 check.
+        assert_eq!(
+            migrate(
+                State(state.clone()),
+                Query(SnapshotOptions {
+                    application: snapshots::Application::Sonarr,
+                    dry_run: true
+                }),
+                axum::body::Bytes::from_static(b"not a database")
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
         for dry_run in [true, false] {
             let response = migrate(
                 State(state.clone()),
@@ -243,106 +184,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_handlers_preserve_paths_and_reject_unimplemented_writes() {
-        let directory = std::env::temp_dir().join(format!("hrrdarr-handlers-{}", Uuid::new_v4()));
+    async fn production_router_merges_import_routes() {
+        // Execution is now covered through real scratch-media HTTP tests in import_api.rs,
+        // replacing the former assertion that every execute request returns 503.
+        let directory = std::env::temp_dir().join(format!("hrrdarr-routes-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
-        {
-            let db = Database::open_local(directory.join("library.db"))
-                .await
-                .unwrap();
-            let conn = db.connect().await.unwrap();
-            conn.execute_batch("INSERT INTO series (id,title,path) VALUES (1,'Series','/tv/Series');
-                INSERT INTO seasons (series_id,number) VALUES (1,1);
-                INSERT INTO episode_files (id,series_id,path) VALUES (1,1,'/tv/Series/episode.mkv');
-                INSERT INTO episodes (id,series_id,season,number,title,episode_file_id) VALUES (1,1,1,1,'Episode',1);")
-                .await.unwrap();
-            let state = Arc::new(AppState { db: Arc::new(db) });
-            // Construct the production merge to catch static/wildcard route conflicts.
-            let _routes = router(state.clone());
-            // Episode endpoint/path assertions now exercise the real router in tests/episode_api.rs.
-            let request = |episode_id| {
-                Json(ImportRequest {
-                    episode_id,
-                    source: "/download/file".into(),
-                    mode: "copy".into(),
-                    destination: "/tv/new.mkv".into(),
-                })
-            };
-            let response = import_preview(State(state.clone()), request(999)).await;
-            let error = match response {
-                Err(error) => error,
-                Ok(_) => panic!("unknown target accepted"),
-            };
-            assert_eq!(error.status, StatusCode::NOT_FOUND);
-            assert_eq!(
-                conn.query("SELECT count(*) FROM operations", ())
-                    .await
-                    .unwrap()
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .get::<i64>(0)
-                    .unwrap(),
-                0
-            );
-            let response = import_preview(State(state.clone()), request(1))
-                .await
-                .unwrap()
-                .into_response();
-            assert_eq!(response.status(), StatusCode::ACCEPTED);
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(
-                payload["target"],
-                serde_json::json!({"media_type":"episode", "id":1})
-            );
-            assert_eq!(
-                import_execute().await.unwrap_err().status,
-                StatusCode::SERVICE_UNAVAILABLE
-            );
-            // Snapshot writes now validate uploads; malformed bytes return 400 rather than the former blanket 503.
-            assert_eq!(
-                migrate(
-                    State(state),
-                    Query(SnapshotOptions {
-                        application: snapshots::Application::Sonarr,
-                        dry_run: true
-                    }),
-                    axum::body::Bytes::from_static(b"not a database")
-                )
-                .await
-                .unwrap_err()
-                .status,
-                StatusCode::BAD_REQUEST
-            );
-            assert_eq!(
-                conn.query("SELECT count(*) FROM operations WHERE status='preview'", ())
-                    .await
-                    .unwrap()
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .get::<i64>(0)
-                    .unwrap(),
-                1
-            );
-            assert_eq!(
-                conn.query("SELECT count(*) FROM episodes", ())
-                    .await
-                    .unwrap()
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .get::<i64>(0)
-                    .unwrap(),
-                1
-            );
-        }
+        let state = Arc::new(AppState {
+            db: Arc::new(Database::open_local(directory.join("db")).await.unwrap()),
+        });
+        let _routes = router(state.clone());
+        drop(_routes);
+        drop(state);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

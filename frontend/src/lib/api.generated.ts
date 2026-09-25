@@ -46,6 +46,8 @@ export type FileRevision = { version: number, real: number, is_repack: boolean, 
 
 export type FileUpdate = { id: number, quality?: FileQualityInput | null, languages?: Array<number> | null, release_group?: string | null, edition?: string | null, indexer_flags?: number | null, release_type?: number | null, };
 
+export type ImportInput = ManualImportRequest | ImportRequest;
+
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };
 
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
@@ -78,6 +80,8 @@ export type LibraryStatistics = { total_episode_count: number | null, episode_co
 
 export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
+export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
+
 export type MediaDomain = "tv" | "movies";
 
 export type MediaInfo = { schema_revision: number | null, container_format: string | null, audio_bitrate: number | null, audio_channels: number | null, audio_codec: string | null, audio_languages: string | null, audio_stream_count: number | null, video_bit_depth: number | null, video_bitrate: number | null, video_codec: string | null, video_fps: number | null, video_dynamic_range: string | null, video_dynamic_range_type: string | null, resolution: string | null, run_time: string | null, scan_type: string | null, subtitles: string | null, video_format: string | null, video_codec_id: string | null, video_profile: string | null, audio_format: string | null, audio_codec_id: string | null, audio_profile: string | null, audio_channel_count: number | null, audio_channel_positions: string | null, width: number | null, height: number | null, runtime_ticks: number | null, audio_streams: Array<MediaInfoAudioStream> | null, subtitle_streams: Array<MediaInfoSubtitleStream> | null, };
@@ -90,11 +94,13 @@ export type MediaTarget = { "media_type": "episode", "id": number } | { "media_t
 
 export type MinimumAvailability = "tba" | "announced" | "in_cinemas" | "released";
 
+export type Mode = "copy" | "move" | "hardlink";
+
 export type MonitorNewItems = "all" | "none";
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type Operation = { id: string, target: MediaTarget, status: string, message: string, };
+export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
 
 export type Quality = { id: number, name: string, source: string, resolution: number, modifier?: string, };
 

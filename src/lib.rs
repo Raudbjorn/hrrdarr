@@ -8,3 +8,5 @@ pub mod quality_profiles;
 pub mod snapshots;
 
 pub mod api_contract;
+
+pub mod import;

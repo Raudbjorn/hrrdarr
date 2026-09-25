@@ -31,6 +31,7 @@ pub struct ApiPage<T> {
     pub offset: u32,
 }
 #[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(deny_unknown_fields)]
 pub struct ImportRequest {
     pub episode_id: i64,
     pub source: String,
@@ -41,8 +42,9 @@ pub struct ImportRequest {
 pub struct Operation {
     pub id: Uuid,
     pub target: crate::db::MediaTarget,
-    pub status: &'static str,
+    pub status: String,
     pub message: String,
+    pub error_code: Option<String>,
 }
 #[derive(Deserialize, TS)]
 pub struct SnapshotOptions {

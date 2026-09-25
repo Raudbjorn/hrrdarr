@@ -288,8 +288,9 @@ async fn actual_handler_wire_specimens_typecheck_against_generated_types() {
         serde_json::to_value(api::Operation {
             id: uuid::Uuid::nil(),
             target: hrrdarr::db::MediaTarget::Episode(1),
-            status: "preview",
+            status: "preview".into(),
             message: "Example".into(),
+            error_code: None,
         })
         .unwrap(),
     ));

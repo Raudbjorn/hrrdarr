@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        7 // Library settings are optional sidecars; upgrades preserve existing domain records.
+        8 // The import journal is additive; existing previews and library records survive upgrades.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,13 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
+    // Version 9 remains unknown now that migration 8 is a supported additive journal.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (8,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (9,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -380,5 +381,236 @@ async fn each_migration_ddl_and_writes_rollback_on_failure() -> Result<(), Error
         params!["/a/file.mkv"],
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    // Build the actual previous schema from its immutable migrations, not an approximation.
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'TV','/tv'),(2,'Other','/other');
+        INSERT INTO seasons VALUES(1,1,1),(2,1,1);
+        INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Pilot'),(2,2,1,1,'Other');
+        INSERT INTO episode_files VALUES(9,2,'/other/file');
+        INSERT INTO movie_metadata(id,title) VALUES(1,'Movie');
+        INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movie');
+        INSERT INTO operations VALUES('tv','episode',1,NULL,'/source/tv','copy','/tv/new','preview','');
+        INSERT INTO operations VALUES('movie','movie',NULL,1,'/source/movie','move','/movie/new','preview','');
+        INSERT INTO snapshot_imports(application,fingerprint,schema_version) VALUES('sonarr','saved',233);
+        INSERT INTO snapshot_mappings VALUES('sonarr','saved','episode_files',7,9);").await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!("../migrations/0008_manual_import_journal.sql"))
+        .await?;
+    assert!(tx.execute("INSERT INTO import_journal(operation_id,plan_json,phase) VALUES('absent','{}','preview')",()).await.is_err());
+    tx.rollback().await?;
+    assert_eq!(scalar(&c,"SELECT count(*) FROM sqlite_schema WHERE name IN ('import_journal','import_history','import_operation_immutable')").await,0);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
+        2
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        7
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.permits_local_imports());
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        8
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
+        2
+    );
+    // Initial Stage JSON may be persisted in the same write that completes staging.
+    c.execute_batch("INSERT INTO import_journal(operation_id,plan_json,phase) VALUES('tv','{}','preview'),('movie','{}','staging');
+        UPDATE import_journal SET stage_json=json_object('directory',json_object('dev',1,'ino',2),'file',json_object('dev',1,'ino',3),'sha256',printf('%064d',0)),phase='staged' WHERE operation_id='tv';").await?;
+    // The delivered predicates compare JSON scalar facts, independent of whitespace/key order.
+    let reordered = format!(
+        r#"{{
+        "sha256": "{}", "file": {{ "ino": 3, "dev": 1 }},
+        "directory": {{ "ino": 2, "dev": 1 }}
+    }}"#,
+        "0".repeat(64)
+    );
+    c.execute(
+        "UPDATE import_journal SET stage_json=? WHERE operation_id='tv'",
+        params![reordered],
+    )
+    .await?;
+    assert!(c.execute("UPDATE import_journal SET stage_json=json_set(stage_json,'$.file.ino',4) WHERE operation_id='tv'",()).await.is_err());
+    for sql in [
+        "UPDATE import_journal SET plan_json='{\"changed\":true}' WHERE operation_id='tv'",
+        "UPDATE import_journal SET version=2 WHERE operation_id='tv'",
+        "UPDATE import_journal SET phase='staging' WHERE operation_id='tv'",
+        "UPDATE import_journal SET stage_json='{\"file\":{\"ino\":123}}' WHERE operation_id='tv'",
+        "UPDATE import_journal SET stage_json='{\"source_retired\":true}' WHERE operation_id='tv'",
+        "UPDATE import_journal SET phase='complete' WHERE operation_id='tv'",
+        "UPDATE import_journal SET phase='published' WHERE operation_id='movie'",
+        "UPDATE import_journal SET plan_json='[]' WHERE operation_id='tv'",
+        "UPDATE import_journal SET stage_json='[]' WHERE operation_id='tv'",
+        "UPDATE import_journal SET stage_json=json_object('large',printf('%05000d',1)) WHERE operation_id='tv'",
+        "UPDATE operations SET source='/changed' WHERE id='tv'",
+        "UPDATE operations SET episode_id=2 WHERE id='tv'",
+        "UPDATE operations SET media_type='movie',episode_id=NULL,movie_id=1 WHERE id='tv'",
+        "DELETE FROM operations WHERE id='tv'",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+
+    // Late failure must roll back file creation, associations, history and phase together.
+    let tx = c.transaction().await?;
+    tx.execute_batch("INSERT INTO episode_files VALUES(7,1,'/tv/new'); UPDATE episodes SET episode_file_id=7 WHERE id=1;
+        INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256)
+        VALUES('tv','episode',1,7,'/source/tv','/tv/new',12,printf('%064d',0));
+        UPDATE import_journal SET phase='committed' WHERE operation_id='tv';").await?;
+    assert!(
+        tx.execute("INSERT INTO episode_files VALUES(10,999,'/invalid')", ())
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM episode_files WHERE id=7").await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM episodes WHERE id=1 AND episode_file_id IS NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM import_history").await, 0);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM import_journal WHERE operation_id='tv' AND phase='staged'"
+        )
+        .await,
+        1
+    );
+
+    c.execute_batch("INSERT INTO episode_files VALUES(7,1,'/tv/new'); UPDATE episodes SET episode_file_id=7 WHERE id=1;
+        INSERT INTO movie_files(id,movie_id,path) VALUES(7,1,'/movie/new');
+        UPDATE import_journal SET stage_json='{}',phase='staged' WHERE operation_id='movie';").await?;
+    for sql in [
+        "INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES('tv','episode',1,9,'/source/tv','/tv/new',12,printf('%064d',0))",
+        "INSERT INTO import_history(operation_id,media_type,movie_id,movie_file_id,source,destination,size,sha256) VALUES('tv','movie',1,7,'/source/tv','/movie/new',12,printf('%064d',0))",
+        "INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES('tv','episode',1,7,'/wrong','/tv/new',12,printf('%064d',0))",
+        "INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES('tv','episode',1,7,'/source/tv','/tv/new',-1,printf('%064d',0))",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    let tx = c.transaction().await?;
+    tx.execute_batch("INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES('tv','episode',1,7,'/source/tv','/tv/new',12,printf('%064d',0));
+        INSERT INTO import_history(operation_id,media_type,movie_id,movie_file_id,source,destination,size,sha256) VALUES('movie','movie',1,7,'/source/movie','/movie/new',34,printf('%064d',1));
+        UPDATE import_journal SET phase='committed';
+        UPDATE import_journal SET stage_json='{\"quarantine\":{\"dev\":1,\"ino\":2},\"source_retired\":false}' WHERE operation_id='movie';
+        UPDATE import_journal SET stage_json=json_set(stage_json,'$.source_retired',json('true')) WHERE operation_id='movie';
+        UPDATE import_journal SET phase='complete'; UPDATE operations SET status='complete';").await?;
+    tx.commit().await?;
+    assert!(
+        c.execute(
+            "UPDATE import_history SET size=99 WHERE operation_id='tv'",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        c.execute("DELETE FROM import_journal WHERE operation_id='tv'", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        c.execute("DELETE FROM import_history WHERE operation_id='tv'", ())
+            .await
+            .is_err()
+    );
+    // Retiring a live file later does not erase/reinterpret historical IDs or snapshot identities.
+    c.execute_batch(
+        "UPDATE episodes SET episode_file_id=NULL WHERE id=1; DELETE FROM episode_files WHERE id=7;
+        DELETE FROM movie_files WHERE id=7;",
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM import_history WHERE episode_file_id=7 OR movie_file_id=7"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT destination_id FROM snapshot_mappings WHERE fingerprint='saved'"
+        )
+        .await,
+        9
+    );
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    assert_eq!(
+        scalar(&db.connect().await?, "SELECT count(*) FROM import_history").await,
+        2
+    );
     Ok(())
 }
