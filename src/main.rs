@@ -74,15 +74,27 @@ async fn migrate(
     Query(options): Query<SnapshotOptions>,
     bytes: axum::body::Bytes,
 ) -> Result<Json<snapshots::Report>, ApiError> {
-    snapshots::import(
-        &state.db,
-        options.application,
-        bytes.to_vec(),
-        options.dry_run,
-    )
-    .await
-    .map(Json)
-    .map_err(|error| ApiError::bad_request(error.to_string()))
+    let result = if options.import_providers {
+        snapshots::import_with_providers(
+            &state.db,
+            options.application,
+            bytes.to_vec(),
+            options.dry_run,
+            state.provider_key.as_deref(),
+        )
+        .await
+    } else {
+        snapshots::import(
+            &state.db,
+            options.application,
+            bytes.to_vec(),
+            options.dry_run,
+        )
+        .await
+    };
+    result
+        .map(Json)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -137,6 +149,8 @@ mod tests {
             INSERT INTO Series VALUES(1,100,'Upload',2024,'/tv/Upload',1,'[]');
             CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);
             CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);
+            CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER);
+            INSERT INTO Indexers VALUES(1,'Imported indexer','Torznab','TorznabSettings','{"baseUrl":"https://indexer.example","apiPath":"/api","apiKey":"SNAPSHOT_SECRET","categories":[5000],"animeCategories":[],"animeStandardFormatSearch":false}',1,1);
         "#).await.unwrap();
         drop(source);
         let bytes = std::fs::read(&source_path).unwrap();
@@ -153,7 +167,8 @@ mod tests {
                 State(state.clone()),
                 Query(SnapshotOptions {
                     application: snapshots::Application::Sonarr,
-                    dry_run: true
+                    dry_run: true,
+                    import_providers: false,
                 }),
                 axum::body::Bytes::from_static(b"not a database")
             )
@@ -168,6 +183,7 @@ mod tests {
                 Query(SnapshotOptions {
                     application: snapshots::Application::Sonarr,
                     dry_run,
+                    import_providers: false,
                 }),
                 bytes.clone().into(),
             )
@@ -193,6 +209,74 @@ mod tests {
                 .unwrap();
             assert_eq!(count, i64::from(!dry_run));
         }
+        let missing_key = migrate(
+            State(state.clone()),
+            Query(SnapshotOptions {
+                application: snapshots::Application::Sonarr,
+                dry_run: false,
+                import_providers: true,
+            }),
+            bytes.clone().into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_key.status, StatusCode::BAD_REQUEST);
+        assert!(!missing_key.message.contains("SNAPSHOT_SECRET"));
+        let keyed_state = Arc::new(AppState {
+            db: state.db.clone(),
+            provider_key: Some(Arc::new(
+                hrrdarr::providers::CredentialKey::from_hex(&"ab".repeat(32)).unwrap(),
+            )),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(keyed_state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (query, expected_status, expected_providers) in [
+            ("application=sonarr&dry_run=false", 200, 0),
+            ("application=sonarr&import_providers=invalid", 400, 0),
+            ("application=sonarr&import_providers=true", 200, 0),
+            (
+                "application=sonarr&import_providers=true&dry_run=false",
+                200,
+                1,
+            ),
+            (
+                "application=sonarr&import_providers=true&dry_run=false",
+                200,
+                1,
+            ),
+        ] {
+            let response = client
+                .post(format!("http://{address}/api/v1/migrations?{query}"))
+                .header("Content-Type", "application/octet-stream")
+                .body(bytes.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{query}");
+            assert!(!response.text().await.unwrap().contains("SNAPSHOT_SECRET"));
+            let conn = state.db.connect().await.unwrap();
+            let row = conn
+                .query(
+                    "SELECT count(*), coalesce(sum(enabled),0) FROM providers",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), expected_providers);
+            assert_eq!(row.get::<i64>(1).unwrap(), 0);
+        }
+        server.abort();
+        let _ = server.await;
         assert_eq!(bytes, std::fs::read(source_path).unwrap());
         drop(state);
         std::fs::remove_dir_all(directory).unwrap();

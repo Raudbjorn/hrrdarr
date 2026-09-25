@@ -1222,3 +1222,117 @@ async fn files(
         .await
         .map_err(|_| http_error(http::HttpError::Timeout).0)?
 }
+
+/// Snapshot writer supplies the transaction; no updates, network calls or independent commit.
+pub(crate) async fn import_configuration(
+    conn: &Connection,
+    key: Option<&CredentialKey>,
+    input: &ProviderInput,
+    mapped: Option<(&str, i64)>,
+) -> std::result::Result<Option<(String, i64, bool)>, &'static str> {
+    const INVALID: &str = "invalid source provider configuration";
+    const FAILED: &str = "provider reconstruction failed; transaction not committed";
+    const LOCKED: &str = "provider reconstruction requires the matching credential key";
+    validate(input).map_err(|_| INVALID)?;
+    if input.enabled {
+        return Err(INVALID);
+    }
+    let implementation = input.settings.implementation();
+    let wanted_secret = match &input.credentials {
+        Change::Value(value) => Some(value),
+        Change::Null => None,
+        Change::Missing => return Err(INVALID),
+    };
+    if wanted_secret.is_some() && key.is_none() {
+        return Err(LOCKED);
+    }
+    let domain = match &input.settings {
+        ProviderSettings::Torznab {
+            tv: Some(_),
+            movies: None,
+            ..
+        }
+        | ProviderSettings::Newznab {
+            tv: Some(_),
+            movies: None,
+            ..
+        }
+        | ProviderSettings::Qbittorrent {
+            tv: Some(_),
+            movies: None,
+            ..
+        } => "tv",
+        ProviderSettings::Torznab {
+            tv: None,
+            movies: Some(_),
+            ..
+        }
+        | ProviderSettings::Newznab {
+            tv: None,
+            movies: Some(_),
+            ..
+        }
+        | ProviderSettings::Qbittorrent {
+            tv: None,
+            movies: Some(_),
+            ..
+        } => "movies",
+        _ => return Err(INVALID),
+    };
+    // Endpoint + implementation + source domain is a conservative reconciliation identity.
+    // Never merge independent TV/movie configurations or pick among ambiguous candidates.
+    let mut rows = if let Some((id, _)) = mapped {
+        conn.query("SELECT id FROM providers WHERE id=?", [id])
+            .await
+            .map_err(|_| FAILED)?
+    } else {
+        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,input.settings.endpoint(),domain]).await.map_err(|_| FAILED)?
+    };
+    let candidate = rows
+        .next()
+        .await
+        .map_err(|_| FAILED)?
+        .map(|row| row.get::<String>(0).map_err(|_| FAILED))
+        .transpose()?;
+    if candidate.is_some() && rows.next().await.map_err(|_| FAILED)?.is_some() {
+        return Ok(None);
+    }
+    drop(rows);
+    if let Some(id) = candidate {
+        let (existing, cipher) = read(conn, &id).await.map_err(|_| FAILED)?;
+        let secret = cipher
+            .as_ref()
+            .map(|bytes| {
+                key.ok_or(LOCKED)?
+                    .open(&id, existing.settings.implementation(), bytes)
+                    .map_err(|_| LOCKED)
+            })
+            .transpose()?;
+        let equals = existing.name == input.name
+            && !existing.enabled
+            && existing.priority == input.priority
+            && existing.last_test.is_none()
+            && mapped.is_none_or(|(_, revision)| existing.revision == revision)
+            && serde_json::to_value(&existing.settings).map_err(|_| FAILED)?
+                == serde_json::to_value(&input.settings).map_err(|_| FAILED)?
+            && serde_json::to_value(&secret).map_err(|_| FAILED)?
+                == serde_json::to_value(wanted_secret).map_err(|_| FAILED)?;
+        return Ok(equals.then_some((id, existing.revision, false)));
+    }
+    if mapped.is_some() {
+        return Ok(None);
+    }
+    let id = Uuid::new_v4().to_string();
+    let encrypted = wanted_secret
+        .map(|value| {
+            key.ok_or(LOCKED)?
+                .seal(&id, implementation, value)
+                .map_err(|_| LOCKED)
+        })
+        .transpose()?;
+    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),input.settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
+    write_scopes(conn, &id, &input.settings)
+        .await
+        .map_err(|_| FAILED)?;
+    Ok(Some((id, 1, true)))
+}

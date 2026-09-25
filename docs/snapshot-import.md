@@ -66,7 +66,7 @@ media. Mounts, permissions, availability of media, and path mappings are unverif
 including extra fields on mapped rows, are archived as typed JSON. This preserves
 SQL nulls and binary values as hex. Profile assignments, custom formats, tags,
 collections, history, providers, path mappings, list exclusions, unknown settings,
-and richer metadata are currently archival only. They have not gained runtime
+and richer metadata are currently archival only (except the explicit provider reconstruction below). They have not gained runtime
 semantics by being retained. There is no archive-reading API.
 
 Archives can contain credentials. Import requires a local Unix destination database
@@ -113,3 +113,68 @@ imported snapshot. A one-time fill requires intact mapped core fields and all ne
 supported fields still null; it never overwrites local edits. `metadata_backfilled`
 counts affected episode records. Dry runs roll back both data and activation marker.
 See [episode API](episode-api.md) for date, numbering, cover-field and replay rules.
+
+## Optional provider reconstruction
+
+`import_providers=true` explicitly reconstructs **Torznab, Newznab and qBittorrent**
+configuration while importing the same supported Sonarr/Radarr snapshot versions.
+The default is `false`, which preserves the previous archival-only behavior and
+requires no provider key. `dry_run` still defaults to `true`.
+
+Reconstructed providers are always **disabled and untested**. Review unsupported
+fields before enabling them through the native provider API. The importer never
+contacts an indexer/client, starts a session, submits a download, resumes a job or
+imports external queue/test state. Source enable flags, indexer automation policies,
+tags, seed criteria and cleanup policies remain archived and explicitly reported
+as unsupported. Unknown provider implementations remain entirely archival.
+Unknown JSON property names are reported through a static settings marker rather
+than echoing potentially private names or values.
+
+Mapped configuration includes names/priorities; indexer endpoint/API path,
+media-specific categories, anime-format/movie-year flags and additional parameters;
+qBittorrent endpoint, scoped categories/priorities, initial state, content layout,
+sequential/first-last-piece settings and TV tag forwarding. Missing JSON properties
+use the pinned source defaults: indexer `/api`, TV categories 5030/5040, movie
+categories 2000/2010/2020/2030/2040/2045/2050/2060, qBittorrent localhost:8080 and
+`tv-sonarr`/`radarr` categories, started/default-layout and false flags. Explicit
+invalid values are rejected, not silently converted to defaults. Bare IPv6 hosts
+are bracketed. Additional parameter percent encoding must represent valid UTF-8;
+malformed encoding is rejected rather than changing credential bytes.
+
+API keys, additional query parameters and username/password pairs are encrypted
+with `HRRDARR_PROVIDER_KEY` using the existing native credential format. A key is
+required only when the reconstructed configuration contains credentials; a wrong
+key on replay fails closed. Credential-free trusted clients remain credential-free.
+Supplying both bearer and username/password credentials is rejected instead of
+choosing one silently. Original credential-bearing source rows remain in the private
+archive, so the database and its backups still need owner-only protection. Key
+custody remains separate from database backups; see [provider configuration](provider-config.md).
+
+Provider mappings use application + snapshot fingerprint + source table + numeric
+source ID, with a UUID destination and captured revision. Equal Indexers and
+DownloadClients IDs remain distinct, as do TV/movie imports. Existing archived
+snapshots can be replayed with the option to add these mappings. Exact replay
+requires the mapped provider to exist with unchanged revision, complete configuration,
+plaintext credential content, disabled state and no test observation. Local changes,
+deletions or testing cause conflicts; nothing is overwritten or silently recreated.
+
+For a different backup, implementation + exact endpoint + media domain identify
+candidate configurations. No candidate creates a new disabled configuration. If a
+candidate exists, exactly one must match every reconstructed field and decrypted
+credential; otherwise the import reports a conflict. Independent
+TV/movie configurations are not automatically merged. Multiple configurations at
+the same endpoint within a domain may therefore require explicit reconciliation,
+even when they have different names or credentials. This conservative rule prevents
+ambiguous ownership and duplicate configuration creation.
+
+All core records, providers, scopes, archives and mappings share the import
+transaction. Any conflict or late error rolls everything back; dry runs persist
+nothing. At most 256 total source indexer/client rows can be reconstructed per upload,
+including unsupported implementations. No source database or media is modified.
+
+Evidence: `tests/provider_snapshots.rs`, provider adapter unit tests and
+`provider_snapshot_mapping_upgrade_rollback_and_reopen` in `tests/schema_migrations.rs`
+cover synthetic both-app/version imports, source-table collisions, defaults,
+credential privacy/key failures, disabled state, exact/new-backup replay, local
+edits/deletions, late rollback and reopening. These do not establish real exported
+backup compatibility, external-service equivalence or full ancillary snapshot parity.

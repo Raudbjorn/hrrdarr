@@ -65,6 +65,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "qbittorrent_options",
         include_str!("../../migrations/0012_qbittorrent_options.sql"),
     ),
+    (
+        "snapshot_provider_mappings",
+        include_str!("../../migrations/0013_snapshot_provider_mappings.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

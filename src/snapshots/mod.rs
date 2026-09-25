@@ -1,6 +1,7 @@
 //! Import self-contained SQLite backup uploads; never open a source path or touch media.
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
+mod providers;
 mod readers;
 
 use crate::db::Database;
@@ -124,6 +125,27 @@ pub async fn import(
     bytes: Vec<u8>,
     dry_run: bool,
 ) -> Result<Report> {
+    import_inner(db, app, bytes, dry_run, false, None).await
+}
+
+/// Explicitly reconstruct supported provider configuration, disabled and untested.
+pub async fn import_with_providers(
+    db: &Database,
+    app: Application,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    key: Option<&crate::providers::CredentialKey>,
+) -> Result<Report> {
+    import_inner(db, app, bytes, dry_run, true, key).await
+}
+async fn import_inner(
+    db: &Database,
+    app: Application,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    reconstruct_providers: bool,
+    key: Option<&crate::providers::CredentialKey>,
+) -> Result<Report> {
     if !db.permits_private_snapshots() {
         return Err(ImportError(
             "snapshot retention requires a private local database (owner-only permissions)",
@@ -158,9 +180,14 @@ pub async fn import(
     })
     .await
     .map_err(|_| ImportError("snapshot reader failed"))??;
-    let plan = match app {
+    let mut plan = match app {
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
+    };
+    let provider_plan = if reconstruct_providers {
+        providers::read(&source, app, &mut plan.unsupported)?
+    } else {
+        Vec::new()
     };
     let mut report = Report {
         application: app,
@@ -176,11 +203,18 @@ pub async fn import(
         unsupported: plan.unsupported,
         policy: "Core library records only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
+    if reconstruct_providers {
+        report.policy = "Supported provider configurations are reconstructed disabled and untested; credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+    }
     let conn = db.connect().await?;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let result = write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await;
+    let result = async {
+        write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
+        providers::write(&tx, &provider_plan, key, &mut report).await
+    }
+    .await;
     match result {
         Ok(()) if !dry_run && report.conflicts == 0 => {
             tx.commit().await?;

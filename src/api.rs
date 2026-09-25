@@ -52,6 +52,9 @@ pub struct SnapshotOptions {
     #[serde(default = "default_dry_run")]
     #[ts(as = "Option<bool>", optional)]
     pub dry_run: bool,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub import_providers: bool,
 }
 fn default_dry_run() -> bool {
     true

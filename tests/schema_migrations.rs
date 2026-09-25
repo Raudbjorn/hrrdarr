@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        12 // Opening latest schema also applies qBittorrent options; Additive scope options now also apply; existing imports/configuration survive.
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 13 remains unknown after migration 12 adds qBittorrent options.
+    // Version 14 remains unknown after migration 13 adds provider snapshot mappings.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (13,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (14,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        12 // Opening latest schema also applies qBittorrent options; Opening the old fixture also applies provider configuration, tests and scope options.
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        12 // Opening latest schema also applies qBittorrent options; Opening schema 8 also applies configuration, test-result and scope-option migrations.
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        12 // Opening latest schema also applies qBittorrent options; Opening schema 9 also applies the additive scope-option migration.
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        12 // Latest schema also applies client options.
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        12
+        13 // Latest-schema opens also apply the additive provider snapshot mapping migration.
     );
     assert_eq!(
         scalar(
@@ -1452,5 +1452,143 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
         assert!(tx.execute(&format!("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES('00000000-0000-0000-0000-000000000003','qbittorrent','movies',{cat},0,0,{state},'default',0,0,0)"),()).await.is_err());
     }
     tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO snapshot_imports(application,fingerprint,schema_version) VALUES('sonarr','abc',233);INSERT INTO providers VALUES('00000000-0000-0000-0000-000000000001','torznab','Kept',0,1,1,1,'https://example.test/api',zeroblob(29));INSERT INTO provider_tests VALUES('00000000-0000-0000-0000-000000000001',1,1,'success',NULL);").await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!(
+        "../migrations/0013_snapshot_provider_mappings.sql"
+    ))
+    .await?;
+    assert!(
+        tx.execute(
+            "INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','Indexers',1,'bad-id',1)",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sqlite_schema WHERE name='snapshot_provider_mappings'"
+        )
+        .await,
+        0
+    );
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        13
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM providers WHERE name='Kept' AND credentials=zeroblob(29)"
+        )
+        .await,
+        1
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_tests").await, 1);
+    for sql in [
+        "INSERT INTO snapshot_provider_mappings VALUES('radarr','abc','Indexers',1,'00000000-0000-0000-0000-000000000001',1)",
+        "INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','Other',1,'00000000-0000-0000-0000-000000000001',1)",
+        "INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','Indexers',0,'00000000-0000-0000-0000-000000000001',1)",
+        "INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','Indexers',1,'00000000-0000-0000-0000-000000000001',0)",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err());
+    }
+    c.execute_batch("INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','Indexers',1,'00000000-0000-0000-0000-000000000001',1);INSERT INTO snapshot_provider_mappings VALUES('sonarr','abc','DownloadClients',1,'00000000-0000-0000-0000-000000000001',1);DELETE FROM providers;").await?;
+    // Intentional absent provider FK preserves deletion and lets replay detect dangling mappings.
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
+        2
+    );
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
+        2
+    );
     Ok(())
 }

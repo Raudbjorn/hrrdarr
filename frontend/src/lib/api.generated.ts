@@ -210,7 +210,7 @@ export type SeriesType = "standard" | "daily" | "anime";
 
 export type SnapshotApplication = "sonarr" | "radarr";
 
-export type SnapshotOptions = { application: SnapshotApplication, dry_run?: boolean, };
+export type SnapshotOptions = { application: SnapshotApplication, dry_run?: boolean, import_providers?: boolean, };
 
 export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, policy: string, };
 
