@@ -124,6 +124,8 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
     let series = table(source, "Series", SERIES)?;
     let episodes = table(source, "Episodes", EPISODES)?;
     let files = table(source, "EpisodeFiles", FILES)?;
+    let mut file_columns = FILES.to_vec();
+    file_columns.extend(FILE_METADATA.iter().map(|(source, _)| *source));
     let mut episode_columns = EPISODES.to_vec();
     episode_columns.extend(EPISODE_METADATA.iter().map(|(source, _)| *source));
     let mut plan = Plan {
@@ -135,7 +137,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             &[
                 ("Series", SERIES),
                 ("Episodes", &episode_columns),
-                ("EpisodeFiles", FILES),
+                ("EpisodeFiles", &file_columns),
             ],
         ),
     };
@@ -211,6 +213,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             ],
             keys: vec![vec!["path"]],
         });
+        add_file_metadata(&mut plan, row, "tv", id)?;
     }
     for row in &episodes.rows {
         let series_id = positive(row, "SeriesId")?;
@@ -305,6 +308,8 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
         ));
     }
     let files = table(source, "MovieFiles", FILES)?;
+    let mut file_columns = FILES.to_vec();
+    file_columns.extend(FILE_METADATA.iter().map(|(source, _)| *source));
     let mut movie_columns = CORE.to_vec();
     if modern {
         movie_columns.push("MovieMetadataId");
@@ -320,7 +325,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
             &[
                 ("Movies", &movie_columns),
                 ("MovieMetadata", META),
-                ("MovieFiles", FILES),
+                ("MovieFiles", &file_columns),
             ],
         ),
     };
@@ -405,6 +410,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
             ],
             keys: vec![vec!["movie_id"], vec!["path"]],
         });
+        add_file_metadata(&mut plan, row, "movies", id)?;
     }
     plan.missing = selected_files
         .keys()
@@ -545,4 +551,211 @@ fn episode_metadata(row: &Record) -> Result<Vec<(&'static str, Field)>> {
         fields.push((destination, Field::Value(value)));
     }
     Ok(fields)
+}
+
+const FILE_METADATA: &[(&str, &str)] = &[
+    ("MediaInfo", "media_info_json"),
+    ("Quality", "quality_id"),
+    ("Languages", "languages_json"),
+    ("Size", "size"),
+    ("DateAdded", "date_added"),
+    ("SeasonNumber", "season_number"),
+    ("OriginalFilePath", "original_file_path"),
+    ("ReleaseGroup", "release_group"),
+    ("IndexerFlags", "indexer_flags"),
+    ("ReleaseType", "release_type"),
+];
+fn add_file_metadata(plan: &mut Plan, row: &Record, media: &'static str, id: i64) -> Result<()> {
+    use serde_json::{Value as J, json};
+    let target = if media == "tv" {
+        "episode_file_id"
+    } else {
+        "movie_file_id"
+    };
+    let core = if media == "tv" {
+        "episode_files"
+    } else {
+        "movie_files"
+    };
+    let source_table = if media == "tv" {
+        "EpisodeFiles"
+    } else {
+        "MovieFiles"
+    };
+    let mut fields = vec![
+        ("media_type", val(media)),
+        (target, Field::Reference(core, id)),
+        ("quality_id", Field::Value(Value::Null)),
+        ("revision_json", Field::Value(Value::Null)),
+    ];
+    let mut unsupported = vec![];
+    for (source, destination) in FILE_METADATA {
+        let raw = row.get(*source).unwrap_or(&Value::Null);
+        if *source == "Quality" {
+            if matches!(raw, Value::Null) {
+                continue;
+            }
+            let Value::Text(raw) = raw else {
+                return Err(ImportError("invalid source file quality"));
+            };
+            let quality: J = serde_json::from_str(raw)
+                .map_err(|_| ImportError("invalid source file quality JSON"))?;
+            if quality.is_null() {
+                continue;
+            }
+            let obj = quality
+                .as_object()
+                .ok_or(ImportError("invalid source file quality object"))?;
+            let qid = obj
+                .get("quality")
+                .and_then(J::as_i64)
+                .ok_or(ImportError("invalid source file quality id"))?;
+            // Supported ids are the pinned catalog identities seeded by migration0004.
+            let known = if media == "tv" {
+                matches!(qid,0..=10|12..=22)
+            } else {
+                matches!(qid,0..=10|12|14..=31)
+            };
+            if !known {
+                unsupported.push("Quality".to_string());
+                continue;
+            }
+            let revision = match obj.get("revision") {
+                None | Some(J::Null) => J::Null,
+                Some(r) => {
+                    let r = r
+                        .as_object()
+                        .ok_or(ImportError("invalid source file revision"))?;
+                    if r.keys()
+                        .any(|k| !matches!(k.as_str(), "version" | "real" | "isRepack"))
+                    {
+                        unsupported.push("Quality.revision".into());
+                    }
+                    json!({"version":r.get("version"),"real":r.get("real"),"is_repack":r.get("isRepack")})
+                }
+            };
+            if obj
+                .keys()
+                .any(|k| !matches!(k.as_str(), "quality" | "revision"))
+            {
+                unsupported.push("Quality.extra_fields".into());
+            }
+            let (qid, revision) =
+                crate::media_files::quality(&json!({"quality_id":qid,"revision":revision}))
+                    .map_err(ImportError)?;
+            fields[2].1 = val(qid);
+            fields[3].1 = Field::Value(revision.map(Value::Text).unwrap_or(Value::Null));
+            continue;
+        }
+        if (media == "movies" && matches!(*source, "SeasonNumber" | "ReleaseType"))
+            || (media == "tv" && *source == "OriginalFilePath")
+        {
+            if !matches!(raw, Value::Null) {
+                unsupported.push(source.to_string());
+            }
+            continue;
+        }
+        let value = match raw {
+            Value::Null => Value::Null,
+            _ => match *source {
+                "MediaInfo" => {
+                    let Value::Text(raw) = raw else {
+                        return Err(ImportError("invalid source media info"));
+                    };
+                    let (normalized, unknown) =
+                        crate::media_files::media_info::normalize(raw, media)
+                            .map_err(ImportError)?;
+                    if unknown {
+                        unsupported.push("MediaInfo.unsupported_fields_or_values".into());
+                    }
+                    normalized.map(Value::Text).unwrap_or(Value::Null)
+                }
+                "Languages" => {
+                    let Value::Text(raw) = raw else {
+                        return Err(ImportError("invalid source file languages"));
+                    };
+                    let mut languages: J = serde_json::from_str(raw)
+                        .map_err(|_| ImportError("invalid source file languages JSON"))?;
+                    if let Some(array) = languages.as_array_mut() {
+                        for value in array {
+                            if value.is_null() {
+                                *value = json!(0);
+                            }
+                        }
+                    }
+                    match crate::media_files::languages(&languages, media) {
+                        Ok(v) => v.map(Value::Text).unwrap_or(Value::Null),
+                        Err(_) => {
+                            unsupported.push("Languages".into());
+                            Value::Null
+                        }
+                    }
+                }
+                "DateAdded" => {
+                    let Value::Text(raw) = raw else {
+                        return Err(ImportError("invalid source file date"));
+                    };
+                    Value::Text(
+                        crate::episodes::normalize_utc(raw)
+                            .ok_or(ImportError("invalid source file date"))?,
+                    )
+                }
+                "ReleaseGroup" | "OriginalFilePath" => {
+                    let Value::Text(raw) = raw else {
+                        return Err(ImportError("invalid source file text"));
+                    };
+                    crate::media_files::string(
+                        &json!(raw),
+                        if *source == "OriginalFilePath" {
+                            4096
+                        } else {
+                            1024
+                        },
+                    )
+                    .map_err(ImportError)?
+                }
+                "Size" | "SeasonNumber" => {
+                    let Value::Integer(n) = raw else {
+                        return Err(ImportError("invalid source file number"));
+                    };
+                    crate::media_files::number(&json!(n), i64::MAX).map_err(ImportError)?
+                }
+                "IndexerFlags" | "ReleaseType" => {
+                    let Value::Integer(n) = raw else {
+                        return Err(ImportError("invalid source file enum"));
+                    };
+                    let max = if *source == "ReleaseType" {
+                        3
+                    } else if media == "tv" {
+                        511
+                    } else {
+                        4095
+                    };
+                    match crate::media_files::number(&json!(n), max) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            unsupported.push(source.to_string());
+                            Value::Null
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            },
+        };
+        fields.push((destination, Field::Value(value)));
+    }
+    if !unsupported.is_empty() {
+        plan.unsupported.push(Unsupported {
+            table: source_table.into(),
+            rows: 1,
+            columns: unsupported,
+        });
+    }
+    plan.entities.push(Entity {
+        table: "file_metadata",
+        source_id: id,
+        fields,
+        keys: vec![vec![target]],
+    });
+    Ok(())
 }

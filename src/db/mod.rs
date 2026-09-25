@@ -36,6 +36,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "episode_metadata",
         include_str!("../../migrations/0005_episode_metadata.sql"),
     ),
+    (
+        "file_metadata",
+        include_str!("../../migrations/0006_file_metadata.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

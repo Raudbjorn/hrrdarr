@@ -357,6 +357,9 @@ async fn both_snapshot_adapters_reconcile_without_data_loss_or_secret_disclosure
     // A missing mapped file is a local edit, not permission to recreate it on replay.
     ic.execute("UPDATE episodes SET episode_file_id=NULL", ())
         .await?;
+    // Migration0006 restricts file removal while metadata exists; simulate coordinated
+    // deletion but retain both mapping records so replay cannot resurrect either row.
+    ic.execute("DELETE FROM file_metadata", ()).await?;
     ic.execute("DELETE FROM episode_files", ()).await?;
     let replay = snapshots::import(
         &isolated,
