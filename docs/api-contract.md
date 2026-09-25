@@ -1,0 +1,70 @@
+# Generated API contract
+
+Rust handler DTOs own the wire shapes. `ts-rs` 12.0.1 derives their TypeScript declarations; `src/api_contract.rs` registers the shipped roots and follows nested dependencies. The deterministic output is committed at `frontend/src/lib/api.generated.ts`. No build script or test rewrites that file. `cargo run` still starts hrrdarr; generation requires the explicit binary.
+
+```sh
+cargo run --locked --bin generate-api
+cargo run --locked --bin generate-api -- --check
+npm --prefix frontend run generate:api
+npm --prefix frontend run check:api
+npm --prefix frontend run check
+npm --prefix frontend test
+cargo test --locked --test api_contract
+```
+
+Install the locked frontend dependencies first (`npm --prefix frontend ci`): the Rust contract test compiles real local HTTP response specimens with the installed TypeScript compiler. `--check` fails on a missing or stale artifact without modifying it. An optional path after `--check` supports isolated artifact checks. Sorted declarations contain no timestamps or environment-dependent configuration.
+
+## Shipped surface
+
+All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{base}` is `tv/series` or `movies`. Query DTOs describe URL scalar values, not JSON request bodies. CSV selectors remain strings. IDs in route segments are positive domain-qualified integers; operation IDs are UUID strings.
+
+| Route and method | Request | Success body |
+| --- | --- | --- |
+| GET `/series` | none | `LegacySeries[]` |
+| GET `/series/{id}/episodes` | none | `LegacyEpisode[]` |
+| POST `/imports` | `ImportRequest` | `Operation` (202 preview) |
+| POST `/imports/{id}/execute` | none | No success yet; existing execution guard returns 503 |
+| POST `/migrations` | `SnapshotOptions` query; raw SQLite backup bytes | `SnapshotReport` |
+| GET `/{base}` | `LibraryQuery` | `LibraryPage` |
+| POST `/{base}` | `LibraryCreate` | `LibraryItem` (201) |
+| GET `/{base}/{id}` | none | `LibraryItem` |
+| PUT `/{base}/{id}` | `LibraryPatch` | `LibraryItem` |
+| PUT `/{base}/bulk` | `LibraryBulk` (`items` with `id` and `patch`) | `LibraryItem[]` |
+| PUT `/{base}/editor` | `LibraryEditor` | `LibraryItem[]` |
+| GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
+| GET `/episodes/{id}` | none (all projections included) | `Episode` |
+| PUT `/episodes/{id}` | `EpisodeMonitor` | `Episode` |
+| PUT `/episodes/monitor` | `EpisodeMonitorMany` body; `EpisodeIncludes` query | `Episode[]` |
+| GET `/{media}/files` | `FileQuery` | `ApiPage<FileResource>` |
+| GET `/{media}/files/{id}` | none | `TvFileResource` or `MovieFileResource` |
+| PUT `/{media}/files/{id}` | `FilePatch` | matching file resource |
+| PUT `/{media}/files/bulk` | `FileBulk` (`files`, each a flattened `FileUpdate`) | `FileResource[]` |
+| PUT `/{media}/files/editor` | `FileEditor` (flattened patch) | `FileResource[]` |
+| GET `/{media}/quality-definitions` or `/defaults` | none | `QualityDefinition[]` |
+| GET `/{media}/quality-definitions/limits` | none | `QualityDefinitionLimits` |
+| GET `/{media}/quality-definitions/{id}` | none | `QualityDefinition` |
+| PUT `/{media}/quality-definitions/{id}` | `QualityDefinitionUpdate` (body ID matches route) | `QualityDefinition` |
+| PUT `/{media}/quality-definitions/bulk` | raw `QualityDefinitionUpdate[]` | `QualityDefinition[]` |
+| POST `/{media}/quality-definitions/reset` | `QualityDefinitionReset` | `QualityDefinition[]` |
+| GET `/{media}/quality-profiles` | `QualityProfileQuery` | `QualityProfilePage` |
+| POST `/{media}/quality-profiles` | `QualityProfileInput` | `QualityProfile` (201) |
+| GET `/{media}/quality-profiles/{id}` | none | `QualityProfile` |
+| PUT `/{media}/quality-profiles/{id}` | `QualityProfileInput` | `QualityProfile` |
+
+Other listed successes return 200. Native errors use `ApiErrorEnvelope` (`error.code`, `error.message`); main import/snapshot errors use `LegacyError` (`error` string). Framework extractor failures, unknown routes and unsupported methods can have non-JSON bodies. Status/range/selector/size constraints remain in handlers and the feature API documents: [library](library-api.md), [episodes](episode-api.md), [files](file-api.md), [qualities](quality-api.md), [snapshots](snapshot-import.md). The table documents routing; the generator exports DTOs, not a generated route client.
+
+## Nulls, omission and numeric safety
+
+Response `Option` fields are normally required and nullable: legacy year/poster/file path and profile leaf size fields must be present even when unknown. Explicit serialization omissions stay optional, including quality modifiers and selectable episode projections. Episode images can be omitted, requested-but-unknown `null`, or an observed array (including empty). Cover URL fields preserve omission separately from explicit `null`.
+
+Library and file patches preserve omitted values; supported explicit nulls clear them. Monitoring null is rejected by library validation. Quality-definition updates instead treat omitted sizes as null. Profile input size fields accept omission; profile responses always emit their nullable fields. Domain restrictions, immutable identities, allowed ranges and unsupported effect fields remain server validations. A common file patch type does not authorize movie-only fields on TV routes or vice versa.
+
+JSON keeps its existing numeric wire representation. Generated `number` is not an assertion that all Rust `i64` values are precisely representable in JavaScript. The frontend boundary rejects non-finite numbers and integers outside `Number.isSafeInteger` on responses and outgoing bodies/IDs. Thus integers beyond ±9,007,199,254,740,991 (including large sizes or duration ticks) fail visibly instead of being used after rounding. This is a client limitation, not a server storage restriction or lossless-number protocol. Other clients must apply the same policy or use a lossless decoder.
+
+## Evidence and limits
+
+`tests/api_contract.rs` checks committed drift, deterministic output, stale CLI failure, actual serde patch/flatten/unknown-field behavior, required-null and omitted fields, and actual merged-router responses against generated types using TypeScript `satisfies`. Negative compiler specimens check required nullable fields and closed domains. Existing endpoint regressions continue checking validation and transactions; frontend tests cover mocked transport, errors and numeric bounds.
+
+The `no-serde-warnings` feature suppresses unsupported-attribute warnings after review: custom presence deserializers have explicit TS field annotations and serialization tests; `deny_unknown_fields` is enforced by serde, not fully expressible in structural TypeScript. UUIDs serialize as strings. The registry uses real handler types; separate profile input/output types represent their different omission rules.
+
+These declarations are compile-time contracts, not runtime response validators. The frontend checks transport status, JSON, byte/time bounds and numeric safety, then trusts its own backend's structural contract. The specimen test samples shipped shapes; it does not exhaust every possible field value or establish Sonarr/Radarr V3 compatibility. No migrations or physical import/deletion behavior are introduced. Code generation adds the pinned ts-rs dependency and its locked transitive packages.

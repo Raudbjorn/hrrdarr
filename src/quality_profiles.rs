@@ -20,8 +20,9 @@ use std::{
 };
 const MAX_NODES: usize = 64;
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename="QualityProfileLeafInput",optional_fields=nullable)]
 pub struct Leaf {
     pub quality_id: i64,
     pub allowed: bool,
@@ -29,8 +30,9 @@ pub struct Leaf {
     pub max_size: Option<f64>,
     pub preferred_size: Option<f64>,
 }
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(rename = "QualityProfileItemInput")]
 pub enum Item {
     Quality(Leaf),
     Group {
@@ -39,31 +41,37 @@ pub enum Item {
         items: Vec<Leaf>,
     },
 }
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename="QualityProfileInput",optional_fields=nullable)]
 pub struct ProfileInput {
     pub name: String,
     pub items: Vec<Item>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "QualityProfile")]
 pub struct Profile {
     pub id: i64,
-    pub media_type: String,
+    pub media_type: crate::api::MediaDomain,
     pub name: String,
-    pub items: Vec<Item>,
+    pub items: Vec<ProfileItem>,
 }
-#[derive(Debug, Serialize)]
-struct Summary {
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "QualityProfileSummary")]
+pub struct Summary {
     id: i64,
     name: String,
     item_count: i64,
     group_count: i64,
 }
-#[derive(Deserialize)]
-struct Page {
+#[derive(Deserialize, ts_rs::TS)]
+#[ts(rename = "QualityProfileQuery")]
+pub struct Page {
     #[serde(default)]
+    #[ts(as = "Option<u32>", optional)]
     offset: u32,
     #[serde(default = "page_limit")]
+    #[ts(as = "Option<u16>", optional)]
     limit: u16,
 }
 fn page_limit() -> u16 {
@@ -150,7 +158,7 @@ async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
     let mut roots = BTreeMap::new();
     let mut rows=conn.query("SELECT quality_id,group_id,position,allowed,min_size,max_size,preferred_size FROM quality_profile_items WHERE profile_id=?1 ORDER BY position",params![id]).await?;
     while let Some(row) = rows.next().await? {
-        let leaf = Leaf {
+        let leaf = ProfileLeaf {
             quality_id: row.get(0)?,
             allowed: row.get::<i64>(3)? != 0,
             min_size: row.get(4)?,
@@ -168,14 +176,14 @@ async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
                 .3
                 .push(leaf);
         } else {
-            roots.insert(row.get::<i64>(2)?, Item::Quality(leaf));
+            roots.insert(row.get::<i64>(2)?, ProfileItem::Quality(leaf));
         }
     }
     for (_, (position, name, allowed, items)) in groups {
         if roots
             .insert(
                 position,
-                Item::Group {
+                ProfileItem::Group {
                     name,
                     allowed,
                     items,
@@ -192,7 +200,7 @@ async fn fetch(conn: &Connection, media: &str, id: i64) -> Result<Profile> {
     }
     Ok(Profile {
         id,
-        media_type: media.to_owned(),
+        media_type: crate::api::MediaDomain::parse(media).map_err(invalid)?,
         name: row.get(0)?,
         items: roots.into_values().collect(),
     })
@@ -201,7 +209,7 @@ async fn list(
     State(db): State<Arc<Database>>,
     Path(media): Path<String>,
     page: std::result::Result<Query<Page>, QueryRejection>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Json<ProfilePage>> {
     domain(&media)?;
     let Query(page) = page
         .map_err(|_| invalid("Pagination requires nonnegative integer offset and integer limit"))?;
@@ -231,9 +239,13 @@ async fn list(
         });
     }
     conn.rollback().await?;
-    Ok(Json(
-        serde_json::json!({"media_type":media,"items":items,"total":total,"offset":page.offset,"limit":page.limit}),
-    ))
+    Ok(Json(ProfilePage {
+        media_type: crate::api::MediaDomain::parse(&media).map_err(invalid)?,
+        items,
+        total,
+        offset: page.offset,
+        limit: page.limit,
+    }))
 }
 async fn read(
     State(db): State<Arc<Database>>,
@@ -330,4 +342,34 @@ async fn replace(
     Ok(Json(
         persist(&db, &media, Some(path_id(&id)?), body(payload)?).await?,
     ))
+}
+
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "QualityProfileLeaf")]
+pub struct ProfileLeaf {
+    pub quality_id: i64,
+    pub allowed: bool,
+    pub min_size: Option<f64>,
+    pub max_size: Option<f64>,
+    pub preferred_size: Option<f64>,
+}
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(rename = "QualityProfileItem")]
+pub enum ProfileItem {
+    Quality(ProfileLeaf),
+    Group {
+        name: String,
+        allowed: bool,
+        items: Vec<ProfileLeaf>,
+    },
+}
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "QualityProfilePage")]
+pub struct ProfilePage {
+    pub media_type: crate::api::MediaDomain,
+    pub items: Vec<Summary>,
+    pub total: i64,
+    pub offset: u32,
+    pub limit: u16,
 }

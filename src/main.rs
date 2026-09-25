@@ -10,7 +10,6 @@ use hrrdarr::{
     snapshots,
 };
 use libsql::params;
-use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
@@ -19,21 +18,7 @@ struct AppState {
     db: Arc<Database>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ImportRequest {
-    episode_id: i64,
-    source: String,
-    mode: String,
-    destination: String,
-}
-
-#[derive(Debug, Serialize)]
-struct Operation {
-    id: Uuid,
-    target: MediaTarget,
-    status: &'static str,
-    message: String,
-}
+use hrrdarr::api::{ImportRequest, LegacyError, Operation, SnapshotOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), hrrdarr::db::Error> {
@@ -129,16 +114,6 @@ async fn import_execute() -> Result<Json<Operation>, ApiError> {
     ))
 }
 
-#[derive(Deserialize)]
-struct SnapshotOptions {
-    application: snapshots::Application,
-    #[serde(default = "default_dry_run")]
-    dry_run: bool,
-}
-fn default_dry_run() -> bool {
-    true
-}
-
 async fn migrate(
     State(state): State<Arc<AppState>>,
     Query(options): Query<SnapshotOptions>,
@@ -192,7 +167,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (
             self.status,
-            Json(serde_json::json!({"error": self.message})),
+            Json(LegacyError {
+                error: self.message,
+            }),
         )
             .into_response()
     }

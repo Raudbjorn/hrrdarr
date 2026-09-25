@@ -1,11 +1,20 @@
 <script lang="ts">
-  type Series = { id:number; title:string; year?:number; path:string; poster?:string };
-  type Episode = { id:number; season:number; number:number; title:string; file_path?:string };
-  let series: Series[] = $state([]), selected: Series | undefined = $state(), episodes: Episode[] = $state([]), error = $state('');
+  import type { LegacySeries, LegacyEpisode } from './lib/api.generated';
+  import { loadSeries as getSeries, loadEpisodes, previewImport } from './lib/api';
+  let series: LegacySeries[] = $state([]), selected: LegacySeries | undefined = $state(), episodes: LegacyEpisode[] = $state([]), error = $state('');
   let episodeId = $state<number>(), source = $state(''), destination = $state(''), mode = $state('copy'), notice = $state('');
-  async function loadSeries() { try { series = await (await fetch('/api/v1/series')).json(); } catch (e) { error = String(e); } }
-  async function select(item: Series) { selected = item; episodes = await (await fetch(`/api/v1/series/${item.id}/episodes`)).json(); }
-  async function preview() { if (!episodeId) return; const response = await fetch('/api/v1/imports', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({episode_id:episodeId, source, destination, mode}) }); const data = await response.json(); notice = response.ok ? `Preview ${data.id} created.` : data.error; }
+  async function loadSeries() { const result = await getSeries(); if (result.ok) series = result.data; else error = result.error; }
+  async function select(item: LegacySeries) {
+    selected = item; episodes = []; episodeId = undefined; notice = ''; error = '';
+    const result = await loadEpisodes(item.id);
+    if (selected?.id !== item.id) return;
+    if (result.ok) episodes = result.data; else error = result.error;
+  }
+  async function preview() {
+    if (!episodeId) return;
+    const result = await previewImport({ episode_id: episodeId, source, destination, mode });
+    notice = result.ok ? `Preview ${result.data.id} created.` : result.error;
+  }
   loadSeries();
 </script>
 

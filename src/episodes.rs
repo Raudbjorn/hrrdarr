@@ -39,7 +39,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
             self.0,
-            Json(serde_json::json!({"error":{"code":self.1,"message":self.2}})),
+            Json(crate::api::ApiErrorEnvelope::new(self.1, self.2)),
         )
             .into_response()
     }
@@ -86,7 +86,8 @@ fn body<T>(b: std::result::Result<Json<T>, JsonRejection>) -> Result<T> {
         }
     })
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "EpisodeSeriesProjection")]
 pub struct SeriesProjection {
     pub id: i64,
     pub tvdb_id: Option<i64>,
@@ -96,13 +97,15 @@ pub struct SeriesProjection {
     pub poster: Option<String>,
     pub monitored: bool,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "EpisodeFileProjection")]
 pub struct FileProjection {
     pub id: i64,
     pub series_id: i64,
     pub path: String,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "Episode")]
 pub struct Episode {
     pub id: i64,
     pub series_id: i64,
@@ -126,51 +129,66 @@ pub struct Episode {
     pub scene_season_number: Option<i64>,
     pub unverified_scene_numbering: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub series: Option<SeriesProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub episode_file: Option<FileProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<serde_json::Value>,
+    #[ts(optional)]
+    pub images: Option<Option<Vec<EpisodeCover>>>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Includes {
+#[ts(rename = "EpisodeIncludes")]
+pub struct Includes {
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_series: bool,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_episode_file: bool,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_images: bool,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct ListQuery {
+#[ts(rename = "EpisodeQuery", optional_fields)]
+pub struct ListQuery {
     series_id: Option<i64>,
     season: Option<i64>,
     episode_ids: Option<String>,
     episode_file_id: Option<i64>,
     #[serde(default)]
+    #[ts(as = "Option<u32>", optional)]
     offset: u32,
     #[serde(default = "page_size")]
+    #[ts(as = "Option<u16>", optional)]
     limit: u16,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_series: bool,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_episode_file: bool,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     include_images: bool,
 }
 fn page_size() -> u16 {
     100
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Monitor {
+#[ts(rename = "EpisodeMonitor")]
+pub struct Monitor {
     monitored: bool,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct MonitorMany {
+#[ts(rename = "EpisodeMonitorMany")]
+pub struct MonitorMany {
     episode_ids: Vec<i64>,
     monitored: bool,
 }
@@ -243,14 +261,14 @@ async fn fetch(
         let path = row.get::<Option<String>>(7)?;
         let images = if includes.include_images {
             Some(match row.get::<Option<String>>(20)? {
-                None => serde_json::Value::Null,
-                Some(value) => serde_json::from_str(&value).map_err(|_| {
+                None => None,
+                Some(value) => Some(serde_json::from_str(&value).map_err(|_| {
                     Error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "metadata_invalid",
                         "Stored episode images are invalid",
                     )
-                })?,
+                })?),
             })
         } else {
             None
@@ -307,7 +325,7 @@ async fn fetch(
 async fn list(
     State(db): State<Arc<Database>>,
     q: std::result::Result<Query<ListQuery>, QueryRejection>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Json<crate::api::ApiPage<Episode>>> {
     let q = query(q)?;
     if q.limit == 0 || q.limit > MAX_PAGE {
         return Err(bad("Page limit must be 1..500"));
@@ -377,9 +395,12 @@ async fn list(
     )
     .await?;
     tx.rollback().await?;
-    Ok(Json(
-        serde_json::json!({"items":items,"total":total,"offset":q.offset,"limit":q.limit}),
-    ))
+    Ok(Json(crate::api::ApiPage {
+        items,
+        total,
+        offset: q.offset,
+        limit: q.limit,
+    }))
 }
 async fn detail(State(db): State<Arc<Database>>, Path(raw): Path<String>) -> Result<Json<Episode>> {
     let id = id(&raw)?;
@@ -402,8 +423,9 @@ async fn detail(State(db): State<Arc<Database>>, Path(raw): Path<String>) -> Res
         .ok_or_else(missing)?,
     ))
 }
-#[derive(Serialize)]
-struct LegacyEpisode {
+#[derive(Serialize, ts_rs::TS)]
+#[ts(rename = "LegacyEpisode")]
+pub struct LegacyEpisode {
     id: i64,
     series_id: i64,
     season: i64,
@@ -540,4 +562,35 @@ pub(crate) fn normalize_utc(raw: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+pub enum EpisodeCoverType {
+    Unknown,
+    Poster,
+    Banner,
+    Fanart,
+    Screenshot,
+    Headshot,
+    Clearlogo,
+}
+#[derive(Debug, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeCover {
+    pub cover_type: EpisodeCoverType,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<String>",optional=nullable)]
+    pub url: crate::library::Change<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<String>",optional=nullable)]
+    pub remote_url: crate::library::Change<String>,
 }

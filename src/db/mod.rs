@@ -6,8 +6,9 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "media_type", content = "id", rename_all = "snake_case")]
+#[ts(rename = "MediaTarget")]
 pub enum MediaTarget {
     Episode(i64),
     Movie(i64),

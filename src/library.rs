@@ -26,7 +26,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
             self.0,
-            Json(serde_json::json!({"error":{"code":self.1,"message":self.2}})),
+            Json(crate::api::ApiErrorEnvelope::new(self.1, self.2)),
         )
             .into_response()
     }
@@ -57,11 +57,7 @@ fn missing() -> Error {
         "One or more library records or seasons do not exist",
     )
 }
-#[derive(Clone, Copy, PartialEq)]
-enum Domain {
-    Tv,
-    Movies,
-}
+use crate::api::MediaDomain as Domain;
 impl Domain {
     fn name(self) -> &'static str {
         if self == Self::Tv { "tv" } else { "movies" }
@@ -98,95 +94,109 @@ impl<T: Serialize> Serialize for Change<T> {
     }
 }
 impl<T> Change<T> {
-    fn is_missing(&self) -> bool {
+    pub(crate) fn is_missing(&self) -> bool {
         matches!(self, Self::Missing)
     }
 }
 // Patch fields distinguish omission from explicit null without exposing an untyped DTO.
-fn change<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn change<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> std::result::Result<Change<T>, D::Error> {
     Ok(Option::<T>::deserialize(d)?
         .map(Change::Value)
         .unwrap_or(Change::Null))
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(rename = "SeriesType")]
 pub enum SeriesType {
     Standard,
     Daily,
     Anime,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(rename = "MonitorNewItems")]
 pub enum NewItems {
     All,
     None,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(rename = "MinimumAvailability")]
 pub enum Availability {
     Tba,
     Announced,
     InCinemas,
     Released,
 }
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename = "LibraryPatch")]
 pub struct Patch {
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as = "Option<bool>", optional)]
     pub monitored: Change<bool>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<i64>", optional = nullable)]
     pub quality_profile_id: Change<i64>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<SeriesType>", optional = nullable)]
     pub series_type: Change<SeriesType>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<bool>", optional = nullable)]
     pub season_folder: Change<bool>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<bool>", optional = nullable)]
     pub use_scene_numbering: Change<bool>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<NewItems>", optional = nullable)]
     pub monitor_new_items: Change<NewItems>,
     #[serde(
         default,
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as="Option<Availability>", optional = nullable)]
     pub minimum_availability: Change<Availability>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional=nullable)]
     pub seasons: Option<Vec<SeasonInput>>,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename = "LibrarySeasonInput")]
 pub struct SeasonInput {
     pub number: i64,
     pub monitored: bool,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename="LibraryCreate",optional_fields=nullable)]
 pub struct Create {
     pub title: Option<String>,
     pub year: Option<i64>,
@@ -196,35 +206,41 @@ pub struct Create {
     pub metadata_id: Option<i64>,
     pub path: String,
     #[serde(default)]
+    #[ts(as = "Option<Patch>", optional)]
     pub settings: Patch,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Bulk {
+#[ts(rename = "LibraryBulk")]
+pub struct Bulk {
     items: Vec<Update>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Update {
+#[ts(rename = "LibraryUpdate")]
+pub struct Update {
     id: i64,
     patch: Patch,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Editor {
+#[ts(rename = "LibraryEditor")]
+pub struct Editor {
     ids: Vec<i64>,
     patch: Patch,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Page {
+#[ts(rename = "LibraryQuery", optional_fields)]
+pub struct Page {
     limit: Option<u16>,
     offset: Option<u32>,
     ids: Option<String>,
     tvdb_id: Option<i64>,
     tmdb_id: Option<i64>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "LibrarySettings")]
 pub struct Settings {
     pub quality_profile_id: Option<i64>,
     pub profile_name: Option<String>,
@@ -235,7 +251,8 @@ pub struct Settings {
     pub minimum_availability: Option<String>,
     pub added: Option<String>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "LibraryStatistics")]
 pub struct Statistics {
     pub total_episode_count: Option<i64>,
     pub episode_count: Option<i64>,
@@ -259,16 +276,18 @@ impl Statistics {
         }
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "LibrarySeason")]
 pub struct Season {
     pub number: i64,
     pub monitored: bool,
     pub statistics: Statistics,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
     pub id: i64,
-    pub media_type: &'static str,
+    pub media_type: Domain,
     pub metadata_id: Option<i64>,
     pub title: String,
     pub year: Option<i64>,
@@ -281,17 +300,20 @@ pub struct LibraryItem {
     pub settings: Settings,
     pub statistics: Statistics,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub seasons: Option<Vec<Season>>,
     pub is_available: Option<bool>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(rename = "LibraryPage")]
 pub struct LibraryPage {
     pub items: Vec<LibraryItem>,
     pub total: i64,
     pub limit: u16,
     pub offset: u32,
 }
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(rename = "LegacySeries")]
 pub struct LegacySeries {
     pub id: i64,
     pub title: String,
@@ -553,7 +575,7 @@ async fn fetch(
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
             id: r.get(0)?,
-            media_type: d.name(),
+            media_type: d,
             metadata_id: r.get(1)?,
             title: r.get(2)?,
             year: r.get(3)?,

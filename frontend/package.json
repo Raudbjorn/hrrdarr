@@ -4,7 +4,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "npm run check:api && svelte-check --tsconfig ./tsconfig.json",
+    "generate:api": "cargo run --locked --manifest-path ../Cargo.toml --bin generate-api --",
+    "check:api": "npm run generate:api -- --check",
+    "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.1",

@@ -14,19 +14,22 @@ use std::{collections::BTreeSet, sync::Arc};
 const MAX_BATCH: usize = 64; // Both fixed catalogs fit; oversized requests are rejected, never truncated.
 const MAX_BODY_BYTES: usize = 32 * 1024;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(rename = "Quality")]
 pub struct Quality {
     pub id: i64,
     pub name: String,
     pub source: String,
     pub resolution: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub modifier: Option<String>,
 }
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(rename = "QualityDefinition")]
 pub struct Definition {
     pub id: i64,
-    pub media_type: String,
+    pub media_type: crate::api::MediaDomain,
     pub quality: Quality,
     pub title: String,
     pub weight: i64,
@@ -35,8 +38,9 @@ pub struct Definition {
     pub max_size: Option<f64>,
     pub preferred_size: Option<f64>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename="QualityDefinitionUpdate",optional_fields=nullable)]
 pub struct Update {
     pub id: i64,
     pub title: String,
@@ -44,10 +48,12 @@ pub struct Update {
     pub max_size: Option<f64>,
     pub preferred_size: Option<f64>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Reset {
+#[ts(rename = "QualityDefinitionReset")]
+pub struct Reset {
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     reset_titles: bool,
 }
 
@@ -61,7 +67,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
             self.0,
-            Json(serde_json::json!({"error":{"code":self.1,"message":self.2}})),
+            Json(crate::api::ApiErrorEnvelope::new(self.1, self.2)),
         )
             .into_response()
     }
@@ -140,7 +146,7 @@ async fn fetch(c: &Connection, media: &str, defaults: bool) -> Result<Vec<Defini
     while let Some(row) = rows.next().await? {
         items.push(Definition {
             id: row.get(0)?,
-            media_type: media.to_owned(),
+            media_type: crate::api::MediaDomain::parse(media).map_err(invalid)?,
             quality: Quality {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -172,10 +178,19 @@ async fn defaults(
     domain(&media)?;
     Ok(Json(fetch(&db.connect().await?, &media, true).await?))
 }
-async fn limits(Path(media): Path<String>) -> Result<Json<serde_json::Value>> {
-    Ok(Json(
-        serde_json::json!({"min":0,"max":domain(&media)? as i64,"unit":"MiB/minute"}),
-    ))
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "QualityDefinitionLimits")]
+pub struct Limits {
+    pub min: i64,
+    pub max: i64,
+    pub unit: &'static str,
+}
+async fn limits(Path(media): Path<String>) -> Result<Json<Limits>> {
+    Ok(Json(Limits {
+        min: 0,
+        max: domain(&media)? as i64,
+        unit: "MiB/minute",
+    }))
 }
 async fn detail(
     State(db): State<Arc<Database>>,

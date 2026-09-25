@@ -13,7 +13,7 @@ use axum::{
 };
 use libsql::{Connection, Value, params};
 use serde::Deserialize;
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
 use std::{collections::BTreeSet, sync::Arc};
 const MAX_IDS: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -24,7 +24,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
             self.0,
-            Json(json!({"error":{"code":self.1,"message":self.2}})),
+            Json(crate::api::ApiErrorEnvelope::new(self.1, self.2)),
         )
             .into_response()
     }
@@ -84,9 +84,10 @@ pub fn router(db: Arc<Database>) -> Router {
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(db)
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct Select {
+#[ts(rename = "FileQuery", optional_fields)]
+pub struct Select {
     series_id: Option<i64>,
     movie_ids: Option<String>,
     file_ids: Option<String>,
@@ -119,7 +120,7 @@ async fn list(
     State(db): State<Arc<Database>>,
     Path(media): Path<String>,
     q: std::result::Result<Query<Select>, QueryRejection>,
-) -> Result<Json<JsonValue>> {
+) -> Result<Json<crate::api::ApiPage<FileResource>>> {
     let d = domain(&media)?;
     let q = q.map_err(|_| bad("Invalid file query parameters"))?.0;
     let selectors = usize::from(q.series_id.is_some())
@@ -159,14 +160,17 @@ async fn list(
     drop(rows);
     let records = fetch(&tx, d, &filter, values, i64::from(limit), i64::from(offset)).await?;
     tx.commit().await?;
-    Ok(Json(
-        json!({"items":records,"total":total,"limit":limit,"offset":offset}),
-    ))
+    Ok(Json(crate::api::ApiPage {
+        items: records,
+        total,
+        limit,
+        offset,
+    }))
 }
 async fn detail(
     State(db): State<Arc<Database>>,
     Path((media, id)): Path<(String, String)>,
-) -> Result<Json<JsonValue>> {
+) -> Result<Json<FileResource>> {
     let d = domain(&media)?;
     let id = parse_id(&id)?;
     let c = db.connect().await?;
@@ -186,7 +190,7 @@ async fn fetch(
     mut values: Vec<Value>,
     limit: i64,
     offset: i64,
-) -> Result<Vec<JsonValue>> {
+) -> Result<Vec<FileResource>> {
     let edition = if d.name == "movies" {
         "f.edition"
     } else {
@@ -215,14 +219,46 @@ async fn fetch(
         let quality = row.get::<Option<i64>>(5)?;
         let revision = parse_stored(row.get::<Option<String>>(6)?)?;
         let languages = parse_stored(row.get::<Option<String>>(7)?)?;
-        let mut item = json!({"id":row.get::<i64>(0)?,d.owner:row.get::<i64>(1)?,"path":path,"relative_path":relative,"quality":quality.map(|quality_id|json!({"quality_id":quality_id,"revision":revision})),"languages":languages,"size":row.get::<Option<i64>>(8)?,"date_added":row.get::<Option<String>>(9)?,"release_group":row.get::<Option<String>>(12)?,"indexer_flags":row.get::<Option<i64>>(13)?,"scene_name":null,"media_info":media_info::public(row.get::<Option<String>>(15)?).map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Invalid stored media info"))?,"custom_formats":null,"custom_format_score":null,"quality_cutoff_not_met":null});
-        if d.name == "tv" {
-            item["season_number"] = json!(row.get::<Option<i64>>(10)?);
-            item["release_type"] = json!(row.get::<Option<i64>>(14)?);
+        let core = FileCore {
+            id: row.get(0)?,
+            path,
+            relative_path: relative,
+            quality: quality.map(|quality_id| FileQuality {
+                quality_id,
+                revision,
+            }),
+            languages,
+            size: row.get(8)?,
+            date_added: row.get(9)?,
+            release_group: row.get(12)?,
+            indexer_flags: row.get(13)?,
+            scene_name: (),
+            media_info: media_info::public(row.get::<Option<String>>(15)?).map_err(|_| {
+                Error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database_error",
+                    "Invalid stored media info",
+                )
+            })?,
+            custom_formats: (),
+            custom_format_score: (),
+            quality_cutoff_not_met: (),
+        };
+        let item = if d.name == "tv" {
+            FileResource::Tv(TvFileResource {
+                core,
+                series_id: row.get(1)?,
+                season_number: row.get(10)?,
+                release_type: row.get(14)?,
+            })
         } else {
-            item["edition"] = json!(row.get::<Option<String>>(4)?);
-            item["original_file_path"] = json!(row.get::<Option<String>>(11)?);
-        }
+            FileResource::Movies(MovieFileResource {
+                core,
+                movie_id: row.get(1)?,
+                edition: row.get(4)?,
+                original_file_path: row.get(11)?,
+            })
+        };
         bytes += serde_json::to_vec(&item)
             .map_err(|_| bad("Invalid stored metadata"))?
             .len()
@@ -238,7 +274,7 @@ async fn fetch(
     }
     Ok(result)
 }
-fn parse_stored(value: Option<String>) -> Result<JsonValue> {
+fn parse_stored<T: serde::de::DeserializeOwned>(value: Option<String>) -> Result<Option<T>> {
     value
         .map(|v| {
             serde_json::from_str(&v).map_err(|_| {
@@ -249,9 +285,9 @@ fn parse_stored(value: Option<String>) -> Result<JsonValue> {
                 )
             })
         })
-        .unwrap_or(Ok(JsonValue::Null))
+        .transpose()
 }
-fn body(value: std::result::Result<Json<JsonValue>, JsonRejection>) -> Result<JsonValue> {
+fn body<T>(value: std::result::Result<Json<T>, JsonRejection>) -> Result<T> {
     value.map(|j| j.0).map_err(|e| {
         if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
             Error(
@@ -264,76 +300,56 @@ fn body(value: std::result::Result<Json<JsonValue>, JsonRejection>) -> Result<Js
         }
     })
 }
+fn patch_json(p: FilePatch) -> Result<JsonValue> {
+    serde_json::to_value(p).map_err(|_| bad("Invalid file patch"))
+}
 async fn update(
     State(db): State<Arc<Database>>,
     Path((media, id)): Path<(String, String)>,
-    b: std::result::Result<Json<JsonValue>, JsonRejection>,
-) -> Result<Json<JsonValue>> {
+    b: std::result::Result<Json<FilePatch>, JsonRejection>,
+) -> Result<Json<FileResource>> {
     let d = domain(&media)?;
     let id = parse_id(&id)?;
-    let patch = body(b)?;
+    let patch = patch_json(body(b)?)?;
     let mut result = persist(&db, d, vec![(id, patch)]).await?;
     Ok(Json(result.remove(0)))
 }
 async fn bulk(
     State(db): State<Arc<Database>>,
     Path(media): Path<String>,
-    b: std::result::Result<Json<JsonValue>, JsonRejection>,
-) -> Result<Json<JsonValue>> {
+    b: std::result::Result<Json<FileBulk>, JsonRejection>,
+) -> Result<Json<Vec<FileResource>>> {
     let d = domain(&media)?;
-    let mut body = body(b)?;
-    let obj = body
-        .as_object_mut()
-        .ok_or_else(|| bad("Expected files object"))?;
-    let files = obj
-        .remove("files")
-        .ok_or_else(|| bad("Expected files array"))?;
-    if !obj.is_empty() {
-        return Err(bad("Unknown bulk fields"));
-    }
-    let files = files
-        .as_array()
-        .ok_or_else(|| bad("Expected files array"))?;
+    let files = body(b)?.files;
     if files.is_empty() || files.len() > MAX_IDS {
         return Err(bad("Expected 1 to 200 files"));
     }
-    let mut changes = vec![];
-    for f in files {
-        let mut f = f.clone();
-        let id = f
-            .as_object_mut()
-            .and_then(|o| o.remove("id"))
-            .and_then(|id| id.as_i64())
-            .ok_or_else(|| bad("Each file needs an id"))?;
-        changes.push((id, f));
-    }
-    Ok(Json(json!(persist(&db, d, changes).await?)))
+    let changes = files
+        .into_iter()
+        .map(|f| Ok((f.id, patch_json(f.patch)?)))
+        .collect::<Result<_>>()?;
+    Ok(Json(persist(&db, d, changes).await?))
 }
 async fn editor(
     State(db): State<Arc<Database>>,
     Path(media): Path<String>,
-    b: std::result::Result<Json<JsonValue>, JsonRejection>,
-) -> Result<Json<JsonValue>> {
+    b: std::result::Result<Json<FileEditor>, JsonRejection>,
+) -> Result<Json<Vec<FileResource>>> {
     let d = domain(&media)?;
-    let mut patch = body(b)?;
-    let selected = patch
-        .as_object_mut()
-        .and_then(|o| o.remove("file_ids"))
-        .ok_or_else(|| bad("Expected file_ids array"))?;
-    let selected: Vec<i64> =
-        serde_json::from_value(selected).map_err(|_| bad("Expected file_ids array"))?;
-    let changes = ids(selected)?
+    let req = body(b)?;
+    let patch = patch_json(req.patch)?;
+    let changes = ids(req.file_ids)?
         .into_iter()
         .map(|id| (id, patch.clone()))
         .collect();
-    Ok(Json(json!(persist(&db, d, changes).await?)))
+    Ok(Json(persist(&db, d, changes).await?))
 }
 // Omitted fields preserve values; explicit null clears them. Identity and factual scan fields are read-only.
 async fn persist(
     db: &Database,
     d: Domain,
     changes: Vec<(i64, JsonValue)>,
-) -> Result<Vec<JsonValue>> {
+) -> Result<Vec<FileResource>> {
     let selected = ids(changes.iter().map(|(id, _)| *id).collect())?;
     let mut validated = vec![];
     for (id, patch) in changes {
@@ -343,7 +359,7 @@ async fn persist(
     let tx = c
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let outcome: Result<Vec<JsonValue>> = async {
+    let outcome: Result<Vec<FileResource>> = async {
         for (id, patch) in &validated {
             let mut found = tx
                 .query(&format!("SELECT id FROM {} WHERE id=?", d.table), [*id])
@@ -548,4 +564,137 @@ pub(crate) fn languages(
         }
     }
     Ok(Some(value.to_string()))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FileRevision {
+    pub version: i64,
+    pub real: i64,
+    pub is_repack: bool,
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(optional_fields=nullable)]
+pub struct FileQualityInput {
+    pub quality_id: i64,
+    pub revision: Option<FileRevision>,
+}
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct FileQuality {
+    pub quality_id: i64,
+    pub revision: Option<FileRevision>,
+}
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct FileCore {
+    pub id: i64,
+    pub path: String,
+    pub relative_path: Option<String>,
+    pub quality: Option<FileQuality>,
+    pub languages: Option<Vec<i64>>,
+    pub size: Option<i64>,
+    pub date_added: Option<String>,
+    pub release_group: Option<String>,
+    pub indexer_flags: Option<i64>,
+    pub scene_name: (),
+    pub media_info: Option<media_info::MediaInfo>,
+    pub custom_formats: (),
+    pub custom_format_score: (),
+    pub quality_cutoff_not_met: (),
+}
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct TvFileResource {
+    #[serde(flatten)]
+    pub core: FileCore,
+    pub series_id: i64,
+    pub season_number: Option<i64>,
+    pub release_type: Option<i64>,
+}
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct MovieFileResource {
+    #[serde(flatten)]
+    pub core: FileCore,
+    pub movie_id: i64,
+    pub edition: Option<String>,
+    pub original_file_path: Option<String>,
+}
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+#[serde(untagged)]
+pub enum FileResource {
+    Tv(TvFileResource),
+    Movies(MovieFileResource),
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FilePatch {
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<FileQualityInput>",optional=nullable)]
+    pub quality: crate::library::Change<FileQualityInput>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<Vec<i64>>",optional=nullable)]
+    pub languages: crate::library::Change<Vec<i64>>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<String>",optional=nullable)]
+    pub release_group: crate::library::Change<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<String>",optional=nullable)]
+    pub edition: crate::library::Change<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<i64>",optional=nullable)]
+    pub indexer_flags: crate::library::Change<i64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(as="Option<i64>",optional=nullable)]
+    pub release_type: crate::library::Change<i64>,
+    // This name is recognized solely to return the existing unsupported_field error.
+    #[serde(
+        default,
+        deserialize_with = "crate::library::change",
+        skip_serializing_if = "crate::library::Change::is_missing"
+    )]
+    #[ts(skip)]
+    pub scene_name: crate::library::Change<JsonValue>,
+}
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FileUpdate {
+    pub id: i64,
+    #[serde(flatten)]
+    pub patch: FilePatch,
+}
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FileBulk {
+    pub files: Vec<FileUpdate>,
+}
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FileEditor {
+    pub file_ids: Vec<i64>,
+    #[serde(flatten)]
+    pub patch: FilePatch,
 }

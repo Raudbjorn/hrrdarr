@@ -7,9 +7,10 @@ const MAX_TEXT_BYTES: usize = 1024;
 const TICKS_PER_SECOND: i64 = 10_000_000;
 type Result<T> = std::result::Result<T, &'static str>;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct AudioStream {
+#[ts(rename = "MediaInfoAudioStream")]
+pub struct AudioStream {
     language: Option<String>,
     format: Option<String>,
     codec_id: Option<String>,
@@ -18,17 +19,19 @@ struct AudioStream {
     channels: Option<i64>,
     channel_positions: Option<String>,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct SubtitleStream {
+#[ts(rename = "MediaInfoSubtitleStream")]
+pub struct SubtitleStream {
     language: Option<String>,
     format: Option<String>,
     forced: Option<bool>,
     hearing_impaired: Option<bool>,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct MediaInfo {
+#[ts(rename = "MediaInfo")]
+pub struct MediaInfo {
     schema_revision: Option<i64>,
     container_format: Option<String>,
     audio_bitrate: Option<i64>,
@@ -410,15 +413,15 @@ pub(crate) fn normalize(raw: &str, media: &str) -> Result<(Option<String>, bool)
     Ok((Some(normalized), unsupported))
 }
 
-pub(super) fn public(raw: Option<String>) -> Result<Value> {
+pub(super) fn public(raw: Option<String>) -> Result<Option<MediaInfo>> {
     let Some(raw) = raw else {
-        return Ok(Value::Null);
+        return Ok(None);
     };
     if raw.len() > MAX_JSON_BYTES {
         return Err("Invalid stored media info");
     }
     let info: MediaInfo = serde_json::from_str(&raw).map_err(|_| "Invalid stored media info")?;
-    serde_json::to_value(info).map_err(|_| "Invalid stored media info")
+    Ok(Some(info))
 }
 
 #[cfg(test)]
@@ -427,7 +430,9 @@ mod tests {
     use serde_json::json;
     fn normalized(value: Value, media: &str) -> Value {
         let (raw, _) = normalize(&value.to_string(), media).unwrap();
-        public(raw).unwrap()
+        // Serialize the handler DTO back to wire JSON so the existing null/fact assertions
+        // continue checking the same public contract after replacing dynamic JSON.
+        serde_json::to_value(public(raw).unwrap()).unwrap()
     }
     #[test]
     fn exact_duration_layout_null_and_domain_hdr_contracts() {
@@ -492,7 +497,11 @@ mod tests {
         for media in ["tv", "movies"] {
             let (raw, unknown) = normalize(r#"{"videoHdrFormat":"futureHdr"}"#, media).unwrap();
             assert!(unknown);
-            assert!(public(raw).unwrap()["video_dynamic_range_type"].is_null());
+            // The typed handler result must retain the previous explicit-null wire value.
+            assert!(
+                serde_json::to_value(public(raw).unwrap()).unwrap()["video_dynamic_range_type"]
+                    .is_null()
+            );
             let (raw, unknown) = normalize(r#"{"schemaRevision":15,"width":1920}"#, media).unwrap();
             assert!(unknown);
             assert!(raw.is_none());

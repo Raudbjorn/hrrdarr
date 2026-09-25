@@ -19,8 +19,9 @@ const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 // ponytail: one importer per process; per-database permits if concurrent library imports are needed.
 static IMPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(rename = "SnapshotApplication")]
 pub enum Application {
     Sonarr,
     Radarr,
@@ -34,7 +35,8 @@ impl Application {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "SnapshotReport")]
 pub struct Report {
     pub application: Application,
     pub fingerprint: String,
@@ -49,7 +51,8 @@ pub struct Report {
     pub unsupported: Vec<Unsupported>,
     pub policy: &'static str,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "SnapshotUnsupported")]
 pub struct Unsupported {
     pub table: String,
     pub rows: usize,
