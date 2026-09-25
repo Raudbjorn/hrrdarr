@@ -1,5 +1,6 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
 pub mod administration;
+pub mod categories;
 mod credentials;
 pub mod draft;
 pub mod http;
@@ -197,21 +198,7 @@ impl ProviderSettings {
         }
     }
     fn validate(&self) -> Result<()> {
-        let endpoint = self.endpoint();
-        let url = url::Url::parse(endpoint).map_err(|_| bad())?;
-        if endpoint.trim() != endpoint
-            || endpoint.contains('\\')
-            || endpoint.len() > 2048
-            || endpoint.chars().any(char::is_control)
-            || !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(bad());
-        }
+        validate_endpoint(self.endpoint())?;
         let categories = |c: &[u32]| {
             c.len() <= 64
                 && c.iter().all(|n| (1..=i32::MAX as u32).contains(n))
@@ -281,6 +268,23 @@ impl ProviderSettings {
         }
         Ok(())
     }
+}
+fn validate_endpoint(endpoint: &str) -> Result<()> {
+    let url = url::Url::parse(endpoint).map_err(|_| bad())?;
+    if endpoint.trim() != endpoint
+        || endpoint.contains('\\')
+        || endpoint.len() > 2048
+        || endpoint.chars().any(char::is_control)
+        || !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(bad());
+    }
+    Ok(())
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -400,6 +404,10 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
         )
         .route("/api/v1/providers/testall", post(administration::test_all))
         .route("/api/v1/providers/test-draft", post(draft::test))
+        .route(
+            "/api/v1/providers/indexer-categories",
+            post(categories::discover),
+        )
         .route(
             "/api/v1/providers/{id}",
             get(detail).put(update).delete(delete),

@@ -1124,3 +1124,177 @@ fn torrent_enclosures_size_fallback_peers_and_private_facts() {
         Err(IndexerError::RateLimited { .. })
     ));
 }
+
+#[tokio::test]
+async fn category_discovery_is_caps_only_bounded_and_preserves_advertised_choices() {
+    use axum::{
+        Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use hrrdarr::providers::{IndexerAccess, IndexerParameter, http::HttpClient};
+    use std::sync::{Arc, Mutex};
+    type Fixture = Arc<Mutex<(String, Vec<BTreeMap<String, String>>)>>;
+    async fn handler(
+        State(state): State<Fixture>,
+        Query(query): Query<BTreeMap<String, String>>,
+    ) -> String {
+        let mut state = state.lock().unwrap();
+        state.1.push(query);
+        state.0.clone()
+    }
+    let state: Fixture = Arc::new(Mutex::new((String::new(), vec![])));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/api", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/api", get(handler))
+                .with_state(state.clone()),
+        )
+        .into_future(),
+    );
+    let client = HttpClient::new().unwrap();
+    let tv = [IndexerParameter {
+        name: "passkey".into(),
+        value: "TV_SECRET".into(),
+    }];
+    let movies = [IndexerParameter {
+        name: "passkey".into(),
+        value: "MOVIE_SECRET".into(),
+    }];
+    let access = IndexerAccess {
+        api_key: Some("API_SECRET"),
+        tv_parameters: &tv,
+        movie_parameters: &movies,
+    };
+    // Both implementations share the caps protocol; configuration discriminators do not alter it.
+    for kind in ["torznab", "newznab"] {
+        let settings = config(kind, &endpoint);
+        assert_eq!(
+            serde_json::to_value(settings).unwrap()["implementation"],
+            kind
+        );
+        for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+            state.lock().unwrap().0 = r#"<caps><limits default="broken"/><categories>
+              <category id="5000" name="TV"><subcat id="5080" name="MOVIE_SECRET"/><subcat id="5010" name="TV_SECRET"/></category>
+              <category id="2000" name="Movies"><subcat id="2045" name="API_SECRET"/></category>
+              <category id="100001" name="Custom &amp; Unicode é"/>
+              <category id="1000" name="Ignored"><subcat id="1001" name="Ignored child"/></category>
+              <category id="3000" name="Ignored"/><category id="4000" name="Ignored"/><category id="6000" name="Ignored"/><category id="7000" name="Ignored"/>
+            </categories></caps>"#.into();
+            let operation = client.operation(uuid::Uuid::new_v4()).unwrap();
+            let options = indexer::discover_categories(&operation, &endpoint, &access, domain)
+                .await
+                .unwrap();
+            let ids = options.iter().map(|o| o.id).collect::<Vec<_>>();
+            // Preferred/custom roots precede the opposite domain; children follow their own parent.
+            let expected = if domain == MediaDomain::Tv {
+                vec![5000, 5010, 5080, 100001, 2000, 2045]
+            } else {
+                vec![2000, 2045, 100001, 5000, 5010, 5080]
+            };
+            assert_eq!(ids, expected);
+            for option in &options {
+                if [5010, 5080, 2045].contains(&option.id) {
+                    assert_eq!(option.label, "[redacted]");
+                }
+                if [5010, 5080].contains(&option.id) {
+                    assert_eq!(option.parent_id, Some(5000));
+                }
+            }
+            assert_eq!(
+                options.iter().find(|o| o.id == 100001).unwrap().label,
+                "Custom & Unicode é"
+            );
+            for empty in ["<caps/>", "<caps><categories/></caps>"] {
+                state.lock().unwrap().0 = empty.into();
+                assert!(
+                    indexer::discover_categories(&operation, &endpoint, &access, domain)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+    let oversized = format!(
+        "<caps><categories><category id='5000' name='{}'/></categories></caps>",
+        "a".repeat(513)
+    );
+    let overcount = format!(
+        "<caps><categories>{}</categories></caps>",
+        (1..=4097)
+            .map(|id| format!("<category id='{id}' name='x'/>"))
+            .collect::<String>()
+    );
+    for invalid in [
+        "<caps>",
+        "<rss/>",
+        "<!DOCTYPE caps [<!ENTITY x 'x'>]><caps/>",
+        "<caps><categories><category id='0' name='Zero'/></categories></caps>",
+        "<caps><categories><category id='2147483648' name='Overflow'/></categories></caps>",
+        "<caps><categories><category id='5000' name='TV'><subcat id='5000' name='Duplicate'/></category></categories></caps>",
+        "<caps><categories><category id='5000'/></categories></caps>",
+        "<caps><categories><category id='5000' name='&#10;'/></categories></caps>",
+        &oversized,
+        &overcount,
+    ] {
+        state.lock().unwrap().0 = invalid.into();
+        let operation = client.operation(uuid::Uuid::new_v4()).unwrap();
+        assert!(matches!(
+            indexer::discover_categories(&operation, &endpoint, &access, MediaDomain::Tv).await,
+            Err(IndexerError::InvalidResponse)
+        ));
+    }
+    for query in &state.lock().unwrap().1 {
+        assert_eq!(
+            query,
+            &BTreeMap::from([
+                ("t".into(), "caps".into()),
+                ("o".into(), "xml".into()),
+                ("apikey".into(), "API_SECRET".into())
+            ])
+        );
+    }
+    let tv = indexer::standard_categories(MediaDomain::Tv);
+    let movies = indexer::standard_categories(MediaDomain::Movies);
+    assert_eq!(
+        tv.iter()
+            .map(|o| (o.id, o.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (5000, "TV"),
+            (5010, "WEB-DL"),
+            (5020, "Foreign"),
+            (5030, "SD"),
+            (5040, "HD"),
+            (5045, "UHD"),
+            (5050, "Other"),
+            (5060, "Sport"),
+            (5070, "Anime"),
+            (5080, "Documentary")
+        ]
+    );
+    assert_eq!(
+        movies
+            .iter()
+            .map(|o| (o.id, o.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (2000, "Movies"),
+            (2010, "Foreign"),
+            (2020, "Other"),
+            (2030, "SD"),
+            (2040, "HD"),
+            (2045, "UHD"),
+            (2050, "BluRay"),
+            (2060, "3D")
+        ]
+    );
+    assert!(tv[1..].iter().all(|o| o.parent_id == Some(5000)));
+    assert!(movies[1..].iter().all(|o| o.parent_id == Some(2000)));
+    server.abort();
+    let _ = server.await;
+}

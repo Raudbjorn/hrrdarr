@@ -50,6 +50,7 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | DELETE `/providers/bulk` | `ProviderSelection` | 204, no body |
 | POST `/providers/testall` | `ProviderFilter` body | `ProviderBatchResult` |
 | POST `/providers/test-draft` | `ProviderDraftInput` (required nullable source; no query flags) | `ProviderDraftResult` (unsaved probe; no persisted observation) |
+| POST `/providers/indexer-categories` | `CategoryDiscoveryInput` (minimal connection; required nullable source; no query flags) | `CategoryDiscoveryResult` (advertised or explicit standard fallback; no writes) |
 | POST `/providers/{id}/path-preview` | `ProviderPathInput` | `ProviderPathPreview` |
 | GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
 | GET `/episodes/{id}` | none (all projections included) | `Episode` |

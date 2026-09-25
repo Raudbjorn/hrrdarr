@@ -51,6 +51,14 @@ pub struct IndexerCategory {
     pub id: u32,
     pub parent_id: Option<u32>,
 }
+/// A selectable category; labels are untrusted remote text, bounded and secret-redacted.
+#[derive(Clone, Serialize, ts_rs::TS)]
+pub struct CategoryOption {
+    pub id: u32,
+    pub parent_id: Option<u32>,
+    pub label: String,
+}
+
 #[derive(Clone, Serialize, ts_rs::TS)]
 pub struct Capabilities {
     pub max_limit: u32,
@@ -334,6 +342,146 @@ fn child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Option<Node<'a, 'i>>>
     }
     Ok(first)
 }
+// Validate all advertised IDs, including filtered roots, before projecting selectable options.
+fn category_nodes<'a, 'i>(root: Node<'a, 'i>) -> Result<Vec<(u32, Option<u32>, Node<'a, 'i>)>> {
+    let mut result = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(container) = child(root, "categories")? {
+        for parent in container.children().filter(|n| n.has_tag_name("category")) {
+            let id = category_id(parent.attribute("id"))?;
+            for (node, parent_id) in std::iter::once((parent, None)).chain(
+                parent
+                    .children()
+                    .filter(|n| n.has_tag_name("subcat"))
+                    .map(|n| (n, Some(id))),
+            ) {
+                if result.len() == 4096 {
+                    return Err(IndexerError::InvalidResponse);
+                }
+                let id = category_id(node.attribute("id"))?;
+                if !seen.insert(id) {
+                    return Err(IndexerError::InvalidResponse);
+                }
+                result.push((id, parent_id, node));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Standard choices used only when discovery fails or the endpoint is not configured.
+pub fn standard_categories(domain: MediaDomain) -> Vec<CategoryOption> {
+    let (root, name, children): (u32, &str, &[(u32, &str)]) = match domain {
+        MediaDomain::Tv => (
+            5000,
+            "TV",
+            &[
+                (5010, "WEB-DL"),
+                (5020, "Foreign"),
+                (5030, "SD"),
+                (5040, "HD"),
+                (5045, "UHD"),
+                (5050, "Other"),
+                (5060, "Sport"),
+                (5070, "Anime"),
+                (5080, "Documentary"),
+            ],
+        ),
+        MediaDomain::Movies => (
+            2000,
+            "Movies",
+            &[
+                (2010, "Foreign"),
+                (2020, "Other"),
+                (2030, "SD"),
+                (2040, "HD"),
+                (2045, "UHD"),
+                (2050, "BluRay"),
+                (2060, "3D"),
+            ],
+        ),
+    };
+    std::iter::once(CategoryOption {
+        id: root,
+        parent_id: None,
+        label: name.into(),
+    })
+    .chain(children.iter().map(|(id, label)| CategoryOption {
+        id: *id,
+        parent_id: Some(root),
+        label: (*label).into(),
+    }))
+    .collect()
+}
+
+/// Caps-only discovery, independent of search/limit validation and without scoped parameters.
+/// Empty or absent advertised categories are a successful empty result, never standard fallback.
+pub async fn discover_categories(
+    operation: &super::http::HttpOperation<'_>,
+    endpoint: &str,
+    access: &IndexerAccess<'_>,
+    domain: MediaDomain,
+) -> Result<Vec<CategoryOption>> {
+    if !access.validate() {
+        return Err(IndexerError::InvalidRequest);
+    }
+    let body = fetch(
+        operation,
+        endpoint,
+        access.api_key,
+        vec![("t".into(), "caps".into()), ("o".into(), "xml".into())],
+    )
+    .await?;
+    let result = (|| {
+        let doc = xml(&body)?;
+        let root = doc.root_element();
+        if !root.has_tag_name("caps") {
+            return Err(IndexerError::InvalidResponse);
+        }
+        let ignored = [1000, 3000, 4000, 6000, 7000];
+        let deferred = match domain {
+            MediaDomain::Tv => 2000,
+            MediaDomain::Movies => 5000,
+        };
+        let mut options = Vec::new();
+        for (id, parent_id, node) in category_nodes(root)? {
+            if ignored.contains(&parent_id.unwrap_or(id)) {
+                continue;
+            }
+            let label = node
+                .attribute("name")
+                .ok_or(IndexerError::InvalidResponse)?;
+            if !valid_text(label, 512) {
+                return Err(IndexerError::InvalidResponse);
+            }
+            let private = access.api_key.into_iter().chain(
+                access
+                    .tv_parameters
+                    .iter()
+                    .chain(access.movie_parameters)
+                    .map(|p| p.value.as_str()),
+            );
+            let label = if private.filter(|s| !s.is_empty()).any(|s| label.contains(s)) {
+                "[redacted]".to_owned()
+            } else {
+                label.to_owned()
+            };
+            options.push(CategoryOption {
+                id,
+                parent_id,
+                label,
+            });
+        }
+        // Group each parent's ascending children directly after it. Opposite-domain roots go last.
+        options.sort_by_key(|o| {
+            let root = o.parent_id.unwrap_or(o.id);
+            (root == deferred, root, o.parent_id.is_some(), o.id)
+        });
+        Ok(options)
+    })();
+    cooldown(operation, result)
+}
+
 pub fn parse_capabilities(input: &str) -> Result<Capabilities> {
     let doc = xml(input)?;
     let root = doc.root_element();
@@ -420,33 +568,10 @@ pub fn parse_capabilities(input: &str) -> Result<Capabilities> {
             },
         })
     };
-    let mut categories = vec![];
-    let mut seen = BTreeSet::new();
-    if let Some(container) = child(root, "categories")? {
-        for node in container.children().filter(|n| n.has_tag_name("category")) {
-            let id = category_id(node.attribute("id"))?;
-            if !seen.insert(id) {
-                return Err(IndexerError::InvalidResponse);
-            }
-            categories.push(IndexerCategory {
-                id,
-                parent_id: None,
-            });
-            for sub in node.children().filter(|n| n.has_tag_name("subcat")) {
-                let subid = category_id(sub.attribute("id"))?;
-                if !seen.insert(subid) {
-                    return Err(IndexerError::InvalidResponse);
-                }
-                categories.push(IndexerCategory {
-                    id: subid,
-                    parent_id: Some(id),
-                });
-            }
-        }
-    }
-    if categories.len() > 4096 {
-        return Err(IndexerError::InvalidResponse);
-    }
+    let categories = category_nodes(root)?
+        .into_iter()
+        .map(|(id, parent_id, _)| IndexerCategory { id, parent_id })
+        .collect();
     Ok(Capabilities {
         max_limit,
         default_limit,

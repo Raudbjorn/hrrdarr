@@ -12,6 +12,16 @@ export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset
 
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
 
+export type CategoryDiscoveryError = { code: string, message: string, retry_after_seconds: number | null, };
+
+export type CategoryDiscoveryInput = { media_type: MediaDomain, source: ProviderDraftSource | null, connection: IndexerConnection, };
+
+export type CategoryDiscoveryResult = { source: ProviderDraftSource | null, media_type: MediaDomain, origin: CategoryOrigin, options: Array<CategoryOption>, discovery_error: CategoryDiscoveryError | null, };
+
+export type CategoryOption = { id: number, parent_id: number | null, label: string, };
+
+export type CategoryOrigin = "advertised" | "standard_fallback";
+
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
 export type Direction = "remote_to_local" | "local_to_remote";
@@ -98,7 +108,11 @@ export type ImportRequest = { episode_id: number, source: string, mode: string, 
 
 export type IndexerCategory = { id: number, parent_id: number | null, };
 
+export type IndexerConnection = { implementation: IndexerImplementation, endpoint: string, credentials?: ProviderCredentials | null, };
+
 export type IndexerContinuation = { query_index: number, offset: number, };
+
+export type IndexerImplementation = "torznab" | "newznab";
 
 export type IndexerItemWarning = { index: number, code: IndexerItemWarningCode, };
 

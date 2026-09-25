@@ -4,8 +4,10 @@ use std::{sync::LazyLock, time::Duration};
 use tokio::sync::Semaphore;
 
 // ponytail: Fixed admission bounds drafts until the command scheduler owns interactive test work.
-static DRAFT_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
-const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) static DRAFT_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+#[cfg(test)]
+pub(super) static DRAFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDraftSource {
@@ -25,13 +27,27 @@ pub struct ProviderDraftResult {
     pub tested_at: i64,
     pub result: ProviderTestOutcome,
 }
-struct Prepared {
-    source: Option<Provider>,
-    credentials: Option<Credentials>,
+pub(super) struct Prepared {
+    pub(super) source: Option<Provider>,
+    pub(super) credentials: Option<Credentials>,
 }
 async fn prepare(context: &Context, input: &mut ProviderDraftInput) -> Result<Prepared> {
     validate(&input.config)?;
-    let source = if let Some(binding) = input.source {
+    resolve(
+        context,
+        input.source,
+        input.config.settings.implementation(),
+        input.config.settings.endpoint(),
+        &mut input.config.credentials,
+    )
+    .await
+}
+pub(super) async fn load_source(
+    context: &Context,
+    binding: Option<ProviderDraftSource>,
+    implementation: &str,
+) -> Result<Option<(Provider, Option<Vec<u8>>)>> {
+    if let Some(binding) = binding {
         if !(1..=9007199254740991).contains(&binding.revision) {
             return Err(bad());
         }
@@ -40,21 +56,28 @@ async fn prepare(context: &Context, input: &mut ProviderDraftInput) -> Result<Pr
         let result = read(&tx, &binding.id.to_string()).await;
         let (provider, bytes) = finish(tx, result).await?;
         if provider.revision != binding.revision
-            || provider.settings.implementation() != input.config.settings.implementation()
+            || provider.settings.implementation() != implementation
         {
             return Err(conflict());
         }
-        Some((provider, bytes))
+        Ok(Some((provider, bytes)))
     } else {
-        None
-    };
-    let credentials = match std::mem::replace(&mut input.config.credentials, Change::Missing) {
+        Ok(None)
+    }
+}
+pub(super) async fn resolve(
+    context: &Context,
+    binding: Option<ProviderDraftSource>,
+    implementation: &str,
+    endpoint: &str,
+    change: &mut Change<Credentials>,
+) -> Result<Prepared> {
+    let source = load_source(context, binding, implementation).await?;
+    let credentials = match std::mem::replace(change, Change::Missing) {
         Change::Missing => match &source {
             Some((provider, bytes)) => {
-                // Exact endpoint equality includes scheme, host, port and path. No inherited secret may change destinations implicitly.
-                if bytes.is_some()
-                    && provider.settings.endpoint() != input.config.settings.endpoint()
-                {
+                // Bind the entire inherited bundle to the exact destination, including its path.
+                if bytes.is_some() && provider.settings.endpoint() != endpoint {
                     return Err(Error::Plain(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "provider_credential_binding",
@@ -65,7 +88,6 @@ async fn prepare(context: &Context, input: &mut ProviderDraftInput) -> Result<Pr
             }
             None => None,
         },
-        // These values stay in memory; unlike persisted edits, replacement/clear neither decrypt nor overwrite the saved bundle.
         Change::Value(credentials) => Some(credentials),
         Change::Null => None,
     };
@@ -153,6 +175,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn cancelled_and_timed_out_drafts_release_admission_without_writes() {
+        let _isolation = DRAFT_TEST_LOCK.lock().await;
         let path = std::env::temp_dir().join(format!("hrrdarr-draft-cancel-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
         let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
