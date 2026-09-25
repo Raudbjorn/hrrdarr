@@ -24,6 +24,18 @@ export type CategoryOrigin = "advertised" | "standard_fallback";
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
+export type Command = { id: string, name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, items_observed: number, };
+
+export type CommandInput = { name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, };
+
+export type CommandName = "refresh_downloads";
+
+export type CommandPriority = "normal" | "high";
+
+export type CommandQuery = { media_type?: MediaDomain, status?: CommandStatus, limit?: number, offset?: number, };
+
+export type CommandStatus = "queued" | "running" | "retry_wait" | "succeeded" | "failed" | "cancelled";
+
 export type Direction = "remote_to_local" | "local_to_remote";
 
 export type DownloadContentLayout = "default" | "original" | "subfolder";
@@ -285,6 +297,20 @@ export type QualityProfilePage = { media_type: MediaDomain, items: Array<Quality
 export type QualityProfileQuery = { offset?: number, limit?: number, };
 
 export type QualityProfileSummary = { id: number, name: string, item_count: number, group_count: number, };
+
+export type QueueObservation = { association: MediaTarget | null, download: DownloadItem, };
+
+export type QueueQuery = { provider_id: string, media_type: MediaDomain, limit?: number, offset?: number, };
+
+export type QueueSnapshot = { target: RefreshTarget, provider_revision: number, observed_at: number, command_id: string | null, items: Array<QueueObservation>, total: number, limit: number, offset: number, };
+
+export type RefreshSchedule = { target: RefreshTarget, revision: number, provider_revision: number, enabled: boolean, interval_seconds: number, next_run_at: number, last_run_at: number | null, error_code: string | null, };
+
+export type RefreshScheduleDelete = { target: RefreshTarget, revision: number, };
+
+export type RefreshScheduleInput = { target: RefreshTarget, revision: number | null, provider_revision: number, enabled: boolean, interval_seconds: number, };
+
+export type RefreshTarget = { provider_id: string, media_type: MediaDomain, };
 
 export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
 

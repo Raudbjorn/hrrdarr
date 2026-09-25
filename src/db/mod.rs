@@ -77,6 +77,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "remote_path_mappings",
         include_str!("../../migrations/0015_remote_path_mappings.sql"),
     ),
+    (
+        "download_refresh",
+        include_str!("../../migrations/0016_download_refresh.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -462,3 +466,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod refresh_tests;

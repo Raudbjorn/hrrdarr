@@ -3439,3 +3439,124 @@ async fn imported_category_is_confirmed_before_scoped_move() {
         }
     }
 }
+
+#[tokio::test]
+async fn refresh_pages_share_auth_redaction_and_enforce_complete_bounds() {
+    #[derive(Default)]
+    struct Pages {
+        count: usize,
+        logins: usize,
+        offsets: Vec<usize>,
+        duplicate: bool,
+        large: bool,
+        denied: bool,
+    }
+    async fn pages(
+        State(state): State<Arc<Mutex<Pages>>>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        let mut s = state.lock().unwrap();
+        if uri.path().ends_with("auth/login") {
+            s.logins += 1;
+            let sid = if s.logins == 1 {
+                "OLD_REFRESH_SID"
+            } else {
+                "NEW_REFRESH_SID"
+            };
+            return ([("set-cookie", format!("SID={sid}; HttpOnly"))], "Ok.").into_response();
+        }
+        if !headers.contains_key("cookie") {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if uri.path().ends_with("webapiVersion") {
+            return "2.8.3".into_response();
+        }
+        assert!(uri.path().ends_with("torrents/info"));
+        let args: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+        let offset: usize = args["offset"].parse().unwrap();
+        if offset == 500 && !s.denied {
+            s.denied = true;
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        s.offsets.push(offset);
+        let rows: Vec<_> = (offset..s.count.min(offset + 500))
+            .map(|i| {
+                let id = if s.duplicate && i == 500 { 0 } else { i };
+                let mut row = item(&format!("{id:040x}"), &args["category"], "downloading");
+                row["name"] = json!(if s.large {
+                    "x".repeat(1024)
+                } else {
+                    "OLD_REFRESH_SID NEW_REFRESH_SID private-password".into()
+                });
+                row
+            })
+            .collect();
+        axum::Json(rows).into_response()
+    }
+    for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+        for (count, duplicate, large) in [
+            (499, false, false),
+            (500, false, false),
+            (1000, false, false),
+            (1001, false, false),
+            (501, true, false),
+            (1000, false, true),
+        ] {
+            let state = Arc::new(Mutex::new(Pages {
+                count,
+                duplicate,
+                large,
+                ..Default::default()
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().fallback(pages).with_state(state.clone());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = HttpClient::new().unwrap();
+            let operation = client.operation(Uuid::new_v4()).unwrap();
+            let result = qbittorrent::refresh_pages(
+                &operation,
+                &settings(endpoint),
+                Some(&credentials()),
+                domain,
+            )
+            .await;
+            if duplicate {
+                assert!(matches!(result, Err(QbitError::InvalidResponse)));
+            } else if count > 1000 || large {
+                assert!(matches!(
+                    result,
+                    Err(QbitError::Http(HttpError::ResponseTooLarge))
+                ));
+            } else {
+                let items = result.unwrap();
+                assert_eq!(items.len(), count);
+                let encoded = serde_json::to_string(&items).unwrap();
+                assert!(!encoded.contains("OLD_REFRESH_SID"));
+                // Even page-one names are redacted after the later renewal learns NEW SID.
+                if count >= 500 {
+                    assert!(!encoded.contains("NEW_REFRESH_SID"));
+                }
+                assert!(!encoded.contains("private-password"));
+                let s = state.lock().unwrap();
+                assert_eq!(s.logins, if count >= 500 { 2 } else { 1 });
+                assert_eq!(
+                    s.offsets,
+                    if count == 1000 {
+                        vec![0, 500, 1000]
+                    } else if count == 500 {
+                        vec![0, 500]
+                    } else {
+                        vec![0]
+                    }
+                );
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}

@@ -40,18 +40,35 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
         Err(_) => return Err("Invalid provider key environment value".into()),
     };
     let state = Arc::new(AppState { db, provider_key });
-    let app = router(state);
+    let (app, refresh) = router_parts(state.clone());
     let addr: SocketAddr = env::var("HRRDARR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("hrrdarr listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    let runtime = if state.db.permits_local_imports() {
+        Some(hrrdarr::commands::start(state.db.clone(), refresh).await?)
+    } else {
+        eprintln!("event=command_worker_disabled code=local_ownership_required");
+        None
+    };
+    let result = axum::serve(listener, app).await;
+    if let Some(runtime) = runtime {
+        runtime.shutdown().await;
+    }
+    result?;
     Ok(())
 }
 
+#[cfg(test)]
 fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    router_parts(state).0
+}
+
+fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshClient) {
+    let (providers, refresh) =
+        hrrdarr::providers::router_with_refresh(state.db.clone(), state.provider_key.clone());
+    let app = Router::new()
         .route(
             "/api/v1/migrations",
             post(migrate).layer(DefaultBodyLimit::max(snapshots::MAX_SNAPSHOT_BYTES)),
@@ -66,10 +83,9 @@ fn router(state: Arc<AppState>) -> Router {
         .merge(hrrdarr::filesystem::router())
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
-        .merge(hrrdarr::providers::router(
-            state.db.clone(),
-            state.provider_key.clone(),
-        ))
+        .merge(providers)
+        .merge(hrrdarr::commands::router(state.db.clone()));
+    (app, refresh)
 }
 
 async fn migrate(

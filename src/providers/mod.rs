@@ -395,7 +395,20 @@ struct Context {
     transport: Arc<std::result::Result<http::HttpClient, http::HttpError>>,
 }
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
-    Router::new()
+    router_with_refresh(db, key).0
+}
+
+/// HTTP requests and durable refreshes share connection pools, provider lanes and cooldowns.
+pub fn router_with_refresh(
+    db: Arc<Database>,
+    key: Option<Arc<CredentialKey>>,
+) -> (Router, RefreshClient) {
+    let context = Context {
+        db,
+        key,
+        transport: Arc::new(http::HttpClient::new()),
+    };
+    let router = Router::new()
         .route("/api/v1/providers", get(list).post(create))
         .route("/api/v1/providers/schema", get(administration::schema))
         .route(
@@ -418,11 +431,120 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
         .route("/api/v1/providers/{id}/files", post(files))
         .route("/api/v1/providers/{id}/path-preview", post(path_preview))
         .layer(DefaultBodyLimit::max(32 * 1024))
-        .with_state(Context {
-            db,
-            key,
-            transport: Arc::new(http::HttpClient::new()),
-        })
+        .with_state(context.clone());
+    (router, RefreshClient(context))
+}
+
+#[derive(Clone)]
+pub struct RefreshClient(Context);
+
+#[derive(Debug)]
+pub(crate) struct RefreshError {
+    pub code: &'static str,
+    pub retryable: bool,
+    pub retry_after_seconds: Option<u32>,
+}
+impl RefreshError {
+    fn new(code: &'static str, retryable: bool) -> Self {
+        Self {
+            code,
+            retryable,
+            retry_after_seconds: None,
+        }
+    }
+}
+fn refresh_error(error: Error) -> RefreshError {
+    match error {
+        Error::RateLimited(seconds) => RefreshError {
+            code: "refresh_failed",
+            retryable: true,
+            retry_after_seconds: Some(seconds.clamp(1, 86400)),
+        },
+        Error::Plain(_, "provider_revision_conflict", _) => {
+            RefreshError::new("provider_changed", false)
+        }
+        Error::Plain(_, "timeout", _) => RefreshError::new("refresh_timeout", true),
+        Error::Plain(_, "response_too_large", _) => RefreshError::new("refresh_limit", false),
+        Error::Plain(status, code, _)
+            if status == StatusCode::NOT_FOUND
+                || status == StatusCode::SERVICE_UNAVAILABLE
+                || code == "authentication"
+                || status == StatusCode::BAD_REQUEST
+                || status == StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            RefreshError::new("provider_unavailable", false)
+        }
+        Error::Plain(_, "provider_busy", _) => RefreshError {
+            code: "refresh_failed",
+            retryable: true,
+            retry_after_seconds: Some(1),
+        },
+        _ => RefreshError::new("refresh_failed", true),
+    }
+}
+impl RefreshClient {
+    pub(crate) fn matches_database(&self, db: &Arc<Database>) -> bool {
+        Arc::ptr_eq(&self.0.db, db)
+    }
+
+    /// A bounded observation, not proof of remote absence: client pagination is not atomic.
+    pub(crate) async fn refresh(
+        &self,
+        id: Uuid,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<Vec<qbittorrent::DownloadItem>, RefreshError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, &id.to_string()),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        let scoped = match &provider.settings {
+            ProviderSettings::Qbittorrent { tv, movies, .. } => match domain {
+                MediaDomain::Tv => tv.is_some(),
+                MediaDomain::Movies => movies.is_some(),
+            },
+            _ => false,
+        };
+        if !provider.enabled || !scoped {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = qbittorrent::refresh_pages(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                domain,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0));
+            // Changed configuration invalidates failed observations too.
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
 }
 fn id(value: String) -> Result<String> {
     Uuid::parse_str(&value)

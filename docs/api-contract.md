@@ -20,6 +20,15 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 
 | Route and method | Request | Success body |
 | --- | --- | --- |
+| POST `/commands` | `CommandInput` | `Command` (202; active scope deduplication) |
+| GET `/commands` | `CommandQuery` | `ApiPage<Command>` |
+| GET `/commands/{id}` | none | `Command` |
+| POST `/commands/{id}/cancel` | none | `Command` |
+| DELETE `/commands/{id}` | none | empty (204; terminal history only) |
+| GET `/download-refresh/schedules` | none | `RefreshSchedule[]` |
+| PUT `/download-refresh/schedules` | `RefreshScheduleInput` | `RefreshSchedule` |
+| DELETE `/download-refresh/schedules` | `RefreshScheduleDelete` | empty (204) |
+| GET `/queue` | `QueueQuery` | `QueueSnapshot` (explicitly unassociated client observations) |
 | GET `/series` | none | `LegacySeries[]` |
 | GET `/series/{id}/episodes` | none | `LegacyEpisode[]` |
 | GET `/filesystem` | `FilesystemLookup` query | `FilesystemContents` |
@@ -89,3 +98,5 @@ JSON keeps its existing numeric wire representation. Generated `number` is not a
 The `no-serde-warnings` feature suppresses unsupported-attribute warnings after review: custom presence deserializers have explicit TS field annotations and serialization tests; `deny_unknown_fields` is enforced by serde, not fully expressible in structural TypeScript. UUIDs serialize as strings. The registry uses real handler types; separate profile input/output types represent their different omission rules.
 
 These declarations are compile-time contracts, not runtime response validators. The frontend checks transport status, JSON, byte/time bounds and numeric safety, then trusts its own backend's structural contract. The specimen test samples shipped shapes; it does not exhaust every possible field value or establish Sonarr/Radarr V3 compatibility. No migrations or physical import/deletion behavior are introduced. Code generation adds the pinned ts-rs dependency and its locked transitive packages.
+
+Durable command and queue semantics, ownership, limits and verification scope are documented in [download refresh](download-refresh.md).

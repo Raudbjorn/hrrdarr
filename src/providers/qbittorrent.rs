@@ -81,7 +81,7 @@ pub struct DownloadPage {
     pub next_offset: Option<u32>,
     pub items: Vec<DownloadItem>,
 }
-#[derive(Serialize, ts_rs::TS, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, ts_rs::TS, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadStatus {
     Queued,
@@ -93,7 +93,7 @@ pub enum DownloadStatus {
     Stalled,
     Unknown,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadDiagnostic {
     Error,
@@ -103,7 +103,8 @@ pub enum DownloadDiagnostic {
     DhtDisabled,
     UnknownState,
 }
-#[derive(Serialize, ts_rs::TS)]
+#[derive(Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
 pub struct DownloadItem {
     pub hash: String,
     pub domain: MediaDomain,
@@ -1048,6 +1049,22 @@ pub async fn query(
         return Err(QbitError::InvalidRequest);
     }
     let configured = scope(settings, request.domain)?;
+    if request.imported && configured.imported_category.is_none() {
+        return Err(QbitError::ScopeConflict);
+    }
+    let mut session = Session::connect(operation, settings, credentials).await?;
+    query_page(&mut session, settings, request).await
+}
+
+async fn query_page(
+    session: &mut Session<'_, '_>,
+    settings: &ProviderSettings,
+    request: &DownloadQuery,
+) -> Result<DownloadPage> {
+    if !(1..=500).contains(&request.limit) || request.offset > i32::MAX as u32 {
+        return Err(QbitError::InvalidRequest);
+    }
+    let configured = scope(settings, request.domain)?;
     let selected = if request.imported {
         configured
             .imported_category
@@ -1056,7 +1073,6 @@ pub async fn query(
     } else {
         &configured.category
     };
-    let mut session = Session::connect(operation, settings, credentials).await?;
     let raw = session
         .raw_list(&[
             (session.scope_field().into(), selected.clone()),
@@ -1115,6 +1131,63 @@ pub async fn query(
         items,
     })
 }
+/// Bounded active-category observation; offset pagination is not an atomic absence proof.
+pub async fn refresh_pages(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    domain: MediaDomain,
+) -> Result<Vec<DownloadItem>> {
+    const MAX_ITEMS: usize = 1000;
+    const MAX_BYTES: usize = 1024 * 1024;
+    const PAGE_ITEMS: u32 = 500;
+    scope(settings, domain)?;
+    let mut session = Session::connect(operation, settings, credentials).await?;
+    let mut items = Vec::new();
+    let mut hashes = BTreeSet::new();
+    let mut offset = 0;
+    loop {
+        let page = query_page(
+            &mut session,
+            settings,
+            &DownloadQuery {
+                domain,
+                offset,
+                limit: PAGE_ITEMS,
+                imported: false,
+            },
+        )
+        .await?;
+        for item in page.items {
+            if items.len() == MAX_ITEMS {
+                return Err(HttpError::ResponseTooLarge.into());
+            }
+            if !hashes.insert(item.hash.clone()) {
+                return Err(QbitError::InvalidResponse);
+            }
+            items.push(item);
+        }
+        match page.next_offset {
+            None => break,
+            Some(next) if next > offset && next <= MAX_ITEMS as u32 => offset = next,
+            _ => return Err(HttpError::ResponseTooLarge.into()),
+        }
+    }
+    // A later page can renew authentication. Redact earlier rows against every SID observed.
+    for item in &mut items {
+        item.name = session.redact(std::mem::take(&mut item.name));
+    }
+    if serde_json::to_vec(&items)
+        .map_err(|_| QbitError::InvalidResponse)?
+        .len()
+        > MAX_BYTES
+    {
+        return Err(HttpError::ResponseTooLarge.into());
+    }
+    operation.ensure_active()?;
+    Ok(items)
+}
+
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadFilesQuery {
