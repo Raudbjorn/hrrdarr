@@ -1,4 +1,5 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
+pub mod administration;
 mod credentials;
 pub mod http;
 pub mod indexer;
@@ -391,6 +392,12 @@ struct Context {
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
     Router::new()
         .route("/api/v1/providers", get(list).post(create))
+        .route("/api/v1/providers/schema", get(administration::schema))
+        .route(
+            "/api/v1/providers/bulk",
+            axum::routing::put(administration::update).delete(administration::delete),
+        )
+        .route("/api/v1/providers/testall", post(administration::test_all))
         .route(
             "/api/v1/providers/{id}",
             get(detail).put(update).delete(delete),
@@ -880,13 +887,25 @@ async fn network_snapshot(context: &Context, id: &str) -> Result<(Provider, Opti
     let tx = conn.transaction().await?;
     let (provider, bytes) = read(&tx, id).await?;
     tx.commit().await?;
+    let credentials = unlock(context, &provider, bytes)?;
+    Ok((provider, credentials))
+}
+fn unlock(
+    context: &Context,
+    provider: &Provider,
+    bytes: Option<Vec<u8>>,
+) -> Result<Option<Credentials>> {
     let credentials = bytes
         .map(|bytes| {
             context
                 .key
                 .as_ref()
                 .ok_or_else(locked)?
-                .open(id, provider.settings.implementation(), &bytes)
+                .open(
+                    &provider.id.to_string(),
+                    provider.settings.implementation(),
+                    &bytes,
+                )
                 .map_err(|_| locked())
         })
         .transpose()?;
@@ -896,8 +915,9 @@ async fn network_snapshot(context: &Context, id: &str) -> Result<(Provider, Opti
     {
         return Err(locked());
     }
-    Ok((provider, credentials))
+    Ok(credentials)
 }
+
 fn http_error(error: http::HttpError) -> (Error, &'static str) {
     use http::HttpError as H;
     match error {
@@ -1033,6 +1053,13 @@ async fn test(
 ) -> Result<Json<ProviderTestResult>> {
     let id = id(value)?;
     let (provider, credentials) = network_snapshot(&context, &id).await?;
+    run_test(&context, provider, credentials).await
+}
+async fn run_test(
+    context: &Context,
+    provider: Provider,
+    credentials: Option<Credentials>,
+) -> Result<Json<ProviderTestResult>> {
     let transport = context
         .transport
         .as_ref()

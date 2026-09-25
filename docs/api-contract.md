@@ -25,8 +25,9 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | GET `/filesystem` | `FilesystemLookup` query | `FilesystemContents` |
 | GET `/filesystem/type` | `FilesystemPath` query | `FilesystemType` (UI classification hint) |
 | GET `/filesystem/media-files` | `FilesystemMediaQuery` query | `FilesystemMediaFiles` |
-| POST `/imports` | `ImportRequest` | `Operation` (202 preview) |
-| POST `/imports/{id}/execute` | none | No success yet; existing execution guard returns 503 |
+| POST `/imports` | `ImportInput` (legacy episode or typed manual request) | `Operation` (202 preview) |
+| GET `/imports/{id}` | none | `Operation` |
+| POST `/imports/{id}/execute` | none | `Operation` (200 after execution or completed replay) |
 | POST `/migrations` | `SnapshotOptions` query; raw SQLite backup bytes | `SnapshotReport` |
 | GET `/{base}` | `LibraryQuery` | `LibraryPage` |
 | POST `/{base}` | `LibraryCreate` | `LibraryItem` (201) |
@@ -44,6 +45,10 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | PUT `/{media}/remote-path-mappings/{id}` | `MappingUpdate` | `Mapping` |
 | DELETE `/{media}/remote-path-mappings/{id}` | `MappingRevision` query | empty (204; configuration only) |
 | POST `/{media}/remote-path-mappings/resolve` | `ResolveInput` | `Resolution` |
+| GET `/providers/schema` | `ProviderFilter` query | `ProviderSchema` |
+| PUT `/providers/bulk` | `ProviderBulkUpdate` | `ProviderBulkResult` |
+| DELETE `/providers/bulk` | `ProviderSelection` | 204, no body |
+| POST `/providers/testall` | `ProviderFilter` body | `ProviderBatchResult` |
 | POST `/providers/{id}/path-preview` | `ProviderPathInput` | `ProviderPathPreview` |
 | GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
 | GET `/episodes/{id}` | none (all projections included) | `Episode` |
