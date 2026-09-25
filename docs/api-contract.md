@@ -49,6 +49,7 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | PUT `/providers/bulk` | `ProviderBulkUpdate` | `ProviderBulkResult` |
 | DELETE `/providers/bulk` | `ProviderSelection` | 204, no body |
 | POST `/providers/testall` | `ProviderFilter` body | `ProviderBatchResult` |
+| POST `/providers/test-draft` | `ProviderDraftInput` (required nullable source; no query flags) | `ProviderDraftResult` (unsaved probe; no persisted observation) |
 | POST `/providers/{id}/path-preview` | `ProviderPathInput` | `ProviderPathPreview` |
 | GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
 | GET `/episodes/{id}` | none (all projections included) | `Episode` |

@@ -65,6 +65,8 @@ pub fn render() -> String {
         crate::providers::administration::ProviderBulkUpdate,
         crate::providers::administration::ProviderBulkResult,
         crate::providers::administration::ProviderBatchResult,
+        crate::providers::draft::ProviderDraftInput,
+        crate::providers::draft::ProviderDraftResult,
         crate::providers::ProviderInput,
         crate::providers::ProviderUpdate,
         crate::providers::ProviderQuery,

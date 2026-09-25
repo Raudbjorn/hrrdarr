@@ -196,6 +196,12 @@ export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: 
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
+export type ProviderDraftInput = { source: ProviderDraftSource | null, config: ProviderInput, };
+
+export type ProviderDraftResult = { source: ProviderDraftSource | null, tested_at: number, result: ProviderTestOutcome, };
+
+export type ProviderDraftSource = { id: string, revision: number, };
+
 export type ProviderFilesResult = { provider_id: string, revision: number, result: DownloadFiles, };
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };

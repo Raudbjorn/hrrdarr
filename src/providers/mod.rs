@@ -1,6 +1,7 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
 pub mod administration;
 mod credentials;
+pub mod draft;
 pub mod http;
 pub mod indexer;
 pub mod qbittorrent;
@@ -398,6 +399,7 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
             axum::routing::put(administration::update).delete(administration::delete),
         )
         .route("/api/v1/providers/testall", post(administration::test_all))
+        .route("/api/v1/providers/test-draft", post(draft::test))
         .route(
             "/api/v1/providers/{id}",
             get(detail).put(update).delete(delete),
@@ -1055,6 +1057,27 @@ async fn test(
     let (provider, credentials) = network_snapshot(&context, &id).await?;
     run_test(&context, provider, credentials).await
 }
+async fn probe(
+    operation: &http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: &Option<Credentials>,
+) -> std::result::Result<ProviderTestOutcome, (Error, &'static str)> {
+    if matches!(settings, ProviderSettings::Qbittorrent { .. }) {
+        qbittorrent::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::DownloadClient)
+            .map_err(qbit_error)
+    } else {
+        indexer::test(
+            operation,
+            settings,
+            &IndexerAccess::from_credentials(credentials),
+        )
+        .await
+        .map(ProviderTestOutcome::Indexer)
+        .map_err(|e| indexer_error(e, operation))
+    }
+}
 async fn run_test(
     context: &Context,
     provider: Provider,
@@ -1069,21 +1092,7 @@ async fn run_test(
         .operation(provider.id)
         .map_err(|e| http_error(e).0)?;
     let work = async {
-        let result = if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-            qbittorrent::test_connection(&operation, &provider.settings, credentials.as_ref())
-                .await
-                .map(ProviderTestOutcome::DownloadClient)
-                .map_err(qbit_error)
-        } else {
-            indexer::test(
-                &operation,
-                &provider.settings,
-                &IndexerAccess::from_credentials(&credentials),
-            )
-            .await
-            .map(ProviderTestOutcome::Indexer)
-            .map_err(|e| indexer_error(e, &operation))
-        };
+        let result = probe(&operation, &provider.settings, &credentials).await;
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
