@@ -659,9 +659,9 @@ async fn process_candidate(
         }
         if p.status=="pending" {
             let collision=if let Some(movie)=movie {
-                tx.query("SELECT 1 FROM rss_candidates WHERE movie_id=? AND id!=? AND status IN ('prepared','submitting','reconciling','observed','needs_attention') LIMIT 1",params![movie,p.id.to_string()]).await?.next().await?.is_some()
+                tx.query("SELECT 1 FROM rss_candidates c WHERE movie_id=? AND id!=? AND status IN ('prepared','submitting','reconciling','observed','needs_attention') AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports i JOIN import_journal j ON j.operation_id=i.operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE i.candidate_id=c.id AND j.phase='complete') LIMIT 1",params![movie,p.id.to_string()]).await?.next().await?.is_some()
             }else{
-                tx.query("SELECT 1 FROM rss_candidate_episodes e JOIN rss_candidates c ON c.id=e.candidate_id WHERE e.episode_id=? AND c.id!=? AND c.status IN ('prepared','submitting','reconciling','observed','needs_attention') LIMIT 1",params![episode,p.id.to_string()]).await?.next().await?.is_some()
+                tx.query("SELECT 1 FROM rss_candidate_episodes e JOIN rss_candidates c ON c.id=e.candidate_id WHERE e.episode_id=? AND c.id!=? AND c.status IN ('prepared','submitting','reconciling','observed','needs_attention') AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports i JOIN import_journal j ON j.operation_id=i.operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE i.candidate_id=c.id AND j.phase='complete') LIMIT 1",params![episode,p.id.to_string()]).await?.next().await?.is_some()
             };
             if collision{candidate_state(&tx,p.id,"rejected",Some("target_conflict"),None).await?;return Ok(false)}
             tx.execute("DELETE FROM rss_candidate_episodes WHERE candidate_id=?",[p.id.to_string()]).await?;

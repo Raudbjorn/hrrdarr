@@ -5,7 +5,7 @@ impl Drop for Scratch {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
 }
-async fn command(
+pub(super) async fn command(
     c: &Connection,
     indexer: &str,
     client: &str,
@@ -15,7 +15,7 @@ async fn command(
     c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync',?,?,1,?,1,100,100)",params![id.clone(),domain,indexer,client]).await?;
     Ok(id)
 }
-async fn candidate(
+pub(super) async fn candidate(
     c: &Connection,
     command: &str,
     domain: &str,
@@ -34,10 +34,14 @@ async fn candidate(
     }
     Ok(id)
 }
-fn identity(domain: &str, hashes: &[&str]) -> String {
+pub(super) fn identity(domain: &str, hashes: &[&str]) -> String {
     serde_json::json!({"version":1,"target":{"media_type":if domain=="tv"{"episode"}else{"movie"},"id":1},"hashes":hashes,"settings_fingerprint":"a".repeat(64),"payload_sha256":"b".repeat(64)}).to_string()
 }
-async fn prepare(c: &Connection, id: &str, identity: String) -> Result<u64, libsql::Error> {
+pub(super) async fn prepare(
+    c: &Connection,
+    id: &str,
+    identity: String,
+) -> Result<u64, libsql::Error> {
     c.execute(
         "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
         params![identity, id],
@@ -83,7 +87,7 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 25);
+    assert_eq!(version(&c).await?, 26); // Latest open adds durable download import ownership; predecessor stays fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

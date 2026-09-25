@@ -17,6 +17,15 @@ use serde_json::Value as JsonValue;
 use std::{collections::BTreeSet, sync::Arc};
 const MAX_IDS: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+// Queries alias the file table as f. Unattached snapshot files remain active;
+// only a journaled replacement retirement removes a file from library views.
+pub(crate) fn active_file_sql(media: &str) -> &'static str {
+    if media == "tv" {
+        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND ri.retirement_state='quarantined')"
+    } else {
+        "1"
+    }
+}
 #[derive(Debug)]
 struct Error(StatusCode, &'static str, &'static str);
 type Result<T> = std::result::Result<T, Error>;
@@ -168,7 +177,11 @@ async fn list(
     let tx = c.transaction().await?;
     let mut rows = tx
         .query(
-            &format!("SELECT count(*) FROM {} f WHERE {filter}", d.table),
+            &format!(
+                "SELECT count(*) FROM {} f WHERE {filter} AND {}",
+                d.table,
+                active_file_sql(d.name)
+            ),
             values.clone(),
         )
         .await?;
@@ -214,11 +227,12 @@ async fn fetch(
         "NULL"
     };
     let sql = format!(
-        "SELECT f.id,f.{owner},f.path,p.path,{edition},m.quality_id,m.revision_json,m.languages_json,m.size,m.date_added,m.season_number,m.original_file_path,m.release_group,m.indexer_flags,m.release_type,m.media_info_json FROM {table} f JOIN {root} p ON p.id=f.{owner} LEFT JOIN file_metadata m ON m.{target}=f.id AND m.media_type=? WHERE {filter} ORDER BY f.id LIMIT ? OFFSET ?",
+        "SELECT f.id,f.{owner},f.path,p.path,{edition},m.quality_id,m.revision_json,m.languages_json,m.size,m.date_added,m.season_number,m.original_file_path,m.release_group,m.indexer_flags,m.release_type,m.media_info_json FROM {table} f JOIN {root} p ON p.id=f.{owner} LEFT JOIN file_metadata m ON m.{target}=f.id AND m.media_type=? WHERE {filter} AND {active} ORDER BY f.id LIMIT ? OFFSET ?",
         owner = d.owner,
         table = d.table,
         root = d.root,
-        target = d.target
+        target = d.target,
+        active = active_file_sql(d.name)
     );
     values.insert(0, Value::Text(d.name.into()));
     values.push(Value::Integer(limit));
@@ -380,7 +394,14 @@ async fn persist(
     let outcome: Result<Vec<FileResource>> = async {
         for (id, patch) in &validated {
             let mut found = tx
-                .query(&format!("SELECT id FROM {} WHERE id=?", d.table), [*id])
+                .query(
+                    &format!(
+                        "SELECT f.id FROM {} f WHERE f.id=? AND {}",
+                        d.table,
+                        active_file_sql(d.name)
+                    ),
+                    [*id],
+                )
                 .await?;
             if found.next().await?.is_none() {
                 return Err(missing());

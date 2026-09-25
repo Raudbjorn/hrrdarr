@@ -1,3 +1,5 @@
+#[path = "owned_tests.rs"]
+mod owned_cases;
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 struct Scratch(std::path::PathBuf);
@@ -85,6 +87,7 @@ async fn count(db: &Database, table: &str) -> i64 {
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
+    owned_cases::replacements().await;
     // These use the real phase helpers and reopen the owned database between interruption and
     // execute. Boundary setup stops before the next journal write; it does not mock recovery.
     for movie in [false, true] {

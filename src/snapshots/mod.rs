@@ -465,6 +465,16 @@ async fn write(
     let old_metadata=conn.query("SELECT episode_metadata_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let mut ids = BTreeMap::new();
     let mut seasons_done = false;
+    // Predecessor-schema fixture writers also use this core before retirement exists.
+    let has_retirement = conn
+        .query(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rss_candidate_imports'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
     for entity in entities {
         if entity.table == "episodes" && !seasons_done {
             write_seasons(conn, seasons, &ids, report).await?;
@@ -524,6 +534,25 @@ async fn write(
             matches.push((row.get::<i64>(0)?, equal, can_backfill));
         }
         let mapped = conn.query("SELECT destination_id FROM snapshot_mappings WHERE application=?1 AND fingerprint=?2 AND destination_table=?3 AND source_id=?4", params![app, report.fingerprint.clone(), entity.table, entity.source_id]).await?.next().await?;
+        // A replacement archive is not an active snapshot file candidate, even when
+        // an old provenance mapping survives or the source path now matches its archive.
+        if has_retirement && entity.table == "episode_files" {
+            let mut ids = matches.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+            if let Some(row) = &mapped {
+                ids.push(row.get::<i64>(0)?);
+            }
+            let mut retired = false;
+            for id in ids {
+                if conn.query("SELECT 1 FROM rss_candidate_imports WHERE old_episode_file_id=? AND retirement_state='quarantined' LIMIT 1", [id]).await?.next().await?.is_some() {
+                    retired = true;
+                    break;
+                }
+            }
+            if retired {
+                report.conflicts += 1;
+                continue;
+            }
+        }
         let id = match matches.as_slice() {
             [(id, true, _)]
                 if mapped

@@ -647,7 +647,7 @@ async fn fetch(
     } else {
         "movie_file_id"
     };
-    let mut rows=c.query(&format!("SELECT f.{owner},count(*),count(m.size),CASE WHEN count(*)=count(m.size) THEN sum(m.size) ELSE NULL END FROM {file_table} f LEFT JOIN file_metadata m ON m.{target}=f.id AND m.media_type=? WHERE f.{owner} IN ({placeholders}) GROUP BY f.{owner}",owner=d.target()),std::iter::once(Value::Text(d.name().into())).chain(selected.clone()).collect::<Vec<_>>()).await?;
+    let mut rows=c.query(&format!("SELECT f.{owner},count(*),count(m.size),CASE WHEN count(*)=count(m.size) THEN sum(m.size) ELSE NULL END FROM {file_table} f LEFT JOIN file_metadata m ON m.{target}=f.id AND m.media_type=? WHERE f.{owner} IN ({placeholders}) AND {active} GROUP BY f.{owner}",owner=d.target(),active=crate::media_files::active_file_sql(d.name())),std::iter::once(Value::Text(d.name().into())).chain(selected.clone()).collect::<Vec<_>>()).await?;
     while let Some(r) = rows.next().await? {
         let stats = &mut items[positions[&r.get::<i64>(0)?]].statistics;
         stats.file_count = r.get(1)?;

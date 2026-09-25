@@ -82,6 +82,8 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, reasons: Array<string>, created_at: number, updated_at: number, };
+
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
 export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, initial_state?: DownloadInitialState, content_layout?: DownloadContentLayout, sequential_order?: boolean, first_last_first?: boolean, add_tags?: boolean, };
@@ -267,6 +269,18 @@ export type Operation = { id: string, target: MediaTarget, status: string, messa
 export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, };
 
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
+
+export type ProcessingInput = { provider_id: string, provider_revision: number, media_type: MediaDomain, receipt_ids: Array<string>, };
+
+export type ProcessingMode = "copy" | "hardlink";
+
+export type ProcessingPolicy = { provider_id: string, media_type: MediaDomain, provider_revision: number, revision: number | null, enabled: boolean, mode: ProcessingMode, };
+
+export type ProcessingPolicyInput = { provider_revision: number, revision: number | null, enabled: boolean, mode: ProcessingMode, };
+
+export type ProcessingQuery = { provider_id?: string, media_type?: MediaDomain, status?: ProcessingStatus, receipt_id?: string, limit?: number, offset?: number, };
+
+export type ProcessingStatus = "queued" | "checking" | "importing" | "imported" | "blocked" | "cancelled";
 
 export type Provider = { id: string, revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, has_credentials: boolean, test_supported: boolean, test_status: TestStatus, last_test: ProviderTestObservation | null, };
 

@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 pub mod blocklist;
 pub mod metadata;
+pub mod processing;
 pub mod rss;
 mod worker;
 pub use worker::{Runtime, start, start_with_metadata};
@@ -336,6 +337,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let metadata = metadata::router(db.clone());
     let blocklist = blocklist::router(db.clone());
     let rss = rss::router(db.clone());
+    let processing = processing::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -350,6 +352,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(metadata)
         .merge(blocklist)
         .merge(rss)
+        .merge(processing)
 }
 async fn create(
     State(db): State<Arc<Database>>,

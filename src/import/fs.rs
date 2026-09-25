@@ -495,3 +495,133 @@ fn stream(source: &mut File, mut destination: Option<&mut File>) -> Result<Strin
         .map(|b| format!("{b:02x}"))
         .collect())
 }
+
+/// Immutable original-file evidence for an owned replacement. Recovery artifacts are retained.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct OldFile {
+    pub version: u8,
+    pub file_id: i64,
+    pub path: String,
+    pub metadata: serde_json::Value,
+    parent: Identity,
+    file: Identity,
+    quarantine_name: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Retirement {
+    directory: Identity,
+}
+impl Plan {
+    pub(super) fn source_size(&self) -> u64 {
+        self.source_identity.size
+    }
+}
+impl OldFile {
+    pub(super) fn capture(
+        file_id: i64,
+        path: String,
+        metadata: serde_json::Value,
+        root: &str,
+        operation: &str,
+    ) -> Result<Self> {
+        validate_path(&path)?;
+        check(Path::new(&path).starts_with(root) && path != root)?;
+        let (parent, name) = parts(&path)?;
+        let directory = directory(parent)?;
+        let file = child(&directory, name, OFlags::RDONLY)?;
+        let identity = Identity::read(&file)?;
+        check(identity.unchanged(&Identity::read(&file)?))?;
+        Ok(Self {
+            version: 1,
+            file_id,
+            path,
+            metadata,
+            parent: Identity::read(&directory)?,
+            file: identity,
+            quarantine_name: format!(".hrrdarr-replaced-{operation}"),
+        })
+    }
+    fn parent(&self) -> Result<File> {
+        let dir = directory(parts(&self.path)?.0)?;
+        check(self.parent.same(&Identity::read(&dir)?))?;
+        Ok(dir)
+    }
+    fn verify(&self, file: &mut File) -> Result<()> {
+        check(self.file.content(&Identity::read(file)?))
+    }
+    pub(super) fn verify_original(&self) -> Result<()> {
+        self.verify(&mut child(
+            &self.parent()?,
+            parts(&self.path)?.1,
+            OFlags::RDONLY,
+        )?)
+    }
+    pub(super) fn prepare_retirement(&self) -> Result<Retirement> {
+        self.verify_original()?;
+        let parent = self.parent()?;
+        fs::mkdirat(
+            &parent,
+            self.quarantine_name.as_str(),
+            Permissions::from_bits_truncate(0o700),
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::EXIST {
+                unowned()
+            } else {
+                io(e)
+            }
+        })?;
+        sync(&parent)?;
+        let dir: File = fs::openat(
+            &parent,
+            self.quarantine_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Permissions::empty(),
+        )
+        .map_err(io)?
+        .into();
+        Ok(Retirement {
+            directory: Identity::read(&dir)?,
+        })
+    }
+    pub(super) fn recovery_path(&self) -> Result<String> {
+        let path = parts(&self.path)?
+            .0
+            .join(&self.quarantine_name)
+            .join("original");
+        let path = path.to_str().ok_or_else(changed)?.to_owned();
+        validate_path(&path)?;
+        Ok(path)
+    }
+    pub(super) fn retire(&self, checkpoint: &Retirement) -> Result<()> {
+        let parent = self.parent()?;
+        let dir: File = fs::openat(
+            &parent,
+            self.quarantine_name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Permissions::empty(),
+        )
+        .map_err(io)?
+        .into();
+        check(checkpoint.directory.same(&Identity::read(&dir)?))?;
+        if optional(&dir, "original")?.is_none() {
+            check(self.file.unchanged(&Identity::read(&child(
+                &parent,
+                parts(&self.path)?.1,
+                OFlags::RDONLY,
+            )?)?))?;
+            fs::renameat_with(
+                &parent,
+                parts(&self.path)?.1,
+                &dir,
+                "original",
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io)?;
+            sync(&parent)?;
+            sync(&dir)?;
+        }
+        // A re-created original pathname is never touched on retry.
+        self.verify(&mut child(&dir, "original", OFlags::RDONLY)?)
+    }
+}

@@ -117,6 +117,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "rss_grab_journal",
         include_str!("../../migrations/0025_rss_grab_journal.sql"),
     ),
+    (
+        "download_processing",
+        include_str!("../../migrations/0026_download_processing.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -526,3 +530,6 @@ mod blocklist_clear_tests;
 
 #[cfg(test)]
 mod rss_tests;
+
+#[cfg(test)]
+mod processing_tests;

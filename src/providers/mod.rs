@@ -483,7 +483,74 @@ fn refresh_error(error: Error) -> RefreshError {
         _ => RefreshError::new("refresh_failed", true),
     }
 }
+/// Private download paths and file facts; never directly serialize these into an API response.
+pub(crate) struct OwnedDownloadDetails {
+    pub details: qbittorrent::TorrentDetails,
+    pub host: String,
+}
 impl RefreshClient {
+    pub(crate) async fn inspect_download(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        target: &crate::db::MediaTarget,
+        remote_id: &str,
+    ) -> std::result::Result<OwnedDownloadDetails, AutomationError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let endpoint = url::Url::parse(provider.settings.endpoint())
+            .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let host = crate::remote_paths::host(
+            endpoint
+                .host_str()
+                .ok_or(RefreshError::new("provider_unavailable", false))?,
+        )
+        .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let result = qbittorrent::details(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                target,
+                remote_id,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0));
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            Ok(OwnedDownloadDetails {
+                details: result?,
+                host,
+            })
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
     pub(crate) fn matches_database(&self, db: &Arc<Database>) -> bool {
         Arc::ptr_eq(&self.0.db, db)
     }

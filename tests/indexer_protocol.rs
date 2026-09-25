@@ -1298,3 +1298,40 @@ async fn category_discovery_is_caps_only_bounded_and_preserves_advertised_choice
     server.abort();
     let _ = server.await;
 }
+
+#[test]
+fn selected_magnet_links_and_enclosures_have_typed_torrent_facts() {
+    for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+        for magnet in [
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string(),
+            format!("magnet:?xt=urn:btmh:1220{}", "a".repeat(64)),
+        ] {
+            for locator in [
+                format!("<link>{magnet}</link>"),
+                format!(r#"<enclosure type="application/x-bittorrent" url="{magnet}"/>"#),
+            ] {
+                let body = format!(
+                    "<rss><channel><item><title>Release</title><pubDate>2024-01-02</pubDate>{locator}</item></channel></rss>"
+                );
+                let page = indexer::parse_page(&body, 0, 10, true, domain).unwrap();
+                assert_eq!(page.items.len(), 1);
+                assert_eq!(page.items[0].download_url, magnet);
+                assert_eq!(
+                    page.items[0]
+                        .facts
+                        .torrent
+                        .as_ref()
+                        .unwrap()
+                        .magnet_url
+                        .as_deref(),
+                    Some(magnet.as_str()),
+                    "a validated selected magnet locator must not be dispatched as an HTTP torrent URL"
+                );
+                assert!(
+                    indexer::parse_page(&body, 0, 10, false, domain).is_err(),
+                    "Newznab does not inherit torrent locator support"
+                );
+            }
+        }
+    }
+}

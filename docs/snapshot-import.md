@@ -338,3 +338,5 @@ archives and blocklist activation together. Source databases and media remain un
 mapping, schema-21 backfill, rollback, complete target ownership, deletion/replay and
 reopen. Live services, real operator backups and full Blocklist controller parity are
 not established by these fixtures.
+
+An episode-file row retained as a quarantined replacement artifact is no longer an active snapshot reconciliation candidate. Exact reuploads and matching source records report a conflict rather than restoring its old path or episode association. Its original provenance remains stored. This exclusion is specific to explicitly quarantined replacement rows; ordinary unassociated snapshot files and shared files remain supported.

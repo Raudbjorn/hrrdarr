@@ -1,6 +1,6 @@
 // Opt-in real browser regression. Requires the owned library_ui_fixture and Vite proxy.
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 const { chromium } = await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE || '/usr/lib/node_modules/playwright/index.mjs').href);
 const origin = process.env.UI_URL;
@@ -161,6 +161,91 @@ async function verifyRss() {
   assert.equal(await panel.getByRole('button',{name:'Run RSS now',exact:true}).isDisabled(),true);assert.equal(posts,1);
   await page.unroute('**/api/v1/rss/commands');await panel.getByRole('button',{name:'Check RSS status',exact:true}).click();
   await panel.getByText('RSS status checked. Inspect recorded commands and receipts before another action.',{exact:true}).waitFor();
+}
+
+async function verifyDownloadProcessing() {
+  const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
+  const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
+  const client=providers.find(p=>p.name==='Browser qbittorrent'),indexer=providers.find(p=>p.name==='Browser torznab');
+  const expectStatus=async(response,status)=>assert.equal(response.status(),status,await response.text());
+  const poll=async(read,accept,label)=>{const deadline=Date.now()+15000;let last;while(Date.now()<deadline){last=await read(Math.max(1,deadline-Date.now()));if(accept(last))return last;await new Promise(r=>setTimeout(r,100));}assert.fail(`${label}: ${JSON.stringify(last)}`);};
+  const processing=async(domain,timeout=10000)=>(await (await page.request.get(`${origin}/api/v1/download-processing?provider_id=${client.id}&media_type=${domain}`,{timeout})).json()).items;
+  await expectStatus(await page.request.post(`${providerOrigin}/fixture-processing`),204);
+  await expectStatus(await page.request.post(`${providerOrigin}/fixture-mode?mode=0`),204);
+  for(const domain of ['tv','movies']) {
+    const profileResponse=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Completed ${domain}`,items:[{kind:'quality',quality_id:1,allowed:true,min_size:0},{kind:'quality',quality_id:3,allowed:true,min_size:0}],policy:{upgrade_allowed:true,cutoff:{kind:'quality',quality_id:3},min_format_score:0,cutoff_format_score:0,min_upgrade_format_score:1,language_id:domain==='movies'?-2:null,format_items:[]}}});
+    await expectStatus(profileResponse,201);const profile=await profileResponse.json();
+    await expectStatus(await page.request.put(`${origin}${domain==='tv'?'/api/v1/tv/series/1':'/api/v1/movies/1'}`,{data:{monitored:true,quality_profile_id:profile.id,...(domain==='tv'?{series_type:'standard',use_scene_numbering:false,seasons:[{number:1,monitored:true}]}:{minimum_availability:'released'})}}),200);
+    await expectStatus(await page.request.put(`${origin}/api/v1/release-policies/${domain}`,{data:{torrent_delay_minutes:0,usenet_delay_minutes:0,availability_delay_days:0}}),200);
+    if(domain==='tv')await expectStatus(await page.request.put(`${origin}/api/v1/episodes/2`,{data:{monitored:true}}),200);
+    else {
+      const old=(await (await page.request.get(`${origin}/api/v1/movies/files?movie_ids=1`)).json()).items[0];
+      await expectStatus(await page.request.put(`${origin}/api/v1/movies/files/${old.id}`,{data:{quality:{quality_id:1}}}),200);
+    }
+    await page.getByRole('button',{name:'RSS',exact:true}).click();
+    const rss=page.getByRole('region',{name:'RSS automation'});
+    await rss.getByLabel('RSS media').selectOption(domain);await rss.getByLabel('RSS indexer').selectOption(indexer.id);await rss.getByLabel('RSS download client').selectOption(client.id);
+    const accepted=page.waitForResponse(r=>r.url().endsWith('/api/v1/rss/commands')&&r.request().method()==='POST');
+    await rss.getByRole('button',{name:'Run RSS now',exact:true}).click();const response=await accepted;await expectStatus(response,202);await waitForCommand('/api/v1/rss/commands',(await response.json()).id,'succeeded');
+    const receipt=await poll(async(timeout)=>(await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`,{timeout})).json()).items.find(r=>r.status==='observed'),r=>!!r,`observed ${domain} receipt`);
+    assert.equal(receipt.target.media_type,domain);
+    await page.getByRole('button',{name:'Activity',exact:true}).click();
+    await page.getByLabel('Download client').selectOption(client.id);await page.getByLabel('Refresh media').selectOption(domain);
+    const panel=page.getByRole('region',{name:'Completed downloads',exact:true});
+    await panel.getByRole('button',{name:'Save import policy',exact:true}).waitFor();
+    const policyUrl=`${origin}/api/v1/download-processing/policies/${client.id}/${domain}`;
+    if(domain==='tv') {
+      // Concurrent policy write invalidates the panel's revision; explicit readback resolves it.
+      const current=await (await page.request.get(policyUrl)).json();
+      await expectStatus(await page.request.put(policyUrl,{data:{provider_revision:client.revision,revision:current.revision,enabled:false,mode:'copy'}}),200);
+      await panel.getByLabel('Enable completed-download imports').check();
+      await panel.getByRole('button',{name:'Save import policy',exact:true}).click();
+      await panel.getByRole('alert').filter({hasText:'Check processing status'}).waitFor();
+      await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+      await panel.getByText('Processing status checked. Inspect saved policy and imports before another action.',{exact:true}).waitFor();
+    }
+    await panel.getByLabel('Enable completed-download imports').check();await panel.getByLabel('Import transfer',{exact:true}).selectOption(domain==='tv'?'hardlink':'copy');
+    let writes=0;
+    if(domain==='tv')await page.route('**/api/v1/download-processing/policies/**',async route=>{if(route.request().method()!=='PUT')return route.continue();writes++;const result=await route.fetch();assert.equal(result.status(),200);await route.abort('failed');});
+    await panel.getByRole('button',{name:'Save import policy',exact:true}).click();
+    if(domain==='tv'){
+      await panel.getByText('The request may have committed. Check processing status before another action.',{exact:true}).waitFor();
+      assert.equal(await panel.getByRole('button',{name:'Save import policy',exact:true}).isDisabled(),true);assert.equal(writes,1);
+      await page.unroute('**/api/v1/download-processing/policies/**');await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+      await panel.getByText('Processing status checked. Inspect saved policy and imports before another action.',{exact:true}).waitFor();
+    }else await panel.getByText('Completed-download policy saved.',{exact:true}).waitFor();
+    // First attempt has no mapping and surfaces a real blocked preflight, with no import yet.
+    await page.getByRole('button',{name:'Refresh downloads',exact:true}).click();
+    const blocked=await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='blocked'),'mapping conflict');
+    assert.ok(blocked.some(r=>r.error_code==='path_mapping_missing'));assert.ok(blocked.every(r=>r.operation_id===null));
+    await expectStatus(await page.request.post(`${origin}/api/v1/${domain}/remote-path-mappings`,{data:{host:'127.0.0.1',remote_path:'/remote',local_path:`${scratch}/incoming`}}),201);
+    if(domain==='movies')await expectStatus(await page.request.post(`${origin}/api/fixture/fail-import-history?enabled=1`),204);
+    await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+    await panel.getByRole('button',{name:`Retry processing ${receipt.id}`,exact:true}).click();
+    if(domain==='movies'){
+      const failed=(await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='importing'&&r.error_code==='import_failed'),'failed replacement'))[0];
+      assert.ok(failed.operation_id);assert.equal(failed.import_phase,'published');
+      assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media','Failed replacement commit preserves original bytes');
+      await expectStatus(await page.request.post(`${origin}/api/fixture/fail-import-history?enabled=0`),204);
+      await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+      let retries=0;
+      await page.route('**/api/v1/download-processing',async route=>{if(route.request().method()!=='POST')return route.continue();retries++;const result=await route.fetch();assert.equal(result.status(),202);await route.abort('failed');});
+      await panel.getByRole('button',{name:`Resume import ${failed.operation_id}`,exact:true}).click();
+      await panel.getByText('The request may have committed. Check processing status before another action.',{exact:true}).waitFor();assert.equal(retries,1);
+      await page.unroute('**/api/v1/download-processing');
+      await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+      const done=(await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='imported'),'resumed movie import'))[0];assert.equal(done.operation_id,failed.operation_id);assert.equal(done.retirement_state,'quarantined');assert.equal(done.recovery_bytes_retained,true);
+      assert.equal(await readFile(`${scratch}/movies/.hrrdarr-replaced-${done.operation_id}/original`,'utf8'),'scratch movie media');
+    } else await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='imported'),'TV import');
+    await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+    await panel.getByText(domain==='tv'?'Episode 2: imported':'Movie 1: imported',{exact:true}).waitFor();
+    if(domain==='movies')await panel.getByText('Previous file retained in a private recovery location. Recovery bytes are not automatically deleted.',{exact:true}).waitFor();
+    await page.setViewportSize({width:390,height:844});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Completed import feedback must fit mobile');await page.setViewportSize({width:1280,height:720});
+    const filename=domain==='tv'?'Refreshed.series.S01E02.1080p.WEB-DL.mkv':'Refreshed.movie.2021.1080p.WEB-DL.mkv';
+    assert.equal((await readFile(`${scratch}/${domain}/${filename}`)).length,1048576);assert.equal((await readFile(`${scratch}/incoming/${filename}`)).length,1048576);
+    if(domain==='tv')assert.equal((await stat(`${scratch}/tv/${filename}`)).ino,(await stat(`${scratch}/incoming/${filename}`)).ino,'TV hardlink preserves source inode');
+  }
+  const added=await (await page.request.get(`${providerOrigin}/fixture-completed`)).json();assert.equal(added.length,2,'Retry/recovery must not add torrents again');assert.deepEqual(added.map(r=>r.category).sort(),['movies','tv']);
 }
 
 async function verifyActivity() {
@@ -554,11 +639,12 @@ try {
   await verifyMetadataRefresh();
   await verifyBlocklist();
   await verifyClearBlocklist();
+  await verifyDownloadProcessing();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});

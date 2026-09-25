@@ -1,5 +1,7 @@
-//! Initial manual imports. Replacement and multi-episode selection require a later contract.
+//! Initial manual imports and receipt-bound singleton replacements with durable recovery.
 mod fs;
+mod owned;
+pub(crate) use owned::{OwnedImport, prepare_owned};
 
 // Share the existing descriptor-relative, no-symlink directory walk with root observations.
 pub(crate) fn root_directory(path: &std::path::Path) -> Option<std::fs::File> {
@@ -40,6 +42,10 @@ pub struct Error {
 type Result<T> = std::result::Result<T, Error>;
 const MAX_SOURCE_GUARD_ROWS: usize = 10_000;
 impl Error {
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+
     fn bad(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -103,7 +109,7 @@ pub enum Mode {
     Hardlink,
 }
 impl Mode {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Copy => "copy",
             Self::Move => "move",
@@ -366,10 +372,48 @@ async fn load(c: &Connection, opid: &str) -> Result<Record> {
     })
 }
 pub async fn status(db: Arc<Database>, opid: &str) -> Result<Operation> {
-    load(&db.connect().await?, opid).await?.response()
+    let c = db.connect().await?;
+    let mut response = load(&c, opid).await?.response()?;
+    if let Some(row)=c.query("SELECT old_file_json IS NOT NULL,retirement_state FROM rss_candidate_imports WHERE operation_id=?",[opid]).await?.next().await? {
+        response.message=if row.get::<i64>(0)?==0 {"Owned download import; source bytes retained"} else {match row.get::<String>(1)?.as_str(){"quarantined"=>"Replacement imported; original bytes retained in private recovery artifact","shared_retained"=>"Replacement imported; original still serves other episodes",_=>"Owned replacement; original retirement pending and bytes retained"}}.into();
+    }
+    Ok(response)
 }
 // ponytail: one import at a time per process; per-library workers when throughput requires it.
 static EXECUTING: AtomicBool = AtomicBool::new(false);
+const MAX_FAILED_OWNED: usize = 1024; // Same cap as durable RSS receipts; no eviction of failed work.
+static FAILED_OWNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static FAILED_LATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+fn failed_owned(opid: &str) -> Result<bool> {
+    Ok(FAILED_LATCH_UNAVAILABLE.load(Ordering::Acquire)
+        || FAILED_OWNED
+            .lock()
+            .map_err(|_| Error::internal())?
+            .contains(opid))
+}
+fn latch_owned_failure(opid: &str) {
+    match FAILED_OWNED.lock() {
+        Ok(mut failed) if failed.contains(opid) || failed.len() < MAX_FAILED_OWNED => {
+            failed.insert(opid.into());
+        }
+        _ => {
+            FAILED_LATCH_UNAVAILABLE.store(true, Ordering::Release);
+            eprintln!(
+                "{}",
+                serde_json::json!({"level":"ERROR","component":"owned_import","condition":"failure_latch_unavailable","operation_id":opid})
+            );
+        }
+    }
+}
+static ACTIVE_OPERATION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartOwned {
+    Started,
+    Active,
+    Busy,
+    Complete,
+}
 struct Permit {
     _db: Option<Arc<Database>>,
 }
@@ -377,31 +421,121 @@ impl Drop for Permit {
     fn drop(&mut self) {
         // Release the worker's database ownership before publishing that it has finished.
         drop(self._db.take());
+        if let Ok(mut active) = ACTIVE_OPERATION.lock() {
+            *active = None;
+        }
         EXECUTING.store(false, Ordering::Release);
     }
+}
+fn acquire(db: &Arc<Database>, opid: &str) -> Option<Arc<Permit>> {
+    let mut active = ACTIVE_OPERATION.lock().ok()?;
+    EXECUTING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()?;
+    *active = Some(opid.into());
+    Some(Arc::new(Permit {
+        _db: Some(db.clone()),
+    }))
+}
+fn launch(
+    db: Arc<Database>,
+    opid: String,
+    permit: Arc<Permit>,
+    owned: bool,
+) -> tokio::task::JoinHandle<Result<Operation>> {
+    tokio::spawn(async move {
+        let result = run(db.clone(), &opid, &permit).await;
+        if let Err(e) = &result {
+            if owned {
+                latch_owned_failure(&opid);
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"code":e.code,"diagnostic":e.diagnostic})
+            );
+            let persisted=async{let c=db.connect().await?;c.execute("UPDATE import_journal SET error_code=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![e.code,opid.clone()]).await?;Ok::<(),libsql::Error>(())}.await;
+            if let Err(error) = persisted {
+                let error = Error::from(error);
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"condition":"error_status_persistence_failed","diagnostic":error.diagnostic})
+                );
+            }
+        }
+        result
+    })
+}
+async fn consume_owned_start(c: &Connection, opid: &str, explicit_manual: bool) -> Result<()> {
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let r=tx.query("SELECT j.error_code,d.resume_requested FROM import_journal j JOIN rss_candidate_imports i ON i.operation_id=j.operation_id JOIN download_processing d ON d.candidate_id=i.candidate_id WHERE j.operation_id=?",[opid]).await?.next().await?.ok_or_else(Error::missing)?;
+    if (r.get::<Option<String>>(0)?.is_some() || failed_owned(opid)?)
+        && r.get::<i64>(1)? == 0
+        && !explicit_manual
+    {
+        return Err(Error::conflict(
+            "resume_required",
+            "Failed owned import requires an explicit retry",
+        ));
+    }
+    tx.execute("UPDATE download_processing SET resume_requested=0,error_code=NULL,reasons_json='[]' WHERE candidate_id=(SELECT candidate_id FROM rss_candidate_imports WHERE operation_id=?) AND status='importing'",[opid]).await?;
+    tx.execute(
+        "UPDATE import_journal SET error_code=NULL WHERE operation_id=?",
+        [opid],
+    )
+    .await?;
+    tx.commit().await?;
+    FAILED_OWNED
+        .lock()
+        .map_err(|_| Error::internal())?
+        .remove(opid);
+    Ok(())
+}
+pub(crate) async fn start_owned(db: Arc<Database>, opid: &str) -> Result<StartOwned> {
+    local(&db)?;
+    let c = db.connect().await?;
+    if owned::facts(&c, opid).await?.is_none() {
+        return Err(Error::missing());
+    }
+    let record = load(&c, opid).await?;
+    if record.phase == "complete" {
+        FAILED_OWNED
+            .lock()
+            .map_err(|_| Error::internal())?
+            .remove(opid);
+        return Ok(StartOwned::Complete);
+    }
+    let Some(permit) = acquire(&db, opid) else {
+        let active = ACTIVE_OPERATION.lock().map_err(|_| Error::internal())?;
+        return Ok(if active.as_deref() == Some(opid) {
+            StartOwned::Active
+        } else {
+            StartOwned::Busy
+        });
+    };
+    consume_owned_start(&c, opid, false).await?;
+    // Lease remains inside the task and each blocking closure after its caller is dropped.
+    drop(launch(db, opid.into(), permit, true));
+    Ok(StartOwned::Started)
 }
 pub async fn execute(db: Arc<Database>, opid: &str) -> Result<Operation> {
     local(&db)?;
     Uuid::parse_str(opid).map_err(|_| Error::bad("Operation ID must be a UUID"))?;
-    if EXECUTING
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        return Err(Error::conflict(
+    let permit = acquire(&db, opid).ok_or_else(|| {
+        Error::conflict(
             "import_busy",
             "Another import is executing; retry this operation",
-        ));
+        )
+    })?;
+    let c = db.connect().await?;
+    let is_owned = owned::facts(&c, opid).await?.is_some();
+    if is_owned {
+        consume_owned_start(&c, opid, true).await?;
     }
-    let permit = Arc::new(Permit {
-        _db: Some(db.clone()),
-    });
-    let opid = opid.to_owned();
-    // The task owns the permit. Cancelling an HTTP request cannot admit another worker while
-    // its blocking transfer is still running.
-    tokio::spawn(async move {let result=run(db.clone(),&opid,&permit).await;
-        if let Err(e)=&result {eprintln!("{}",serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"code":e.code,"diagnostic":e.diagnostic}));let persisted=async{let c=db.connect().await?;c.execute("UPDATE import_journal SET error_code=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![e.code,opid.clone()]).await?;Ok::<(),libsql::Error>(())}.await;if let Err(error)=persisted{let error=Error::from(error);eprintln!("{}",serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"condition":"error_status_persistence_failed","diagnostic":error.diagnostic}));}}
-        result
-    }).await.map_err(|_|Error::internal())?
+    launch(db, opid.into(), permit, is_owned)
+        .await
+        .map_err(|_| Error::internal())?
 }
 async fn checkpoint(c: &Connection, opid: &str, phase: &str, stage: Option<&Stage>) -> Result<()> {
     let tx = c
@@ -446,7 +580,7 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
         source_unmanaged(&c, &plan.source).await?;
     }
     if rec.phase == "preview" {
-        let own = owner(&c, &rec.target).await?;
+        let own = owned::before(&c, opid, &rec.target).await?;
         if own.0 != plan.owner_id || own.1 != plan.root {
             return Err(Error::conflict(
                 "target_changed",
@@ -473,7 +607,7 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
     }
     let mut stage = rec.stage.ok_or_else(Error::internal)?;
     if rec.phase == "staged" {
-        let own = owner(&c, &rec.target).await?;
+        let own = owned::before(&c, opid, &rec.target).await?;
         if own.0 != plan.owner_id || own.1 != plan.root {
             return Err(Error::conflict(
                 "target_changed",
@@ -504,6 +638,7 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
         stage = leased(lease, move || p.retire_source(stage)).await?;
         checkpoint(&c, opid, "committed", Some(&stage)).await?;
         committed_owner(&c, opid, &rec.target, &plan).await?;
+        owned::retire(&c, opid, &rec.target, &plan, &stage, lease).await?;
         let p = plan.clone();
         let s = stage.clone();
         leased(lease, move || p.cleanup(&s)).await?;
@@ -522,7 +657,7 @@ async fn commit(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async {
-        let (owner_id,root,season)=owner(&tx,t).await?;if owner_id!=plan.owner_id || root!=plan.root{return Err(Error::conflict("target_changed","Library ownership changed before commit"));}
+        let (owner_id,root,season)=owned::before(&tx,opid,t).await?;let facts=owned::facts(&tx,opid).await?;let old_id=facts.as_ref().and_then(|f|f.old.as_ref()).map(|o|o.file_id);if owner_id!=plan.owner_id || root!=plan.root{return Err(Error::conflict("target_changed","Library ownership changed before commit"));}
         destination_free(&tx,&plan.destination).await?;
         let size=i64::try_from(stage.size()).map_err(|_|Error::internal())?;
         let (domain,episode,movie)=target(t);
@@ -530,12 +665,16 @@ async fn commit(
             MediaTarget::Episode(episode)=>{
                 tx.execute("INSERT INTO episode_files(series_id,path)VALUES(?,?)",params![owner_id,plan.destination.clone()]).await?;let fid=tx.last_insert_rowid();
                 tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,size,date_added,season_number)VALUES('tv',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?)",params![fid,size,season]).await?;
-                tx.execute("UPDATE episodes SET episode_file_id=? WHERE id=? AND episode_file_id IS NULL",params![fid,*episode]).await?;(Some(fid),None)
+                if tx.execute("UPDATE episodes SET episode_file_id=? WHERE id=? AND episode_file_id IS ?",params![fid,*episode,old_id]).await?!=1{return Err(Error::conflict("target_changed","Episode association changed"));}(Some(fid),None)
             },MediaTarget::Movie(movie)=>{
-                tx.execute("INSERT INTO movie_files(movie_id,path)VALUES(?,?)",params![*movie,plan.destination.clone()]).await?;let fid=tx.last_insert_rowid();
+                let fid=if let Some(old)=old_id {tx.execute("UPDATE movie_files SET path=?,edition=NULL WHERE id=? AND movie_id=?",params![plan.destination.clone(),old,*movie]).await?;tx.execute("DELETE FROM file_metadata WHERE movie_file_id=?",[old]).await?;old}else{tx.execute("INSERT INTO movie_files(movie_id,path)VALUES(?,?)",params![*movie,plan.destination.clone()]).await?;tx.last_insert_rowid()};
                 tx.execute("INSERT INTO file_metadata(media_type,movie_file_id,size,date_added,original_file_path)VALUES('movies',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?)",params![fid,size,plan.source.clone()]).await?;(None,Some(fid))
             }
         };
+        if let Some(facts)=facts { let (scope,column,fid)=match t {MediaTarget::Episode(_)=>("tv","episode_file_id",file_episode),MediaTarget::Movie(_)=>("movies","movie_file_id",file_movie)};
+            tx.execute(&format!("UPDATE file_metadata SET quality_id=?,revision_json=? WHERE media_type=? AND {column}=?"),params![facts.quality_id,facts.revision_json,scope,fid]).await?;
+            if let Some(fid)=file_movie {tx.execute("UPDATE movie_files SET edition=? WHERE id=?",params![facts.edition,fid]).await?;}
+        }
         tx.execute("INSERT INTO import_history(operation_id,media_type,episode_id,movie_id,episode_file_id,movie_file_id,source,destination,size,sha256)VALUES(?,?,?,?,?,?,?,?,?,?)",params![opid,domain,episode,movie,file_episode,file_movie,plan.source.clone(),plan.destination.clone(),size,stage.sha256.clone().ok_or_else(Error::internal)?]).await?;
         tx.execute("UPDATE import_journal SET phase='committed',error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",[opid]).await?;
         tx.execute("UPDATE operations SET status='committed' WHERE id=?",[opid]).await?;Ok(())

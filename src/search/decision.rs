@@ -292,114 +292,18 @@ pub async fn evaluate(
     if parsed.revision > 1 {
         result.deny("proper_upgrade_unsupported")
     }
-    let quality = if let Some(name) = &parsed.quality_name {
-        c.query("SELECT quality_id,min_size,max_size FROM quality_definitions WHERE media_type=? AND name=?",params![domain(media),name.as_str()]).await?.next().await?
-    } else {
-        None
-    };
-    if let Some(q) = quality {
-        let quality_id = q.get::<i64>(0)?;
-        result.quality_id = Some(quality_id);
-        if let Some(profile_id) = candidate.profile {
-            let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
-                .await
-                .map_err(|_| SearchError("release_profile_error"))?;
-            let mut ranked = Vec::new();
-            for (rank, item) in profile.items.iter().enumerate() {
-                match item {
-                    ProfileItem::Quality(l) => {
-                        ranked.push((l.quality_id, rank, l.allowed, l.min_size, l.max_size))
-                    }
-                    ProfileItem::Group { allowed, items, .. } => {
-                        for l in items {
-                            ranked.push((
-                                l.quality_id,
-                                rank,
-                                *allowed && l.allowed,
-                                l.min_size,
-                                l.max_size,
-                            ))
-                        }
-                    }
-                }
-            }
-            if let Some((_, rank, allowed, min, max)) =
-                ranked.iter().find(|(id, ..)| *id == quality_id)
-            {
-                if !allowed {
-                    result.deny("quality_not_allowed")
-                }
-                let minimum = min.or(q.get::<Option<f64>>(1)?);
-                let maximum = max.or(q.get::<Option<f64>>(2)?);
-                if minimum.is_some() || maximum.is_some() {
-                    if let Some((size, runtime)) = release
-                        .metadata
-                        .size_bytes
-                        .zip(candidate.runtime.filter(|v| *v > 0))
-                    {
-                        let per_minute = size as f64 / (1024.0 * 1024.0 * runtime as f64);
-                        if minimum.is_some_and(|v| per_minute < v)
-                            || maximum.is_some_and(|v| per_minute > v)
-                        {
-                            result.deny("size_outside_profile")
-                        }
-                    } else {
-                        result.deny("size_or_runtime_unknown")
-                    }
-                }
-                if let Some(policy) = profile.policy {
-                    if policy.min_format_score != 0 || policy.cutoff_format_score != 0 {
-                        result.deny("custom_format_policy_unsupported")
-                    }
-                    if !tv && policy.language_id != Some(-2) {
-                        // Protocol language strings are not a verified audio-language measurement.
-                        let _ = candidate.language;
-                        result.deny("language_policy_unsupported");
-                    }
-                    let cutoff = match policy.cutoff {
-                        Cutoff::Quality { quality_id } => ranked
-                            .iter()
-                            .find(|(id, ..)| *id == quality_id)
-                            .map(|(_, r, ..)| *r),
-                        Cutoff::Group { position } => Some(position),
-                    };
-                    for file in candidate.files.iter().flatten() {
-                        let column = if tv {
-                            "episode_file_id"
-                        } else {
-                            "movie_file_id"
-                        };
-                        let existing=c.query(&format!("SELECT quality_id FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),*file]).await?.next().await?;
-                        let existing = existing
-                            .map(|r| r.get::<Option<i64>>(0))
-                            .transpose()?
-                            .flatten()
-                            .and_then(|id| ranked.iter().find(|(q, ..)| *q == id));
-                        if !policy.upgrade_allowed {
-                            result.deny("upgrades_disabled")
-                        } else if let Some((_, old, ..)) = existing {
-                            if cutoff.is_some_and(|c| *old >= c) && policy.cutoff_format_score <= 0
-                            {
-                                result.deny("cutoff_met")
-                            } else if rank <= old {
-                                result.deny("not_quality_upgrade")
-                            }
-                        } else {
-                            result.deny("existing_quality_unknown")
-                        }
-                    }
-                } else {
-                    result.deny("quality_policy_unconfigured")
-                }
-            } else {
-                result.deny("quality_not_allowed")
-            }
-        } else {
-            result.deny("quality_profile_unconfigured")
-        }
-    } else {
-        result.deny("quality_unknown")
-    }
+    let _ = candidate.language;
+    apply_quality(
+        c,
+        media,
+        candidate.profile,
+        &candidate.files,
+        candidate.runtime,
+        release.metadata.size_bytes,
+        &parsed,
+        &mut result,
+    )
+    .await?;
     let policy=c.query("SELECT torrent_delay_minutes,usenet_delay_minutes,availability_delay_days FROM release_delay_policies WHERE media_type=?",[domain(media)]).await?.next().await?;
     if context == SearchContext::Rss {
         if let Some(p) = policy {
@@ -472,4 +376,122 @@ fn available(c: &Candidate, now: i64, delay_days: i64) -> bool {
         }
         _ => false,
     }
+}
+
+/// Shared profile/rank/size/cutoff checks for releases and already downloaded files.
+pub(super) async fn apply_quality(
+    c: &Connection,
+    media: MediaDomain,
+    profile_id: Option<i64>,
+    files: &[Option<i64>],
+    runtime: Option<i64>,
+    size_bytes: Option<u64>,
+    parsed: &crate::search::parser::ParsedRelease,
+    result: &mut ReleaseDecision,
+) -> Result<()> {
+    let tv = matches!(media, MediaDomain::Tv);
+    let quality = if let Some(name) = &parsed.quality_name {
+        c.query("SELECT quality_id,min_size,max_size FROM quality_definitions WHERE media_type=? AND name=?",params![domain(media),name.as_str()]).await?.next().await?
+    } else {
+        None
+    };
+    if let Some(q) = quality {
+        let quality_id = q.get::<i64>(0)?;
+        result.quality_id = Some(quality_id);
+        if let Some(profile_id) = profile_id {
+            let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
+                .await
+                .map_err(|_| SearchError("release_profile_error"))?;
+            let mut ranked = Vec::new();
+            for (rank, item) in profile.items.iter().enumerate() {
+                match item {
+                    ProfileItem::Quality(l) => {
+                        ranked.push((l.quality_id, rank, l.allowed, l.min_size, l.max_size))
+                    }
+                    ProfileItem::Group { allowed, items, .. } => {
+                        for l in items {
+                            ranked.push((
+                                l.quality_id,
+                                rank,
+                                *allowed && l.allowed,
+                                l.min_size,
+                                l.max_size,
+                            ))
+                        }
+                    }
+                }
+            }
+            if let Some((_, rank, allowed, min, max)) =
+                ranked.iter().find(|(id, ..)| *id == quality_id)
+            {
+                if !allowed {
+                    result.deny("quality_not_allowed")
+                }
+                let minimum = min.or(q.get::<Option<f64>>(1)?);
+                let maximum = max.or(q.get::<Option<f64>>(2)?);
+                if minimum.is_some() || maximum.is_some() {
+                    if let Some((size, runtime)) = size_bytes.zip(runtime.filter(|v| *v > 0)) {
+                        let per_minute = size as f64 / (1024.0 * 1024.0 * runtime as f64);
+                        if minimum.is_some_and(|v| per_minute < v)
+                            || maximum.is_some_and(|v| per_minute > v)
+                        {
+                            result.deny("size_outside_profile")
+                        }
+                    } else {
+                        result.deny("size_or_runtime_unknown")
+                    }
+                }
+                if let Some(policy) = profile.policy {
+                    if policy.min_format_score != 0 || policy.cutoff_format_score != 0 {
+                        result.deny("custom_format_policy_unsupported")
+                    }
+                    if !tv && policy.language_id != Some(-2) {
+                        // Protocol language strings are not a verified audio-language measurement.
+                        result.deny("language_policy_unsupported");
+                    }
+                    let cutoff = match policy.cutoff {
+                        Cutoff::Quality { quality_id } => ranked
+                            .iter()
+                            .find(|(id, ..)| *id == quality_id)
+                            .map(|(_, r, ..)| *r),
+                        Cutoff::Group { position } => Some(position),
+                    };
+                    for file in files.iter().flatten() {
+                        let column = if tv {
+                            "episode_file_id"
+                        } else {
+                            "movie_file_id"
+                        };
+                        let existing=c.query(&format!("SELECT quality_id FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),*file]).await?.next().await?;
+                        let existing = existing
+                            .map(|r| r.get::<Option<i64>>(0))
+                            .transpose()?
+                            .flatten()
+                            .and_then(|id| ranked.iter().find(|(q, ..)| *q == id));
+                        if !policy.upgrade_allowed {
+                            result.deny("upgrades_disabled")
+                        } else if let Some((_, old, ..)) = existing {
+                            if cutoff.is_some_and(|c| *old >= c) && policy.cutoff_format_score <= 0
+                            {
+                                result.deny("cutoff_met")
+                            } else if rank <= old {
+                                result.deny("not_quality_upgrade")
+                            }
+                        } else {
+                            result.deny("existing_quality_unknown")
+                        }
+                    }
+                } else {
+                    result.deny("quality_policy_unconfigured")
+                }
+            } else {
+                result.deny("quality_not_allowed")
+            }
+        } else {
+            result.deny("quality_profile_unconfigured")
+        }
+    } else {
+        result.deny("quality_unknown")
+    }
+    Ok(())
 }

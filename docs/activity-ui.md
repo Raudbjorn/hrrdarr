@@ -1,8 +1,7 @@
 # Activity and download-refresh UI
 
 Activity consumes the existing native command, schedule and queue contracts using
-Rust-generated DTOs. It does not submit or remove downloads, match them to library
-targets or import media. Only the implemented `refresh_downloads` command is offered.
+Rust-generated DTOs. Refresh commands read client state. A separate, explicit completed-download policy can authorize importing owned receipts; client removal is not offered.
 
 The command history is paged and filtered by media type and status. Details show
 the immutable provider/domain target, provider revision, priority, attempts, state,
@@ -38,6 +37,14 @@ readback, and requires an explicit successful Reload activity before another act
 No request is automatically retried. API commands may independently use their
 existing durable read-only retry policy.
 
+## Completed-download policies and recovery
+
+Selecting a client and media domain also opens its completed-download policy and paged processing records. The policy defaults disabled, uses an observed revision for changes, and offers copy or hardlink; both retain torrent source bytes. Configure a domain/host remote path mapping before enabling imports. Refreshing downloads may admit completed RSS-owned receipts when the policy is enabled. Merely appearing in a client category does not confer an import target.
+
+Each processing record shows its typed target, preflight attempts, operation UUID, phase and errors. A blocked or cancelled preflight supports explicit retry. A linked failed import supports Resume, which continues the same operation rather than submitting or importing again. Pending resume authorization is visible and suppresses another resume button. Cancellation is offered only before an operation is linked. Disabling a policy stops new admissions; linked recovery remains authorized.
+
+Replacement feedback distinguishes pending retirement, a previous file retained in a private recovery artifact, and an original still shared by other TV episodes. Recovery bytes are not automatically deleted. Policy edits preserve their original revision while dirty. Conflicts prompt explicit readback; unknown write responses lock further actions until Check processing status succeeds. Polling never replays a mutation. Changing client/domain disposes its panel and ignores late responses.
+
 ## Verification limits
 
 Frontend checks/build and transport tests verify native request shapes, explicit
@@ -54,5 +61,7 @@ desktop inspection displayed the failed command and its recorded attempts/error.
 The fixture has a live worker and bounded test-only delay/failure controls; no
 command status or snapshot is inserted directly by these browser tests. This UI does not establish live client
 behavior, process restart recovery, all Activity/settings routes, all command types,
-RSS, tracked-download matching, blocklist/history breadth or full Slice 2 parity.
-No dependency, database migration or backend contract is introduced here.
+all RSS/download-client behaviors, blocklist/history breadth or full Slice 2 parity.
+The UI uses generated backend contracts and adds no frontend dependencies.
+
+The extended completed-import browser scenario uses real RSS commands and the owned mock's actual qBittorrent add/details responses, then domain path mappings and the real import journal. It covers initial TV hardlink import, a movie upgrade from the earlier manual fixture using copy, missing-mapping retry, policy revision conflict, lost accepted policy/resume responses, and retained-original feedback. A scratch-only history INSERT failure proves the movie original survives a failed commit before resuming the same operation. No producer receipt or processing state is fabricated with SQL. This browser run does not kill/restart a process or establish the complete Slice 2/4 gate; backend recovery tests supply separate evidence.

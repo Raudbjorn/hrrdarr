@@ -1,5 +1,6 @@
 //! Native release evaluation shared by interactive search and durable RSS.
 mod decision;
+pub(crate) mod downloaded;
 pub mod parser;
 use crate::api::MediaDomain;
 use crate::{

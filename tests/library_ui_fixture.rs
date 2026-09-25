@@ -134,7 +134,12 @@ async fn search(Query(q): Query<HashMap<String, String>>) -> Response {
 }
 
 #[derive(Default)]
-struct ProviderObservations(Mutex<Vec<serde_json::Value>>, AtomicU8);
+struct ProviderObservations(
+    Mutex<Vec<serde_json::Value>>,
+    AtomicU8,
+    AtomicU8,
+    Mutex<Vec<serde_json::Value>>,
+);
 async fn mode(
     State(state): State<Arc<ProviderObservations>>,
     Query(query): Query<HashMap<String, String>>,
@@ -147,6 +152,31 @@ async fn mode(
     };
     state.1.store(value, Ordering::SeqCst);
     StatusCode::NO_CONTENT
+}
+async fn processing_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCode {
+    state.2.store(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+async fn completed_observations(
+    State(state): State<Arc<ProviderObservations>>,
+) -> Json<Vec<serde_json::Value>> {
+    Json(state.3.lock().unwrap().clone())
+}
+async fn import_failure(
+    State(db): State<Arc<Database>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let sql = match q.get("enabled").map(String::as_str) {
+        Some("1") => {
+            "CREATE TRIGGER fixture_import_failure BEFORE INSERT ON import_history BEGIN SELECT RAISE(ABORT,'owned browser fixture failure');END;"
+        }
+        Some("0") => "DROP TRIGGER IF EXISTS fixture_import_failure;",
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    match db.connect().await.unwrap().execute_batch(sql).await {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 async fn observations(
     State(state): State<Arc<ProviderObservations>>,
@@ -194,10 +224,11 @@ async fn provider_mock(
             return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
         }
         let tv = query.get("cat").is_some_and(|c| c.starts_with('5'));
-        let title = if tv {
-            "Fixture.series.S01E02.1080p.WEB-DL"
-        } else {
-            "Fixture.movie.2021.1080p.WEB-DL"
+        let title = match (tv, state.2.load(Ordering::SeqCst)) {
+            (true, 0) => "Fixture.series.S01E02.1080p.WEB-DL",
+            (false, 0) => "Fixture.movie.2021.1080p.WEB-DL",
+            (true, _) => "Refreshed.series.S01E02.1080p.WEB-DL",
+            (false, _) => "Refreshed.movie.2021.1080p.WEB-DL",
         };
         let category = if tv { "5030" } else { "2000" };
         let identity = if tv { "tvdbid" } else { "tmdbid" };
@@ -206,7 +237,12 @@ async fn provider_mock(
         } else {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         };
-        return ([("content-type", "application/xml")],format!(r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="1"/><item><title>{title}</title><guid>fixture-{category}</guid><pubDate>Thu, 24 Sep 2026 12:00:00 +0000</pubDate><link>magnet:?xt=urn:btih:{hash}</link><x:attr name="category" value="{category}"/><x:attr name="{identity}" value="101"/><x:attr name="size" value="1073741824"/></item></channel></rss>"#)).into_response();
+        let receipt_suffix = if state.2.load(Ordering::SeqCst) == 1 {
+            "-completed"
+        } else {
+            ""
+        };
+        return ([("content-type", "application/xml")],format!(r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="1"/><item><title>{title}</title><guid>fixture-{category}{receipt_suffix}</guid><pubDate>Thu, 24 Sep 2026 12:00:00 +0000</pubDate><link>magnet:?xt=urn:btih:{hash}</link><x:attr name="magneturl" value="magnet:?xt=urn:btih:{hash}"/><x:attr name="category" value="{category}"/><x:attr name="{identity}" value="101"/><x:attr name="size" value="1073741824"/></item></channel></rss>"#)).into_response();
     }
     if uri.path() == "/api/v2/auth/login" {
         let fields: HashMap<String, String> =
@@ -248,10 +284,78 @@ async fn provider_mock(
             _ => {}
         }
     }
+    if state.2.load(Ordering::SeqCst) == 1 {
+        let name = |tv| {
+            if tv {
+                "Refreshed.series.S01E02.1080p.WEB-DL.mkv"
+            } else {
+                "Refreshed.movie.2021.1080p.WEB-DL.mkv"
+            }
+        };
+        if uri.path() == "/api/v2/torrents/add" {
+            let fields: HashMap<String, String> =
+                url::form_urlencoded::parse(&body).into_owned().collect();
+            let Some(category) = fields
+                .get("category")
+                .filter(|v| matches!(v.as_str(), "tv" | "movies"))
+            else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let tv = category == "tv";
+            let hash = if tv { "a".repeat(40) } else { "b".repeat(40) };
+            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":name(tv),"state":"uploading","progress":1.0,"size":1048576,"amount_left":0,"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{}",name(tv))}));
+            return "Ok.".into_response();
+        }
+        if uri.path() == "/api/v2/torrents/setForceStart" {
+            let fields: HashMap<String, String> =
+                url::form_urlencoded::parse(&body).into_owned().collect();
+            let Some(hash) = fields.get("hashes") else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            for row in state
+                .3
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .filter(|r| r["hash"] == hash.as_str())
+            {
+                row["force_start"] = json!(fields.get("value").is_some_and(|v| v == "true"));
+            }
+            return "Ok.".into_response();
+        }
+        if uri.path() == "/api/v2/torrents/info" {
+            let rows: Vec<_> = state
+                .3
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    query
+                        .get("category")
+                        .is_none_or(|v| r["category"] == v.as_str())
+                        && query
+                            .get("hashes")
+                            .is_none_or(|v| v.split('|').any(|h| r["hash"] == h))
+                })
+                .cloned()
+                .collect();
+            return Json(rows).into_response();
+        }
+        if uri.path() == "/api/v2/torrents/files" {
+            let tv = query.get("hash").is_some_and(|v| v == &"a".repeat(40));
+            return Json(
+                json!([{"index":0,"name":name(tv),"size":1048576,"progress":1.0,"priority":1}]),
+            )
+            .into_response();
+        }
+        if uri.path() == "/api/v2/torrents/properties" {
+            return Json(json!({"save_path":"/remote","total_size":1048576,"addition_date":1,"completion_date":2,"seeding_time":0})).into_response();
+        }
+    }
     match uri.path() {
         "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
         "/api/v2/app/version"=>"v4.6.0".into_response(),
-        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
         "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
         "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([{"hash":"1111111111111111111111111111111111111111","category":query.get("category"),"name":"Fixture download","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0}])).into_response(),
         _=>StatusCode::NOT_FOUND.into_response(),
@@ -357,6 +461,12 @@ async fn library_ui_fixture() {
     for dir in [&tv, &movies, &incoming] {
         std::fs::create_dir(dir).unwrap();
     }
+    for name in [
+        "Refreshed.series.S01E02.1080p.WEB-DL.mkv",
+        "Refreshed.movie.2021.1080p.WEB-DL.mkv",
+    ] {
+        std::fs::write(incoming.join(name), vec![7u8; 1048576]).unwrap();
+    }
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
@@ -385,6 +495,8 @@ async fn library_ui_fixture() {
         Router::new()
             .route("/fixture-observations", get(observations))
             .route("/fixture-mode", post(mode))
+            .route("/fixture-processing", post(processing_mode))
+            .route("/fixture-completed", get(completed_observations))
             .fallback(provider_mock)
             .with_state(Arc::new(ProviderObservations::default())),
     )
@@ -407,6 +519,13 @@ async fn library_ui_fixture() {
             .merge(commands::router(db.clone()))
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
+            .merge(hrrdarr::remote_paths::router(db.clone()))
+            .merge(hrrdarr::media_files::router(db.clone()))
+            .merge(
+                Router::new()
+                    .route("/api/fixture/fail-import-history", post(import_failure))
+                    .with_state(db.clone()),
+            )
             .merge(blocklist::router(db))
             .merge(
                 Router::new()

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
+import { getProcessingPolicy, saveProcessingPolicy, listDownloadProcessing, processDownloads, cancelDownloadProcessing, listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -372,4 +372,27 @@ test('release and RSS clients preserve explicit scopes, revisions, targets and u
     assert.equal(result.ok,false);assert.equal(result.status,undefined);
   });
   assert.equal(calls,1,'The client must not automatically repeat an uncertain RSS mutation');
+});
+
+test('processing policy and receipt requests retain domains, revisions and uncertain outcomes',async()=>{
+  const provider='00000000-0000-0000-0000-000000000001',receipt='00000000-0000-0000-0000-000000000002';
+  const seen=[];
+  await withFetch(async(path,options)=>{seen.push([path,options.method,options.body?JSON.parse(options.body):null]);return json({});},async()=>{
+    for(const media_type of ['tv','movies']){
+      await getProcessingPolicy(provider,media_type);
+      await saveProcessingPolicy(provider,media_type,{provider_revision:4,revision:2,enabled:true,mode:'copy'});
+      await listDownloadProcessing(provider,media_type,25);
+      await processDownloads({provider_id:provider,provider_revision:4,media_type,receipt_ids:[receipt]});
+    }
+    await cancelDownloadProcessing(receipt);
+  });
+  assert.deepEqual(seen.filter(([path,method])=>path.includes('/policies/')&&method==='PUT').map(([, ,body])=>body),Array(2).fill({provider_revision:4,revision:2,enabled:true,mode:'copy'}));
+  assert.deepEqual(seen.filter(([path])=>path==='/api/v1/download-processing').map(([, ,body])=>body.media_type),['tv','movies']);
+  assert.ok(seen.some(([path])=>path.includes('media_type=movies&limit=25&offset=25')));
+  let calls=0;
+  await withFetch(async()=>{calls++;throw new Error('lost response');},async()=>{
+    const result=await processDownloads({provider_id:provider,provider_revision:4,media_type:'movies',receipt_ids:[receipt]});
+    assert.equal(result.ok,false);assert.equal(result.status,undefined);
+  });
+  assert.equal(calls,1,'An uncertain import authorization must be read back, never automatically replayed');
 });

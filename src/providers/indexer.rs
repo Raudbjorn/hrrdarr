@@ -242,8 +242,13 @@ pub(crate) fn decode_private(bytes: &[u8]) -> Result<Release> {
     if bytes.len() > 65536 {
         return Err(IndexerError::InvalidResponse);
     }
-    let value: PrivateRelease =
+    let mut value: PrivateRelease =
         serde_json::from_slice(bytes).map_err(|_| IndexerError::InvalidResponse)?;
+    if let Some(facts) = value.facts.torrent.as_mut() {
+        if facts.magnet_url.is_none() {
+            facts.magnet_url = selected_magnet(&value.download_url)?;
+        }
+    }
     Ok(Release {
         metadata: value.metadata,
         guid: value.guid,
@@ -1442,6 +1447,14 @@ fn locator(value: &str, torrent: bool) -> Result<String> {
     }
     Ok(value.to_string())
 }
+// The selected enclosure/link can itself be a magnet; keep locator typing at this boundary.
+fn selected_magnet(value: &str) -> Result<Option<String>> {
+    if url::Url::parse(value).is_ok_and(|url| url.scheme() == "magnet") {
+        locator(value, true).map(Some)
+    } else {
+        Ok(None)
+    }
+}
 fn optional_text(node: Node<'_, '_>, name: &str, max: usize) -> Result<Option<String>> {
     if child(node, name)?.is_none() {
         return Ok(None);
@@ -1720,7 +1733,10 @@ fn parse_item(
             .transpose()?;
         Some(TorrentFacts {
             info_hash,
-            magnet_url: magnet,
+            magnet_url: match magnet {
+                Some(value) => Some(value),
+                None => selected_magnet(&download_url)?,
+            },
             download_volume_factor: decimal(&attributes, "downloadvolumefactor")?,
             upload_volume_factor: decimal(&attributes, "uploadvolumefactor")?,
             minimum_ratio: decimal(&attributes, "minimumratio")?,
@@ -2097,4 +2113,27 @@ pub async fn search(
         total: page.total,
         next_offset: page.next_offset,
     })
+}
+
+#[cfg(test)]
+mod locator_tests {
+    use super::*;
+    #[test]
+    fn pending_release_decoding_normalizes_older_magnet_links() {
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            "<rss><channel><item><title>Release</title><pubDate>2024-01-02</pubDate><link>{magnet}</link></item></channel></rss>"
+        );
+        let mut release = parse_page(&body, 0, 10, true, MediaDomain::Movies)
+            .unwrap()
+            .items
+            .remove(0);
+        // Pre-fix durable pending payloads contain the accepted link but no typed magnet fact.
+        release.facts.torrent.as_mut().unwrap().magnet_url = None;
+        let decoded = decode_private(&encode_private(release).unwrap()).unwrap();
+        assert_eq!(
+            decoded.facts.torrent.unwrap().magnet_url.as_deref(),
+            Some(magnet)
+        );
+    }
 }

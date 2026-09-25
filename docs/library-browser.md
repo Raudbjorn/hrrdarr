@@ -1,9 +1,9 @@
-# Release search and RSS browser checks
+# Release search, RSS and completed-import browser checks
 
 Run the existing owned fixture and browser command described in
 [library-ui.md](library-ui.md#runnable-isolated-browser-verification).
 The fixture now mounts the native release search, policy and quality-profile routes.
-Its synthetic indexer returns one scoped release with a private magnet locator.
+Its synthetic indexer returns one scoped release with a private magnet locator. Its owned qBittorrent mock records actual add requests and supplies completed file/details observations.
 No public indexer, catalogue, download client or real media is contacted.
 
 The added scenario creates quality profiles through the native API, assigns them
@@ -20,12 +20,11 @@ release-search selection; RSS revalidates retained selections by UUID before usi
 their current revisions. Schedule writes include the observed revision. Search is
 read-only and has no grab action. Needs-attention receipts offer no redispatch action.
 
+The completed-download scenario additionally exercises actual observed RSS receipts, explicit processing policies, path mapping and imports: a new TV episode via hardlink and replacement of the earlier manual movie fixture via copy. A failed history commit retains the movie original; explicit resume completes the same operation and preserves original bytes in its recorded recovery artifact. Policy CAS, missing-mapping feedback, unknown accepted responses and mobile layout are checked without automatic write replay. Exactly two qBittorrent add requests remain after retry/recovery.
+
 ## Not claimed
 
-Browser checks of rejected RSS receipts do not establish successful submission,
-uncertain qBittorrent recovery, scheduling across process restarts, or completed
-imports. Backend submission/recovery evidence is separate; the complete automatic
-download-to-import pipeline remains incomplete. Full parser, profile,
+Browser checks do not establish uncertain qBittorrent submission recovery, scheduling across process restarts, or the full Slice 2/4 gate. Backend submission/recovery evidence is separate. Full parser, profile,
 provider/settings UI and manual grab parity remain incomplete. The external installed
 Playwright/Chromium is not a pinned project dependency. No new frontend dependency,
 cache framework or persistent browser state was added for these panels.
