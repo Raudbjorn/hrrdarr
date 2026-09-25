@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -26,16 +26,6 @@ struct Series {
     year: Option<i64>,
     path: String,
     poster: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct Episode {
-    id: i64,
-    series_id: i64,
-    season: i64,
-    number: i64,
-    title: String,
-    file_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +72,6 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/series", get(series))
-        .route("/api/v1/series/{id}/episodes", get(episodes))
         .route("/api/v1/imports", post(import_preview))
         .route("/api/v1/imports/{id}/execute", post(import_execute))
         .route(
@@ -92,6 +81,7 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state.clone())
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
+        .merge(hrrdarr::episodes::router(state.db.clone()))
 }
 
 async fn series(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Series>>, ApiError> {
@@ -110,26 +100,6 @@ async fn series(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Series>>,
             year: r.get(2)?,
             path: r.get(3)?,
             poster: r.get(4)?,
-        });
-    }
-    Ok(Json(result))
-}
-
-async fn episodes(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<Episode>>, ApiError> {
-    let conn = state.db.connect().await?;
-    let mut rows = conn.query("SELECT e.id, e.series_id, e.season, e.number, e.title, f.path FROM episodes e LEFT JOIN episode_files f ON f.id = e.episode_file_id WHERE e.series_id = ?1 ORDER BY e.season, e.number", params![id]).await?;
-    let mut result = Vec::new();
-    while let Some(r) = rows.next().await? {
-        result.push(Episode {
-            id: r.get(0)?,
-            series_id: r.get(1)?,
-            season: r.get(2)?,
-            number: r.get(3)?,
-            title: r.get(4)?,
-            file_path: r.get(5)?,
         });
     }
     Ok(Json(result))
@@ -327,12 +297,7 @@ mod tests {
             let state = Arc::new(AppState { db: Arc::new(db) });
             // Construct the production merge to catch static/wildcard route conflicts.
             let _routes = router(state.clone());
-            let listed = episodes(State(state.clone()), Path(1)).await.unwrap().0;
-            assert_eq!(listed.len(), 1);
-            assert_eq!(
-                listed[0].file_path.as_deref(),
-                Some("/tv/Series/episode.mkv")
-            );
+            // Episode endpoint/path assertions now exercise the real router in tests/episode_api.rs.
             let request = |episode_id| {
                 Json(ImportRequest {
                     episode_id,

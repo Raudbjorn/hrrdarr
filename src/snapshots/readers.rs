@@ -124,6 +124,8 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
     let series = table(source, "Series", SERIES)?;
     let episodes = table(source, "Episodes", EPISODES)?;
     let files = table(source, "EpisodeFiles", FILES)?;
+    let mut episode_columns = EPISODES.to_vec();
+    episode_columns.extend(EPISODE_METADATA.iter().map(|(source, _)| *source));
     let mut plan = Plan {
         entities: Vec::new(),
         seasons: Vec::new(),
@@ -132,7 +134,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             source,
             &[
                 ("Series", SERIES),
-                ("Episodes", EPISODES),
+                ("Episodes", &episode_columns),
                 ("EpisodeFiles", FILES),
             ],
         ),
@@ -235,17 +237,39 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             },
             None => Field::Value(Value::Null),
         };
+        let mut fields = vec![
+            ("series_id", Field::Reference("series", series_id)),
+            ("season", val(season)),
+            ("number", val(number)),
+            ("title", val(text(row, "Title")?)),
+            ("episode_file_id", file),
+            ("monitored", val(boolean(row, "Monitored")?)),
+        ];
+        fields.extend(episode_metadata(row)?);
+        if let Some(Value::Text(raw)) = row.get("Images") {
+            let images: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| ImportError("invalid episode image data"))?;
+            if images.as_array().is_some_and(|images| {
+                images.iter().any(|image| {
+                    image.as_object().is_some_and(|image| {
+                        image
+                            .keys()
+                            .any(|key| !["coverType", "url", "remoteUrl"].contains(&key.as_str()))
+                    })
+                })
+            }) {
+                plan.unsupported.push(Unsupported {
+                    table: "Episodes".into(),
+                    rows: 1,
+                    columns: vec!["Images: unknown cover fields retained privately".into()],
+                });
+            }
+        }
+
         plan.entities.push(Entity {
             table: "episodes",
             source_id: positive(row, "Id")?,
-            fields: vec![
-                ("series_id", Field::Reference("series", series_id)),
-                ("season", val(season)),
-                ("number", val(number)),
-                ("title", val(text(row, "Title")?)),
-                ("episode_file_id", file),
-                ("monitored", val(boolean(row, "Monitored")?)),
-            ],
+            fields,
             keys: vec![vec!["series_id", "season", "number"]],
         });
     }
@@ -387,4 +411,138 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
         .filter(|id| !found.contains(id))
         .count();
     Ok(plan)
+}
+
+const EPISODE_METADATA: &[(&str, &str)] = &[
+    ("TvdbId", "tvdb_id"),
+    ("AirDate", "air_date"),
+    ("AirDateUtc", "air_date_utc"),
+    ("LastSearchTime", "last_search_time"),
+    ("Runtime", "runtime"),
+    ("FinaleType", "finale_type"),
+    ("Overview", "overview"),
+    ("AbsoluteEpisodeNumber", "absolute_episode_number"),
+    (
+        "SceneAbsoluteEpisodeNumber",
+        "scene_absolute_episode_number",
+    ),
+    ("SceneEpisodeNumber", "scene_episode_number"),
+    ("SceneSeasonNumber", "scene_season_number"),
+    ("UnverifiedSceneNumbering", "unverified_scene_numbering"),
+    ("Images", "images_json"),
+];
+fn episode_metadata(row: &Record) -> Result<Vec<(&'static str, Field)>> {
+    let mut fields = Vec::new();
+    for &(source, destination) in EPISODE_METADATA {
+        let value = match row.get(source) {
+            None | Some(Value::Null) => Value::Null,
+            Some(value) => match source {
+                "TvdbId" => match value {
+                    Value::Integer(0) => Value::Null,
+                    Value::Integer(n) if *n > 0 => value.clone(),
+                    _ => return Err(ImportError("invalid episode TVDB identity")),
+                },
+                "Runtime"
+                | "AbsoluteEpisodeNumber"
+                | "SceneAbsoluteEpisodeNumber"
+                | "SceneEpisodeNumber"
+                | "SceneSeasonNumber" => match value {
+                    Value::Integer(n) if *n >= 0 => value.clone(),
+                    _ => return Err(ImportError("invalid episode runtime or numbering")),
+                },
+                "UnverifiedSceneNumbering" => match value {
+                    Value::Integer(0 | 1) => value.clone(),
+                    _ => return Err(ImportError("invalid episode scene flag")),
+                },
+                "AirDate" | "AirDateUtc" | "LastSearchTime" => match value {
+                    Value::Text(s) if s.is_empty() => Value::Null,
+                    Value::Text(s) => Value::Text(
+                        if source == "AirDate" {
+                            crate::episodes::normalize_date(s)
+                        } else {
+                            crate::episodes::normalize_utc(s)
+                        }
+                        .ok_or(ImportError("invalid episode date or UTC timestamp"))?,
+                    ),
+                    _ => return Err(ImportError("invalid episode date type")),
+                },
+                "Images" => match value {
+                    Value::Text(s) if s.len() <= 65536 => {
+                        let images: serde_json::Value = serde_json::from_str(s)
+                            .map_err(|_| ImportError("invalid episode images JSON"))?;
+                        let array =
+                            images
+                                .as_array()
+                                .filter(|a| a.len() <= 32)
+                                .ok_or(ImportError(
+                                    "episode images must be an array of at most 32 covers",
+                                ))?;
+                        let mut public_images = Vec::new();
+                        for image in array {
+                            let object = image
+                                .as_object()
+                                .ok_or(ImportError("invalid episode cover"))?;
+                            let kind = match object.get("coverType") {
+                                Some(serde_json::Value::String(s))
+                                    if [
+                                        "unknown",
+                                        "poster",
+                                        "banner",
+                                        "fanart",
+                                        "screenshot",
+                                        "headshot",
+                                        "clearlogo",
+                                    ]
+                                    .contains(&s.as_str()) =>
+                                {
+                                    s.as_str()
+                                }
+                                Some(serde_json::Value::Number(n))
+                                    if n.as_u64().is_some_and(|n| n <= 6) =>
+                                {
+                                    [
+                                        "unknown",
+                                        "poster",
+                                        "banner",
+                                        "fanart",
+                                        "screenshot",
+                                        "headshot",
+                                        "clearlogo",
+                                    ][n.as_u64().unwrap() as usize]
+                                }
+                                _ => return Err(ImportError("invalid episode cover type")),
+                            };
+                            let mut public = serde_json::json!({"coverType":kind});
+                            for key in ["url", "remoteUrl"] {
+                                if let Some(value) = object.get(key) {
+                                    if !value.is_null()
+                                        && !value.as_str().is_some_and(|s| {
+                                            s.len() <= 4096 && !s.chars().any(char::is_control)
+                                        })
+                                    {
+                                        return Err(ImportError("invalid episode image URL"));
+                                    }
+                                    public[key] = value.clone();
+                                }
+                            }
+                            public_images.push(public);
+                        }
+                        Value::Text(serde_json::Value::Array(public_images).to_string())
+                    }
+                    _ => return Err(ImportError("invalid episode image data")),
+                },
+                _ => match value {
+                    Value::Text(s)
+                        if !s.contains('\0')
+                            && s.len() <= if source == "Overview" { 65536 } else { 128 } =>
+                    {
+                        value.clone()
+                    }
+                    _ => return Err(ImportError("invalid episode metadata text")),
+                },
+            },
+        };
+        fields.push((destination, Field::Value(value)));
+    }
+    Ok(fields)
 }

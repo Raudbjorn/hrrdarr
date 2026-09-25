@@ -43,6 +43,7 @@ pub struct Report {
     pub applied: bool,
     pub mapped: usize,
     pub duplicates: usize,
+    pub metadata_backfilled: usize,
     pub conflicts: usize,
     pub missing_file_records: usize,
     pub unsupported: Vec<Unsupported>,
@@ -166,6 +167,7 @@ pub async fn import(
         applied: false,
         mapped: 0,
         duplicates: 0,
+        metadata_backfilled: 0,
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
@@ -411,7 +413,8 @@ async fn write(
     report: &mut Report,
 ) -> Result<()> {
     let app = report.application.name();
-    conn.execute("INSERT INTO snapshot_imports (application,fingerprint,schema_version) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING", params![app, report.fingerprint.clone(), source.version]).await?;
+    conn.execute("INSERT INTO snapshot_imports (application,fingerprint,schema_version,episode_metadata_version) VALUES (?1,?2,?3,1) ON CONFLICT DO NOTHING", params![app, report.fingerprint.clone(), source.version]).await?;
+    let old_metadata=conn.query("SELECT episode_metadata_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let mut ids = BTreeMap::new();
     let mut seasons_done = false;
     for entity in entities {
@@ -459,16 +462,53 @@ async fn write(
                 row.get_value((i + 1) as i32)
                     .is_ok_and(|actual| actual == *v)
             });
-            matches.push((row.get::<i64>(0)?, equal));
+            let can_backfill = old_metadata
+                && entity.table == "episodes"
+                && fields.iter().enumerate().all(|(i, (col, value))| {
+                    row.get_value((i + 1) as i32).is_ok_and(|actual| {
+                        if crate::episodes::METADATA_COLUMNS.contains(col) {
+                            actual == Value::Null
+                        } else {
+                            actual == *value
+                        }
+                    })
+                });
+            matches.push((row.get::<i64>(0)?, equal, can_backfill));
         }
         let mapped = conn.query("SELECT destination_id FROM snapshot_mappings WHERE application=?1 AND fingerprint=?2 AND destination_table=?3 AND source_id=?4", params![app, report.fingerprint.clone(), entity.table, entity.source_id]).await?.next().await?;
         let id = match matches.as_slice() {
-            [(id, true)]
+            [(id, true, _)]
                 if mapped
                     .as_ref()
                     .is_none_or(|r| r.get::<i64>(0).ok() == Some(*id)) =>
             {
                 report.duplicates += 1;
+                *id
+            }
+            [(id, false, true)]
+                if mapped
+                    .as_ref()
+                    .is_some_and(|r| r.get::<i64>(0).ok() == Some(*id)) =>
+            {
+                let metadata = fields
+                    .iter()
+                    .filter(|(c, _)| crate::episodes::METADATA_COLUMNS.contains(c))
+                    .collect::<Vec<_>>();
+                let mut values = metadata.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
+                values.push(Value::Integer(*id));
+                conn.execute(
+                    &format!(
+                        "UPDATE episodes SET {} WHERE id=?",
+                        metadata
+                            .iter()
+                            .map(|(c, _)| format!("{c}=?"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    values,
+                )
+                .await?;
+                report.metadata_backfilled += 1;
                 *id
             }
             [] if mapped.is_none() => {
@@ -503,6 +543,7 @@ async fn write(
             conn.execute("INSERT INTO snapshot_records (application,fingerprint,source_table,ordinal,record_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),table.clone(),i as i64,archive(row)?]).await?;
         }
     }
+    conn.execute("UPDATE snapshot_imports SET episode_metadata_version=1 WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?;
     Ok(())
 }
 async fn write_seasons(

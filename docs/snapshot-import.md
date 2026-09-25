@@ -47,7 +47,7 @@ resolve through file records and their correct owner, never into path strings.
 ## Reconciliation and retention
 
 HTTP 200 returns `application`, `fingerprint` (SHA-256 of upload), `schema_version`,
-`dry_run`, `applied`, `mapped`, `duplicates`, `conflicts`, `missing_file_records`,
+`dry_run`, `applied`, `mapped`, `duplicates`, `metadata_backfilled`, `conflicts`, `missing_file_records`,
 `unsupported` and a `policy` explanation. `mapped` counts new proposed records;
 `duplicates` counts matching existing records. With any conflict, `applied=false`
 and **the entire destination transaction rolls back**, including otherwise valid rows.
@@ -107,3 +107,9 @@ coverage exercises uploaded bytes and preview/application results.
 No real exported application backup, browser flow, Windows path, remote database,
 external provider, actual media scan, or crash/disk-failure injection is claimed.
 Ancillary settings still require semantic adapters before full snapshot parity.
+
+Episode metadata added in schema 5 can be activated by exact replay of a previously
+imported snapshot. A one-time fill requires intact mapped core fields and all newly
+supported fields still null; it never overwrites local edits. `metadata_backfilled`
+counts affected episode records. Dry runs roll back both data and activation marker.
+See [episode API](episode-api.md) for date, numbering, cover-field and replay rules.
