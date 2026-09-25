@@ -261,7 +261,11 @@ async fn import_blocklists(State(state): State<Arc<BlocklistFixture>>) -> Respon
     }
     Json(reports).into_response()
 }
-async fn blocklist_fixture(db: Arc<Database>, root: &std::path::Path) -> Arc<BlocklistFixture> {
+async fn blocklist_fixture(
+    db: Arc<Database>,
+    root: &std::path::Path,
+    external_id: i64,
+) -> Arc<BlocklistFixture> {
     let tv_root = root.join("blocklist-tv");
     let movie_root = root.join("blocklist-movie");
     std::fs::create_dir(&tv_root).unwrap();
@@ -281,6 +285,9 @@ async fn blocklist_fixture(db: Arc<Database>, root: &std::path::Path) -> Arc<Blo
       INSERT INTO Blocklist VALUES(2,1,'[1]','2026-01-03 00:00:00','Blocked TV pilot',1,200,NULL,NULL,NULL,'PRIVATE_BLOCKLIST_SENTINEL','private-indexer');
     "#).await.unwrap();
     c.execute("UPDATE Series SET Path=?", [tv_root.to_str().unwrap()])
+        .await
+        .unwrap();
+    c.execute("UPDATE Series SET TvdbId=?", [external_id])
         .await
         .unwrap();
     for id in 3..=26 {
@@ -307,6 +314,12 @@ async fn blocklist_fixture(db: Arc<Database>, root: &std::path::Path) -> Arc<Blo
     c.execute("UPDATE Movies SET Path=?", [movie_root.to_str().unwrap()])
         .await
         .unwrap();
+    c.execute(
+        "UPDATE MovieMetadata SET TmdbId=?,ImdbId=?",
+        libsql::params![external_id, format!("tt7654{external_id}")],
+    )
+    .await
+    .unwrap();
     drop(c);
     drop(source);
     Arc::new(BlocklistFixture {
@@ -362,7 +375,10 @@ async fn library_ui_fixture() {
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
-    let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0).await;
+    let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0, 901).await;
+    let clear_root = scratch.0.join("clear-source");
+    std::fs::create_dir(&clear_root).unwrap();
+    let clear_fixture = blocklist_fixture(db.clone(), &clear_root, 902).await;
     let worker = commands::start_with_metadata(db.clone(), refresh, client.clone())
         .await
         .unwrap();
@@ -374,6 +390,14 @@ async fn library_ui_fixture() {
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
             .merge(blocklist::router(db))
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/fixture/import-clear-blocklists",
+                        post(import_blocklists),
+                    )
+                    .with_state(clear_fixture),
+            )
             .merge(
                 Router::new()
                     .route("/api/fixture/import-blocklists", post(import_blocklists))

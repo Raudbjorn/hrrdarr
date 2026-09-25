@@ -90,7 +90,8 @@ pub async fn start_with_metadata(
             if !matches!(result, Ok(Ok(()))) {
                 eprintln!("event=command_worker_error code=storage_error");
                 // The failed future is gone. External GETs can repeat; metadata facts and success
-                // commit together, so only uncommitted reconciliation retries. Attempts never reset;
+                // commit together; local clears likewise commit tombstones and success together.
+                // Only uncommitted effects retry. Attempts never reset;
                 // this policy never applies implicitly to future external mutations.
                 if !matches!(
                     tokio::time::timeout(Duration::from_secs(10), recover(&db, "storage_error"))
@@ -109,6 +110,7 @@ async fn recover(db: &Database, code: &str) -> Result<()> {
     let timestamp = now()?;
     c.execute("UPDATE commands SET status=CASE WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?,completed_at=CASE WHEN attempts<3 THEN NULL ELSE ? END,error_code=? WHERE status='running'",params![timestamp,timestamp,code]).await?;
     metadata::recover(&c, timestamp, code).await?;
+    blocklist::recover(&c, timestamp, code).await?;
     Ok(())
 }
 async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
@@ -144,6 +146,7 @@ async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
 enum Claimed {
     Downloads(Command),
     Metadata(metadata::MetadataCommand),
+    Blocklist(blocklist::BlocklistClearCommand),
 }
 async fn claim(db: &Database) -> Result<Option<Claimed>> {
     let c = connection(db).await?;
@@ -155,9 +158,10 @@ async fn claim(db: &Database) -> Result<Option<Claimed>> {
         tx.execute("UPDATE commands SET status='failed',completed_at=?,error_code='provider_changed' WHERE status IN ('queued','retry_wait') AND NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=commands.provider_id AND p.revision=commands.provider_revision AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=commands.media_type)",[timestamp]).await?;
         schedule_due(&tx,timestamp).await?;
         metadata::sweep(&tx,timestamp).await?;
-        let row=tx.query("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",params![timestamp,timestamp]).await?.next().await?;
+        let row=tx.query("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",params![timestamp,timestamp,timestamp]).await?.next().await?;
         let Some(row)=row else{return Ok(None)};
         let id=Uuid::parse_str(&row.get::<String>(0)?).map_err(|_|bad())?;
+        if row.get::<i64>(1)?==2 {return Ok(Some(Claimed::Blocklist(blocklist::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==1 {return Ok(Some(Claimed::Metadata(metadata::claim(&tx,id,timestamp).await?)))}
         let command=read_command(&tx,id).await?;
         if !valid_provider(&tx,command.target,command.provider_revision).await?{
@@ -176,7 +180,7 @@ async fn step(
     client: &RefreshClient,
     metadata_client: &crate::metadata::MetadataClient,
 ) -> Result<()> {
-    // A prior local storage failure can leave an interrupted read claim. There is no other worker.
+    // A prior local storage failure can leave an interrupted claim. There is no other worker.
     recover(db, "storage_error").await?;
     let Some(command) = claim(db).await? else {
         return Ok(());
@@ -184,6 +188,7 @@ async fn step(
     let command = match command {
         Claimed::Downloads(command) => command,
         Claimed::Metadata(command) => return metadata::run(db, metadata_client, command).await,
+        Claimed::Blocklist(command) => return blocklist::run(db, command).await,
     };
     let id = command.id;
     let result = if !snapshot_capacity(&connection(db).await?, command.target).await? {

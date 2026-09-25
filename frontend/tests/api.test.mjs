@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
+import { listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -326,4 +326,24 @@ test('blocklist preserves composite identities, scoped filters and explicit no-r
     assert.equal((await deleteBlocklistEntries({ids:[tv,tv]})).ok,false);
     assert.equal((await deleteBlocklistEntries({ids:[]})).ok,false);
   });
+});
+
+ test('clear blocklist command wrappers preserve explicit domain and never retry mutations',async()=>{
+ const id='12345678-1234-1234-1234-123456789012', calls=[];
+ await withFetch(async(path,options)=>{calls.push([path,options.method,options.body?JSON.parse(options.body):undefined]);return options.method==='DELETE'?new Response(null,{status:204}):json({});},async()=>{
+ await listBlocklistClearCommands({media_type:'movies',offset:25});
+ await createBlocklistClearCommand({target:{media_type:'tv'},priority:'normal'});
+ await getBlocklistClearCommand(id);await cancelBlocklistClearCommand(id);
+ assert.deepEqual(await deleteBlocklistClearCommand(id),{ok:true,data:undefined});
+ });
+ assert.equal(calls[0][0],'/api/v1/blocklist/clear-commands?limit=25&offset=25&media_type=movies');
+ assert.deepEqual(calls[1],['/api/v1/blocklist/clear-commands','POST',{target:{media_type:'tv'},priority:'normal'}]);
+ assert.equal(calls[3][0],`/api/v1/blocklist/clear-commands/${id}/cancel`);
+ let count=0;await withFetch(async()=>{count++;throw new DOMException('Timed out','TimeoutError');},async()=>{assert.equal((await createBlocklistClearCommand({target:{media_type:'movies'},priority:'normal'})).ok,false);});assert.equal(count,1);
+ });
+
+test('clear deadline exposes ambiguous server timeout for explicit readback',async()=>{
+ let count=0;await withFetch(async()=>{count++;return json({error:{code:'blocklist_clear_timeout',message:'Command request timed out'}},503);},async()=>{
+ const result=await createBlocklistClearCommand({target:{media_type:'tv'},priority:'normal'});assert.equal(result.ok,false);assert.equal(result.status,503);assert.equal(result.code,'blocklist_clear_timeout');
+ });assert.equal(count,1);
 });

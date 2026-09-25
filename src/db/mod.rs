@@ -105,6 +105,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "snapshot_blocklist",
         include_str!("../../migrations/0022_snapshot_blocklist.sql"),
     ),
+    (
+        "blocklist_clear_commands",
+        include_str!("../../migrations/0023_blocklist_clear_commands.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -508,3 +512,6 @@ mod metadata_refresh_tests;
 
 #[cfg(test)]
 mod blocklist_tests;
+
+#[cfg(test)]
+mod blocklist_clear_tests;

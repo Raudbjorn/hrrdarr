@@ -23,6 +23,11 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | GET `/blocklist` | `BlocklistQuery` | `ApiPage<BlocklistEntry>` (typed imported source facts) |
 | DELETE `/blocklist/{application}/{fingerprint}/{source_id}` | none | empty (204; durable provenance tombstone) |
 | DELETE `/blocklist/bulk` | `BlocklistRemoval` | empty (204; atomic, max 100 explicit identities) |
+| POST `/blocklist/clear-commands` | `BlocklistClearInput` | `BlocklistClearCommand` (202; active domain deduplication) |
+| GET `/blocklist/clear-commands` | `CommandQuery` | `ApiPage<BlocklistClearCommand>` |
+| GET `/blocklist/clear-commands/{id}` | none | `BlocklistClearCommand` |
+| POST `/blocklist/clear-commands/{id}/cancel` | none | `BlocklistClearCommand` |
+| DELETE `/blocklist/clear-commands/{id}` | none | empty (204; terminal command history only) |
 | GET `/history` | `HistoryQuery` | `ApiPage<HistoryEvent>` (tagged native receipts and source snapshot facts) |
 | POST `/commands` | `CommandInput` | `Command` (202; active scope deduplication) |
 | GET `/commands` | `CommandQuery` | `ApiPage<Command>` |

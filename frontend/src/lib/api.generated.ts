@@ -10,6 +10,14 @@ export type ApiErrorEnvelope = { error: ApiErrorDetail, };
 
 export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset: number, };
 
+export type BlocklistClearCommand = { id: string, name: BlocklistClearName, target: BlocklistClearTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_removed: number, };
+
+export type BlocklistClearInput = { target: BlocklistClearTarget, priority: CommandPriority, };
+
+export type BlocklistClearName = "clear_blocklist";
+
+export type BlocklistClearTarget = { media_type: MediaDomain, };
+
 export type BlocklistEntry = { id: BlocklistIdentity, origin: BlocklistOrigin, target: BlocklistTarget, occurred_at: string, published_at: string | null, source_title: string, protocol: BlocklistProtocol | null, size_bytes: number | null, quality: FileQuality | null, languages: Array<number> | null, };
 
 export type BlocklistIdentity = { application: SnapshotApplication, fingerprint: string, source_id: number, };

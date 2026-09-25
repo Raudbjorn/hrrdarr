@@ -1,4 +1,4 @@
-import type { BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -134,3 +134,14 @@ export const listBlocklist = (query:BlocklistQuery = {}) => {
 };
 export const deleteBlocklistEntry = (id:BlocklistIdentity) => validBlocklistIdentity(id) ? request<void>(`/api/v1/blocklist/${id.application}/${id.fingerprint}/${id.source_id}`,undefined,'DELETE',true) : invalidBlocklist<void>();
 export const deleteBlocklistEntries = (input:BlocklistRemoval) => input.ids.length>0 && input.ids.length<=100 && input.ids.every(validBlocklistIdentity) && new Set(input.ids.map(id=>`${id.application}:${id.fingerprint}:${id.source_id}`)).size===input.ids.length ? request<void>('/api/v1/blocklist/bulk',input,'DELETE',true) : invalidBlocklist<void>();
+
+export const listBlocklistClearCommands = (query:CommandQuery = {}) => {
+  const params=new URLSearchParams({limit:String(query.limit??25),offset:String(query.offset??0)});
+  if(query.media_type)params.set('media_type',query.media_type);
+  if(query.status)params.set('status',query.status);
+  return request<ApiPage<BlocklistClearCommand>>(`/api/v1/blocklist/clear-commands?${params}`,undefined,undefined,true);
+};
+export const createBlocklistClearCommand = (input:BlocklistClearInput) => request<BlocklistClearCommand>('/api/v1/blocklist/clear-commands',input,'POST',true);
+export const getBlocklistClearCommand = (id:string) => validOperation(id)?request<BlocklistClearCommand>(`/api/v1/blocklist/clear-commands/${id}`,undefined,undefined,true):invalidBlocklist<BlocklistClearCommand>();
+export const cancelBlocklistClearCommand = (id:string) => validOperation(id)?request<BlocklistClearCommand>(`/api/v1/blocklist/clear-commands/${id}/cancel`,undefined,'POST',true):invalidBlocklist<BlocklistClearCommand>();
+export const deleteBlocklistClearCommand = (id:string) => validOperation(id)?request<void>(`/api/v1/blocklist/clear-commands/${id}`,undefined,'DELETE',true):invalidBlocklist<void>();

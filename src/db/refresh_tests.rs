@@ -111,7 +111,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 22); // Latest open adds managed snapshot Blocklist; predecessor stays fixed.
+    assert_eq!(version(&conn).await?, 23); // Latest open adds durable scoped Blocklist clear; predecessor stays fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

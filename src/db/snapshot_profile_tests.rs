@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 22); // Latest open adds managed snapshot Blocklist; predecessor stays fixed.
+        assert_eq!(version(&c).await?, 23); // Latest open adds durable scoped Blocklist clear; predecessor stays fixed.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

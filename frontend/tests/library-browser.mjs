@@ -12,6 +12,20 @@ const page = await browser.newPage();
 page.setDefaultTimeout(10000);
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
+// This Playwright version treats an async waitForFunction predicate as a truthy
+// Promise even when it resolves false. Await native reads explicitly and bound time.
+async function waitForCommand(route, id, status, recordsRemoved) {
+  const deadline=Date.now()+10000;
+  let last;
+  while(Date.now()<deadline){
+    const response=await page.request.get(`${origin}${route}/${id}`,{timeout:Math.max(1,deadline-Date.now())});
+    assert.equal(response.status(),200);
+    last=await response.json();assert.equal(last.id,id);
+    if(last.status===status&&(recordsRemoved===undefined||last.records_removed===recordsRemoved))return last;
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }
+  assert.fail(`Command ${id} did not reach ${status}: ${JSON.stringify(last)}`);
+}
 async function add(domain, title, path) {
   await page.getByRole('button', {name: domain === 'tv' ? 'TV' : 'Movies', exact:true}).click();
   await page.getByRole('button', {name: domain === 'tv' ? 'Add series' : 'Add movie', exact:true}).click();
@@ -256,11 +270,7 @@ async function verifyMetadataRefresh() {
   assert.deepEqual(lateCommand.target,{media_type:'tv',series_id:1});
   await page.getByRole('button',{name:'Movies',exact:true}).click();
   await page.getByRole('button',{name:/Refreshed movie.*1 files/}).click();
-  await page.waitForFunction(async id=>{
-    const response=await fetch(`/api/v1/metadata-refresh/commands/${id}`);
-    const command=await response.json();
-    return command.id===id&&command.status==='succeeded';
-  },lateCommand.id);
+  await waitForCommand('/api/v1/metadata-refresh/commands',lateCommand.id,'succeeded');
   await page.getByRole('article').getByRole('heading',{name:'Refreshed movie',exact:true}).waitFor();
   assert.ok((await history('movies')).every(command=>command.target.media_type==='movies'));
   await mode(1);
@@ -341,6 +351,59 @@ async function verifyBlocklist() {
   assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
 }
 
+
+async function verifyClearBlocklist() {
+  const importPair=async(route)=>{const response=await page.request.post(`${origin}/api/fixture/${route}`);assert.equal(response.status(),200);const reports=await response.json();assert.equal(reports.length,2);for(const report of reports){assert.equal(report.applied,true);assert.equal(report.conflicts,0);}};
+  const read=async()=> (await page.request.get(`${origin}/api/v1/blocklist?limit=100`)).json();
+  await importPair('import-clear-blocklists');assert.equal((await read()).total,51);
+  await page.getByLabel('Blocklist media').selectOption('movies');
+  await page.getByRole('button',{name:'Apply blocklist filters',exact:true}).click();
+  await page.getByText('1 matching entries. Selection applies only to the current page.',{exact:true}).waitFor();
+  await page.getByLabel('Clear domain').selectOption('tv');
+  await page.getByRole('button',{name:'Clear entire domain',exact:true}).click();
+  assert.match(await page.getByRole('region',{name:'Confirm whole-domain clear'}).innerText(),/regardless of the current filters/);
+  await page.getByRole('button',{name:'Keep domain blocklist',exact:true}).click();assert.equal((await read()).total,51);
+  // Occupy the same worker with a bounded read so queued cancellation is observable.
+  await page.request.post(`${process.env.UI_METADATA_ORIGIN}/fixture-metadata-mode?mode=3`);
+  const hold=await (await page.request.post(`${origin}/api/v1/metadata-refresh/commands`,{data:{target:{media_type:'tv',series_id:1},priority:'normal'}})).json();
+  await waitForCommand('/api/v1/metadata-refresh/commands',hold.id,'running');
+  await page.getByLabel('Clear domain').selectOption('movies');
+  await page.getByRole('button',{name:'Clear entire domain',exact:true}).click();
+  const queuedResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/blocklist/clear-commands')&&r.request().method()==='POST');
+  await page.getByRole('button',{name:'Confirm clear Movies blocklist',exact:true}).click();
+  const queued=await (await queuedResponse).json();
+  await page.getByRole('button',{name:'Cancel clear command',exact:true}).click();
+  await waitForCommand('/api/v1/blocklist/clear-commands',queued.id,'cancelled');
+  assert.equal((await read()).total,51);
+  await page.getByLabel('Clear domain').selectOption('tv');
+  await page.getByRole('button',{name:'Clear entire domain',exact:true}).click();
+  let posts=0, accepted;
+  await page.route('**/api/v1/blocklist/clear-commands',async route=>{if(route.request().method()!=='POST')return route.continue();posts++;const result=await route.fetch();accepted=await result.json();await route.abort();});
+  await page.getByRole('button',{name:'Confirm clear TV blocklist',exact:true}).click();
+  await page.getByText(/The request may have committed/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Clear entire domain',exact:true}).isDisabled(),true);
+  await page.unroute('**/api/v1/blocklist/clear-commands');
+  await waitForCommand('/api/v1/blocklist/clear-commands',accepted.id,'succeeded');
+  await page.getByRole('button',{name:'Check clear command status',exact:true}).click();
+  await page.getByRole('heading',{name:'tv clear: succeeded',exact:true}).waitFor();
+  assert.match(await page.getByRole('region',{name:'Clear command detail'}).innerText(),/Records removed\s+50/);assert.equal(posts,1);
+  let records=await read();assert.equal(records.total,1);assert.equal(records.items[0].target.media_type,'movies');
+  await importPair('import-blocklists');await importPair('import-clear-blocklists');assert.equal((await read()).total,1);
+  await page.getByRole('button',{name:'Delete clear command history',exact:true}).click();
+  await page.getByRole('button',{name:'Confirm delete clear history',exact:true}).click();
+  await page.getByLabel('Clear domain').selectOption('movies');
+  await page.getByRole('button',{name:'Clear entire domain',exact:true}).click();
+  const movieResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/blocklist/clear-commands')&&r.request().method()==='POST');
+  await page.getByRole('button',{name:'Confirm clear Movies blocklist',exact:true}).click();
+  const movieClear=await (await movieResponse).json();
+  await waitForCommand('/api/v1/blocklist/clear-commands',movieClear.id,'succeeded',1);
+  await importPair('import-blocklists');await importPair('import-clear-blocklists');assert.equal((await read()).total,0);
+  await page.reload();await page.getByRole('button',{name:'Blocklist',exact:true}).click();
+  await page.getByText('0 matching entries. Selection applies only to the current page.',{exact:true}).waitFor();
+  assert.equal(await readFile(`${scratch}/tv/pilot.mkv`,'utf8'),'scratch episode media');
+  assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
+}
+
 try {
   await page.goto(origin);
   await add('tv', 'Fixture series', `${scratch}/tv`);
@@ -417,11 +480,12 @@ try {
   await verifyActivity();
   await verifyMetadataRefresh();
   await verifyBlocklist();
+  await verifyClearBlocklist();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});
