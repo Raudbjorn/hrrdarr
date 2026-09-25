@@ -14,6 +14,8 @@ export type Capabilities = { max_limit: number, default_limit: number, search: S
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
+export type Direction = "remote_to_local" | "local_to_remote";
+
 export type DownloadContentLayout = "default" | "original" | "subfolder";
 
 export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state";
@@ -124,6 +126,16 @@ export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
 export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
 
+export type Mapping = { id: number, media_type: MediaDomain, host: string, remote_path: string, local_path: string, revision: number, };
+
+export type MappingInput = { host: string, remote_path: string, local_path: string, };
+
+export type MappingQuery = { limit?: number, offset?: number, };
+
+export type MappingRevision = { revision: number, };
+
+export type MappingUpdate = { revision: number, host: string, remote_path: string, local_path: string, };
+
 export type MediaDomain = "tv" | "movies";
 
 export type MediaInfo = { schema_revision: number | null, container_format: string | null, audio_bitrate: number | null, audio_channels: number | null, audio_codec: string | null, audio_languages: string | null, audio_stream_count: number | null, video_bit_depth: number | null, video_bitrate: number | null, video_codec: string | null, video_fps: number | null, video_dynamic_range: string | null, video_dynamic_range_type: string | null, resolution: string | null, run_time: string | null, scan_type: string | null, subtitles: string | null, video_format: string | null, video_codec_id: string | null, video_profile: string | null, audio_format: string | null, audio_codec_id: string | null, audio_profile: string | null, audio_channel_count: number | null, audio_channel_positions: string | null, width: number | null, height: number | null, runtime_ticks: number | null, audio_streams: Array<MediaInfoAudioStream> | null, subtitle_streams: Array<MediaInfoSubtitleStream> | null, };
@@ -155,6 +167,10 @@ export type ProviderDownloadResult = { provider_id: string, revision: number, pa
 export type ProviderFilesResult = { provider_id: string, revision: number, result: DownloadFiles, };
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
+
+export type ProviderPathInput = { media_type: MediaDomain, remote_path: string, };
+
+export type ProviderPathPreview = { provider_id: string, provider_revision: number, resolution: Resolution, };
 
 export type ProviderQuery = { limit?: number, offset?: number, media_type?: MediaDomain, };
 
@@ -201,6 +217,10 @@ export type QualityProfileQuery = { offset?: number, limit?: number, };
 export type QualityProfileSummary = { id: number, name: string, item_count: number, group_count: number, };
 
 export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
+
+export type Resolution = { input: string, output: string, mapping_id: number | null, mapping_revision: number | null, lexical_only: boolean, };
+
+export type ResolveInput = { host: string, path: string, direction: Direction, };
 
 export type RootFolder = { id: number, media_type: MediaDomain, path: string, observation: RootObservationStatus, accessible: boolean | null, writable: boolean | null, free_space: number | null, total_space: number | null, unmapped_folders: Array<UnmappedFolder> | null, };
 

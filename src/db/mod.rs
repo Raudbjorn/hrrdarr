@@ -73,6 +73,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "root_folders",
         include_str!("../../migrations/0014_root_folders.sql"),
     ),
+    (
+        "remote_path_mappings",
+        include_str!("../../migrations/0015_remote_path_mappings.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

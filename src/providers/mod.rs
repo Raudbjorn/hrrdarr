@@ -399,6 +399,7 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
         .route("/api/v1/providers/{id}/search", post(search))
         .route("/api/v1/providers/{id}/downloads", post(downloads))
         .route("/api/v1/providers/{id}/files", post(files))
+        .route("/api/v1/providers/{id}/path-preview", post(path_preview))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .with_state(Context {
             db,
@@ -1335,4 +1336,65 @@ pub(crate) async fn import_configuration(
         .await
         .map_err(|_| FAILED)?;
     Ok(Some((id, 1, true)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathPreviewQuery {}
+
+async fn path_preview(
+    State(context): State<Context>,
+    Path(value): Path<String>,
+    query: std::result::Result<Query<PathPreviewQuery>, QueryRejection>,
+    input: std::result::Result<Json<crate::remote_paths::ProviderPathInput>, JsonRejection>,
+) -> std::result::Result<Json<crate::remote_paths::ProviderPathPreview>, Response> {
+    let id = id(value).map_err(IntoResponse::into_response)?;
+    query.map_err(|_| bad().into_response())?;
+    let input = input.map_err(|_| bad().into_response())?.0;
+    let c = context
+        .db
+        .connect()
+        .await
+        .map_err(|_| corrupt().into_response())?;
+    let tx = c
+        .transaction()
+        .await
+        .map_err(|_| corrupt().into_response())?;
+    let (provider, _) = read(&tx, &id).await.map_err(IntoResponse::into_response)?;
+    let ProviderSettings::Qbittorrent {
+        endpoint,
+        tv,
+        movies,
+    } = &provider.settings
+    else {
+        return Err(bad().into_response());
+    };
+    if match input.media_type {
+        MediaDomain::Tv => tv.is_none(),
+        MediaDomain::Movies => movies.is_none(),
+    } {
+        return Err(bad().into_response());
+    }
+    let url = url::Url::parse(endpoint).map_err(|_| bad().into_response())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| bad().into_response())?
+        .to_string();
+    let resolution = crate::remote_paths::resolve(
+        &tx,
+        input.media_type,
+        crate::remote_paths::ResolveInput {
+            host,
+            path: input.remote_path,
+            direction: crate::remote_paths::Direction::RemoteToLocal,
+        },
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    tx.commit().await.map_err(|_| corrupt().into_response())?;
+    Ok(Json(crate::remote_paths::ProviderPathPreview {
+        provider_id: provider.id,
+        provider_revision: provider.revision,
+        resolution,
+    }))
 }

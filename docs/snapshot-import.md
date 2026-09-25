@@ -183,3 +183,9 @@ Configured `RootFolders.Id/Path` are also mapped for both applications, scoped b
 media domain and reconciled by normalized path. This performs no filesystem access:
 missing paths remain unobserved declarations. See [root folders](root-folders.md)
 for supported path boundaries, replay/deletion conflicts and verification limits.
+
+`RemotePathMappings` is reconstructed offline for both applications using canonical
+host/path identity and revision-aware replay protection. Source IDs determine initial
+first-match order; incompatible existing forward/reverse overlap precedence causes an
+atomic conflict. See [remote path mappings](remote-path-mappings.md) for the exact
+normalization, reconciliation, supported path syntax and native preview boundary.

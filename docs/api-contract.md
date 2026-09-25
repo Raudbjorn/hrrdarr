@@ -35,6 +35,13 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | POST `/{media}/root-folders` | `RootInput` | `RootFolder` (201) |
 | GET `/{media}/root-folders/{id}` | none | `RootFolder` |
 | DELETE `/{media}/root-folders/{id}` | none | empty (204; configuration only) |
+| GET `/{media}/remote-path-mappings` | `MappingQuery` | `ApiPage<Mapping>` |
+| POST `/{media}/remote-path-mappings` | `MappingInput` | `Mapping` (201) |
+| GET `/{media}/remote-path-mappings/{id}` | none | `Mapping` |
+| PUT `/{media}/remote-path-mappings/{id}` | `MappingUpdate` | `Mapping` |
+| DELETE `/{media}/remote-path-mappings/{id}` | `MappingRevision` query | empty (204; configuration only) |
+| POST `/{media}/remote-path-mappings/resolve` | `ResolveInput` | `Resolution` |
+| POST `/providers/{id}/path-preview` | `ProviderPathInput` | `ProviderPathPreview` |
 | GET `/episodes` | `EpisodeQuery` | `ApiPage<Episode>` |
 | GET `/episodes/{id}` | none (all projections included) | `Episode` |
 | PUT `/episodes/{id}` | `EpisodeMonitor` | `Episode` |

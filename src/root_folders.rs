@@ -564,3 +564,15 @@ mod tests {
         ));
     }
 }
+
+/// Existence-only check shares the bounded worker pool; no write probe or enumeration.
+pub(crate) async fn existing_directory(path: String) -> bool {
+    let Ok(permit) = OBSERVERS.try_acquire() else {
+        return false;
+    };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::import::root_directory(FsPath::new(&path)).is_some()
+    });
+    matches!(tokio::time::timeout(BUDGET, worker).await, Ok(Ok(true)))
+}

@@ -280,6 +280,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
         });
     }
     add_root_folders(source, &mut plan, "tv")?;
+    add_remote_mappings(source, &mut plan, "tv")?;
     Ok(plan)
 }
 
@@ -423,6 +424,7 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
         .filter(|id| !found.contains(id))
         .count();
     add_root_folders(source, &mut plan, "movies")?;
+    add_remote_mappings(source, &mut plan, "movies")?;
     Ok(plan)
 }
 
@@ -899,6 +901,115 @@ fn add_root_folders(source: &Source, plan: &mut Plan, media: &'static str) -> Re
             fields: vec![("media_type", val(media)), ("path", val(path))],
             keys: vec![vec!["media_type", "path"]],
         });
+    }
+    Ok(())
+}
+
+fn add_remote_mappings(source: &Source, plan: &mut Plan, media: &'static str) -> Result<()> {
+    if !source.tables.contains_key("RemotePathMappings") {
+        return Ok(());
+    }
+    let table = table(
+        source,
+        "RemotePathMappings",
+        &["Id", "Host", "RemotePath", "LocalPath"],
+    )?;
+    if table.rows.len() > 1000 {
+        return Err(ImportError("snapshot exceeds remote path mapping limit"));
+    }
+    plan.unsupported.retain(|u| u.table != "RemotePathMappings");
+    let columns = table
+        .columns
+        .iter()
+        .filter(|c| !matches!(c.as_str(), "Id" | "Host" | "RemotePath" | "LocalPath"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !columns.is_empty() {
+        plan.unsupported.push(Unsupported {
+            table: "RemotePathMappings".into(),
+            rows: table.rows.len(),
+            columns,
+        });
+    }
+    // Destination IDs preserve ascending source precedence on first reconstruction.
+    let mut ordered = table
+        .rows
+        .iter()
+        .map(|row| Ok((positive(row, "Id")?, row)))
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|(id, _)| *id);
+    for (id, row) in ordered {
+        let input = crate::remote_paths::MappingInput {
+            host: text(row, "Host")?.into(),
+            remote_path: text(row, "RemotePath")?.into(),
+            local_path: text(row, "LocalPath")?.into(),
+        };
+        let (input, kind, key) = crate::remote_paths::normalize(input).map_err(ImportError)?;
+        plan.entities.push(Entity {
+            table: "remote_path_mappings",
+            source_id: id,
+            fields: vec![
+                ("media_type", val(media)),
+                ("host", val(input.host)),
+                ("remote_path", val(input.remote_path)),
+                ("remote_kind", val(kind)),
+                ("remote_key", val(key)),
+                ("local_path", val(input.local_path)),
+                ("revision", val(1)),
+            ],
+            keys: vec![vec!["media_type", "host", "remote_key"]],
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn verify_remote_order(
+    conn: &Connection,
+    entities: &[Entity],
+    ids: &BTreeMap<(&str, i64), i64>,
+    report: &mut Report,
+) -> Result<()> {
+    if report.conflicts != 0 {
+        return Ok(());
+    }
+    let mut groups: BTreeMap<(String, String), Vec<(i64, crate::remote_paths::MappingInput)>> =
+        BTreeMap::new();
+    for entity in entities
+        .iter()
+        .filter(|e| e.table == "remote_path_mappings")
+    {
+        let text = |name: &str| -> Result<String> {
+            entity
+                .fields
+                .iter()
+                .find_map(|(key, value)| match value {
+                    Field::Value(Value::Text(text)) if *key == name => Some(text.clone()),
+                    _ => None,
+                })
+                .ok_or(ImportError("invalid mapping reconciliation plan"))
+        };
+        let media = text("media_type")?;
+        let host = text("host")?;
+        let destination = *ids
+            .get(&(entity.table, entity.source_id))
+            .ok_or(ImportError("missing mapping reconciliation identity"))?;
+        groups.entry((media, host.clone())).or_default().push((
+            destination,
+            crate::remote_paths::MappingInput {
+                host,
+                remote_path: text("remote_path")?,
+                local_path: text("local_path")?,
+            },
+        ));
+    }
+    for ((media, _), expected) in groups {
+        let domain = crate::api::MediaDomain::parse(&media).map_err(ImportError)?;
+        if !crate::remote_paths::snapshot_order(conn, domain, &expected)
+            .await
+            .map_err(ImportError)?
+        {
+            report.conflicts += 1;
+        }
     }
     Ok(())
 }

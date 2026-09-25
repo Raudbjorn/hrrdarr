@@ -575,6 +575,7 @@ async fn write(
     if !seasons_done {
         write_seasons(conn, seasons, &ids, report).await?;
     }
+    readers::verify_remote_order(conn, entities, &ids, report).await?;
     for (table, data) in &source.tables {
         for (i, row) in data.rows.iter().enumerate() {
             conn.execute("INSERT INTO snapshot_records (application,fingerprint,source_table,ordinal,record_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),table.clone(),i as i64,archive(row)?]).await?;
