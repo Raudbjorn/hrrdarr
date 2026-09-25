@@ -116,7 +116,7 @@ export type FilesystemType = { type: FilesystemKind, };
 
 export type HistoricalFile = { media_type: MediaDomain, id: number, };
 
-export type HistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
+export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent;
 
 export type HistoryEventType = "file_imported";
 
@@ -207,6 +207,8 @@ export type MonitorNewItems = "all" | "none";
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
 export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
+
+export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
 
@@ -347,6 +349,12 @@ export type SnapshotOptions = { application: SnapshotApplication, dry_run?: bool
 export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, policy: string, };
 
 export type SnapshotUnsupported = { table: string, rows: number, columns: Array<string>, };
+
+export type SourceHistoryEvent = { id: SourceHistoryIdentity, event_type: SourceHistoryEventType, source_event_type: number, target: MediaTarget, occurred_at: string, source_title: string | null, download_id: string | null, quality: FileQuality | null, languages: Array<number> | null, };
+
+export type SourceHistoryEventType = "grabbed" | "series_folder_imported" | "download_folder_imported" | "download_failed" | "file_deleted" | "file_renamed" | "download_ignored" | "movie_folder_imported";
+
+export type SourceHistoryIdentity = { application: SnapshotApplication, fingerprint: string, source_id: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
 

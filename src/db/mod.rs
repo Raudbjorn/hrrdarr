@@ -85,6 +85,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "import_history_order",
         include_str!("../../migrations/0017_import_history_order.sql"),
     ),
+    (
+        "snapshot_history",
+        include_str!("../../migrations/0018_snapshot_history.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

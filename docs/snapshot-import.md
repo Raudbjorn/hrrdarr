@@ -66,7 +66,7 @@ media. Mounts, permissions, availability of media, and path mappings are unverif
 including extra fields on mapped rows, are archived as typed JSON. This preserves
 SQL nulls and binary values as hex. Profile assignments, custom formats, tags,
 collections, history, providers, path mappings, list exclusions, unknown settings,
-and richer metadata are currently archival only (except the explicit provider reconstruction below). They have not gained runtime
+and richer metadata are archival only except the explicit History, provider, root-folder and path-mapping reconstructions below. They have not gained runtime
 semantics by being retained. There is no archive-reading API.
 
 Archives can contain credentials. Import requires a local Unix destination database
@@ -189,3 +189,53 @@ host/path identity and revision-aware replay protection. Source IDs determine in
 first-match order; incompatible existing forward/reverse overlap precedence causes an
 atomic conflict. See [remote path mappings](remote-path-mappings.md) for the exact
 normalization, reconciliation, supported path syntax and native preview boundary.
+
+Source History is activated independently from native import receipts for Sonarr 233
+and Radarr 206/242. A fact retains `(application, fingerprint, source_id)`, its resolved
+TV episode or movie target, original numeric event code, semantic event name, UTC
+date, and supported title/download ID/quality/language fields. It never invents a
+local operation, file association, path, transfer size or hash. Historical file IDs
+are not resolved to today's files. `GET /history` tags these facts as
+`source_snapshot`; native association commits remain `native_import`.
+
+Sonarr event codes 1–7 map respectively to grabbed, series-folder import,
+download-folder import, failed download, file deletion, file rename and ignored
+download. Radarr supports 1, 3, 4, 6, 7, 8, 9 respectively as grabbed,
+download-folder import, failed download, file deletion, movie-folder import, file
+rename and ignored download. Code zero and unknown/deprecated codes remain archived
+and reported, with no active fact. Missing targets are likewise archived/reported;
+a TV History row whose SeriesId contradicts its source episode fails validation.
+
+Dates accept source SQLite UTC values or explicit RFC3339 offsets. Canonical storage
+uses `YYYY-MM-DD HH:MM:SS` plus an optional fraction of at most nine digits, with
+trailing zeros removed. Invalid dates, leap seconds and excess precision fail the
+whole import. Missing/null optional fields remain absent; language `[]` remains an
+empty list, while null elements normalize to the source unknown language ID zero.
+Known quality/language catalogs are validated using the existing native validators.
+Unsupported catalog IDs remain private and are reported without their values;
+malformed JSON and duplicate language IDs fail validation. Quality catalog membership
+is checked on replay too; these catalogs are currently fixed reference data.
+
+Arbitrary `Data`, unknown columns and unsafe download identifiers remain private raw
+archives and appear only as static unsupported field/count reports. Public download
+IDs require 1–256 ASCII letters, digits, dots, underscores, colons or hyphens; URL-like
+values are omitted. Source titles are bounded to 1024 bytes. No raw Data or source
+credential values are returned through History.
+
+Migration 18 adds immutable source facts and a History activation version to each
+snapshot provenance. It does not activate old archives by itself. Re-uploading the
+exact original backup validates and backfills a schema-17 archive atomically; later
+exact replays compare every supported fact and create nothing. A missing previously
+activated fact or changed mapped target causes a conflict, never silent repair.
+Different backup fingerprints retain separate historical provenance, even for the
+same upstream History ID; cross-backup event deduplication is not claimed. All source
+facts, native core mappings, archives and optional provider reconstruction share the
+same transaction, including dry-run rollback.
+
+Requirements were checked against the pinned `History/EpisodeHistory.cs` (Sonarr),
+`History/History.cs` (Radarr), and both `Datastore/Converters/UtcConverter.cs` contracts.
+Independent implementation evidence is `tests/snapshot_history.rs`, the schema-17
+backfill/rollback/reopen test and mixed-page query-plan test in
+`src/db/history_tests.rs`, and `tests/history_api.rs`. These use synthetic snapshots;
+real exported backup compatibility, unsupported History payload semantics, source
+History mutation endpoints and complete ancillary snapshot parity remain unverified.

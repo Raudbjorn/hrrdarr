@@ -1,6 +1,7 @@
 //! Import self-contained SQLite backup uploads; never open a source path or touch media.
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
+mod history;
 mod providers;
 mod readers;
 
@@ -184,6 +185,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let history_plan = history::read(&source, app, &mut plan.unsupported)?;
     let provider_plan = if reconstruct_providers {
         providers::read(&source, app, &mut plan.unsupported)?
     } else {
@@ -201,10 +203,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library records only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library and supported source History facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported provider configurations are reconstructed disabled and untested; credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported source History facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -212,6 +214,7 @@ async fn import_inner(
         .await?;
     let result = async {
         write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
+        history::write(&tx, &history_plan, &mut report).await?;
         providers::write(&tx, &provider_plan, key, &mut report).await
     }
     .await;
@@ -616,5 +619,36 @@ async fn write_seasons(
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn write_pre_history_fixture(
+    conn: &Connection,
+    app: Application,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let fingerprint = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref());
+    let source = read_upload(bytes).await?;
+    let plan = match app {
+        Application::Sonarr => readers::sonarr(&source)?,
+        Application::Radarr => readers::radarr(&source)?,
+    };
+    let mut report = Report {
+        application: app,
+        fingerprint,
+        schema_version: source.version,
+        dry_run: false,
+        applied: false,
+        mapped: 0,
+        duplicates: 0,
+        metadata_backfilled: 0,
+        conflicts: 0,
+        missing_file_records: plan.missing,
+        unsupported: plan.unsupported,
+        policy: "test predecessor",
+    };
+    write(conn, &source, &plan.entities, &plan.seasons, &mut report).await?;
+    assert_eq!(report.conflicts, 0);
     Ok(())
 }

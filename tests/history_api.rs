@@ -2,6 +2,8 @@ use hrrdarr::{db::Database, history, import};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
+// The real importer has one process-wide execution permit; these are sequential workflow fixtures.
+static IMPORT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -60,6 +62,7 @@ fn dates(from: Option<&str>, to: Option<&str>) -> String {
 
 #[tokio::test]
 async fn committed_import_history_is_typed_filtered_bounded_and_retained() {
+    let _fixture = IMPORT_TESTS.lock().await;
     let scratch = Scratch::new();
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let c = db.connect().await.unwrap();
@@ -152,6 +155,7 @@ async fn committed_import_history_is_typed_filtered_bounded_and_retained() {
     assert_eq!(actual_order, ordered);
     for (operation, target, source, destination, size) in &facts {
         let event = items.iter().find(|v| v["id"] == *operation).unwrap();
+        assert_eq!(event["origin"], "native_import");
         assert_eq!(event["event_type"], "file_imported");
         assert_eq!(event["target"], *target);
         assert_eq!(event["source"], source.to_str().unwrap());
@@ -291,6 +295,7 @@ async fn committed_import_history_is_typed_filtered_bounded_and_retained() {
         "?season=0",
         "?series_id=1&season=-1",
         "?from=not-a-date",
+        "?from=2016-12-31T23:59:60Z",
         "?from=2025-01-01T00:00:00.0000000001Z",
         "?to=2025-01-01T00:00:00.1234567890Z",
         "?quality=1",
@@ -371,6 +376,278 @@ async fn committed_import_history_is_typed_filtered_bounded_and_retained() {
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let (base, server) = serve(db.clone()).await;
     assert_eq!(page(&base, "").await, all);
+    server.abort();
+    let _ = server.await;
+    drop(db);
+}
+
+async fn history_backup(path: &std::path::Path, root: &std::path::Path, tv: bool) -> Vec<u8> {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let c = db.connect().unwrap();
+    if tv {
+        c.execute_batch("CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(233);CREATE TABLE Series(Id INTEGER,TvdbId INTEGER,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,Seasons TEXT);CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);CREATE TABLE History(Id INTEGER,EpisodeId INTEGER,SeriesId INTEGER,Date TEXT,EventType INTEGER,SourceTitle TEXT,DownloadId TEXT,Quality TEXT,Languages TEXT,Data TEXT);").await.unwrap();
+        c.execute("INSERT INTO Series VALUES(1,100,'Imported TV',2020,?,1,'[{\"seasonNumber\":1,\"monitored\":true}]')",[root.to_str().unwrap()]).await.unwrap();
+        c.execute_batch("INSERT INTO Episodes VALUES(1,1,1,1,'Episode',1,0);")
+            .await
+            .unwrap();
+    } else {
+        c.execute_batch("CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(206);CREATE TABLE Movies(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);CREATE TABLE History(Id INTEGER,MovieId INTEGER,Date TEXT,EventType INTEGER,SourceTitle TEXT,DownloadId TEXT,Quality TEXT,Languages TEXT,Data TEXT);").await.unwrap();
+        c.execute(
+            "INSERT INTO Movies VALUES(1,200,'tt200','Imported Movie',2020,?,1,0)",
+            [root.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+    }
+    let columns = if tv {
+        "Id,EpisodeId,SeriesId,Date,EventType,SourceTitle,DownloadId,Quality,Languages,Data"
+    } else {
+        "Id,MovieId,Date,EventType,SourceTitle,DownloadId,Quality,Languages,Data"
+    };
+    let values = if tv {
+        "1,1,1,?,?,?,?,?,?,?"
+    } else {
+        "1,1,?,?,?,?,?,?,?"
+    };
+    c.execute(
+        &format!("INSERT INTO History({columns}) VALUES({values})"),
+        libsql::params![
+            "2020-01-01T00:00:00.1000000Z",
+            6,
+            "Original source title",
+            "SABnzbd_nzo_123",
+            r#"{"quality":7,"revision":{"version":1,"real":0,"isRepack":false}}"#,
+            "[1,2]",
+            r#"{"privateUrl":"https://example.invalid/?apikey=SOURCE_PRIVATE_DATA"}"#
+        ],
+    )
+    .await
+    .unwrap();
+    let values = if tv {
+        "2,1,1,?,1,NULL,?,NULL,NULL,?"
+    } else {
+        "2,1,?,1,NULL,?,NULL,NULL,?"
+    };
+    c.execute(
+        &format!("INSERT INTO History({columns}) VALUES({values})"),
+        libsql::params![
+            "2019-12-31T19:00:00.1-05:00",
+            "https://example.invalid/?apikey=SOURCE_PRIVATE_DATA",
+            r#"{"password":"SOURCE_PRIVATE_DATA"}"#
+        ],
+    )
+    .await
+    .unwrap();
+    drop(c);
+    drop(db);
+    std::fs::read(path).unwrap()
+}
+
+#[tokio::test]
+async fn snapshot_history_and_native_receipts_share_truthful_scoped_pages() {
+    let _fixture = IMPORT_TESTS.lock().await;
+    use hrrdarr::snapshots::{self, Application};
+    let scratch = Scratch::new();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let tv = scratch.0.join("tv");
+    let movie = scratch.0.join("movie");
+    std::fs::create_dir(&tv).unwrap();
+    std::fs::create_dir(&movie).unwrap();
+    let tv_bytes = history_backup(&scratch.0.join("sonarr.db"), &tv, true).await;
+    let movie_bytes = history_backup(&scratch.0.join("radarr.db"), &movie, false).await;
+    let mut identities = Vec::new();
+    for (app, bytes) in [
+        (Application::Sonarr, tv_bytes.clone()),
+        (Application::Radarr, movie_bytes.clone()),
+    ] {
+        let report = snapshots::import(&db, app, bytes, false).await.unwrap();
+        assert!(report.applied);
+        identities.push(report.fingerprint);
+    }
+    let (base, server) = serve(db.clone()).await;
+    let before = page(&base, "").await;
+    assert_eq!(before["total"], 4);
+    assert!(!before.to_string().contains("SOURCE_PRIVATE_DATA"));
+    let items = before["items"].as_array().unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|v| (
+                v["id"]["application"].as_str().unwrap(),
+                v["id"]["source_id"].as_i64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("radarr", 2), ("radarr", 1), ("sonarr", 2), ("sonarr", 1)]
+    );
+    for item in items {
+        assert_eq!(item["origin"], "source_snapshot");
+        assert_eq!(item["occurred_at"], "2020-01-01T00:00:00.100Z");
+        for absent in [
+            "file",
+            "source",
+            "destination",
+            "sha256",
+            "size_bytes",
+            "imported_at",
+            "data",
+            "Data",
+        ] {
+            assert!(
+                item.get(absent).is_none(),
+                "source history must not invent {absent}"
+            );
+        }
+        let tv = item["id"]["application"] == "sonarr";
+        assert_eq!(
+            item["id"]["fingerprint"],
+            identities[if tv { 0 } else { 1 }]
+        );
+        assert_eq!(
+            item["target"],
+            json!({"media_type":if tv{"episode"}else{"movie"},"id":1})
+        );
+        if item["id"]["source_id"] == 1 {
+            // The same source event integer is different domain behavior: TV6 renames, movie6 deletes.
+            assert_eq!(item["source_event_type"], 6);
+            assert_eq!(
+                item["event_type"],
+                if tv { "file_renamed" } else { "file_deleted" }
+            );
+            assert_eq!(item["source_title"], "Original source title");
+            assert_eq!(item["download_id"], "SABnzbd_nzo_123");
+            assert_eq!(
+                item["quality"],
+                json!({"quality_id":7,"revision":{"version":1,"real":0,"is_repack":false}})
+            );
+            assert_eq!(item["languages"], json!([1, 2]));
+        } else {
+            assert_eq!(item["event_type"], "grabbed");
+            for field in ["source_title", "download_id", "quality", "languages"] {
+                assert!(item[field].is_null());
+            }
+        }
+    }
+    // Exact reuploads are tested before native imports change the snapshot's no-file episode
+    // association; that later library change correctly belongs to core reconciliation conflicts.
+    for (app, bytes) in [
+        (Application::Sonarr, tv_bytes),
+        (Application::Radarr, movie_bytes),
+    ] {
+        let report = snapshots::import(&db, app, bytes, false).await.unwrap();
+        assert!(report.applied);
+        assert_eq!(report.conflicts, 0);
+    }
+    assert_eq!(page(&base, "").await, before);
+    for (media, root) in [("episode", &tv), ("movie", &movie)] {
+        let source = scratch.0.join(format!("{media}.mkv"));
+        std::fs::write(&source, b"owned mixed history receipt").unwrap();
+        let destination = root.join("imported.mkv");
+        let(code,preview)=request(&base,"POST","/api/v1/imports",json!({"target":{"media_type":media,"id":1},"source":source,"destination":destination,"mode":"copy"})).await;
+        assert_eq!(code, 202, "{preview}");
+        let (code, done) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/imports/{}/execute",
+                preview["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, 200, "{done}");
+    }
+    let mixed = page(&base, "").await;
+    assert_eq!(mixed["total"], 6);
+    for item in mixed["items"].as_array().unwrap().iter().take(2) {
+        assert_eq!(item["origin"], "native_import");
+        assert!(item["id"].is_string());
+        assert_eq!(item["event_type"], "file_imported");
+        assert!(item.get("occurred_at").is_none());
+    }
+    assert_eq!(&mixed["items"].as_array().unwrap()[2..], items.as_slice());
+    for offset in 0..6 {
+        let p = page(&base, &format!("?offset={offset}&limit=1")).await;
+        assert_eq!(p["total"], 6);
+        assert_eq!(p["items"][0], mixed["items"][offset]);
+    }
+    for query in [
+        "?episode_id=1",
+        "?movie_id=1",
+        "?media_type=tv&series_id=1&season=1",
+        "?media_type=movies",
+    ] {
+        assert_eq!(page(&base, query).await["total"], 3);
+    }
+    for from in [
+        "2020-01-01T00:00:00.1Z",
+        "2020-01-01T00:00:00.100000000Z",
+        "2019-12-31T19:00:00.100-05:00",
+    ] {
+        let p = page(&base, &dates(Some(from), Some("2020-01-01T00:00:00.101Z"))).await;
+        assert_eq!(
+            p["items"], before["items"],
+            "equivalent fractional instants must include the same boundary"
+        );
+    }
+    assert_eq!(
+        page(
+            &base,
+            &dates(
+                Some("2020-01-01T00:00:00.100000001Z"),
+                Some("2020-01-01T00:00:00.101Z")
+            )
+        )
+        .await["total"],
+        0
+    );
+    assert_eq!(
+        page(&base, &dates(None, Some("2020-01-01T00:00:00.1000Z"))).await["total"],
+        0
+    );
+    // A supplemental synthetic source fact uses an actual native event's immutable timestamp.
+    // This isolates cross-origin tie ordering without rewriting producer history or claiming
+    // that this added row came from the source reader's separate end-to-end fixture.
+    let c = db.connect().await.unwrap();
+    let native_id = mixed["items"][0]["id"].as_str().unwrap();
+    let timestamp = c
+        .query(
+            "SELECT imported_at FROM import_history WHERE operation_id=?",
+            [native_id],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    c.execute("INSERT INTO snapshot_history_events(application,fingerprint,source_id,media_type,episode_id,occurred_at,event_type,source_event_type) VALUES('sonarr',?,3,'episode',1,?,'grabbed',1)", libsql::params![identities[0].clone(),timestamp]).await.unwrap();
+    let mixed = page(&base, "").await;
+    assert_eq!(mixed["total"], 7);
+    let tied = mixed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take_while(|v| v["origin"] == "native_import")
+        .count();
+    assert!(tied >= 1);
+    assert_eq!(mixed["items"][tied]["origin"], "source_snapshot");
+    assert_eq!(mixed["items"][tied]["id"]["source_id"], 3);
+    for offset in 0..7 {
+        assert_eq!(
+            page(&base, &format!("?limit=1&offset={offset}")).await["items"][0],
+            mixed["items"][offset]
+        );
+    }
+    drop(c);
+    assert_eq!(page(&base, "").await, mixed);
+    server.abort();
+    let _ = server.await;
+    drop(db);
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let (base, server) = serve(db.clone()).await;
+    assert_eq!(page(&base, "").await, mixed);
     server.abort();
     let _ = server.await;
     drop(db);

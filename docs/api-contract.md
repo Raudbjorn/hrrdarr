@@ -20,7 +20,7 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 
 | Route and method | Request | Success body |
 | --- | --- | --- |
-| GET `/history` | `HistoryQuery` | `ApiPage<HistoryEvent>` (immutable initial-import facts) |
+| GET `/history` | `HistoryQuery` | `ApiPage<HistoryEvent>` (tagged native receipts and source snapshot facts) |
 | POST `/commands` | `CommandInput` | `Command` (202; active scope deduplication) |
 | GET `/commands` | `CommandQuery` | `ApiPage<Command>` |
 | GET `/commands/{id}` | none | `Command` |
