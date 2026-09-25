@@ -28,6 +28,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "snapshot_imports",
         include_str!("../../migrations/0003_snapshot_imports.sql"),
     ),
+    (
+        "quality_definitions",
+        include_str!("../../migrations/0004_quality_definitions.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

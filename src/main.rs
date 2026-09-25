@@ -69,7 +69,18 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
         println!("pre-migration recovery backup: {}", path.display());
     }
     let state = Arc::new(AppState { db });
-    let app = Router::new()
+    let app = router(state);
+    let addr: SocketAddr = env::var("HRRDARR_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8787".into())
+        .parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("hrrdarr listening on http://{addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/api/v1/series", get(series))
         .route("/api/v1/series/{id}/episodes", get(episodes))
         .route("/api/v1/imports", post(import_preview))
@@ -78,14 +89,9 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
             "/api/v1/migrations",
             post(migrate).layer(DefaultBodyLimit::max(snapshots::MAX_SNAPSHOT_BYTES)),
         )
-        .with_state(state);
-    let addr: SocketAddr = env::var("HRRDARR_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8787".into())
-        .parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("hrrdarr listening on http://{addr}");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state.clone())
+        .merge(hrrdarr::qualities::router(state.db.clone()))
+        .merge(hrrdarr::quality_profiles::router(state.db.clone()))
 }
 
 async fn series(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Series>>, ApiError> {
@@ -319,6 +325,8 @@ mod tests {
                 INSERT INTO episodes (id,series_id,season,number,title,episode_file_id) VALUES (1,1,1,1,'Episode',1);")
                 .await.unwrap();
             let state = Arc::new(AppState { db: Arc::new(db) });
+            // Construct the production merge to catch static/wildcard route conflicts.
+            let _routes = router(state.clone());
             let listed = episodes(State(state.clone()), Path(1)).await.unwrap().0;
             assert_eq!(listed.len(), 1);
             assert_eq!(
