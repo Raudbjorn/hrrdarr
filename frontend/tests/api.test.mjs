@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport } from '../src/lib/api.ts';
+import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -191,4 +191,50 @@ test('native invalid identities fail before fetch including operation path injec
     }
   });
   assert.equal(calls, 0);
+});
+
+test('provider wrappers preserve full scopes and credential omission, replacement and clear', async () => {
+  const id = '0d3a11d1-4aba-4dd7-913d-d4b50a9065b3';
+  const settings = {implementation:'torznab',endpoint:'http://127.0.0.1:1/torznab',tv:{categories:[5030],anime_categories:[5070],anime_standard_format_search:true},movies:{categories:[2000],remove_year:true}};
+  const base = {name:'Indexer',enabled:true,priority:1,settings};
+  const calls=[];
+  await withFetch(async (path, options) => {
+    calls.push([path,options.method,options.body ? JSON.parse(options.body) : undefined]);
+    return options.method==='DELETE' ? new Response(null,{status:204}) : json({id,revision:2,has_credentials:true});
+  }, async () => {
+    await listProviders(25); await getProviderSchema('movies','indexer'); await getProvider(id);
+    await createProvider({...base,credentials:{kind:'api_key',api_key:'fixture-good'}});
+    await updateProvider(id,{...base,revision:1});
+    await updateProvider(id,{...base,revision:2,credentials:{kind:'indexer',api_key:'replacement',tv_parameters:[{name:'private',value:'kept'}],movie_parameters:[]}});
+    await updateProvider(id,{...base,revision:3,credentials:null});
+    await testProvider(id);
+    assert.deepEqual(await deleteProvider(id,4),{ok:true,data:undefined});
+  });
+  assert.equal(calls[0][0],'/api/v1/providers?limit=25&offset=25');
+  assert.equal(calls[1][0],'/api/v1/providers/schema?media_type=movies&kind=indexer');
+  assert.deepEqual(calls[3].slice(0,2),['/api/v1/providers','POST']);
+  assert.equal(Object.hasOwn(calls[4][2],'credentials'),false);
+  assert.deepEqual(calls[4][2].settings,settings);
+  assert.deepEqual(calls[5][2].credentials.tv_parameters,[{name:'private',value:'kept'}]);
+  assert.equal(calls[6][2].credentials,null);
+  assert.deepEqual(calls[7],[`/api/v1/providers/${id}/test`,'POST',undefined]);
+  assert.deepEqual(calls[8],[`/api/v1/providers/${id}?revision=4`,'DELETE',undefined]);
+});
+
+test('provider revision conflicts remain actionable and uncertain tests do not replay', async () => {
+  const id='0d3a11d1-4aba-4dd7-913d-d4b50a9065b3';
+  await withFetch(async()=>json({error:{code:'revision_conflict',message:'Configuration changed'}},409),async()=>{
+    assert.deepEqual(await testProvider(id),{ok:false,error:'Configuration changed',status:409,code:'revision_conflict'});
+  });
+  let calls=0;
+  await withFetch(async()=>{calls++;throw new DOMException('Timed out','TimeoutError');},async()=>{
+    assert.deepEqual(await testProvider(id),{ok:false,error:'Timed out'});
+  });
+  assert.equal(calls,1);
+  await withFetch(async()=>{throw new Error('unexpected fetch');},async()=>{
+    assert.equal((await deleteProvider(id,0)).ok,false);
+    assert.equal((await updateProvider(id,{revision:Number.MAX_SAFE_INTEGER+1})).ok,false);
+    assert.equal((await getProvider('../providers')).ok,false);
+    assert.equal((await testProvider('invalid')).ok,false);
+  });
 });

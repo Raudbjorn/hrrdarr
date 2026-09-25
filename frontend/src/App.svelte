@@ -3,6 +3,8 @@
   import type { Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, MediaDomain, MediaTarget, SeriesType, MinimumAvailability } from './lib/api.generated';
   import { listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode } from './lib/api';
   import ImportPanel from './lib/ImportPanel.svelte';
+  import ProviderPanel from './lib/ProviderPanel.svelte';
+  let view = $state<'library' | 'providers'>('library');
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
   let episodes: Episode[] = $state([]), episodeTotal = $state(0), episodeOffset = $state(0), episodeId: number | null = $state(null);
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
@@ -76,6 +78,9 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button></nav>
+  {#if view === 'providers'}<ProviderPanel />{/if}
+  <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" onclick={() => {adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
   {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
   {#if adding}
@@ -110,11 +115,13 @@
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
     </article>
   </div>
-  <ImportPanel {target} label={targetLabel} oncomplete={refreshAfterImport} />
+  </div>
+  {#if view === 'library'}<ImportPanel {target} label={targetLabel} oncomplete={refreshAfterImport} />{/if}
 </main>
 
 <style>
   :global(*){box-sizing:border-box} :global(body){margin:0;background:#f3f6f8;color:#243746;font:15px/1.5 Inter,"Segoe UI",sans-serif} :global(button),:global(input),:global(select){font:inherit} :global(button){border:1px solid #98a9b8;border-radius:5px;padding:.5rem .8rem;background:#fff;color:#243746;cursor:pointer} :global(button:hover:not(:disabled)){background:#e7eef7} :global(button:disabled){opacity:.55;cursor:default} :global(button[aria-pressed=true]),:global(button[aria-current=true]){background:#e0ebfb;border-color:#245ba8;color:#173f79} :global(:focus-visible){outline:3px solid #245ba8;outline-offset:3px} :global(.primary){background:#245ba8;color:#fff;border-color:#245ba8} :global(.primary:hover:not(:disabled)){background:#194a8e} :global(h1){font-size:1.65rem;line-height:1.2;margin:0 0 1rem} :global(h2){font-size:1.15rem;margin:1.5rem 0 .6rem} :global(h3){font-size:1rem} :global(p){max-width:76ch} :global(.error){color:#a12637;background:#fff0f2;padding:.8rem;border-left:3px solid #a12637} :global(.muted),small{color:#596b7b} :global(.path){overflow-wrap:anywhere} :global(form){display:grid;gap:.8rem;max-width:620px;margin:1rem 0} :global(label){display:grid;gap:.3rem;font-weight:600} :global(input),:global(select){width:100%;padding:.6rem;border:1px solid #8e9faa;border-radius:4px;background:#fff;color:#243746} :global(form button){justify-self:start} :global(.actions){display:flex;flex-wrap:wrap;gap:.6rem} :global(.import-panel){background:#fff;border-top:3px solid #245ba8;padding:1.5rem;margin-top:1.5rem} :global(.import-panel h2){margin-top:0} :global(dl){display:grid;grid-template-columns:130px 1fr;gap:.4rem} :global(dt){font-weight:600} :global(dd){margin:0;overflow-wrap:anywhere}
+  .app-nav{margin-bottom:1.25rem}
   .masthead{padding:1rem max(1.25rem,calc((100vw - 1360px)/2));display:flex;align-items:center;gap:1.5rem;background:#243746;color:white}.brand{font-size:1.5rem;letter-spacing:-.06em;font-weight:800;color:inherit;text-decoration:none}main{max-width:1400px;padding:1.5rem;margin:auto}.toolbar{display:flex;justify-content:space-between;gap:1rem;margin-bottom:1.5rem}nav{display:flex;gap:.5rem}.workspace{display:grid;grid-template-columns:minmax(260px,330px) minmax(0,1fr);background:#fff;border:1px solid #cbd5de}aside{border-right:1px solid #cbd5de;padding:1.25rem}article{padding:1.5rem;min-width:0}.section-heading{display:flex;align-items:start;justify-content:space-between;gap:1rem}.section-heading h1{font-size:1.25rem}.section-heading button{font-size:.8rem}.collection,.lookup-results{list-style:none;margin:0;padding:0}.collection li{border-bottom:1px solid #dce3e9}.collection button{width:100%;display:flex;align-items:center;justify-content:space-between;text-align:left;border:0;border-radius:0;gap:.8rem;padding:1rem .5rem}small{display:block;font-size:.8rem}.count{white-space:nowrap;font-size:.8rem}.pagination{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-top:1rem}.pagination button{font-size:.8rem}.empty{padding:2rem 0}.add-section{background:#fff;padding:1.5rem;border-left:4px solid #245ba8;margin-bottom:1.5rem}.lookup-results{max-width:620px}.lookup-results button{width:100%;text-align:left;margin-bottom:.4rem}.seasons{display:flex;flex-wrap:wrap;gap:.5rem}details{margin:1.5rem 0}summary{cursor:pointer;font-weight:600}.table-scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;text-align:left}th,td{padding:.8rem .5rem;border-bottom:1px solid #dce3e9;vertical-align:top}th{font-size:.85rem}td button{font-size:.85rem}
   @media(max-width:800px){.workspace{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid #cbd5de}main{padding:1rem}article{padding:1rem}.masthead{padding:1rem}.toolbar{align-items:center}:global(dl){grid-template-columns:1fr}:global(dd){margin-bottom:.5rem}.pagination{flex-wrap:wrap}}
 </style>

@@ -1,14 +1,20 @@
 //! Opt-in local browser fixture. No catalog/library rows are inserted directly.
 use axum::{
     Json, Router,
-    extract::{Path, Query},
-    http::StatusCode,
+    body::Bytes,
+    extract::{OriginalUri, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
-use hrrdarr::{db::Database, episodes, import, library, metadata::MetadataClient};
+use hrrdarr::{db::Database, episodes, import, library, metadata::MetadataClient, providers};
 use serde_json::json;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -81,6 +87,89 @@ async fn search(Query(q): Query<HashMap<String, String>>) -> Response {
     .into_response()
 }
 
+#[derive(Default)]
+struct ProviderObservations(Mutex<Vec<serde_json::Value>>);
+async fn observations(
+    State(state): State<Arc<ProviderObservations>>,
+) -> Json<Vec<serde_json::Value>> {
+    Json(state.0.lock().unwrap().clone())
+}
+// Synthetic credentials are accepted only by this owned loopback server.
+async fn provider_mock(
+    State(state): State<Arc<ProviderObservations>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let query: HashMap<String, String> =
+        url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    {
+        let mut seen = state.0.lock().unwrap();
+        if seen.len() < 256 {
+            seen.push(json!({"path":uri.path(),"category":query.get("cat").or_else(||query.get("category")),"private_tv":query.get("private_tv").is_some_and(|v|v=="fixture-tv"),"private_movie":query.get("private_movie").is_some_and(|v|v=="fixture-movie")}));
+        }
+    }
+    if matches!(uri.path(), "/torznab" | "/newznab") {
+        if query.get("t").is_some_and(|v| v == "caps") {
+            return ([("content-type","application/xml")],r#"<caps><limits max="100" default="10"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,tvdbid,season,ep"/><movie-search available="yes" supportedParams="q,tmdbid,imdbid"/></searching><categories><category id="5030"/><category id="5070"/><category id="2000"/></categories></caps>"#).into_response();
+        }
+        if !query
+            .get("apikey")
+            .is_some_and(|v| matches!(v.as_str(), "fixture-good" | "fixture-replacement"))
+        {
+            return (
+                [("content-type", "application/xml")],
+                r#"<error code="100" description="PRIVATE_FIXTURE_AUTH_FAILURE"/>"#,
+            )
+                .into_response();
+        }
+        if !query
+            .get("cat")
+            .is_some_and(|v| matches!(v.as_str(), "5030" | "5030,5070" | "2000"))
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        return ([("content-type","application/xml")],r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="0"/></channel></rss>"#).into_response();
+    }
+    if uri.path() == "/api/v2/auth/login" {
+        let fields: HashMap<String, String> =
+            url::form_urlencoded::parse(&body).into_owned().collect();
+        return if fields
+            .get("password")
+            .is_some_and(|v| matches!(v.as_str(), "fixture-good" | "fixture-replacement"))
+        {
+            (
+                [("set-cookie", "SID=fixture-session; HttpOnly; Path=/")],
+                "Ok.",
+            )
+                .into_response()
+        } else {
+            "Fails.".into_response()
+        };
+    }
+    let authorized = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| matches!(v, "Bearer fixture-good" | "Bearer fixture-replacement"))
+        || headers
+            .get("cookie")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|v| v.contains("SID=fixture-session"));
+    if !authorized {
+        return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
+    }
+    match uri.path() {
+        "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
+        "/api/v2/app/version"=>"v4.6.0".into_response(),
+        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
+        "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([])).into_response(),
+        _=>StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Run explicitly, read the printed manifest, then create its shutdown file to stop.
 #[tokio::test]
 #[ignore = "manual browser fixture; owned loopback servers, max 15 minutes"]
@@ -116,17 +205,26 @@ async fn library_ui_fixture() {
             .await
             .unwrap(),
     );
+    let (provider_origin, _providers) = serve(
+        Router::new()
+            .route("/fixture-observations", get(observations))
+            .fallback(provider_mock)
+            .with_state(Arc::new(ProviderObservations::default())),
+    )
+    .await;
+    let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (api, _api) = serve(
         library::router(db.clone())
             .merge(library::metadata_router(db.clone(), client))
             .merge(episodes::router(db.clone()))
-            .merge(import::router(db)),
+            .merge(import::router(db.clone()))
+            .merge(providers::router(db, Some(key))),
     )
     .await;
     let shutdown = scratch.0.join("shutdown");
     println!(
         "UI_FIXTURE {}",
-        json!({"api":api,"metadata":metadata_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
+        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
     while !shutdown.exists() && tokio::time::Instant::now() < deadline {
@@ -135,4 +233,5 @@ async fn library_ui_fixture() {
     // Join aborted servers before removing their database and scratch files.
     _api.stop().await;
     _metadata.stop().await;
+    _providers.stop().await;
 }
