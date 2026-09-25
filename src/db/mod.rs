@@ -61,6 +61,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "indexer_scope_options",
         include_str!("../../migrations/0011_indexer_scope_options.sql"),
     ),
+    (
+        "qbittorrent_options",
+        include_str!("../../migrations/0012_qbittorrent_options.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

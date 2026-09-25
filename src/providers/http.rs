@@ -17,6 +17,24 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_RESERVE: Duration = Duration::from_secs(5);
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_FIELD_BYTES: usize = 32 * 1024;
+const MAX_MULTIPART_BYTES: u64 = (MAX_BODY_BYTES + MAX_FIELD_BYTES + 16 * 1024) as u64;
+// Private protocol payloads must never acquire a Debug or public serialization implementation.
+pub enum HttpRequestBody {
+    Empty,
+    Form(Vec<(String, String)>),
+    Multipart {
+        fields: Vec<(String, String)>,
+        file_name: String,
+        field_name: String,
+        file: Vec<u8>,
+    },
+}
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub set_cookies: Vec<String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpError {
     InvalidRequest,
@@ -161,6 +179,28 @@ impl HttpOperation<'_> {
         endpoint: &str,
         query: &[(String, String)],
     ) -> Result<Vec<u8>, HttpError> {
+        let response = self
+            .request(endpoint, query, &[], HttpRequestBody::Empty)
+            .await?;
+        if !(200..300).contains(&response.status) {
+            return Err(HttpError::Transport);
+        }
+        Ok(response.body)
+    }
+
+    pub async fn request(
+        &self,
+        endpoint: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+    ) -> Result<HttpResponse, HttpError> {
+        if endpoint.trim() != endpoint
+            || endpoint.contains('\\')
+            || endpoint.chars().any(char::is_control)
+        {
+            return Err(HttpError::InvalidRequest);
+        }
         let mut url = url::Url::parse(endpoint).map_err(|_| HttpError::InvalidRequest)?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -177,6 +217,97 @@ impl HttpOperation<'_> {
         if url.as_str().len() > 16384 {
             return Err(HttpError::InvalidRequest);
         }
+        let mut header_map = reqwest::header::HeaderMap::new();
+        if headers.len() > 16 {
+            return Err(HttpError::InvalidRequest);
+        }
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| HttpError::InvalidRequest)?;
+            if !matches!(
+                name.as_str(),
+                "cookie" | "referer" | "origin" | "authorization"
+            ) || header_map.contains_key(&name)
+                || value.len() > 4096
+            {
+                return Err(HttpError::InvalidRequest);
+            }
+            if matches!(name.as_str(), "referer" | "origin") {
+                let source = url::Url::parse(value).map_err(|_| HttpError::InvalidRequest)?;
+                if source.origin() != url.origin()
+                    || !source.username().is_empty()
+                    || source.password().is_some()
+                    || source.query().is_some()
+                    || source.fragment().is_some()
+                {
+                    return Err(HttpError::InvalidRequest);
+                }
+            }
+            let mut value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| HttpError::InvalidRequest)?;
+            value.set_sensitive(true);
+            header_map.insert(name, value);
+        }
+        let request = match body {
+            HttpRequestBody::Empty => self.client.client.get(url),
+            HttpRequestBody::Form(fields) => {
+                validate_fields(&fields)?;
+                let encoded = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(&fields)
+                    .finish();
+                if encoded.len() > MAX_FIELD_BYTES {
+                    return Err(HttpError::InvalidRequest);
+                }
+                self.client
+                    .client
+                    .post(url)
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(encoded)
+            }
+            HttpRequestBody::Multipart {
+                fields,
+                file_name,
+                field_name,
+                file,
+            } => {
+                validate_fields(&fields)?;
+                if file.len() > MAX_BODY_BYTES
+                    || !safe_part_name(&file_name, 128)
+                    || !safe_part_name(&field_name, 64)
+                {
+                    return Err(HttpError::InvalidRequest);
+                }
+                let part = reqwest::multipart::Part::bytes(file)
+                    .file_name(file_name)
+                    .mime_str("application/x-bittorrent")
+                    .map_err(|_| HttpError::InvalidRequest)?;
+                let mut form = reqwest::multipart::Form::new().part(field_name, part);
+                for (name, value) in fields {
+                    form = form.text(name, value);
+                }
+                self.client.client.post(url).multipart(form)
+            }
+        }
+        .headers(header_map)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .build()
+        .map_err(|_| HttpError::InvalidRequest)?;
+        if request
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_some_and(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_none_or(|size| size > MAX_MULTIPART_BYTES)
+            })
+        {
+            return Err(HttpError::InvalidRequest);
+        }
         let work = async {
             let start = {
                 let mut state = self.lane.state.lock().map_err(|_| HttpError::Transport)?;
@@ -189,9 +320,7 @@ impl HttpOperation<'_> {
             let mut response = self
                 .client
                 .client
-                .get(url)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                .send()
+                .execute(request)
                 .await
                 .map_err(classify)?;
             let status = response.status();
@@ -210,9 +339,6 @@ impl HttpOperation<'_> {
             if status.is_redirection() {
                 return Err(HttpError::Redirect);
             }
-            if !status.is_success() {
-                return Err(HttpError::Transport);
-            }
             if response
                 .headers()
                 .get(reqwest::header::CONTENT_ENCODING)
@@ -226,6 +352,18 @@ impl HttpOperation<'_> {
             {
                 return Err(HttpError::ResponseTooLarge);
             }
+            let mut set_cookies = Vec::new();
+            for value in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                if set_cookies.len() >= 8 || value.as_bytes().len() > 4096 {
+                    return Err(HttpError::InvalidResponse);
+                }
+                set_cookies.push(
+                    value
+                        .to_str()
+                        .map_err(|_| HttpError::InvalidResponse)?
+                        .to_owned(),
+                );
+            }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(classify)? {
                 if chunk.len() > MAX_BODY_BYTES - bytes.len() {
@@ -233,12 +371,37 @@ impl HttpOperation<'_> {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(bytes)
+            Ok(HttpResponse {
+                status: status.as_u16(),
+                body: bytes,
+                set_cookies,
+            })
         };
         tokio::time::timeout_at(self.deadline - STATUS_RESERVE, work)
             .await
             .map_err(|_| HttpError::Timeout)?
     }
+}
+fn safe_part_name(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | '"'))
+}
+fn validate_fields(fields: &[(String, String)]) -> Result<(), HttpError> {
+    if fields.len() > 64
+        || fields.iter().any(|(name, _)| !safe_part_name(name, 64))
+        || fields
+            .iter()
+            .try_fold(0usize, |size, (name, value)| {
+                size.checked_add(name.len())?.checked_add(value.len())
+            })
+            .is_none_or(|size| size > MAX_FIELD_BYTES)
+    {
+        return Err(HttpError::InvalidRequest);
+    }
+    Ok(())
 }
 fn classify(error: reqwest::Error) -> HttpError {
     if error.is_timeout() {
@@ -270,6 +433,181 @@ mod tests {
     use super::*;
     use axum::{Router, response::IntoResponse, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn private_post_payloads_status_and_cookie_bounds() {
+        use axum::{
+            body::Bytes,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        let app = Router::new()
+            .route(
+                "/form",
+                post(|headers: HeaderMap, body: Bytes| async move {
+                    assert_eq!(headers["cookie"], "SID=private");
+                    assert_eq!(body, "password=a%26b%3D%2B&username=user");
+                    (
+                        StatusCode::CONFLICT,
+                        [("set-cookie", "SID=secret; HttpOnly")],
+                        "rejected",
+                    )
+                }),
+            )
+            .route(
+                "/multipart",
+                post(|headers: HeaderMap, body: Bytes| async move {
+                    assert!(
+                        headers["content-type"]
+                            .to_str()
+                            .unwrap()
+                            .starts_with("multipart/form-data; boundary=")
+                    );
+                    let body = String::from_utf8(body.to_vec()).unwrap();
+                    assert!(body.contains("name=\"torrents\"; filename=\"item.torrent\""));
+                    assert!(body.contains("application/x-bittorrent"));
+                    assert!(body.contains("TORRENT_BYTES"));
+                    assert!(body.contains("name=\"category\""));
+                    "accepted"
+                }),
+            )
+            .route(
+                "/cookies",
+                get(|| async { ([("set-cookie", "s".repeat(4097))], "body") }),
+            )
+            .route(
+                "/failure",
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "private") }),
+            );
+        let app = app.route("/status/{code}", get(|axum::extract::Path(code): axum::extract::Path<u16>, headers: HeaderMap| async move {
+            assert!(headers.get("cookie").is_none(), "No ambient cookie jar after a SID response");
+            StatusCode::from_u16(code).unwrap()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new().unwrap();
+        let operation = client.operation(Uuid::new_v4()).unwrap();
+        let response = operation
+            .request(
+                &format!("{base}/form"),
+                &[],
+                &[("Cookie".into(), "SID=private".into())],
+                HttpRequestBody::Form(vec![
+                    ("password".into(), "a&b=+".into()),
+                    ("username".into(), "user".into()),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 409);
+        assert_eq!(response.set_cookies, ["SID=secret; HttpOnly"]);
+        let response = operation
+            .request(
+                &format!("{base}/multipart"),
+                &[],
+                &[],
+                HttpRequestBody::Multipart {
+                    fields: vec![("category".into(), "tv".into())],
+                    file_name: "item.torrent".into(),
+                    field_name: "torrents".into(),
+                    file: b"TORRENT_BYTES".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            operation
+                .get(&format!("{base}/failure"), &[])
+                .await
+                .unwrap_err(),
+            HttpError::Transport,
+            "Indexer GET retains non-success classification while qbit can inspect rejection statuses"
+        );
+        assert!(matches!(
+            operation
+                .request(&format!("{base}/cookies"), &[], &[], HttpRequestBody::Empty)
+                .await,
+            Err(HttpError::InvalidResponse)
+        ));
+        for headers in [
+            vec![("Host".into(), "other".into())],
+            vec![("Origin".into(), "http://other.invalid".into())],
+            vec![("Cookie".into(), "injected\r\nX-Header: value".into())],
+        ] {
+            assert!(matches!(
+                operation
+                    .request(
+                        &format!("{base}/form"),
+                        &[],
+                        &headers,
+                        HttpRequestBody::Empty
+                    )
+                    .await,
+                Err(HttpError::InvalidRequest)
+            ));
+        }
+        assert!(
+            matches!(
+                operation
+                    .request(
+                        &base,
+                        &[],
+                        &[],
+                        HttpRequestBody::Form(vec![("p".into(), "&".repeat(MAX_FIELD_BYTES))])
+                    )
+                    .await,
+                Err(HttpError::InvalidRequest)
+            ),
+            "Encoded form limit also covers percent expansion"
+        );
+        assert!(matches!(
+            operation
+                .request(
+                    &base,
+                    &[],
+                    &[],
+                    HttpRequestBody::Multipart {
+                        fields: vec![],
+                        file_name: "a.torrent".into(),
+                        field_name: "torrents".into(),
+                        file: vec![0; MAX_BODY_BYTES + 1]
+                    }
+                )
+                .await,
+            Err(HttpError::InvalidRequest)
+        ));
+        assert!(matches!(
+            operation
+                .request(
+                    &base,
+                    &[],
+                    &[],
+                    HttpRequestBody::Multipart {
+                        fields: vec![("category".into(), "x".repeat(MAX_FIELD_BYTES + 1))],
+                        file_name: "a.torrent".into(),
+                        field_name: "torrents".into(),
+                        file: vec![]
+                    }
+                )
+                .await,
+            Err(HttpError::InvalidRequest)
+        ));
+        for status in [400, 404] {
+            let response = operation
+                .request(
+                    &format!("{base}/status/{status}"),
+                    &[],
+                    &[],
+                    HttpRequestBody::Empty,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, status);
+        }
+        server.abort();
+        let _ = server.await;
+    }
     #[tokio::test]
     async fn bounds_cooldowns_and_cancelled_leases_preserve_transport_safety() {
         let app = Router::new()

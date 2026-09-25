@@ -12,7 +12,29 @@ export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset
 
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
 
-export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, };
+export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
+
+export type DownloadContentLayout = "default" | "original" | "subfolder";
+
+export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state";
+
+export type DownloadFile = { index: number, name: string, size_bytes: number, progress: number, priority: number, };
+
+export type DownloadFiles = { domain: MediaDomain, hash: string, files: Array<DownloadFile>, };
+
+export type DownloadFilesQuery = { domain: MediaDomain, hash: string, };
+
+export type DownloadInitialState = "started" | "stopped" | "forced";
+
+export type DownloadItem = { hash: string, domain: MediaDomain, name: string, category: string, status: DownloadStatus, diagnostic: DownloadDiagnostic | null, progress: number, size_bytes: number, remaining_bytes: number | null, download_bytes_per_second: number, upload_bytes_per_second: number, eta_seconds: number | null, ratio: number, seeding_seconds: number | null, completed: boolean, };
+
+export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
+
+export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
+
+export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, initial_state?: DownloadInitialState, content_layout?: DownloadContentLayout, sequential_order?: boolean, first_last_first?: boolean, add_tags?: boolean, };
+
+export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "warning" | "stalled" | "unknown";
 
 export type Episode = { id: number, series_id: number, season: number, number: number, title: string, monitored: boolean, episode_file_id: number | null, has_file: boolean, file_path: string | null, tvdb_id: number | null, air_date: string | null, air_date_utc: string | null, last_search_time: string | null, runtime: number | null, finale_type: string | null, overview: string | null, absolute_episode_number: number | null, scene_absolute_episode_number: number | null, scene_episode_number: number | null, scene_season_number: number | null, unverified_scene_numbering: boolean | null, series?: EpisodeSeriesProjection, episode_file?: EpisodeFileProjection, images?: Array<EpisodeCover> | null, };
 
@@ -128,6 +150,10 @@ export type Provider = { id: string, revision: number, name: string, enabled: bo
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
+export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
+
+export type ProviderFilesResult = { provider_id: string, revision: number, result: DownloadFiles, };
+
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
 export type ProviderQuery = { limit?: number, offset?: number, media_type?: MediaDomain, };
@@ -140,7 +166,9 @@ export type ProviderSettings = { "implementation": "torznab", endpoint: string, 
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
-export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: IndexerTest, };
+export type ProviderTestOutcome = IndexerTest | ClientTest;
+
+export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: ProviderTestOutcome, };
 
 export type ProviderUpdate = { revision: number, name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 

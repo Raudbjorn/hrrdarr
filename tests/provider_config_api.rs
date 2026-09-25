@@ -217,7 +217,7 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     assert!(!download.to_string().contains("PRIVATE_USER_SENTINEL"));
     assert_eq!(download["settings"]["tv"]["category"], "tv");
     assert_eq!(download["settings"]["movies"]["category"], "movies");
-    // qBittorrent retains the unsupported test path; never call the declaration-only indexer endpoint.
+    // The owned placeholder has no qBittorrent API; discovery must fail without claiming success.
     let (status, error) = request(
         address,
         "POST",
@@ -225,8 +225,8 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
         "",
     )
     .await;
-    assert_eq!(status, 501);
-    assert_eq!(error["error"]["code"], "provider_test_not_implemented");
+    assert_eq!(status, 404);
+    assert_eq!(error["error"]["code"], "not_found");
     let mut collision = client.clone();
     collision["settings"]["movies"] = scope("tv");
     assert_eq!(

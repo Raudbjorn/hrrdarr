@@ -2,6 +2,7 @@
 mod credentials;
 pub mod http;
 pub mod indexer;
+pub mod qbittorrent;
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -113,7 +114,23 @@ pub struct MovieIndexerScope {
     #[ts(as = "Option<bool>", optional)]
     pub remove_year: bool,
 }
-#[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadInitialState {
+    #[default]
+    Started,
+    Stopped,
+    Forced,
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadContentLayout {
+    #[default]
+    Default,
+    Original,
+    Subfolder,
+}
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadScope {
     pub category: String,
@@ -121,6 +138,21 @@ pub struct DownloadScope {
     pub imported_category: Option<String>,
     pub recent_priority: i8,
     pub older_priority: i8,
+    #[serde(default)]
+    #[ts(as = "Option<DownloadInitialState>", optional)]
+    pub initial_state: DownloadInitialState,
+    #[serde(default)]
+    #[ts(as = "Option<DownloadContentLayout>", optional)]
+    pub content_layout: DownloadContentLayout,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub sequential_order: bool,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub first_last_first: bool,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_tags: bool,
 }
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(tag = "implementation", rename_all = "lowercase", deny_unknown_fields)]
@@ -203,6 +235,14 @@ impl ProviderSettings {
                 if tv.is_none() && movies.is_none() {
                     return Err(bad());
                 }
+                if movies.as_ref().is_some_and(|scope| scope.add_tags) {
+                    return Err(bad());
+                }
+                let overlaps = |a: &str, b: &str| {
+                    a == b
+                        || a.strip_prefix(b).is_some_and(|s| s.starts_with('/'))
+                        || b.strip_prefix(a).is_some_and(|s| s.starts_with('/'))
+                };
                 let category = |c: &str| {
                     !c.trim().is_empty()
                         && c.len() <= 64
@@ -216,7 +256,7 @@ impl ProviderSettings {
                     if !category(&s.category)
                         || s.imported_category
                             .as_ref()
-                            .is_some_and(|c| !category(c) || c == &s.category)
+                            .is_some_and(|c| !category(c) || overlaps(c, &s.category))
                         || !(0..=1).contains(&s.recent_priority)
                         || !(0..=1).contains(&s.older_priority)
                     {
@@ -228,7 +268,10 @@ impl ProviderSettings {
                     let mcats: Vec<_> = std::iter::once(&movies.category)
                         .chain(movies.imported_category.iter())
                         .collect();
-                    if tvcats.into_iter().any(|c| mcats.contains(&c)) {
+                    if tvcats
+                        .into_iter()
+                        .any(|c| mcats.iter().any(|m| overlaps(c, m)))
+                    {
                         return Err(bad());
                     }
                 }
@@ -287,7 +330,25 @@ pub struct ProviderTestResult {
     pub provider_id: Uuid,
     pub revision: i64,
     pub tested_at: i64,
-    pub result: indexer::IndexerTest,
+    pub result: ProviderTestOutcome,
+}
+#[derive(Serialize, ts_rs::TS)]
+#[serde(untagged)]
+pub enum ProviderTestOutcome {
+    Indexer(indexer::IndexerTest),
+    DownloadClient(qbittorrent::ClientTest),
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderDownloadResult {
+    pub provider_id: Uuid,
+    pub revision: i64,
+    pub page: qbittorrent::DownloadPage,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ProviderFilesResult {
+    pub provider_id: Uuid,
+    pub revision: i64,
+    pub result: qbittorrent::DownloadFiles,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct ProviderSearchResult {
@@ -336,6 +397,8 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
         )
         .route("/api/v1/providers/{id}/test", post(test))
         .route("/api/v1/providers/{id}/search", post(search))
+        .route("/api/v1/providers/{id}/downloads", post(downloads))
+        .route("/api/v1/providers/{id}/files", post(files))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .with_state(Context {
             db,
@@ -375,7 +438,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -388,6 +451,21 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 imported_category: scope.get(4)?,
                 recent_priority: scope.get::<i64>(5)?.try_into().map_err(|_| corrupt())?,
                 older_priority: scope.get::<i64>(6)?.try_into().map_err(|_| corrupt())?,
+                initial_state: match scope.get::<String>(9)?.as_str() {
+                    "started" => DownloadInitialState::Started,
+                    "stopped" => DownloadInitialState::Stopped,
+                    "forced" => DownloadInitialState::Forced,
+                    _ => return Err(corrupt()),
+                },
+                content_layout: match scope.get::<String>(10)?.as_str() {
+                    "default" => DownloadContentLayout::Default,
+                    "original" => DownloadContentLayout::Original,
+                    "subfolder" => DownloadContentLayout::Subfolder,
+                    _ => return Err(corrupt()),
+                },
+                sequential_order: stored_bool(scope.get(11)?)?,
+                first_last_first: stored_bool(scope.get(12)?)?,
+                add_tags: stored_bool(scope.get(13)?)?,
             };
             if media == "tv" {
                 tv_client = Some(item)
@@ -447,7 +525,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             priority: row.get::<i64>(3)?.try_into().map_err(|_| corrupt())?,
             settings,
             has_credentials: credentials.is_some(),
-            test_supported: implementation != "qbittorrent",
+            test_supported: true,
             test_status,
             last_test,
         },
@@ -493,7 +571,7 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 .map(|s| ("tv", s))
                 .chain(movies.iter().map(|s| ("movies", s)))
             {
-                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.imported_category.clone(),i64::from(s.recent_priority),i64::from(s.older_priority)]).await?;
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.imported_category.clone(),i64::from(s.recent_priority),i64::from(s.older_priority),match s.initial_state { DownloadInitialState::Started => "started", DownloadInitialState::Stopped => "stopped", DownloadInitialState::Forced => "forced" },match s.content_layout { DownloadContentLayout::Default => "default", DownloadContentLayout::Original => "original", DownloadContentLayout::Subfolder => "subfolder" },i64::from(s.sequential_order),i64::from(s.first_last_first),i64::from(s.add_tags)]).await?;
             }
         }
     }
@@ -756,11 +834,25 @@ mod tests {
                     imported_category: None,
                     recent_priority: 0,
                     older_priority: 1,
+                    ..Default::default()
                 }),
                 movies: None,
             };
             assert_eq!(settings.validate().is_ok(), valid);
         }
+        // Migration rejects conflicting hierarchies before startup; stored and incoming settings use the same rule.
+        let legacy = ProviderSettings::Qbittorrent {
+            endpoint: "https://example.invalid".into(),
+            tv: Some(DownloadScope {
+                category: "media".into(),
+                ..Default::default()
+            }),
+            movies: Some(DownloadScope {
+                category: "media/movies".into(),
+                ..Default::default()
+            }),
+        };
+        assert!(legacy.validate().is_err());
         // Upstream category IDs are signed integers, not an invented six-digit ceiling.
         let mut invalid = input;
         invalid["settings"]["movies"]["categories"] = serde_json::json!([2147483648u32]);
@@ -775,11 +867,11 @@ mod tests {
     }
 }
 
-fn unsupported_test() -> Error {
+fn unsupported_operation() -> Error {
     Error::Plain(
-        StatusCode::NOT_IMPLEMENTED,
-        "provider_test_not_implemented",
-        "No network test is implemented for this provider yet",
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported",
+        "Provider does not support this operation",
     )
 }
 async fn network_snapshot(context: &Context, id: &str) -> Result<(Provider, Option<Credentials>)> {
@@ -787,9 +879,6 @@ async fn network_snapshot(context: &Context, id: &str) -> Result<(Provider, Opti
     let tx = conn.transaction().await?;
     let (provider, bytes) = read(&tx, id).await?;
     tx.commit().await?;
-    if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-        return Err(unsupported_test());
-    }
     let credentials = bytes
         .map(|bytes| {
             context
@@ -952,12 +1041,21 @@ async fn test(
         .operation(provider.id)
         .map_err(|e| http_error(e).0)?;
     let work = async {
-        let result = indexer::test(
-            &operation,
-            &provider.settings,
-            &IndexerAccess::from_credentials(&credentials),
-        )
-        .await;
+        let result = if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            qbittorrent::test_connection(&operation, &provider.settings, credentials.as_ref())
+                .await
+                .map(ProviderTestOutcome::DownloadClient)
+                .map_err(qbit_error)
+        } else {
+            indexer::test(
+                &operation,
+                &provider.settings,
+                &IndexerAccess::from_credentials(&credentials),
+            )
+            .await
+            .map(ProviderTestOutcome::Indexer)
+            .map_err(|e| indexer_error(e, &operation))
+        };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
@@ -970,7 +1068,7 @@ async fn test(
                 })
             }
             Err(error) => {
-                let (error, code) = indexer_error(error, &operation);
+                let (error, code) = error;
                 record_test(&context.db, &provider, Some(code)).await?;
                 Err(error)
             }
@@ -988,6 +1086,9 @@ async fn search(
     let id = id(value)?;
     let input = input.map_err(|_| bad())?.0;
     let (provider, credentials) = network_snapshot(&context, &id).await?;
+    if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        return Err(unsupported_operation());
+    }
     let transport = context
         .transport
         .as_ref()
@@ -1010,6 +1111,111 @@ async fn search(
             provider_id: provider.id,
             revision: provider.revision,
             page: result.map_err(|e| indexer_error(e, &operation).0)?,
+        })
+    };
+    tokio::time::timeout_at(operation.deadline(), work)
+        .await
+        .map_err(|_| http_error(http::HttpError::Timeout).0)?
+}
+
+fn qbit_error(error: qbittorrent::QbitError) -> (Error, &'static str) {
+    use qbittorrent::QbitError as Q;
+    match error {
+        Q::Http(e) => http_error(e),
+        Q::InvalidRequest | Q::ScopeConflict => (bad(), "invalid_request"),
+        Q::UnsafeRetention => (
+            Error::Plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsafe_retention",
+                "Client is configured to remove downloads before completed download handling can retain them",
+            ),
+            "unsupported",
+        ),
+        Q::UnsupportedVersion | Q::UnsupportedFeature => (
+            Error::Plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported",
+                "Client does not support the requested operation",
+            ),
+            "unsupported",
+        ),
+        Q::NotFound => (
+            Error::Plain(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Download was not found in the requested scope",
+            ),
+            "invalid_request",
+        ),
+        Q::InvalidResponse | Q::Rejected | Q::MutationUnknown => {
+            http_error(http::HttpError::InvalidResponse)
+        }
+    }
+}
+
+async fn downloads(
+    State(context): State<Context>,
+    Path(value): Path<String>,
+    input: std::result::Result<Json<qbittorrent::DownloadQuery>, JsonRejection>,
+) -> Result<Json<ProviderDownloadResult>> {
+    let id = id(value)?;
+    let input = input.map_err(|_| bad())?.0;
+    let (provider, credentials) = network_snapshot(&context, &id).await?;
+    if !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        return Err(unsupported_operation());
+    }
+    let transport = context
+        .transport
+        .as_ref()
+        .as_ref()
+        .map_err(|e| http_error(*e).0)?;
+    let operation = transport
+        .operation(provider.id)
+        .map_err(|e| http_error(e).0)?;
+    let work = async {
+        let result =
+            qbittorrent::query(&operation, &provider.settings, credentials.as_ref(), &input).await;
+        operation.ensure_active().map_err(|e| http_error(e).0)?;
+        current_revision(&context.db, &provider).await?;
+        bounded(ProviderDownloadResult {
+            provider_id: provider.id,
+            revision: provider.revision,
+            page: result.map_err(|e| qbit_error(e).0)?,
+        })
+    };
+    tokio::time::timeout_at(operation.deadline(), work)
+        .await
+        .map_err(|_| http_error(http::HttpError::Timeout).0)?
+}
+
+async fn files(
+    State(context): State<Context>,
+    Path(value): Path<String>,
+    input: std::result::Result<Json<qbittorrent::DownloadFilesQuery>, JsonRejection>,
+) -> Result<Json<ProviderFilesResult>> {
+    let id = id(value)?;
+    let input = input.map_err(|_| bad())?.0;
+    let (provider, credentials) = network_snapshot(&context, &id).await?;
+    if !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        return Err(unsupported_operation());
+    }
+    let transport = context
+        .transport
+        .as_ref()
+        .as_ref()
+        .map_err(|e| http_error(*e).0)?;
+    let operation = transport
+        .operation(provider.id)
+        .map_err(|e| http_error(e).0)?;
+    let work = async {
+        let result =
+            qbittorrent::files(&operation, &provider.settings, credentials.as_ref(), &input).await;
+        operation.ensure_active().map_err(|e| http_error(e).0)?;
+        current_revision(&context.db, &provider).await?;
+        bounded(ProviderFilesResult {
+            provider_id: provider.id,
+            revision: provider.revision,
+            result: result.map_err(|e| qbit_error(e).0)?,
         })
     };
     tokio::time::timeout_at(operation.deadline(), work)
