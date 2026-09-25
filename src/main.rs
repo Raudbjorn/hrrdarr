@@ -1,11 +1,14 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
-use hrrdarr::db::{Database, MediaTarget};
+use hrrdarr::{
+    db::{Database, MediaTarget},
+    snapshots,
+};
 use libsql::params;
 use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, sync::Arc};
@@ -71,7 +74,10 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
         .route("/api/v1/series/{id}/episodes", get(episodes))
         .route("/api/v1/imports", post(import_preview))
         .route("/api/v1/imports/{id}/execute", post(import_execute))
-        .route("/api/v1/migrations", post(migrate))
+        .route(
+            "/api/v1/migrations",
+            post(migrate).layer(DefaultBodyLimit::max(snapshots::MAX_SNAPSHOT_BYTES)),
+        )
         .with_state(state);
     let addr: SocketAddr = env::var("HRRDARR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
@@ -169,18 +175,37 @@ async fn import_preview(
     ))
 }
 
-// Temporary safety boundaries until journaled imports and validated snapshot readers land.
-// Keep both routes explicit: callers must not receive success while the library is unchanged.
+// Keep execution unavailable until file and database recovery is implemented.
 async fn import_execute() -> Result<Json<Operation>, ApiError> {
     Err(ApiError::unavailable(
         "import execution is unavailable until recoverable file/DB imports are implemented; previews are retained",
     ))
 }
 
-async fn migrate() -> Result<Json<serde_json::Value>, ApiError> {
-    Err(ApiError::unavailable(
-        "snapshot import is unavailable until validated Sonarr/Radarr readers are implemented; destination data has not changed",
-    ))
+#[derive(Deserialize)]
+struct SnapshotOptions {
+    application: snapshots::Application,
+    #[serde(default = "default_dry_run")]
+    dry_run: bool,
+}
+fn default_dry_run() -> bool {
+    true
+}
+
+async fn migrate(
+    State(state): State<Arc<AppState>>,
+    Query(options): Query<SnapshotOptions>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<snapshots::Report>, ApiError> {
+    snapshots::import(
+        &state.db,
+        options.application,
+        bytes.to_vec(),
+        options.dry_run,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -236,6 +261,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_handler_previews_then_applies_uploaded_core_library() {
+        let directory = std::env::temp_dir().join(format!("hrrdarr-upload-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let source_path = directory.join("backup.db");
+        let source = libsql::Builder::new_local(&source_path)
+            .build()
+            .await
+            .unwrap();
+        source.connect().unwrap().execute_batch(r#"
+            CREATE TABLE VersionInfo(Version INTEGER); INSERT INTO VersionInfo VALUES(233);
+            CREATE TABLE Series(Id INTEGER,TvdbId INTEGER,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,Seasons TEXT);
+            INSERT INTO Series VALUES(1,100,'Upload',2024,'/tv/Upload',1,'[]');
+            CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);
+            CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);
+        "#).await.unwrap();
+        drop(source);
+        let bytes = std::fs::read(&source_path).unwrap();
+        let db = Database::open_local(directory.join("destination.db"))
+            .await
+            .unwrap();
+        let state = Arc::new(AppState { db: Arc::new(db) });
+        for dry_run in [true, false] {
+            let response = migrate(
+                State(state.clone()),
+                Query(SnapshotOptions {
+                    application: snapshots::Application::Sonarr,
+                    dry_run,
+                }),
+                bytes.clone().into(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(response.applied, !dry_run);
+            assert_eq!(response.mapped, 1);
+            let listed = series(State(state.clone())).await.unwrap().0;
+            assert_eq!(listed.len(), usize::from(!dry_run));
+        }
+        assert_eq!(bytes, std::fs::read(source_path).unwrap());
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn schema_handlers_preserve_paths_and_reject_unimplemented_writes() {
         let directory = std::env::temp_dir().join(format!("hrrdarr-handlers-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
@@ -282,7 +351,7 @@ mod tests {
                     .unwrap(),
                 0
             );
-            let response = import_preview(State(state), request(1))
+            let response = import_preview(State(state.clone()), request(1))
                 .await
                 .unwrap()
                 .into_response();
@@ -299,9 +368,20 @@ mod tests {
                 import_execute().await.unwrap_err().status,
                 StatusCode::SERVICE_UNAVAILABLE
             );
+            // Snapshot writes now validate uploads; malformed bytes return 400 rather than the former blanket 503.
             assert_eq!(
-                migrate().await.unwrap_err().status,
-                StatusCode::SERVICE_UNAVAILABLE
+                migrate(
+                    State(state),
+                    Query(SnapshotOptions {
+                        application: snapshots::Application::Sonarr,
+                        dry_run: true
+                    }),
+                    axum::body::Bytes::from_static(b"not a database")
+                )
+                .await
+                .unwrap_err()
+                .status,
+                StatusCode::BAD_REQUEST
             );
             assert_eq!(
                 conn.query("SELECT count(*) FROM operations WHERE status='preview'", ())

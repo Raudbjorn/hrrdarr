@@ -24,6 +24,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "media_relations",
         include_str!("../../migrations/0002_media_relations.sql"),
     ),
+    (
+        "snapshot_imports",
+        include_str!("../../migrations/0003_snapshot_imports.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -89,6 +93,23 @@ impl Database {
             ));
         }
         Ok(conn)
+    }
+
+    /// Source archives can contain credentials. Remote and public local databases are not
+    /// accepted until they have an explicit private storage policy.
+    pub fn permits_private_snapshots(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            self._owner
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .is_some_and(|m| m.permissions().mode() & 0o077 == 0)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     pub fn migration_backup(&self) -> Option<&Path> {
