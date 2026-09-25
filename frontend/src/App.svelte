@@ -5,6 +5,7 @@
   import ImportPanel from './lib/ImportPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
   import ActivityPanel from './lib/ActivityPanel.svelte';
+  import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
   let view = $state<'library' | 'providers' | 'activity'>('library');
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
   let episodes: Episode[] = $state([]), episodeTotal = $state(0), episodeOffset = $state(0), episodeId: number | null = $state(null);
@@ -105,6 +106,7 @@
       {#if selected && !detailLoading}
         <h1>{selected.title}</h1><p class="path">{selected.path}</p><p>{selected.statistics.file_count} associated files · {selected.monitored ? 'Monitored' : 'Unmonitored'}</p>
         <button disabled={saving} onclick={() => patch({monitored: !selected!.monitored})}>{selected.monitored ? 'Unmonitor' : 'Monitor'} {domain === 'tv' ? 'series' : 'movie'}</button>
+        {#if view === 'library'}{#key `${selected.media_type}:${selected.id}`}<MetadataRefreshPanel target={selected.media_type === 'tv' ? {media_type:'tv',series_id:selected.id} : {media_type:'movies',movie_id:selected.id}} onreload={() => {if(selected) {void load(page?.offset ?? 0); void select(selected.id,episodeOffset);}}} />{/key}{/if}
         <details><summary>Library settings</summary><form onsubmit={(event) => {event.preventDefault(); saveSettings();}}>
           {#if domain === 'tv'}<label>Series type<select bind:value={seriesType}><option value="">Unknown</option><option value="standard">Standard</option><option value="daily">Daily</option><option value="anime">Anime</option></select></label><label>Season folders<select bind:value={seasonFolder}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Scene numbering<select bind:value={sceneNumbering}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Monitor new seasons<select bind:value={newItems}><option value="">Unknown</option><option value="all">All</option><option value="none">None</option></select></label>
           {:else}<label>Minimum availability<select bind:value={availability}><option value="">Unknown</option><option value="tba">To be announced</option><option value="announced">Announced</option><option value="in_cinemas">In cinemas</option><option value="released">Released</option></select></label><p>Availability is a saved policy. Current release availability is not yet calculated.</p>{/if}

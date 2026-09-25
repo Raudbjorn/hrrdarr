@@ -209,3 +209,30 @@ plus malformed catalog, duplicate add and late-write rollback. Existing library 
 import tests remain applicable. These are native recorded-protocol tests; live metadata
 services, full upstream lookup/refresh behavior and full controller parity remain
 unverified. Complete `api.035`/`api.040` scope remains Partial.
+
+## Existing-library metadata refresh
+
+The durable [metadata refresh commands](metadata-refresh.md) fetch validated metadata
+before opening a transaction. The reconciliation writer shares the command's transaction:
+catalog changes and successful completion commit together, and every writer error requires
+rollback. Captured TVDB/TMDB identity and movie catalog membership must still match.
+
+Refresh preserves local IDs, roots, profiles, settings, monitoring and file associations.
+It updates supported catalog facts and adds new seasons/episodes. Missing optional facts
+retain their stored values; this contract cannot clear an existing optional fact. Identical
+reconciliation changes zero records. Existing episode identities must be unique and retain
+their season/number; missing, renumbered, ambiguous or globally conflicting episode IDs,
+or removed seasons, produce a conflict instead of deleting or reassociating records.
+
+Existing monitoring remains independent of series-level monitoring. New special seasons
+are unmonitored; other new seasons require an explicit `monitor_new_items` policy. New
+episodes inherit their season's monitoring, except episode zero outside season one remains
+unmonitored. Unknown policy conflicts when a new non-special season requires it.
+
+Both incoming and existing graphs are bounded to 1,000 seasons and 10,000 episodes.
+Existing episode reads collect only identity/numbering, not arbitrary legacy text facts.
+The writer performs no network or filesystem operations. `tests/library_refresh.rs` covers
+both domains, local state preservation, identical replay, identity conflicts and late-write
+rollback; the schema regression covers upgrade preservation, shared command capacity and
+reopen. These scratch tests do not establish live provider equivalence, rescans, artwork,
+metadata schedules or complete refresh-job parity.

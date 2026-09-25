@@ -59,16 +59,56 @@ fn show() -> serde_json::Value {
 fn movie() -> serde_json::Value {
     json!({"tmdbId":101,"title":"Fixture movie","year":2021,"imdbId":"tt7654321"})
 }
-async fn tv_detail(Path(id): Path<String>) -> Response {
+async fn metadata_mode(
+    State(state): State<Arc<AtomicU8>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let value = match query.get("mode").map(String::as_str) {
+        Some("0") => 0,
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    state.store(value, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
+    let mode = state.load(Ordering::SeqCst);
+    if mode == 2 {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if mode == 3 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
     if id == "101" {
-        Json(show()).into_response()
+        let mut value = show();
+        if mode == 1 || mode == 3 {
+            value["title"] = json!("Refreshed series");
+            value["episodes"][0]["title"] = json!("Refreshed pilot");
+            value["episodes"].as_array_mut().unwrap().push(json!({"tvdbId":503,"seasonNumber":1,"episodeNumber":3,"title":"New episode","airDate":"2020-01-03"}));
+        }
+        Json(value).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
 }
-async fn movie_detail(Path(id): Path<String>) -> Response {
+async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
+    let mode = state.load(Ordering::SeqCst);
+    if mode == 2 {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if mode == 3 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
     if id == "101" {
-        Json(movie()).into_response()
+        let mut value = movie();
+        if mode == 1 || mode == 3 {
+            value["title"] = json!("Refreshed movie");
+        }
+        Json(value).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
@@ -218,10 +258,12 @@ async fn library_ui_fixture() {
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
         Router::new()
+            .route("/fixture-metadata-mode", post(metadata_mode))
             .route("/shows/en/{id}", get(tv_detail))
             .route("/movie/{id}", get(movie_detail))
             .route("/search/en", get(search))
-            .route("/search", get(search)),
+            .route("/search", get(search))
+            .with_state(Arc::new(AtomicU8::new(0))),
     )
     .await;
     let client = Arc::new(
@@ -246,7 +288,9 @@ async fn library_ui_fixture() {
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
-    let worker = commands::start(db.clone(), refresh).await.unwrap();
+    let worker = commands::start_with_metadata(db.clone(), refresh, client.clone())
+        .await
+        .unwrap();
     let (api, _api) = serve(
         library::router(db.clone())
             .merge(library::metadata_router(db.clone(), client))

@@ -1,4 +1,4 @@
-import type { Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -110,3 +110,17 @@ export const listRefreshSchedules = () => request<RefreshSchedule[]>('/api/v1/do
 export const saveRefreshSchedule = (input: RefreshScheduleInput) => validOperation(input.target.provider_id) && validId(input.provider_revision) && (input.revision === null || validId(input.revision)) ? request<RefreshSchedule>('/api/v1/download-refresh/schedules', input, 'PUT', true) : invalidProvider<RefreshSchedule>();
 export const deleteRefreshSchedule = (input: RefreshScheduleDelete) => validOperation(input.target.provider_id) && validId(input.revision) ? request<void>('/api/v1/download-refresh/schedules', input, 'DELETE', true) : invalidProvider<void>();
 export const getQueueSnapshot = (target: RefreshTarget, offset = 0) => validOperation(target.provider_id) ? request<QueueSnapshot>(`/api/v1/queue?${new URLSearchParams({provider_id:target.provider_id,media_type:target.media_type,limit:'25',offset:String(offset)})}`, undefined, undefined, true) : invalidProvider<QueueSnapshot>();
+
+const validMetadataTarget = (target: MetadataRefreshTarget) => validId(target.media_type === 'tv' ? target.series_id : target.movie_id);
+export const listMetadataCommands = (query: MetadataCommandQuery = {}) => {
+  const params = new URLSearchParams({limit:String(query.limit ?? 25),offset:String(query.offset ?? 0)});
+  if (query.media_type) params.set('media_type',query.media_type);
+  if (query.series_id !== undefined) {if (!validId(query.series_id)) return invalidProvider<ApiPage<MetadataCommand>>(); params.set('series_id',String(query.series_id));}
+  if (query.movie_id !== undefined) {if (!validId(query.movie_id)) return invalidProvider<ApiPage<MetadataCommand>>(); params.set('movie_id',String(query.movie_id));}
+  if (query.status) params.set('status',query.status);
+  return request<ApiPage<MetadataCommand>>(`/api/v1/metadata-refresh/commands?${params}`,undefined,undefined,true);
+};
+export const createMetadataCommand = (input: MetadataCommandInput) => validMetadataTarget(input.target) ? request<MetadataCommand>('/api/v1/metadata-refresh/commands',input,'POST',true) : invalidProvider<MetadataCommand>();
+export const getMetadataCommand = (id: string) => validOperation(id) ? request<MetadataCommand>(`/api/v1/metadata-refresh/commands/${id}`,undefined,undefined,true) : invalidProvider<MetadataCommand>();
+export const cancelMetadataCommand = (id: string) => validOperation(id) ? request<MetadataCommand>(`/api/v1/metadata-refresh/commands/${id}/cancel`,undefined,'POST',true) : invalidProvider<MetadataCommand>();
+export const deleteMetadataCommand = (id: string) => validOperation(id) ? request<void>(`/api/v1/metadata-refresh/commands/${id}`,undefined,'DELETE',true) : invalidProvider<void>();

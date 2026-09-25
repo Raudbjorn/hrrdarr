@@ -26,6 +26,11 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | GET `/commands/{id}` | none | `Command` |
 | POST `/commands/{id}/cancel` | none | `Command` |
 | DELETE `/commands/{id}` | none | empty (204; terminal history only) |
+| POST `/metadata-refresh/commands` | `MetadataCommandInput` | `MetadataCommand` (202; active typed-target deduplication) |
+| GET `/metadata-refresh/commands` | `MetadataCommandQuery` | `ApiPage<MetadataCommand>` |
+| GET `/metadata-refresh/commands/{id}` | none | `MetadataCommand` |
+| POST `/metadata-refresh/commands/{id}/cancel` | none | `MetadataCommand` |
+| DELETE `/metadata-refresh/commands/{id}` | none | empty (204; terminal history only) |
 | GET `/download-refresh/schedules` | none | `RefreshSchedule[]` |
 | PUT `/download-refresh/schedules` | `RefreshScheduleInput` | `RefreshSchedule` |
 | DELETE `/download-refresh/schedules` | `RefreshScheduleDelete` | empty (204) |
@@ -103,3 +108,5 @@ These declarations are compile-time contracts, not runtime response validators. 
 Durable command and queue semantics, ownership, limits and verification scope are documented in [download refresh](download-refresh.md).
 
 Native history filtering, event semantics and evidence limits are documented in [history](history.md).
+
+Durable single-target catalog refresh has a separate additive command surface; its typed targets, shared worker limits and atomic reconciliation contract are documented in [metadata refresh](metadata-refresh.md). Existing download-command DTOs remain unchanged.

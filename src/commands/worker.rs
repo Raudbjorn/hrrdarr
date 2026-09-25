@@ -45,6 +45,18 @@ impl Drop for Runtime {
 }
 
 pub async fn start(db: Arc<Database>, client: RefreshClient) -> Result<Runtime> {
+    let metadata = Arc::new(
+        crate::metadata::MetadataClient::new()
+            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))?,
+    );
+    start_with_metadata(db, client, metadata).await
+}
+
+pub async fn start_with_metadata(
+    db: Arc<Database>,
+    client: RefreshClient,
+    metadata: Arc<crate::metadata::MetadataClient>,
+) -> Result<Runtime> {
     if !db.permits_local_imports() {
         return Err(Error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -73,11 +85,13 @@ pub async fn start(db: Arc<Database>, client: RefreshClient) -> Result<Runtime> 
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let result = tokio::time::timeout(Duration::from_secs(45), step(&db, &client)).await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(45), step(&db, &client, &metadata)).await;
             if !matches!(result, Ok(Ok(()))) {
                 eprintln!("event=command_worker_error code=storage_error");
-                // The failed future is gone, so repeating this read-only command is safe. Recovery
-                // never resets attempts and never applies to future mutating commands implicitly.
+                // The failed future is gone. External GETs can repeat; metadata facts and success
+                // commit together, so only uncommitted reconciliation retries. Attempts never reset;
+                // this policy never applies implicitly to future external mutations.
                 if !matches!(
                     tokio::time::timeout(Duration::from_secs(10), recover(&db, "storage_error"))
                         .await,
@@ -94,6 +108,7 @@ async fn recover(db: &Database, code: &str) -> Result<()> {
     let c = connection(db).await?;
     let timestamp = now()?;
     c.execute("UPDATE commands SET status=CASE WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?,completed_at=CASE WHEN attempts<3 THEN NULL ELSE ? END,error_code=? WHERE status='running'",params![timestamp,timestamp,code]).await?;
+    metadata::recover(&c, timestamp, code).await?;
     Ok(())
 }
 async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
@@ -126,7 +141,11 @@ async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
     }
     Ok(())
 }
-async fn claim(db: &Database) -> Result<Option<Command>> {
+enum Claimed {
+    Downloads(Command),
+    Metadata(metadata::MetadataCommand),
+}
+async fn claim(db: &Database) -> Result<Option<Claimed>> {
     let c = connection(db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -135,25 +154,36 @@ async fn claim(db: &Database) -> Result<Option<Command>> {
         let timestamp=now()?;
         tx.execute("UPDATE commands SET status='failed',completed_at=?,error_code='provider_changed' WHERE status IN ('queued','retry_wait') AND NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=commands.provider_id AND p.revision=commands.provider_revision AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=commands.media_type)",[timestamp]).await?;
         schedule_due(&tx,timestamp).await?;
-        let row=tx.query(&format!("SELECT {COMMAND_COLUMNS} FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? ORDER BY priority DESC,created_at,id LIMIT 1"),[timestamp]).await?.next().await?;
+        metadata::sweep(&tx,timestamp).await?;
+        let row=tx.query("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",params![timestamp,timestamp]).await?.next().await?;
         let Some(row)=row else{return Ok(None)};
-        let command=command_row(row)?;
+        let id=Uuid::parse_str(&row.get::<String>(0)?).map_err(|_|bad())?;
+        if row.get::<i64>(1)?==1 {return Ok(Some(Claimed::Metadata(metadata::claim(&tx,id,timestamp).await?)))}
+        let command=read_command(&tx,id).await?;
         if !valid_provider(&tx,command.target,command.provider_revision).await?{
             tx.execute("UPDATE commands SET status='failed',completed_at=?,error_code='provider_changed' WHERE id=?",params![timestamp,command.id.to_string()]).await?;return Ok(None)
         }
         tx.execute("UPDATE commands SET status='running',attempts=attempts+1,started_at=?,error_code=NULL WHERE id=?",params![timestamp,command.id.to_string()]).await?;
-        Ok(Some(read_command(&tx,command.id).await?))
+        Ok(Some(Claimed::Downloads(read_command(&tx,command.id).await?)))
     }.await;
     finish(tx, result).await
 }
 async fn snapshot_capacity(c: &Connection, target: RefreshTarget) -> Result<bool> {
     Ok(c.query("SELECT (SELECT count(*) FROM download_refresh_snapshots)<? OR EXISTS(SELECT 1 FROM download_refresh_snapshots WHERE provider_id=? AND media_type=?)",params![MAX_SNAPSHOTS,target.provider_id.to_string(),domain(target.media_type)]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1)
 }
-async fn step(db: &Arc<Database>, client: &RefreshClient) -> Result<()> {
+async fn step(
+    db: &Arc<Database>,
+    client: &RefreshClient,
+    metadata_client: &crate::metadata::MetadataClient,
+) -> Result<()> {
     // A prior local storage failure can leave an interrupted read claim. There is no other worker.
     recover(db, "storage_error").await?;
     let Some(command) = claim(db).await? else {
         return Ok(());
+    };
+    let command = match command {
+        Claimed::Downloads(command) => command,
+        Claimed::Metadata(command) => return metadata::run(db, metadata_client, command).await,
     };
     let id = command.id;
     let result = if !snapshot_capacity(&connection(db).await?, command.target).await? {
@@ -318,7 +348,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut work = Box::pin(step(&db, &client));
+        let metadata = crate::metadata::MetadataClient::new().unwrap();
+        let mut work = Box::pin(step(&db, &client, &metadata));
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut work => panic!("probe unexpectedly settled: {}", result.is_ok()),

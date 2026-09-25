@@ -35,6 +35,9 @@ pub fn render() -> String {
     roots!(
         crate::history::HistoryQuery,
         crate::api::ApiPage<crate::history::HistoryEvent>,
+        crate::commands::metadata::MetadataCommandInput,
+        crate::commands::metadata::MetadataCommandQuery,
+        crate::api::ApiPage<crate::commands::metadata::MetadataCommand>,
         crate::commands::CommandInput,
         crate::commands::CommandQuery,
         crate::api::ApiPage<crate::commands::Command>,

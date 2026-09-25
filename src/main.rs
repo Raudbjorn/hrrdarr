@@ -53,7 +53,14 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("hrrdarr listening on http://{addr}");
     let runtime = if state.db.permits_local_imports() {
-        Some(hrrdarr::commands::start(state.db.clone(), refresh).await?)
+        Some(
+            hrrdarr::commands::start_with_metadata(
+                state.db.clone(),
+                refresh,
+                state.metadata.clone(),
+            )
+            .await?,
+        )
     } else {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None

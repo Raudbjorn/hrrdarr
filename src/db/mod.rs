@@ -97,6 +97,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "snapshot_profiles",
         include_str!("../../migrations/0020_snapshot_profiles.sql"),
     ),
+    (
+        "metadata_refresh_commands",
+        include_str!("../../migrations/0021_metadata_refresh_commands.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -494,3 +498,6 @@ mod profile_policy_tests;
 
 #[cfg(test)]
 mod snapshot_profile_tests;
+
+#[cfg(test)]
+mod metadata_refresh_tests;

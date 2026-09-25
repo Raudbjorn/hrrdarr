@@ -187,6 +187,92 @@ async function verifyActivity() {
   assert.ok((await (await filtered).json()).items.every(command=>command.target.media_type==='tv'));
 }
 
+async function verifyMetadataRefresh() {
+  const metadataOrigin=process.env.UI_METADATA_ORIGIN;
+  assert.ok(metadataOrigin,'Set UI_METADATA_ORIGIN from the owned fixture');
+  assert.equal(new URL(metadataOrigin).hostname,'127.0.0.1');
+  const mode=async(value)=>assert.equal((await page.request.post(`${metadataOrigin}/fixture-metadata-mode?mode=${value}`)).status(),204);
+  const history=async(domain)=>{const response=await page.request.get(`${origin}/api/v1/metadata-refresh/commands?media_type=${domain}&${domain==='tv'?'series_id':'movie_id'}=1`);assert.equal(response.status(),200);return (await response.json()).items;};
+  const panel=page.getByRole('region',{name:'Metadata refresh',exact:true});
+  await page.getByRole('button',{name:'Library',exact:true}).click();
+  await page.getByRole('button',{name:'TV',exact:true}).click();
+  await page.getByRole('button',{name:/Fixture series.*1 files/}).click();
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).waitFor();
+  await page.getByText('Library settings',{exact:true}).click();
+  await page.getByLabel('Series type').selectOption('daily');
+  await mode(1);
+  // The server accepts a command but its response is lost. UI must not retry the POST.
+  let postCount=0;
+  await page.route('**/api/v1/metadata-refresh/commands',async route=>{
+    if(route.request().method()!=='POST'){await route.continue();return;}
+    postCount++;await route.fetch();await route.abort('failed');
+  });
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).click();
+  await panel.getByText(/request may have committed/).waitFor();
+  assert.equal(await panel.getByRole('button',{name:'Refresh metadata',exact:true}).isDisabled(),true);
+  await page.unroute('**/api/v1/metadata-refresh/commands');
+  await panel.getByRole('button',{name:'Check metadata status',exact:true}).click();
+  await panel.getByRole('heading',{name:'refresh_series: succeeded',exact:true}).waitFor();
+  assert.equal(postCount,1);assert.equal((await history('tv')).length,1);
+  assert.equal(await page.getByLabel('Series type').inputValue(),'daily','Completion must preserve unsaved form edits');
+  await panel.getByRole('button',{name:'Reload library details',exact:true}).click();
+  await page.getByRole('article').getByRole('heading',{name:'Refreshed series',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Unmonitor Refreshed pilot',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Monitor New episode',exact:true}).waitFor();
+  assert.match(await page.getByRole('article').innerText(),/pilot.mkv/);
+  await page.getByRole('button',{name:'Monitor series',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Movies',exact:true}).click();
+  await page.getByRole('button',{name:/Fixture movie.*1 files/}).click();
+  await panel.getByText('0 metadata commands for this title.',{exact:true}).waitFor();
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).click();
+  await panel.getByRole('heading',{name:'refresh_movie: succeeded',exact:true}).waitFor();
+  const movieHistory=await history('movies');assert.equal(movieHistory.length,1);assert.deepEqual(movieHistory[0].target,{media_type:'movies',movie_id:1});
+  await panel.getByRole('button',{name:'Reload library details',exact:true}).click();
+  await page.getByRole('article').getByRole('heading',{name:'Refreshed movie',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Monitor movie',exact:true}).waitFor();
+  assert.match(await page.getByRole('article').innerText(),/1 associated files/);
+  await mode(3);
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).click();
+  await panel.getByRole('button',{name:'Cancel metadata refresh',exact:true}).click();
+  await panel.getByRole('heading',{name:'refresh_movie: cancelled',exact:true}).waitFor();
+  await panel.getByRole('button',{name:'Delete metadata command history',exact:true}).click();
+  await panel.getByRole('button',{name:'Confirm delete metadata history',exact:true}).click();
+  assert.equal((await history('movies')).some(command=>command.status==='cancelled'),false);
+  await mode(2);
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).click();
+  await panel.getByRole('heading',{name:'refresh_movie: retry_wait',exact:true}).waitFor();
+  assert.match(await panel.innerText(),/metadata_unavailable/);
+  await panel.getByRole('button',{name:'Cancel metadata refresh',exact:true}).click();
+  await panel.getByRole('heading',{name:'refresh_movie: cancelled',exact:true}).waitFor();
+  // Leave while TV refresh is running; late reads must never replace movie detail.
+  await mode(3);
+  await page.getByRole('button',{name:'TV',exact:true}).click();
+  await page.getByRole('button',{name:/Refreshed series.*1 files/}).click();
+  // Bind this assertion to the newly accepted command, never an earlier success.
+  const accepted=page.waitForResponse(response=>response.url().endsWith('/api/v1/metadata-refresh/commands')&&response.request().method()==='POST');
+  await panel.getByRole('button',{name:'Refresh metadata',exact:true}).click();
+  const acceptedResponse=await accepted;assert.equal(acceptedResponse.status(),202);
+  const lateCommand=await acceptedResponse.json();
+  assert.deepEqual(lateCommand.target,{media_type:'tv',series_id:1});
+  await page.getByRole('button',{name:'Movies',exact:true}).click();
+  await page.getByRole('button',{name:/Refreshed movie.*1 files/}).click();
+  await page.waitForFunction(async id=>{
+    const response=await fetch(`/api/v1/metadata-refresh/commands/${id}`);
+    const command=await response.json();
+    return command.id===id&&command.status==='succeeded';
+  },lateCommand.id);
+  await page.getByRole('article').getByRole('heading',{name:'Refreshed movie',exact:true}).waitFor();
+  assert.ok((await history('movies')).every(command=>command.target.media_type==='movies'));
+  await mode(1);
+  const before=(await history('movies')).length;
+  await page.reload();await page.getByRole('button',{name:'Movies',exact:true}).click();
+  await page.getByRole('button',{name:/Refreshed movie.*1 files/}).click();
+  await panel.getByRole('button',{name:'Check metadata status',exact:true}).click();
+  assert.equal((await history('movies')).length,before,'Readback and reload do not enqueue metadata refresh');
+  assert.equal(await readFile(`${scratch}/tv/pilot.mkv`,'utf8'),'scratch episode media');
+  assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
+}
+
 try {
   await page.goto(origin);
   await add('tv', 'Fixture series', `${scratch}/tv`);
@@ -261,11 +347,12 @@ try {
   assert.match(await page.getByRole('article').innerText(), /pilot.mkv/);
   await verifyProviders();
   await verifyActivity();
+  await verifyMetadataRefresh();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});

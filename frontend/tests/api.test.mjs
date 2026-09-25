@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot } from '../src/lib/api.ts';
+import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -268,5 +268,34 @@ test('activity requests retain typed targets, schedule revisions and command-onl
   assert.equal(calls[9][0],`/api/v1/queue?provider_id=${id}&media_type=movies&limit=25&offset=25`);
   await withFetch(async()=>json({error:{code:'queue_snapshot_unavailable',message:'No observation'}},404),async()=>{
     assert.deepEqual(await getQueueSnapshot(target),{ok:false,error:'No observation',status:404,code:'queue_snapshot_unavailable'});
+  });
+});
+
+
+test('metadata refresh keeps equal TV/movie IDs distinct and never retries uncertain writes', async () => {
+  const id='0d3a11d1-4aba-4dd7-913d-d4b50a9065b3';
+  const targets=[{media_type:'tv',series_id:1},{media_type:'movies',movie_id:1}];
+  const calls=[];
+  await withFetch(async(path,options)=>{
+    calls.push([path,options.method,options.body?JSON.parse(options.body):undefined]);
+    return options.method==='DELETE'?new Response(null,{status:204}):json({id});
+  },async()=>{
+    for(const target of targets){await listMetadataCommands({...target,limit:25,offset:0});await createMetadataCommand({target,priority:'normal'});}
+    await getMetadataCommand(id); await cancelMetadataCommand(id);
+    assert.deepEqual(await deleteMetadataCommand(id),{ok:true,data:undefined});
+  });
+  assert.equal(calls[0][0],'/api/v1/metadata-refresh/commands?limit=25&offset=0&media_type=tv&series_id=1');
+  assert.equal(calls[2][0],'/api/v1/metadata-refresh/commands?limit=25&offset=0&media_type=movies&movie_id=1');
+  assert.deepEqual(calls[1][2],{target:targets[0],priority:'normal'});
+  assert.deepEqual(calls[3][2],{target:targets[1],priority:'normal'});
+  assert.deepEqual(calls[5],[`/api/v1/metadata-refresh/commands/${id}/cancel`,'POST',undefined]);
+  let requests=0;
+  await withFetch(async()=>{requests++;throw new DOMException('Timed out','TimeoutError');},async()=>{
+    assert.deepEqual(await createMetadataCommand({target:targets[0],priority:'normal'}),{ok:false,error:'Timed out'});
+  });
+  assert.equal(requests,1);
+  await withFetch(async()=>{throw new Error('must not fetch');},async()=>{
+    assert.equal((await createMetadataCommand({target:{media_type:'movies',movie_id:0},priority:'normal'})).ok,false);
+    assert.equal((await getMetadataCommand('../commands')).ok,false);
   });
 });

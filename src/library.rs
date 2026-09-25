@@ -1,4 +1,5 @@
 //! Manual library records. Physical paths are declarations; no filesystem actions are performed.
+pub mod refresh;
 use crate::db::Database;
 use axum::{
     Json, Router,

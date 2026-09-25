@@ -202,7 +202,17 @@ export type MediaInfoSubtitleStream = { language: string | null, format: string 
 
 export type MediaTarget = { "media_type": "episode", "id": number } | { "media_type": "movie", "id": number };
 
+export type MetadataCommand = { id: string, name: MetadataCommandName, target: MetadataRefreshTarget, external_id: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_updated: number, };
+
+export type MetadataCommandInput = { target: MetadataRefreshTarget, priority: CommandPriority, };
+
+export type MetadataCommandName = "refresh_series" | "refresh_movie";
+
+export type MetadataCommandQuery = { media_type?: MediaDomain, series_id?: number, movie_id?: number, status?: CommandStatus, limit?: number, offset?: number, };
+
 export type MetadataLookupQuery = { term: string, };
+
+export type MetadataRefreshTarget = { "media_type": "tv", series_id: number, } | { "media_type": "movies", movie_id: number, };
 
 export type MinimumAvailability = "tba" | "announced" | "in_cinemas" | "released";
 

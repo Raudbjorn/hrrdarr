@@ -18,7 +18,7 @@ impl Drop for Sandbox {
     }
 }
 
-async fn provider(conn: &Connection) -> Result<String, Error> {
+pub(super) async fn provider(conn: &Connection) -> Result<String, Error> {
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Client',1,1,1,1,'http://fixture.invalid')",[id.clone()]).await?;
     for media in ["tv", "movies"] {
@@ -26,12 +26,16 @@ async fn provider(conn: &Connection) -> Result<String, Error> {
     }
     Ok(id)
 }
-async fn enqueue(conn: &Connection, provider: &str, media: &str) -> Result<String, libsql::Error> {
+pub(super) async fn enqueue(
+    conn: &Connection,
+    provider: &str,
+    media: &str,
+) -> Result<String, libsql::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute("INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at) VALUES(?,?,?,1,100,100)",params![id.clone(),provider,media]).await?;
     Ok(id)
 }
-async fn succeed(conn: &Connection, id: &str, count: i64) -> Result<(), libsql::Error> {
+pub(super) async fn succeed(conn: &Connection, id: &str, count: i64) -> Result<(), libsql::Error> {
     conn.execute(
         "UPDATE commands SET status='running',attempts=1,started_at=100 WHERE id=?",
         [id],
@@ -44,7 +48,7 @@ async fn succeed(conn: &Connection, id: &str, count: i64) -> Result<(), libsql::
     .await?;
     Ok(())
 }
-async fn snapshot(
+pub(super) async fn snapshot(
     conn: &Connection,
     provider: &str,
     media: &str,
@@ -54,7 +58,11 @@ async fn snapshot(
     conn.execute("INSERT INTO download_refresh_snapshots(provider_id,media_type,provider_revision,observed_at,command_id,items_json) VALUES(?,?,1,101,?,?) ON CONFLICT(provider_id,media_type) DO UPDATE SET command_id=excluded.command_id,items_json=excluded.items_json,observed_at=excluded.observed_at",params![provider,media,command,items]).await?;
     Ok(())
 }
-async fn schedule(conn: &Connection, provider: &str, media: &str) -> Result<(), libsql::Error> {
+pub(super) async fn schedule(
+    conn: &Connection,
+    provider: &str,
+    media: &str,
+) -> Result<(), libsql::Error> {
     conn.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at) VALUES(?,?,1,1,60,100) ON CONFLICT(provider_id,media_type) DO UPDATE SET interval_seconds=120,revision=revision+1",params![provider,media]).await?;
     Ok(())
 }
@@ -103,7 +111,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 20); // Latest open adds profile activation provenance; predecessor stays unchanged.
+    assert_eq!(version(&conn).await?, 21); // Latest open adds metadata refresh jobs; predecessor stays fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

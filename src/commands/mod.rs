@@ -1,4 +1,4 @@
-//! Durable, locally owned download refresh. Observations never authorize client mutations.
+//! Durable, locally owned download and catalog refresh. Neither authorizes client mutations.
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -21,8 +21,9 @@ use std::{
 };
 use uuid::Uuid;
 
+pub mod metadata;
 mod worker;
-pub use worker::{Runtime, start};
+pub use worker::{Runtime, start, start_with_metadata};
 
 const MAX_COMMANDS: i64 = 1024;
 const MAX_SNAPSHOTS: i64 = 64;
@@ -315,7 +316,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Ok(current)
     }
     let count = c
-        .query("SELECT count(*) FROM commands", ())
+        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)", ())
         .await?
         .next()
         .await?
@@ -330,6 +331,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
 }
 
 pub fn router(db: Arc<Database>) -> Router {
+    let metadata = metadata::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -341,6 +343,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .route("/api/v1/queue", get(queue))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(db)
+        .merge(metadata)
 }
 async fn create(
     State(db): State<Arc<Database>>,
