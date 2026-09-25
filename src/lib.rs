@@ -24,3 +24,5 @@ pub mod commands;
 pub mod history;
 
 pub mod metadata;
+
+pub mod blocklist;

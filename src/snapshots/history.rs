@@ -71,7 +71,7 @@ fn json(
         _ => Err(ImportError("invalid source History JSON type")),
     }
 }
-fn date(value: &str) -> Result<String> {
+pub(super) fn date(value: &str) -> Result<String> {
     if value.len() > 40
         || value
             .split_once('.')

@@ -33,6 +33,9 @@ pub fn render() -> String {
     };
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::blocklist::BlocklistQuery,
+        crate::blocklist::BlocklistRemoval,
+        crate::api::ApiPage<crate::blocklist::BlocklistEntry>,
         crate::history::HistoryQuery,
         crate::api::ApiPage<crate::history::HistoryEvent>,
         crate::commands::metadata::MetadataCommandInput,

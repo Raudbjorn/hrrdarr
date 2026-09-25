@@ -302,3 +302,39 @@ schema-19 archives through the prior core writer, checks migration rollback, per
 both-domain exact-upload backfill and tests missing mappings/rows, local assignments
 and reopen. These do not establish real-backup equivalence, custom-format support,
 policy evaluation or the complete snapshot parity gate.
+
+## Managed source Blocklist
+
+Sonarr 233 and Radarr 206/242 `Blocklist` records can now be reconstructed for
+native blocklist reads and removal. This is source-backed management, not evidence
+of failed-download production, matching or decision enforcement. TV records retain
+the complete remapped episode set within their series (including an explicitly
+empty set); movies reference library membership separately. Unresolved or cross-series
+episode references archive/report the whole record, never a narrower target set.
+
+Only validated title, canonical UTC dates, size, protocol, domain quality/revision
+and languages enter the public projection. Message, indexer, source, torrent hash,
+flags, release type and unknown columns remain in the private raw archive and are
+reported unsupported. Unsupported protocol/quality/language semantics leave the
+whole record inactive. Malformed known JSON, duplicate identities, invalid dates or
+negative sizes fail the import transaction. Missing optional facts remain absent.
+The adapter permits at most 10,000 entries and 100,000 total episode links per upload,
+with at most 10,000 episodes per entry; existing snapshot byte/row limits also apply.
+
+Identity is `(application, snapshot fingerprint, source ID)`. Immutable normalized
+facts and exact destination links are checked on replay. Explicit single/bulk removal
+removes the active entry and retains a provenance tombstone; reuploading those same
+bytes never reactivates it. Removing library membership likewise tombstones its active
+entries. Removing an individual referenced episode is restricted so an entry cannot
+silently lose part of its target set. A different fingerprint is a new source attestation
+and may introduce another record even with the same source ID or title.
+
+Migration 22 preserves existing archives and does not activate their contents by
+itself. Reuploading the validated original backup backfills schema-21 archives once;
+missing or changed activated facts conflict rather than being silently repaired.
+Dry runs roll back the entire reconciliation, and late failures roll back core mappings,
+archives and blocklist activation together. Source databases and media remain untouched.
+`tests/blocklist_snapshots.rs` and `src/db/blocklist_tests.rs` cover synthetic both-domain
+mapping, schema-21 backfill, rollback, complete target ownership, deletion/replay and
+reopen. Live services, real operator backups and full Blocklist controller parity are
+not established by these fixtures.

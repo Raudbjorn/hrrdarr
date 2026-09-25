@@ -20,6 +20,9 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 
 | Route and method | Request | Success body |
 | --- | --- | --- |
+| GET `/blocklist` | `BlocklistQuery` | `ApiPage<BlocklistEntry>` (typed imported source facts) |
+| DELETE `/blocklist/{application}/{fingerprint}/{source_id}` | none | empty (204; durable provenance tombstone) |
+| DELETE `/blocklist/bulk` | `BlocklistRemoval` | empty (204; atomic, max 100 explicit identities) |
 | GET `/history` | `HistoryQuery` | `ApiPage<HistoryEvent>` (tagged native receipts and source snapshot facts) |
 | POST `/commands` | `CommandInput` | `Command` (202; active scope deduplication) |
 | GET `/commands` | `CommandQuery` | `ApiPage<Command>` |
@@ -110,3 +113,5 @@ Durable command and queue semantics, ownership, limits and verification scope ar
 Native history filtering, event semantics and evidence limits are documented in [history](history.md).
 
 Durable single-target catalog refresh has a separate additive command surface; its typed targets, shared worker limits and atomic reconciliation contract are documented in [metadata refresh](metadata-refresh.md). Existing download-command DTOs remain unchanged.
+
+Imported source blocklist read/removal contracts and replay behavior are documented in [blocklist management](blocklist.md). No automatic release-decision enforcement or failed-download producer is implied.

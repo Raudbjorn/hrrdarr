@@ -8,7 +8,8 @@ use axum::{
     routing::{get, post},
 };
 use hrrdarr::{
-    commands, db::Database, episodes, import, library, metadata::MetadataClient, providers,
+    blocklist, commands, db::Database, episodes, import, library, metadata::MetadataClient,
+    providers, snapshots,
 };
 use serde_json::json;
 use std::{
@@ -242,6 +243,79 @@ async fn provider_mock(
 }
 
 /// Run explicitly, read the printed manifest, then create its shutdown file to stop.
+struct BlocklistFixture {
+    db: Arc<Database>,
+    tv: Vec<u8>,
+    movies: Vec<u8>,
+}
+async fn import_blocklists(State(state): State<Arc<BlocklistFixture>>) -> Response {
+    let mut reports = Vec::new();
+    for (app, bytes) in [
+        (snapshots::Application::Sonarr, &state.tv),
+        (snapshots::Application::Radarr, &state.movies),
+    ] {
+        match snapshots::import(&state.db, app, bytes.clone(), false).await {
+            Ok(report) => reports.push(report),
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.0).into_response(),
+        }
+    }
+    Json(reports).into_response()
+}
+async fn blocklist_fixture(db: Arc<Database>, root: &std::path::Path) -> Arc<BlocklistFixture> {
+    let tv_root = root.join("blocklist-tv");
+    let movie_root = root.join("blocklist-movie");
+    std::fs::create_dir(&tv_root).unwrap();
+    std::fs::create_dir(&movie_root).unwrap();
+    let tv_path = root.join("blocklist-sonarr.db");
+    let source = libsql::Builder::new_local(&tv_path).build().await.unwrap();
+    let c = source.connect().unwrap();
+    c.execute_batch(r#"
+      CREATE TABLE VersionInfo(Version INTEGER); INSERT INTO VersionInfo VALUES(233);
+      CREATE TABLE Series(Id INTEGER,TvdbId INTEGER,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,Seasons TEXT);
+      INSERT INTO Series VALUES(1,901,'Blocklist series',2020,'/fixture/blocklist-tv',1,'[{"seasonNumber":1,"monitored":true}]');
+      CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);
+      INSERT INTO Episodes VALUES(1,1,1,1,'Blocked pilot',1,0),(2,1,1,2,'Blocked second',1,0);
+      CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);
+      CREATE TABLE Blocklist(Id INTEGER,SeriesId INTEGER,EpisodeIds TEXT,Date TEXT,SourceTitle TEXT,Protocol INTEGER,Size INTEGER,Quality TEXT,Languages TEXT,PublishedDate TEXT,Message TEXT,Indexer TEXT);
+      INSERT INTO Blocklist VALUES(1,1,'[1,2]','2026-01-02 00:00:00','Blocked TV pack',2,100,'{"quality":1}','[1]','2026-01-01 00:00:00','PRIVATE_BLOCKLIST_SENTINEL','private-indexer');
+      INSERT INTO Blocklist VALUES(2,1,'[1]','2026-01-03 00:00:00','Blocked TV pilot',1,200,NULL,NULL,NULL,'PRIVATE_BLOCKLIST_SENTINEL','private-indexer');
+    "#).await.unwrap();
+    c.execute("UPDATE Series SET Path=?", [tv_root.to_str().unwrap()])
+        .await
+        .unwrap();
+    for id in 3..=26 {
+        c.execute("INSERT INTO Blocklist(Id,SeriesId,EpisodeIds,Date,SourceTitle,Protocol) VALUES(?,1,'[2]','2026-01-01 00:00:00',?,0)", libsql::params![id,format!("Blocked TV extra {id:02}")]).await.unwrap();
+    }
+    drop(c);
+    drop(source);
+    let movie_path = root.join("blocklist-radarr.db");
+    let source = libsql::Builder::new_local(&movie_path)
+        .build()
+        .await
+        .unwrap();
+    let c = source.connect().unwrap();
+    c.execute_batch(r#"
+      CREATE TABLE VersionInfo(Version INTEGER); INSERT INTO VersionInfo VALUES(242);
+      CREATE TABLE MovieMetadata(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER);
+      INSERT INTO MovieMetadata VALUES(1,901,'tt7654999','Blocklist movie',2021);
+      CREATE TABLE Movies(Id INTEGER,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);
+      INSERT INTO Movies VALUES(1,1,'/fixture/blocklist-movie',1,0);
+      CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);
+      CREATE TABLE Blocklist(Id INTEGER,MovieId INTEGER,Date TEXT,SourceTitle TEXT,Protocol INTEGER,Size INTEGER,Quality TEXT,Languages TEXT,PublishedDate TEXT,Message TEXT,Indexer TEXT);
+      INSERT INTO Blocklist VALUES(1,1,'2026-01-04 00:00:00','Blocked movie',2,300,'{"quality":1}','[1]',NULL,'PRIVATE_BLOCKLIST_SENTINEL','private-indexer');
+    "#).await.unwrap();
+    c.execute("UPDATE Movies SET Path=?", [movie_root.to_str().unwrap()])
+        .await
+        .unwrap();
+    drop(c);
+    drop(source);
+    Arc::new(BlocklistFixture {
+        db,
+        tv: std::fs::read(tv_path).unwrap(),
+        movies: std::fs::read(movie_path).unwrap(),
+    })
+}
+
 #[tokio::test]
 #[ignore = "manual browser fixture; owned loopback servers, max 15 minutes"]
 async fn library_ui_fixture() {
@@ -288,6 +362,7 @@ async fn library_ui_fixture() {
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0).await;
     let worker = commands::start_with_metadata(db.clone(), refresh, client.clone())
         .await
         .unwrap();
@@ -297,7 +372,13 @@ async fn library_ui_fixture() {
             .merge(episodes::router(db.clone()))
             .merge(import::router(db.clone()))
             .merge(provider_routes)
-            .merge(commands::router(db)),
+            .merge(commands::router(db.clone()))
+            .merge(blocklist::router(db))
+            .merge(
+                Router::new()
+                    .route("/api/fixture/import-blocklists", post(import_blocklists))
+                    .with_state(snapshot_fixture),
+            ),
     )
     .await;
     let shutdown = scratch.0.join("shutdown");

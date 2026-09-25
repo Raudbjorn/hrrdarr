@@ -1,4 +1,4 @@
-import type { MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -124,3 +124,13 @@ export const createMetadataCommand = (input: MetadataCommandInput) => validMetad
 export const getMetadataCommand = (id: string) => validOperation(id) ? request<MetadataCommand>(`/api/v1/metadata-refresh/commands/${id}`,undefined,undefined,true) : invalidProvider<MetadataCommand>();
 export const cancelMetadataCommand = (id: string) => validOperation(id) ? request<MetadataCommand>(`/api/v1/metadata-refresh/commands/${id}/cancel`,undefined,'POST',true) : invalidProvider<MetadataCommand>();
 export const deleteMetadataCommand = (id: string) => validOperation(id) ? request<void>(`/api/v1/metadata-refresh/commands/${id}`,undefined,'DELETE',true) : invalidProvider<void>();
+
+const validBlocklistIdentity = (id:BlocklistIdentity) => ['sonarr','radarr'].includes(id.application) && /^[a-f0-9]{64}$/.test(id.fingerprint) && validId(id.source_id);
+const invalidBlocklist = <T>(): Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid blocklist identity or selection.'});
+export const listBlocklist = (query:BlocklistQuery = {}) => {
+  const params=new URLSearchParams({limit:String(query.limit??25),offset:String(query.offset??0)});
+  for(const field of ['media_type','series_ids','movie_ids','protocols','sort','sort_direction'] as const) if(query[field]!==undefined) params.set(field,String(query[field]));
+  return request<ApiPage<BlocklistEntry>>(`/api/v1/blocklist?${params}`,undefined,undefined,true);
+};
+export const deleteBlocklistEntry = (id:BlocklistIdentity) => validBlocklistIdentity(id) ? request<void>(`/api/v1/blocklist/${id.application}/${id.fingerprint}/${id.source_id}`,undefined,'DELETE',true) : invalidBlocklist<void>();
+export const deleteBlocklistEntries = (input:BlocklistRemoval) => input.ids.length>0 && input.ids.length<=100 && input.ids.every(validBlocklistIdentity) && new Set(input.ids.map(id=>`${id.application}:${id.fingerprint}:${id.source_id}`)).size===input.ids.length ? request<void>('/api/v1/blocklist/bulk',input,'DELETE',true) : invalidBlocklist<void>();

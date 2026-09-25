@@ -273,6 +273,74 @@ async function verifyMetadataRefresh() {
   assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
 }
 
+async function verifyBlocklist() {
+  const imported=await page.request.post(`${origin}/api/fixture/import-blocklists`);
+  assert.equal(imported.status(),200,await imported.text());
+  const reports=await imported.json();assert.equal(reports.length,2);
+  for(const report of reports){assert.equal(report.applied,true);assert.equal(report.conflicts,0);}
+  const read=async(query='')=>{const response=await page.request.get(`${origin}/api/v1/blocklist?limit=100${query}`);assert.equal(response.status(),200);return response.json();};
+  let records=await read();assert.equal(records.total,27);
+  const tv=records.items.find(item=>item.source_title==='Blocked TV pack');
+  const movie=records.items.find(item=>item.source_title==='Blocked movie');
+  assert.equal(tv.id.source_id,movie.id.source_id);
+  assert.equal(tv.target.series_id,movie.target.movie_id,'Equal numeric parent IDs must retain distinct domains');
+  assert.equal(tv.target.episode_ids.length,2);assert.equal(new Set(tv.target.episode_ids).size,2);
+  assert.notEqual(tv.id.fingerprint,movie.id.fingerprint);
+  assert.ok(!JSON.stringify(records).includes('PRIVATE_BLOCKLIST_SENTINEL'));
+  assert.ok(!JSON.stringify(records).includes('private-indexer'));
+  await page.getByRole('button',{name:'Blocklist',exact:true}).click();
+  await page.getByText('27 matching entries. Selection applies only to the current page.',{exact:true}).waitFor();
+  const next=page.waitForResponse(response=>response.url().includes('/api/v1/blocklist?')&&response.url().includes('offset=25'));
+  await page.getByRole('button',{name:'Next blocklist page',exact:true}).click();
+  assert.equal((await (await next).json()).items.length,2);
+  await page.getByLabel('Blocklist media').selectOption('tv');
+  await page.getByLabel('Library IDs',{exact:true}).fill(`${tv.target.series_id}, 999999`);
+  await page.getByLabel('Blocklist protocol').selectOption('torrent');
+  const filtered=page.waitForResponse(response=>response.url().includes('/api/v1/blocklist?')&&response.url().includes('series_ids='));
+  await page.getByRole('button',{name:'Apply blocklist filters',exact:true}).click();
+  const filterResponse=await filtered;
+  assert.equal(new URL(filterResponse.url()).searchParams.get('series_ids'),`${tv.target.series_id},999999`,'Validated CSV whitespace is canonicalized before sending');
+  assert.equal((await filterResponse.json()).total,1);
+  await page.getByRole('button',{name:'Blocked TV pack',exact:true}).click();
+  const detail=page.getByRole('region',{name:'Blocklist entry detail'});
+  assert.match(await detail.innerText(),new RegExp(`episodes ${tv.target.episode_ids.join(', ')}`));
+  assert.match(await detail.innerText(),/source_snapshot/);
+  assert.ok(!(await page.locator('body').innerText()).includes('PRIVATE_BLOCKLIST_SENTINEL'));
+  // Single removal requires confirmation; abandoning it has no effect.
+  await page.getByRole('button',{name:'Remove this entry',exact:true}).click();
+  await page.getByRole('button',{name:'Keep blocklist entries',exact:true}).click();
+  assert.equal((await read()).total,27);
+  await page.getByRole('button',{name:'Remove this entry',exact:true}).click();
+  await page.getByRole('button',{name:'Confirm blocklist removal',exact:true}).click();
+  await page.getByText('Blocklist entries removed. Library records, files and client downloads remain intact.',{exact:true}).waitFor();
+  assert.equal((await read()).total,26);
+  await page.getByLabel('Blocklist media').selectOption('');
+  await page.getByLabel('Library IDs',{exact:true}).fill('');
+  await page.getByLabel('Blocklist protocol').selectOption('');
+  await page.getByRole('button',{name:'Apply blocklist filters',exact:true}).click();
+  await page.getByLabel('Select movies Blocked movie (1)',{exact:true}).check();
+  await page.getByLabel('Select tv Blocked TV pilot (2)',{exact:true}).check();
+  await page.getByRole('button',{name:'Remove selected entries (2)',exact:true}).click();
+  let deletes=0;
+  await page.route('**/api/v1/blocklist/bulk',async route=>{deletes++;await route.fetch();await route.abort('failed');});
+  await page.getByRole('button',{name:'Confirm blocklist removal',exact:true}).click();
+  await page.getByText(/removal may have completed/).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Remove selected entries (2)',exact:true}).isDisabled(),true);
+  await page.unroute('**/api/v1/blocklist/bulk');
+  await page.getByRole('button',{name:'Refresh blocklist',exact:true}).click();
+  await page.getByText('24 matching entries. Selection applies only to the current page.',{exact:true}).waitFor();
+  assert.equal(deletes,1,'Lost deletion response must never cause automatic replay');
+  const replay=await page.request.post(`${origin}/api/fixture/import-blocklists`);assert.equal(replay.status(),200);
+  const replayReports=await replay.json();assert.equal(replayReports.length,2);
+  for(const report of replayReports){assert.equal(report.applied,true);assert.equal(report.conflicts,0);}
+  records=await read();assert.equal(records.total,24,'Same-snapshot replay must retain removals');
+  assert.ok(records.items.every(item=>item.target.media_type==='tv'));
+  await page.reload();await page.getByRole('button',{name:'Blocklist',exact:true}).click();
+  await page.getByText('24 matching entries. Selection applies only to the current page.',{exact:true}).waitFor();
+  assert.equal(await readFile(`${scratch}/tv/pilot.mkv`,'utf8'),'scratch episode media');
+  assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
+}
+
 try {
   await page.goto(origin);
   await add('tv', 'Fixture series', `${scratch}/tv`);
@@ -348,11 +416,12 @@ try {
   await verifyProviders();
   await verifyActivity();
   await verifyMetadataRefresh();
+  await verifyBlocklist();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});

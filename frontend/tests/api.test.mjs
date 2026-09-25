@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand } from '../src/lib/api.ts';
+import { loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -297,5 +297,33 @@ test('metadata refresh keeps equal TV/movie IDs distinct and never retries uncer
   await withFetch(async()=>{throw new Error('must not fetch');},async()=>{
     assert.equal((await createMetadataCommand({target:{media_type:'movies',movie_id:0},priority:'normal'})).ok,false);
     assert.equal((await getMetadataCommand('../commands')).ok,false);
+  });
+});
+
+
+test('blocklist preserves composite identities, scoped filters and explicit no-retry removals', async()=>{
+  const tv={application:'sonarr',fingerprint:'a'.repeat(64),source_id:1};
+  const movie={application:'radarr',fingerprint:'b'.repeat(64),source_id:1};
+  const calls=[];
+  await withFetch(async(path,options)=>{
+    calls.push([path,options.method,options.body?JSON.parse(options.body):undefined]);
+    return options.method==='DELETE'?new Response(null,{status:204}):json({items:[],total:0,limit:25,offset:0});
+  },async()=>{
+    await listBlocklist({media_type:'tv',series_ids:'1,2',protocols:'torrent',sort:'source_title',sort_direction:'asc',offset:25});
+    assert.deepEqual(await deleteBlocklistEntry(tv),{ok:true,data:undefined});
+    assert.deepEqual(await deleteBlocklistEntries({ids:[tv,movie]}),{ok:true,data:undefined});
+  });
+  assert.equal(calls[0][0],'/api/v1/blocklist?limit=25&offset=25&media_type=tv&series_ids=1%2C2&protocols=torrent&sort=source_title&sort_direction=asc');
+  assert.deepEqual(calls[1],[`/api/v1/blocklist/sonarr/${tv.fingerprint}/1`,'DELETE',undefined]);
+  assert.deepEqual(calls[2],['/api/v1/blocklist/bulk','DELETE',{ids:[tv,movie]}]);
+  let requests=0;
+  await withFetch(async()=>{requests++;throw new DOMException('Timed out','TimeoutError');},async()=>{
+    assert.deepEqual(await deleteBlocklistEntries({ids:[tv,movie]}),{ok:false,error:'Timed out'});
+  });
+  assert.equal(requests,1);
+  await withFetch(async()=>{throw new Error('must not fetch');},async()=>{
+    assert.equal((await deleteBlocklistEntry({...tv,fingerprint:'../private'})).ok,false);
+    assert.equal((await deleteBlocklistEntries({ids:[tv,tv]})).ok,false);
+    assert.equal((await deleteBlocklistEntries({ids:[]})).ok,false);
   });
 });

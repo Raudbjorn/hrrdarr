@@ -10,6 +10,24 @@ export type ApiErrorEnvelope = { error: ApiErrorDetail, };
 
 export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset: number, };
 
+export type BlocklistEntry = { id: BlocklistIdentity, origin: BlocklistOrigin, target: BlocklistTarget, occurred_at: string, published_at: string | null, source_title: string, protocol: BlocklistProtocol | null, size_bytes: number | null, quality: FileQuality | null, languages: Array<number> | null, };
+
+export type BlocklistIdentity = { application: SnapshotApplication, fingerprint: string, source_id: number, };
+
+export type BlocklistOrigin = "source_snapshot";
+
+export type BlocklistProtocol = "unknown" | "usenet" | "torrent";
+
+export type BlocklistQuery = { media_type?: MediaDomain, series_ids?: string, movie_ids?: string, protocols?: string, sort?: BlocklistSort, sort_direction?: BlocklistSortDirection, limit?: number, offset?: number, };
+
+export type BlocklistRemoval = { ids: Array<BlocklistIdentity>, };
+
+export type BlocklistSort = "date" | "source_title";
+
+export type BlocklistSortDirection = "asc" | "desc";
+
+export type BlocklistTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
+
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
 
 export type CategoryDiscoveryError = { code: string, message: string, retry_after_seconds: number | null, };
