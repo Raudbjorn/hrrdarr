@@ -158,6 +158,16 @@ pub fn render() -> String {
         crate::media_files::FileEditor,
         crate::media_files::FileResource,
         crate::api::ApiPage<crate::media_files::FileResource>,
+        crate::naming::NamingErrorEnvelope,
+        crate::naming::ColonReplacement,
+        crate::naming::TvNamingConfig,
+        crate::naming::TvNamingUpdate,
+        crate::naming::TvNamingExamplesQuery,
+        crate::naming::TvNamingExamples,
+        crate::naming::MovieNamingConfig,
+        crate::naming::MovieNamingUpdate,
+        crate::naming::MovieNamingExamplesQuery,
+        crate::naming::MovieNamingExamples,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",

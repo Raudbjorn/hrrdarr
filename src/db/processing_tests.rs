@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 28); // Latest open adds same-path exchange authority; fixed predecessors remain unchanged.
+    assert_eq!(version(&c).await?, 29); // Latest open adds naming settings singleton; fixed predecessors remain unchanged.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

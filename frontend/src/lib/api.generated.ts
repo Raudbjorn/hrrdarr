@@ -52,6 +52,8 @@ export type CategoryOrigin = "advertised" | "standard_fallback";
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
+export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
+
 export type Command = { id: string, name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, items_observed: number, };
 
 export type CommandInput = { name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, };
@@ -261,6 +263,18 @@ export type MovieFileResource = { movie_id: number, edition: string | null, orig
 export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
 
 export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
+
+export type MovieNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
+
+export type MovieNamingExamples = { standard_movie_format: string | null, movie_folder_format: string | null, };
+
+export type MovieNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_movie_format?: string, movie_folder_format?: string, };
+
+export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
+
+export type NamingErrorDetail = { code: string, message: string, };
+
+export type NamingErrorEnvelope = { error: NamingErrorDetail, };
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
@@ -475,6 +489,14 @@ export type TestStatus = "never_tested" | "success" | "failure";
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
 export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
+
+export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
+
+export type TvNamingExamples = { standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, };
+
+export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_episode_format?: string, daily_episode_format?: string, anime_episode_format?: string, series_folder_format?: string, season_folder_format?: string, specials_folder_format?: string, };
+
+export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
 export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
 

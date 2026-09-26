@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 29 remains unknown after migration 28 adds same-path replacement.
+    // Version 30 remains unknown after migration 29 adds naming settings singleton.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (29,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (30,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        28 // Latest schema adds same-path replacement authority.
+        29 // Latest schema adds naming settings singleton.
     );
     assert_eq!(
         scalar(
@@ -1928,5 +1928,243 @@ async fn remote_mappings_upgrade_rollback_constraints_and_reopen() -> Result<(),
         .await,
         2
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+        (
+            "root_folders",
+            include_str!("../migrations/0014_root_folders.sql"),
+        ),
+        (
+            "remote_path_mappings",
+            include_str!("../migrations/0015_remote_path_mappings.sql"),
+        ),
+        (
+            "download_refresh",
+            include_str!("../migrations/0016_download_refresh.sql"),
+        ),
+        (
+            "import_history_order",
+            include_str!("../migrations/0017_import_history_order.sql"),
+        ),
+        (
+            "snapshot_history",
+            include_str!("../migrations/0018_snapshot_history.sql"),
+        ),
+        (
+            "profile_policy",
+            include_str!("../migrations/0019_profile_policy.sql"),
+        ),
+        (
+            "snapshot_profiles",
+            include_str!("../migrations/0020_snapshot_profiles.sql"),
+        ),
+        (
+            "metadata_refresh_commands",
+            include_str!("../migrations/0021_metadata_refresh_commands.sql"),
+        ),
+        (
+            "snapshot_blocklist",
+            include_str!("../migrations/0022_snapshot_blocklist.sql"),
+        ),
+        (
+            "blocklist_clear_commands",
+            include_str!("../migrations/0023_blocklist_clear_commands.sql"),
+        ),
+        (
+            "release_catalog_policy",
+            include_str!("../migrations/0024_release_catalog_policy.sql"),
+        ),
+        (
+            "rss_grab_journal",
+            include_str!("../migrations/0025_rss_grab_journal.sql"),
+        ),
+        (
+            "download_processing",
+            include_str!("../migrations/0026_download_processing.sql"),
+        ),
+        (
+            "targeted_search",
+            include_str!("../migrations/0027_targeted_search.sql"),
+        ),
+        (
+            "same_path_replacements",
+            include_str!("../migrations/0028_same_path_replacements.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Kept','/tv/Kept');")
+        .await?;
+    let tx = c.transaction().await?;
+    tx.execute_batch(include_str!("../migrations/0029_naming_settings.sql"))
+        .await?;
+    assert!(
+        tx.execute(
+            "INSERT INTO naming_settings(domain,rename_enabled,replace_illegal_characters,colon_replacement,revision) VALUES('bad',0,1,'smart',1)",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        scalar(&c,"SELECT count(*) FROM sqlite_schema WHERE name IN ('naming_settings','naming_settings_revision_step')").await,
+        0
+    );
+    drop(c);
+    drop(raw);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        29 // Latest schema adds naming settings singleton.
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
+        1
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM naming_settings").await, 2);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM naming_settings WHERE domain='tv'").await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM naming_settings WHERE domain='movies'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(&c,"SELECT count(*) FROM naming_settings WHERE rename_enabled=0 AND replace_illegal_characters=1 AND colon_replacement='smart' AND custom_colon_replacement IS NULL AND revision=1 AND standard_episode_format IS NULL AND daily_episode_format IS NULL AND anime_episode_format IS NULL AND series_folder_format IS NULL AND season_folder_format IS NULL AND specials_folder_format IS NULL AND multi_episode_style IS NULL AND standard_movie_format IS NULL AND movie_folder_format IS NULL").await,
+        2
+    );
+    for sql in [
+        "UPDATE naming_settings SET revision=2,standard_movie_format='{Movie Title}' WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=2,movie_folder_format='{Movie Title}' WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=2,standard_episode_format='{Episode Title}' WHERE domain='movies'",
+        "UPDATE naming_settings SET revision=2,series_folder_format='{Series Title}' WHERE domain='movies'",
+        "UPDATE naming_settings SET revision=2,multi_episode_style=0 WHERE domain='movies'",
+        "UPDATE naming_settings SET revision=2,colon_replacement='custom' WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=2,custom_colon_replacement=':' WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=2,colon_replacement='unsupported' WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=2,multi_episode_style=6 WHERE domain='tv'",
+        "UPDATE naming_settings SET revision=5 WHERE domain='movies'",
+        "UPDATE naming_settings SET revision=1 WHERE domain='movies'",
+        "INSERT INTO naming_settings(domain,rename_enabled,replace_illegal_characters,colon_replacement,revision) VALUES('anime',0,1,'smart',1)",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    assert_eq!(
+        scalar(&c, "SELECT revision FROM naming_settings WHERE domain='tv'").await,
+        1
+    );
+    c.execute("UPDATE naming_settings SET revision=2,colon_replacement='custom',custom_colon_replacement=':' WHERE domain='tv'",()).await?;
+    c.execute(
+        "UPDATE naming_settings SET revision=2 WHERE domain='movies'",
+        (),
+    )
+    .await?;
+    assert_eq!(
+        scalar(&c, "SELECT revision FROM naming_settings WHERE domain='tv'").await,
+        2
+    );
+    assert_eq!(
+        scalar(&c,"SELECT count(*) FROM naming_settings WHERE domain='tv' AND colon_replacement='custom' AND custom_colon_replacement=':'").await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT revision FROM naming_settings WHERE domain='movies'"
+        )
+        .await,
+        2
+    );
+    drop(c);
+    drop(db);
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_none());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c,"SELECT count(*) FROM naming_settings WHERE colon_replacement='custom' AND custom_colon_replacement=':'").await,
+        1
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM naming_settings").await, 2);
     Ok(())
 }

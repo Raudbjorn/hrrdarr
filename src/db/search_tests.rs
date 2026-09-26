@@ -113,7 +113,7 @@ async fn search_schema26_upgrade_rollback_transfer_origin_and_retention() -> Res
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 28); // Latest open adds same-path exchange authority.
+    assert_eq!(version(&c).await?, 29); // Latest open adds naming settings singleton.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

@@ -27,3 +27,5 @@ pub mod metadata;
 
 pub mod blocklist;
 pub mod search;
+
+pub mod naming;

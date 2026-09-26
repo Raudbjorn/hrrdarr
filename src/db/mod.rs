@@ -129,6 +129,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "same_path_replacements",
         include_str!("../../migrations/0028_same_path_replacements.sql"),
     ),
+    (
+        "naming_settings",
+        include_str!("../../migrations/0029_naming_settings.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

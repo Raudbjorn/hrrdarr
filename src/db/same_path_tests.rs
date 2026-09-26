@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 28);
+    assert_eq!(version(&c).await?, 29); // Latest open adds naming settings singleton.
     for op in &operations {
         let r = c
             .query(
