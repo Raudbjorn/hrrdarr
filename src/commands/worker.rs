@@ -500,8 +500,13 @@ mod tests {
         .await
         .unwrap();
         let rescan_id = Uuid::new_v4();
+        // created_at=1 (not 0, tying manual_import_commands' row): if the kind=7 deferral
+        // predicate were ever broken, both rows would become simultaneously eligible and this
+        // ordering makes manual_import_commands (created_at=0) deterministically win the tie,
+        // so a regression here fails this test every time rather than ~50% of the time on
+        // random UUID ordering (flagged during the kind=5 test's own dispatch, fixed to match).
         c.execute(
-            "INSERT INTO rescan_commands(id,media_type,series_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',1,0,'queued',0,0,0)",
+            "INSERT INTO rescan_commands(id,media_type,series_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',1,0,'queued',0,0,1)",
             [rescan_id.to_string()],
         )
         .await
@@ -524,5 +529,138 @@ mod tests {
             panic!("expected the manual import to become claimable once the rescan cleared");
         };
         assert_eq!(claimed.id, command_id);
+    }
+
+    // Trimmed, duplicated variant of rescan::tests::admit_pending_replacement's fixture chain (private per-file test modules) that stops at 'observed', skipping its replacement-only wiring.
+    async fn observed_candidate(c: &Connection, series_id: i64, episode_id: i64) -> Uuid {
+        let indexer = Uuid::new_v4().to_string();
+        let client = Uuid::new_v4().to_string();
+        c.execute_batch(&format!(
+            "INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('{indexer}','torznab','Indexer',1,1,1,1,'http://indexer');
+             INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search) VALUES('{indexer}','torznab','tv','[5000]','[]',0);
+             INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('{client}','qbittorrent','Client',1,1,1,1,'http://client');
+             INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES('{client}','qbittorrent','tv','tv',0,1,'started','default',0,0,0);"
+        ))
+        .await
+        .unwrap();
+        let command_id = Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO rss_commands(id,name,media_type,status,next_attempt_at,created_at,indexer_id,indexer_revision,client_id,client_revision) VALUES(?,'rss_sync','tv','queued',9007199254740991,0,?,1,?,1)",
+            params![command_id.clone(), indexer.clone(), client.clone()],
+        )
+        .await
+        .unwrap();
+        let candidate_id = Uuid::new_v4();
+        let fingerprint = "a".repeat(64);
+        let payload = vec![0u8; 32];
+        c.execute(
+            "INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,status,decision_reasons_json,created_at,updated_at) VALUES(?,?,'tv',?,1,?,1,?,'Release',?,?,'pending','[]',0,0)",
+            params![
+                candidate_id.to_string(),
+                command_id,
+                indexer,
+                client.clone(),
+                fingerprint,
+                payload,
+                series_id
+            ],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id) VALUES(?,?,?)",
+            params![candidate_id.to_string(), series_id, episode_id],
+        )
+        .await
+        .unwrap();
+        let hash = "b".repeat(40);
+        let identity = serde_json::json!({
+            "version": 1,
+            "target": {"media_type": "episode", "id": episode_id},
+            "hashes": [hash.clone()],
+            "settings_fingerprint": "c".repeat(64),
+            "payload_sha256": "d".repeat(64),
+        })
+        .to_string();
+        c.execute(
+            "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+            params![identity, candidate_id.to_string()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO rss_hash_claims(client_id,hash,candidate_id) VALUES(?,?,?)",
+            params![client.clone(), hash.clone(), candidate_id.to_string()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+            [candidate_id.to_string()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+            params![hash, candidate_id.to_string()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode) VALUES(?,'tv',1,1,1,'copy')",
+            [client],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) VALUES(?,1,'queued',0,0,0)",
+            [candidate_id.to_string()],
+        )
+        .await
+        .unwrap();
+        candidate_id
+    }
+
+    // A queued download_processing row for a target with an active rescan must be deferred by
+    // claim()'s own SELECT, not claimed and then aborted by rescan_blocks_processing's RAISE.
+    #[tokio::test]
+    async fn claim_defers_a_queued_download_processing_whose_target_has_an_active_rescan() {
+        let path = std::env::temp_dir().join(format!("hrrdarr-kind5-deferral-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _scratch = Scratch(path.clone());
+        let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+        let c = connection(&db).await.unwrap();
+        c.execute_batch(
+            "INSERT INTO series(id,title,path) VALUES(1,'Show','/tv/show');
+             INSERT INTO seasons(series_id,number) VALUES(1,1);
+             INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Pilot');",
+        )
+        .await
+        .unwrap();
+        let candidate_id = observed_candidate(&c, 1, 1).await;
+        let rescan_id = Uuid::new_v4();
+        c.execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',1,0,'queued',0,0,1)",
+            [rescan_id.to_string()],
+        )
+        .await
+        .unwrap();
+        // download_processing sorts first on created_at (0 < 1) among eligible kind=5/9 rows, so
+        // the rescan being claimed here only happens because the kind=5 predicate excluded it.
+        let Some(Claimed::Rescan(claimed_rescan)) = claim(&db).await.unwrap() else {
+            panic!("expected the rescan to be claimed while download_processing is deferred");
+        };
+        assert_eq!(claimed_rescan.id, rescan_id);
+        c.execute(
+            "UPDATE rescan_commands SET status='succeeded',files_adopted=0,files_removed=0,completed_at=1 WHERE id=?",
+            [rescan_id.to_string()],
+        )
+        .await
+        .unwrap();
+        // Picked up once the rescan clears.
+        let Some(Claimed::Processing(claimed)) = claim(&db).await.unwrap() else {
+            panic!("expected download_processing to become claimable once the rescan cleared");
+        };
+        assert_eq!(claimed.receipt_id, candidate_id);
     }
 }
