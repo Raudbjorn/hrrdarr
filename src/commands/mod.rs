@@ -68,8 +68,11 @@ fn conflict() -> Error {
 }
 /// Every command table admitted through the shared 1024-row capacity pool (see each
 /// `*_admit` trigger) must be counted here; a table left out here can still be inserted
-/// past the trigger's own limit undetected by any pre-check.
-const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)+(SELECT count(*) FROM quality_reset_commands)+(SELECT count(*) FROM rescan_commands)";
+/// past the trigger's own limit undetected by any pre-check. Only non-terminal rows count
+/// (migration 0033): a capacity limit bounds concurrent/pending work, not historical audit
+/// rows, and nothing in this schema prunes terminal rows -- counting them here too would let
+/// ordinary scheduled churn alone exhaust the pool over long uptimes.
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
 async fn command_capacity(c: &Connection) -> Result<i64> {
     Ok(c.query(COMMAND_CAPACITY_SQL, ())
         .await?

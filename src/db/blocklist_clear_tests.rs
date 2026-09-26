@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 32); // Latest open adds rescan commands; fixed predecessors remain unchanged.
+    assert_eq!(version(&c).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
     for (i, table) in tables.iter().enumerate() {
         assert_eq!(rows(&c, table).await?, before[i]);
     }
@@ -262,12 +262,71 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
         }
         total += 1;
     }
-    assert!(clear(&c, "tv").await.is_err());
-    assert!(metadata(&c).await.is_err());
-    assert!(enqueue(&c, &provider, "movies").await.is_err());
+    // Every one of those 1024 historical rows is terminal (migration 0033: active rows only count
+    // toward the shared pool), so the pool is not actually full yet -- pad it with genuinely active
+    // search_commands rows (no per-target uniqueness, unlike the tables above) to prove admission
+    // is really rejected once every pool table combined reaches 1024.
+    let search_indexer = super::refresh_tests::search_indexer(&c, "tv").await?;
+    let active = scalar(
+        &c,
+        &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL),
+    )
+    .await?;
+    let padding = super::refresh_tests::pad_search_commands(
+        &c,
+        &search_indexer,
+        &provider,
+        "tv",
+        1024 - active,
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL)
+        )
+        .await?,
+        1024
+    );
+    assert!(
+        clear(&c, "tv")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    assert!(
+        metadata(&c)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    assert!(
+        enqueue(&c, &provider, "movies")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
     assert_eq!(scalar(&c, TOTAL).await?, 1024);
     c.execute("DELETE FROM blocklist_clear_commands WHERE id=?", [tv])
         .await?;
+    // The DELETE above only removed an already-terminal row, so it did not free the pool (migration
+    // 0033): the pool is still exactly full.
+    assert!(
+        clear(&c, "movies")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    // Cancelling one active padding row instead proves capacity really does free up again.
+    c.execute(
+        "UPDATE search_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [padding[0].clone()],
+    )
+    .await?;
     let slot = clear(&c, "movies").await?;
     assert!(
         c.execute(

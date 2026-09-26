@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 33 remains unknown after migration 32 adds rescan commands.
+    // Version 34 remains unknown after migration 33 adds active-only command capacity.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (33,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (34,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(
@@ -2866,8 +2866,19 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     // body is byte-for-byte the migration-30 body with only the new capacity term inserted before
     // the limit; a `contains` check alone would miss drift elsewhere in the copied body. This test
     // opens the database through the real, current migration runner, so later migrations that also
-    // DROP/CREATE these same six triggers (each appending one more chained capacity term) must be
-    // reflected here too, in the order they were applied.
+    // DROP/CREATE these same six triggers (each appending one more chained capacity term, then
+    // migration 33 making every term active-only) must be reflected here too, in the order they
+    // were applied.
+    let all_pool_tables = [
+        "commands",
+        "metadata_refresh_commands",
+        "blocklist_clear_commands",
+        "rss_commands",
+        "search_commands",
+        "manual_import_commands",
+        "quality_reset_commands",
+        "rescan_commands",
+    ];
     for name in sibling_admit_triggers {
         let sql: String = c
             .query(
@@ -2879,13 +2890,22 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
             .await?
             .unwrap()
             .get(0)?;
-        let expected = sibling_sql_before[name]
+        let mut expected = sibling_sql_before[name]
             .replacen(
                 ">=1024",
                 "+(SELECT count(*) FROM quality_reset_commands)>=1024",
                 1,
             )
             .replacen(">=1024", "+(SELECT count(*) FROM rescan_commands)>=1024", 1);
+        for table in all_pool_tables {
+            expected = expected.replacen(
+                &format!("(SELECT count(*) FROM {table})"),
+                &format!(
+                    "(SELECT count(*) FROM {table} WHERE status IN ('queued','running','retry_wait'))"
+                ),
+                1,
+            );
+        }
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
 
@@ -3223,7 +3243,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        32 // Latest schema adds rescan commands.
+        33 // Latest schema adds active-only command capacity.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -3235,8 +3255,20 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     );
 
     // A real upgrade DROP/CREATEs exactly the seven known sibling admit triggers, and each
-    // recreated body is byte-for-byte the migration-31 body with only the new capacity term
-    // inserted before the limit; a `contains` check alone would miss drift elsewhere in the body.
+    // recreated body is byte-for-byte the migration-31 body with the new capacity term inserted
+    // before the limit (migration 32), then every unconditional `count(*)` term made active-only
+    // (migration 33, applied by this same reopen); a `contains` check alone would miss drift
+    // elsewhere in the body.
+    let all_pool_tables = [
+        "commands",
+        "metadata_refresh_commands",
+        "blocklist_clear_commands",
+        "rss_commands",
+        "search_commands",
+        "manual_import_commands",
+        "quality_reset_commands",
+        "rescan_commands",
+    ];
     for name in sibling_admit_triggers {
         let sql: String = c
             .query(
@@ -3248,14 +3280,24 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
             .await?
             .unwrap()
             .get(0)?;
-        let expected = sibling_sql_before[name].replacen(
+        let mut expected = sibling_sql_before[name].replacen(
             ">=1024",
             "+(SELECT count(*) FROM rescan_commands)>=1024",
             1,
         );
+        for table in all_pool_tables {
+            expected = expected.replacen(
+                &format!("(SELECT count(*) FROM {table})"),
+                &format!(
+                    "(SELECT count(*) FROM {table} WHERE status IN ('queued','running','retry_wait'))"
+                ),
+                1,
+            );
+        }
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
-    // The new eighth pool member carries the same full eight-way capacity sum from the start.
+    // The new eighth pool member carries the same full eight-way capacity sum from the start
+    // (migration 32), then the same active-only rewrite as every sibling (migration 33).
     let rescan_admit_sql: String = c
         .query(
             "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='rescan_admit'",
@@ -3267,7 +3309,9 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
         .unwrap()
         .get(0)?;
     assert!(
-        rescan_admit_sql.contains("+(SELECT count(*) FROM rescan_commands)>=1024"),
+        rescan_admit_sql.contains(
+            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
+        ),
         "{rescan_admit_sql}"
     );
 
@@ -3867,5 +3911,440 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
         .await,
         0
     );
+    Ok(())
+}
+
+fn normalize_whitespace(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Standing guard: every shared-pool admit trigger must count every pool table. The pool
+// membership is *derived* from the triggers actually found (by their shared
+// 'command capacity reached' abort message), not hardcoded, so a future migration that adds a 9th
+// pool table but forgets to update every sibling body fails this test loudly instead of silently
+// under-counting capacity in production. The fixed comparison against today's known eight tables
+// additionally catches the opposite failure: a table silently and consistently dropped from every
+// trigger body at once (which the cross-reference check alone would not detect, since a shrunken
+// but internally consistent set would still pass it).
+#[tokio::test]
+async fn pool_admit_triggers_cross_reference_every_capacity_table() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let db = Database::open_local(files.db()).await?;
+    let c = db.connect().await?;
+    let mut rows = c
+        .query(
+            "SELECT name,tbl_name,sql FROM sqlite_schema WHERE type='trigger' AND name LIKE '%_admit' AND sql LIKE '%command capacity reached%'",
+            (),
+        )
+        .await?;
+    let mut triggers = std::collections::BTreeMap::new();
+    let mut pool_tables = std::collections::BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        let name: String = row.get(0)?;
+        let table: String = row.get(1)?;
+        let sql: String = row.get(2)?;
+        pool_tables.insert(table.clone());
+        triggers.insert(name, (table, sql));
+    }
+    let known_pool_tables: std::collections::BTreeSet<String> = [
+        "commands",
+        "metadata_refresh_commands",
+        "blocklist_clear_commands",
+        "rss_commands",
+        "search_commands",
+        "manual_import_commands",
+        "quality_reset_commands",
+        "rescan_commands",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        pool_tables, known_pool_tables,
+        "the shared command-capacity pool must have exactly these eight member tables; update \
+         both this list and every admit trigger body together if that ever changes"
+    );
+    assert_eq!(
+        triggers.len(),
+        pool_tables.len(),
+        "expected exactly one capacity-admit trigger per pool table"
+    );
+    for (name, (table, sql)) in &triggers {
+        let body = normalize_whitespace(sql);
+        for other in &pool_tables {
+            let clause = normalize_whitespace(&format!(
+                "FROM {other} WHERE status IN ('queued','running','retry_wait')"
+            ));
+            assert!(
+                body.contains(&clause),
+                "{name} (on {table}) must count active rows in {other} toward the shared pool, \
+                 found: {sql}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// Direct migration test for 0033 (the active-only command-capacity pool). Follows the upgrade/
+// rollback/reopen pattern of migration 0032's own test (rescan_commands_upgrade_rollback_mutual_
+// exclusion_and_reopen above): a fresh application and rollback must leave the schema
+// byte-identical, and a real upgrade must preserve prior data and land at version 33. It then
+// proves the actual behavior change: terminal rows that would have exhausted the old unconditional
+// pool no longer occupy it, while active rows still enforce the exact 1024-row boundary.
+#[tokio::test]
+async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary()
+-> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+        (
+            "root_folders",
+            include_str!("../migrations/0014_root_folders.sql"),
+        ),
+        (
+            "remote_path_mappings",
+            include_str!("../migrations/0015_remote_path_mappings.sql"),
+        ),
+        (
+            "download_refresh",
+            include_str!("../migrations/0016_download_refresh.sql"),
+        ),
+        (
+            "import_history_order",
+            include_str!("../migrations/0017_import_history_order.sql"),
+        ),
+        (
+            "snapshot_history",
+            include_str!("../migrations/0018_snapshot_history.sql"),
+        ),
+        (
+            "profile_policy",
+            include_str!("../migrations/0019_profile_policy.sql"),
+        ),
+        (
+            "snapshot_profiles",
+            include_str!("../migrations/0020_snapshot_profiles.sql"),
+        ),
+        (
+            "metadata_refresh_commands",
+            include_str!("../migrations/0021_metadata_refresh_commands.sql"),
+        ),
+        (
+            "snapshot_blocklist",
+            include_str!("../migrations/0022_snapshot_blocklist.sql"),
+        ),
+        (
+            "blocklist_clear_commands",
+            include_str!("../migrations/0023_blocklist_clear_commands.sql"),
+        ),
+        (
+            "release_catalog_policy",
+            include_str!("../migrations/0024_release_catalog_policy.sql"),
+        ),
+        (
+            "rss_grab_journal",
+            include_str!("../migrations/0025_rss_grab_journal.sql"),
+        ),
+        (
+            "download_processing",
+            include_str!("../migrations/0026_download_processing.sql"),
+        ),
+        (
+            "targeted_search",
+            include_str!("../migrations/0027_targeted_search.sql"),
+        ),
+        (
+            "same_path_replacements",
+            include_str!("../migrations/0028_same_path_replacements.sql"),
+        ),
+        (
+            "naming_settings",
+            include_str!("../migrations/0029_naming_settings.sql"),
+        ),
+        (
+            "manual_import_commands",
+            include_str!("../migrations/0030_manual_import_commands.sql"),
+        ),
+        (
+            "quality_reset_commands",
+            include_str!("../migrations/0031_quality_reset_commands.sql"),
+        ),
+        (
+            "rescan_commands",
+            include_str!("../migrations/0032_rescan_commands.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+
+    // Reproduce the actual bug on the real, unmodified v32 schema: a provider and 1024 terminal
+    // (cancelled) `commands` rows -- ordinary historical churn, nothing concurrently active -- are
+    // already enough to exhaust the old unconditional pool outright.
+    let provider_id = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Client',1,1,1,1,'http://fixture.invalid')",[provider_id.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','tv','tv',0,0,'started','default',0,0,0)",[provider_id.clone()]).await?;
+    for _ in 0..1024 {
+        let id = uuid::Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at) VALUES(?,?,'tv',1,100,100)",
+            params![id.clone(), provider_id.clone()],
+        )
+        .await?;
+        c.execute(
+            "UPDATE commands SET status='cancelled',completed_at=101 WHERE id=?",
+            [id],
+        )
+        .await?;
+    }
+    assert_eq!(scalar(&c, "SELECT count(*) FROM commands").await, 1024);
+    let message = c
+        .execute(
+            "INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at) VALUES(?,?,'tv',1,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), provider_id.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("command capacity reached"),
+        "the pre-migration bug (unconditional count(*)) must reproduce on real v32: {message}"
+    );
+
+    let pool_tables = [
+        "commands",
+        "metadata_refresh_commands",
+        "blocklist_clear_commands",
+        "rss_commands",
+        "search_commands",
+        "manual_import_commands",
+        "quality_reset_commands",
+        "rescan_commands",
+    ];
+    let admit_triggers = [
+        "commands_admit",
+        "metadata_refresh_admit",
+        "blocklist_clear_admit",
+        "rss_commands_admit",
+        "search_commands_admit",
+        "manual_import_commands_admit",
+        "quality_reset_admit",
+        "rescan_admit",
+    ];
+    let mut sibling_sql_before = std::collections::BTreeMap::new();
+    for name in admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        sibling_sql_before.insert(name, sql);
+    }
+    // schema_fingerprint covers schema only (sqlite_schema type/name/sql), not row data, so the
+    // 1024 seeded rows above do not affect it either way.
+    let before = schema_fingerprint(&c).await;
+
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    tx.execute_batch(include_str!(
+        "../migrations/0033_command_capacity_active_only.sql"
+    ))
+    .await?;
+    tx.rollback().await?;
+    assert_eq!(
+        schema_fingerprint(&c).await,
+        before,
+        "rollback of migration 33 must leave the prior schema (including all eight DROP/CREATE-\
+         recreated admit triggers) byte-identical"
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        33
+    );
+    // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
+    // survive untouched.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM commands").await, 1024);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM commands WHERE status='cancelled'").await,
+        1024
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT count(*) FROM providers WHERE id='{provider_id}'")
+        )
+        .await,
+        1
+    );
+
+    // Every sibling trigger is DROP/CREATE-recreated with each unconditional `count(*)` term
+    // replaced by an active-only (queued/running/retry_wait) term for every pool table, and
+    // nothing else changes.
+    for name in admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        let mut expected = sibling_sql_before[name].clone();
+        for table in pool_tables {
+            expected = expected.replacen(
+                &format!("(SELECT count(*) FROM {table})"),
+                &format!(
+                    "(SELECT count(*) FROM {table} WHERE status IN ('queued','running','retry_wait'))"
+                ),
+                1,
+            );
+        }
+        assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
+    }
+
+    // Direct proof of the bug fix, on the very data that reproduced the bug above: the exact same
+    // insert that was rejected under the pre-upgrade (v32) trigger now succeeds after the real
+    // upgrade, because none of those 1024 historical rows are active.
+    let fresh = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at) VALUES(?,?,'tv',1,100,100)",
+        params![fresh.clone(), provider_id.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE commands SET status='cancelled',completed_at=101 WHERE id=?",
+        [fresh],
+    )
+    .await?;
+
+    // Separately, active rows still enforce the exact 1024-row boundary: seed 1023 active rows
+    // (search_commands has no per-target uniqueness, so one indexer/episode pair is enough), admit
+    // the 1024th in a different pool table, reject the 1025th outright, then free exactly one slot.
+    c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'TV','/tv');INSERT INTO seasons VALUES(1,1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One');").await?;
+    let search_indexer = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Indexer',1,1,1,1,'http://127.0.0.1:1/')",[search_indexer.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)",[search_indexer.clone()]).await?;
+    let captured = serde_json::json!({"media_type":"tv","series_id":1,"episode_id":1,"tvdb_id":101,"title":"Boundary","season":1,"number":1,"series_type":"standard","use_scene_numbering":false});
+    for _ in 0..1023 {
+        let id = uuid::Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO search_commands(id,mode,media_type,requested_episode_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'automatic','tv',1,?,?,1,?,1,9007199254740000,100)",
+            params![id, captured.to_string(), search_indexer.clone(), provider_id.clone()],
+        )
+        .await?;
+    }
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM search_commands WHERE status='queued'"
+        )
+        .await,
+        1023
+    );
+    let boundary = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at) VALUES(?,?,'tv',1,100,100)",
+        params![boundary.clone(), provider_id.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "INSERT INTO blocklist_clear_commands(id,name,media_type,next_attempt_at,created_at) VALUES(?,'clear_blocklist','tv',100,100)",
+            [uuid::Uuid::new_v4().to_string()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("command capacity reached"), "{message}");
+    c.execute(
+        "UPDATE commands SET status='cancelled',completed_at=101 WHERE id=?",
+        [boundary],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO blocklist_clear_commands(id,name,media_type,next_attempt_at,created_at) VALUES(?,'clear_blocklist','tv',100,100)",
+        [uuid::Uuid::new_v4().to_string()],
+    )
+    .await?;
     Ok(())
 }

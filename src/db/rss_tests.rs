@@ -87,7 +87,7 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 32); // Latest open adds rescan commands; fixed predecessors remain unchanged.
+    assert_eq!(version(&c).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?
@@ -421,6 +421,27 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     }
     let total = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)";
     assert_eq!(scalar(&tx, total).await?, 1024);
+    // Every one of those 1024 historical rows is terminal (migration 0033: active rows only count
+    // toward the pool), so it is not actually full yet; pad it with genuinely active
+    // search_commands rows (no per-target uniqueness, so the existing indexer/client/episode
+    // fixture is enough -- unlike the other pool tables here, which allow only one active row per
+    // target) to prove admission really is rejected once every table combined reaches 1024.
+    let active = scalar(
+        &tx,
+        &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL),
+    )
+    .await?;
+    let padding =
+        super::refresh_tests::pad_search_commands(&tx, &indexer, &client, "tv", 1024 - active)
+            .await?;
+    assert_eq!(
+        scalar(
+            &tx,
+            &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL)
+        )
+        .await?,
+        1024
+    );
     assert!(
         command(&tx, &indexer, &client, "tv")
             .await
@@ -437,8 +458,14 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     );
     assert!(tx.execute("INSERT INTO metadata_refresh_commands(id,name,media_type,series_id,external_id,next_attempt_at,created_at) VALUES(?,'refresh_series','tv',1,101,100,100)",[uuid::Uuid::new_v4().to_string()]).await.unwrap_err().to_string().contains("command capacity reached"));
     assert!(tx.execute("INSERT INTO blocklist_clear_commands(id,name,media_type,next_attempt_at,created_at) VALUES(?,'clear_blocklist','movies',100,100)",[uuid::Uuid::new_v4().to_string()]).await.unwrap_err().to_string().contains("command capacity reached"));
-    tx.execute("DELETE FROM rss_commands WHERE id=?", [tv.clone()])
-        .await?;
+    // Cancelling one active padding row frees exactly one slot, regardless of which pool table it
+    // came from; deleting an already-terminal row (such as `tv`, cancelled above) would not, since
+    // terminal rows never occupy the pool.
+    tx.execute(
+        "UPDATE search_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [padding[0].clone()],
+    )
+    .await?;
     command(&tx, &indexer, &client, "tv").await?;
     tx.rollback().await?;
     let schedule = uuid::Uuid::new_v4().to_string();

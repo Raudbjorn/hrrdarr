@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 32); // Latest open adds rescan commands; fixed predecessors remain unchanged.
+    assert_eq!(version(&c).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
     for (i, table) in [
         "commands",
         "download_refresh_schedules",
@@ -165,10 +165,63 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
         }
     }
     assert_eq!(scalar(&c,"SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)").await?,1024);
-    assert!(metadata(&c, true).await.is_err());
-    assert!(enqueue(&c, &provider, "tv").await.is_err());
+    // Every terminal row above is invisible to the shared pool (migration 0033: active rows only
+    // count), so it is not actually full yet -- pad it with genuinely active search_commands rows
+    // (no per-target uniqueness) against the existing movie fixture to prove admission is really
+    // rejected once every pool table combined reaches 1024.
+    let search_indexer = super::refresh_tests::search_indexer(&c, "movies").await?;
+    let active = scalar(
+        &c,
+        &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL),
+    )
+    .await?;
+    let padding = super::refresh_tests::pad_search_commands(
+        &c,
+        &search_indexer,
+        &provider,
+        "movies",
+        1024 - active,
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL)
+        )
+        .await?,
+        1024
+    );
+    assert!(
+        metadata(&c, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    assert!(
+        enqueue(&c, &provider, "tv")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
     c.execute("DELETE FROM metadata_refresh_commands WHERE id=?", [tv])
         .await?;
+    // The DELETE above only removed an already-terminal row, so it did not free the pool (migration
+    // 0033): the pool is still exactly full.
+    assert!(
+        metadata(&c, true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    // Cancelling one active padding row instead proves capacity really does free up again.
+    c.execute(
+        "UPDATE search_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [padding[0].clone()],
+    )
+    .await?;
     let id = metadata(&c, true).await?;
     c.execute(
         "UPDATE metadata_refresh_commands SET status='cancelled',completed_at=100 WHERE id=?",

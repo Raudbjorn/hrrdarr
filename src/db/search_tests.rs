@@ -113,7 +113,7 @@ async fn search_schema26_upgrade_rollback_transfer_origin_and_retention() -> Res
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 32); // Latest open adds rescan commands.
+    assert_eq!(version(&c).await?, 33); // Latest open adds active-only command capacity.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?
@@ -383,13 +383,27 @@ async fn search_schema26_upgrade_rollback_transfer_origin_and_retention() -> Res
     let error = offer(&tx, &second, 999, 29, 0).await.unwrap_err();
     assert!(error.to_string().contains("search result capacity reached"));
     tx.rollback().await?;
-    // Admission for every delivered command kind sees the same 1024-row capacity.
+    // Admission for every delivered command kind sees the same 1024-row capacity. Only active
+    // (queued/running/retry_wait) rows occupy the pool (migration 0033), so `existing` must be
+    // computed the same way -- terminal rows left over from earlier in this test must not be
+    // mistaken for occupied slots, or this loop under-pads and the capacity below is never hit.
     let tx = c.transaction().await?;
-    let count = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)";
-    let existing = scalar(&tx, count).await?;
+    let existing = scalar(
+        &tx,
+        &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL),
+    )
+    .await?;
     for _ in 0..1024 - existing {
         search(&tx, &indexer, &client, "tv", "interactive").await?;
     }
+    assert_eq!(
+        scalar(
+            &tx,
+            &format!("SELECT {}", super::refresh_tests::POOL_ACTIVE_SQL),
+        )
+        .await?,
+        1024
+    );
     assert!(
         search(&tx, &indexer, &client, "tv", "interactive")
             .await

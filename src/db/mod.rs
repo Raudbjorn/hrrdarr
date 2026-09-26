@@ -145,6 +145,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "rescan_commands",
         include_str!("../../migrations/0032_rescan_commands.sql"),
     ),
+    (
+        "command_capacity_active_only",
+        include_str!("../../migrations/0033_command_capacity_active_only.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

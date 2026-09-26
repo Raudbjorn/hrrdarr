@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 32); // Latest open adds rescan commands; fixed predecessors remain unchanged.
+    assert_eq!(version(&conn).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

@@ -554,6 +554,55 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
         .unwrap();
     }
     tx.commit().await.unwrap();
+    // Every row above is terminal (migration 0033: only active queued/running/retry_wait rows
+    // occupy the shared pool), so it is not actually full yet. Pad it with genuinely active
+    // search_commands rows (no per-target uniqueness, unlike `commands` itself) against a minimal
+    // fixture episode, using a far-future next_attempt_at so neither live worker below claims them.
+    const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
+    conn.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Pad','/pad');INSERT INTO seasons VALUES(1,1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One');").await.unwrap();
+    let search_indexer_id = uuid::Uuid::new_v4().to_string();
+    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Padding Indexer',1,1,1,1,'http://127.0.0.1:1/')",[search_indexer_id.clone()]).await.unwrap();
+    conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)",[search_indexer_id.clone()]).await.unwrap();
+    let captured = json!({"media_type":"tv","series_id":1,"episode_id":1,"tvdb_id":101,"title":"Padding","season":1,"number":1,"series_type":"standard","use_scene_numbering":false});
+    let active: i64 = conn
+        .query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let mut padding = Vec::new();
+    for _ in 0..1024 - active {
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO search_commands(id,mode,media_type,requested_episode_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'automatic','tv',1,?,?,1,?,?,9007199254740000,0)",
+            libsql::params![
+                id.clone(),
+                captured.to_string(),
+                search_indexer_id.clone(),
+                provider["id"].as_str().unwrap(),
+                provider["revision"].as_i64().unwrap()
+            ],
+        )
+        .await
+        .unwrap();
+        padding.push(id);
+    }
+    assert_eq!(
+        conn.query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        1024
+    );
     assert_eq!(
         request(&base, "POST", "/api/v1/commands", input(&provider, "tv"))
             .await
@@ -594,6 +643,22 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
         .0,
         204
     );
+    // The DELETE above only removed an already-terminal row, so it did not free the shared pool
+    // (migration 0033): admission is still rejected.
+    assert_eq!(
+        request(&base, "POST", "/api/v1/commands", input(&provider, "tv"))
+            .await
+            .0,
+        429
+    );
+    // Cancelling one active padding row instead so the scheduler's retry below can actually claim
+    // a slot.
+    conn.execute(
+        "UPDATE search_commands SET status='cancelled',completed_at=0 WHERE id=?",
+        [padding[0].clone()],
+    )
+    .await
+    .unwrap();
     conn.execute("UPDATE download_refresh_schedules SET next_run_at=0", ())
         .await
         .unwrap();

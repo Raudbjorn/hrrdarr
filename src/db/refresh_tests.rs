@@ -66,6 +66,76 @@ pub(super) async fn schedule(
     conn.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at) VALUES(?,?,1,1,60,100) ON CONFLICT(provider_id,media_type) DO UPDATE SET interval_seconds=120,revision=revision+1",params![provider,media]).await?;
     Ok(())
 }
+/// Every table in the shared 1024-row command-capacity pool (migration 0033: active rows only).
+/// Kept in test code only -- production admission lives in `commands::COMMAND_CAPACITY_SQL`.
+pub(super) const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
+/// A torznab indexer scoped to `media`, suitable as `search_commands.indexer_id` for pool padding.
+pub(super) async fn search_indexer(
+    conn: &Connection,
+    media: &str,
+) -> Result<String, libsql::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Padding Indexer',1,1,1,1,'http://127.0.0.1:1/')",[id.clone()]).await?;
+    conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab',?,'[5000]','[]',?,?)",params![id.clone(),media,(media=="tv").then_some(0),(media=="movies").then_some(0)]).await?;
+    Ok(id)
+}
+/// Inserts `count` genuinely active (`queued`, far-future `next_attempt_at`) `search_commands`
+/// rows, all sharing one looked-up episode/movie target: unlike every other pool table,
+/// `search_commands` has no per-target uniqueness index, so it is the only table that can pad the
+/// shared pool to its 1024-row cap without needing hundreds of distinct valid providers/targets.
+/// Requires the caller's fixture to already contain at least one episode (for `media=="tv"`) or
+/// movie (otherwise); the target is looked up rather than hardcoded so this helper works across
+/// fixtures that use different series/episode/movie ids.
+pub(super) async fn pad_search_commands(
+    conn: &Connection,
+    indexer: &str,
+    client: &str,
+    media: &str,
+    count: i64,
+) -> Result<Vec<String>, libsql::Error> {
+    let (episode, movie, target) = if media == "tv" {
+        let row = conn
+            .query(
+                "SELECT s.id,e.id,s.tvdb_id FROM episodes e JOIN series s ON s.id=e.series_id LIMIT 1",
+                (),
+            )
+            .await?
+            .next()
+            .await?
+            .expect("fixture must include an episode for search-command padding");
+        let (series_id, episode_id, tvdb_id): (i64, i64, i64) =
+            (row.get(0)?, row.get(1)?, row.get(2)?);
+        (
+            Some(episode_id),
+            None,
+            serde_json::json!({"media_type":"tv","series_id":series_id,"episode_id":episode_id,"tvdb_id":tvdb_id,"title":"Padding","season":1,"number":1,"series_type":"standard","use_scene_numbering":false}),
+        )
+    } else {
+        let row = conn
+            .query(
+                "SELECT m.id,m.metadata_id,d.tmdb_id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id LIMIT 1",
+                (),
+            )
+            .await?
+            .next()
+            .await?
+            .expect("fixture must include a movie for search-command padding");
+        let (movie_id, metadata_id, tmdb_id): (i64, i64, i64) =
+            (row.get(0)?, row.get(1)?, row.get(2)?);
+        (
+            None,
+            Some(movie_id),
+            serde_json::json!({"media_type":"movies","movie_id":movie_id,"metadata_id":metadata_id,"tmdb_id":tmdb_id,"imdb_id":null,"title":"Padding","year":2020}),
+        )
+    };
+    let mut ids = Vec::with_capacity(count.max(0) as usize);
+    for _ in 0..count {
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute("INSERT INTO search_commands(id,mode,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'automatic',?,?,?,?,?,1,?,1,9007199254740000,100)",params![id.clone(),media,episode,movie,target.to_string(),indexer,client]).await?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
 
 #[tokio::test]
 async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> Result<(), Error> {
@@ -111,7 +181,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 32); // Latest open adds rescan commands; fixed predecessors remain unchanged.
+    assert_eq!(version(&conn).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1
@@ -339,9 +409,38 @@ async fn download_refresh_storage_caps_allow_explicit_retention_and_replacement(
         .await?;
     }
     assert_eq!(scalar(&tx, "SELECT count(*) FROM commands").await?, 1024);
-    assert!(enqueue(&tx, &extra, "tv").await.is_err());
-    tx.execute("DELETE FROM commands WHERE id=?", [extra_command])
-        .await?;
+    // Migration 0033: 1024 historical (terminal) rows in one table no longer occupy the shared
+    // pool -- admission looks only at active (queued/running/retry_wait) rows, so a fresh enqueue
+    // for the same provider+media still succeeds here, unlike under the pre-migration formula.
+    let freed = enqueue(&tx, &extra, "tv").await?;
+    tx.execute(
+        "UPDATE commands SET status='cancelled',completed_at=101 WHERE id=?",
+        [freed],
+    )
+    .await?;
+    // Pad the pool with genuinely active rows (search_commands has no per-target uniqueness, so
+    // this needs only one indexer/episode, not 1024 distinct providers) to prove the cap still
+    // rejects admission once the pool is truly full, and still frees up once a slot goes terminal.
+    tx.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Pad','/pad');INSERT INTO seasons VALUES(1,1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One');").await?;
+    let indexer = search_indexer(&tx, "tv").await?;
+    let active = scalar(&tx, &format!("SELECT {POOL_ACTIVE_SQL}")).await?;
+    let padding = pad_search_commands(&tx, &indexer, &extra, "tv", 1024 - active).await?;
+    assert_eq!(
+        scalar(&tx, &format!("SELECT {POOL_ACTIVE_SQL}")).await?,
+        1024
+    );
+    assert!(
+        enqueue(&tx, &extra, "tv")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("command capacity reached")
+    );
+    tx.execute(
+        "UPDATE search_commands SET status='cancelled',completed_at=101 WHERE id=?",
+        [padding[0].clone()],
+    )
+    .await?;
     enqueue(&tx, &extra, "tv").await?;
     tx.commit().await?;
     integrity(&conn).await?;
