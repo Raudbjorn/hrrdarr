@@ -613,6 +613,7 @@ async fn library_ui_fixture() {
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
+            .merge(hrrdarr::naming::router(db.clone()))
             .merge(
                 Router::new()
                     .route("/api/fixture/fail-import-history", post(import_failure))

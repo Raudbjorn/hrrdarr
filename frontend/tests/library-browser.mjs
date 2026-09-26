@@ -606,6 +606,57 @@ async function verifyClearBlocklist() {
   assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media');
 }
 
+async function verifyNaming() {
+  await page.getByRole('button',{name:'Naming',exact:true}).click();
+  const panel=page.getByRole('region',{name:'Naming'});
+  await panel.getByLabel('Standard episode format').waitFor();
+  assert.equal(await panel.getByLabel('Rename on automated import').isChecked(),false);
+  assert.equal(await panel.getByLabel('Colon replacement').inputValue(),'smart');
+  await panel.getByText('Not configured.',{exact:true}).first().waitFor();
+  assert.equal(await panel.getByText('Not configured.',{exact:true}).count(),6,'Fresh install must show every TV format field unconfigured');
+
+  const tvTemplate='{Series Title} - S{season:00}E{episode:00} - {Episode Title} [{Quality Title}]';
+  await panel.getByLabel('Standard episode format').fill(tvTemplate);
+  await panel.getByText('Example: Halcyon Vale - S03E07 - The Long Dark [WEBDL-1080p]',{exact:true}).waitFor();
+  const tvSaved=page.waitForResponse(r=>r.url().endsWith('/api/v1/tv/config/naming')&&r.request().method()==='PUT');
+  await panel.getByRole('button',{name:'Save naming settings',exact:true}).click();
+  assert.equal((await tvSaved).status(),200);
+  await panel.getByText('Naming settings saved.',{exact:true}).waitFor();
+  let stored=await (await page.request.get(`${origin}/api/v1/tv/config/naming`)).json();
+  assert.equal(stored.standard_episode_format,tvTemplate);assert.equal(stored.rename_enabled,false);
+
+  await panel.getByRole('button',{name:'Movies',exact:true}).click();
+  await panel.getByLabel('Standard movie format').waitFor();
+  assert.equal(await panel.getByLabel('Standard episode format').count(),0,'Switching domain must remove TV-only fields');
+  const movieTemplate='{Movie Title} ({Release Year}) {Edition Tags} [{Quality Title}]';
+  await panel.getByLabel('Standard movie format').fill(movieTemplate);
+  await panel.getByText("Example: The Wandering Harbor (2023) Director's Cut [Bluray-1080p]",{exact:true}).waitFor();
+  const movieSaved=page.waitForResponse(r=>r.url().endsWith('/api/v1/movies/config/naming')&&r.request().method()==='PUT');
+  await panel.getByRole('button',{name:'Save naming settings',exact:true}).click();
+  assert.equal((await movieSaved).status(),200);
+  await panel.getByText('Naming settings saved.',{exact:true}).waitFor();
+  stored=await (await page.request.get(`${origin}/api/v1/movies/config/naming`)).json();
+  assert.equal(stored.standard_movie_format,movieTemplate);
+  const movieRevision=stored.revision;
+
+  // A real unknown-token rejection must reach both the debounced preview and the save path unmodified.
+  const preview=page.waitForResponse(r=>r.url().includes('/api/v1/movies/config/naming/examples'));
+  await panel.getByLabel('Standard movie format').fill('{Not A Token}');
+  const previewResponse=await preview;assert.equal(previewResponse.status(),400);
+  const previewMessage=(await previewResponse.json()).error.message;
+  assert.match(previewMessage,/Not A Token/);
+  await panel.getByText(`Preview error: ${previewMessage}`,{exact:true}).waitFor();
+  const rejected=page.waitForResponse(r=>r.url().endsWith('/api/v1/movies/config/naming')&&r.request().method()==='PUT');
+  await panel.getByRole('button',{name:'Save naming settings',exact:true}).click();
+  const rejectedResponse=await rejected;assert.equal(rejectedResponse.status(),400);
+  const rejectedBody=await rejectedResponse.json();
+  assert.equal(rejectedBody.error.code,'unknown_naming_token');
+  await panel.getByRole('alert').filter({hasText:rejectedBody.error.message}).waitFor();
+  const afterReject=await (await page.request.get(`${origin}/api/v1/movies/config/naming`)).json();
+  assert.equal(afterReject.revision,movieRevision,'A rejected save must never bump the stored revision');
+  assert.equal(afterReject.standard_movie_format,movieTemplate,'A rejected save must never overwrite the last valid stored template');
+}
+
 try {
   await page.goto(origin);
   await add('tv', 'Fixture series', `${scratch}/tv`);
@@ -691,11 +742,12 @@ try {
   await verifyClearBlocklist();
   await verifyDownloadProcessing();
   await verifySearchGrab();
+  await verifyNaming();
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, both-domain automatic/interactive search and exact grab, lost create/grab reply readback and retained history, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, both-domain automatic/interactive search and exact grab, lost create/grab reply readback and retained history, naming fresh-install defaults/live preview/save round trip in both domains and a real rejected validation error, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});
