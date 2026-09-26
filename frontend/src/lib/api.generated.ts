@@ -234,6 +234,12 @@ export type MappingRevision = { revision: number, };
 
 export type MappingUpdate = { revision: number, host: string, remote_path: string, local_path: string, };
 
+export type MatchedEpisode = { id: number, season: number, number: number, };
+
+export type MatchedMovie = { id: number, title: string, year: number | null, };
+
+export type MatchedSeries = { id: number, title: string, };
+
 export type MediaDomain = "tv" | "movies";
 
 export type MediaInfo = { schema_revision: number | null, container_format: string | null, audio_bitrate: number | null, audio_channels: number | null, audio_codec: string | null, audio_languages: string | null, audio_stream_count: number | null, video_bit_depth: number | null, video_bitrate: number | null, video_codec: string | null, video_fps: number | null, video_dynamic_range: string | null, video_dynamic_range_type: string | null, resolution: string | null, run_time: string | null, scan_type: string | null, subtitles: string | null, video_format: string | null, video_codec_id: string | null, video_profile: string | null, audio_format: string | null, audio_codec_id: string | null, audio_profile: string | null, audio_channel_count: number | null, audio_channel_positions: string | null, width: number | null, height: number | null, runtime_ticks: number | null, audio_streams: Array<MediaInfoAudioStream> | null, subtitle_streams: Array<MediaInfoSubtitleStream> | null, };
@@ -278,6 +284,8 @@ export type MovieNamingExamplesQuery = { rename_enabled?: boolean, replace_illeg
 
 export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
 
+export type MovieParseResult = { title: string, parsed: ParsedRelease | null, movie: MatchedMovie | null, };
+
 export type NamingErrorDetail = { code: string, message: string, };
 
 export type NamingErrorEnvelope = { error: NamingErrorDetail, };
@@ -287,6 +295,8 @@ export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, tar
 export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
 
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
+
+export type ParseQuery = { title: string, };
 
 export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, };
 
@@ -505,6 +515,8 @@ export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_
 export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
 export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
+
+export type TvParseResult = { title: string, parsed: ParsedRelease | null, series: MatchedSeries | null, episodes: Array<MatchedEpisode>, };
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 

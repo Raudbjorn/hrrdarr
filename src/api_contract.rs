@@ -171,6 +171,9 @@ pub fn render() -> String {
         crate::naming::MovieNamingUpdate,
         crate::naming::MovieNamingExamplesQuery,
         crate::naming::MovieNamingExamples,
+        crate::parse::ParseQuery,
+        crate::parse::TvParseResult,
+        crate::parse::MovieParseResult,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",
