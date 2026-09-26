@@ -1,4 +1,4 @@
-import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation } from './api.generated';
+import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery } from './api.generated';
 
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -165,6 +165,27 @@ export const saveProcessingPolicy = (provider:string,domain:MediaDomain,input:Pr
 export const listDownloadProcessing = (provider:string,domain:MediaDomain,offset=0) => validOperation(provider)?request<ApiPage<DownloadProcessing>>(`/api/v1/download-processing?provider_id=${provider}&media_type=${domain}&limit=25&offset=${offset}`,undefined,undefined,true):invalidProvider<ApiPage<DownloadProcessing>>();
 export const processDownloads = (input:ProcessingInput) => validOperation(input.provider_id)&&validId(input.provider_revision)&&input.receipt_ids.length>0&&input.receipt_ids.length<=100&&input.receipt_ids.every(validOperation)?request<DownloadProcessing[]>('/api/v1/download-processing',input,'POST',true):invalidProvider<DownloadProcessing[]>();
 export const cancelDownloadProcessing = (receipt:string) => validOperation(receipt)?request<DownloadProcessing>(`/api/v1/download-processing/${receipt}/cancel`,undefined,'POST',true):invalidProvider<DownloadProcessing>();
+
+export const getTvNaming = () => request<TvNamingConfig>('/api/v1/tv/config/naming', undefined, undefined, true);
+export const updateTvNaming = (input: TvNamingUpdate) => validId(input.revision) ? request<TvNamingConfig>('/api/v1/tv/config/naming', input, 'PUT', true) : invalidProvider<TvNamingConfig>();
+export const getTvNamingExamples = (query: TvNamingExamplesQuery = {}) => {
+  const params = new URLSearchParams();
+  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_episode_format','daily_episode_format','anime_episode_format','series_folder_format','season_folder_format','specials_folder_format'] as const) {
+    if (query[field] != null) params.set(field, String(query[field]));
+  }
+  const qs = params.toString();
+  return request<TvNamingExamples>(`/api/v1/tv/config/naming/examples${qs ? `?${qs}` : ''}`, undefined, undefined, true);
+};
+export const getMovieNaming = () => request<MovieNamingConfig>('/api/v1/movies/config/naming', undefined, undefined, true);
+export const updateMovieNaming = (input: MovieNamingUpdate) => validId(input.revision) ? request<MovieNamingConfig>('/api/v1/movies/config/naming', input, 'PUT', true) : invalidProvider<MovieNamingConfig>();
+export const getMovieNamingExamples = (query: MovieNamingExamplesQuery = {}) => {
+  const params = new URLSearchParams();
+  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_movie_format','movie_folder_format'] as const) {
+    if (query[field] != null) params.set(field, String(query[field]));
+  }
+  const qs = params.toString();
+  return request<MovieNamingExamples>(`/api/v1/movies/config/naming/examples${qs ? `?${qs}` : ''}`, undefined, undefined, true);
+};
 
 export const listSearchCommands = (target:MediaTarget,offset=0) => validId(target.id) ? request<ApiPage<SearchCommand>>(`/api/v1/search/commands?target_type=${target.media_type}&target_id=${target.id}&limit=25&offset=${offset}`,undefined,undefined,true) : invalid<ApiPage<SearchCommand>>();
 export const getSearchCommand = (id:string) => validOperation(id) ? request<SearchCommand>(`/api/v1/search/commands/${id}`,undefined,undefined,true) : invalidProvider<SearchCommand>();

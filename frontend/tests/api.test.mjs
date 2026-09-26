@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listSearchCommands, getSearchCommand, createSearchCommand, cancelSearchCommand, listSearchResults, grabSearchResult, getProcessingPolicy, saveProcessingPolicy, listDownloadProcessing, processDownloads, cancelDownloadProcessing, listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries } from '../src/lib/api.ts';
+import { listSearchCommands, getSearchCommand, createSearchCommand, cancelSearchCommand, listSearchResults, grabSearchResult, getProcessingPolicy, saveProcessingPolicy, listDownloadProcessing, processDownloads, cancelDownloadProcessing, listQualityProfiles, getReleasePolicy, saveReleasePolicy, searchReleases, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule, listBlocklistClearCommands, createBlocklistClearCommand, getBlocklistClearCommand, cancelBlocklistClearCommand, deleteBlocklistClearCommand, loadSeries, loadEpisodes, previewImport, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode, previewManualImport, getImport, executeImport, listProviders, getProviderSchema, getProvider, createProvider, updateProvider, deleteProvider, testProvider, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listMetadataCommands, createMetadataCommand, getMetadataCommand, cancelMetadataCommand, deleteMetadataCommand, listBlocklist, deleteBlocklistEntry, deleteBlocklistEntries, getTvNaming, updateTvNaming, getTvNamingExamples, getMovieNaming, updateMovieNaming, getMovieNamingExamples } from '../src/lib/api.ts';
 
 // These stubs verify client behavior; Rust handler tests establish the wire specimens.
 async function withFetch(stub, run) {
@@ -416,4 +416,69 @@ test('search command requests preserve typed identities and result-only grab aut
     const response=await grabSearchResult(request_id);assert.equal(response.ok,false);assert.equal(response.status,undefined);
   });
   assert.equal(calls,1,'Unknown selection outcome requires explicit readback, never automatic replay');
+});
+
+test('naming config wrappers round-trip a full replacement for both domains', async () => {
+  const tvConfig = { revision: 1, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_episode_format: null, daily_episode_format: null, anime_episode_format: null, series_folder_format: null, season_folder_format: null, specials_folder_format: null, multi_episode_style: null };
+  const tvUpdate = { revision: 1, rename_enabled: true, replace_illegal_characters: true, colon_replacement: 'custom', custom_colon_replacement: '~', standard_episode_format: '{Series Title}', daily_episode_format: null, anime_episode_format: null, series_folder_format: null, season_folder_format: null, specials_folder_format: null, multi_episode_style: null };
+  const movieConfig = { revision: 1, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_movie_format: null, movie_folder_format: null };
+  const movieUpdate = { revision: 1, rename_enabled: true, replace_illegal_characters: true, colon_replacement: 'dash', custom_colon_replacement: null, standard_movie_format: '{Movie Title}', movie_folder_format: null };
+  const calls = [];
+  await withFetch(async (path, options) => {
+    calls.push([path, options.method, options.body ? JSON.parse(options.body) : undefined]);
+    return json(path.includes('/tv/') ? { ...tvUpdate, revision: 2 } : { ...movieUpdate, revision: 2 });
+  }, async () => {
+    assert.deepEqual(await updateTvNaming(tvUpdate), { ok: true, data: { ...tvUpdate, revision: 2 } });
+    assert.deepEqual(await updateMovieNaming(movieUpdate), { ok: true, data: { ...movieUpdate, revision: 2 } });
+  });
+  assert.deepEqual(calls, [['/api/v1/tv/config/naming', 'PUT', tvUpdate], ['/api/v1/movies/config/naming', 'PUT', movieUpdate]]);
+  assert.equal(Object.hasOwn(calls[0][2], 'daily_episode_format'), true);
+  assert.equal(calls[0][2].daily_episode_format, null);
+  await withFetch(async (path) => json(path.includes('/tv/') ? tvConfig : movieConfig), async () => {
+    assert.deepEqual(await getTvNaming(), { ok: true, data: tvConfig });
+    assert.deepEqual(await getMovieNaming(), { ok: true, data: movieConfig });
+  });
+});
+
+test('naming revision conflicts surface the coded 409 and a bad revision never calls fetch', async () => {
+  await withFetch(async () => json({ error: { code: 'naming_revision_conflict', message: 'Naming settings changed' } }, 409), async () => {
+    const result = await updateTvNaming({ revision: 1, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_episode_format: null, daily_episode_format: null, anime_episode_format: null, series_folder_format: null, season_folder_format: null, specials_folder_format: null, multi_episode_style: null });
+    assert.deepEqual(result, { ok: false, error: 'Naming settings changed', status: 409, code: 'naming_revision_conflict' });
+  });
+  await withFetch(async () => json({ error: { code: 'unknown_naming_token', message: 'Unknown token {Bogus} in standard_movie_format' } }, 400), async () => {
+    const result = await updateMovieNaming({ revision: 1, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_movie_format: '{Bogus}', movie_folder_format: null });
+    assert.deepEqual(result, { ok: false, error: 'Unknown token {Bogus} in standard_movie_format', status: 400, code: 'unknown_naming_token' });
+  });
+  let calls = 0;
+  await withFetch(async () => { calls++; throw new Error('must not fetch'); }, async () => {
+    for (const revision of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.equal((await updateTvNaming({ revision, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_episode_format: null, daily_episode_format: null, anime_episode_format: null, series_folder_format: null, season_folder_format: null, specials_folder_format: null, multi_episode_style: null })).ok, false);
+      assert.equal((await updateMovieNaming({ revision, rename_enabled: false, replace_illegal_characters: true, colon_replacement: 'smart', custom_colon_replacement: null, standard_movie_format: null, movie_folder_format: null })).ok, false);
+    }
+  });
+  assert.equal(calls, 0);
+});
+
+test('naming examples query strings omit unset fields and never emit literal undefined/null', async () => {
+  const calls = [];
+  await withFetch(async (path) => { calls.push(path); return json({ standard_episode_format: 'Halcyon Vale - S03E07' }); }, async () => {
+    await getTvNamingExamples();
+    await getTvNamingExamples({ standard_episode_format: '{Series Title}' });
+    await getTvNamingExamples({ colon_replacement: 'custom', custom_colon_replacement: '~', rename_enabled: false, replace_illegal_characters: true });
+    await getMovieNamingExamples({ standard_movie_format: '{Movie Title}: {Release Year}' });
+  });
+  assert.equal(calls[0], '/api/v1/tv/config/naming/examples');
+  assert.equal(calls[1], '/api/v1/tv/config/naming/examples?standard_episode_format=%7BSeries+Title%7D');
+  assert.equal(calls[2], '/api/v1/tv/config/naming/examples?rename_enabled=false&replace_illegal_characters=true&colon_replacement=custom&custom_colon_replacement=%7E');
+  assert.equal(calls[3], '/api/v1/movies/config/naming/examples?standard_movie_format=%7BMovie+Title%7D%3A+%7BRelease+Year%7D');
+  for (const call of calls) { assert.doesNotMatch(call, /undefined/); assert.doesNotMatch(call, /=null(&|$)/); }
+});
+
+test('naming examples query builders allowlist domain-scoped fields and drop the rest', async () => {
+  const calls = [];
+  await withFetch(async (path) => { calls.push(path); return json({}); }, async () => {
+    await getTvNamingExamples({ standard_movie_format: 'x', multi_episode_style: 1, revision: 2 });
+    await getMovieNamingExamples({ standard_episode_format: 'x', multi_episode_style: 1, revision: 2 });
+  });
+  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples', '/api/v1/movies/config/naming/examples']);
 });
