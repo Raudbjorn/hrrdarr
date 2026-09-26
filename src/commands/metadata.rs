@@ -185,7 +185,7 @@ async fn create(
             if existing.captured()!=captured {return Err(conflict())}
             return bounded(existing)
         }
-        if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS {return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
+        if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS {return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
         let id=Uuid::new_v4();let timestamp=now()?;
         tx.execute("INSERT INTO metadata_refresh_commands(id,name,media_type,series_id,movie_id,external_id,metadata_id,priority,status,attempts,next_attempt_at,created_at,records_updated)VALUES(?,?,?,?,?,?,?,?,'queued',0,?,?,0)",params![id.to_string(),name,media,series,movie,captured.external_id,captured.metadata_id,input.priority.number(),timestamp,timestamp]).await?;
         bounded(read(&tx,id).await?)

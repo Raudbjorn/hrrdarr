@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 30 remains unknown after migration 29 adds naming settings singleton.
+    // Version 31 remains unknown after migration 30 adds manual import commands.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (30,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (31,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        29 // Latest schema adds naming settings singleton.
+        30 // Latest schema adds manual import commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2166,5 +2166,484 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
         1
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM naming_settings").await, 2);
+    Ok(())
+}
+
+async fn schema_fingerprint(conn: &Connection) -> String {
+    conn.query(
+        "SELECT group_concat(type || ':' || name || ':' || coalesce(sql,''), char(10)) FROM (SELECT type,name,sql FROM sqlite_schema ORDER BY type,name)",
+        (),
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get::<Option<String>>(0)
+    .unwrap()
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+        (
+            "root_folders",
+            include_str!("../migrations/0014_root_folders.sql"),
+        ),
+        (
+            "remote_path_mappings",
+            include_str!("../migrations/0015_remote_path_mappings.sql"),
+        ),
+        (
+            "download_refresh",
+            include_str!("../migrations/0016_download_refresh.sql"),
+        ),
+        (
+            "import_history_order",
+            include_str!("../migrations/0017_import_history_order.sql"),
+        ),
+        (
+            "snapshot_history",
+            include_str!("../migrations/0018_snapshot_history.sql"),
+        ),
+        (
+            "profile_policy",
+            include_str!("../migrations/0019_profile_policy.sql"),
+        ),
+        (
+            "snapshot_profiles",
+            include_str!("../migrations/0020_snapshot_profiles.sql"),
+        ),
+        (
+            "metadata_refresh_commands",
+            include_str!("../migrations/0021_metadata_refresh_commands.sql"),
+        ),
+        (
+            "snapshot_blocklist",
+            include_str!("../migrations/0022_snapshot_blocklist.sql"),
+        ),
+        (
+            "blocklist_clear_commands",
+            include_str!("../migrations/0023_blocklist_clear_commands.sql"),
+        ),
+        (
+            "release_catalog_policy",
+            include_str!("../migrations/0024_release_catalog_policy.sql"),
+        ),
+        (
+            "rss_grab_journal",
+            include_str!("../migrations/0025_rss_grab_journal.sql"),
+        ),
+        (
+            "download_processing",
+            include_str!("../migrations/0026_download_processing.sql"),
+        ),
+        (
+            "targeted_search",
+            include_str!("../migrations/0027_targeted_search.sql"),
+        ),
+        (
+            "same_path_replacements",
+            include_str!("../migrations/0028_same_path_replacements.sql"),
+        ),
+        (
+            "naming_settings",
+            include_str!("../migrations/0029_naming_settings.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Kept','/tv/Kept');INSERT INTO seasons(series_id,number) VALUES(1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One'),(2,1,1,2,'Two');").await?;
+
+    // Seed one real, fully observed RSS-owned import so the disjointness guard has live data to reject.
+    let indexer = uuid::Uuid::new_v4().to_string();
+    let client = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Indexer',1,1,1,1,'http://127.0.0.1:1/')",[indexer.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)",[indexer.clone()]).await?;
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Client',1,1,1,1,'http://fixture.invalid')",[client.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','tv','tv',0,0,'started','default',0,0,0)",[client.clone()]).await?;
+    let rss_command = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','tv',?,1,?,1,100,100)",params![rss_command.clone(),indexer.clone(),client.clone()]).await?;
+    let candidate = uuid::Uuid::new_v4().to_string();
+    let hash = "a".repeat(40);
+    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,1,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?",params![candidate.clone(),"c".repeat(64),vec![1u8;29],rss_command.clone()]).await?;
+    c.execute(
+        "INSERT INTO rss_candidate_episodes VALUES(?,1,1)",
+        [candidate.clone()],
+    )
+    .await?;
+    let identity = serde_json::json!({"version":1,"target":{"media_type":"episode","id":1},"hashes":[hash],"settings_fingerprint":"a".repeat(64),"payload_sha256":"b".repeat(64)}).to_string();
+    c.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        params![identity, candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        params![client.clone(), hash.clone(), candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        params![hash, candidate.clone()],
+    )
+    .await?;
+    let owned_op = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',1,'/download/tv','copy','/tv/Kept/one.mkv','preview','fixture')",[owned_op.clone()]).await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json) VALUES(?,?,1,'{\"version\":1,\"real\":0,\"is_repack\":false}','{}')",params![candidate.clone(),owned_op.clone()]).await?;
+
+    // A second, fully observed candidate on episode 2, kept unlinked so it can later prove the
+    // reverse direction: it must still be rejected once episode 2's operation is manually claimed.
+    let candidate2 = uuid::Uuid::new_v4().to_string();
+    let hash2 = "e".repeat(40);
+    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,1,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?",params![candidate2.clone(),"d".repeat(64),vec![1u8;29],rss_command.clone()]).await?;
+    c.execute(
+        "INSERT INTO rss_candidate_episodes VALUES(?,1,2)",
+        [candidate2.clone()],
+    )
+    .await?;
+    let identity2 = serde_json::json!({"version":1,"target":{"media_type":"episode","id":2},"hashes":[hash2],"settings_fingerprint":"a".repeat(64),"payload_sha256":"b".repeat(64)}).to_string();
+    c.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        params![identity2, candidate2.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        params![client.clone(), hash2.clone(), candidate2.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate2.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        params![hash2, candidate2.clone()],
+    )
+    .await?;
+
+    // A second, independent manually-previewed operation with no RSS ownership at all.
+    let manual_op = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',2,'/download/manual','copy','/tv/Kept/two.mkv','preview','fixture')",[manual_op.clone()]).await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [manual_op.clone()],
+    )
+    .await?;
+    let other_manual_op = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',2,'/download/manual-2','copy','/tv/Kept/two-again.mkv','preview','fixture')",[other_manual_op.clone()]).await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [other_manual_op.clone()],
+    )
+    .await?;
+    let dangling_op = uuid::Uuid::new_v4().to_string();
+
+    let before = schema_fingerprint(&c).await;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    tx.execute_batch(include_str!(
+        "../migrations/0030_manual_import_commands.sql"
+    ))
+    .await?;
+    // Even before rollback, the fresh DDL already rejects an operation the RSS pipeline owns.
+    assert!(
+        tx.execute(
+            "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), owned_op.clone()]
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        schema_fingerprint(&c).await,
+        before,
+        "rollback of migration 30 must leave the prior schema (including the five DROP/CREATE-recreated sibling admit triggers) byte-identical"
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        30 // Latest schema adds manual import commands.
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM rss_candidate_imports").await,
+        1
+    );
+
+    // The FK to operations(id) is structurally declared with ON DELETE RESTRICT...
+    let mut fk = c
+        .query("PRAGMA foreign_key_list(manual_import_commands)", ())
+        .await?;
+    let fk = fk.next().await?.unwrap();
+    assert_eq!(fk.get::<String>(2)?, "operations"); // table
+    assert_eq!(fk.get::<String>(3)?, "operation_id"); // from
+    assert_eq!(fk.get::<String>(4)?, "id"); // to
+    assert_eq!(fk.get::<String>(6)?, "RESTRICT"); // on_delete
+    // ...but a dangling operation_id is actually rejected by the journal-existence admission
+    // check first (an operation without a journal can never have been previewed); the FK itself
+    // is unreachable on INSERT because that check subsumes it, which is why it is asserted above
+    // structurally rather than behaviorally here.
+    let message = c
+        .execute(
+            "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), dangling_op.clone()]
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("operation has no import journal"),
+        "{message}"
+    );
+
+    // An operation already claimed by the automated RSS/search-grab pipeline cannot be submitted here.
+    let message = c
+        .execute(
+            "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), owned_op.clone()]
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("operation is owned by automated download import"),
+        "{message}"
+    );
+
+    // A batch groups independently claimable rows: two operations submitted together share one batch_id.
+    let batch = uuid::Uuid::new_v4().to_string();
+    let first = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![first.clone(), batch.clone(), manual_op.clone()],
+    )
+    .await?;
+    // Nor can the reverse: once manual_op is claimed above, a fresh RSS receipt for the same
+    // operation (candidate2, fully observed on episode 2, otherwise eligible on its own) is
+    // still rejected because manual_import_commands already owns it.
+    let message = c
+        .execute(
+            "INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json) VALUES(?,?,1,'{\"version\":1,\"real\":0,\"is_repack\":false}','{}')",
+            params![candidate2.clone(), manual_op.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("operation is owned by manual import command"),
+        "{message}"
+    );
+    let second = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![second.clone(), batch.clone(), other_manual_op.clone()],
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT count(*) FROM manual_import_commands WHERE batch_id='{batch}'")
+        )
+        .await,
+        2
+    );
+
+    // One active command per operation: a second non-terminal row for the same operation is rejected...
+    let message = c
+        .execute(
+            "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), batch.clone(), manual_op.clone()]
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("UNIQUE constraint failed"), "{message}");
+    // Identity is immutable once queued.
+    let message = c
+        .execute(
+            "UPDATE manual_import_commands SET operation_id=? WHERE id=?",
+            params![other_manual_op.clone(), first.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("command identity is immutable"),
+        "{message}"
+    );
+    // ...queued -> running -> failed retains the row as terminal (attempts/started_at/completed_at/error_code rules enforced).
+    c.execute(
+        "UPDATE manual_import_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [first.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE manual_import_commands SET status='failed',completed_at=101,error_code='storage_error' WHERE id=?",
+        [first.clone()],
+    )
+    .await?;
+    // A queued -> running -> succeeded row is terminal too.
+    c.execute(
+        "UPDATE manual_import_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [second.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE manual_import_commands SET status='succeeded',completed_at=101 WHERE id=?",
+        [second.clone()],
+    )
+    .await?;
+    // A queued -> cancelled row (direct, no attempt) is terminal as well.
+    let third = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![third.clone(), batch.clone(), other_manual_op.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "UPDATE manual_import_commands SET status='cancelled' WHERE id=?",
+            [third.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("CHECK constraint failed"),
+        "cancelling must still record completed_at: {message}"
+    );
+    c.execute(
+        "UPDATE manual_import_commands SET status='cancelled',completed_at=101 WHERE id=?",
+        [third.clone()],
+    )
+    .await?;
+    // ...now that every prior row for manual_op is terminal, a fresh submission is admitted again.
+    let fourth = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO manual_import_commands(id,batch_id,operation_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![fourth.clone(), batch.clone(), manual_op.clone()],
+    )
+    .await?;
+
+    // Active rows cannot be deleted; terminal rows can.
+    let message = c
+        .execute(
+            "DELETE FROM manual_import_commands WHERE id=?",
+            [fourth.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("active commands cannot be deleted"),
+        "{message}"
+    );
+    c.execute(
+        "DELETE FROM manual_import_commands WHERE id=?",
+        [first.clone()],
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT count(*) FROM manual_import_commands WHERE id='{first}'")
+        )
+        .await,
+        0
+    );
     Ok(())
 }

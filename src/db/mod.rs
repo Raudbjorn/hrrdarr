@@ -133,6 +133,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "naming_settings",
         include_str!("../../migrations/0029_naming_settings.sql"),
     ),
+    (
+        "manual_import_commands",
+        include_str!("../../migrations/0030_manual_import_commands.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

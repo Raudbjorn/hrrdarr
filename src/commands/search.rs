@@ -310,7 +310,7 @@ async fn create(
  // A selected offer must never depend on an unencrypted locator fallback.
  s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;
  let captured=identity(&tx,&input.target).await?;let timestamp=now()?;
- if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)>=1024",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
+ if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)>=1024",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
  tx.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0)",params![input.request_id.to_string(),input.mode.text(),domain(media),episode,movie,captured,input.indexer_id.to_string(),input.indexer_revision,input.client_id.to_string(),input.client_revision,input.priority.number(),timestamp,timestamp]).await?;
  bounded(read(&tx,input.request_id).await?)
  }.await;

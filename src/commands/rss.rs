@@ -162,7 +162,7 @@ async fn enqueue(c: &Connection, input: RssInput, timestamp: i64) -> Result<RssC
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     if let Some(r)=c.query(&format!("SELECT {COLUMNS} FROM rss_commands WHERE indexer_id=? AND client_id=? AND media_type=? AND status IN ('queued','running','retry_wait')"),params![t.indexer_id.to_string(),t.client_id.to_string(),domain(t.media_type)]).await?.next().await?{return row(r)}
-    if c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
+    if c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
     let id = Uuid::new_v4();
     c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at)VALUES(?,'rss_sync',?,?,?,?,?,?,'queued',0,?,?)",params![id.to_string(),domain(t.media_type),t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,input.priority.number(),timestamp,timestamp]).await?;
     read(c, id).await

@@ -109,7 +109,7 @@ async fn create(
         .await?;
     let outcome=async{
         if let Some(r)=tx.query(&format!("SELECT {COLUMNS} FROM blocklist_clear_commands WHERE media_type=? AND status IN ('queued','running','retry_wait')"),[domain(input.target.media_type)]).await?.next().await?{return bounded(row(r)?)}
-        if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
+        if tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)? >=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
         let id=Uuid::new_v4();let timestamp=now()?;
         tx.execute("INSERT INTO blocklist_clear_commands(id,name,media_type,priority,status,attempts,next_attempt_at,created_at,records_removed)VALUES(?,'clear_blocklist',?,?,'queued',0,?,?,0)",params![id.to_string(),domain(input.target.media_type),input.priority.number(),timestamp,timestamp]).await?;
         bounded(read(&tx,id).await?)

@@ -22,6 +22,7 @@ use std::{
 use uuid::Uuid;
 
 pub mod blocklist;
+pub mod manual_import;
 pub mod metadata;
 pub mod processing;
 pub mod rss;
@@ -320,7 +321,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Ok(current)
     }
     let count = c
-        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)", ())
+        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)", ())
         .await?
         .next()
         .await?
@@ -339,6 +340,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let blocklist = blocklist::router(db.clone());
     let rss = rss::router(db.clone());
     let processing = processing::router(db.clone());
+    let manual_import = manual_import::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -354,6 +356,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(blocklist)
         .merge(rss)
         .merge(processing)
+        .merge(manual_import)
 }
 async fn create(
     State(db): State<Arc<Database>>,

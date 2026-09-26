@@ -216,6 +216,12 @@ export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
 export type LookupResult = { media_type: MediaDomain, external_id: number, title: string, year: number | null, imdb_id: string | null, };
 
+export type ManualImportBatchInput = { operation_ids: Array<string>, priority: CommandPriority, };
+
+export type ManualImportCommand = { id: string, batch_id: string, operation_id: string, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, };
+
+export type ManualImportCommandQuery = { batch_id?: string, status?: CommandStatus, limit?: number, offset?: number, };
+
 export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
 
 export type Mapping = { id: number, media_type: MediaDomain, host: string, remote_path: string, local_path: string, revision: number, };
