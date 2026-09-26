@@ -33,6 +33,131 @@ fn input(target_id: Option<i64>) -> RescanInput {
         priority: CommandPriority::Normal,
     }
 }
+/// Admits a minimal but schema-valid `rss_candidate_imports` row that claims `old_episode_file_id`
+/// as the file `operation_id` is about to replace -- walking `rss_candidates` through its full
+/// pending->prepared->submitting->observed state machine (0025) since `rss_candidate_admit` only
+/// allows inserting at `pending`/`rejected`. `episode.episode_file_id` must already equal
+/// `old_episode_file_id` and that file's current path must equal `old_file_json.path`, per
+/// `candidate_import_admit` (0026).
+async fn admit_pending_replacement(
+    c: &Connection,
+    series_id: i64,
+    episode_id: i64,
+    old_episode_file_id: i64,
+    old_path: &str,
+    operation_id: &str,
+    destination: &str,
+) {
+    let indexer = Uuid::new_v4().to_string();
+    let client = Uuid::new_v4().to_string();
+    c.execute_batch(&format!(
+        "INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('{indexer}','torznab','Indexer',1,1,1,1,'http://indexer');
+         INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search) VALUES('{indexer}','torznab','tv','[5000]','[]',0);
+         INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('{client}','qbittorrent','Client',1,1,1,1,'http://client');
+         INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES('{client}','qbittorrent','tv','tv',0,1,'started','default',0,0,0);"
+    ))
+    .await
+    .unwrap();
+    let command_id = Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rss_commands(id,name,media_type,status,next_attempt_at,created_at,indexer_id,indexer_revision,client_id,client_revision) VALUES(?,'rss_sync','tv','queued',0,0,?,1,?,1)",
+        libsql::params![command_id.clone(), indexer.clone(), client.clone()],
+    )
+    .await
+    .unwrap();
+    let candidate_id = Uuid::new_v4().to_string();
+    let fingerprint = "a".repeat(64);
+    let payload = vec![0u8; 32];
+    c.execute(
+        "INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,status,decision_reasons_json,created_at,updated_at) VALUES(?,?,'tv',?,1,?,1,?,'Release',?,?,'pending','[]',0,0)",
+        libsql::params![
+            candidate_id.clone(),
+            command_id,
+            indexer,
+            client.clone(),
+            fingerprint,
+            payload,
+            series_id
+        ],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id) VALUES(?,?,?)",
+        libsql::params![candidate_id.clone(), series_id, episode_id],
+    )
+    .await
+    .unwrap();
+    let hash = "b".repeat(40);
+    let identity = serde_json::json!({
+        "version": 1,
+        "target": {"media_type": "episode", "id": episode_id},
+        "hashes": [hash.clone()],
+        "settings_fingerprint": "c".repeat(64),
+        "payload_sha256": "d".repeat(64),
+    })
+    .to_string();
+    c.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        libsql::params![identity, candidate_id.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO rss_hash_claims(client_id,hash,candidate_id) VALUES(?,?,?)",
+        libsql::params![client, hash.clone(), candidate_id.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate_id.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        libsql::params![hash, candidate_id.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        &format!(
+            "INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',?,'/download/new.mkv','copy','{destination}','preview','fixture')"
+        ),
+        libsql::params![operation_id, episode_id],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [operation_id],
+    )
+    .await
+    .unwrap();
+    let old_file_json = serde_json::json!({
+        "version": 1,
+        "file_id": old_episode_file_id,
+        "path": old_path,
+        "metadata": null,
+        "parent": {"dev":1,"ino":2,"size":0,"mtime":0,"mtime_ns":0,"ctime":0,"ctime_ns":0},
+        "file": {"dev":1,"ino":3,"size":1,"mtime":0,"mtime_ns":0,"ctime":0,"ctime_ns":0},
+        "quarantine_name": format!(".hrrdarr-replaced-{operation_id}"),
+    })
+    .to_string();
+    c.execute(
+        "INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json,old_episode_file_id,old_file_json) VALUES(?,?,3,?,'{}',?,?)",
+        libsql::params![
+            candidate_id,
+            operation_id,
+            r#"{"version":1,"real":0,"is_repack":false}"#,
+            old_episode_file_id,
+            old_file_json
+        ],
+    )
+    .await
+    .unwrap();
+}
 async fn actual_claim(db: &Database, id: Uuid) -> RescanCommand {
     let c = connection(db).await.unwrap();
     let tx = c
@@ -268,6 +393,133 @@ async fn missing_subfolder_with_root_present_is_a_real_deletion() {
     assert_eq!(file_id, None);
     let remaining: i64 = c
         .query("SELECT count(*) FROM episode_files", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+// Movies-domain counterpart of `root_missing_and_root_empty_skip_with_zero_db_changes`: the
+// missing-mount failsafe is the single most safety-critical behavior in this command, so it
+// needs both-domain evidence, not just the TV case.
+#[tokio::test]
+async fn root_missing_and_root_empty_skip_with_zero_db_changes_for_movies() {
+    let scratch = Scratch::new();
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    // Root missing: neither the movie folder nor its parent exist on disk.
+    c.execute_batch(&format!(
+        "INSERT INTO movie_metadata(id,title,year) VALUES(1,'Gone',2020);
+         INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'{}');",
+        scratch.path("unmounted/Movie (2020)")
+    ))
+    .await
+    .unwrap();
+    let created = create(
+        State(db.clone()),
+        MediaDomain::Movies,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(1)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    let claimed = actual_claim(&db, created.commands[0].id).await;
+    run(&db, claimed).await.unwrap();
+    let done = read(&c, created.commands[0].id).await.unwrap();
+    assert!(matches!(done.status, RescanStatus::Skipped));
+    assert_eq!(done.skip_reason.as_deref(), Some("root_missing"));
+    assert_eq!(done.files_adopted, None);
+    assert_eq!(done.files_removed, None);
+    let movie_files: i64 = c
+        .query("SELECT count(*) FROM movie_files", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(movie_files, 0);
+
+    // Root empty: the parent directory exists but has nothing in it, movie folder still missing.
+    let empty_root = scratch.dir("emptymoviesroot");
+    c.execute_batch(&format!(
+        "INSERT INTO movie_metadata(id,title,year) VALUES(2,'Gone2',2021);
+         INSERT INTO movies(id,metadata_id,path) VALUES(2,2,'{empty_root}/Movie2 (2021)');"
+    ))
+    .await
+    .unwrap();
+    let created = create(
+        State(db.clone()),
+        MediaDomain::Movies,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(2)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    let claimed = actual_claim(&db, created.commands[0].id).await;
+    run(&db, claimed).await.unwrap();
+    let done = read(&c, created.commands[0].id).await.unwrap();
+    assert!(matches!(done.status, RescanStatus::Skipped));
+    assert_eq!(done.skip_reason.as_deref(), Some("root_empty"));
+    let movie_files: i64 = c
+        .query("SELECT count(*) FROM movie_files", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(movie_files, 0);
+}
+
+// Movies-domain counterpart of `missing_subfolder_with_root_present_is_a_real_deletion`.
+#[tokio::test]
+async fn missing_subfolder_with_root_present_is_a_real_deletion_for_movies() {
+    let scratch = Scratch::new();
+    let root = scratch.dir("movies");
+    // Root is non-empty (holds an unrelated file) but this movie's own subfolder is missing.
+    write_file(&format!("{root}/keepalive.txt"), b"x");
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    c.execute_batch(&format!(
+        "INSERT INTO movie_metadata(id,title,year) VALUES(1,'Gone',2020);
+         INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'{root}/Movie (2020)');
+         INSERT INTO movie_files(id,movie_id,path) VALUES(1,1,'{root}/Movie (2020)/old.mkv');
+         INSERT INTO file_metadata(media_type,movie_file_id,size,date_added) VALUES('movies',1,10,'2026-01-01T00:00:00Z');"
+    ))
+    .await
+    .unwrap();
+    let created = create(
+        State(db.clone()),
+        MediaDomain::Movies,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(1)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    let claimed = actual_claim(&db, created.commands[0].id).await;
+    run(&db, claimed).await.unwrap();
+    let done = read(&c, created.commands[0].id).await.unwrap();
+    assert!(matches!(done.status, RescanStatus::Succeeded));
+    assert_eq!(done.files_adopted, Some(0));
+    assert_eq!(done.files_removed, Some(1));
+    let remaining: i64 = c
+        .query("SELECT count(*) FROM movie_files", ())
         .await
         .unwrap()
         .next()
@@ -612,4 +864,93 @@ async fn walk_fails_closed_on_depth_cap_leaving_existing_association_untouched()
         .get(0)
         .unwrap();
     assert_eq!(count, 1);
+}
+
+// A file mid an owned-download replacement (admitted, not yet transferred) must survive a
+// rescan untouched on both sides of the interaction: cleanup must not delete the "old" file
+// record FK-protected by `rss_candidate_imports.old_episode_file_id`, and the walk must not
+// wander into its `.hrrdarr-replaced-<operation_id>` quarantine directory and re-adopt whatever
+// sits there as a stray new file.
+#[tokio::test]
+async fn pending_replacement_file_survives_cleanup_and_is_never_readopted() {
+    let scratch = Scratch::new();
+    let series_path = scratch.dir("tv/Show");
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    let old_path = format!("{series_path}/original.mkv");
+    c.execute_batch(&format!(
+        "INSERT INTO series(id,title,path) VALUES(1,'Show','{series_path}');
+         INSERT INTO seasons(series_id,number) VALUES(1,1);
+         INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Pilot');
+         INSERT INTO episode_files(id,series_id,path) VALUES(1,1,'{old_path}');
+         UPDATE episodes SET episode_file_id=1 WHERE id=1;
+         INSERT INTO file_metadata(media_type,episode_file_id,size,date_added) VALUES('tv',1,5,'2026-01-01T00:00:00Z');"
+    ))
+    .await
+    .unwrap();
+    admit_pending_replacement(
+        &c,
+        1,
+        1,
+        1,
+        &old_path,
+        "op-1",
+        &format!("{series_path}/new.mkv"),
+    )
+    .await;
+    // The quarantined bytes physically exist under a hidden directory the walk must never enter;
+    // the "original" file at `old_path` was never actually moved there in this fixture (the real
+    // transfer never ran), so it's simply absent from disk -- exactly what would make cleanup
+    // consider it "vanished" if the FK didn't stop it.
+    std::fs::create_dir_all(format!("{series_path}/.hrrdarr-replaced-op-1")).unwrap();
+    write_file(
+        &format!("{series_path}/.hrrdarr-replaced-op-1/original.mkv"),
+        b"quarantined",
+    );
+    let created = create(
+        State(db.clone()),
+        MediaDomain::Tv,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(1)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    let claimed = actual_claim(&db, created.commands[0].id).await;
+    run(&db, claimed).await.unwrap();
+    let done = read(&c, created.commands[0].id).await.unwrap();
+    assert!(matches!(done.status, RescanStatus::Succeeded));
+    assert_eq!(done.files_adopted, Some(0));
+    assert_eq!(done.files_removed, Some(0));
+    let (file_id, path): (Option<i64>, String) = {
+        let row = c
+            .query(
+                "SELECT e.episode_file_id,f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=1",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    };
+    assert_eq!(file_id, Some(1));
+    assert_eq!(path, old_path);
+    let total_files: i64 = c
+        .query("SELECT count(*) FROM episode_files", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        total_files, 1,
+        "the quarantined file must not be adopted as a new one"
+    );
 }

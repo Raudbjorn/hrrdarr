@@ -280,6 +280,15 @@ async fn source_unmanaged(c: &Connection, path: &str) -> Result<()> {
     }
     Ok(())
 }
+// Mirrors migration 0032's `rescan_blocks_import_update` trigger, which only fires on the
+// preview->non-preview transition: a pre-check here turns that RAISE into a clean 409 instead
+// of the generic 500 `Error::from(libsql::Error)` would otherwise produce.
+async fn rescan_active(c: &Connection, t: &MediaTarget) -> Result<bool> {
+    Ok(match t {
+        MediaTarget::Episode(id) => c.query("SELECT 1 FROM rescan_commands r JOIN episodes e ON e.series_id=r.series_id WHERE r.status IN ('queued','running','retry_wait') AND r.media_type='tv' AND e.id=?",[*id]).await?.next().await?.is_some(),
+        MediaTarget::Movie(id) => c.query("SELECT 1 FROM rescan_commands r WHERE r.status IN ('queued','running','retry_wait') AND r.media_type='movies' AND r.movie_id=?",[*id]).await?.next().await?.is_some(),
+    })
+}
 async fn committed_owner(c: &Connection, opid: &str, t: &MediaTarget, p: &Plan) -> Result<()> {
     let sql = match t {
         MediaTarget::Episode(_) => {
@@ -597,6 +606,12 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
             return Err(Error::conflict(
                 "target_changed",
                 "Library path changed since preview",
+            ));
+        }
+        if rescan_active(&c, &rec.target).await? {
+            return Err(Error::conflict(
+                "rescan_active",
+                "A library rescan is in progress for this target; retry once it completes",
             ));
         }
         owned::available(&c, opid, &rec.target, &plan).await?;
