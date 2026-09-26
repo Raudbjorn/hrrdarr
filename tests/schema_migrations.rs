@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 32 remains unknown after migration 31 adds quality reset commands.
+    // Version 33 remains unknown after migration 32 adds rescan commands.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (32,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (33,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        31 // Latest schema adds quality reset commands.
+        32 // Latest schema adds rescan commands.
     );
     assert_eq!(
         scalar(
@@ -2864,7 +2864,10 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
 
     // A real upgrade DROP/CREATEs exactly the six known sibling admit triggers, and each recreated
     // body is byte-for-byte the migration-30 body with only the new capacity term inserted before
-    // the limit; a `contains` check alone would miss drift elsewhere in the copied body.
+    // the limit; a `contains` check alone would miss drift elsewhere in the copied body. This test
+    // opens the database through the real, current migration runner, so later migrations that also
+    // DROP/CREATE these same six triggers (each appending one more chained capacity term) must be
+    // reflected here too, in the order they were applied.
     for name in sibling_admit_triggers {
         let sql: String = c
             .query(
@@ -2876,11 +2879,13 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
             .await?
             .unwrap()
             .get(0)?;
-        let expected = sibling_sql_before[name].replacen(
-            ">=1024",
-            "+(SELECT count(*) FROM quality_reset_commands)>=1024",
-            1,
-        );
+        let expected = sibling_sql_before[name]
+            .replacen(
+                ">=1024",
+                "+(SELECT count(*) FROM quality_reset_commands)>=1024",
+                1,
+            )
+            .replacen(">=1024", "+(SELECT count(*) FROM rescan_commands)>=1024", 1);
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
 
@@ -2988,6 +2993,876 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
         scalar(
             &c,
             &format!("SELECT count(*) FROM quality_reset_commands WHERE id='{id}'")
+        )
+        .await,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+        (
+            "root_folders",
+            include_str!("../migrations/0014_root_folders.sql"),
+        ),
+        (
+            "remote_path_mappings",
+            include_str!("../migrations/0015_remote_path_mappings.sql"),
+        ),
+        (
+            "download_refresh",
+            include_str!("../migrations/0016_download_refresh.sql"),
+        ),
+        (
+            "import_history_order",
+            include_str!("../migrations/0017_import_history_order.sql"),
+        ),
+        (
+            "snapshot_history",
+            include_str!("../migrations/0018_snapshot_history.sql"),
+        ),
+        (
+            "profile_policy",
+            include_str!("../migrations/0019_profile_policy.sql"),
+        ),
+        (
+            "snapshot_profiles",
+            include_str!("../migrations/0020_snapshot_profiles.sql"),
+        ),
+        (
+            "metadata_refresh_commands",
+            include_str!("../migrations/0021_metadata_refresh_commands.sql"),
+        ),
+        (
+            "snapshot_blocklist",
+            include_str!("../migrations/0022_snapshot_blocklist.sql"),
+        ),
+        (
+            "blocklist_clear_commands",
+            include_str!("../migrations/0023_blocklist_clear_commands.sql"),
+        ),
+        (
+            "release_catalog_policy",
+            include_str!("../migrations/0024_release_catalog_policy.sql"),
+        ),
+        (
+            "rss_grab_journal",
+            include_str!("../migrations/0025_rss_grab_journal.sql"),
+        ),
+        (
+            "download_processing",
+            include_str!("../migrations/0026_download_processing.sql"),
+        ),
+        (
+            "targeted_search",
+            include_str!("../migrations/0027_targeted_search.sql"),
+        ),
+        (
+            "same_path_replacements",
+            include_str!("../migrations/0028_same_path_replacements.sql"),
+        ),
+        (
+            "naming_settings",
+            include_str!("../migrations/0029_naming_settings.sql"),
+        ),
+        (
+            "manual_import_commands",
+            include_str!("../migrations/0030_manual_import_commands.sql"),
+        ),
+        (
+            "quality_reset_commands",
+            include_str!("../migrations/0031_quality_reset_commands.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+
+    // Seed data that must survive the upgrade untouched, and that the mutual-exclusion checks
+    // target. Series 2 (with its own episode, for the TV branch of the download_processing
+    // guards) and series 3 (bare, for the 'skipped' status check) give those checks a target that
+    // isn't already occupied by series 1's own narrative. Movie 2 plays the same role for the
+    // movie branch of the import_journal guards.
+    c.execute_batch(
+        "INSERT INTO series(id,title,path) VALUES(1,'Kept','/tv/Kept');
+        INSERT INTO seasons(series_id,number) VALUES(1,1);
+        INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Pilot');
+        INSERT INTO series(id,title,path) VALUES(2,'Other','/tv/Other');
+        INSERT INTO seasons(series_id,number) VALUES(2,1);
+        INSERT INTO episodes(id,series_id,season,number,title) VALUES(2,2,1,1,'Other Pilot');
+        INSERT INTO series(id,title,path) VALUES(3,'Unmounted','/tv/Unmounted');
+        INSERT INTO movie_metadata(id,title) VALUES(1,'Movie');
+        INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movies/Movie');
+        INSERT INTO movie_metadata(id,title) VALUES(2,'Movie Two');
+        INSERT INTO movies(id,metadata_id,path) VALUES(2,2,'/movies/MovieTwo');",
+    )
+    .await?;
+
+    // Capture the seven sibling admit triggers exactly as migration 0031 left them, so the
+    // DROP/CREATE bodies added by 0032 can be checked for byte-for-byte fidelity.
+    let sibling_admit_triggers = [
+        "commands_admit",
+        "metadata_refresh_admit",
+        "blocklist_clear_admit",
+        "rss_commands_admit",
+        "search_commands_admit",
+        "manual_import_commands_admit",
+        "quality_reset_admit",
+    ];
+    let mut sibling_sql_before = std::collections::BTreeMap::new();
+    for name in sibling_admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        sibling_sql_before.insert(name, sql);
+    }
+
+    let before = schema_fingerprint(&c).await;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    tx.execute_batch(include_str!("../migrations/0032_rescan_commands.sql"))
+        .await?;
+    // Even before rollback, the fresh DDL already rejects a command that isn't freshly enqueued.
+    assert!(
+        tx.execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at,status) VALUES(?,?,?,100,100,'running')",
+            params![uuid::Uuid::new_v4().to_string(), "tv", 1]
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        schema_fingerprint(&c).await,
+        before,
+        "rollback of migration 32 must leave the prior schema (including the seven DROP/CREATE-recreated sibling admit triggers) byte-identical"
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        32 // Latest schema adds rescan commands.
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movies WHERE path='/movies/Movie'").await,
+        1
+    );
+
+    // A real upgrade DROP/CREATEs exactly the seven known sibling admit triggers, and each
+    // recreated body is byte-for-byte the migration-31 body with only the new capacity term
+    // inserted before the limit; a `contains` check alone would miss drift elsewhere in the body.
+    for name in sibling_admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        let expected = sibling_sql_before[name].replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rescan_commands)>=1024",
+            1,
+        );
+        assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
+    }
+    // The new eighth pool member carries the same full eight-way capacity sum from the start.
+    let rescan_admit_sql: String = c
+        .query(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='rescan_admit'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    assert!(
+        rescan_admit_sql.contains("+(SELECT count(*) FROM rescan_commands)>=1024"),
+        "{rescan_admit_sql}"
+    );
+
+    // An unknown series/movie id is rejected outright.
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "tv", 999],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("invalid rescan target"), "{message}");
+
+    // A 'preview' import (no filesystem work yet, and may never be executed) does not block a TV
+    // rescan of series 1 by itself...
+    let owned_op = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',1,'/download/tv','copy','/tv/Kept/pilot.mkv','preview','fixture')",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [owned_op.clone()],
+    )
+    .await?;
+    let rescan_tv = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_tv.clone(), "tv", 1],
+    )
+    .await?;
+
+    // ...and the reverse guard's INSERT path (not just its UPDATE-out-of-preview path) catches a
+    // second episode-1 operation whose journal is created directly at 'staging', the same way
+    // manual imports are sometimes seeded (skipping 'preview' entirely).
+    let second_tv_op = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message) VALUES(?,'episode',1,'/download/tv2','copy','/tv/Kept/pilot2.mkv','preview','fixture')",
+        [second_tv_op.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','staging')",
+            [second_tv_op.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("import target has an active rescan"),
+        "{message}"
+    );
+
+    // ...cross-domain isolation: an active TV rescan of series 1 never blocks an unrelated movie.
+    let cross_movie = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![cross_movie.clone(), "movies", 1],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rescan_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [cross_movie.clone()],
+    )
+    .await?;
+
+    // ...but the reverse guard now blocks that same preview from starting real transfer work,
+    // because a rescan is queued against its target.
+    let message = c
+        .execute(
+            "UPDATE import_journal SET stage_json='{}',phase='staging' WHERE operation_id=?",
+            [owned_op.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("import target has an active rescan"),
+        "{message}"
+    );
+
+    // Completing the rescan (succeeded requires both outcome-projection columns) releases the target...
+    c.execute(
+        "UPDATE rescan_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [rescan_tv.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "UPDATE rescan_commands SET status='succeeded',completed_at=101 WHERE id=?",
+            [rescan_tv.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("CHECK constraint failed"),
+        "succeeding without a recorded outcome must fail: {message}"
+    );
+    c.execute(
+        "UPDATE rescan_commands SET status='succeeded',completed_at=101,files_adopted=2,files_removed=1 WHERE id=?",
+        [rescan_tv.clone()],
+    )
+    .await?;
+
+    // ...so the same preview can now start real transfer work...
+    c.execute(
+        "UPDATE import_journal SET stage_json='{}',phase='staging' WHERE operation_id=?",
+        [owned_op.clone()],
+    )
+    .await?;
+
+    // ...and, symmetrically, a fresh TV rescan of series 1 is now rejected by the forward check
+    // while that transfer is in flight (not yet 'complete', no longer merely 'preview').
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "tv", 1],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("rescan target has an in-flight import"),
+        "{message}"
+    );
+
+    // ...but once that import reaches 'complete', the same series is admitted again.
+    c.execute(
+        "INSERT INTO episode_files VALUES(1,1,'/tv/Kept/pilot.mkv')",
+        (),
+    )
+    .await?;
+    c.execute("UPDATE episodes SET episode_file_id=1 WHERE id=1", ())
+        .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='staged' WHERE operation_id=?",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='published' WHERE operation_id=?",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256) VALUES(?,'episode',1,1,'/download/tv','/tv/Kept/pilot.mkv',10,printf('%064d',0))",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='committed' WHERE operation_id=?",
+        [owned_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='complete' WHERE operation_id=?",
+        [owned_op.clone()],
+    )
+    .await?;
+    let rescan_tv2 = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_tv2.clone(), "tv", 1],
+    )
+    .await?;
+
+    // One active rescan per target: a second queued row for the same series is rejected while
+    // the first is still active.
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "tv", 1],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("UNIQUE constraint failed"), "{message}");
+
+    // A failsafe skip (e.g. an unmounted root folder, per upstream DiskScanService) is a distinct
+    // terminal outcome from 'succeeded': it requires a skip_reason instead of file-outcome counts,
+    // and it must never silently look like a real scan happened.
+    let rescan_skip = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_skip.clone(), "tv", 3],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rescan_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [rescan_skip.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "UPDATE rescan_commands SET status='skipped',completed_at=101 WHERE id=?",
+            [rescan_skip.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("CHECK constraint failed"),
+        "skipping without a recorded reason must fail: {message}"
+    );
+    c.execute(
+        "UPDATE rescan_commands SET status='skipped',completed_at=101,skip_reason='root_missing' WHERE id=?",
+        [rescan_skip.clone()],
+    )
+    .await?;
+
+    // A live, non-terminal download_processing row for a movie candidate blocks a movie rescan
+    // of that movie...
+    let indexer = uuid::Uuid::new_v4().to_string();
+    let client = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Indexer',1,1,1,1,'http://127.0.0.1:1/')",[indexer.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','movies','[2000]','[]',NULL,0)",[indexer.clone()]).await?;
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Client',1,1,1,1,'http://fixture.invalid')",[client.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','movies','movies',0,0,'started','default',0,0,0)",[client.clone()]).await?;
+    c.execute(
+        "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode) VALUES(?,'movies',1,1,1,'copy')",
+        [client.clone()],
+    )
+    .await?;
+    let rss_command = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','movies',?,1,?,1,100,100)",params![rss_command.clone(),indexer.clone(),client.clone()]).await?;
+    let candidate = uuid::Uuid::new_v4().to_string();
+    let hash = "a".repeat(40);
+    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,NULL,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?",params![candidate.clone(),"c".repeat(64),vec![1u8;29],rss_command.clone()]).await?;
+    let identity = serde_json::json!({"version":1,"target":{"media_type":"movie","id":1},"hashes":[hash],"settings_fingerprint":"a".repeat(64),"payload_sha256":"b".repeat(64)}).to_string();
+    c.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=?,movie_id=1 WHERE id=?",
+        params![identity, candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        params![client.clone(), hash.clone(), candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        params![hash, candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) VALUES(?,1,'queued',100,100,100)",
+        [candidate.clone()],
+    )
+    .await?;
+
+    // 'queued' has not started preflight/transfer work, so it does not block a movie rescan by itself...
+    let rescan_movie = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_movie.clone(), "movies", 1],
+    )
+    .await?;
+
+    // One active rescan per target: a second queued row for the same movie is rejected while the
+    // first is still active.
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "movies", 1],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("UNIQUE constraint failed"), "{message}");
+
+    // Cross-domain isolation: an active movie rescan never blocks an unrelated TV series.
+    let cross_tv = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![cross_tv.clone(), "tv", 2],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rescan_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [cross_tv.clone()],
+    )
+    .await?;
+
+    // ...but the reverse guard now blocks that download from entering 'checking' (the gate to
+    // real preflight/transfer work), because a rescan is active against its target.
+    let message = c
+        .execute(
+            "UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1 WHERE candidate_id=?",
+            [candidate.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("download processing target has an active rescan"),
+        "{message}"
+    );
+
+    // Identity, including movie_id, is immutable once queued.
+    let message = c
+        .execute(
+            "UPDATE rescan_commands SET movie_id=NULL,media_type='tv',series_id=1 WHERE id=?",
+            [rescan_movie.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("command identity is immutable"),
+        "{message}"
+    );
+
+    // queued -> running -> failed is terminal too, and requires an error_code but no outcome
+    // counts; it also releases the target, both for the uniqueness index and for the reverse guard.
+    c.execute(
+        "UPDATE rescan_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [rescan_movie.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rescan_commands SET status='failed',completed_at=101,error_code='storage_error' WHERE id=?",
+        [rescan_movie.clone()],
+    )
+    .await?;
+
+    // ...so the download can now enter 'checking'...
+    c.execute(
+        "UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1 WHERE candidate_id=?",
+        [candidate.clone()],
+    )
+    .await?;
+
+    // ...and, symmetrically, the forward check on rescan_admit now rejects a fresh movie-1 rescan
+    // while that download is actively checking/importing.
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "movies", 1],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("rescan target has in-flight download processing"),
+        "{message}"
+    );
+
+    // Once that download reaches 'imported' (with its import complete), the same movie is
+    // admitted again.
+    let movie_op = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO operations(id,media_type,movie_id,source,mode,destination,status,message) VALUES(?,'movie',1,'/download/movie','copy','/movies/Movie/film.mkv','preview','fixture')",[movie_op.clone()]).await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','preview')",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json) VALUES(?,?,1,'{\"version\":1,\"real\":0,\"is_repack\":false}','{}')",params![candidate.clone(),movie_op.clone()]).await?;
+    c.execute(
+        "UPDATE download_processing SET status='importing' WHERE candidate_id=?",
+        [candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET stage_json='{}',phase='staging' WHERE operation_id=?",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='staged' WHERE operation_id=?",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='published' WHERE operation_id=?",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO movie_files(id,movie_id,path) VALUES(1,1,'/movies/Movie/film.mkv')",
+        (),
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO import_history(operation_id,media_type,movie_id,movie_file_id,source,destination,size,sha256) VALUES(?,'movie',1,1,'/download/movie','/movies/Movie/film.mkv',10,printf('%064d',0))",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='committed' WHERE operation_id=?",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE import_journal SET phase='complete' WHERE operation_id=?",
+        [movie_op.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE download_processing SET status='imported' WHERE candidate_id=?",
+        [candidate.clone()],
+    )
+    .await?;
+    let rescan_movie2 = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_movie2.clone(), "movies", 1],
+    )
+    .await?;
+
+    // The movie branch of the import_journal guards, on movie 2 (independent of movie 1's own
+    // narrative, and never routed through download_processing at all).
+    let rescan_movie2_branch = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_movie2_branch.clone(), "movies", 2],
+    )
+    .await?;
+    let movie2_op = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO operations(id,media_type,movie_id,source,mode,destination,status,message) VALUES(?,'movie',2,'/download/movie2','copy','/movies/MovieTwo/film.mkv','preview','fixture')",[movie2_op.clone()]).await?;
+    // A direct insert at 'staging' (the same shape used for movie 1 earlier in this test) is
+    // rejected by rescan_blocks_import_insert's movie branch...
+    let message = c
+        .execute(
+            "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','staging')",
+            [movie2_op.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("import target has an active rescan"),
+        "{message}"
+    );
+    // ...but once the rescan is terminal, the same insert succeeds...
+    c.execute(
+        "UPDATE rescan_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [rescan_movie2_branch.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO import_journal(operation_id,plan_json,phase) VALUES(?,'{}','staging')",
+        [movie2_op.clone()],
+    )
+    .await?;
+    // ...and now rescan_admit's own forward check (movie branch of the import_journal predicate)
+    // rejects a fresh movie-2 rescan while that import sits mid-transfer.
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,movie_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "movies", 2],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("rescan target has an in-flight import"),
+        "{message}"
+    );
+
+    // The TV branch of the download_processing guards, on series 2/episode 2 (independent of both
+    // the TV import_journal scenario on series 1 and the movie download_processing scenario above).
+    let tv_indexer = uuid::Uuid::new_v4().to_string();
+    let tv_client = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','TV Indexer',1,1,1,1,'http://127.0.0.1:2/')",[tv_indexer.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)",[tv_indexer.clone()]).await?;
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','TV Client',1,1,1,1,'http://fixture-tv.invalid')",[tv_client.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','tv','tv',0,0,'started','default',0,0,0)",[tv_client.clone()]).await?;
+    c.execute(
+        "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode) VALUES(?,'tv',1,1,1,'copy')",
+        [tv_client.clone()],
+    )
+    .await?;
+    let tv_rss_command = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','tv',?,1,?,1,100,100)",params![tv_rss_command.clone(),tv_indexer.clone(),tv_client.clone()]).await?;
+    let tv_candidate = uuid::Uuid::new_v4().to_string();
+    let tv_hash = "f".repeat(40);
+    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,2,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?",params![tv_candidate.clone(),"e".repeat(64),vec![1u8;29],tv_rss_command.clone()]).await?;
+    c.execute(
+        "INSERT INTO rss_candidate_episodes VALUES(?,2,2)",
+        [tv_candidate.clone()],
+    )
+    .await?;
+    let tv_identity = serde_json::json!({"version":1,"target":{"media_type":"episode","id":2},"hashes":[tv_hash],"settings_fingerprint":"a".repeat(64),"payload_sha256":"b".repeat(64)}).to_string();
+    c.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        params![tv_identity, tv_candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        params![tv_client.clone(), tv_hash.clone(), tv_candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [tv_candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        params![tv_hash, tv_candidate.clone()],
+    )
+    .await?;
+    c.execute(
+        "INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) VALUES(?,1,'queued',100,100,100)",
+        [tv_candidate.clone()],
+    )
+    .await?;
+    let rescan_series2 = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+        params![rescan_series2.clone(), "tv", 2],
+    )
+    .await?;
+    // A queued TV rescan of series 2 blocks that download from entering 'checking' (reverse
+    // guard, TV branch)...
+    let message = c
+        .execute(
+            "UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1 WHERE candidate_id=?",
+            [tv_candidate.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("download processing target has an active rescan"),
+        "{message}"
+    );
+    // ...and, once the rescan is cancelled and the download reaches 'checking' on its own, the
+    // forward check (TV branch) rejects a fresh series-2 rescan while it is active.
+    c.execute(
+        "UPDATE rescan_commands SET status='cancelled',completed_at=100 WHERE id=?",
+        [rescan_series2.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1 WHERE candidate_id=?",
+        [tv_candidate.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,next_attempt_at,created_at) VALUES(?,?,?,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "tv", 2],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("rescan target has in-flight download processing"),
+        "{message}"
+    );
+
+    // Active rows cannot be deleted, but terminal rows can (also proving the pool re-admits once
+    // every prior row for series 1, respectively movie 1, is terminal).
+    let message = c
+        .execute(
+            "DELETE FROM rescan_commands WHERE id=?",
+            [rescan_tv2.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("active commands cannot be deleted"),
+        "{message}"
+    );
+    c.execute(
+        "UPDATE rescan_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [rescan_tv2.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE rescan_commands SET status='succeeded',completed_at=101,files_adopted=0,files_removed=0 WHERE id=?",
+        [rescan_tv2.clone()],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM rescan_commands WHERE id=?",
+        [rescan_tv2.clone()],
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT count(*) FROM rescan_commands WHERE id='{rescan_tv2}'")
         )
         .await,
         0

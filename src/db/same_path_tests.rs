@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 31); // Latest open adds quality reset commands.
+    assert_eq!(version(&c).await?, 32); // Latest open adds rescan commands.
     for op in &operations {
         let r = c
             .query(
