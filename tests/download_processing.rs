@@ -40,6 +40,12 @@ struct Remote {
     completed: AtomicU8,
     detail_reads: AtomicU8,
     endpoint: Mutex<String>,
+    // scn.002: overrides the tv search-feed title and the completed-download filename below
+    // (stem only, no extension) so a daily/anime-shaped release can be exercised end to end
+    // without disturbing the fixed "Harbor.S01E01.1080p.WEB-DL" title every other tv scenario
+    // in this file relies on. The wire hash stays the plain `TV` constant either way -- only
+    // the advertised/observed filename changes.
+    release_override: Mutex<Option<String>>,
 }
 const TV: &str = "1111111111111111111111111111111111111111";
 const MOVIE: &str = "2222222222222222222222222222222222222222";
@@ -57,7 +63,10 @@ async fn remote(
             .into_owned()
             .collect();
     if uri.path() == "/shows/en/101" {
-        return axum::Json(json!({"tvdbId":101,"title":"Harbor","seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":501,"seasonNumber":1,"episodeNumber":1,"title":"Pilot","runtime":45,"airDateUtc":"2020-01-01T00:00:00Z"}]})).into_response();
+        // airDate/absoluteEpisodeNumber are additive: every existing standard-typed scenario
+        // ignores both columns, but a daily/anime-typed series (scn.002) needs a real air date
+        // and absolute number on this same fixture episode to match end to end.
+        return axum::Json(json!({"tvdbId":101,"title":"Harbor","seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":501,"seasonNumber":1,"episodeNumber":1,"title":"Pilot","runtime":45,"airDate":"2020-01-01","airDateUtc":"2020-01-01T00:00:00Z","absoluteEpisodeNumber":1}]})).into_response();
     }
     if uri.path() == "/movie/201" {
         return axum::Json(json!({"tmdbId":201,"title":"Harbor","year":2020,"runtime":100,"digitalRelease":"2020-01-01T00:00:00Z"})).into_response();
@@ -70,18 +79,20 @@ async fn remote(
         let hash = q.get("hash").unwrap();
         let tv = hash == TV || hash.starts_with('3');
         let upgrade = hash.starts_with('3') || hash.starts_with('4');
-        let mut name = if upgrade {
+        let mut name = if let Some(stem) = s.release_override.lock().unwrap().clone() {
+            format!("{stem}.mkv")
+        } else if upgrade {
             if tv {
                 "Harbor.S01E01.1080p.Bluray.mkv"
             } else {
                 "Harbor.2020.1080p.Bluray.mkv"
             }
+            .to_string()
         } else if tv {
-            "Harbor.S01E01.1080p.WEB-DL.mkv"
+            "Harbor.S01E01.1080p.WEB-DL.mkv".to_string()
         } else {
-            "Harbor.2020.1080p.WEB-DL.mkv"
-        }
-        .to_string();
+            "Harbor.2020.1080p.WEB-DL.mkv".to_string()
+        };
         if s.mode.load(Ordering::SeqCst) == 9 {
             name = if tv {
                 "Harbor.S01E02.1080p.WEB-DL.mkv"
@@ -113,9 +124,17 @@ async fn remote(
         }
         let tv = q.get("cat").is_some_and(|v| v.contains("5030"));
         let (title, hash, cat) = if tv {
-            ("Harbor.S01E01.1080p.WEB-DL", TV, 5030)
+            (
+                s.release_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "Harbor.S01E01.1080p.WEB-DL".to_string()),
+                TV,
+                5030,
+            )
         } else {
-            ("Harbor.2020.1080p.WEB-DL", MOVIE, 2030)
+            ("Harbor.2020.1080p.WEB-DL".to_string(), MOVIE, 2030)
         };
         let hash = match s.mode.load(Ordering::SeqCst) {
             6 => {
@@ -129,9 +148,9 @@ async fn remote(
         };
         let title = if s.mode.load(Ordering::SeqCst) == 6 {
             if tv {
-                "Harbor.S01E01.1080p.Bluray"
+                "Harbor.S01E01.1080p.Bluray".to_string()
             } else {
-                "Harbor.2020.1080p.Bluray"
+                "Harbor.2020.1080p.Bluray".to_string()
             }
         } else {
             title
@@ -983,6 +1002,8 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     naming_render_failure_blocks_and_touches_nothing_http().await;
     naming_resume_uses_captured_destination_not_reconfigured_one_http().await;
     naming_hostile_episode_title_renders_safely_http().await;
+    daily_series_completed_download_imports_and_renders_http().await;
+    anime_series_completed_download_imports_and_renders_http().await;
 }
 
 // Runs after the existing HTTP scenario in the same test so the global import lease is serial.
@@ -1248,13 +1269,22 @@ impl Ctx {
         self.api.stop().await;
     }
 }
-async fn naming_ctx(movie: bool, tv_series_type: &str) -> Ctx {
+// `tv_release_stem` (no extension) overrides the tv search-feed title and completed-download
+// filename via `Remote::release_override` -- `None` keeps every existing scenario's fixed
+// "Harbor.S01E01.1080p.WEB-DL", `Some(..)` lets a daily/anime-shaped release (scn.002) drive
+// the same real Add->RSS->grab->completed-download pipeline this fixture already exercises.
+async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&str>) -> Ctx {
     let scratch = Scratch(
         std::env::temp_dir().join(format!("hrrdarr-naming-wiring-{}", uuid::Uuid::new_v4())),
     );
     std::fs::create_dir(&scratch.0).unwrap();
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let state = Arc::new(Remote::default());
+    if !movie {
+        if let Some(stem) = tv_release_stem {
+            *state.release_override.lock().unwrap() = Some(stem.to_string());
+        }
+    }
     let (origin, upstream) = serve(
         axum::Router::new()
             .fallback(remote)
@@ -1308,11 +1338,14 @@ async fn naming_ctx(movie: bool, tv_series_type: &str) -> Ctx {
         source_top.join("batch")
     };
     let name = if movie {
-        "Harbor.2020.1080p.WEB-DL.mkv"
+        "Harbor.2020.1080p.WEB-DL.mkv".to_string()
     } else {
-        "Harbor.S01E01.1080p.WEB-DL.mkv"
+        format!(
+            "{}.mkv",
+            tv_release_stem.unwrap_or("Harbor.S01E01.1080p.WEB-DL")
+        )
     };
-    std::fs::write(source.join(name), vec![1u8; 1048576]).unwrap();
+    std::fs::write(source.join(&name), vec![1u8; 1048576]).unwrap();
     let route = if movie {
         "/api/v1/movies/lookup"
     } else {
@@ -1436,7 +1469,7 @@ async fn put_movie_naming(
 // Scenario: `standard_episode_format` configured and enabled actually changes the on-disk
 // filename for TV, through the real Add->RSS->grab->completed-download pipeline.
 async fn naming_renders_tv_destination_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     put_tv_naming(
         &ctx.base,
         1,
@@ -1467,7 +1500,7 @@ async fn naming_renders_tv_destination_http() {
 // Scenario: `standard_movie_format` configured and enabled actually changes the on-disk
 // filename for movies, through the real pipeline.
 async fn naming_renders_movie_destination_http() {
-    let ctx = naming_ctx(true, "standard").await;
+    let ctx = naming_ctx(true, "standard", None).await;
     put_movie_naming(
         &ctx.base,
         1,
@@ -1513,7 +1546,7 @@ async fn naming_renders_movie_destination_http() {
 // visibly-different names, falls back to basename preservation rather than sliding to
 // either of the other configured format columns.
 async fn naming_null_format_falls_back_to_basename_not_another_column_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     put_tv_naming(
         &ctx.base,
         1,
@@ -1549,7 +1582,7 @@ async fn naming_null_format_falls_back_to_basename_not_another_column_http() {
 // pre-existing associated file must still go through the same-path replacement/exchange
 // machinery from the prior iteration, not be treated as a fresh distinct destination.
 async fn naming_rendered_collision_uses_same_path_replacement_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     let existing_name = "Collide S01E01.mkv";
     let old_source = ctx.scratch.0.join("original-tv");
     std::fs::write(&old_source, b"original-collision-media").unwrap();
@@ -1649,7 +1682,7 @@ async fn naming_rendered_collision_uses_same_path_replacement_http() {
 // asserts the ACTUAL observed behavior (including the bug) plus the safety invariants that DO
 // still hold (no operation/journal ever created, no file ever touched, in any of the 3 attempts).
 async fn naming_render_failure_blocks_and_touches_nothing_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     put_tv_naming(&ctx.base, 1, true, Some("{Episode Title}"), None, None).await;
     let c = ctx.db.connect().await.unwrap();
     // `episodes.title` is `NOT NULL` with no emptiness check; an empty title is the only
@@ -1704,7 +1737,7 @@ async fn naming_render_failure_blocks_and_touches_nothing_http() {
 // must resume to completion using A's destination verbatim, never re-rendering against a
 // naming config B applied while the operation was paused mid-flight.
 async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     put_tv_naming(
         &ctx.base,
         1,
@@ -1810,7 +1843,7 @@ async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
 // component -- proving the wiring carries a hostile real stored fact through safely, on top of
 // `src/naming/render.rs`'s own unit tests for the pure sanitization rules in isolation.
 async fn naming_hostile_episode_title_renders_safely_http() {
-    let ctx = naming_ctx(false, "standard").await;
+    let ctx = naming_ctx(false, "standard", None).await;
     put_tv_naming(&ctx.base, 1, true, Some("{Episode Title}"), None, None).await;
     let c = ctx.db.connect().await.unwrap();
     let hostile = format!("Face/Off: {}", "x".repeat(300));
@@ -1841,5 +1874,142 @@ async fn naming_hostile_episode_title_renders_safely_http() {
     assert_eq!(name.len(), 255, "{name}");
     assert!(!name.contains('/'), "{name}");
     assert!(!name.contains(':'), "{name}");
+    ctx.shutdown().await;
+}
+
+// scn.002 end-to-end recovery. iteration 44 found that a completed download for a
+// `daily`/`anime`-typed series could never reach this pipeline at all: `evaluate` rejected any
+// non-`standard` `series_type` before any numbering-match logic ran. That gap is now closed in
+// `src/search/downloaded.rs::evaluate` (real `Daily`/`Absolute` matching), and this file's own
+// `docs/naming-api.md` note flagged that the fix was unit-tested at the `evaluate()` function
+// level but never re-verified through a live Add->RSS->grab->completed-download run. This
+// scenario drives exactly that live run for a `daily`-typed series: a real air-date-form
+// release title is matched at RSS/grab time (`decision::evaluate`'s `Daily` arm), the completed
+// download is matched again and accepted (`downloaded::evaluate`'s fixed `Daily` arm), the file
+// is actually imported (a real `episode_file_id`/`episode_files` association, not merely an
+// accepted decision), and the `daily_episode_format` naming arm --
+// `src/naming/destination.rs::resolve_owned_destination`'s `Some("daily")` case, already
+// confirmed correct in isolation but never exercised end to end -- renders the real air date
+// into the final on-disk filename.
+async fn daily_series_completed_download_imports_and_renders_http() {
+    let ctx = naming_ctx(false, "daily", Some("Harbor.2020.01.01.1080p.WEB-DL")).await;
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        None,
+        Some("{Series Title} - {Air-Date} [{Quality Title}]"),
+        None,
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    assert_eq!(done["target"]["media_type"], "tv");
+    let c = ctx.db.connect().await.unwrap();
+    let file_id: Option<i64> = c
+        .query("SELECT episode_file_id FROM episodes WHERE id=1", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert!(
+        file_id.is_some(),
+        "a daily episode must get a real file association through the automated pipeline, \
+         not merely an accepted decision"
+    );
+    let stored_path: String = c
+        .query(
+            "SELECT path FROM episode_files WHERE id=?",
+            [file_id.unwrap()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let expected = ctx.root.join("Harbor - 2020-01-01 [WEBDL-1080p].mkv");
+    assert_eq!(PathBuf::from(stored_path), expected);
+    assert_eq!(std::fs::read(&expected).unwrap(), vec![1u8; 1048576]);
+    assert!(
+        !ctx.root.join("Harbor.2020.01.01.1080p.WEB-DL.mkv").exists(),
+        "the daily_episode_format arm must actually render, not silently preserve the raw \
+         downloaded basename"
+    );
+    ctx.shutdown().await;
+}
+
+// scn.002 end-to-end recovery, anime numbering (see `daily_series_completed_download_imports_
+// and_renders_http` above for the full gap/fix narrative). Exercises the `Absolute` arm through
+// the same real Add->RSS->grab->completed-download pipeline and the `anime_episode_format`
+// naming arm. `use_scene_numbering` stays `false` here (the shared `naming_ctx` fixture's
+// default): this proves reachability of the plain `absolute_episode_number` path only, not the
+// scene-numbering fallback that `downloaded::match_absolute`/this session's `decision.rs` fix
+// also cover (those have their own dedicated unit/integration coverage elsewhere).
+async fn anime_series_completed_download_imports_and_renders_http() {
+    let ctx = naming_ctx(false, "anime", Some("Harbor - 001 1080p WEB-DL")).await;
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        None,
+        None,
+        Some("{Series Title} - {episode:00} [{Quality Title}]"),
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    assert_eq!(done["target"]["media_type"], "tv");
+    let c = ctx.db.connect().await.unwrap();
+    let file_id: Option<i64> = c
+        .query("SELECT episode_file_id FROM episodes WHERE id=1", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert!(
+        file_id.is_some(),
+        "an anime episode must get a real file association through the automated pipeline, \
+         not merely an accepted decision"
+    );
+    let stored_path: String = c
+        .query(
+            "SELECT path FROM episode_files WHERE id=?",
+            [file_id.unwrap()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let expected = ctx.root.join("Harbor - 01 [WEBDL-1080p].mkv");
+    assert_eq!(PathBuf::from(stored_path), expected);
+    assert_eq!(std::fs::read(&expected).unwrap(), vec![1u8; 1048576]);
+    assert!(
+        !ctx.root.join("Harbor - 001 1080p WEB-DL.mkv").exists(),
+        "the anime_episode_format arm must actually render, not silently preserve the raw \
+         downloaded basename"
+    );
     ctx.shutdown().await;
 }

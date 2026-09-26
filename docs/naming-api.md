@@ -61,17 +61,41 @@ renderer returns a stem only), and caps the stem so `stem.ext` never exceeds
 stem. TV picks `standard_episode_format`, `daily_episode_format` or
 `anime_episode_format` by the series' `library_settings.series_type`
 (`NULL`/`standard` uses `standard_episode_format`); movies always use
-`standard_movie_format`. **The `daily`/`anime` selection is unreachable from
-the automated pipeline today**, confirmed by integration testing, not just a
-gap in this module: `src/search/downloaded.rs::evaluate` rejects any target
-whose `library_settings.series_type != "standard"` with `numbering_unsupported`
-before naming is ever consulted, and its numbering-match logic only
-implements `parser::Numbering::Episodes` (`Daily`/`Absolute` always fail to
-match). A `daily`- or `anime`-typed series can never have a completed
-download accepted by this pipeline at all, so `resolve_owned_destination`'s
-`Some("daily")`/`Some("anime")` arms are dead code from any real HTTP flow
-until `evaluate`'s numbering support is extended -- tracked as a
-`search-grab-pipeline` gap, not a naming defect. A render failure (for
+`standard_movie_format`. **The `daily`/`anime` selection was unreachable from
+the automated pipeline before iteration49 (`scn.002`, `f7cb8f8`)**:
+`src/search/downloaded.rs::evaluate` rejected any target whose
+`library_settings.series_type != "standard"` with `numbering_unsupported`
+before naming was ever consulted, and its numbering-match logic only
+implemented `parser::Numbering::Episodes`. That gap is now closed --
+`evaluate` matches real `Daily` (exact air-date, upstream
+`FindOneByAirDate` semantics) and `Absolute`/anime (upstream
+`GetAnimeEpisodes` scene-then-plain-column semantics) numbering, so a
+matched daily/anime episode reaches this module the same way a standard
+one does, using its own real `season`/`number`/`air_date` fields --
+`resolve_owned_destination`'s `Some("daily")`/`Some("anime")` arms need no
+change themselves, since they already loaded and rendered against exactly
+this data; they simply couldn't be reached by anything real before.
+**Independently re-verified end to end**, in a follow-up to the note this
+replaces: `tests/download_processing.rs::daily_series_completed_download_imports_and_renders_http`
+and `::anime_series_completed_download_imports_and_renders_http` each drive a
+real Add->RSS->grab->completed-download run for a `daily`- and an
+`anime`-typed series respectively, over the same real HTTP/producer pipeline
+the rest of that file already exercises (no mocked `evaluate` or
+`resolve_owned_destination` call). Both assert a real `episodes.episode_file_id`
+row association (not merely an accepted decision) and that the configured
+`daily_episode_format`/`anime_episode_format` template actually rendered the
+on-disk filename (`"Harbor - 2020-01-01 [WEBDL-1080p].mkv"` from a real air
+date, `"Harbor - 01 [WEBDL-1080p].mkv"` from a real absolute episode number),
+not the raw downloaded basename. Two residual gaps this run does not cover,
+left for whoever owns them next: the fixture's `use_scene_numbering` is
+`false`, so this does not exercise the scene-absolute-number-vs-plain-column
+fallback in `downloaded::match_absolute` (which has its own dedicated unit
+coverage in `src/search/downloaded.rs`) or the equivalent fallback this same
+session added to `src/search/decision.rs`'s own `Absolute` arm (which has its
+own dedicated coverage in `tests/release_decisions.rs`); and
+`src/commands/rescan.rs:958` still reports daily/absolute numbering as
+unsupported on its own separate call path, unrelated to and not fixed by
+either change described here. A render failure (for
 example `standard_episode_format = "{Episode Title}"` for an episode with no
 title) is a distinct, propagated error -- the automated path blocks the item
 with `error_code="unsupported_download"` and reason token

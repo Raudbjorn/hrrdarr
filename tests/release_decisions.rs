@@ -375,3 +375,109 @@ async fn both_domain_decisions_and_real_search_consumer() {
     drop(c);
     drop(db);
 }
+
+// scn.002 follow-up: decision::evaluate's own Absolute (anime) numbering arm had the same
+// scene-absolute-number-vs-plain-column gap search::downloaded::evaluate's first draft had --
+// no fallback, so an empty or ambiguous scene_absolute_episode_number match silently rejected a
+// real anime release at search/decision time instead of falling back to absolute_episode_number
+// (mirrors downloaded::match_absolute and upstream ParsingService.GetAnimeEpisodes). This test
+// exercises the three cases that distinguish "no fallback" from "fallback, discard-not-reject":
+// an empty scene-column result, an ambiguous (multi-hit) scene-column result, and a genuine
+// plain-column duplicate that must still fail once the fallback runs.
+#[tokio::test]
+async fn anime_scene_absolute_falls_back_to_plain_column_at_decision_time() {
+    let path = std::env::temp_dir().join(format!("hrrdarr-release-anime-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _scratch = Scratch(path.clone());
+    let db = Database::open_local(path.join("test.db")).await.unwrap();
+    let c = db.connect().await.unwrap();
+    c.execute_batch(
+        "INSERT INTO quality_profiles VALUES(1,'tv','HD');\
+         INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1);\
+         INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL);\
+         INSERT INTO release_delay_policies VALUES('tv',0,0,0);\
+         INSERT INTO series(id,title,path)VALUES(1,'Aurora','/synthetic/tv-anime');\
+         INSERT INTO seasons(series_id,number)VALUES(1,1);\
+         INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'anime',1);\
+         INSERT INTO episodes(id,series_id,season,number,title,runtime,absolute_episode_number,scene_absolute_episode_number)VALUES\
+            (1,1,1,1,'No scene mapping, falls back to the plain column',45,51,NULL),\
+            (2,1,1,2,'Shares a scene number but unique on the plain column',45,60,60),\
+            (3,1,1,3,'Collides on the scene number only',45,70,60),\
+            (4,1,1,4,'Duplicate on the plain column too',45,80,NULL),\
+            (5,1,1,5,'Second duplicate on the plain column',45,80,NULL);",
+    )
+    .await
+    .unwrap();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z")
+        .unwrap()
+        .timestamp();
+
+    // Empty scene-column result (no episode has scene_absolute_episode_number=51): discarded,
+    // not rejected -- falls back to absolute_episode_number, which uniquely resolves to
+    // episode 1.
+    let empty_scene = release("Aurora - 051 1080p WEB-DL", true);
+    let result = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &empty_scene,
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.disposition,
+        Disposition::Accept,
+        "{:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.target,
+        Some(ReleaseTarget::Tv {
+            series_id: 1,
+            episode_ids: vec![1]
+        })
+    );
+
+    // Ambiguous scene-column result (episodes 2 and 3 both have scene_absolute_episode_number=60):
+    // discarded, not rejected -- falls back to absolute_episode_number=60, which only episode 2
+    // has (episode 3's plain column is 70), so the fallback still resolves uniquely.
+    let ambiguous_scene = release("Aurora - 060 1080p WEB-DL", true);
+    let result = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &ambiguous_scene,
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.disposition,
+        Disposition::Accept,
+        "{:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.target,
+        Some(ReleaseTarget::Tv {
+            series_id: 1,
+            episode_ids: vec![2]
+        })
+    );
+
+    // Once the scene column is empty/ambiguous and matching falls back to the plain column,
+    // a genuine duplicate there (episodes 4 and 5 both have absolute_episode_number=80) is a
+    // real, unresolved ambiguity -- the series never becomes a complete/unique candidate.
+    let plain_duplicate = release("Aurora - 080 1080p WEB-DL", true);
+    let result = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &plain_duplicate,
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.reasons, vec!["no_library_match"]);
+}
