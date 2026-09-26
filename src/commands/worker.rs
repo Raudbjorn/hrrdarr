@@ -456,4 +456,73 @@ mod tests {
         drop(client);
         drop(db);
     }
+
+    // A queued manual import for a target with an active rescan must be deferred by claim()'s
+    // own SELECT, not claimed and then failed by rescan_blocks_import_update's RAISE.
+    #[tokio::test]
+    async fn claim_defers_a_queued_manual_import_whose_target_has_an_active_rescan() {
+        let path = std::env::temp_dir().join(format!("hrrdarr-kind7-deferral-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _scratch = Scratch(path.clone());
+        for p in ["tv", "downloads"] {
+            std::fs::create_dir(path.join(p)).unwrap();
+        }
+        let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+        let tv = path.join("tv").to_str().unwrap().to_owned();
+        let source = path.join("downloads/media").to_str().unwrap().to_owned();
+        let dest = path.join("tv/media.mkv").to_str().unwrap().to_owned();
+        std::fs::write(&source, b"kind7-deferral-content").unwrap();
+        let c = connection(&db).await.unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO series(id,title,path) VALUES(1,'Show','{tv}');
+             INSERT INTO seasons(series_id,number) VALUES(1,1);
+             INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Pilot');"
+        ))
+        .await
+        .unwrap();
+        let operation = crate::import::preview(
+            db.clone(),
+            crate::import::ImportInput::Typed(crate::import::ManualImportRequest {
+                target: crate::db::MediaTarget::Episode(1),
+                source,
+                mode: crate::import::Mode::Copy,
+                destination: dest,
+            }),
+        )
+        .await
+        .unwrap()
+        .id;
+        let command_id = Uuid::new_v4();
+        c.execute(
+            "INSERT INTO manual_import_commands(id,batch_id,operation_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,?,?,0,'queued',0,0,0)",
+            params![command_id.to_string(), Uuid::new_v4().to_string(), operation.to_string()],
+        )
+        .await
+        .unwrap();
+        let rescan_id = Uuid::new_v4();
+        c.execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',1,0,'queued',0,0,0)",
+            [rescan_id.to_string()],
+        )
+        .await
+        .unwrap();
+        // The rescan itself is claimed first (the journal is still at 'preview', so kind=9's own
+        // admission predicate doesn't block it) -- proving the manual import was correctly
+        // deferred, since it's the only other queued command and claim() only returns one row.
+        let Some(Claimed::Rescan(claimed_rescan)) = claim(&db).await.unwrap() else {
+            panic!("expected the rescan to be claimed while the manual import is deferred");
+        };
+        assert_eq!(claimed_rescan.id, rescan_id);
+        c.execute(
+            "UPDATE rescan_commands SET status='succeeded',files_adopted=0,files_removed=0,completed_at=1 WHERE id=?",
+            [rescan_id.to_string()],
+        )
+        .await
+        .unwrap();
+        // Picked up once the rescan clears.
+        let Some(Claimed::ManualImport(claimed)) = claim(&db).await.unwrap() else {
+            panic!("expected the manual import to become claimable once the rescan cleared");
+        };
+        assert_eq!(claimed.id, command_id);
+    }
 }

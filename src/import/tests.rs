@@ -287,6 +287,52 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
         tokio::task::yield_now().await;
     }
     drop(dir.database().await);
+    // An active rescan for the same series must reject preview->staging as a transient conflict
+    // (not a permanent journal failure) and must never persist `error_code` for it -- doing so
+    // would make `manual_import::run` treat a self-resolving race as a durable terminal failure.
+    let dir = Scratch::new();
+    let db = dir.database().await;
+    dir.setup(&db).await;
+    let id = dir.preview(db.clone(), false, Mode::Copy).await;
+    db.connect()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,series_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',1,0,'queued',0,0,0)",
+            [Uuid::new_v4().to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        execute(db.clone(), &id).await.unwrap_err().code(),
+        "rescan_active"
+    );
+    let c = db.connect().await.unwrap();
+    assert_eq!(
+        c.query(
+            "SELECT error_code FROM import_journal WHERE operation_id=?",
+            [id.clone()]
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<Option<String>>(0)
+        .unwrap(),
+        None,
+        "a transient rescan conflict must not be persisted as a durable journal failure"
+    );
+    // Once the rescan clears, the same untouched operation must still complete normally.
+    c.execute(
+        "UPDATE rescan_commands SET status='cancelled',completed_at=1 WHERE series_id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(c);
+    assert_eq!(execute(db.clone(), &id).await.unwrap().status, "complete");
 }
 
 #[tokio::test]

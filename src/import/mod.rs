@@ -462,13 +462,22 @@ fn launch(
                 "{}",
                 serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"code":e.code,"diagnostic":e.diagnostic})
             );
-            let persisted=async{let c=db.connect().await?;c.execute("UPDATE import_journal SET error_code=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![e.code,opid.clone()]).await?;Ok::<(),libsql::Error>(())}.await;
-            if let Err(error) = persisted {
-                let error = Error::from(error);
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"condition":"error_status_persistence_failed","diagnostic":error.diagnostic})
-                );
+            // `rescan_active` fires in `run_inner` before any checkpoint/mutation for this
+            // attempt -- the operation is untouched, exactly like `import_busy`'s pre-launch
+            // bail. Unlike every other error here, persisting it would permanently poison the
+            // journal: `manual_import::run` treats any `import_journal.error_code` as a durable
+            // terminal failure and never retries. Leaving it unpersisted lets that same caller's
+            // "journal untouched" fallback retry within its own budget once the rescan clears,
+            // instead of settling a transient, self-resolving conflict as a permanent failure.
+            if e.code != "rescan_active" {
+                let persisted=async{let c=db.connect().await?;c.execute("UPDATE import_journal SET error_code=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![e.code,opid.clone()]).await?;Ok::<(),libsql::Error>(())}.await;
+                if let Err(error) = persisted {
+                    let error = Error::from(error);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"condition":"error_status_persistence_failed","diagnostic":error.diagnostic})
+                    );
+                }
             }
         }
         result
