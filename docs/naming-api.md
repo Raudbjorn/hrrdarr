@@ -42,12 +42,58 @@ is not claimed. Known shape divergences from what the Sonarr controller shows:
   are wired in — worth remembering when this renderer is connected to
   automated imports.
 
-**Not wired into automation.** `src/commands/processing.rs` still computes the
-automated-import destination as `root.join(basename)` (plain basename
-preservation). Wiring this renderer into that path requires threading
-series/episode/movie title facts through `src/search/downloaded.rs::Facts`,
-which is out of scope for this change. This iteration ships the persisted
-config, the validator and the pure renderer/preview endpoint only.
+**Wired into the automated owned-download import path, filenames only.**
+`src/naming/destination.rs::resolve_owned_destination` is now the single
+place that computes the automated-import destination: it is called
+pre-transaction from `src/commands/processing.rs` (building the `OwnedImport`
+sent to `prepare_owned`) and again, fresh, inside `prepare_owned`'s
+transaction (`src/import/owned.rs`) as a preflight re-check that the
+destination a stale `Plan` was built from still matches what the current
+facts would produce. When `rename_enabled=0` for the target's domain, or the
+applicable format field (below) is `NULL`, it returns exactly
+`root.join(basename)` -- byte-identical to the pre-wiring behavior; no
+default template is ever invented. When enabled and configured, it fetches
+the series/episode or movie/quality facts from the database, renders the
+applicable **filename** format through the same parser/renderer described
+above, takes the extension from the downloaded file's own basename (the
+renderer returns a stem only), and caps the stem so `stem.ext` never exceeds
+255 bytes (NAME_MAX) even though the renderer's own cap only accounts for the
+stem. TV picks `standard_episode_format`, `daily_episode_format` or
+`anime_episode_format` by the series' `library_settings.series_type`
+(`NULL`/`standard` uses `standard_episode_format`); movies always use
+`standard_movie_format`. **The `daily`/`anime` selection is unreachable from
+the automated pipeline today**, confirmed by integration testing, not just a
+gap in this module: `src/search/downloaded.rs::evaluate` rejects any target
+whose `library_settings.series_type != "standard"` with `numbering_unsupported`
+before naming is ever consulted, and its numbering-match logic only
+implements `parser::Numbering::Episodes` (`Daily`/`Absolute` always fail to
+match). A `daily`- or `anime`-typed series can never have a completed
+download accepted by this pipeline at all, so `resolve_owned_destination`'s
+`Some("daily")`/`Some("anime")` arms are dead code from any real HTTP flow
+until `evaluate`'s numbering support is extended -- tracked as a
+`search-grab-pipeline` gap, not a naming defect. A render failure (for
+example `standard_episode_format = "{Episode Title}"` for an episode with no
+title) is a distinct, propagated error -- the automated path blocks the item
+with `error_code="unsupported_download"` and reason token
+`naming_render_failed` in `reasons_json` (the `error_code` enum from
+migration 0026 predates this feature and has no naming-specific member, and
+`reasons_json` only accepts `[a-z0-9_]*` tokens up to 128 bytes, so the full
+free-text render-failure detail is logged, not stored -- see
+`src/commands/processing.rs`) rather than silently falling back to basename
+preservation under a name the operator did not ask for. Once a
+`Plan` is journaled (`import_journal`), resuming an in-flight operation reads
+`plan.destination` verbatim from the journal and never calls the resolver
+again, so a mid-flight settings change cannot alter a destination already
+committed to disk.
+
+**Still not wired.** Folder-format templates
+(`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
+are not rendered anywhere; the automated path's destination parent directory
+is always the library root, unchanged, because there is no journaled
+directory-creation capability yet. Multi-episode rendering
+(`multi_episode_style`) is still not consumed. Manual import
+(`src/import/mod.rs`'s `preview`/`ManualImportRequest`, the
+caller-supplied-destination path) is untouched by this renderer entirely.
 
 ## Routes
 
@@ -262,7 +308,18 @@ yet** — a separate reviewer is expected to add `tests/naming_api.rs` exercisin
 the routes end to end over a real listener, the way `tests/provider_config_api.rs`
 exercises `src/providers/mod.rs`; that file was intentionally not created here.
 
-Outstanding: wiring into `src/commands/processing.rs`'s automated import path
-(needs `Facts` to carry series/episode/movie titles); multi-episode rendering;
-any UI. No live services, network calls, or fixed ports are used anywhere in
+`src/naming/destination.rs` carries its own in-module unit tests for the
+pure stem/extension-capping logic (`finish_render`): a short stem passed
+through unchanged, a 500-byte title capped so `stem.ext` still fits inside
+255 bytes, and a template that renders empty surfacing as a `Render` error
+rather than a silent fallback. Fetching facts from the database and the
+`rename_enabled=0`/unconfigured-format basename-preservation path are
+exercised only indirectly today, through whichever integration tests cover
+`src/commands/processing.rs` and `src/import/owned.rs`; no dedicated
+`resolve_owned_destination` integration test exists yet.
+
+Outstanding: folder-format rendering
+(`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
+and the directory-creation it would require; multi-episode rendering; any UI.
+No live services, network calls, or fixed ports are used anywhere in
 this module.

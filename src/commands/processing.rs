@@ -560,11 +560,48 @@ async fn preflight(
             let mapping_revision = mapped
                 .mapping_revision
                 .ok_or(Error(StatusCode::CONFLICT, "path_mapping_missing"))?;
-            let destination = std::path::Path::new(&facts.root)
-                .join(&facts.basename)
-                .to_str()
-                .ok_or_else(bad)?
-                .to_string();
+            let destination = match crate::naming::destination::resolve_owned_destination(
+                &c,
+                &target,
+                &facts.root,
+                &facts.basename,
+                facts.quality_id,
+                facts.edition.as_deref(),
+            )
+            .await
+            {
+                Ok(destination) => destination,
+                Err(crate::naming::destination::DestinationError::Render(detail)) => {
+                    // `error_code` is a closed enum (migration 0026) with no naming-specific
+                    // member, and `reasons_json` rejects anything but `[a-z0-9_]*` (<=128
+                    // bytes) -- `detail` is a free-text sentence, so it can never be stored
+                    // directly. Log the actionable detail; store a short, valid reason token
+                    // plus the closest existing error_code (this item can't be turned into a
+                    // supported import under the current naming configuration).
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"level":"ERROR","event":"naming_render_failed","candidate_id":item.receipt_id.to_string(),"detail":detail})
+                    );
+                    blocked(
+                        &c,
+                        item.receipt_id,
+                        "unsupported_download",
+                        vec!["naming_render_failed".to_string()],
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(crate::naming::destination::DestinationError::Db(e)) => {
+                    return Err(Error::from(e));
+                }
+                Err(crate::naming::destination::DestinationError::Internal(reason)) => {
+                    eprintln!("event=naming_destination_unavailable condition={reason}");
+                    return Err(Error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "command_storage_error",
+                    ));
+                }
+            };
             accepted = Some(crate::import::OwnedImport {
                 candidate_id: item.receipt_id.to_string(),
                 target: match target {

@@ -435,7 +435,7 @@ fn replace_illegal(raw: &str, replace: bool) -> Result<String, RenderError> {
 fn trim_edges(s: &str) -> &str {
     s.trim_matches(|c: char| c == '.' || c == ' ')
 }
-fn cap_bytes(s: &str, max: usize) -> &str {
+pub(super) fn cap_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

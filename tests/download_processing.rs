@@ -346,11 +346,30 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
             metadata.clone(),
         ))
         .merge(hrrdarr::remote_paths::router(db.clone()))
+        .merge(hrrdarr::naming::router(db.clone()))
         .merge(hrrdarr::history::router(db.clone()));
     let (base, _api) = serve(router).await;
     let c = db.connect().await.unwrap();
     // Profiles are configuration fixtures; all catalog targets, receipts, import journals and history use real producers.
     c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1),(1,'tv',7,1,1),(2,'movies',7,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,7,0,0,1,NULL),(2,'movies',1,7,0,0,1,-2); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    // Fresh-install naming defaults must be disabled with every format unset; a naming
+    // config that is *configured but disabled* must not perturb any basename assertion
+    // below, since `rename_enabled` is the only automated-path gate that matters.
+    let (code, tv_defaults) = request(&base, "GET", "/api/v1/tv/config/naming", Value::Null).await;
+    assert_eq!(code, 200, "{tv_defaults}");
+    assert_eq!(tv_defaults["rename_enabled"], false);
+    assert_eq!(tv_defaults["revision"], 1);
+    assert!(tv_defaults["standard_episode_format"].is_null());
+    let (code, movie_defaults) =
+        request(&base, "GET", "/api/v1/movies/config/naming", Value::Null).await;
+    assert_eq!(code, 200, "{movie_defaults}");
+    assert_eq!(movie_defaults["rename_enabled"], false);
+    assert_eq!(movie_defaults["revision"], 1);
+    assert!(movie_defaults["standard_movie_format"].is_null());
+    let(code,v)=request(&base,"PUT","/api/v1/tv/config/naming",json!({"revision":1,"rename_enabled":false,"replace_illegal_characters":true,"colon_replacement":"smart","custom_colon_replacement":null,"standard_episode_format":"DISABLED-{Series Title}","daily_episode_format":null,"anime_episode_format":null,"series_folder_format":null,"season_folder_format":null,"specials_folder_format":null,"multi_episode_style":null})).await;
+    assert_eq!(code, 200, "{v}");
+    let(code,v)=request(&base,"PUT","/api/v1/movies/config/naming",json!({"revision":1,"rename_enabled":false,"replace_illegal_characters":true,"colon_replacement":"smart","custom_colon_replacement":null,"standard_movie_format":"DISABLED-{Movie Title}","movie_folder_format":null})).await;
+    assert_eq!(code, 200, "{v}");
     let (indexer, download) = providers(&base, &origin).await;
     let mut receipts = Vec::new();
     let mut roots = Vec::new();
@@ -957,6 +976,13 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     }
     runtime.shutdown().await;
     same_basename_http().await;
+    naming_renders_tv_destination_http().await;
+    naming_renders_movie_destination_http().await;
+    naming_null_format_falls_back_to_basename_not_another_column_http().await;
+    naming_rendered_collision_uses_same_path_replacement_http().await;
+    naming_render_failure_blocks_and_touches_nothing_http().await;
+    naming_resume_uses_captured_destination_not_reconfigured_one_http().await;
+    naming_hostile_episode_title_renders_safely_http().await;
 }
 
 // Runs after the existing HTTP scenario in the same test so the global import lease is serial.
@@ -1194,4 +1220,626 @@ async fn same_basename_http() {
     );
     assert_eq!(state.adds.lock().unwrap().len(), 2);
     runtime.shutdown().await;
+}
+
+// Shared fixture for the naming-wiring scenarios below: one series/movie, one root, one
+// completed WEB-DL release, real HTTP add/RSS/grab through the same producer pipeline as
+// the rest of this file. Each scenario gets its own scratch/db so the global owned-import
+// lease (`src/import/mod.rs`'s `EXECUTING`/`ACTIVE_OPERATION` statics) never contends across
+// concurrently-running test binaries; every caller runs serially from the bottom of the main
+// `#[tokio::test]` above for the same reason `same_basename_http` already does.
+struct Ctx {
+    scratch: Scratch,
+    db: Arc<Database>,
+    state: Arc<Remote>,
+    base: String,
+    root: PathBuf,
+    source: PathBuf,
+    runtime: hrrdarr::commands::Runtime,
+    api: Server,
+    _upstream: Server,
+    download: Value,
+    indexer: Value,
+    movie: bool,
+}
+impl Ctx {
+    async fn shutdown(self) {
+        self.runtime.shutdown().await;
+        self.api.stop().await;
+    }
+}
+async fn naming_ctx(movie: bool, tv_series_type: &str) -> Ctx {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-naming-wiring-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let state = Arc::new(Remote::default());
+    let (origin, upstream) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(state.clone()),
+    )
+    .await;
+    *state.endpoint.lock().unwrap() = origin.clone();
+    let metadata = Arc::new(
+        hrrdarr::metadata::MetadataClient::with_origins(
+            &format!("{origin}/"),
+            &format!("{origin}/"),
+        )
+        .unwrap(),
+    );
+    let key = Arc::new(providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
+    let router = router
+        .merge(commands::router(db.clone()))
+        .merge(hrrdarr::library::router(db.clone()))
+        .merge(hrrdarr::library::metadata_router(
+            db.clone(),
+            metadata.clone(),
+        ))
+        .merge(hrrdarr::remote_paths::router(db.clone()))
+        .merge(hrrdarr::naming::router(db.clone()))
+        .merge(hrrdarr::import::router(db.clone()))
+        .merge(hrrdarr::media_files::router(db.clone()))
+        .merge(hrrdarr::history::router(db.clone()));
+    let (base, api) = serve(router).await;
+    let c = db.connect().await.unwrap();
+    let media = if movie { "movies" } else { "tv" };
+    let lang = if movie { "-2" } else { "NULL" };
+    c.execute_batch(&format!(
+        "UPDATE quality_definitions SET min_size=0; \
+         INSERT INTO quality_profiles VALUES(1,'{media}','HD'); \
+         INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'{media}',1,0,1),(1,'{media}',3,1,1); \
+         INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'{media}',1,3,0,0,1,{lang}); \
+         INSERT INTO release_delay_policies VALUES('{media}',0,0,0);"
+    ))
+    .await
+    .unwrap();
+    let (indexer, download) = providers(&base, &origin).await;
+    let root = scratch.0.join(media);
+    std::fs::create_dir(&root).unwrap();
+    let source_top = scratch.0.join(format!("source-{media}"));
+    let source = if movie {
+        std::fs::create_dir_all(&source_top).unwrap();
+        source_top.clone()
+    } else {
+        std::fs::create_dir_all(source_top.join("batch")).unwrap();
+        source_top.join("batch")
+    };
+    let name = if movie {
+        "Harbor.2020.1080p.WEB-DL.mkv"
+    } else {
+        "Harbor.S01E01.1080p.WEB-DL.mkv"
+    };
+    std::fs::write(source.join(name), vec![1u8; 1048576]).unwrap();
+    let route = if movie {
+        "/api/v1/movies/lookup"
+    } else {
+        "/api/v1/tv/series/lookup"
+    };
+    let input = if movie {
+        json!({"tmdb_id":201,"path":root,"settings":{"quality_profile_id":1,"minimum_availability":"released","monitored":true}})
+    } else {
+        json!({"tvdb_id":101,"path":root,"settings":{"quality_profile_id":1,"series_type":tv_series_type,"use_scene_numbering":false,"monitored":true}})
+    };
+    let (code, v) = request(&base, "POST", route, input).await;
+    assert_eq!(code, 201, "{v}");
+    let (code, v) = request(
+        &base,
+        "POST",
+        &format!("/api/v1/{media}/remote-path-mappings"),
+        json!({"host":"127.0.0.1","remote_path":"/remote","local_path":source_top}),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":if movie{"hardlink"}else{"copy"}})).await;
+    assert_eq!(code, 200, "{v}");
+    let runtime = commands::start_with_metadata(db.clone(), client, metadata)
+        .await
+        .unwrap();
+    Ctx {
+        scratch,
+        db,
+        state,
+        base,
+        root,
+        source,
+        runtime,
+        api,
+        _upstream: upstream,
+        download,
+        indexer,
+        movie,
+    }
+}
+async fn naming_grab_and_complete(ctx: &Ctx) -> Value {
+    let media = if ctx.movie { "movies" } else { "tv" };
+    let command = enqueue(&ctx.base, target(&ctx.indexer, &ctx.download, media)).await;
+    let done = wait_status(
+        &ctx.base,
+        &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+        "succeeded",
+    )
+    .await;
+    assert_eq!(done["observed"], 1, "{done}");
+    let (code, v) = request(
+        &ctx.base,
+        "GET",
+        &format!(
+            "/api/v1/rss/candidates?command_id={}",
+            command["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200);
+    let receipt = v["items"][0]["id"].clone();
+    ctx.state.completed.store(1, Ordering::SeqCst);
+    receipt
+}
+async fn naming_process(ctx: &Ctx, receipt: &Value) -> (u16, Value) {
+    let media = if ctx.movie { "movies" } else { "tv" };
+    request(
+        &ctx.base,
+        "POST",
+        "/api/v1/download-processing",
+        json!({"provider_id":ctx.download["id"],"provider_revision":ctx.download["revision"],"media_type":media,"receipt_ids":[receipt]}),
+    )
+    .await
+}
+async fn put_tv_naming(
+    base: &str,
+    revision: i64,
+    rename_enabled: bool,
+    standard: Option<&str>,
+    daily: Option<&str>,
+    anime: Option<&str>,
+) -> Value {
+    let (code, v) = request(
+        base,
+        "PUT",
+        "/api/v1/tv/config/naming",
+        json!({
+            "revision": revision, "rename_enabled": rename_enabled, "replace_illegal_characters": true,
+            "colon_replacement": "dash", "custom_colon_replacement": null,
+            "standard_episode_format": standard, "daily_episode_format": daily, "anime_episode_format": anime,
+            "series_folder_format": null, "season_folder_format": null, "specials_folder_format": null,
+            "multi_episode_style": null,
+        }),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    v
+}
+async fn put_movie_naming(
+    base: &str,
+    revision: i64,
+    rename_enabled: bool,
+    standard: Option<&str>,
+) -> Value {
+    let (code, v) = request(
+        base,
+        "PUT",
+        "/api/v1/movies/config/naming",
+        json!({
+            "revision": revision, "rename_enabled": rename_enabled, "replace_illegal_characters": true,
+            "colon_replacement": "dash", "custom_colon_replacement": null,
+            "standard_movie_format": standard, "movie_folder_format": null,
+        }),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    v
+}
+
+// Scenario: `standard_episode_format` configured and enabled actually changes the on-disk
+// filename for TV, through the real Add->RSS->grab->completed-download pipeline.
+async fn naming_renders_tv_destination_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        Some("{Series Title} - S{season:00}E{episode:00} - {Episode Title} [{Quality Title}]"),
+        Some("DAILY-{Series Title}-S{season:00}E{episode:00}"),
+        Some("ANIME-{Series Title}-{episode:00}"),
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    let expected = "Harbor - S01E01 - Pilot [WEBDL-1080p].mkv";
+    assert_eq!(
+        std::fs::read(ctx.root.join(expected)).unwrap(),
+        vec![1u8; 1048576]
+    );
+    assert!(
+        !ctx.root.join("Harbor.S01E01.1080p.WEB-DL.mkv").exists(),
+        "raw downloaded basename must not remain once rendering is enabled"
+    );
+    ctx.shutdown().await;
+}
+
+// Scenario: `standard_movie_format` configured and enabled actually changes the on-disk
+// filename for movies, through the real pipeline.
+async fn naming_renders_movie_destination_http() {
+    let ctx = naming_ctx(true, "standard").await;
+    put_movie_naming(
+        &ctx.base,
+        1,
+        true,
+        Some("{Movie Title} ({Release Year}) [{Quality Title}]"),
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    let expected = "Harbor (2020) [WEBDL-1080p].mkv";
+    assert_eq!(
+        std::fs::read(ctx.root.join(expected)).unwrap(),
+        vec![1u8; 1048576]
+    );
+    assert!(!ctx.root.join("Harbor.2020.1080p.WEB-DL.mkv").exists());
+    ctx.shutdown().await;
+}
+
+// Scenario 3 (series-type selection) is only partially reachable end to end: NOTE below and
+// in the final report explains why the `daily`/`anime` arms of `resolve_owned_destination`
+// cannot be exercised through the real completed-download pipeline as it exists today.
+//
+// `src/search/downloaded.rs::evaluate` (the decision the automated owned-download path uses to
+// accept a completed file) rejects ANY target whose `library_settings.series_type` is not
+// `"standard"` with `numbering_unsupported`, before naming is ever consulted, and its numbering
+// match arm only implements `parser::Numbering::Episodes` (`_ => false` for `Daily`/`Absolute`).
+// So a `daily`- or `anime`-typed series can never have a completed download accepted by this
+// pipeline at all today, independent of naming configuration -- there is no way to reach the
+// `Some("daily")`/`Some("anime")` arms in `src/naming/destination.rs`'s series-type match from
+// a real HTTP flow. `naming_renders_tv_destination_http` above already proves the `"standard"`
+// arm picks `standard_episode_format` over the (also configured) daily/anime templates; the
+// scenario below proves the reverse half of the same selection (a `NULL` `standard_episode_format`
+// does not fall back to `standard_episode_format`'s own value, obviously, but more importantly
+// does not fall back to ANY other configured format either). Together these are the full
+// selection-logic coverage obtainable without a change to `search/downloaded.rs`.
+
+// Scenario: `rename_enabled=true` but `standard_episode_format` itself is `NULL`, while
+// `daily_episode_format`/`anime_episode_format` are both configured and would render
+// visibly-different names, falls back to basename preservation rather than sliding to
+// either of the other configured format columns.
+async fn naming_null_format_falls_back_to_basename_not_another_column_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        None,
+        Some("DAILY-{Series Title}-S{season:00}E{episode:00}"),
+        Some("ANIME-{Series Title}-{episode:00}"),
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    let raw = "Harbor.S01E01.1080p.WEB-DL.mkv";
+    assert_eq!(
+        std::fs::read(ctx.root.join(raw)).unwrap(),
+        vec![1u8; 1048576]
+    );
+    assert!(
+        !ctx.root.join("DAILY-Harbor-S01E01.mkv").exists(),
+        "a NULL standard_episode_format must not fall back to daily_episode_format"
+    );
+    assert!(
+        !ctx.root.join("ANIME-Harbor-01.mkv").exists(),
+        "a NULL standard_episode_format must not fall back to anime_episode_format"
+    );
+    ctx.shutdown().await;
+}
+
+// Scenario: a configured template that happens to render to the SAME filename as a
+// pre-existing associated file must still go through the same-path replacement/exchange
+// machinery from the prior iteration, not be treated as a fresh distinct destination.
+async fn naming_rendered_collision_uses_same_path_replacement_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    let existing_name = "Collide S01E01.mkv";
+    let old_source = ctx.scratch.0.join("original-tv");
+    std::fs::write(&old_source, b"original-collision-media").unwrap();
+    let (code, op) = request(
+        &ctx.base,
+        "POST",
+        "/api/v1/imports",
+        json!({"target":{"media_type":"episode","id":1},"source":old_source,"destination":ctx.root.join(existing_name),"mode":"copy"}),
+    )
+    .await;
+    assert_eq!(code, 202, "{op}");
+    let (code, v) = request(
+        &ctx.base,
+        "POST",
+        &format!("/api/v1/imports/{}/execute", op["id"].as_str().unwrap()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = request(
+        &ctx.base,
+        "PUT",
+        "/api/v1/tv/files/1",
+        json!({"quality":{"quality_id":1,"revision":{"version":1,"real":0,"is_repack":false}}}),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        Some("Collide S{season:00}E{episode:00}"),
+        None,
+        None,
+    )
+    .await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    assert_eq!(done["retirement_state"], "quarantined");
+    assert_eq!(
+        std::fs::read(ctx.root.join(existing_name)).unwrap(),
+        vec![1u8; 1048576],
+        "the rendered destination must equal the pre-existing path, not a fresh one"
+    );
+    assert!(
+        !ctx.root.join("Harbor.S01E01.1080p.WEB-DL.mkv").exists(),
+        "same-path replacement must not also leave the raw downloaded basename behind"
+    );
+    let c = ctx.db.connect().await.unwrap();
+    let old_json: String = c
+        .query(
+            "SELECT old_file_json FROM rss_candidate_imports WHERE operation_id=?",
+            [done["operation_id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let old: Value = serde_json::from_str(&old_json).unwrap();
+    let retained = ctx
+        .root
+        .join(old["quarantine_name"].as_str().unwrap())
+        .join("original");
+    assert_eq!(
+        std::fs::read(retained).unwrap(),
+        b"original-collision-media"
+    );
+    ctx.shutdown().await;
+}
+
+// Scenario: a template that fails to render against real stored facts blocks the item and
+// touches nothing -- no destination file, no operation, no journal.
+//
+// BUG FOUND (reported, not fixed here -- out of file-ownership scope): the item does NOT end
+// up blocked with `naming_render_failed` as documented. `download_processing.reasons_json` has
+// a trigger (migration 0026_download_processing.sql, both `CHECK`-style triggers around lines
+// 103/114) that `RAISE(ABORT,'invalid processing reason')` whenever any reason string is not
+// `[a-z0-9_]*` of at most 128 bytes. `src/commands/processing.rs::preflight()`'s naming-render-
+// failure branch calls `blocked(&c, item.receipt_id, "naming_render_failed", vec![detail])`
+// where `detail` is `finish_render`'s free-text message (e.g. "standard_episode_format failed
+// to render: rendering produced an empty path component") -- which always contains spaces and
+// punctuation and therefore always violates that trigger. The `blocked()` write itself fails
+// with a real SQLite constraint error (verified via temporary `{error:?}` instrumentation on
+// `commands::Error::from(libsql::Error)`, since reverted), is treated as a retryable
+// `storage_error` for up to 3 attempts (identical failure each time, since the render input
+// never changes), and only succeeds at blocking on the 3rd attempt using the generic
+// `storage_error`/`["storage_error"]` pair instead. Every render failure hits this, since
+// `finish_render`'s messages are always human-readable sentences, never bare tokens. This test
+// asserts the ACTUAL observed behavior (including the bug) plus the safety invariants that DO
+// still hold (no operation/journal ever created, no file ever touched, in any of the 3 attempts).
+async fn naming_render_failure_blocks_and_touches_nothing_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    put_tv_naming(&ctx.base, 1, true, Some("{Episode Title}"), None, None).await;
+    let c = ctx.db.connect().await.unwrap();
+    // `episodes.title` is `NOT NULL` with no emptiness check; an empty title is the only
+    // schema-legal way to make `{Episode Title}` alone render to an empty path component.
+    c.execute("UPDATE episodes SET title='' WHERE id=1", ())
+        .await
+        .unwrap();
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let blocked = wait_status(&ctx.base, &path, "blocked").await;
+    // `error_code` (migration 0026) is a closed enum predating this feature with no
+    // naming-specific member; `reasons_json` only accepts `[a-z0-9_]*` tokens <=128 bytes,
+    // so the free-text render-failure detail is logged, not stored. `unsupported_download`
+    // (otherwise unused) plus a `naming_render_failed` reason token is the fix for the
+    // previously-discovered bug where the raw sentence violated the reasons_json trigger and
+    // masked the real outcome as `storage_error` after 3 failed retries.
+    assert_eq!(blocked["error_code"], "unsupported_download", "{blocked}");
+    assert_eq!(
+        blocked["reasons"].as_array().unwrap(),
+        &vec![serde_json::json!("naming_render_failed")]
+    );
+    assert_eq!(blocked["total_preflight_attempts"], 1, "{blocked}");
+    assert!(blocked["operation_id"].is_null());
+    assert!(
+        ctx.source.join("Harbor.S01E01.1080p.WEB-DL.mkv").exists(),
+        "source file must remain untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(&ctx.root).unwrap().count(),
+        0,
+        "no destination file may be created on a render failure"
+    );
+    for table in ["operations", "import_journal", "rss_candidate_imports"] {
+        let count: i64 = c
+            .query(&format!("SELECT count(*) FROM {table}"), ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    ctx.shutdown().await;
+}
+
+// Scenario: an operation whose `Plan` was already captured/journaled under naming config A
+// must resume to completion using A's destination verbatim, never re-rendering against a
+// naming config B applied while the operation was paused mid-flight.
+async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    put_tv_naming(
+        &ctx.base,
+        1,
+        true,
+        Some("CONFIG-A-{Series Title}-S{season:00}E{episode:00}"),
+        None,
+        None,
+    )
+    .await;
+    let c = ctx.db.connect().await.unwrap();
+    // Installed before the grab/complete step (not after) so there is no window in which a
+    // scheduled refresh could auto-queue and race the completed item past `staging`
+    // unpaused. Pauses right after the Plan is journaled (phase='preview') and before any
+    // file is staged/published, so a re-render (if it happened) would be directly observable.
+    c.execute_batch("CREATE TRIGGER naming_resume_pause BEFORE UPDATE OF phase ON import_journal WHEN NEW.phase='staging' BEGIN SELECT RAISE(ABORT,'test pause before staging'); END;").await.unwrap();
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let paused = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (_, v) = request(&ctx.base, "GET", &path, Value::Null).await;
+            if v["error_code"] == "import_failed" {
+                break v;
+            }
+            assert_ne!(v["status"], "blocked", "{v}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        paused["import_phase"], "preview",
+        "must pause before any file materialization"
+    );
+    assert!(!paused["operation_id"].is_null());
+    let config_a = "CONFIG-A-Harbor-S01E01.mkv";
+    assert!(
+        !ctx.root.join(config_a).exists(),
+        "nothing may be written before staging even begins"
+    );
+    let plan_json: String = c
+        .query(
+            "SELECT plan_json FROM import_journal WHERE operation_id=?",
+            [paused["operation_id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let plan: Value = serde_json::from_str(&plan_json).unwrap();
+    assert_eq!(
+        plan["destination"],
+        ctx.root.join(config_a).to_str().unwrap()
+    );
+    put_tv_naming(
+        &ctx.base,
+        2,
+        true,
+        Some("CONFIG-B-{Series Title}-S{season:00}E{episode:00}"),
+        None,
+        None,
+    )
+    .await;
+    c.execute_batch("DROP TRIGGER naming_resume_pause;")
+        .await
+        .unwrap();
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["operation_id"], paused["operation_id"]);
+    assert_eq!(
+        std::fs::read(ctx.root.join(config_a)).unwrap(),
+        vec![1u8; 1048576]
+    );
+    assert!(
+        !ctx.root.join("CONFIG-B-Harbor-S01E01.mkv").exists(),
+        "resume must not re-render with the newly-applied config"
+    );
+    let association: String = c
+        .query(
+            "SELECT f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=1",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(association, ctx.root.join(config_a).to_str().unwrap());
+    ctx.shutdown().await;
+}
+
+// Scenario: a hostile episode title (a literal `/`, a literal `:`, and 250+ bytes combined
+// into one fact) renders through the real pipeline into a single, sanitized, <=255-byte path
+// component -- proving the wiring carries a hostile real stored fact through safely, on top of
+// `src/naming/render.rs`'s own unit tests for the pure sanitization rules in isolation.
+async fn naming_hostile_episode_title_renders_safely_http() {
+    let ctx = naming_ctx(false, "standard").await;
+    put_tv_naming(&ctx.base, 1, true, Some("{Episode Title}"), None, None).await;
+    let c = ctx.db.connect().await.unwrap();
+    let hostile = format!("Face/Off: {}", "x".repeat(300));
+    c.execute("UPDATE episodes SET title=? WHERE id=1", [hostile])
+        .await
+        .unwrap();
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let (code, v) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{v}");
+    let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+    let done = wait_status(&ctx.base, &path, "imported").await;
+    assert_eq!(done["import_phase"], "complete");
+    // `fs.rs::cleanup` intentionally retains the emptied `.hrrdarr-import-<opid>` staging
+    // directory as a durable ownership receipt after every completed import; filter it out
+    // rather than asserting an exact directory entry count.
+    let entries: Vec<_> = std::fs::read_dir(&ctx.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.starts_with(".hrrdarr-"))
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let name = &entries[0];
+    assert!(
+        name.starts_with("Face-Off- "),
+        "slash and colon must sanitize within one component: {name}"
+    );
+    assert!(name.ends_with(".mkv"), "{name}");
+    assert_eq!(name.len(), 255, "{name}");
+    assert!(!name.contains('/'), "{name}");
+    assert!(!name.contains(':'), "{name}");
+    ctx.shutdown().await;
 }

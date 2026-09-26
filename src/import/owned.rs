@@ -229,14 +229,34 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             "Downloaded file no longer passes current import policy",
         )
     })?;
+    // Re-derive the SAME destination fresh, inside this transaction, rather than trusting
+    // `plan.destination` still matches `accepted.basename` -- a configured naming template
+    // means destination is no longer always `root.join(basename)`. A facts change that makes
+    // rendering newly fail (or newly succeed differently) surfaces as the same conflict as any
+    // other preflight fact drift, not a panic or a silent mismatch.
+    let expected_destination = match crate::naming::destination::resolve_owned_destination(
+        &tx,
+        &input.target,
+        &accepted.root,
+        &accepted.basename,
+        accepted.quality_id,
+        accepted.edition.as_deref(),
+    )
+    .await
+    {
+        Ok(destination) => Some(destination),
+        Err(crate::naming::destination::DestinationError::Render(_)) => None,
+        Err(crate::naming::destination::DestinationError::Db(e)) => return Err(Error::from(e)),
+        Err(crate::naming::destination::DestinationError::Internal(reason)) => {
+            eprintln!("event=naming_destination_unavailable condition={reason}");
+            return Err(Error::internal());
+        }
+    };
     if accepted.root != plan.root
         || accepted.quality_id != input.quality_id
         || accepted.revision_json != input.revision_json
         || accepted.edition != input.edition
-        || std::path::Path::new(&plan.destination)
-            .file_name()
-            .and_then(|n| n.to_str())
-            != Some(accepted.basename.as_str())
+        || expected_destination.as_deref() != Some(plan.destination.as_str())
     {
         return Err(Error::conflict(
             "preflight_changed",

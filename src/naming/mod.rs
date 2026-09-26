@@ -1,6 +1,7 @@
 //! Native `config/naming` API: domain-scoped naming singletons plus a live preview
 //! endpoint. Persists to the `naming_settings` table (migration 0029). Not wired
 //! into any automated import path yet; see docs/naming-api.md.
+pub(crate) mod destination;
 pub mod render;
 use crate::db::Database;
 use axum::{
