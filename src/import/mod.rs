@@ -617,14 +617,35 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
                 "Library path changed since preview",
             ));
         }
-        if rescan_active(&c, &rec.target).await? {
+        owned::available(&c, opid, &rec.target, &plan).await?;
+        // Re-checked inside the same IMMEDIATE transaction as the phase write below, not just
+        // beforehand: a plain pre-check here would leave a race where a rescan is admitted
+        // between the check and the UPDATE, and rescan_blocks_import_update's RAISE would come
+        // back as a generic error rather than "rescan_active", bypassing launch()'s exemption and
+        // permanently failing the operation via the exact bug this same module already fixed once.
+        // IMMEDIATE acquires the write lock at transaction start, so no concurrent rescan INSERT
+        // can be admitted between this re-check and the UPDATE it guards.
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        if rescan_active(&tx, &rec.target).await? {
+            tx.rollback().await?;
             return Err(Error::conflict(
                 "rescan_active",
                 "A library rescan is in progress for this target; retry once it completes",
             ));
         }
-        owned::available(&c, opid, &rec.target, &plan).await?;
-        checkpoint(&c, opid, "staging", None).await?;
+        tx.execute(
+            "UPDATE import_journal SET phase='staging',stage_json=NULL,error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",
+            [opid],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE operations SET status='staging',message='Manual import progress' WHERE id=?",
+            [opid],
+        )
+        .await?;
+        tx.commit().await?;
         rec.phase = "staging".into();
     }
     if rec.phase == "staging" {
