@@ -442,6 +442,16 @@ export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: In
 
 export type ReleaseTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
+export type RescanBatch = { commands: Array<RescanCommand>, busy_target_ids: Array<number>, };
+
+export type RescanCommand = { id: string, media_type: MediaDomain, series_id: number | null, movie_id: number | null, priority: CommandPriority, status: RescanStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, skip_reason: string | null, files_adopted: number | null, files_removed: number | null, };
+
+export type RescanInput = { target_id?: number, priority: CommandPriority, };
+
+export type RescanQuery = { status?: RescanStatus, limit?: number, offset?: number, };
+
+export type RescanStatus = "queued" | "running" | "retry_wait" | "succeeded" | "skipped" | "failed" | "cancelled";
+
 export type Resolution = { input: string, output: string, mapping_id: number | null, mapping_revision: number | null, lexical_only: boolean, };
 
 export type ResolveInput = { host: string, path: string, direction: Direction, };

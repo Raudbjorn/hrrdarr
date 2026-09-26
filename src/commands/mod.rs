@@ -26,6 +26,7 @@ pub mod manual_import;
 pub mod metadata;
 pub mod processing;
 pub mod quality_reset;
+pub mod rescan;
 pub mod rss;
 pub mod search;
 mod worker;
@@ -68,7 +69,7 @@ fn conflict() -> Error {
 /// Every command table admitted through the shared 1024-row capacity pool (see each
 /// `*_admit` trigger) must be counted here; a table left out here can still be inserted
 /// past the trigger's own limit undetected by any pre-check.
-const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)+(SELECT count(*) FROM quality_reset_commands)";
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)+(SELECT count(*) FROM quality_reset_commands)+(SELECT count(*) FROM rescan_commands)";
 async fn command_capacity(c: &Connection) -> Result<i64> {
     Ok(c.query(COMMAND_CAPACITY_SQL, ())
         .await?
@@ -349,6 +350,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let processing = processing::router(db.clone());
     let manual_import = manual_import::router(db.clone());
     let quality_reset = quality_reset::router(db.clone());
+    let rescan = rescan::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -366,6 +368,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(processing)
         .merge(manual_import)
         .merge(quality_reset)
+        .merge(rescan)
 }
 async fn create(
     State(db): State<Arc<Database>>,
