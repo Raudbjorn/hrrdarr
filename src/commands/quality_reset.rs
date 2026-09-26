@@ -358,6 +358,70 @@ mod tests {
         assert_eq!(min_size, 1.);
     }
     #[tokio::test]
+    async fn run_on_one_domain_leaves_the_other_domains_definitions_untouched() {
+        let (db, _scratch) = seeded().await;
+        edited(&connection(&db).await.unwrap(), "movies").await;
+        edited(&connection(&db).await.unwrap(), "tv").await;
+        let tv_before: (String, f64) = {
+            let r = connection(&db)
+                .await
+                .unwrap()
+                .query(
+                    "SELECT title,min_size FROM quality_definitions WHERE media_type='tv' LIMIT 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap())
+        };
+        let command = enqueue(&db, MediaDomain::Movies, true).await.unwrap();
+        let claimed = actual_claim(&db, command.id).await;
+        run(&db, claimed).await.unwrap();
+        let done = read(&connection(&db).await.unwrap(), command.id)
+            .await
+            .unwrap();
+        assert!(matches!(done.status, CommandStatus::Succeeded));
+        let (movies_title, movies_min_size): (String, f64) = {
+            let r = connection(&db)
+                .await
+                .unwrap()
+                .query(
+                    "SELECT title,min_size FROM quality_definitions WHERE media_type='movies' LIMIT 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap())
+        };
+        assert_ne!(movies_title, "Edited");
+        assert_eq!(movies_min_size, 0.);
+        let tv_after: (String, f64) = {
+            let r = connection(&db)
+                .await
+                .unwrap()
+                .query(
+                    "SELECT title,min_size FROM quality_definitions WHERE media_type='tv' LIMIT 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap())
+        };
+        assert_eq!(tv_after, tv_before);
+    }
+    #[tokio::test]
     async fn second_active_command_for_same_media_type_is_idempotent_or_a_clean_conflict() {
         let (db, _scratch) = seeded().await;
         let first = enqueue(&db, MediaDomain::Tv, false).await.unwrap();
