@@ -341,6 +341,29 @@ async fn update(
             .ok_or_else(absent)?,
     ))
 }
+/// Pinned TV reset preserves sizes; movie reset restores defaults regardless of titles.
+/// Returns the count of `quality_definitions` rows the reset actually touched.
+pub(crate) async fn reset_definitions(
+    tx: &Connection,
+    media: &str,
+    reset_titles: bool,
+) -> std::result::Result<i64, libsql::Error> {
+    let mut touched = 0i64;
+    if media == "movies" {
+        let changed = tx.execute("UPDATE quality_definitions SET min_size=default_min,max_size=default_max,preferred_size=default_preferred WHERE media_type='movies'",()).await?;
+        touched = touched.max(changed as i64);
+    }
+    if reset_titles {
+        let changed = tx
+            .execute(
+                "UPDATE quality_definitions SET title=name WHERE media_type=?1",
+                params![media],
+            )
+            .await?;
+        touched = touched.max(changed as i64);
+    }
+    Ok(touched)
+}
 async fn reset(
     State(db): State<Arc<Database>>,
     Extension(media): Extension<String>,
@@ -352,14 +375,11 @@ async fn reset(
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let result:Result<Vec<Definition>>=async {
-        // Pinned TV reset preserves sizes; movie reset restores defaults regardless of titles.
-        if media=="movies" {
-            tx.execute("UPDATE quality_definitions SET min_size=default_min,max_size=default_max,preferred_size=default_preferred WHERE media_type='movies'",()).await?;
-        }
-        if request.reset_titles {tx.execute("UPDATE quality_definitions SET title=name WHERE media_type=?1",params![media.clone()]).await?;}
-        fetch(&tx,&media,false).await
-    }.await;
+    let result: Result<Vec<Definition>> = async {
+        reset_definitions(&tx, &media, request.reset_titles).await?;
+        fetch(&tx, &media, false).await
+    }
+    .await;
     match result {
         Ok(items) => {
             tx.commit().await?;

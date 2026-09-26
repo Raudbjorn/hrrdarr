@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version 31 remains unknown after migration 30 adds manual import commands.
+    // Version 32 remains unknown after migration 31 adds quality reset commands.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (31,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (32,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        30 // Latest schema adds manual import commands.
+        31 // Latest schema adds quality reset commands.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2641,6 +2641,353 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
         scalar(
             &c,
             &format!("SELECT count(*) FROM manual_import_commands WHERE id='{first}'")
+        )
+        .await,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    for (index, (name, sql)) in [
+        (
+            "prototype",
+            include_str!("../migrations/0001_prototype.sql"),
+        ),
+        (
+            "media_relations",
+            include_str!("../migrations/0002_media_relations.sql"),
+        ),
+        (
+            "snapshot_imports",
+            include_str!("../migrations/0003_snapshot_imports.sql"),
+        ),
+        (
+            "quality_definitions",
+            include_str!("../migrations/0004_quality_definitions.sql"),
+        ),
+        (
+            "episode_metadata",
+            include_str!("../migrations/0005_episode_metadata.sql"),
+        ),
+        (
+            "file_metadata",
+            include_str!("../migrations/0006_file_metadata.sql"),
+        ),
+        (
+            "library_settings",
+            include_str!("../migrations/0007_library_settings.sql"),
+        ),
+        (
+            "manual_import_journal",
+            include_str!("../migrations/0008_manual_import_journal.sql"),
+        ),
+        (
+            "provider_configuration",
+            include_str!("../migrations/0009_provider_configuration.sql"),
+        ),
+        (
+            "provider_test_results",
+            include_str!("../migrations/0010_provider_test_results.sql"),
+        ),
+        (
+            "indexer_scope_options",
+            include_str!("../migrations/0011_indexer_scope_options.sql"),
+        ),
+        (
+            "qbittorrent_options",
+            include_str!("../migrations/0012_qbittorrent_options.sql"),
+        ),
+        (
+            "snapshot_provider_mappings",
+            include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
+        ),
+        (
+            "root_folders",
+            include_str!("../migrations/0014_root_folders.sql"),
+        ),
+        (
+            "remote_path_mappings",
+            include_str!("../migrations/0015_remote_path_mappings.sql"),
+        ),
+        (
+            "download_refresh",
+            include_str!("../migrations/0016_download_refresh.sql"),
+        ),
+        (
+            "import_history_order",
+            include_str!("../migrations/0017_import_history_order.sql"),
+        ),
+        (
+            "snapshot_history",
+            include_str!("../migrations/0018_snapshot_history.sql"),
+        ),
+        (
+            "profile_policy",
+            include_str!("../migrations/0019_profile_policy.sql"),
+        ),
+        (
+            "snapshot_profiles",
+            include_str!("../migrations/0020_snapshot_profiles.sql"),
+        ),
+        (
+            "metadata_refresh_commands",
+            include_str!("../migrations/0021_metadata_refresh_commands.sql"),
+        ),
+        (
+            "snapshot_blocklist",
+            include_str!("../migrations/0022_snapshot_blocklist.sql"),
+        ),
+        (
+            "blocklist_clear_commands",
+            include_str!("../migrations/0023_blocklist_clear_commands.sql"),
+        ),
+        (
+            "release_catalog_policy",
+            include_str!("../migrations/0024_release_catalog_policy.sql"),
+        ),
+        (
+            "rss_grab_journal",
+            include_str!("../migrations/0025_rss_grab_journal.sql"),
+        ),
+        (
+            "download_processing",
+            include_str!("../migrations/0026_download_processing.sql"),
+        ),
+        (
+            "targeted_search",
+            include_str!("../migrations/0027_targeted_search.sql"),
+        ),
+        (
+            "same_path_replacements",
+            include_str!("../migrations/0028_same_path_replacements.sql"),
+        ),
+        (
+            "naming_settings",
+            include_str!("../migrations/0029_naming_settings.sql"),
+        ),
+        (
+            "manual_import_commands",
+            include_str!("../migrations/0030_manual_import_commands.sql"),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![index as i64 + 1, *name, checksum, *sql],
+        )
+        .await?;
+    }
+
+    // Capture the six sibling admit triggers exactly as migration 0030 left them, so the DROP/CREATE
+    // bodies added by 0031 can be checked for byte-for-byte fidelity, not just presence of the new term.
+    let sibling_admit_triggers = [
+        "commands_admit",
+        "metadata_refresh_admit",
+        "blocklist_clear_admit",
+        "rss_commands_admit",
+        "search_commands_admit",
+        "manual_import_commands_admit",
+    ];
+    let mut sibling_sql_before = std::collections::BTreeMap::new();
+    for name in sibling_admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        sibling_sql_before.insert(name, sql);
+    }
+
+    // Move one movie quality definition away from its defaults so reset has something real to prove.
+    c.execute("UPDATE quality_definitions SET min_size=999,max_size=999,preferred_size=999,title='Custom' WHERE media_type='movies' AND quality_id=(SELECT quality_id FROM quality_definitions WHERE media_type='movies' LIMIT 1)",()).await?;
+
+    let before = schema_fingerprint(&c).await;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    tx.execute_batch(include_str!(
+        "../migrations/0031_quality_reset_commands.sql"
+    ))
+    .await?;
+    // Even before rollback, the fresh DDL already rejects a command that isn't freshly enqueued.
+    assert!(
+        tx.execute(
+            "INSERT INTO quality_reset_commands(id,media_type,reset_titles,next_attempt_at,created_at,status) VALUES(?,?,0,100,100,'running')",
+            params![uuid::Uuid::new_v4().to_string(), "movies"]
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        schema_fingerprint(&c).await,
+        before,
+        "rollback of migration 31 must leave the prior schema (including the six DROP/CREATE-recreated sibling admit triggers) byte-identical"
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(db.migration_backup().is_some());
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        31 // Latest schema adds quality reset commands.
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM quality_definitions WHERE media_type='movies' AND title='Custom'"
+        )
+        .await,
+        1
+    );
+
+    // A real upgrade DROP/CREATEs exactly the six known sibling admit triggers, and each recreated
+    // body is byte-for-byte the migration-30 body with only the new capacity term inserted before
+    // the limit; a `contains` check alone would miss drift elsewhere in the copied body.
+    for name in sibling_admit_triggers {
+        let sql: String = c
+            .query(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        let expected = sibling_sql_before[name].replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM quality_reset_commands)>=1024",
+            1,
+        );
+        assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
+    }
+
+    // One active reset per media domain: a second 'movies' submission is rejected while the first is queued...
+    let id = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO quality_reset_commands(id,media_type,reset_titles,next_attempt_at,created_at) VALUES(?,?,1,100,100)",
+        params![id.clone(), "movies"],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "INSERT INTO quality_reset_commands(id,media_type,reset_titles,next_attempt_at,created_at) VALUES(?,?,0,100,100)",
+            params![uuid::Uuid::new_v4().to_string(), "movies"],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("UNIQUE constraint failed"), "{message}");
+    // ...but a different media domain is independently admitted.
+    let other_domain = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO quality_reset_commands(id,media_type,reset_titles,next_attempt_at,created_at) VALUES(?,?,0,100,100)",
+        params![other_domain.clone(), "tv"],
+    )
+    .await?;
+
+    // queued -> running -> succeeded requires the outcome-projection column to be populated...
+    c.execute(
+        "UPDATE quality_reset_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [id.clone()],
+    )
+    .await?;
+    let message = c
+        .execute(
+            "UPDATE quality_reset_commands SET status='succeeded',completed_at=101 WHERE id=?",
+            [id.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("CHECK constraint failed"),
+        "succeeding without a recorded outcome must fail: {message}"
+    );
+    c.execute(
+        "UPDATE quality_reset_commands SET status='succeeded',completed_at=101,definitions_reset=1 WHERE id=?",
+        [id.clone()],
+    )
+    .await?;
+
+    // Identity, including reset_titles, is immutable once queued.
+    let message = c
+        .execute(
+            "UPDATE quality_reset_commands SET reset_titles=1 WHERE id=?",
+            [other_domain.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("command identity is immutable"),
+        "{message}"
+    );
+
+    // ...queued -> running -> failed is terminal too, and requires an error_code but no outcome count.
+    c.execute(
+        "UPDATE quality_reset_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
+        [other_domain.clone()],
+    )
+    .await?;
+    c.execute(
+        "UPDATE quality_reset_commands SET status='failed',completed_at=101,error_code='storage_error' WHERE id=?",
+        [other_domain.clone()],
+    )
+    .await?;
+
+    // Now that every prior row is terminal, a fresh submission for either domain is admitted again.
+    let fresh = uuid::Uuid::new_v4().to_string();
+    c.execute(
+        "INSERT INTO quality_reset_commands(id,media_type,reset_titles,next_attempt_at,created_at) VALUES(?,?,0,100,100)",
+        params![fresh.clone(), "movies"],
+    )
+    .await?;
+
+    // Active rows cannot be deleted; terminal rows can.
+    let message = c
+        .execute(
+            "DELETE FROM quality_reset_commands WHERE id=?",
+            [fresh.clone()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("active commands cannot be deleted"),
+        "{message}"
+    );
+    c.execute(
+        "DELETE FROM quality_reset_commands WHERE id=?",
+        [id.clone()],
+    )
+    .await?;
+    assert_eq!(
+        scalar(
+            &c,
+            &format!("SELECT count(*) FROM quality_reset_commands WHERE id='{id}'")
         )
         .await,
         0

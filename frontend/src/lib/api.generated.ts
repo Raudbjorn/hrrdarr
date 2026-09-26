@@ -412,6 +412,10 @@ export type QualityProfileQuery = { offset?: number, limit?: number, };
 
 export type QualityProfileSummary = { id: number, name: string, item_count: number, group_count: number, };
 
+export type QualityResetCommand = { id: string, media_type: MediaDomain, reset_titles: boolean, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, definitions_reset: number | null, };
+
+export type QualityResetInput = { media_type: MediaDomain, reset_titles: boolean, priority: CommandPriority, };
+
 export type QueueObservation = { association: MediaTarget | null, download: DownloadItem, };
 
 export type QueueQuery = { provider_id: string, media_type: MediaDomain, limit?: number, offset?: number, };

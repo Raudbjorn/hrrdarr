@@ -137,6 +137,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "manual_import_commands",
         include_str!("../../migrations/0030_manual_import_commands.sql"),
     ),
+    (
+        "quality_reset_commands",
+        include_str!("../../migrations/0031_quality_reset_commands.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

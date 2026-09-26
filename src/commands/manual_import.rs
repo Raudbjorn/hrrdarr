@@ -208,10 +208,10 @@ async fn create(
         .await?;
     let outcome = async {
         let timestamp = now()?;
-        // Six command tables share the 1024-row capacity pool (migration 0030's *_admit triggers);
-        // this pre-check must count all six or the batch fails mid-insert against the trigger
+        // Seven command tables share the 1024-row capacity pool (migration 0031's *_admit triggers);
+        // this pre-check must count all seven or the batch fails mid-insert against the trigger
         // instead of cleanly up front.
-        let count = tx.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?;
+        let count = command_capacity(&tx).await?;
         if count + input.operation_ids.len() as i64 > MAX_COMMANDS {
             return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
         }

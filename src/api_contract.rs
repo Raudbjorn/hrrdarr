@@ -58,6 +58,8 @@ pub fn render() -> String {
         crate::commands::manual_import::ManualImportBatchInput,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
+        crate::commands::quality_reset::QualityResetInput,
+        crate::api::ApiPage<crate::commands::quality_reset::QualityResetCommand>,
         crate::blocklist::BlocklistQuery,
         crate::blocklist::BlocklistRemoval,
         crate::api::ApiPage<crate::blocklist::BlocklistEntry>,

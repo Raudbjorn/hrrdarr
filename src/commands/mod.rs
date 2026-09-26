@@ -25,6 +25,7 @@ pub mod blocklist;
 pub mod manual_import;
 pub mod metadata;
 pub mod processing;
+pub mod quality_reset;
 pub mod rss;
 pub mod search;
 mod worker;
@@ -63,6 +64,18 @@ fn bad() -> Error {
 }
 fn conflict() -> Error {
     Error(StatusCode::CONFLICT, "command_conflict")
+}
+/// Every command table admitted through the shared 1024-row capacity pool (see each
+/// `*_admit` trigger) must be counted here; a table left out here can still be inserted
+/// past the trigger's own limit undetected by any pre-check.
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)+(SELECT count(*) FROM quality_reset_commands)";
+async fn command_capacity(c: &Connection) -> Result<i64> {
+    Ok(c.query(COMMAND_CAPACITY_SQL, ())
+        .await?
+        .next()
+        .await?
+        .ok_or_else(bad)?
+        .get::<i64>(0)?)
 }
 fn domain(value: MediaDomain) -> &'static str {
     match value {
@@ -320,13 +333,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         if current.provider_revision!=input.provider_revision{return Err(conflict())}
         return Ok(current)
     }
-    let count = c
-        .query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)+(SELECT count(*) FROM rss_commands)+(SELECT count(*) FROM search_commands)+(SELECT count(*) FROM manual_import_commands)", ())
-        .await?
-        .next()
-        .await?
-        .ok_or_else(bad)?
-        .get::<i64>(0)?;
+    let count = command_capacity(c).await?;
     if count >= MAX_COMMANDS {
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
     }
@@ -341,6 +348,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let rss = rss::router(db.clone());
     let processing = processing::router(db.clone());
     let manual_import = manual_import::router(db.clone());
+    let quality_reset = quality_reset::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -357,6 +365,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(rss)
         .merge(processing)
         .merge(manual_import)
+        .merge(quality_reset)
 }
 async fn create(
     State(db): State<Arc<Database>>,
