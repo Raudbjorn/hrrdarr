@@ -16,7 +16,7 @@ HRRDARR_DATABASE_PATH=/tmp/hrrdarr.db cargo run
 ```
 
 Run against a Turso/libSQL endpoint by setting `TURSO_DATABASE_URL` and
-`TURSO_AUTH_TOKEN`. The API listens on `127.0.0.1:8787` by default; override
+`TURSO_AUTH_TOKEN`. The API listens on `127.0.0.1:8760` by default; override
 with `HRRDARR_BIND`. The default local database filename is `hrrdarr.db`.
 When upgrading an existing checkout, set `HRRDARR_DATABASE_PATH` to its existing
 database file to preserve the selected library.

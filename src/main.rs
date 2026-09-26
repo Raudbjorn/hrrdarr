@@ -48,7 +48,9 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
     });
     let (app, refresh) = router_parts(state.clone());
     let addr: SocketAddr = env::var("HRRDARR_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8787".into())
+        // 8787 collides with a live Readarr instance on hosts running the rest of the *arr
+        // family alongside hrrdarr; 8760 avoids the whole 76xx-97xx range those apps use.
+        .unwrap_or_else(|_| "127.0.0.1:8760".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("hrrdarr listening on http://{addr}");
