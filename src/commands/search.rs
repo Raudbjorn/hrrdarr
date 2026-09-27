@@ -225,6 +225,18 @@ fn matches_target(requested: &MediaTarget, actual: &Option<crate::search::Releas
 fn decision_error(error: crate::search::SearchError, invalid: &'static str) -> Error {
     if error.0 == "release_storage_error" {
         Error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error")
+    } else if error.0.starts_with("custom_format_") {
+        Error(
+            if matches!(
+                error.0,
+                "custom_format_busy" | "custom_format_timeout" | "custom_format_worker_failed"
+            ) {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            },
+            error.0,
+        )
     } else {
         Error(StatusCode::CONFLICT, invalid)
     }
@@ -438,6 +450,14 @@ async fn grab(
     let _ = body.map_err(|_| bad())?;
     let id = uuid(id)?;
     let c = connection(&s.db).await?;
+    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await? {
+        if let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
+            let command=read(&c,uuid(row.get::<String>(0)?)?).await?;
+            let mut bytes=s.client.open_release(&envelope(id,&command),&payload).map_err(|e|Error(StatusCode::CONFLICT,e.code))?;
+            let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::CONFLICT,"invalid_release"))?;
+            evaluate(&c,&command,&release).await?;
+        }
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -624,13 +644,19 @@ async fn publish(
     releases: Vec<Vec<u8>>,
 ) -> Result<()> {
     let c = connection(db).await?;
+    // Prepare bounded CPU decisions before taking the writer; exact-input cache hits guard inside.
+    for bytes in &releases {
+        let release = indexer::decode_private(bytes)
+            .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
+        evaluate(&c, command, &release).await?;
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async{
  if !matches!(read(&tx,command.id).await?.status,CommandStatus::Running){return Ok(())}
  if !rss::valid_target(&tx,command.source).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}check_identity(&tx,command).await?;
- let timestamp=now()?;let mut seen=std::collections::BTreeSet::new();let mut best:Option<(usize,u32,i64,String,Uuid)>=None;let mut ranks=None;let mut count=0;
+ let timestamp=now()?;let mut seen=std::collections::BTreeSet::new();let mut best:Option<(usize,i64,u32,i64,String,Uuid)>=None;let mut ranks=None;let mut count=0;
  for mut bytes in releases {
  let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;
  let identity=release.guid.as_deref().filter(|s|!s.is_empty()).unwrap_or(&release.download_url);
@@ -641,8 +667,9 @@ async fn publish(
  let payload=if matches!(decision.disposition,Disposition::Accept){
  if ranks.is_none(){ranks=Some(crate::search::target_ranks(&tx,&command.target).await.map_err(|e|decision_error(e,"invalid_release"))?)}
  let rank=ranks.as_ref().and_then(|r|r.iter().find(|(id,_)|Some(*id)==decision.quality_id)).map(|(_,rank)|*rank).ok_or(Error(StatusCode::CONFLICT,"invalid_release"))?;
+ let format_score=decision.custom_formats.as_ref().map_or(0,|s|s.score);
  let seeders=release.metadata.seeders.unwrap_or(0);let published=crate::search::timestamp(&release.metadata.published_at).unwrap_or(0);
- if best.as_ref().is_none_or(|(r,s,p,f,_)|(rank,seeders,published)>(*r,*s,*p)||((rank,seeders,published)==(*r,*s,*p)&&fingerprint<*f)){best=Some((rank,seeders,published,fingerprint.clone(),id));}
+ if best.as_ref().is_none_or(|(r,cf,s,p,f,_)|(rank,format_score,seeders,published)>(*r,*cf,*s,*p)||((rank,format_score,seeders,published)==(*r,*cf,*s,*p)&&fingerprint<*f)){best=Some((rank,format_score,seeders,published,fingerprint.clone(),id));}
  let mut bytes=indexer::encode_private(release).map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;let payload=client.seal_release(&envelope(id,command),&bytes);bytes.fill(0);Some(payload.map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?)
  }else{None};
  if tx.query("SELECT (SELECT count(*) FROM search_results)>=1024 OR (SELECT COALESCE(sum(length(private_payload)),0) FROM search_results)+(SELECT COALESCE(sum(length(private_payload)),0) FROM rss_candidates)+?>16777216",[payload.as_ref().map_or(0,Vec::len) as i64]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"candidate_limit"))}
@@ -650,7 +677,7 @@ async fn publish(
  }
  tx.execute("UPDATE search_commands SET fetched=?,fetch_complete=1 WHERE id=?",params![count,command.id.to_string()]).await?;
  if command.mode==SearchMode::Automatic {
- if let Some((_,_,_,_,id))=best{select(&tx,client,command,id).await?;}else{tx.execute("UPDATE search_commands SET status='failed',completed_at=?,error_code='no_eligible_release' WHERE id=?",params![timestamp,command.id.to_string()]).await?;return Ok(())}
+ if let Some((_,_,_,_,_,id))=best{select(&tx,client,command,id).await?;}else{tx.execute("UPDATE search_commands SET status='failed',completed_at=?,error_code='no_eligible_release' WHERE id=?",params![timestamp,command.id.to_string()]).await?;return Ok(())}
  }
  tx.execute("UPDATE search_commands SET status='succeeded',completed_at=?,error_code=NULL WHERE id=?",params![timestamp,command.id.to_string()]).await?;Ok(())
  }.await;

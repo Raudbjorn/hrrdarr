@@ -66,6 +66,20 @@ export type CommandQuery = { media_type?: MediaDomain, status?: CommandStatus, l
 
 export type CommandStatus = "queued" | "running" | "retry_wait" | "succeeded" | "failed" | "cancelled";
 
+export type CustomFormat = { id: number, media_type: MediaDomain, name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
+
+export type CustomFormatBulkInput = { ids: Array<number>, include_when_renaming?: boolean | null, };
+
+export type CustomFormatChoice = { value: number, label: string, };
+
+export type CustomFormatCondition = { "kind": "release_title", pattern: string, } | { "kind": "release_group", pattern: string, } | { "kind": "edition", pattern: string, } | { "kind": "language", value: number, except_language: boolean, } | { "kind": "size", min_gib: number, max_gib: number, } | { "kind": "source", value: number, } | { "kind": "resolution", value: number, } | { "kind": "quality_modifier", value: number, } | { "kind": "indexer_flag", value: number, } | { "kind": "release_type", value: number, } | { "kind": "year", min: number, max: number, };
+
+export type CustomFormatInput = { name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
+
+export type CustomFormatSchema = { version: number, media_type: MediaDomain, conditions: Array<CustomFormatCondition>, choices: { [key in string]: Array<CustomFormatChoice> }, max_formats: number, max_specifications: number, regex: string, };
+
+export type CustomFormatSpecification = { name: string, negate: boolean, required: boolean, condition: CustomFormatCondition, };
+
 export type Direction = "remote_to_local" | "local_to_remote";
 
 export type Disposition = "accept" | "reject" | "delay";
@@ -298,7 +312,7 @@ export type Operation = { id: string, target: MediaTarget, status: string, messa
 
 export type ParseQuery = { title: string, };
 
-export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, };
+export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, technical_start: number | null, };
 
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
 
@@ -394,6 +408,8 @@ export type QualityProfile = { id: number, media_type: MediaDomain, name: string
 
 export type QualityProfileCutoff = { "kind": "quality", quality_id: number, } | { "kind": "group", position: number, };
 
+export type QualityProfileFormatScore = { format_id: number, score: number, };
+
 export type QualityProfileInput = { name: string, items: Array<QualityProfileItemInput>, policy?: QualityProfilePolicy | null, };
 
 export type QualityProfileItem = { "kind": "quality" } & QualityProfileLeaf | { "kind": "group", name: string, allowed: boolean, items: Array<QualityProfileLeaf>, };
@@ -406,7 +422,7 @@ export type QualityProfileLeafInput = { quality_id: number, allowed: boolean, mi
 
 export type QualityProfilePage = { media_type: MediaDomain, items: Array<QualityProfileSummary>, total: number, offset: number, limit: number, };
 
-export type QualityProfilePolicy = { upgrade_allowed: boolean, cutoff: QualityProfileCutoff, min_format_score: number, cutoff_format_score: number, min_upgrade_format_score: number, language_id?: number | null, format_items: [], };
+export type QualityProfilePolicy = { upgrade_allowed: boolean, cutoff: QualityProfileCutoff, min_format_score: number, cutoff_format_score: number, min_upgrade_format_score: number, language_id?: number | null, format_items: Array<QualityProfileFormatScore>, };
 
 export type QualityProfileQuery = { offset?: number, limit?: number, };
 
@@ -430,7 +446,7 @@ export type RefreshScheduleInput = { target: RefreshTarget, revision: number | n
 
 export type RefreshTarget = { provider_id: string, media_type: MediaDomain, };
 
-export type ReleaseDecision = { target: ReleaseTarget | null, disposition: Disposition, reasons: Array<string>, not_before: number | null, quality_id: number | null, parsed: ParsedRelease | null, };
+export type ReleaseDecision = { target: ReleaseTarget | null, disposition: Disposition, reasons: Array<string>, not_before: number | null, quality_id: number | null, parsed: ParsedRelease | null, custom_formats: Score | null, };
 
 export type ReleaseMetadata = { title: string | null, size_bytes: number | null, published_at: string, categories: Array<number>, seeders: number | null, leechers: number | null, peers: number | null, languages: Array<string>, };
 
@@ -479,6 +495,8 @@ export type RssScheduleDelete = { revision: number, };
 export type RssScheduleInput = { revision?: number, target: RssTarget, interval_seconds: number, enabled: boolean, };
 
 export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_id: string, client_revision: number, };
+
+export type Score = { format_ids: Array<number>, score: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 

@@ -78,7 +78,7 @@ pub async fn evaluate(
             return Ok(ReleaseDecision::reject("tv_identity_unsupported"));
         }
         let mut scanned = 0;
-        let mut rows=c.query("SELECT s.id,s.title,s.tvdb_id,s.monitored,l.quality_profile_id,l.series_type,l.use_scene_numbering FROM series s LEFT JOIN library_settings l ON l.series_id=s.id ORDER BY s.id LIMIT 10001",()).await?;
+        let mut rows=c.query("SELECT s.id,s.title,s.tvdb_id,s.monitored,l.quality_profile_id,l.series_type,l.use_scene_numbering,s.original_language FROM series s LEFT JOIN library_settings l ON l.series_id=s.id ORDER BY s.id LIMIT 10001",()).await?;
         while let Some(r) = rows.next().await? {
             scanned += 1;
             if scanned > 10000 {
@@ -212,7 +212,7 @@ pub async fn evaluate(
                 cinema: None,
                 digital: None,
                 physical: None,
-                language: None,
+                language: r.get(7)?,
                 monitored,
                 files,
                 aired,
@@ -304,6 +304,7 @@ pub async fn evaluate(
         not_before: None,
         quality_id: None,
         parsed: Some(parsed.clone()),
+        custom_formats: None,
     };
     if candidate.status.as_deref() == Some("deleted") {
         result.deny("movie_deleted")
@@ -320,7 +321,9 @@ pub async fn evaluate(
     if parsed.revision > 1 {
         result.deny("proper_upgrade_unsupported")
     }
-    let _ = candidate.language;
+    let mut evidence = crate::custom_formats::release(release, &parsed, tv);
+    crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
+        .await?;
     apply_quality(
         c,
         media,
@@ -329,6 +332,8 @@ pub async fn evaluate(
         candidate.runtime,
         release.metadata.size_bytes,
         &parsed,
+        &evidence,
+        candidate.language,
         &mut result,
     )
     .await?;
@@ -415,6 +420,8 @@ pub(super) async fn apply_quality(
     runtime: Option<i64>,
     size_bytes: Option<u64>,
     parsed: &crate::search::parser::ParsedRelease,
+    evidence: &crate::custom_formats::Evidence,
+    original_language: Option<i64>,
     result: &mut ReleaseDecision,
 ) -> Result<()> {
     let tv = matches!(media, MediaDomain::Tv);
@@ -452,13 +459,38 @@ pub(super) async fn apply_quality(
                     }
                 }
                 if let Some(policy) = profile.policy {
-                    if policy.min_format_score != 0 || policy.cutoff_format_score != 0 {
-                        result.deny("custom_format_policy_unsupported")
+                    let formats = crate::custom_formats::catalog(c, media)
+                        .await
+                        .map_err(|_| SearchError("custom_format_catalog_invalid"))?;
+                    let score = crate::custom_formats::score(
+                        &formats,
+                        media,
+                        evidence.clone(),
+                        original_language,
+                        policy.format_items.clone(),
+                        !c.is_autocommit(),
+                    )
+                    .await?;
+                    if score.score < i64::from(policy.min_format_score) {
+                        result.deny("custom_format_minimum_score");
                     }
+                    result.custom_formats = Some(score.clone());
                     if !tv && policy.language_id != Some(-1) {
-                        // Only Any (-1) needs no audio-language evidence. Original (-2)
-                        // and concrete languages remain unsupported, including at import.
-                        result.deny("language_policy_unsupported");
+                        let wanted = if policy.language_id == Some(-2) {
+                            original_language
+                                .filter(|v| *v > 0)
+                                .and_then(|v| i32::try_from(v).ok())
+                        } else {
+                            policy.language_id
+                        };
+                        if !wanted.is_some_and(|id| {
+                            evidence
+                                .languages
+                                .as_ref()
+                                .is_some_and(|langs| langs.contains(&id))
+                        }) {
+                            result.deny("language_not_wanted");
+                        }
                     }
                     let cutoff = match policy.cutoff {
                         Cutoff::Quality { quality_id } => ranked
@@ -482,11 +514,32 @@ pub(super) async fn apply_quality(
                         if !policy.upgrade_allowed {
                             result.deny("upgrades_disabled")
                         } else if let Some((_, old, ..)) = existing {
-                            if cutoff.is_some_and(|c| *old >= c) && policy.cutoff_format_score <= 0
+                            let old_facts =
+                                crate::custom_formats::existing(c, media, *file).await?;
+                            let old_score = crate::custom_formats::score(
+                                &formats,
+                                media,
+                                old_facts,
+                                original_language,
+                                policy.format_items.clone(),
+                                !c.is_autocommit(),
+                            )
+                            .await?
+                            .score;
+                            if rank < old {
+                                result.deny("not_quality_upgrade");
+                            } else if rank > old {
+                                if cutoff.is_some_and(|cutoff| *old >= cutoff) {
+                                    result.deny("cutoff_met");
+                                }
+                            } else if old_score >= i64::from(policy.cutoff_format_score) {
+                                result.deny("cutoff_met");
+                            } else if score.score <= old_score {
+                                result.deny("custom_format_not_upgrade");
+                            } else if score.score - old_score
+                                < i64::from(policy.min_upgrade_format_score)
                             {
-                                result.deny("cutoff_met")
-                            } else if rank <= old {
-                                result.deny("not_quality_upgrade")
+                                result.deny("custom_format_upgrade_increment");
                             }
                         } else {
                             result.deny("existing_quality_unknown")

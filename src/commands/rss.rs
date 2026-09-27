@@ -684,7 +684,12 @@ async fn process_candidate(
             if tx.query("SELECT 1 FROM rss_hash_claims WHERE client_id=? AND hash=?",params![p.source.client_id.to_string(),hash.clone()]).await?.next().await?.is_some(){candidate_state(&tx,p.id,"rejected",Some("hash_conflict"),None).await?;return Ok(false)}
         }
         for hash in prepared.identity().hashes(){tx.execute("INSERT INTO rss_hash_claims(client_id,hash,candidate_id)VALUES(?,?,?)",params![p.source.client_id.to_string(),hash.clone(),p.id.to_string()]).await?;}
-        tx.execute("UPDATE rss_candidates SET status='submitting',private_payload=NULL,updated_at=? WHERE id=?",params![now()?,p.id.to_string()]).await?;Ok(true)
+        let parsed=latest.parsed.as_ref().ok_or_else(bad)?;
+        let mut evidence=crate::custom_formats::release(&release,parsed,matches!(p.source.media_type,MediaDomain::Tv));
+        crate::custom_formats::populate_quality(&tx,&mut evidence,parsed.quality_name.as_deref(),matches!(p.source.media_type,MediaDomain::Tv)).await.map_err(|e|Error(StatusCode::INTERNAL_SERVER_ERROR,e.0))?;
+        let evidence=serde_json::to_string(&evidence).map_err(|_|bad())?;
+        if evidence.len()>16384{return Err(Error(StatusCode::CONFLICT,"invalid_release"))}
+        tx.execute("UPDATE rss_candidates SET status='submitting',private_payload=NULL,comparison_facts_json=?,updated_at=? WHERE id=?",params![evidence,now()?,p.id.to_string()]).await?;Ok(true)
     }.await;
     if !finish(tx, outcome).await? {
         return Ok(());

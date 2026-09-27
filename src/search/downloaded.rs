@@ -9,6 +9,7 @@ pub(crate) struct AcceptedFile {
     pub quality_id: i64,
     pub revision_json: String,
     pub edition: Option<String>,
+    pub evidence: crate::custom_formats::Evidence,
 }
 pub(crate) struct DownloadedDecision {
     pub accepted: Option<AcceptedFile>,
@@ -21,11 +22,21 @@ fn rejected(reason: &str) -> DownloadedDecision {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn evaluate(
     c: &Connection,
     target: &MediaTarget,
     filename: &str,
     size: u64,
+) -> super::Result<DownloadedDecision> {
+    evaluate_with_evidence(c, target, filename, size, None).await
+}
+pub(crate) async fn evaluate_with_evidence(
+    c: &Connection,
+    target: &MediaTarget,
+    filename: &str,
+    size: u64,
+    receipt: Option<crate::custom_formats::Evidence>,
 ) -> super::Result<DownloadedDecision> {
     if filename.is_empty() || filename.len() > 4096 || filename.chars().any(char::is_control) {
         return Ok(rejected("invalid_filename"));
@@ -162,10 +173,35 @@ pub(crate) async fn evaluate(
         not_before: None,
         quality_id: None,
         parsed: Some(parsed.clone()),
+        custom_formats: None,
     };
     if parsed.revision > 1 {
         result.deny("proper_upgrade_unsupported");
     }
+    let mut evidence = crate::custom_formats::parsed(stem, &parsed, tv, Some(size));
+    if let Some(receipt) = receipt {
+        crate::custom_formats::validate_evidence(
+            if tv {
+                MediaDomain::Tv
+            } else {
+                MediaDomain::Movies
+            },
+            &receipt,
+        )
+        .map_err(SearchError)?;
+        evidence.title = receipt.title;
+        evidence.indexer_flags = receipt.indexer_flags;
+        if evidence.languages.is_none() {
+            evidence.languages = receipt.languages;
+        }
+        if evidence.release_group.is_none() {
+            evidence.release_group = receipt.release_group;
+        }
+    }
+    crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
+        .await?;
+    evidence.filename = Some(basename.to_owned());
+    let original = original_language(c, target).await?;
     decision::apply_quality(
         c,
         if tv {
@@ -178,6 +214,8 @@ pub(crate) async fn evaluate(
         runtime,
         Some(size),
         &parsed,
+        &evidence,
+        original,
         &mut result,
     )
     .await?;
@@ -194,6 +232,7 @@ pub(crate) async fn evaluate(
             quality_id: result.quality_id.ok_or(SearchError("quality_unknown"))?,
             revision_json: "{\"version\":1,\"real\":0,\"is_repack\":false}".into(),
             edition: parsed.edition,
+            evidence,
         }),
         reasons: vec![],
     })
@@ -389,7 +428,7 @@ mod tests {
             assert_eq!(accepted.quality_id, 3);
             assert!(!accepted.basename.contains('/'));
         }
-        // Import uses the same policy guard: no audio measurement exists for Original/concrete.
+        // No filename/receipt audio evidence exists here, so restricted policies still reject.
         c.execute("UPDATE movie_metadata SET original_language=1", ())
             .await
             .unwrap();
@@ -410,9 +449,7 @@ mod tests {
             .unwrap();
             assert_eq!(result.accepted.is_some(), language == -1);
             assert_eq!(
-                result
-                    .reasons
-                    .contains(&"language_policy_unsupported".into()),
+                result.reasons.contains(&"language_not_wanted".into()),
                 language != -1
             );
             assert!(
@@ -770,4 +807,51 @@ mod tests {
             result.reasons
         );
     }
+}
+
+pub(crate) async fn original_language(
+    c: &Connection,
+    target: &MediaTarget,
+) -> super::Result<Option<i64>> {
+    let sql = match target {
+        MediaTarget::Episode(_) => {
+            "SELECT s.original_language FROM series s JOIN episodes e ON e.series_id=s.id WHERE e.id=?"
+        }
+        MediaTarget::Movie(_) => {
+            "SELECT d.original_language FROM movie_metadata d JOIN movies m ON m.metadata_id=d.id WHERE m.id=?"
+        }
+    };
+    let id = match target {
+        MediaTarget::Episode(id) | MediaTarget::Movie(id) => *id,
+    };
+    Ok(c.query(sql, [id])
+        .await?
+        .next()
+        .await?
+        .map(|r| r.get(0))
+        .transpose()?
+        .flatten())
+}
+
+pub(crate) async fn evaluate_receipt(
+    c: &Connection,
+    target: &MediaTarget,
+    filename: &str,
+    size: u64,
+    candidate: &str,
+) -> super::Result<DownloadedDecision> {
+    let row = c
+        .query(
+            "SELECT comparison_facts_json FROM rss_candidates WHERE id=?",
+            [candidate],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or(SearchError("release_target_missing"))?;
+    let evidence = row
+        .get::<Option<String>>(0)?
+        .map(|s| serde_json::from_str(&s).map_err(|_| SearchError("custom_format_facts_invalid")))
+        .transpose()?;
+    evaluate_with_evidence(c, target, filename, size, evidence).await
 }

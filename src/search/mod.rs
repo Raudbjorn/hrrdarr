@@ -54,6 +54,8 @@ pub struct ReleaseDecision {
     pub not_before: Option<i64>,
     pub quality_id: Option<i64>,
     pub parsed: Option<parser::ParsedRelease>,
+    #[serde(default)]
+    pub custom_formats: Option<crate::custom_formats::Score>,
 }
 impl ReleaseDecision {
     fn reject(code: &str) -> Self {
@@ -64,6 +66,7 @@ impl ReleaseDecision {
             not_before: None,
             quality_id: None,
             parsed: None,
+            custom_formats: None,
         }
     }
     pub(crate) fn deny(&mut self, code: &str) {

@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fancy-regex = "=0.19.2"
 html-escape = { version = "=0.2.15", default-features = false }
 icu_normalizer = { version = "=2.3.0", default-features = false, features = ["compiled_data"] }
 icu_properties = { version = "=2.3.0", default-features = false, features = ["compiled_data"] }

@@ -60,7 +60,7 @@ pub struct Policy {
     pub min_upgrade_format_score: i32,
     #[ts(optional = nullable)]
     pub language_id: Option<i32>,
-    pub format_items: [(); 0],
+    pub format_items: Vec<crate::db::custom_formats::FormatScore>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
@@ -395,10 +395,21 @@ fn validate_policy(input: &ProfileInput, media: &str) -> Result<()> {
     let Some(policy) = &input.policy else {
         return Ok(());
     };
-    if policy.min_format_score > 0 {
-        return Err(invalid(
-            "Minimum format score is unsatisfiable without custom formats",
-        ));
+    let mut ids = BTreeSet::new();
+    if policy.format_items.len() > crate::custom_formats::MAX_FORMATS
+        || policy.format_items.iter().any(|f| {
+            f.format_id <= 0 || f.format_id > 9_007_199_254_740_991 || !ids.insert(f.format_id)
+        })
+    {
+        return Err(invalid("Invalid or duplicate custom format score ids"));
+    }
+    let reachable: i64 = policy
+        .format_items
+        .iter()
+        .map(|f| i64::from(f.score.max(0)))
+        .sum();
+    if i64::from(policy.min_format_score) > reachable {
+        return Err(invalid("Minimum score exceeds configured positive scores"));
     }
     if policy.min_upgrade_format_score < 1 {
         return Err(invalid("Minimum upgrade format score must be at least one"));
@@ -430,6 +441,17 @@ async fn fetch_policy(conn: &Connection, media: &str, id: i64) -> Result<Option<
             position: row.get::<i64>(2)? as usize,
         },
     };
+    let mut format_items = Vec::new();
+    let mut scores=conn.query("SELECT f.id,COALESCE(s.score,0) FROM custom_formats f LEFT JOIN quality_profile_format_scores s ON s.format_id=f.id AND s.profile_id=? WHERE f.media_type=? ORDER BY f.id LIMIT 129",params![id,media]).await?;
+    while let Some(score) = scores.next().await? {
+        format_items.push(crate::db::custom_formats::FormatScore {
+            format_id: score.get(0)?,
+            score: score.get(1)?,
+        });
+    }
+    if format_items.len() > crate::custom_formats::MAX_FORMATS {
+        return Err(invalid("Custom format score limit"));
+    }
     Ok(Some(Policy {
         upgrade_allowed: row.get::<i64>(0)? != 0,
         cutoff,
@@ -437,7 +459,7 @@ async fn fetch_policy(conn: &Connection, media: &str, id: i64) -> Result<Option<
         cutoff_format_score: row.get(4)?,
         min_upgrade_format_score: row.get(5)?,
         language_id: row.get(6)?,
-        format_items: [],
+        format_items,
     }))
 }
 async fn insert_policy(conn: &Connection, media: &str, id: i64, policy: Policy) -> Result<()> {
@@ -458,6 +480,9 @@ async fn insert_policy(conn: &Connection, media: &str, id: i64, policy: Policy) 
         }
     };
     conn.execute("INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,cutoff_group_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id) VALUES(?,?,?,?,?,?,?,?,?)",params![id,media,i64::from(policy.upgrade_allowed),quality,group,policy.min_format_score,policy.cutoff_format_score,policy.min_upgrade_format_score,policy.language_id]).await?;
+    for score in policy.format_items {
+        conn.execute("INSERT INTO quality_profile_format_scores(profile_id,format_id,media_type,score)VALUES(?,?,?,?)",params![id,score.format_id,media,score.score]).await?;
+    }
     Ok(())
 }
 
@@ -465,9 +490,11 @@ fn profile_body(
     payload: std::result::Result<Json<ProfileInput>, JsonRejection>,
 ) -> Result<ProfileInput> {
     body(payload).map_err(|error| {
-        if error.0==StatusCode::BAD_REQUEST {
-            invalid("Expected the documented profile fields and types; nonempty custom format lists are unsupported")
-        } else { error }
+        if error.0 == StatusCode::BAD_REQUEST {
+            invalid("Expected the documented profile fields and types")
+        } else {
+            error
+        }
     })
 }
 
@@ -525,11 +552,34 @@ pub(crate) async fn persist_on_connection(
             ));
         }
     }
+    if let Some(policy) = &input.policy {
+        for score in &policy.format_items {
+            if conn
+                .query(
+                    "SELECT 1 FROM custom_formats WHERE id=? AND media_type=?",
+                    params![score.format_id, media],
+                )
+                .await?
+                .next()
+                .await?
+                .is_none()
+            {
+                return Err(invalid(
+                    "Custom format does not belong to this media domain",
+                ));
+            }
+        }
+    }
     let id = match id {
         Some(id) => {
             conn.execute(
                 "UPDATE quality_profiles SET name=?1 WHERE id=?2",
                 params![input.name, id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM quality_profile_format_scores WHERE profile_id=?",
+                [id],
             )
             .await?;
             conn.execute(
