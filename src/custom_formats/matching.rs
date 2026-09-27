@@ -586,7 +586,12 @@ pub(crate) async fn existing(
     let original_path: Option<String> = row.get(2)?;
     let title = row
         .get::<Option<String>>(1)?
-        .or_else(|| original_path.map(|s| basename(&s)))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            original_path
+                .map(|s| basename(&s))
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| basename(&path));
     let parsed = crate::search::parser::parse(&title, tv).ok();
     let (source, resolution, modifier) = structured_quality(
@@ -886,6 +891,35 @@ mod tests {
         }
         assert!(count > 50);
         drop(rows);
+        c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Series','/tv'); INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/tv/Current.mkv'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,'/movies/Current.mkv'); INSERT INTO file_metadata(media_type,episode_file_id)VALUES('tv',1); INSERT INTO file_metadata(media_type,movie_file_id)VALUES('movies',1);").await.unwrap();
+        for (title, original_path, expected) in [
+            (Some("   "), "/original/Original.mkv", "Original.mkv"),
+            (Some("\t"), "/original/   ", "Current.mkv"),
+            (None, "   ", "Current.mkv"),
+            (
+                Some("  Actual release  "),
+                "/original/Original.mkv",
+                "  Actual release  ",
+            ),
+        ] {
+            c.execute(
+                "UPDATE file_metadata SET original_release_title=?,original_file_path=CASE WHEN media_type='movies' THEN ? ELSE NULL END",
+                params![title, original_path],
+            )
+            .await
+            .unwrap();
+            for media in [MediaDomain::Tv, MediaDomain::Movies] {
+                // TV original paths are currently absent by schema contract; its blank
+                // scene title falls directly through to the current basename.
+                let expected =
+                    if media == MediaDomain::Tv && title.is_none_or(|s| s.trim().is_empty()) {
+                        "Current.mkv"
+                    } else {
+                        expected
+                    };
+                assert_eq!(existing(&c, media, 1).await.unwrap().title, expected);
+            }
+        }
         drop(c);
         drop(db);
         std::fs::remove_dir_all(path).unwrap();
