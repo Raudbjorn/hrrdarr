@@ -267,7 +267,16 @@ async fn select_inner(c: &Connection, m: MediaDomain, owner_id: i64) -> Result<E
     }
     let tags = crate::tags::assigned(c, m, owner_id)
         .await
-        .map_err(|_| corrupt())?;
+        .map_err(|error| {
+            if error.1 == "database_error" {
+                Error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "delay_profile_storage_error",
+                )
+            } else {
+                corrupt()
+            }
+        })?;
     let selected = all
         .profiles
         .into_iter()
