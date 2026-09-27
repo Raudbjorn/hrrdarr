@@ -457,3 +457,188 @@ async fn schema_presets_are_valid_scoped_copies_with_independent_patterns() {
         );
     }
 }
+
+#[tokio::test]
+async fn final_format_delete_resets_only_its_domain_atomically_and_survives_reopen() {
+    for media in ["tv", "movies"] {
+        for bulk in [false, true] {
+            let scratch = Scratch(
+                std::env::temp_dir()
+                    .join(format!("hrrdarr-format-delete-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let path = scratch.0.join("db");
+            let db = Arc::new(Database::open_local(&path).await.unwrap());
+            let c = db.connect().await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = hrrdarr::custom_formats::router(db.clone())
+                .merge(hrrdarr::quality_profiles::router(db.clone()));
+            let mut server = Server(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let mut profiles = Vec::new();
+            let mut ids = Vec::new();
+            for domain in [media, if media == "tv" { "movies" } else { "tv" }] {
+                let prefix = format!("/api/v1/{domain}");
+                let (status, first) = request(
+                    &base,
+                    "POST",
+                    &format!("{prefix}/custom-formats"),
+                    definition("Scored", "Scored"),
+                )
+                .await;
+                assert_eq!(status, 201);
+                let fid = first["id"].as_i64().unwrap();
+                let (status, zero) = request(
+                    &base,
+                    "POST",
+                    &format!("{prefix}/custom-formats"),
+                    definition("Zero", "Zero"),
+                )
+                .await;
+                assert_eq!(status, 201);
+                let zid = zero["id"].as_i64().unwrap();
+                let (status, profile) = request(&base, "POST", &format!("{prefix}/quality-profiles"), json!({"name":"Policy","items":[{"kind":"quality","quality_id":3,"allowed":true}],"policy":{"upgrade_allowed":true,"cutoff":{"kind":"quality","quality_id":3},"min_format_score":-5,"cutoff_format_score":100,"min_upgrade_format_score":10,"language_id":if domain=="tv"{Value::Null}else{json!(-2)},"format_items":[{"format_id":fid,"score":10},{"format_id":zid,"score":0}]}})).await;
+                assert_eq!(status, 201, "{profile}");
+                c.execute(
+                    "INSERT INTO quality_profiles(media_type,name)VALUES(?,'No policy')",
+                    [domain],
+                )
+                .await
+                .unwrap();
+                profiles.push(profile);
+                ids.push((fid, zid));
+            }
+            let prefix = format!("/api/v1/{media}/custom-formats");
+            let profile_path = format!("/api/v1/{media}/quality-profiles/{}", profiles[0]["id"]);
+            let (fid, zid) = ids[0];
+            // Invalid mixed batches must preserve the definitions and the original policy.
+            for (bad, status) in [
+                (json!([fid, 0]), 400),
+                (json!([fid, 999999]), 404),
+                (json!([fid, ids[1].0]), 404),
+            ] {
+                assert_eq!(
+                    request(
+                        &base,
+                        "DELETE",
+                        &format!("{prefix}/bulk"),
+                        json!({"ids":bad})
+                    )
+                    .await
+                    .0,
+                    status
+                );
+                assert_eq!(
+                    request(&base, "GET", &profile_path, Value::Null).await.1,
+                    profiles[0]
+                );
+                assert_eq!(
+                    request(&base, "GET", &format!("{prefix}/{fid}"), Value::Null)
+                        .await
+                        .0,
+                    200
+                );
+            }
+            if !bulk {
+                assert_eq!(
+                    request(&base, "DELETE", &format!("{prefix}/{fid}"), Value::Null)
+                        .await
+                        .0,
+                    204
+                );
+                // An implicit zero item remains even though the sparse score table is now empty.
+                profiles[0]["policy"]["format_items"] = json!([{"format_id":zid,"score":0}]);
+                assert_eq!(
+                    request(&base, "GET", &profile_path, Value::Null).await.1,
+                    profiles[0]
+                );
+            }
+            let delete_path = if bulk {
+                format!("{prefix}/bulk")
+            } else {
+                format!("{prefix}/{zid}")
+            };
+            let body = if bulk {
+                json!({"ids":[fid,zid]})
+            } else {
+                Value::Null
+            };
+            c.execute_batch("CREATE TRIGGER reject_format_reset BEFORE UPDATE OF min_format_score ON quality_profile_policies BEGIN SELECT RAISE(ABORT,'injected reset failure'); END;").await.unwrap();
+            assert_eq!(
+                request(&base, "DELETE", &delete_path, body.clone()).await.0,
+                500
+            );
+            assert_eq!(
+                request(&base, "GET", &profile_path, Value::Null).await.1,
+                profiles[0]
+            );
+            assert_eq!(
+                request(&base, "GET", &format!("{prefix}/{zid}"), Value::Null)
+                    .await
+                    .0,
+                200
+            );
+            c.execute_batch("DROP TRIGGER reject_format_reset")
+                .await
+                .unwrap();
+            assert_eq!(request(&base, "DELETE", &delete_path, body).await.0, 204);
+            let expected = &mut profiles[0];
+            expected["policy"]["format_items"] = json!([]);
+            expected["policy"]["min_format_score"] = json!(0);
+            expected["policy"]["cutoff_format_score"] = json!(0);
+            expected["policy"]["min_upgrade_format_score"] = json!(1);
+            assert_eq!(
+                request(&base, "GET", &profile_path, Value::Null).await.1,
+                *expected
+            );
+            server.0.abort();
+            // Await cancellation before reopening: the router owns the database lock.
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), &mut server.0)
+                .await
+                .unwrap();
+            assert!(stopped.unwrap_err().is_cancelled());
+            drop(server);
+            drop(c);
+            drop(db);
+            let reopened = Arc::new(Database::open_local(&path).await.unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = hrrdarr::quality_profiles::router(reopened.clone());
+            let _server = Server(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            for (i, domain) in [media, if media == "tv" { "movies" } else { "tv" }]
+                .into_iter()
+                .enumerate()
+            {
+                let (status, all) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/{domain}/quality-profiles"),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(status, 200);
+                let all = all["items"].as_array().unwrap();
+                for name in ["Policy", "No policy"] {
+                    let id = &all.iter().find(|p| p["name"] == name).unwrap()["id"];
+                    let (status, detail) = request(
+                        &base,
+                        "GET",
+                        &format!("/api/v1/{domain}/quality-profiles/{id}"),
+                        Value::Null,
+                    )
+                    .await;
+                    assert_eq!(status, 200);
+                    if name == "Policy" {
+                        assert_eq!(detail, profiles[i]);
+                    } else {
+                        assert!(detail["policy"].is_null());
+                    }
+                }
+            }
+        }
+    }
+}

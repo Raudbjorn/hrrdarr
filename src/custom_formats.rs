@@ -292,6 +292,15 @@ async fn mutate(
                 .await?;
             }
         }
+        // Every catalog definition is an implicit profile item, including omitted zero scores.
+        // Reset only when this domain's entire catalog was deleted, in the same transaction.
+        if delete && all.len() == input.ids.len() {
+            tx.execute(
+                "UPDATE quality_profile_policies SET min_format_score=0,cutoff_format_score=0,min_upgrade_format_score=1 WHERE profile_id IN (SELECT id FROM quality_profiles WHERE media_type=?)",
+                [crate::search::domain(media)],
+            )
+            .await?;
+        }
         all.retain(|f| input.ids.contains(&f.id));
         if let Some(value) = input.include_when_renaming {
             for f in &mut all {
