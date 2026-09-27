@@ -123,13 +123,17 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 37); // Latest open adds normalized tags; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 38); // Latest open adds revision preference; historical migration starts remain unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "snapshot_imports" {
-            // Migrations 36 and 37 append inactive CF/tag markers; all prior fields stay identical.
+            // Migrations 36 through 38 append inactive CF/tag/revision-policy markers; all prior fields stay identical.
             for row in &mut expected {
-                row.extend([libsql::Value::Integer(0), libsql::Value::Integer(0)]);
+                row.extend([
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                ]);
             }
         }
         assert_eq!(rows(&c, table).await?, expected);

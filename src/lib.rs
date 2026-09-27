@@ -37,3 +37,5 @@ pub mod languages;
 pub mod custom_formats;
 
 pub mod tags;
+
+pub mod revision_policy;

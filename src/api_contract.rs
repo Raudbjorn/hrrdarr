@@ -31,6 +31,8 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::revision_policy::Policy>();
+    registry.visit::<crate::revision_policy::Update>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();

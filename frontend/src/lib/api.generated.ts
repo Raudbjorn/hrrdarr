@@ -474,6 +474,12 @@ export type Resolution = { input: string, output: string, mapping_id: number | n
 
 export type ResolveInput = { host: string, path: string, direction: Direction, };
 
+export type RevisionPolicy = { media_type: MediaDomain, mode: RevisionPolicyMode, revision: number, };
+
+export type RevisionPolicyMode = "prefer_and_upgrade" | "do_not_upgrade" | "do_not_prefer";
+
+export type RevisionPolicyUpdate = { mode: RevisionPolicyMode, revision: number, };
+
 export type RootFolder = { id: number, media_type: MediaDomain, path: string, observation: RootObservationStatus, accessible: boolean | null, writable: boolean | null, free_space: number | null, total_space: number | null, unmapped_folders: Array<UnmappedFolder> | null, };
 
 export type RootInput = { path: string, };

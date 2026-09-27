@@ -7,6 +7,7 @@ mod history;
 mod profiles;
 mod providers;
 mod readers;
+mod revision_policy;
 mod tags;
 
 use crate::db::Database;
@@ -189,6 +190,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
     let tag_plan = tags::read(&source, app, &mut plan.unsupported)?;
     let profile_plan = profiles::read(&source, app, &mut plan.unsupported).await?;
     let blocklist_plan = blocklist::read(&source, app, &mut plan.unsupported)?;
@@ -225,6 +227,7 @@ async fn import_inner(
         write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
         profiles::finish(&tx, prepared, &mut report).await?;
         tags::write(&tx, &tag_plan, &mut report).await?;
+        revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
         providers::write(&tx, &provider_plan, key, &mut report).await
