@@ -20,27 +20,94 @@ struct AppState {
 use hrrdarr::api::{LegacyError, SnapshotOptions};
 
 #[tokio::main]
-async fn main() -> Result<(), hrrdarr::db::Error> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"level":"ERROR","event":"process_failed",
+                "phase":error.phase,"error_class":error.class,"storage":error.storage})
+            );
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+struct ProcessFailure {
+    phase: &'static str,
+    class: String,
+    storage: Option<serde_json::Value>,
+}
+impl ProcessFailure {
+    fn at(phase: &'static str, error: impl Into<hrrdarr::db::Error>) -> Self {
+        let error = error.into();
+        // Only type information crosses this boundary, never Display/Debug/source chains.
+        let class = if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            format!("io_{:?}", error.kind())
+        } else if let Some(error) = error.downcast_ref::<libsql::Error>() {
+            match error {
+                libsql::Error::ConnectionFailed(_) => "database_connection",
+                libsql::Error::Hrana(_) => "remote_database_protocol",
+                libsql::Error::SqliteFailure(_, _)
+                | libsql::Error::RemoteSqliteFailure(_, _, _) => "database_sql",
+                _ => "database_operation",
+            }
+            .into()
+        } else if error.is::<hrrdarr::db::StorageCompatibilityError>() {
+            "storage_compatibility".into()
+        } else {
+            "configuration_or_operation".into()
+        };
+        let storage = error
+            .downcast_ref::<hrrdarr::db::StorageCompatibilityError>()
+            .map(|e| {
+                serde_json::json!({"capability":e.capability,
+                "sqlite_version":e.engine.as_ref().map(|engine| &engine.sqlite_version),
+                "sqlite_source_id":e.engine.as_ref().map(|engine| &engine.sqlite_source_id)})
+            });
+        Self {
+            phase,
+            class,
+            storage,
+        }
+    }
+}
+
+async fn run() -> Result<(), ProcessFailure> {
     let db = if let (Ok(url), Ok(token)) =
         (env::var("TURSO_DATABASE_URL"), env::var("TURSO_AUTH_TOKEN"))
     {
-        Database::open_remote(url, token).await?
+        Database::open_remote(url, token)
+            .await
+            .map_err(|e| ProcessFailure::at("database_open", e))?
     } else {
         let path = env::var("HRRDARR_DATABASE_PATH").unwrap_or_else(|_| "hrrdarr.db".into());
-        Database::open_local(path).await?
+        Database::open_local(path)
+            .await
+            .map_err(|e| ProcessFailure::at("database_open", e))?
     };
     let db = Arc::new(db);
-    if let Some(path) = db.migration_backup() {
-        println!("pre-migration recovery backup: {}", path.display());
+    if db.migration_backup().is_some() {
+        println!("event=migration_backup_created");
     }
     let provider_key = match env::var("HRRDARR_PROVIDER_KEY") {
-        Ok(value) => Some(Arc::new(hrrdarr::providers::CredentialKey::from_hex(
-            &value,
-        )?)),
+        Ok(value) => Some(Arc::new(
+            hrrdarr::providers::CredentialKey::from_hex(&value)
+                .map_err(|e| ProcessFailure::at("provider_key", e))?,
+        )),
         Err(env::VarError::NotPresent) => None,
-        Err(_) => return Err("Invalid provider key environment value".into()),
+        Err(_) => {
+            return Err(ProcessFailure::at(
+                "provider_key",
+                "invalid environment value",
+            ));
+        }
     };
-    let metadata = Arc::new(hrrdarr::metadata::MetadataClient::new()?);
+    let metadata = Arc::new(
+        hrrdarr::metadata::MetadataClient::new()
+            .map_err(|e| ProcessFailure::at("metadata_client", e))?,
+    );
     let state = Arc::new(AppState {
         db,
         provider_key,
@@ -51,8 +118,11 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
         // 8787 collides with a live Readarr instance on hosts running the rest of the *arr
         // family alongside hrrdarr; 8760 avoids the whole 76xx-97xx range those apps use.
         .unwrap_or_else(|_| "127.0.0.1:8760".into())
-        .parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+        .parse()
+        .map_err(|e| ProcessFailure::at("bind_address", e))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     println!("hrrdarr listening on http://{addr}");
     let runtime = if state.db.permits_local_imports() {
         Some(
@@ -61,7 +131,8 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
                 refresh,
                 state.metadata.clone(),
             )
-            .await?,
+            .await
+            .map_err(|e| ProcessFailure::at("command_worker", e))?,
         )
     } else {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
@@ -71,7 +142,7 @@ async fn main() -> Result<(), hrrdarr::db::Error> {
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
-    result?;
+    result.map_err(|e| ProcessFailure::at("http_server", e))?;
     Ok(())
 }
 
