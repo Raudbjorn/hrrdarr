@@ -20,4 +20,38 @@ Activation requires an unconfigured, untouched destination. Exact complete graph
 
 ## Not claimed
 
-This dependency exposes and preserves settings. It does not implement protocol rejection, preferred-protocol ranking, revision/highest-quality/custom-format bypass evaluation, oldest-pending overlap behavior, or an editor. Existing consumer guards remain until the separate pipeline integration is verified. It does not establish complete api046 or the full slice acceptance gate. Bounds are native operational limits; oversized catalogs are rejected and other unrepresentable settings remain explicitly unsupported. Runtime tests are recorded separately from source review.
+This dependency exposes and preserves settings. It does not implement protocol rejection, preferred-protocol ranking, revision/highest-quality/custom-format bypass evaluation, or oldest-pending overlap behavior. The browser editor below covers settings only. Existing consumer guards remain until the separate pipeline integration is verified. It does not establish complete api046 or the full slice acceptance gate. Bounds are native operational limits; oversized catalogs are rejected and other unrepresentable settings remain explicitly unsupported. Runtime tests are recorded separately from source review.
+
+## Native browser editor
+
+Profiles → Delay profiles exposes both media domains, global fallback and ordered
+exclusive-tag profiles. Opening a legacy policy reports unknown protocol/bypass
+settings; Configure full delay policy proposes schema defaults locally and retains
+known delay minutes. Saving is explicit, including activation of an unconfigured
+global fallback. Tagged creation requires a configured domain. The editor preserves
+independent enabled/preferred protocols and signed CF thresholds, including values
+retained while their bypass is disabled. The global fallback cannot be deleted or
+reordered; Up/Down controls save the complete tagged order with catalog revision.
+
+Every full mutation uses catalog CAS and reads its complete returned catalog.
+Conflicts retain a stale draft rather than rebasing it silently. Lost responses
+block further mutations until explicit full readback; a lost create may have
+succeeded, so review and select that row instead of repeating the POST. Failed
+readback keeps the block. Editors stay mounted across workspace/section navigation.
+Tag changes invalidate label selection; delay usage is linked separately from
+library owners in Tags settings. Per-domain write guards serialize tag settings and
+delay settings in this browser without blocking unrelated domains.
+
+Release search now links to this persistent editor. The Compatibility minutes and
+availability subsection retains the existing global delay/movie availability
+workflow. It preserves richer protocol/bypass fields and tagged profiles. **That
+legacy endpoint has no CAS:** other sessions/clients retain last-writer-wins behavior.
+Same-session guards and stale counters do not provide cross-session protection.
+Full profile writes invalidate older compatibility drafts until an explicit read.
+
+`frontend/tests/delay-profiles-browser.mjs` targets owned native fixtures and covers
+both domains, legacy activation, full CRUD/order/CAS, held/lost writes, failed
+reconciliation, tag usage, and stale reads. These checks do not claim complete RSS
+cohort ranking/delay bypass parity. Release-profile settings remain absent, so the
+full Profiles route stays Partial. Full browser reload can discard local uncertain
+state; no durable mutation receipt system is introduced.

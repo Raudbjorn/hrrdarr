@@ -57,14 +57,16 @@ async fn serve(router: Router) -> (String, Server) {
 fn show() -> serde_json::Value {
     json!({"tvdbId":101,"title":"Fixture series","firstAired":"2020-01-01","seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":501,"seasonNumber":1,"episodeNumber":1,"title":"Pilot","airDate":"2020-01-01","airDateUtc":"2020-01-01T00:00:00Z","runtime":45},{"tvdbId":502,"seasonNumber":1,"episodeNumber":2,"title":"Second episode","airDate":"2020-01-02","airDateUtc":"2020-01-02T00:00:00Z","runtime":45}]})
 }
+// Original-language profiles require explicit metadata and matching offer language facts.
+// Downloads keep their original filenames; accepted receipt evidence supplies the language.
 fn movie() -> serde_json::Value {
-    json!({"tmdbId":101,"title":"Fixture movie","year":2021,"imdbId":"tt7654321","runtime":100,"digitalRelease":"2021-01-01T00:00:00Z"})
+    json!({"tmdbId":101,"title":"Fixture movie","year":2021,"originalLanguage":"en","imdbId":"tt7654321","runtime":100,"digitalRelease":"2021-01-01T00:00:00Z"})
 }
 fn search_show(id: u32) -> serde_json::Value {
     json!({"tvdbId":id,"title":format!("Search series {id}"),"seasons":[{"seasonNumber":1}],"episodes":[{"tvdbId":id*10,"seasonNumber":1,"episodeNumber":1,"title":"Search pilot","airDateUtc":"2099-01-01T00:00:00Z","runtime":45}]})
 }
 fn search_movie(id: u32) -> serde_json::Value {
-    json!({"tmdbId":id,"title":format!("Search movie {id}"),"year":2030,"runtime":100,"digitalRelease":"2099-01-01T00:00:00Z"})
+    json!({"tmdbId":id,"title":format!("Search movie {id}"),"year":2030,"originalLanguage":"en","runtime":100,"digitalRelease":"2099-01-01T00:00:00Z"})
 }
 async fn metadata_mode(
     State(state): State<Arc<AtomicU8>>,
@@ -276,7 +278,7 @@ async fn provider_mock(
                     let title = if tv {
                         format!("Search.series.{external}.S01E01.{quality}.WEB-DL")
                     } else {
-                        format!("Search.movie.{external}.2030.{quality}.WEB-DL")
+                        format!("Search.movie.{external}.2030.{quality}.WEB-DL.English")
                     };
                     let digit = match (tv, external, quality) {
                         (true, 202, "720p") => "1",
@@ -297,9 +299,9 @@ async fn provider_mock(
         }
         let title = match (tv, state.2.load(Ordering::SeqCst)) {
             (true, 0) => "Fixture.series.S01E02.1080p.WEB-DL",
-            (false, 0) => "Fixture.movie.2021.1080p.WEB-DL",
+            (false, 0) => "Fixture.movie.2021.1080p.WEB-DL.English",
             (true, _) => "Refreshed.series.S01E02.1080p.WEB-DL",
-            (false, _) => "Refreshed.movie.2021.1080p.WEB-DL",
+            (false, _) => "Refreshed.movie.2021.1080p.WEB-DL.English",
         };
         let category = if tv { "5030" } else { "2000" };
         let identity = if tv { "tvdbid" } else { "tmdbid" };
@@ -613,6 +615,8 @@ async fn library_ui_fixture() {
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
+            .merge(hrrdarr::delay_profiles::router(db.clone()))
+            .merge(hrrdarr::revision_policy::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
             .merge(hrrdarr::naming::router(db.clone()))

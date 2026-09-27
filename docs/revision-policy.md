@@ -14,4 +14,20 @@ Focused evidence lives in `tests/revision_policy.rs` and `src/db/revision_policy
 
 ## Not claimed
 
-This unit supplies settings and snapshot preservation. Existing unsupported proper/repack guards remain until the complete parser/comparison/import pipeline is integrated. There is no settings panel in this unit, no new dependency, no V3 wire-compatibility claim and no full delay-profile or parity-gate completion claim. Tests use isolated scratch databases and synthetic endpoints; they do not contact providers or access real media.
+This unit supplies settings and snapshot preservation. Existing unsupported proper/repack guards remain until the complete parser/comparison/import pipeline is integrated. The browser control below covers this singleton only. There is no new dependency, no V3 wire-compatibility claim and no full delay-profile or parity-gate completion claim. Tests use isolated scratch databases and synthetic endpoints; they do not contact providers or access real media.
+
+## Native browser control
+
+Media management → Propers and repacks provides the three domain-scoped modes:
+Prefer and upgrade, Prefer without automatic upgrades, and Do not prefer. The
+middle mode is not described as a blanket ban on every proper release. The form
+uses the saved revision for PUT, including same-value saves; stale conflicts and
+unknown outcomes preserve the draft and block blind retry until explicit reload.
+Its mounted state survives workspace navigation. This independent singleton does
+not share a UI mutex with unrelated quality/delay fields.
+
+`frontend/tests/revision-policy-browser.mjs` exercises both domains, every mode,
+same-value revision increments, concurrent-writer conflict, and a held committed
+write whose response is lost. The control does not establish runtime consumer
+parity by itself or complete Media Management's other missing settings. A full
+browser reload still discards local transient state.

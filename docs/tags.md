@@ -80,8 +80,15 @@ The API/helper tests cover scope, payload projection, label bounds and empty sem
 Concurrent external clients have no revision/CAS protection. A full browser reload
 can discard local pending/uncertain state; this editor does not introduce durable
 mutation receipts. Owner links identify native series/movie IDs rather than
-upstream provider references. Provider, delay/release profile,
+upstream provider references. Provider, release profile,
 list, notification and autotag tag references are not yet implemented; their
 source fields remain archived unsupported and do not silently become active.
 No external services or real media are used. Tag reconstruction does not complete
 collection/list defaults, exclusions, advanced numbering, or the full parity gate.
+
+Delay profiles additionally contribute typed `delay_profile_ids` to tag details.
+The UI displays those references separately and opens the correct scoped delay
+editor. Library owner counts/pages retain their original meaning. Delay mutations
+invalidate usage reads; a response captured before a mutation cannot clear that
+stale state. Tags referenced only by delay profiles remain protected from deletion.
+AutoTagging and the other unsupported reference categories above remain absent.

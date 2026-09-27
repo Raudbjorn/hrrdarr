@@ -128,9 +128,10 @@ async function verifyReleaseSearch() {
     const releases=await response;assert.equal(releases.status(),200);const result=await releases.json();assert.equal(result.items.length,1);
     assert.equal(result.items[0].decision.target.media_type,domain);
     await panel.getByText('1 releases on this page.',{exact:true}).waitFor();
-    await panel.getByText(`Background release delays · ${domain==='tv'?'TV':'Movies'}`,{exact:true}).click();
-    await panel.getByLabel('Torrent delay (minutes)').fill('60');await panel.getByLabel('Usenet delay (minutes)').fill('30');
-    await panel.getByRole('button',{name:'Save release delays',exact:true}).click();await panel.getByText('Release delay settings saved.',{exact:true}).waitFor();
+    await panel.getByRole('button',{name:'Open background delay settings',exact:true}).click();
+    const delays=page.getByRole('region',{name:'Delay profiles',exact:true});if(await delays.locator('details').getAttribute('open')===null)await delays.getByText('Compatibility minutes and availability',{exact:true}).click();
+    await delays.getByLabel('Torrent delay (minutes)').fill('60');await delays.getByLabel('Usenet delay (minutes)').fill('30');
+    await delays.getByRole('button',{name:'Save release delays',exact:true}).click();await delays.getByText('Release delay settings saved.',{exact:true}).waitFor();await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Library',exact:true}).click();
     assert.deepEqual(await (await page.request.get(`${origin}/api/v1/release-policies/${domain}`)).json(),{torrent_delay_minutes:60,usenet_delay_minutes:30,availability_delay_days:0});
   }
 }
@@ -187,7 +188,9 @@ async function verifyDownloadProcessing() {
     await rss.getByLabel('RSS media').selectOption(domain);await rss.getByLabel('RSS indexer').selectOption(indexer.id);await rss.getByLabel('RSS download client').selectOption(client.id);
     const accepted=page.waitForResponse(r=>r.url().endsWith('/api/v1/rss/commands')&&r.request().method()==='POST');
     await rss.getByRole('button',{name:'Run RSS now',exact:true}).click();const response=await accepted;await expectStatus(response,202);await waitForCommand('/api/v1/rss/commands',(await response.json()).id,'succeeded');
-    const receipt=await poll(async(timeout)=>(await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`,{timeout})).json()).items.find(r=>r.status==='observed'),r=>!!r,`observed ${domain} receipt`);
+    // Keep all candidate decisions in a failed poll: selecting first hid rejection reasons.
+    const receipts=await poll(async(timeout)=>(await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`,{timeout})).json()).items,items=>items.some(r=>r.status==='observed'),`observed ${domain} receipt`);
+    const receipt=receipts.find(r=>r.status==='observed');
     assert.equal(receipt.target.media_type,domain);
     await page.getByRole('button',{name:'Activity',exact:true}).click();
     await page.getByLabel('Download client').selectOption(client.id);await page.getByLabel('Refresh media').selectOption(domain);

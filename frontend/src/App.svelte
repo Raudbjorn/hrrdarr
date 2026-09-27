@@ -1,4 +1,6 @@
 <script lang="ts">
+  import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
+  import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
   import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
   import CreateTags from './lib/CreateTags.svelte';
@@ -21,10 +23,14 @@
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
   let searchTarget: MediaTarget | null = $state(null);
-  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles' | 'naming' | 'import-existing' | 'custom-formats' | 'tags'>('library');
+  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles' | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management'>('library');
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
+  let delayVisited=$state(false), revisionVisited=$state(false), profileSection=$state<'quality'|'delay'>('quality');
+  let delayWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}),delayUsageVersion=$state({tv:0,movies:0});
+  let delayRequest=$state<{domain:MediaDomain;id?:number;nonce:number}|null>(null),delayNonce=0;
+  function openDelay(scope:MediaDomain,id?:number){delayVisited=true;profilesVisited=true;profileSection='delay';view='profiles';delayRequest={domain:scope,id,nonce:++delayNonce};}
   let tagsVisited=$state(false), tagVersions=$state({tv:0,movies:0});
   let tagWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), assignmentWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let creationIds=$state<number[]>([]), creationReady=$state(true), creationUncertain=$state(false);
@@ -37,6 +43,7 @@
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
   const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle');
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
+  const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
   let adding = $state(false), term = $state(''), results: LookupResult[] = $state([]), choice: LookupResult | null = $state(null), path = $state(''), searching = $state(false), searched = $state(false);
   let seriesType = $state(''), seasonFolder = $state(''), sceneNumbering = $state(''), newItems = $state(''), availability = $state('');
   let profiles: QualityProfilePage | null = $state(null), profileId: number | null = $state(null), profilesLoading = $state(false), profilesError = $state('');
@@ -116,17 +123,18 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>{tagsVisited=true;view='tags';}}>Tags</button><button aria-pressed={view === 'custom-formats'} onclick={() => {customFormatsVisited=true; view = 'custom-formats';}}>Custom formats</button><button aria-pressed={view === 'qualities'} onclick={() => {qualitiesVisited=true; view = 'qualities';}}>Quality settings</button><button aria-pressed={view === 'profiles'} onclick={() => {profilesVisited=true; view = 'profiles';}}>Quality profiles</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>{tagsVisited=true;view='tags';}}>Tags</button><button aria-pressed={view === 'custom-formats'} onclick={() => {customFormatsVisited=true; view = 'custom-formats';}}>Custom formats</button><button aria-pressed={view === 'qualities'} onclick={() => {qualitiesVisited=true; view = 'qualities';}}>Quality settings</button><button aria-pressed={view === 'profiles'} onclick={() => {profilesVisited=true; view = 'profiles';}}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>{revisionVisited=true;view='media-management';}}>Media management</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
   {#if view === 'rss'}<RssPanel />{/if}
   {#if view === 'providers'}<ProviderPanel />{/if}
   {#if view === 'activity'}<ActivityPanel />{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
   {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
   {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
-  {#if profilesVisited}<div hidden={view !== 'profiles'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{/if}
+  {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
+  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
-  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWrites} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
+  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithDelay} usageVersions={delayUsageVersion} ondelay={openDelay} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
   {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}{#if saving}<p role="status">Saving library changes…</p>{/if}
@@ -171,7 +179,7 @@
           <div class="pagination"><button disabled={episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
         {:else if selected.statistics.file_count > 0}<p>This movie already has a file association. Initial import will not replace it.</p>{/if}
         {#if domain === 'movies'}<button onclick={() => searchTarget = {media_type:'movie',id:selected!.id}}>Search movie releases</button>{/if}
-        {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} />{/key}{/if}
+        {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} onsettings={openDelay} />{/key}{/if}
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
     </article>
   </div>

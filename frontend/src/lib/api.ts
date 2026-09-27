@@ -234,3 +234,13 @@ export const renameTag = (domain: MediaDomain, id: number, label: string) => val
 export const deleteTag = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`${tagPath(domain)}/${id}`, undefined, 'DELETE', true) : invalid<void>();
 export const getTagOwners = (domain: MediaDomain, id: number, offset = 0) => validId(id) && Number.isSafeInteger(offset) && offset >= 0 ? request<TagOwners>(`${tagPath(domain)}/${id}/owners?limit=25&offset=${offset}`, undefined, undefined, true) : invalid<TagOwners>();
 export const assignLibraryTags = (domain: MediaDomain, ids: number[], tags: TagAssignment) => ids.length > 0 && ids.length <= 100 && ids.every(validId) && tags.ids.length <= 200 && tags.ids.every(validId) ? request<LibraryItem[]>(`${collection(domain)}/editor`, {ids,patch:{tags}}, 'PUT', true) : invalid<LibraryItem[]>();
+
+const delayPath = (domain: MediaDomain) => `/api/v1/${domain}/delay-profiles`;
+export const listDelayProfiles = (domain: MediaDomain) => request<import('./api.generated').DelayProfileCatalog>(delayPath(domain), undefined, undefined, true);
+export const getDelayProfileSchema = (domain: MediaDomain) => request<import('./api.generated').DelayProfileInput>(`${delayPath(domain)}/schema`, undefined, undefined, true);
+export const createDelayProfile = (domain: MediaDomain, input: import('./api.generated').DelayProfileWrite) => request<import('./api.generated').DelayProfileCatalog>(delayPath(domain), input, 'POST', true);
+export const updateDelayProfile = (domain: MediaDomain, id: number, input: import('./api.generated').DelayProfileWrite) => validId(id) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').DelayProfileCatalog>();
+export const deleteDelayProfile = (domain: MediaDomain, id: number, revision: number) => validId(id)&&validId(revision) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}?revision=${revision}`, undefined, 'DELETE', true) : invalid<import('./api.generated').DelayProfileCatalog>();
+export const reorderDelayProfiles = (domain: MediaDomain, input: import('./api.generated').DelayProfileReorder) => request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/reorder`, input, 'PUT', true);
+export const getRevisionPolicy = (domain: MediaDomain) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, undefined, undefined, true);
+export const updateRevisionPolicy = (domain: MediaDomain, input: import('./api.generated').RevisionPolicyUpdate) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, input, 'PUT', true);

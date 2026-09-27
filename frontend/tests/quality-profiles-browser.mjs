@@ -11,7 +11,7 @@ const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',
 const panel=page.getByRole('region',{name:'Quality profiles',exact:true});
 async function read(path) {const r=await page.request.get(`${origin}/api/v1/${path}`);assert.equal(r.status(),200);return r.json();}
 try {
- await page.goto(origin);await page.getByRole('button',{name:'Quality profiles',exact:true}).click();
+ await page.goto(origin);await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();
  for(const domain of ['tv','movies']) {
   if(domain==='movies') await panel.getByRole('button',{name:'Movies',exact:true}).click();
   for(const name of ['Browser positive','Browser zero']) {
@@ -49,7 +49,7 @@ try {
   assert.deepEqual(saved.policy.format_items.map(f=>f.score).sort((a,b)=>a-b),[0,25]);
   // Workspace navigation retains the current draft and stable group selection.
   await panel.getByLabel('Profile name',{exact:true}).fill(`${name} draft`);
-  await page.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('button',{name:'Quality profiles',exact:true}).click();
+  await page.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();
   assert.equal(await panel.getByLabel('Profile name',{exact:true}).inputValue(),`${name} draft`);
   // A lost write response blocks retry and preserves input until explicit reconciliation.
   await page.route(`**/api/v1/${domain}/quality-profiles/${created.id}`,route=>route.request().method()==='PUT'?route.abort('failed'):route.continue());

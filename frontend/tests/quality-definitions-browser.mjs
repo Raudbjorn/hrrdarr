@@ -17,7 +17,7 @@ const ids={};
 try {
  for(const domain of ['tv','movies']) {const response=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Propagation ${domain}`,policy:null,items:[{kind:'quality',quality_id:1,allowed:true,min_size:10,preferred_size:20,max_size:30},{kind:'quality',quality_id:2,allowed:false,min_size:30,preferred_size:40,max_size:50}]}});assert.equal(response.status(),201);ids[domain]=(await response.json()).id;}
  const originalMovie=await read('movies/quality-definitions');
- await page.goto(origin);await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await editProfile('Propagation tv');
+ await page.goto(origin);await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await editProfile('Propagation tv');
  // Hold the profile write before delivery: the other panel must not overlap a global write.
  let captureProfile;const heldProfile=new Promise(resolve=>captureProfile=resolve);
  const profilePattern=`**/api/v1/tv/quality-profiles/${ids.tv}`;
@@ -27,7 +27,7 @@ try {
  assert.equal(await panel.getByRole('button',{name:'Save quality settings',exact:true}).isDisabled(),true);assert.equal(await panel.getByRole('button',{name:'Reset quality settings',exact:true}).isDisabled(),true);
  await profileRoute.continue();await page.unroute(profilePattern);
  await page.waitForFunction(()=>{const f=document.querySelector('section[aria-label="Global quality settings"] form > fieldset');return f && !f.disabled;});
- await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await editProfile('Propagation tv');await profiles.getByLabel('Profile name',{exact:true}).fill('Keep this draft');
+ await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await editProfile('Propagation tv');await profiles.getByLabel('Profile name',{exact:true}).fill('Keep this draft');
  await page.getByRole('button',{name:'Quality settings',exact:true}).click();
  await panel.getByLabel('SDTV display title',{exact:true}).fill('Global TV');await panel.getByLabel('SDTV minimum size',{exact:true}).fill('11');await panel.getByLabel('SDTV preferred size',{exact:true}).fill('');await panel.getByLabel('SDTV maximum size',{exact:true}).fill('40');
  // Reverse ordering: a held global write blocks the retained profile draft.
@@ -35,12 +35,12 @@ try {
  await page.route(globalPattern,route=>captureGlobal(route));
  const globalResponse=page.waitForResponse(r=>r.url().endsWith('/tv/quality-definitions/bulk'));
  await panel.getByRole('button',{name:'Save quality settings',exact:true}).click();const globalRoute=await heldGlobal;
- await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await profiles.getByText('Global quality write in progress.',{exact:false}).waitFor();
+ await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await profiles.getByText('Global quality write in progress.',{exact:false}).waitFor();
  assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);assert.equal(await profiles.getByLabel('Profile name',{exact:true}).inputValue(),'Keep this draft');
  await globalRoute.continue();assert.equal((await globalResponse).status(),200);await page.unroute(globalPattern);
  let profile=await read(`tv/quality-profiles/${ids.tv}`);assert.deepEqual([profile.items[0].min_size,profile.items[0].preferred_size,profile.items[0].max_size],[11,null,40]);assert.equal(profile.items[1].min_size,30);
  assert.deepEqual(await read('movies/quality-definitions'),originalMovie);
- await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await profiles.getByText('Global quality settings changed.',{exact:false}).waitFor();assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);assert.equal(await profiles.getByLabel('Profile name',{exact:true}).inputValue(),'Keep this draft');
+ await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await profiles.getByText('Global quality settings changed.',{exact:false}).waitFor();assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);assert.equal(await profiles.getByLabel('Profile name',{exact:true}).inputValue(),'Keep this draft');
  await profiles.getByRole('button',{name:'Refresh list and catalogs',exact:true}).click();await profiles.getByRole('button',{name:'Edit Propagation tv',exact:true}).waitFor();assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);
  await editProfile('Propagation tv');assert.equal(await profiles.getByLabel('Global TV minimum size',{exact:true}).inputValue(),'11');
  await page.getByRole('button',{name:'Quality settings',exact:true}).click();
@@ -60,23 +60,23 @@ try {
    for(const name of ['minimum','preferred','maximum'])await panel.getByLabel(`SDTV ${name} size`,{exact:true}).fill('');assert.equal((await save()).status(),200);
    const existing=await read(`tv/quality-profiles/${ids.tv}`);assert.equal(existing.items[0].min_size,12);
    // Reconcile TV draft before movie writes, so isolation is observable in the editor.
-   await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await editProfile('Propagation tv');await page.getByRole('button',{name:'Quality settings',exact:true}).click();
+   await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await editProfile('Propagation tv');await page.getByRole('button',{name:'Quality settings',exact:true}).click();
   } else {
    assert.equal((await read(`movies/quality-profiles/${ids.movies}`)).items[0].min_size,10);
-   await page.getByRole('button',{name:'Quality profiles',exact:true}).click();assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),false);await page.getByRole('button',{name:'Quality settings',exact:true}).click();
+   await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),false);await page.getByRole('button',{name:'Quality settings',exact:true}).click();
   }
   // An ambiguous response retains the draft and blocks save/reset until explicit readback.
   const pattern=`**/api/v1/${domain}/quality-definitions/bulk`;await page.route(pattern,route=>route.abort('failed'));
   await panel.getByLabel('SDTV display title',{exact:true}).fill('Uncertain draft');await panel.getByRole('button',{name:'Save quality settings',exact:true}).click();await panel.getByText('The write outcome is unknown.',{exact:false}).waitFor();assert.equal(await panel.getByRole('button',{name:'Save quality settings',exact:true}).isDisabled(),true);assert.equal(await panel.getByRole('button',{name:'Reset quality settings',exact:true}).isDisabled(),true);assert.equal(await panel.getByLabel('SDTV display title',{exact:true}).inputValue(),'Uncertain draft');
   if(domain==='tv') {
-   await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await profiles.getByText('Global quality write outcome unknown.',{exact:false}).waitFor();
+   await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await profiles.getByText('Global quality write outcome unknown.',{exact:false}).waitFor();
    const currentRead=page.waitForResponse(r=>r.url().endsWith(`/tv/quality-profiles/${ids.tv}`) && r.request().method()==='GET');
    await profiles.getByRole('button',{name:'Edit Propagation tv',exact:true}).click();await (await currentRead).finished();
    assert.equal(await profiles.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);
    await page.getByRole('button',{name:'Quality settings',exact:true}).click();
   }
   await page.unroute(pattern);await panel.getByRole('button',{name:'Reload saved settings',exact:true}).click();await panel.getByRole('button',{name:'Save quality settings',exact:true}).waitFor();
-  if(domain==='tv'){await page.getByRole('button',{name:'Quality profiles',exact:true}).click();await editProfile('Propagation tv');await page.getByRole('button',{name:'Quality settings',exact:true}).click();}
+  if(domain==='tv'){await page.getByRole('navigation',{name:'Workspace'}).getByRole('button',{name:'Profiles',exact:true}).click();await editProfile('Propagation tv');await page.getByRole('button',{name:'Quality settings',exact:true}).click();}
  }
  assert.deepEqual(errors,[]);console.log('Global quality settings browser workflow passed for TV and movies.');
 }finally{await browser.close();}
