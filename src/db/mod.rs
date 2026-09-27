@@ -154,7 +154,107 @@ const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
     sql TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)";
 
+/// Identity reported by the connected engine, not the system SQLite package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageEngine {
+    pub sqlite_version: String,
+    pub sqlite_source_id: String,
+}
+
+/// Intentionally excludes driver errors: remote errors can contain URLs/credentials.
+#[derive(Debug)]
+pub struct StorageCompatibilityError {
+    pub capability: &'static str,
+    pub engine: Option<StorageEngine>,
+}
+
+impl std::fmt::Display for StorageCompatibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "storage engine compatibility check failed: {}; schema migration not started",
+            self.capability
+        )
+    }
+}
+
+impl std::error::Error for StorageCompatibilityError {}
+
+// Read-only preflight: never create probe tables before the migration backup.
+async fn storage_engine(conn: &Connection) -> Result<StorageEngine, StorageCompatibilityError> {
+    let mut identity = None;
+    let mut capability = "engine identity";
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let row = conn
+            .query("SELECT sqlite_version(), sqlite_source_id()", ())
+            .await?
+            .next()
+            .await?
+            .ok_or(libsql::Error::QueryReturnedNoRows)?;
+        let version = row.get::<String>(0)?;
+        let source = row.get::<String>(1)?;
+        if version.len() > 32 {
+            return Ok(false);
+        }
+        // Source identity is diagnostic, not a capability requirement. Modified
+        // SQLite amalgamations (including bundled libSQL) can have an alt1 suffix.
+        let source = if !source.is_empty()
+            && source.len() <= 128
+            && source
+                .strip_suffix("alt1")
+                .unwrap_or(&source)
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b" -:.".contains(&b))
+        {
+            source
+        } else {
+            "unavailable".to_owned()
+        };
+        let components: Option<Vec<u32>> = version.split('.').map(|s| s.parse().ok()).collect();
+        let Some(parts) = components.filter(|v| v.len() == 3) else {
+            return Ok(false);
+        };
+        identity = Some(StorageEngine {
+            sqlite_version: version,
+            sqlite_source_id: source,
+        });
+        capability = "SQLite SQL baseline >= 3.38.0";
+        // unixepoch() is used by persisted commands (3.38); this also covers
+        // RETURNING / DROP COLUMN (3.35) and earlier ALTER TABLE operations.
+        if parts.as_slice() < [3, 38, 0].as_slice() {
+            return Ok(false);
+        }
+        capability = "structural JSON and UTC date functions";
+        let supported = scalar(
+            conn,
+            r#"SELECT
+            json_valid('{"v":[7]}') = 1
+            AND json_valid('invalid') = 0
+            AND json_type('{"v":[7]}', '$.v') = 'array'
+            AND json_extract('{"v":[7]}', '$.v[0]') = 7
+            AND json_array_length('[7]') = 1
+            AND (SELECT sum(value) FROM json_each('[3,4]')) = 7
+            AND json_extract(json_object('v', 7), '$.v') = 7
+            AND unixepoch('2000-01-01T00:00:00Z') = 946684800"#,
+        )
+        .await?;
+        Ok::<bool, libsql::Error>(supported == 1)
+    })
+    .await;
+    if matches!(result, Ok(Ok(true))) {
+        // A successful probe necessarily captured a validated identity above.
+        if let Some(engine) = identity {
+            return Ok(engine);
+        }
+    }
+    Err(StorageCompatibilityError {
+        capability,
+        engine: identity,
+    })
+}
+
 pub struct Database {
+    engine: StorageEngine,
     inner: libsql::Database,
     // Advisory ownership lasts for the application lifetime, including backup/migration.
     _owner: Option<File>,
@@ -183,8 +283,10 @@ impl Database {
         })
         .await??;
         let inner = libsql::Builder::new_local(&path).build().await?;
+        let engine = storage_engine(&inner.connect()?).await?;
         let mut db = Self {
             inner,
+            engine,
             _owner: Some(owner),
             backup: None,
         };
@@ -195,13 +297,19 @@ impl Database {
 
     pub async fn open_remote(url: String, token: String) -> Result<Self, Error> {
         let inner = libsql::Builder::new_remote(url, token).build().await?;
+        let engine = storage_engine(&inner.connect()?).await?;
         let db = Self {
             inner,
+            engine,
             _owner: None,
             backup: None,
         };
         migrate(&db.connect().await?, None).await?;
         Ok(db)
+    }
+
+    pub fn storage_engine(&self) -> &StorageEngine {
+        &self.engine
     }
 
     pub async fn connect(&self) -> Result<Connection, libsql::Error> {
