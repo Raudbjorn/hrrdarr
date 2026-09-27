@@ -110,7 +110,12 @@ async fn matching_names(
             class: "custom_format_evaluation_failed",
         })
     };
-    let parsed = render::parse(field, template).map_err(|_| fail())?;
+    let parsed = render::parse(field, template).map_err(|_| {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "invalid_template",
+        })
+    })?;
     if !parsed.uses_custom_formats() {
         return Ok(Vec::new());
     }
