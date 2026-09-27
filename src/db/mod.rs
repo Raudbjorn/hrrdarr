@@ -159,6 +159,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "candidate_comparison_facts",
         include_str!("../../migrations/0035_candidate_comparison_facts.sql"),
     ),
+    (
+        "snapshot_custom_formats",
+        include_str!("../../migrations/0036_snapshot_custom_formats.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

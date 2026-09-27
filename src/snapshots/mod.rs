@@ -2,6 +2,7 @@
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
 mod blocklist;
+mod custom_formats;
 mod history;
 mod profiles;
 mod providers;
@@ -187,7 +188,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
-    let profile_plan = profiles::read(&source, app, &mut plan.unsupported)?;
+    let profile_plan = profiles::read(&source, app, &mut plan.unsupported).await?;
     let blocklist_plan = blocklist::read(&source, app, &mut plan.unsupported)?;
     let history_plan = history::read(&source, app, &mut plan.unsupported)?;
     let provider_plan = if reconstruct_providers {
@@ -207,10 +208,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library, whole supported profiles and assignments, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library, supported custom formats, whole profiles and assignments, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported whole profiles/assignments, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported custom formats and whole profiles/assignments, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn

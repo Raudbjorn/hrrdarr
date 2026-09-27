@@ -281,7 +281,8 @@ async fn unsupported_profiles_are_never_truncated_and_conflicts_roll_back() {
     let s = Scratch::new();
     let cases = [
         "UPDATE QualityProfiles SET FormatItems='[{\"format\":9,\"score\":10}]'",
-        "INSERT INTO CustomFormats VALUES(9,'PRIVATE_CF_SENTINEL')",
+        // Unknown definitions must also prevent zero-score references from disappearing.
+        "INSERT INTO CustomFormats VALUES(9,'PRIVATE_CF_SENTINEL'); UPDATE QualityProfiles SET FormatItems='[{\"format\":9,\"score\":0}]'",
         "DROP TABLE CustomFormats",
         "UPDATE QualityProfiles SET Cutoff=9999,Items='[{\"quality\":9999,\"allowed\":true,\"items\":[]}]'",
         "UPDATE QualityProfiles SET Items='[{\"quality\":1,\"allowed\":true,\"items\":[],\"PRIVATE_KEY_SENTINEL\":true}]'",

@@ -130,7 +130,7 @@ async fn read(
             .ok_or_else(missing)?,
     ))
 }
-async fn validate(media: MediaDomain, input: &Input) -> Result<String> {
+pub(crate) async fn validate(media: MediaDomain, input: &Input) -> Result<String> {
     if input.name.trim().is_empty()
         || input.name.chars().count() > 100
         || input.name.chars().any(char::is_control)
@@ -156,15 +156,7 @@ async fn save(db: &Database, media: MediaDomain, id: Option<i64>, input: Input) 
     let tx = c
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
- let existing=catalog(&tx,media).await?;
- if id.is_some_and(|id|!existing.iter().any(|f|f.id==id)){return Err(missing())}
- if existing.iter().any(|f|Some(f.id)!=id&&f.definition.name==input.name){return Err(Error(StatusCode::CONFLICT,"custom_format_name_conflict","Name already exists"))}
- let bytes:usize=existing.iter().filter(|f|Some(f.id)!=id).map(|f|serde_json::to_string(&f.definition.specifications).map(|s|s.len()).unwrap_or(MAX_CATALOG_BYTES)).sum();
- if (id.is_none()&&existing.len()>=MAX_FORMATS)||bytes+json.len()>MAX_CATALOG_BYTES{return Err(invalid("Custom format catalog exceeds evaluation limits"))}
- let id=if let Some(id)=id {tx.execute("UPDATE custom_formats SET name=?,include_when_renaming=?,specifications_json=? WHERE id=? AND media_type=?",params![input.name.clone(),i64::from(input.include_when_renaming),json,id,crate::search::domain(media)]).await?;id}else{tx.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?)",params![crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;tx.last_insert_rowid()};
- Ok(Format{id,media_type:media,definition:input})
- }.await;
+    let outcome = persist_validated(&tx, media, id, input, json).await;
     match outcome {
         Ok(v) => {
             tx.commit().await?;
@@ -176,6 +168,54 @@ async fn save(db: &Database, media: MediaDomain, id: Option<i64>, input: Input) 
         }
     }
 }
+/// Caller validates/compiles before acquiring its write transaction.
+pub(crate) async fn persist_validated(
+    conn: &Connection,
+    media: MediaDomain,
+    id: Option<i64>,
+    input: Input,
+    json: String,
+) -> Result<Format> {
+    let existing = catalog(conn, media).await?;
+    if id.is_some_and(|id| !existing.iter().any(|f| f.id == id)) {
+        return Err(missing());
+    }
+    if existing
+        .iter()
+        .any(|f| Some(f.id) != id && f.definition.name == input.name)
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "custom_format_name_conflict",
+            "Name already exists",
+        ));
+    }
+    let bytes: usize = existing
+        .iter()
+        .filter(|f| Some(f.id) != id)
+        .map(|f| {
+            serde_json::to_string(&f.definition.specifications)
+                .map(|s| s.len())
+                .unwrap_or(MAX_CATALOG_BYTES)
+        })
+        .sum();
+    if (id.is_none() && existing.len() >= MAX_FORMATS) || bytes + json.len() > MAX_CATALOG_BYTES {
+        return Err(invalid("Custom format catalog exceeds evaluation limits"));
+    }
+    let id = if let Some(id) = id {
+        conn.execute("UPDATE custom_formats SET name=?,include_when_renaming=?,specifications_json=? WHERE id=? AND media_type=?",params![input.name.clone(),i64::from(input.include_when_renaming),json,id,crate::search::domain(media)]).await?;
+        id
+    } else {
+        conn.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?)",params![crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;
+        conn.last_insert_rowid()
+    };
+    Ok(Format {
+        id,
+        media_type: media,
+        definition: input,
+    })
+}
+
 async fn create(
     State(db): State<Arc<Database>>,
     Extension(media): Extension<String>,

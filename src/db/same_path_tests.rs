@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 35); // Latest open adds durable comparison facts; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 36); // Latest open adds snapshot CF activation; historical migration starts remain unchanged.
     for op in &operations {
         let r = c
             .query(

@@ -5,10 +5,11 @@ use serde_json::Value as J;
 
 pub(super) struct Profiles {
     table: &'static str,
+    catalog: super::custom_formats::Catalog,
     profiles: BTreeMap<i64, Option<ProfileInput>>,
     assignments: Vec<(i64, i64)>,
 }
-fn issue(unsupported: &mut Vec<Unsupported>, table: &str, reason: &str) {
+pub(super) fn issue(unsupported: &mut Vec<Unsupported>, table: &str, reason: &str) {
     if let Some(item) = unsupported
         .iter_mut()
         .find(|item| item.table == table && item.columns == [reason])
@@ -94,9 +95,25 @@ fn leaf(value: &J, tv: bool) -> Option<Leaf> {
     })
 }
 fn parse(row: &Record, items: &J, formats: &J, tv: bool, old: bool) -> Option<ProfileInput> {
-    if !formats.as_array()?.is_empty() {
-        return None;
-    }
+    let mut seen = std::collections::BTreeSet::new();
+    let format_items = formats
+        .as_array()?
+        .iter()
+        .map(|item| {
+            let obj = object(item)?;
+            if obj.len() != 2 {
+                return None;
+            }
+            let id = obj.get("format")?.as_i64()?;
+            if !(1..=9_007_199_254_740_991).contains(&id) || !seen.insert(id) {
+                return None;
+            }
+            Some(crate::db::custom_formats::FormatScore {
+                format_id: id,
+                score: i32::try_from(obj.get("score")?.as_i64()?).ok()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
     let roots_json = items.as_array()?;
     if roots_json.len() > native::MAX_NODES {
         return None;
@@ -183,11 +200,11 @@ fn parse(row: &Record, items: &J, formats: &J, tv: bool, old: bool) -> Option<Pr
             } else {
                 Some(i32::try_from(int(row, "Language")?).ok()?)
             },
-            format_items: vec![],
+            format_items,
         }),
     })
 }
-pub(super) fn read(
+pub(super) async fn read(
     source: &Source,
     app: Application,
     unsupported: &mut Vec<Unsupported>,
@@ -197,13 +214,11 @@ pub(super) fn read(
     let table = if old { "Profiles" } else { "QualityProfiles" };
     let mut result = Profiles {
         table,
+        catalog: super::custom_formats::read(source, app, unsupported).await?,
         profiles: BTreeMap::new(),
         assignments: Vec::new(),
     };
-    let catalog_empty = source
-        .tables
-        .get("CustomFormats")
-        .is_some_and(|t| t.rows.is_empty());
+    let catalog_resolved = result.catalog.observed;
     if let Some(data) = source.tables.get(table) {
         if data.rows.len() > 256 {
             return Err(ImportError("snapshot exceeds 256 profile limit"));
@@ -233,7 +248,7 @@ pub(super) fn read(
             let unknown = row
                 .keys()
                 .any(|key| !known.contains(&key.as_str()) && !(key == "Language" && !tv));
-            let input = if catalog_empty && !unknown {
+            let input = if catalog_resolved && !unknown {
                 items
                     .as_ref()
                     .zip(formats.as_ref())
@@ -243,12 +258,21 @@ pub(super) fn read(
             };
             let input = input.filter(|input| {
                 native::validate_input(input, if tv { "tv" } else { "movies" }).is_ok()
+                    && input.policy.as_ref().is_some_and(|p| {
+                        p.format_items.iter().all(|f| {
+                            result
+                                .catalog
+                                .definitions
+                                .get(&f.format_id)
+                                .is_some_and(Option::is_some)
+                        })
+                    })
             });
             if input.is_none() {
                 issue(
                     unsupported,
                     table,
-                    if !catalog_empty {
+                    if !catalog_resolved {
                         "custom_format_catalog_unresolved"
                     } else {
                         "whole_profile_unsupported"
@@ -311,8 +335,14 @@ pub(super) async fn prepare(
         .await?
         .map(|row| row.get::<i64>(0))
         .transpose()?;
-    let old = prior == Some(0);
+    let cf_activated = conn.query("SELECT custom_format_version FROM snapshot_imports WHERE application=? AND fingerprint=?",params![app,report.fingerprint.clone()]).await?.next().await?.map(|r|r.get::<i64>(0)).transpose()? == Some(1);
+    // The predecessor refused every profile in a nonempty CF catalog, including empty scores.
+    // Empty-catalog profiles were already supported: never resurrect their deleted mappings.
+    let backfill_cf = prior == Some(1) && !cf_activated && !profiles.catalog.definitions.is_empty();
+    let old = prior == Some(0) || backfill_cf;
     conn.execute("INSERT INTO snapshot_imports(application,fingerprint,schema_version,episode_metadata_version) VALUES(?,?,?,1) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),report.schema_version]).await?;
+    let format_ids =
+        super::custom_formats::write(conn, &profiles.catalog, report, cf_activated).await?;
     let mut available = std::collections::BTreeSet::new();
     let mut rows = conn
         .query(
@@ -327,6 +357,23 @@ pub(super) async fn prepare(
     let mut ids = BTreeMap::new();
     for (source_id, input) in &profiles.profiles {
         let Some(input) = input else { continue };
+        let mut input = input.clone();
+        let mut resolved = true;
+        for score in &mut input.policy.as_mut().expect("parsed policy").format_items {
+            if let Some(id) = format_ids.get(&score.format_id) {
+                score.format_id = *id
+            } else {
+                resolved = false
+            }
+        }
+        if !resolved {
+            issue(
+                &mut report.unsupported,
+                profiles.table,
+                "custom_format_catalog_unresolved",
+            );
+            continue;
+        }
         // Catalog checks use the same engine/domain catalogue as native writes.
         let mut valid = true;
         for item in &input.items {
@@ -362,21 +409,21 @@ pub(super) async fn prepare(
         let id = match candidate {
             Some(id)
                 if mapped.is_none_or(|mapped| mapped == id)
-                    && !(prior == Some(1) && mapped.is_none()) =>
+                    && !(prior == Some(1) && !backfill_cf && mapped.is_none()) =>
             {
                 let actual = native::as_input(
                     native::fetch(conn, media, id)
                         .await
                         .map_err(|_| ImportError("profile destination read failed"))?,
                 );
-                if actual != *input {
+                if canonical(actual) != canonical(input.clone()) {
                     report.conflicts += 1;
                     continue;
                 }
                 report.duplicates += 1;
                 id
             }
-            None if mapped.is_none() && prior != Some(1) => {
+            None if mapped.is_none() && (prior != Some(1) || backfill_cf) => {
                 let profile = native::persist_on_connection(conn, media, None, input.clone())
                     .await
                     .map_err(|_| ImportError("profile destination write failed"))?;
@@ -450,9 +497,18 @@ pub(super) async fn finish(
         }
     }
     conn.execute(
-        "UPDATE snapshot_imports SET profile_version=1 WHERE application=? AND fingerprint=?",
+        "UPDATE snapshot_imports SET profile_version=1,custom_format_version=1 WHERE application=? AND fingerprint=?",
         params![report.application.name(), report.fingerprint.clone()],
     )
     .await?;
     Ok(())
+}
+
+// Native reads include implicit zero scores for every current domain definition.
+fn canonical(mut input: ProfileInput) -> ProfileInput {
+    if let Some(policy) = &mut input.policy {
+        policy.format_items.retain(|f| f.score != 0);
+        policy.format_items.sort_by_key(|f| f.format_id);
+    }
+    input
 }
