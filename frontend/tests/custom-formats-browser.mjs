@@ -72,18 +72,18 @@ try {
   assert.deepEqual(movie[0].specifications.find(s=>s.condition.kind==='size').condition,{kind:'size',min_gib:1,max_gib:10});
   assert.equal(movie[0].specifications.find(s=>s.condition.kind==='language').condition.except_language,true);
   await panel.getByRole('button',{name:'Clone condition',exact:true}).first().click();
-  await panel.getByText('Import or export native JSON',{exact:true}).click();
+  await panel.getByText('Import or export JSON',{exact:true}).click();
   await panel.getByRole('button',{name:'Export draft as JSON',exact:true}).click();
-  const exported=JSON.parse(await panel.getByLabel('Native custom format JSON',{exact:true}).inputValue());
+  const exported=JSON.parse(await panel.getByLabel('Custom format JSON',{exact:true}).inputValue());
   assert.equal(exported.specifications.length,schema.conditions.length+1);
   assert.deepEqual(exported.specifications[0],exported.specifications[1]);
   await panel.getByRole('button',{name:'Clone format',exact:true}).click();
   assert.equal(await panel.getByRole('button',{name:'Delete custom format',exact:true}).count(),0);
   exported.name='Imported clone';
-  await panel.getByLabel('Native custom format JSON',{exact:true}).fill('[');
+  await panel.getByLabel('Custom format JSON',{exact:true}).fill('[');
   await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
   await panel.getByText('Invalid JSON.',{exact:true}).waitFor();
-  await panel.getByLabel('Native custom format JSON',{exact:true}).fill(JSON.stringify(exported));
+  await panel.getByLabel('Custom format JSON',{exact:true}).fill(JSON.stringify(exported));
   await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
   assert.equal((await (await page.request.get(`${origin}/api/v1/movies/custom-formats`)).json()).length,1);
   await panel.getByRole('button',{name:'Save custom format',exact:true}).click();
@@ -135,6 +135,32 @@ try {
   release();await page.unrouteAll({behavior:'wait'});
   assert.equal(await panel.getByText('obsolete TV failure').count(),0);
   assert.equal(await panel.getByRole('button',{name:'Preset tv',exact:true}).count(),0);
+  for(const [media,button] of [['tv','TV'],['movies','Movies']]) {
+    await panel.getByRole('button',{name:button,exact:true}).click();
+    await panel.getByRole('button',{name:`Preset ${media}`,exact:true}).click();
+    await panel.getByText('Import or export JSON',{exact:true}).click();
+    await panel.getByLabel('JSON format',{exact:true}).selectOption('community');
+    const before=(await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).length;
+    const community={id:123,name:`Community ${media}`,includeCustomFormatWhenRenaming:true,specifications:[{id:42,implementationName:'private presentation',infoLink:'https://private.invalid',name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'community'}}]};
+    await panel.getByLabel('Custom format JSON',{exact:true}).fill(JSON.stringify(community));
+    await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
+    assert.equal((await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).length,before);
+    assert.equal(await panel.getByLabel('Format name',{exact:true}).inputValue(),`Community ${media}`);
+    await panel.getByLabel('Pattern',{exact:true}).fill('edited-community');
+    await panel.getByRole('button',{name:'Export draft as JSON',exact:true}).click();
+    const output=JSON.parse(await panel.getByLabel('Custom format JSON',{exact:true}).inputValue());
+    assert.deepEqual(output,{name:`Community ${media}`,includeCustomFormatWhenRenaming:true,specifications:[{name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'edited-community'}}]});
+    const invalid={...community,specifications:[...community.specifications,{name:'Future',implementation:'FutureSpecification',fields:{value:1}}]};
+    await panel.getByLabel('Custom format JSON',{exact:true}).fill(JSON.stringify(invalid));
+    await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
+    await panel.getByText('Unknown community condition or condition fields.',{exact:true}).waitFor();
+    assert.equal(await panel.getByLabel('Pattern',{exact:true}).inputValue(),'edited-community');
+    assert.equal((await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).length,before);
+    await panel.getByRole('button',{name:'Save custom format',exact:true}).click();
+    await panel.getByText('Custom format saved.',{exact:true}).waitFor();
+    const saved=(await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).find(f=>f.name===`Community ${media}`);
+    assert.equal(saved.specifications[0].condition.pattern,'edited-community');assert.equal(saved.specifications[0].required,true);assert.equal(saved.specifications[0].negate,true);
+  }
   assert.deepEqual(errors,[]);
-  console.log('PASS custom format browser: both-domain preset create/edit/copy/delete, validation, typed fields, native JSON/clone, long labels, failed refresh, persisted isolation, stale response');
+  console.log('PASS custom format browser: both-domain preset create/edit/copy/delete, validation, typed fields, native/community JSON/clone, long labels, failed refresh, persisted isolation, stale response');
 } finally {await browser.close();}

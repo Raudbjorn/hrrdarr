@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { parseCustomFormatDraft } from './custom-format-draft';
+  import { parseCustomFormatDraft, parseCommunityCustomFormat, exportCommunityCustomFormat } from './custom-format-draft';
   import type { CustomFormat, CustomFormatInput, CustomFormatSchema, CustomFormatSpecification, MediaDomain } from './api.generated';
   import { listCustomFormats, getCustomFormatSchema, createCustomFormat, updateCustomFormat, deleteCustomFormat } from './api';
   let domain: MediaDomain = $state('tv');
@@ -8,6 +8,7 @@
   let draft: CustomFormatInput | null = $state(null), selected: number | null = $state(null);
   let loading = $state(false), busy = $state(false), uncertain = $state(false), confirming = $state(false);
   let jsonText = $state('');
+  let jsonFormat = $state<'native' | 'community'>('native');
   let error = $state(''), notice = $state(''), kind = $state('release_title');
   let alive = true, generation = 0;
   const label = (kind: string) => kind.replaceAll('_', ' ');
@@ -55,9 +56,16 @@
   }
   function applyJson() {
     if (!schema) return;
-    const result = parseCustomFormatDraft(jsonText, schema);
+    const result = jsonFormat === 'community' ? parseCommunityCustomFormat(jsonText, schema) : parseCustomFormatDraft(jsonText, schema);
     if (!result.ok) { error = result.error; return; }
     draft = result.data; selected = null; confirming = false; error = ''; notice = 'JSON applied to a new draft. Review it before saving.';
+  }
+  function exportJson() {
+    if (!draft || !schema) return;
+    if (jsonFormat === 'native') { jsonText = JSON.stringify(draft, null, 2); error = ''; return; }
+    const result = exportCommunityCustomFormat(copy(draft), schema);
+    if (!result.ok) { error = result.error; return; }
+    jsonText = result.data; error = '';
   }
   function cloneFormat() {
     if (!draft) return;
@@ -90,11 +98,12 @@
     {#if formats.length === 0}<p>No custom formats in this library.</p>{/if}
     <ul>{#each formats as format (format.id)}<li><button disabled={busy || uncertain} aria-pressed={selected === format.id} onclick={() => edit(format)}>{format.name}</button><span>{format.specifications.length} conditions</span></li>{/each}</ul>
     <button disabled={busy || uncertain || formats.length >= schema.max_formats} onclick={() => edit()}>New custom format</button>
-    <details><summary>Import or export native JSON</summary>
-      <label>Native custom format JSON<textarea aria-label="Native custom format JSON" rows="8" maxlength="73728" bind:value={jsonText} disabled={busy || uncertain}></textarea></label>
-      <p>Native format only, up to 72 KiB. Applying checks structure and creates a new draft; Save validates patterns before writing.</p>
+    <details><summary>Import or export JSON</summary>
+      <label>JSON format<select aria-label="JSON format" bind:value={jsonFormat} disabled={busy || uncertain}><option value="native">Native</option><option value="community">Sonarr / Radarr community</option></select></label>
+      <label>Custom format JSON<textarea aria-label="Custom format JSON" rows="8" maxlength="73728" bind:value={jsonText} disabled={busy || uncertain}></textarea></label>
+      <p>Choose the document format and library domain explicitly. Up to 72 KiB; unknown community conditions or options reject the entire document. Applying checks structure and creates a new draft; Save validates patterns before writing.</p>
       <button disabled={busy || uncertain} onclick={applyJson}>Apply JSON to new draft</button>
-      <button disabled={busy || uncertain || !draft} onclick={() => jsonText = JSON.stringify(draft, null, 2)}>Export draft as JSON</button>
+      <button disabled={busy || uncertain || !draft} onclick={exportJson}>Export draft as JSON</button>
     </details>
     {#if draft}
       <form onsubmit={(event) => { event.preventDefault(); void save(); }}>
