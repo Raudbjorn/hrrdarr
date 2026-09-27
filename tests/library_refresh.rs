@@ -49,6 +49,7 @@ fn episode(id: i64, season: i64, number: i64, title: &str) -> EpisodeDetails {
 }
 fn series() -> SeriesDetails {
     SeriesDetails {
+        original_language: None,
         tvdb_id: 101,
         title: "New TV".into(),
         year: None,

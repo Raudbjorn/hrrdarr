@@ -31,3 +31,5 @@ pub mod search;
 pub mod naming;
 
 pub mod parse;
+
+pub mod languages;
