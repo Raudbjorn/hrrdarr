@@ -66,7 +66,7 @@ media. Mounts, permissions, availability of media, and path mappings are unverif
 including extra fields on mapped rows, are archived as typed JSON. This preserves
 SQL nulls and binary values as hex. Profile assignments, custom formats, tags,
 collections, history, providers, path mappings, list exclusions, unknown settings,
-and richer metadata are archival only except the explicit profile, History, provider, root-folder and path-mapping reconstructions below. They have not gained runtime
+and richer metadata are archival only except the explicit custom-format, profile, History, provider, root-folder and path-mapping reconstructions below. They have not gained runtime
 semantics by being retained. There is no archive-reading API.
 
 Archives can contain credentials. Import requires a local Unix destination database
@@ -259,16 +259,21 @@ that profile's root groups. Cutoff must identify exactly one allowed root qualit
 or group; ambiguous identities are unsupported. The writer resolves groups through
 native request positions and allocates destination IDs inside the import transaction.
 
-The source must include an observed-empty `CustomFormats` table and each profile's
-`FormatItems` must be exactly `[]`. Both pinned applications synchronize global
-custom formats into profiles, including zero-score entries; a missing catalog does
-not prove independence. Missing/nonempty catalogs, nonempty format lists, unknown
-policy fields, unsupported nesting, catalog IDs or policy values leave the **whole
-profile** archived and reported. Its source assignment remains unsupported; no
-truncated native profile is created. Malformed serialized JSON or duplicate source
-profile IDs fails the entire import with a static error. Unknown field names and
-values from policy JSON never appear in reports. Static source assignment column
-names (`QualityProfileId`/`ProfileId`) identify unresolved assignments.
+The source must include a `CustomFormats` table. Definitions use stored `{type, body}`
+wrappers and profile scores use numeric `{format, score}` references. Supported whole
+definitions are validated by the native domain/regex validators before the writer
+transaction; source IDs are remapped before complete profile persistence. Every
+reference, including score zero, must resolve. Unknown conditions/policy fields,
+unsupported regex, invalid values or unresolved references leave the whole affected
+definition/profile archived and reported. Malformed serialized JSON and duplicate
+source identities abort the import. Reports contain static reasons, never source
+field values. Worker admission/timeouts abort with a retryable explanation rather
+than permanently classifying a valid definition as unsupported.
+
+Current-domain definitions absent from a profile contribute implicit zero scores.
+Canonical comparison ignores zero scores only after validating all source references;
+nonzero local additions or changes still conflict. Native catalog/specification bounds
+apply, including 128 definitions per domain and the aggregate byte budget.
 
 Profile names are candidate keys only within a media domain. An existing candidate
 must match the complete canonical ordered graph and policy, including sizes,
@@ -300,8 +305,7 @@ activation, both-domain policy readback, unsupported/privacy cases, replay, loca
 edits and late-write rollback. `src/db/snapshot_profile_tests.rs` constructs actual
 schema-19 archives through the prior core writer, checks migration rollback, performs
 both-domain exact-upload backfill and tests missing mappings/rows, local assignments
-and reopen. These do not establish real-backup equivalence, custom-format support,
-policy evaluation or the complete snapshot parity gate.
+and reopen. These do not establish real-backup equivalence or the complete snapshot parity gate.
 
 ## Managed source Blocklist
 
@@ -340,3 +344,23 @@ reopen. Live services, real operator backups and full Blocklist controller parit
 not established by these fixtures.
 
 An episode-file row retained as a quarantined replacement artifact is no longer an active snapshot reconciliation candidate. Exact reuploads and matching source records report a conflict rather than restoring its old path or episode association. Its original provenance remains stored. This exclusion is specific to explicitly quarantined replacement rows; ordinary unassociated snapshot files and shared files remain supported.
+
+
+## Custom-format activation
+
+Migration 36 adds an independent custom-format activation marker without changing
+existing profile activation. Opening an old destination does not activate archives.
+Reuploading identical schema-35 source bytes can reconstruct definitions and profiles
+previously rejected because the source CF catalog was nonempty, including profiles
+with empty score arrays. This exception does not recreate deleted profiles that were
+already supported with an empty source catalog. Backfill requires intact core mappings
+and still-null assignments; definition/profile changes, deleted mapped rows and changed
+assignments conflict. Dry-run, conflicts and late failures roll back definitions,
+scores, mappings, assignments and activation markers together.
+
+`cargo test --locked --lib snapshot_profile_tests` covers synthetic three-layout graph
+mapping, schema35 upgrade/backfill/reopen, rollback, zero-score equality, local edits,
+unsupported definitions and unresolved references. Regex compatibility remains the
+bounded native subset. No real backups, filesystem/media validation or full ancillary
+snapshot preservation is claimed. New state is one activation column; no dependency
+is added.

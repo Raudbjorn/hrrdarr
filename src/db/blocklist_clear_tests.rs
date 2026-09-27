@@ -123,9 +123,16 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 35); // Latest open adds durable comparison facts; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 36); // Latest open adds snapshot CF activation; historical migration starts remain unchanged.
     for (i, table) in tables.iter().enumerate() {
-        assert_eq!(rows(&c, table).await?, before[i]);
+        let mut expected = before[i].clone();
+        if *table == "snapshot_imports" {
+            // Migration36 appends an inactive marker; every pre-existing field stays identical.
+            for row in &mut expected {
+                row.push(libsql::Value::Integer(0));
+            }
+        }
+        assert_eq!(rows(&c, table).await?, expected);
     }
     assert!(clear(&c, "all").await.is_err());
     let tv = clear(&c, "tv").await?;
