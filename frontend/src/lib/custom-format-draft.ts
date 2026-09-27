@@ -51,14 +51,17 @@ export function parseCommunityCustomFormat(text: string, schema: CustomFormatSch
   if (new TextEncoder().encode(text).length > MAX_JSON_BYTES) return invalid('JSON exceeds 72 KiB.');
   let document: unknown;
   try { document=JSON.parse(text); } catch { return invalid('Invalid JSON.'); }
-  if (!object(document) || !allowedKeys(document,['name','includeCustomFormatWhenRenaming','specifications','id'])) return invalid('Unknown community format fields or invalid document.');
+  if (!object(document)) return invalid('Invalid community format document.');
+  // Both source import paths project the editable contract; community metadata is not model state.
+  // Discard outer/spec presentation and identity keys, but validate every fields-object option.
   const rows=document.specifications ?? [];
   if (!Array.isArray(rows) || rows.length>schema.max_specifications) return invalid('Invalid community specifications.');
   const specifications: unknown[]=[];
-  // Sonarr's importer explicitly defaults null flags; Radarr forwards supplied null values.
+  // Specification flags differ: Sonarr defaults null; Radarr's nonnullable bools reject it.
+  // The root renaming flag is nullable in Radarr too and independently defaults to false.
   const flag=(value:Record<string,unknown>,key:string)=>schema.media_type==='tv' ? value[key] ?? false : Object.hasOwn(value,key) ? value[key] : false;
   for(const row of rows) {
-    if (!object(row) || !allowedKeys(row,['name','implementation','negate','required','fields','id','implementationName','infoLink']) || typeof row.implementation!=='string' || !Object.hasOwn(communityKinds,row.implementation)) return invalid('Unknown community condition or condition fields.');
+    if (!object(row) || typeof row.implementation!=='string' || !Object.hasOwn(communityKinds,row.implementation)) return invalid('Unknown community condition or condition fields.');
     const kind=communityKinds[row.implementation as keyof typeof communityKinds];
     if (!schema.conditions.some(condition=>condition.kind===kind)) return invalid('Community condition is unsupported in this library.');
     const fields=schema.media_type==='tv' ? row.fields ?? {} : Object.hasOwn(row,'fields') ? row.fields : {};
@@ -72,7 +75,7 @@ export function parseCommunityCustomFormat(text: string, schema: CustomFormatSch
       : {kind,value:field('value',0)};
     specifications.push({name:row.name,negate:flag(row,'negate'),required:flag(row,'required'),condition});
   }
-  const result=parseCustomFormatDraft(JSON.stringify({name:document.name ?? '',include_when_renaming:flag(document,'includeCustomFormatWhenRenaming'),specifications}),schema);
+  const result=parseCustomFormatDraft(JSON.stringify({name:document.name ?? '',include_when_renaming:document.includeCustomFormatWhenRenaming ?? false,specifications}),schema);
   return result.ok ? result : invalid(`Community definition cannot be represented without changes: ${result.error} No conditions were imported. Complete omitted fields rather than relying on native example values.`);
 }
 

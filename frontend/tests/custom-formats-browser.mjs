@@ -141,7 +141,7 @@ try {
     await panel.getByText('Import or export JSON',{exact:true}).click();
     await panel.getByLabel('JSON format',{exact:true}).selectOption('community');
     const before=(await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).length;
-    const community={id:123,name:`Community ${media}`,includeCustomFormatWhenRenaming:true,specifications:[{id:42,implementationName:'private presentation',infoLink:'https://private.invalid',name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'community'}}]};
+    const community={id:123,media_type:media==='tv'?'movies':'tv',domain:'spoofed',trash_id:'private-trash-id',trash_scores:{default:10000},notes:{arbitrary:'private note'},name:`Community ${media}`,includeCustomFormatWhenRenaming:null,specifications:[{id:42,trash_id:'private-spec-id',notes:['private note'],domain:'spoofed',future:true,implementationName:'private presentation',infoLink:'https://private.invalid',name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'community'}}]};
     await panel.getByLabel('Custom format JSON',{exact:true}).fill(JSON.stringify(community));
     await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
     assert.equal((await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).length,before);
@@ -149,7 +149,7 @@ try {
     await panel.getByLabel('Pattern',{exact:true}).fill('edited-community');
     await panel.getByRole('button',{name:'Export draft as JSON',exact:true}).click();
     const output=JSON.parse(await panel.getByLabel('Custom format JSON',{exact:true}).inputValue());
-    assert.deepEqual(output,{name:`Community ${media}`,includeCustomFormatWhenRenaming:true,specifications:[{name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'edited-community'}}]});
+    assert.deepEqual(output,{name:`Community ${media}`,includeCustomFormatWhenRenaming:false,specifications:[{name:'Imported title',implementation:'ReleaseTitleSpecification',negate:true,required:true,fields:{value:'edited-community'}}]});
     const invalid={...community,specifications:[...community.specifications,{name:'Future',implementation:'FutureSpecification',fields:{value:1}}]};
     await panel.getByLabel('Custom format JSON',{exact:true}).fill(JSON.stringify(invalid));
     await panel.getByRole('button',{name:'Apply JSON to new draft',exact:true}).click();
@@ -159,6 +159,7 @@ try {
     await panel.getByRole('button',{name:'Save custom format',exact:true}).click();
     await panel.getByText('Custom format saved.',{exact:true}).waitFor();
     const saved=(await (await page.request.get(`${origin}/api/v1/${media}/custom-formats`)).json()).find(f=>f.name===`Community ${media}`);
+    assert.equal(saved.include_when_renaming,false);assert.equal(saved.media_type,media);assert.notEqual(saved.id,123);assert.equal(JSON.stringify(saved).includes('private'),false);assert.equal(JSON.stringify(saved).includes('trash_'),false);
     assert.equal(saved.specifications[0].condition.pattern,'edited-community');assert.equal(saved.specifications[0].required,true);assert.equal(saved.specifications[0].negate,true);
   }
   assert.deepEqual(errors,[]);

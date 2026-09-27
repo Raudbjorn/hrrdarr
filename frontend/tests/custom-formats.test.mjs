@@ -72,10 +72,12 @@ test('community format roundtrips every supported implementation across explicit
   external.specifications.forEach((spec,i)=>{assert.equal(spec.implementation,selected[i][0]);assert.deepEqual(spec.fields,selected[i][2]);assert.equal(Array.isArray(spec.fields),false);});
   assert.deepEqual(parseCommunityCustomFormat(result.data,contract),{ok:true,data:native});
   // Identity and presentation metadata never become native IDs, domain choices, or exported data.
-  external.id=999;
-  for(const spec of external.specifications) Object.assign(spec,{id:999,implementationName:'private-presentation-sentinel',infoLink:'https://private.invalid/key'});
+  // Sonarr buildSpec/handleImport project known fields; Radarr's typed resource drops unmapped metadata.
+  Object.assign(external,{id:999,domain:media==='tv'?'movies':'tv',media_type:'spoofed',trash_id:'private-trash-id',trash_scores:{default:10000},notes:{arbitrary:'private note'},apiKey:'private sentinel'});
+  for(const spec of external.specifications) Object.assign(spec,{id:999,implementationName:'private-presentation-sentinel',infoLink:'https://private.invalid/key',trash_id:'private-spec-id',future:true,notes:['private condition'],domain:'spoofed'});
   const imported=parseCommunityCustomFormat(JSON.stringify(external),contract);assert.deepEqual(imported,{ok:true,data:native});
   const roundtrip=exportCommunityCustomFormat(imported.data,contract);assert.equal(roundtrip.data.includes('private'),false);assert.equal(roundtrip.data.includes('999'),false);
+  const nativeExport=exportNativeCustomFormat(imported.data,contract);assert.equal(nativeExport.ok,true);assert.deepEqual(JSON.parse(nativeExport.data),native);
  }
 });
 test('community defaults come from source zero/false fields, never native example values',()=>{
@@ -98,7 +100,7 @@ test('community defaults come from source zero/false fields, never native exampl
 test('community import rejects unknown semantics atomically, invalid values and oversized documents',()=>{
  const contract=interchangeSchema('tv');
  const valid={name:'Valid',specifications:[{name:'Title',implementation:'ReleaseTitleSpecification',fields:{value:'ok'}}]};
- const variations=[null,[],{...valid,apiKey:'secret'}, {...valid,media_type:'movies'}, {...valid,specifications:[...valid.specifications,{name:'Future',implementation:'FutureSpecification',fields:{value:1}}]}, {...valid,specifications:[{...valid.specifications[0],future:true}]}, {...valid,specifications:[{...valid.specifications[0],fields:{value:'ok',future:true}}]}, {...valid,specifications:[{...valid.specifications[0],fields:[]}]}, {...valid,specifications:[{...valid.specifications[0],fields:{value:null}}]}, {...valid,specifications:[{name:'Edition',implementation:'EditionSpecification',fields:{value:'extended'}}]}, {...valid,specifications:[{name:'Language',implementation:'LanguageSpecification',fields:{value:57}}]}, {...valid,specifications:Array(65).fill(valid.specifications[0])}];
+ const variations=[null,[], {...valid,specifications:[...valid.specifications,{name:'Future',implementation:'FutureSpecification',fields:{value:1}}]}, {...valid,specifications:[{...valid.specifications[0],fields:{value:'ok',future:true}}]}, {...valid,specifications:[{...valid.specifications[0],fields:[]}]}, {...valid,specifications:[{...valid.specifications[0],fields:{value:null}}]}, {...valid,specifications:[{name:'Edition',implementation:'EditionSpecification',fields:{value:'extended'}}]}, {...valid,specifications:[{name:'Language',implementation:'LanguageSpecification',fields:{value:57}}]}, {...valid,specifications:Array(65).fill(valid.specifications[0])}];
  for(const value of variations) {const result=parseCommunityCustomFormat(JSON.stringify(value),contract);assert.equal(result.ok,false,JSON.stringify(value));assert.equal('data' in result,false);}
  assert.equal(parseCommunityCustomFormat('{',contract).ok,false);
  assert.equal(parseCommunityCustomFormat('界'.repeat(25000),contract).ok,false);
@@ -136,6 +138,8 @@ test('community explicit null follows each pinned importer instead of assuming o
   if(field==='includeCustomFormatWhenRenaming') input[field]=null;
   else input.specifications[0][field]=null;
   assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema('tv')).ok,true,field);
-  assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema('movies')).ok,false,field);
+  // Radarr CustomFormatResource.IncludeCustomFormatWhenRenaming is nullable and ToModel uses ?? false.
+  assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema('movies')).ok,field==='includeCustomFormatWhenRenaming',field);
+  if(field==='includeCustomFormatWhenRenaming') for(const media of ['tv','movies']) assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema(media)).data.include_when_renaming,false);
  }
 });
