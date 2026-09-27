@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 34);
+    assert_eq!(version(&c).await?, 35); // Latest open adds durable comparison facts; historical migration starts remain unchanged.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

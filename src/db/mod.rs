@@ -155,6 +155,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "custom_formats",
         include_str!("../../migrations/0034_custom_formats.sql"),
     ),
+    (
+        "candidate_comparison_facts",
+        include_str!("../../migrations/0035_candidate_comparison_facts.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -684,3 +688,6 @@ mod same_path_tests;
 
 #[cfg(test)]
 mod custom_format_tests;
+
+#[cfg(test)]
+mod candidate_fact_tests;
