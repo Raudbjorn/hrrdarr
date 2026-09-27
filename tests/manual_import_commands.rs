@@ -401,11 +401,6 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         ),
     ];
 
-    let (_, client) = providers::router_with_refresh(db.clone(), Some(credential_key()));
-    let runtime = commands::start_with_metadata(db.clone(), client, metadata.clone())
-        .await
-        .unwrap();
-
     let operation_ids: Vec<String> = entries.iter().map(|(op, _, _)| op.clone()).collect();
     let (code, created) = submit_batch(&base, operation_ids, "normal").await;
     assert_eq!(code, 202, "{created}");
@@ -415,6 +410,25 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         .iter()
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
+
+    // A future queued rescan excludes this movie's import from worker claims. Polling
+    // alone can miss the entire two-completed/one-queued window. Use this existing
+    // eligibility gate without bypassing the immutable manual-command transition guard.
+    let held_rescan_id = Uuid::new_v4().to_string();
+    db.connect()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,movie_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'movies',?,0,'queued',0,9007199254740991,0)",
+            libsql::params![held_rescan_id.clone(), mid],
+        )
+        .await
+        .unwrap();
+
+    let (_, client) = providers::router_with_refresh(db.clone(), Some(credential_key()));
+    let runtime = commands::start_with_metadata(db.clone(), client, metadata.clone())
+        .await
+        .unwrap();
 
     let settled = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -447,7 +461,7 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         }
     })
     .await
-    .expect("did not observe a 2-succeeded/1-still-queued window before the batch finished");
+    .expect("first two commands did not complete while the third was held ineligible");
     let (succeeded, pending_command_id) = settled;
 
     let mut before = std::collections::HashMap::new();
@@ -478,6 +492,17 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
     drop(db);
 
     let db2 = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    // Clear the persisted eligibility gate after reopening, before worker restart.
+    // Queued -> cancelled is a normal legal rescan transition; the import remains queued.
+    db2.connect()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE rescan_commands SET status='cancelled',completed_at=0 WHERE id=? AND status='queued'",
+            [held_rescan_id],
+        )
+        .await
+        .unwrap();
     let (base2, api2) = serve(manual_import_router(db2.clone(), metadata.clone())).await;
     let (_, client2) = providers::router_with_refresh(db2.clone(), Some(credential_key()));
     let runtime2 = commands::start_with_metadata(db2.clone(), client2, metadata.clone())
