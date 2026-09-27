@@ -303,3 +303,157 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         );
     }
 }
+
+#[tokio::test]
+async fn schema_presets_are_valid_scoped_copies_with_independent_patterns() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-format-presets-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, hrrdarr::custom_formats::router(db))
+            .await
+            .unwrap()
+    }));
+    // Independently chosen release tokens and counterexamples, not upstream expression fixtures.
+    let cases = [
+        ("x264", "Film.H.264-GRP", "Film.x263-GRP"),
+        ("x265", "Film.HEVC-GRP", "Film.AVC-GRP"),
+        ("Simple Hardcoded Subs", "Film.Subs.1080p", "Film.HDR.1080p"),
+        ("Hardcoded Subs", "Film.ENGsub.1080p", "Film.Subs.1080p"),
+        ("Surround Sound", "Film.DDP5.1-GRP", "Film.AAC2.0-GRP"),
+        (
+            "Preferred Words",
+            "Film.Framestor-GRP",
+            "Film.Unpreferred-GRP",
+        ),
+    ];
+    for media in ["tv", "movies"] {
+        let prefix = format!("/api/v1/{media}/custom-formats");
+        let (code, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        assert_eq!(code, 200);
+        let presets = schema["presets"]["release_title"].as_array().unwrap();
+        assert_eq!(presets.len(), 6);
+        for (preset, (name, yes, no)) in presets.iter().zip(cases) {
+            assert_eq!(preset["label"], name);
+            let pattern = preset["specification"]["condition"]["pattern"]
+                .as_str()
+                .unwrap();
+            let re = fancy_regex::Regex::new(&format!("(?i){pattern}")).unwrap();
+            assert!(re.is_match(yes).unwrap(), "{name}: {yes}");
+            assert!(!re.is_match(no).unwrap(), "{name}: {no}");
+            let (positive, negative): (&[&str], &[&str]) = match name {
+                "x264" => (
+                    &["ax264z", "h264", "X.264", "x2640"],
+                    &["x 264", "x-264", "x263"],
+                ),
+                "x265" => (
+                    &["h.265", "x265suffix", "WHEVC", "H265"],
+                    &["h 265", "h-265", "h264"],
+                ),
+                "Simple Hardcoded Subs" => {
+                    (&["SUB", "subs", "submarine", "ENGsubs"], &["HC", "caption"])
+                }
+                "Hardcoded Subs" => (
+                    &["ENGsub", "FRENCHSUBS", "HC", "SUBBED", "prefixHC"],
+                    &["SUB", "SUBS", "HCA", "SUBBEDextra"],
+                ),
+                "Surround Sound" => (
+                    &[
+                        "ATMOS", "TRUEHD", "DTS-HD", "DTSES", "DTS-X7", "DTSX", "DD+5.1",
+                        "DDP 7.1", "EAC3.9",
+                    ],
+                    &["DTS", "DTS-Xfoo", "AAC5.1", "AC3.5.1", "DD5.1", "DDP2.0"],
+                ),
+                "Preferred Words" => (
+                    &["SPARKS", "Film-Framestor", "[sparks]"],
+                    &["Framestory", "XSparks", "preferred", "favorite"],
+                ),
+                _ => unreachable!(),
+            };
+            for text in positive {
+                assert!(re.is_match(text).unwrap(), "{name}: {text}");
+            }
+            for text in negative {
+                assert!(!re.is_match(text).unwrap(), "{name}: {text}");
+            }
+            let input = json!({"name":name,"include_when_renaming":false,"specifications":[preset["specification"].clone()]});
+            assert_eq!(request(&base, "POST", &prefix, input).await.0, 201);
+        }
+        for (pattern, status) in [
+            (r"(?<=Harbor\.)WEB", 201),
+            (r"\b([a-z]+)-\1\b", 201),
+            ("(", 400),
+            ("(?0)", 400),
+            ("((?=a)){1000000000}", 400),
+        ] {
+            assert_eq!(
+                request(&base, "POST", &prefix, definition(pattern, pattern))
+                    .await
+                    .0,
+                status,
+                "{media}: {pattern}"
+            );
+        }
+        let name = "界".repeat(100);
+        let mut input = definition(&name, "original");
+        input["specifications"][0]["name"] = json!(name);
+        input["specifications"][0]["required"] = json!(true);
+        input["specifications"][0]["negate"] = json!(true);
+        input["specifications"].as_array_mut().unwrap().push(json!({"name":"Group","negate":false,"required":true,"condition":{"kind":"release_group","pattern":"group"}}));
+        let (code, original) = request(&base, "POST", &prefix, input.clone()).await;
+        assert_eq!(code, 201);
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        let saved = schema["presets"]["release_title"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["label"].as_str().unwrap().chars().count() == 202)
+            .unwrap();
+        assert_eq!(saved["specification"], input["specifications"][0]);
+        assert!(
+            schema["presets"]["release_group"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["label"] == format!("{name}: Group"))
+        );
+        let clone = json!({"name":format!("Clone {media}"),"include_when_renaming":false,"specifications":[saved["specification"].clone()]});
+        assert_eq!(request(&base, "POST", &prefix, clone).await.0, 201);
+        input["specifications"][0]["condition"]["pattern"] = json!("changed");
+        let id = original["id"].as_i64().unwrap();
+        assert_eq!(
+            request(&base, "PUT", &format!("{prefix}/{id}"), input)
+                .await
+                .0,
+            200
+        );
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        let copied = schema["presets"]["release_title"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["label"] == format!("Clone {media}: {name}"))
+            .unwrap();
+        assert_eq!(copied["specification"]["condition"]["pattern"], "original");
+        let other = if media == "tv" { "movies" } else { "tv" };
+        assert!(!schema.to_string().contains(&format!("Clone {other}:")));
+        assert_eq!(
+            request(&base, "DELETE", &format!("{prefix}/{id}"), Value::Null)
+                .await
+                .0,
+            204
+        );
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        assert!(
+            !schema["presets"]["release_title"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["label"] == format!("{name}: {name}"))
+        );
+    }
+}

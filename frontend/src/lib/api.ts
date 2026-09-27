@@ -204,3 +204,10 @@ export const getRootFolder = (domain: MediaDomain, id: number) => validId(id) ? 
 export const createRootFolder = (domain: MediaDomain, path: string) => path.trim().length > 0 && path.length <= 4096 ? request<RootFolder>(`/api/v1/${domain}/root-folders`, { path }, 'POST', true) : Promise.resolve<Result<RootFolder>>({ ok: false, error: 'Root folder path is required.' });
 export const createRescanCommand = (domain: MediaDomain, targetId: number, priority: CommandPriority = 'normal') => validId(targetId) ? request<RescanBatch>(`/api/v1/${domain}/rescan-commands`, { target_id: targetId, priority }, 'POST', true) : invalid<RescanBatch>();
 export const getRescanCommand = (domain: MediaDomain, id: string) => validOperation(id) ? request<RescanCommand>(`/api/v1/${domain}/rescan-commands/${id}`, undefined, undefined, true) : invalidProvider<RescanCommand>();
+
+// Custom formats remain scoped to the selected library domain.
+export const listCustomFormats = (domain: MediaDomain) => request<import('./api.generated').CustomFormat[]>(`/api/v1/${domain}/custom-formats`, undefined, undefined, true);
+export const getCustomFormatSchema = (domain: MediaDomain) => request<import('./api.generated').CustomFormatSchema>(`/api/v1/${domain}/custom-formats/schema`, undefined, undefined, true);
+export const createCustomFormat = (domain: MediaDomain, input: import('./api.generated').CustomFormatInput) => request<import('./api.generated').CustomFormat>(`/api/v1/${domain}/custom-formats`, input, 'POST', true);
+export const updateCustomFormat = (domain: MediaDomain, id: number, input: import('./api.generated').CustomFormatInput) => validId(id) ? request<import('./api.generated').CustomFormat>(`/api/v1/${domain}/custom-formats/${id}`, input, 'PUT', true) : invalid<import('./api.generated').CustomFormat>();
+export const deleteCustomFormat = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`/api/v1/${domain}/custom-formats/${id}`, undefined, 'DELETE', true) : invalid<void>();

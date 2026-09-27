@@ -76,7 +76,9 @@ export type CustomFormatCondition = { "kind": "release_title", pattern: string, 
 
 export type CustomFormatInput = { name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
 
-export type CustomFormatSchema = { version: number, media_type: MediaDomain, conditions: Array<CustomFormatCondition>, choices: { [key in string]: Array<CustomFormatChoice> }, max_formats: number, max_specifications: number, regex: string, };
+export type CustomFormatPreset = { label: string, specification: CustomFormatSpecification, };
+
+export type CustomFormatSchema = { version: number, media_type: MediaDomain, conditions: Array<CustomFormatCondition>, presets: { [key in string]: Array<CustomFormatPreset> }, choices: { [key in string]: Array<CustomFormatChoice> }, max_formats: number, max_specifications: number, regex: string, };
 
 export type CustomFormatSpecification = { name: string, negate: boolean, required: boolean, condition: CustomFormatCondition, };
 

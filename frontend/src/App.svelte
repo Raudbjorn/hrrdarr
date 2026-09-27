@@ -10,9 +10,10 @@
   import BlocklistPanel from './lib/BlocklistPanel.svelte';
   import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
   import NamingPanel from './lib/NamingPanel.svelte';
+  import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
   let searchTarget: MediaTarget | null = $state(null);
-  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'naming' | 'import-existing'>('library');
+  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'naming' | 'import-existing' | 'custom-formats'>('library');
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false);
@@ -98,11 +99,12 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view === 'custom-formats'} onclick={() => view = 'custom-formats'}>Custom formats</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
   {#if view === 'rss'}<RssPanel />{/if}
   {#if view === 'providers'}<ProviderPanel />{/if}
   {#if view === 'activity'}<ActivityPanel />{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
+  {#if view === 'custom-formats'}<CustomFormatPanel />{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
   <div hidden={view !== 'library'}>

@@ -614,6 +614,7 @@ async fn library_ui_fixture() {
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
             .merge(hrrdarr::naming::router(db.clone()))
+            .merge(hrrdarr::custom_formats::router(db.clone()))
             .merge(hrrdarr::root_folders::router(db.clone()))
             .merge(
                 Router::new()

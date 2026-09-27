@@ -343,17 +343,27 @@ pub struct Choice {
     pub label: String,
 }
 #[derive(Serialize, ts_rs::TS)]
+#[ts(rename = "CustomFormatPreset")]
+pub struct Preset {
+    pub label: String,
+    pub specification: Specification,
+}
+#[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "CustomFormatSchema")]
 pub struct Schema {
     pub version: i32,
     pub media_type: MediaDomain,
     pub conditions: Vec<crate::db::custom_formats::Condition>,
+    pub presets: std::collections::BTreeMap<String, Vec<Preset>>,
     pub choices: std::collections::BTreeMap<String, Vec<Choice>>,
     pub max_formats: usize,
     pub max_specifications: usize,
     pub regex: String,
 }
-async fn schema(Extension(media): Extension<String>) -> Json<Schema> {
+async fn schema(
+    State(db): State<Arc<Database>>,
+    Extension(media): Extension<String>,
+) -> Result<Json<Schema>> {
     use crate::db::custom_formats::Condition as C;
     let movies = media == "movies";
     let domain = if movies {
@@ -500,5 +510,68 @@ async fn schema(Extension(media): Extension<String>) -> Json<Schema> {
         );
     }
     choices.insert("indexer_flag".into(), make(flags));
-    Json(Schema{version:1,media_type:domain,conditions,choices,max_formats:MAX_FORMATS,max_specifications:64,regex:"fancy-regex 0.19.2; case insensitive; bounded AST/backtracking; unsupported syntax rejected".into()})
+    let mut presets = built_in_presets();
+    for format in catalog(&db.connect().await?, domain).await? {
+        for specification in format.definition.specifications {
+            presets
+                .entry(condition_kind(&specification.condition).into())
+                .or_default()
+                .push(Preset {
+                    label: format!("{}: {}", format.definition.name, specification.name),
+                    specification,
+                });
+        }
+    }
+    Ok(Json(Schema{version:1,media_type:domain,conditions,presets,choices,max_formats:MAX_FORMATS,max_specifications:64,regex:"fancy-regex 0.19.2; case insensitive; bounded AST/backtracking; unsupported syntax rejected".into()}))
+}
+
+fn condition_kind(condition: &crate::db::custom_formats::Condition) -> &'static str {
+    use crate::db::custom_formats::Condition as C;
+    match condition {
+        C::ReleaseTitle { .. } => "release_title",
+        C::ReleaseGroup { .. } => "release_group",
+        C::Edition { .. } => "edition",
+        C::Language { .. } => "language",
+        C::Size { .. } => "size",
+        C::Source { .. } => "source",
+        C::Resolution { .. } => "resolution",
+        C::QualityModifier { .. } => "quality_modifier",
+        C::IndexerFlag { .. } => "indexer_flag",
+        C::ReleaseType { .. } => "release_type",
+        C::Year { .. } => "year",
+    }
+}
+
+// Independently authored token patterns. Presets are editable starting points, not parser rules.
+fn built_in_presets() -> std::collections::BTreeMap<String, Vec<Preset>> {
+    // Codec and subtitle presets intentionally search substrings; the word preset does not.
+    let definitions = [
+        ("x264", r"h264|x264|h[.]264|x[.]264"),
+        ("x265", r"hevc|h265|x265|h[.]265|x[.]265"),
+        ("Simple Hardcoded Subs", r"sub"),
+        ("Hardcoded Subs", r"(?:\w+sub(?:s)?|hc|subbed)(?!\w)"),
+        (
+            "Surround Sound",
+            r"atmos|truehd|dts.?hd|dts.?es|dts.?x(?=$|\d)|(?:ddp|dd[+]|eac3).?[56789]",
+        ),
+        ("Preferred Words", r"(?<!\w)(?:framestor|sparks)(?!\w)"),
+    ];
+    [(
+        "release_title".into(),
+        definitions
+            .into_iter()
+            .map(|(name, pattern)| Preset {
+                label: name.into(),
+                specification: Specification {
+                    name: name.into(),
+                    negate: false,
+                    required: false,
+                    condition: crate::db::custom_formats::Condition::ReleaseTitle {
+                        pattern: pattern.into(),
+                    },
+                },
+            })
+            .collect(),
+    )]
+    .into()
 }
