@@ -325,6 +325,17 @@ async fn end_to_end_success_and_equal_ids() {
     )
     .await;
     assert_eq!(status_movie["status"], "complete");
+    // Ordinary completed manual operations still fail readiness; ownership precedence must
+    // not weaken the existing journal guard or create another command.
+    for operation in [&op_tv, &op_movie] {
+        let (code, rejected) = submit_batch(&ctx.base, vec![operation.clone()], "normal").await;
+        assert_eq!(code, 409, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"], "manual_import_not_ready",
+            "{rejected}"
+        );
+    }
+
     let (_, list) = request(
         &ctx.base,
         "GET",
@@ -985,11 +996,45 @@ async fn operation_owned_by_download_rejected_at_submission() {
     .expect("owned import never produced an operation");
     let operation_id = owned["operation_id"].as_str().unwrap().to_owned();
 
-    let (code, rejected) = submit_batch(&base, vec![operation_id], "normal").await;
+    let (code, rejected) = submit_batch(&base, vec![operation_id.clone()], "normal").await;
     assert_eq!(code, 409, "{rejected}");
     assert_eq!(
         rejected["error"]["code"], "manual_import_owned_by_download",
         "{rejected}"
+    );
+    // Ownership remains the rejection reason after the automated worker leaves preview.
+    // Waiting for a terminal journal makes this regression independent of polling speed.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (_, value) = request(&base, "GET", &path, Value::Null).await;
+            if value["import_phase"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("owned import did not complete");
+    let (code, rejected) = submit_batch(&base, vec![operation_id.clone()], "normal").await;
+    assert_eq!(code, 409, "{rejected}");
+    assert_eq!(
+        rejected["error"]["code"], "manual_import_owned_by_download",
+        "{rejected}"
+    );
+    assert_eq!(
+        c.query(
+            "SELECT count(*) FROM manual_import_commands WHERE operation_id=?",
+            [operation_id]
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap(),
+        0
     );
 
     drop(c);
