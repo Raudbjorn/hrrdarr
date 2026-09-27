@@ -779,38 +779,85 @@ fn stem_of(relative: &str) -> Option<&str> {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     name.rsplit_once('.').map(|(stem, _)| stem)
 }
-// Deletes both the file record and its metadata row in one transaction (foreign_keys=ON means
-// file_metadata's ON DELETE RESTRICT must be cleared first). A row still protected by a live
-// `rss_candidate_imports` replacement claim (FK RESTRICT) is left untouched -- that protection
-// is intentional, not a bug, so this reports "not removed" rather than failing the whole scan.
-async fn delete_episode_file(c: &Connection, file_id: i64) -> Result<bool> {
+// Called only inside the owning reconciliation transaction; metadata and associations
+// must roll back with a failed replacement. A replacement receipt keeps its FK protection.
+async fn clear_episode_file(c: &Connection, file_id: i64) -> Result<bool> {
+    // A pending/recovered replacement owns this record even when the old path is absent.
+    if c.query(
+        "SELECT 1 FROM rss_candidate_imports WHERE old_episode_file_id=? LIMIT 1",
+        [file_id],
+    )
+    .await?
+    .next()
+    .await?
+    .is_some()
+    {
+        return Ok(false);
+    }
+    c.execute(
+        "UPDATE episodes SET episode_file_id=NULL WHERE episode_file_id=?",
+        [file_id],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM file_metadata WHERE episode_file_id=?",
+        [file_id],
+    )
+    .await?;
+    c.execute("DELETE FROM episode_files WHERE id=?", [file_id])
+        .await?;
+    Ok(true)
+}
+async fn current_series_path(c: &Connection, series_id: i64, expected: &str) -> Result<()> {
+    let matches = c
+        .query(
+            "SELECT 1 FROM series WHERE id=? AND path=?",
+            params![series_id, expected],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    if !matches {
+        return Err(Error(StatusCode::CONFLICT, "target_changed"));
+    }
+    Ok(())
+}
+async fn delete_stale_episode_file(
+    c: &Connection,
+    series_id: i64,
+    expected: &str,
+    file_id: i64,
+    path: &str,
+) -> Result<bool> {
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome: std::result::Result<(), libsql::Error> = async {
-        tx.execute(
-            "UPDATE episodes SET episode_file_id=NULL WHERE episode_file_id=?",
-            [file_id],
-        )
-        .await?;
-        tx.execute(
-            "DELETE FROM file_metadata WHERE episode_file_id=?",
-            [file_id],
-        )
-        .await?;
-        tx.execute("DELETE FROM episode_files WHERE id=?", [file_id])
-            .await?;
-        Ok(())
+    let result = async {
+        current_series_path(&tx, series_id, expected).await?;
+        if tx
+            .query(
+                "SELECT 1 FROM episode_files WHERE id=? AND series_id=? AND path=?",
+                params![file_id, series_id, path],
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        clear_episode_file(&tx, file_id).await
     }
     .await;
-    match outcome {
-        Ok(()) => {
+    match result {
+        Ok(value) => {
             tx.commit().await?;
-            Ok(true)
+            Ok(value)
         }
-        Err(_) => {
-            let _ = tx.rollback().await;
-            Ok(false)
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
         }
     }
 }
@@ -834,47 +881,6 @@ async fn delete_movie_file(c: &Connection, file_id: i64) -> Result<bool> {
         Err(_) => {
             let _ = tx.rollback().await;
             Ok(false)
-        }
-    }
-}
-async fn adopt_episode_file(
-    c: &Connection,
-    series_id: i64,
-    path: &str,
-    size: i64,
-    season: i64,
-    quality_id: Option<i64>,
-    episode_ids: &[i64],
-) -> Result<()> {
-    let tx = c
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    let outcome: std::result::Result<(), libsql::Error> = async {
-        tx.execute(
-            "INSERT INTO episode_files(series_id,path) VALUES(?,?)",
-            params![series_id, path],
-        )
-        .await?;
-        let fid = tx.last_insert_rowid();
-        tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,size,date_added,season_number,quality_id) VALUES('tv',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?,?)",params![fid,size,season,quality_id]).await?;
-        for eid in episode_ids {
-            tx.execute(
-                "UPDATE episodes SET episode_file_id=? WHERE id=?",
-                params![fid, *eid],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-    .await;
-    match outcome {
-        Ok(()) => {
-            tx.commit().await?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = tx.rollback().await;
-            Err(Error::from(e))
         }
     }
 }
@@ -916,37 +922,174 @@ async fn adopt_movie_file(
 // does not rank duplicate candidates by quality: if two present files resolve to the same
 // episode(s), the first in deterministic (sorted-by-relative-path) order wins and the other is
 // left unmatched, rather than this module guessing a quality preference it doesn't own.
+// Resolve local-file numbering from current catalog facts. Existing library files are not
+// scene releases: use ordinary season/absolute columns even on scene-numbered series.
+async fn local_episode_ids(
+    c: &Connection,
+    series_id: i64,
+    numbering: &Numbering,
+) -> Result<Option<(i64, Vec<i64>)>> {
+    match numbering {
+        Numbering::Episodes { season, episodes } => {
+            let mut ids = Vec::with_capacity(episodes.len());
+            for number in episodes {
+                let Some(row) = c
+                    .query(
+                        "SELECT id FROM episodes WHERE series_id=? AND season=? AND number=?",
+                        params![series_id, *season, *number],
+                    )
+                    .await?
+                    .next()
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                ids.push(row.get(0)?);
+            }
+            Ok((!ids.is_empty()).then_some((*season, ids)))
+        }
+        Numbering::Daily { date } => {
+            let kind = c
+                .query(
+                    "SELECT series_type FROM library_settings WHERE series_id=?",
+                    [series_id],
+                )
+                .await?
+                .next()
+                .await?
+                .map(|r| r.get::<Option<String>>(0))
+                .transpose()?
+                .flatten();
+            // The source's local-file policy allows daily filenames on anime as well as daily
+            // series; standard and unknown series types cannot authorize this match.
+            if !matches!(kind.as_deref(), Some("daily" | "anime")) {
+                return Ok(None);
+            }
+            let mut rows = c
+                .query(
+                    "SELECT id,season FROM episodes WHERE series_id=? AND air_date=? LIMIT 1001",
+                    params![series_id, date.as_str()],
+                )
+                .await?;
+            let mut hits = vec![];
+            while let Some(row) = rows.next().await? {
+                hits.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+            }
+            if hits.len() > 1000 {
+                return Err(Error(StatusCode::CONFLICT, "episode_match_limit"));
+            }
+            if hits.len() > 1 {
+                hits.retain(|(_, season)| *season > 0);
+            }
+            Ok((hits.len() == 1).then(|| (hits[0].1, vec![hits[0].0])))
+        }
+        Numbering::Absolute { episode } => {
+            // No anime-only restriction in the local-file source contract. Missing metadata
+            // and duplicate numbers remain unmatched, without falling back to scene numbers.
+            let mut rows=c.query("SELECT id,season FROM episodes WHERE series_id=? AND absolute_episode_number=? LIMIT 2",params![series_id,*episode]).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let id = row.get::<i64>(0)?;
+            let season = row.get::<i64>(1)?;
+            if rows.next().await?.is_some() {
+                return Ok(None);
+            }
+            Ok(Some((season, vec![id])))
+        }
+        Numbering::Season { .. } => Ok(None),
+    }
+}
+async fn reconcile_episode_candidate(
+    c: &Connection,
+    series_id: i64,
+    expected_path: &str,
+    file: &WalkFile,
+    parsed: &parser::ParsedRelease,
+    present: &HashSet<String>,
+    claimed: &HashSet<i64>,
+) -> Result<(bool, Vec<i64>)> {
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let result: Result<(bool,Vec<i64>)> = async {
+        current_series_path(&tx,series_id,expected_path).await?;
+        let Some(numbering)=&parsed.numbering else {return Ok((false,vec![]))};
+        let Some((season,ids))=local_episode_ids(&tx,series_id,numbering).await? else {return Ok((false,vec![]))};
+        if ids.iter().any(|id|claimed.contains(id)) {return Ok((false,vec![]))}
+        let existing=tx.query("SELECT id,series_id FROM episode_files WHERE path=?",[file.absolute.clone()]).await?.next().await?;
+        let mut replace=None;
+        if let Some(row)=existing {
+            let fid=row.get::<i64>(0)?;
+            if row.get::<i64>(1)? != series_id {return Ok((false,vec![]))}
+            let mut rows=tx.query("SELECT id FROM episodes WHERE episode_file_id=? ORDER BY id",[fid]).await?;
+            let mut associated=vec![];
+            while let Some(row)=rows.next().await? { associated.push(row.get::<i64>(0)?); }
+            let mut targets=ids.clone();targets.sort_unstable();
+            if associated==targets { return Ok((false,ids)) }
+            replace=Some(fid);
+        }
+        // Check displacement before clearing anything. All reads, replacement and binding
+        // share one writer transaction, so metadata edits cannot invalidate a chosen target.
+        for id in &ids {
+            if let Some(row)=tx.query("SELECT f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=?",[*id]).await?.next().await? {
+                let path=row.get::<String>(0)?;
+                if path!=file.absolute && present.contains(&path) {return Ok((false,vec![]))}
+            }
+        }
+        if let Some(fid)=replace {
+            if !clear_episode_file(&tx,fid).await? {return Ok((false,vec![]))}
+        }
+        let quality=quality_for(&tx,"tv",parsed.quality_name.as_deref()).await?;
+        let size=storage_size(file.size)?;
+        tx.execute("INSERT INTO episode_files(series_id,path)VALUES(?,?)",params![series_id,file.absolute.clone()]).await?;
+        let fid=tx.last_insert_rowid();
+        tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,size,date_added,season_number,quality_id)VALUES('tv',?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now'),?,?)",params![fid,size,season,quality]).await?;
+        for id in &ids {tx.execute("UPDATE episodes SET episode_file_id=? WHERE id=? AND series_id=?",params![fid,*id,series_id]).await?;}
+        Ok((true,ids))
+    }.await;
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
 async fn reconcile_series(
     c: &Connection,
     series_id: i64,
+    expected_path: &str,
     mut files: Vec<WalkFile>,
 ) -> Result<(i64, i64)> {
+    current_series_path(c, series_id, expected_path).await?;
     let present: HashSet<String> = files.iter().map(|f| f.absolute.clone()).collect();
-    let mut removed = 0i64;
-    let mut stale = Vec::new();
-    {
-        let mut rows = c
-            .query(
-                "SELECT id,path FROM episode_files WHERE series_id=?",
-                [series_id],
-            )
-            .await?;
-        while let Some(r) = rows.next().await? {
-            let id: i64 = r.get(0)?;
-            let path: String = r.get(1)?;
-            if !present.contains(&path) {
-                stale.push(id);
-            }
+    let mut stale = vec![];
+    let mut rows = c
+        .query(
+            "SELECT id,path FROM episode_files WHERE series_id=?",
+            [series_id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let path = row.get::<String>(1)?;
+        if !present.contains(&path) {
+            stale.push((row.get::<i64>(0)?, path));
         }
     }
-    for id in stale {
-        if delete_episode_file(c, id).await? {
+    drop(rows);
+    let mut removed = 0;
+    for (id, path) in stale {
+        if delete_stale_episode_file(c, series_id, expected_path, id, &path).await? {
             removed += 1;
         }
     }
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
-    let mut adopted = 0i64;
-    let mut claimed: HashSet<i64> = HashSet::new();
+    let mut adopted = 0;
+    let mut claimed = HashSet::new();
     for file in &files {
         let Some(stem) = stem_of(&file.relative) else {
             continue;
@@ -954,103 +1097,18 @@ async fn reconcile_series(
         let Ok(parsed) = parser::parse(stem, true) else {
             continue;
         };
-        let Some(Numbering::Episodes { season, episodes }) = parsed.numbering else {
-            continue; // scn.002: season/daily/absolute numbering unsupported here, reported unmatched
-        };
-        let mut ids = Vec::with_capacity(episodes.len());
-        let mut ok = true;
-        for n in &episodes {
-            match c
-                .query(
-                    "SELECT id FROM episodes WHERE series_id=? AND season=? AND number=?",
-                    params![series_id, season, *n],
-                )
-                .await?
-                .next()
-                .await?
-            {
-                Some(r) => ids.push(r.get::<i64>(0)?),
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok || ids.iter().any(|id| claimed.contains(id)) {
-            continue;
-        }
-        if let Some(r) = c
-            .query(
-                "SELECT id,series_id FROM episode_files WHERE path=?",
-                [file.absolute.clone()],
-            )
-            .await?
-            .next()
-            .await?
-        {
-            let existing_id: i64 = r.get(0)?;
-            let existing_series: i64 = r.get(1)?;
-            if existing_series != series_id {
-                continue; // path already owned by another series: report unmatched, never steal it
-            }
-            let mut all_target_match = true;
-            let mut only_target = true;
-            let mut erows = c
-                .query(
-                    "SELECT id,episode_file_id FROM episodes WHERE series_id=?",
-                    [series_id],
-                )
-                .await?;
-            while let Some(er) = erows.next().await? {
-                let eid: i64 = er.get(0)?;
-                let fid: Option<i64> = er.get(1)?;
-                let is_target = ids.contains(&eid);
-                let points_here = fid == Some(existing_id);
-                if is_target && !points_here {
-                    all_target_match = false;
-                }
-                if !is_target && points_here {
-                    only_target = false;
-                }
-            }
-            drop(erows);
-            if all_target_match && only_target {
-                for id in &ids {
-                    claimed.insert(*id);
-                }
-                continue; // already correctly associated
-            }
-            if !delete_episode_file(c, existing_id).await? {
-                continue; // FK-protected; leave this candidate unmatched this pass
-            }
-        }
-        let mut displaced = false;
-        for eid in &ids {
-            if let Some(r) = c
-                .query(
-                    "SELECT f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=?",
-                    [*eid],
-                )
-                .await?
-                .next()
-                .await?
-            {
-                let existing_path: String = r.get(0)?;
-                if existing_path != file.absolute && present.contains(&existing_path) {
-                    displaced = true;
-                }
-            }
-        }
-        if displaced {
-            continue;
-        }
-        let quality_id = quality_for(c, "tv", parsed.quality_name.as_deref()).await?;
-        let size = storage_size(file.size)?;
-        adopt_episode_file(c, series_id, &file.absolute, size, season, quality_id, &ids).await?;
-        for id in &ids {
-            claimed.insert(*id);
-        }
-        adopted += 1;
+        let (added, ids) = reconcile_episode_candidate(
+            c,
+            series_id,
+            expected_path,
+            file,
+            &parsed,
+            &present,
+            &claimed,
+        )
+        .await?;
+        adopted += i64::from(added);
+        claimed.extend(ids);
     }
     Ok((adopted, removed))
 }
@@ -1127,6 +1185,7 @@ async fn scan(db: &Database, command: &RescanCommand) -> Settlement {
         Ok(v) => v,
         Err(_) => return Settlement::Failed("storage_error"),
     };
+    let expected_path = target.to_string_lossy().into_owned();
     let deadline = Instant::now() + SCAN_BUDGET;
     let outcome = tokio::task::spawn_blocking(move || blocking_scan(root, target, deadline)).await;
     let files = match outcome {
@@ -1136,12 +1195,13 @@ async fn scan(db: &Database, command: &RescanCommand) -> Settlement {
         Err(_) => return Settlement::Failed("storage_error"),
     };
     let result = match (command.series_id, command.movie_id) {
-        (Some(sid), None) => reconcile_series(&c, sid, files).await,
+        (Some(sid), None) => reconcile_series(&c, sid, &expected_path, files).await,
         (None, Some(mid)) => reconcile_movie(&c, mid, files).await,
         _ => return Settlement::Failed("storage_error"),
     };
     match result {
         Ok((adopted, removed)) => Settlement::Succeeded { adopted, removed },
+        Err(Error(_, "target_changed")) => Settlement::Failed("target_changed"),
         Err(_) => Settlement::Failed("storage_error"),
     }
 }

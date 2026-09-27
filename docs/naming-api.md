@@ -87,16 +87,18 @@ row association (not merely an accepted decision) and that the configured
 `daily_episode_format`/`anime_episode_format` template actually rendered the
 on-disk filename (`"Harbor - 2020-01-01 [WEBDL-1080p].mkv"` from a real air
 date, `"Harbor - 01 [WEBDL-1080p].mkv"` from a real absolute episode number),
-not the raw downloaded basename. Two residual gaps this run does not cover,
-left for whoever owns them next: the fixture's `use_scene_numbering` is
+not the raw downloaded basename. The fixture's `use_scene_numbering` is
 `false`, so this does not exercise the scene-absolute-number-vs-plain-column
 fallback in `downloaded::match_absolute` (which has its own dedicated unit
 coverage in `src/search/downloaded.rs`) or the equivalent fallback this same
 session added to `src/search/decision.rs`'s own `Absolute` arm (which has its
-own dedicated coverage in `tests/release_decisions.rs`); and
-`src/commands/rescan.rs:958` still reports daily/absolute numbering as
-unsupported on its own separate call path, unrelated to and not fixed by
-either change described here. A render failure (for
+own dedicated coverage in `tests/release_decisions.rs`).
+
+Local rescans now support daily and ordinary absolute numbering through their
+separate transactional matcher; see [local rescan contracts](rescan-commands.md).
+Local files intentionally do not use downloaded-release scene-first matching.
+
+A render failure (for
 example `standard_episode_format = "{Episode Title}"` for an episode with no
 title) is a distinct, propagated error -- the automated path blocks the item
 with `error_code="unsupported_download"` and reason token
