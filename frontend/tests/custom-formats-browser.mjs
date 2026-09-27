@@ -31,8 +31,30 @@ try {
     assert.equal(stored.length,1);assert.equal(stored[0].specifications[0].negate,true);assert.equal(stored[0].specifications[0].required,true);
     const id=stored[0].id;
     await panel.getByLabel('Include when renaming',{exact:true}).check();
-    await panel.getByRole('button',{name:'Save custom format',exact:true}).click();
+    // Workspace navigation must retain ownership of a pending write and its draft.
+    const updatePattern=`**/api/v1/${media}/custom-formats/${id}`;
+    let capture;const held=new Promise(resolve=>capture=resolve);
+    await page.route(updatePattern,route=>route.request().method()==='PUT'?capture(route):route.continue());
+    const updateResponse=page.waitForResponse(r=>r.url().endsWith(`/custom-formats/${id}`) && r.request().method()==='PUT');
+    // Closing a failed held-request assertion must not mask it with an unhandled waiter rejection.
+    updateResponse.catch(()=>{});
+    await panel.getByRole('button',{name:'Save custom format',exact:true}).click();const heldRoute=await held;
+    await page.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('button',{name:'Custom formats',exact:true}).click();
+    assert.equal(await panel.getByRole('button',{name:'Save custom format',exact:true}).count(),1);
+    assert.equal(await panel.getByRole('button',{name:'Save custom format',exact:true}).isDisabled(),true);
+    assert.equal(await panel.getByLabel('Format name',{exact:true}).inputValue(),`Preset ${media}`);
+    assert.equal(await panel.getByLabel('Include when renaming',{exact:true}).isChecked(),true);
+    await heldRoute.continue();assert.equal((await updateResponse).status(),200);await page.unroute(updatePattern);
     await panel.getByText('Custom format saved.',{exact:true}).waitFor();
+    // An unknown outcome also survives leaving and reopening the workspace.
+    await panel.getByLabel('Pattern',{exact:true}).fill('uncertain-workspace-draft');
+    await page.route(updatePattern,route=>route.request().method()==='PUT'?route.abort('failed'):route.continue());
+    await panel.getByRole('button',{name:'Save custom format',exact:true}).click();await panel.getByText('The outcome is uncertain.',{exact:false}).waitFor();
+    await page.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('button',{name:'Custom formats',exact:true}).click();
+    assert.equal(await panel.getByLabel('Pattern',{exact:true}).inputValue(),'uncertain-workspace-draft');
+    assert.equal(await panel.getByRole('button',{name:'Save custom format',exact:true}).isDisabled(),true);
+    await page.unroute(updatePattern);await panel.getByRole('button',{name:'Reload custom formats',exact:true}).click();
+    await panel.getByRole('button',{name:`Preset ${media}`,exact:true}).click();
     assert.equal((await (await page.request.get(`${origin}/api/v1/${media}/custom-formats/${id}`)).json()).include_when_renaming,true);
 
     await panel.getByRole('button',{name:'New custom format',exact:true}).click();
