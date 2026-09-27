@@ -285,6 +285,79 @@ fn singleton(target: &Option<ReleaseTarget>) -> bool {
     matches!(target, Some(ReleaseTarget::Movies { .. }))
         || matches!(target,Some(ReleaseTarget::Tv{episode_ids,..}) if episode_ids.len()==1)
 }
+struct CapturedRelease {
+    id: Uuid,
+    fingerprint: String,
+    title: String,
+    release: indexer::Release,
+}
+async fn insert_captured(
+    c: &Connection,
+    client: &RefreshClient,
+    command: &RssCommand,
+    item: CapturedRelease,
+    timestamp: i64,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(bad());
+    }
+    let t = command.target;
+    let CapturedRelease {
+        id,
+        fingerprint,
+        title,
+        release,
+    } = item;
+    let mut decision =
+        crate::search::evaluate(c, t.media_type, &release, SearchContext::Rss, timestamp)
+            .await
+            .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
+    if !singleton(&decision.target) {
+        decision.disposition = Disposition::Reject;
+        decision.reasons.push("unsupported_target".into());
+    }
+    if matches!(decision.disposition, Disposition::Reject) {
+        decision.target = None;
+    }
+    let payload = if matches!(decision.disposition, Disposition::Reject) {
+        None
+    } else {
+        let mut bytes = indexer::encode_private(release)
+            .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
+        let sealed = client.seal_release(&payload_context(id, t), &bytes);
+        bytes.fill(0);
+        Some(sealed.map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code))?)
+    };
+    if let Some(existing)=c.query("SELECT id,status FROM rss_candidates WHERE indexer_id=? AND indexer_revision=? AND client_id=? AND client_revision=? AND media_type=? AND fingerprint=?",params![t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,domain(t.media_type),fingerprint.clone()]).await?.next().await?{
+                let existing_id:String=existing.get(0)?;let status:String=existing.get(1)?;
+                if matches!(status.as_str(),"rejected"|"cancelled") {c.execute("DELETE FROM rss_candidates WHERE id=?",[existing_id]).await?;}else{return Ok(())}
+            }
+    if c.query("SELECT count(*)>=1024 OR COALESCE(sum(length(private_payload)),0)+(SELECT COALESCE(sum(length(private_payload)),0) FROM search_results)+?>16777216 FROM rss_candidates",[payload.as_ref().map_or(0,Vec::len) as i64]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"candidate_limit"))}
+    let (series, movie, episode) = match decision.target {
+        Some(ReleaseTarget::Tv {
+            series_id,
+            episode_ids,
+        }) if episode_ids.len() == 1 => (Some(series_id), None, episode_ids.first().copied()),
+        Some(ReleaseTarget::Movies { movie_id }) => (None, Some(movie_id), None),
+        _ => (None, None, None),
+    };
+    let status = if matches!(decision.disposition, Disposition::Reject) {
+        "rejected"
+    } else {
+        "pending"
+    };
+    let reasons = serde_json::to_string(&decision.reasons).map_err(|_| bad())?;
+    c.execute("INSERT INTO rss_candidates(id,command_id,indexer_id,indexer_revision,client_id,client_revision,media_type,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,not_before,attempts,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",params![id.to_string(),command.id.to_string(),t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,domain(t.media_type),fingerprint,title,payload,series,movie,status,reasons,decision.not_before,timestamp,timestamp]).await?;
+    if let Some(episode) = episode {
+        c.execute(
+            "INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id)VALUES(?,?,?)",
+            params![id.to_string(), series, episode],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssCommand) -> Result<()> {
     let t = command.target;
     let mut releases = Vec::new();
@@ -345,15 +418,10 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
         let release = indexer::decode_private(&encoded)
             .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
         encoded.fill(0);
-        let mut decision =
-            crate::search::evaluate(&c, t.media_type, &release, SearchContext::Rss, timestamp)
-                .await
-                .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
-        if !matches!(decision.disposition, Disposition::Reject) && !singleton(&decision.target) {
-            decision.disposition = Disposition::Reject;
-            decision.reasons.push("unsupported_target".into());
-            decision.target = None;
-        }
+        // Warm bounded CF work outside the writer; no prewarm decision is durable.
+        crate::search::evaluate(&c, t.media_type, &release, SearchContext::Rss, timestamp)
+            .await
+            .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
         let fingerprint = digest(
             release
                 .guid
@@ -371,42 +439,35 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
         if title.len() > 1024 {
             return Err(Error(StatusCode::BAD_GATEWAY, "invalid_release"));
         }
-        if matches!(decision.disposition, Disposition::Reject) {
-            decision.target = None;
-        }
-        let id = Uuid::new_v4();
-        let payload = if matches!(decision.disposition, Disposition::Reject) {
-            None
-        } else {
-            let mut bytes = indexer::encode_private(release)
-                .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
-            let result = client.seal_release(&payload_context(id, t), &bytes);
-            bytes.fill(0);
-            Some(result.map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code))?)
-        };
-        captured.push((id, fingerprint, title, decision, payload));
+        captured.push(CapturedRelease {
+            id: Uuid::new_v4(),
+            fingerprint,
+            title,
+            release,
+        });
     }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
-        if !matches!(read(&tx,command.id).await?.status,CommandStatus::Running){return Ok(())}
-        if !valid_target(&tx,t).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
-        let count=captured.len() as i64;
-        for (id,fingerprint,title,decision,payload) in captured {
-            if let Some(existing)=tx.query("SELECT id,status FROM rss_candidates WHERE indexer_id=? AND indexer_revision=? AND client_id=? AND client_revision=? AND media_type=? AND fingerprint=?",params![t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,domain(t.media_type),fingerprint.clone()]).await?.next().await?{
-                let existing_id:String=existing.get(0)?;let status:String=existing.get(1)?;
-                if matches!(status.as_str(),"rejected"|"cancelled") {tx.execute("DELETE FROM rss_candidates WHERE id=?",[existing_id]).await?;}else{continue}
-            }
-            if tx.query("SELECT count(*)>=1024 OR COALESCE(sum(length(private_payload)),0)+(SELECT COALESCE(sum(length(private_payload)),0) FROM search_results)+?>16777216 FROM rss_candidates",[payload.as_ref().map_or(0,Vec::len) as i64]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"candidate_limit"))}
-            let (series,movie,episode)=match decision.target{Some(ReleaseTarget::Tv{series_id,episode_ids}) if episode_ids.len()==1=>(Some(series_id),None,episode_ids.first().copied()),Some(ReleaseTarget::Movies{movie_id})=>(None,Some(movie_id),None),_=>(None,None,None)};
-            let status=if matches!(decision.disposition,Disposition::Reject){"rejected"}else{"pending"};
-            let reasons=serde_json::to_string(&decision.reasons).map_err(|_|bad())?;
-            tx.execute("INSERT INTO rss_candidates(id,command_id,indexer_id,indexer_revision,client_id,client_revision,media_type,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,not_before,attempts,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",params![id.to_string(),command.id.to_string(),t.indexer_id.to_string(),t.indexer_revision,t.client_id.to_string(),t.client_revision,domain(t.media_type),fingerprint,title,payload,series,movie,status,reasons,decision.not_before,timestamp,timestamp]).await?;
-            if let Some(episode)=episode{tx.execute("INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id)VALUES(?,?,?)",params![id.to_string(),series,episode]).await?;}
+    let outcome = async {
+        if !matches!(read(&tx, command.id).await?.status, CommandStatus::Running) {
+            return Ok(());
         }
-        tx.execute("UPDATE rss_commands SET fetch_complete=1,fetched=?,evaluated=? WHERE id=?",params![count,count,command.id.to_string()]).await?;Ok(())
-    }.await;
+        if !valid_target(&tx, t).await? {
+            return Err(Error(StatusCode::CONFLICT, "provider_changed"));
+        }
+        let count = captured.len() as i64;
+        for item in captured {
+            insert_captured(&tx, client, command, item, timestamp).await?;
+        }
+        tx.execute(
+            "UPDATE rss_commands SET fetch_complete=1,fetched=?,evaluated=? WHERE id=?",
+            params![count, count, command.id.to_string()],
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
     finish(tx, outcome).await
 }
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
@@ -552,6 +613,59 @@ async fn reconcile(db: &Database, client: &RefreshClient, work: CandidateWork) -
         }
     }
 }
+/// Only the writer's fresh decision can discard a payload or park a pending row.
+async fn settle_local(
+    c: &Connection,
+    expected: &RssCandidate,
+    release: &indexer::Release,
+    timestamp: i64,
+) -> Result<Option<crate::search::ReleaseDecision>> {
+    if c.is_autocommit() {
+        return Err(bad());
+    }
+    let current = candidate(c, expected.id).await?;
+    if current.public.status != expected.status
+        || !matches!(current.public.status.as_str(), "pending" | "prepared")
+    {
+        return Ok(None);
+    }
+    if !valid_target(c, current.public.source).await? {
+        candidate_state(c, expected.id, "rejected", Some("provider_changed"), None).await?;
+        return Ok(None);
+    }
+    let decision = crate::search::evaluate(
+        c,
+        current.public.source.media_type,
+        release,
+        super::search::authority(c, expected.id).await?,
+        timestamp,
+    )
+    .await
+    .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
+    if !singleton(&decision.target) || matches!(decision.disposition, Disposition::Reject) {
+        let reasons = if singleton(&decision.target) {
+            decision.reasons
+        } else {
+            vec!["unsupported_target".into()]
+        };
+        c.execute("UPDATE rss_candidates SET status='rejected',private_payload=NULL,decision_reasons_json=?,not_before=NULL,updated_at=? WHERE id=? AND status IN ('pending','prepared')",params![serde_json::to_string(&reasons).map_err(|_|bad())?,timestamp,expected.id.to_string()]).await?;
+        return Ok(None);
+    }
+    if current.public.target != decision.target {
+        candidate_state(c, expected.id, "rejected", Some("target_changed"), None).await?;
+        return Ok(None);
+    }
+    if matches!(decision.disposition, Disposition::Delay) {
+        if current.public.status == "prepared" {
+            candidate_state(c, expected.id, "rejected", Some("target_changed"), None).await?;
+        } else {
+            c.execute("UPDATE rss_candidates SET decision_reasons_json=?,not_before=?,updated_at=? WHERE id=? AND status='pending'",params![serde_json::to_string(&decision.reasons).map_err(|_|bad())?,decision.not_before,timestamp,expected.id.to_string()]).await?;
+        }
+        return Ok(None);
+    }
+    Ok(Some(decision))
+}
+
 async fn process_candidate(
     db: &Database,
     client: &RefreshClient,
@@ -574,7 +688,9 @@ async fn process_candidate(
     let decoded = indexer::decode_private(&bytes);
     bytes.fill(0);
     let release = decoded.map_err(|_| bad())?;
-    let decision = crate::search::evaluate(
+    // Prewarm may compile bounded CF expressions; current policy is read again
+    // together with every early state/deadline write under the Immediate lock.
+    crate::search::evaluate(
         &c,
         p.source.media_type,
         &release,
@@ -583,25 +699,13 @@ async fn process_candidate(
     )
     .await
     .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
-    if !singleton(&decision.target) || matches!(decision.disposition, Disposition::Reject) {
-        let reasons = if singleton(&decision.target) {
-            decision.reasons
-        } else {
-            vec!["unsupported_target".into()]
-        };
-        c.execute("UPDATE rss_candidates SET status='rejected',private_payload=NULL,decision_reasons_json=?,not_before=NULL,updated_at=? WHERE id=?",params![serde_json::to_string(&reasons).map_err(|_|bad())?,now()?,p.id.to_string()]).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = settle_local(&tx, &p, &release, now()?).await;
+    let Some(decision) = finish(tx, outcome).await? else {
         return Ok(());
-    }
-    if matches!(decision.disposition, Disposition::Delay) {
-        if p.status == "prepared" {
-            return candidate_state(&c, p.id, "rejected", Some("target_changed"), None).await;
-        }
-        c.execute("UPDATE rss_candidates SET decision_reasons_json=?,not_before=?,updated_at=? WHERE id=?",params![serde_json::to_string(&decision.reasons).map_err(|_|bad())?,decision.not_before,now()?,p.id.to_string()]).await?;
-        return Ok(());
-    }
-    if p.target != decision.target {
-        return candidate_state(&c, p.id, "rejected", Some("target_changed"), None).await;
-    }
+    };
     let target = decision.target.ok_or_else(bad)?;
     let (media_target, series, movie, episode) = match &target {
         ReleaseTarget::Tv {
@@ -983,34 +1087,54 @@ pub(super) async fn run(db: &Database, client: &RefreshClient, command: RssComma
     }.await;
     finish(tx, outcome).await
 }
+async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> {
+    // Exact transient classes only. Malformed durable facts/configuration retain
+    // permanent rejection. For standalone run_due work the one-second worker tick
+    // retries these. Parent-command/capture paths instead use settle_error retry_wait.
+    if matches!(
+        error.1,
+        "custom_format_state_changed"
+            | "custom_format_busy"
+            | "custom_format_timeout"
+            | "custom_format_worker_failed"
+    ) {
+        return Err(error);
+    }
+    let code = match error.1 {
+        "key_unavailable"
+        | "target_changed"
+        | "provider_changed"
+        | "provider_unavailable"
+        | "refresh_timeout"
+        | "refresh_failed"
+        | "invalid_release" => error.1,
+        _ => "storage_error",
+    };
+    eprintln!("event=rss_candidate_error candidate_id={id} code={code}");
+    let current: String = c
+        .query(
+            "SELECT status FROM rss_candidates WHERE id=?",
+            [id.to_string()],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(bad)?
+        .get(0)?;
+    if matches!(current.as_str(), "submitting" | "reconciling") {
+        return Err(error);
+    }
+    candidate_state(&c, id, "rejected", Some(code), None).await?;
+    Ok(())
+}
 pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> Result<()> {
     let c = connection(db).await?;
     if let Err(error) = process_candidate(db, client, candidate(&c, id).await?).await {
-        let code = match error.1 {
-            "key_unavailable"
-            | "target_changed"
-            | "provider_changed"
-            | "provider_unavailable"
-            | "refresh_timeout"
-            | "refresh_failed"
-            | "invalid_release" => error.1,
-            _ => "storage_error",
-        };
-        eprintln!("event=rss_candidate_error candidate_id={id} code={code}");
-        let current: String = c
-            .query(
-                "SELECT status FROM rss_candidates WHERE id=?",
-                [id.to_string()],
-            )
-            .await?
-            .next()
-            .await?
-            .ok_or_else(bad)?
-            .get(0)?;
-        if matches!(current.as_str(), "submitting" | "reconciling") {
-            return Err(error);
-        }
-        candidate_state(&c, id, "rejected", Some(code), None).await?;
+        settle_due_error(&c, id, error).await?;
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "rss_revision_tests.rs"]
+mod tests;

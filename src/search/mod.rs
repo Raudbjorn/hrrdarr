@@ -2,6 +2,7 @@
 mod decision;
 pub(crate) mod downloaded;
 pub mod parser;
+pub(crate) mod revision;
 use crate::api::MediaDomain;
 use crate::{
     db::Database,

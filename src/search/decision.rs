@@ -300,9 +300,7 @@ pub async fn evaluate(
     if release.facts.nuked == Some(true) {
         result.deny("nuked_release")
     }
-    if parsed.revision > 1 {
-        result.deny("proper_upgrade_unsupported")
-    }
+
     let mut evidence = crate::custom_formats::release(release, &parsed, tv);
     crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
         .await?;
@@ -316,6 +314,8 @@ pub async fn evaluate(
         &parsed,
         &evidence,
         candidate.language,
+        context,
+        now,
         &mut result,
     )
     .await?;
@@ -404,6 +404,8 @@ pub(super) async fn apply_quality(
     parsed: &crate::search::parser::ParsedRelease,
     evidence: &crate::custom_formats::Evidence,
     original_language: Option<i64>,
+    search_context: SearchContext,
+    now: i64,
     result: &mut ReleaseDecision,
 ) -> Result<()> {
     let tv = matches!(media, MediaDomain::Tv);
@@ -481,50 +483,103 @@ pub(super) async fn apply_quality(
                             .map(|(_, r, ..)| *r),
                         Cutoff::Group { position } => Some(position),
                     };
-                    for file in files.iter().flatten() {
+                    let mode = crate::revision_policy::read(c, media)
+                        .await
+                        .map_err(|_| SearchError("revision_policy_unavailable"))?
+                        .mode;
+                    let anime = if let Some(ReleaseTarget::Tv { series_id, .. }) = &result.target {
+                        c.query(
+                            "SELECT series_type='anime' FROM library_settings WHERE series_id=?",
+                            [*series_id],
+                        )
+                        .await?
+                        .next()
+                        .await?
+                        .map(|r| r.get::<Option<i64>>(0))
+                        .transpose()?
+                        .flatten()
+                            == Some(1)
+                    } else {
+                        false
+                    };
+                    let clock = revision::EvaluationClock::local(now).map_err(SearchError)?;
+                    let context = revision::Context {
+                        mode,
+                        search: search_context,
+                        anime,
+                        queued: false,
+                        clock,
+                    };
+                    let comparison_policy = revision::Profile {
+                        upgrade_allowed: policy.upgrade_allowed,
+                        cutoff_rank: cutoff,
+                        cutoff_score: i64::from(policy.cutoff_format_score),
+                        minimum_increment: i64::from(policy.min_upgrade_format_score),
+                    };
+                    let unique_files: std::collections::BTreeSet<_> =
+                        files.iter().flatten().copied().collect();
+                    for file in unique_files {
                         let column = if tv {
                             "episode_file_id"
                         } else {
                             "movie_file_id"
                         };
-                        let existing=c.query(&format!("SELECT quality_id FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),*file]).await?.next().await?;
-                        let existing = existing
-                            .map(|r| r.get::<Option<i64>>(0))
-                            .transpose()?
-                            .flatten()
-                            .and_then(|id| ranked.iter().find(|(q, ..)| *q == id));
-                        if !policy.upgrade_allowed {
-                            result.deny("upgrades_disabled")
-                        } else if let Some((_, old, ..)) = existing {
-                            let old_facts =
-                                crate::custom_formats::existing(c, media, *file).await?;
-                            let old_score = crate::custom_formats::score(
-                                &formats,
-                                media,
-                                old_facts,
-                                original_language,
-                                policy.format_items.clone(),
-                                !c.is_autocommit(),
-                            )
-                            .await?
-                            .score;
-                            if rank < old {
-                                result.deny("not_quality_upgrade");
-                            } else if rank > old {
-                                if cutoff.is_some_and(|cutoff| *old >= cutoff) {
-                                    result.deny("cutoff_met");
-                                }
-                            } else if old_score >= i64::from(policy.cutoff_format_score) {
-                                result.deny("cutoff_met");
-                            } else if score.score <= old_score {
-                                result.deny("custom_format_not_upgrade");
-                            } else if score.score - old_score
-                                < i64::from(policy.min_upgrade_format_score)
-                            {
-                                result.deny("custom_format_upgrade_increment");
-                            }
-                        } else {
-                            result.deny("existing_quality_unknown")
+                        let existing = c.query(&format!("SELECT quality_id,revision_json,release_group,date_added FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),file]).await?.next().await?;
+                        let Some(row) = existing else {
+                            result.deny("existing_quality_unknown");
+                            continue;
+                        };
+                        let old_quality = row.get::<Option<i64>>(0)?;
+                        let Some((old_id, old_rank, ..)) =
+                            old_quality.and_then(|id| ranked.iter().find(|(q, ..)| *q == id))
+                        else {
+                            result.deny("existing_quality_unknown");
+                            continue;
+                        };
+                        let old_revision = row
+                            .get::<Option<String>>(1)?
+                            .map(|s| {
+                                serde_json::from_str::<crate::media_files::FileRevision>(&s)
+                                    .map_err(|_| SearchError("existing_revision_invalid"))
+                            })
+                            .transpose()?;
+                        if let Some(old) = &old_revision {
+                            old.validate()
+                                .map_err(|_| SearchError("existing_revision_invalid"))?;
+                        }
+                        let old_group: Option<String> = row.get(2)?;
+                        let old_date = row.get::<Option<String>>(3)?.as_deref().and_then(timestamp);
+                        let old_facts = crate::custom_formats::existing(c, media, file).await?;
+                        let old_score = crate::custom_formats::score(
+                            &formats,
+                            media,
+                            old_facts,
+                            original_language,
+                            policy.format_items.clone(),
+                            !c.is_autocommit(),
+                        )
+                        .await?
+                        .score;
+                        let incoming = revision::Facts {
+                            quality_id,
+                            rank: *rank,
+                            revision: parsed.revision.as_ref(),
+                            score: score.score,
+                            group: evidence.release_group.as_deref(),
+                            date_added: None,
+                        };
+                        let current = revision::Facts {
+                            quality_id: *old_id,
+                            rank: *old_rank,
+                            revision: old_revision.as_ref(),
+                            score: old_score,
+                            group: old_group.as_deref(),
+                            date_added: old_date,
+                        };
+                        let comparison =
+                            revision::compare(&incoming, &current, &comparison_policy, &context);
+                        for reason in comparison.reasons {
+                            result.deny(reason);
                         }
                     }
                 } else {

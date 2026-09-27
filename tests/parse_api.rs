@@ -90,6 +90,26 @@ async fn tv_route_parses_matches_series_and_episode_over_real_http() {
     assert_eq!(body["episodes"][0]["id"], 1);
     assert_eq!(body["episodes"][0]["season"], 1);
     assert_eq!(body["episodes"][0]["number"], 2);
+    assert_eq!(
+        body["parsed"]["revision"],
+        serde_json::json!({"version":1,"real":0,"is_repack":false})
+    );
+    assert_eq!(body["parsed"]["revision_marker"], false);
+    let (status, body) = get(
+        &client,
+        addr,
+        "/api/v1/tv/parse",
+        "Harbor.S01E02v3.1080p.WEB-DL.REAL",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["parsed"]["revision"],
+        serde_json::json!({"version":3,"real":1,"is_repack":false})
+    );
+    assert_eq!(body["parsed"]["revision_marker"], true);
+    assert_eq!(body["episodes"][0]["id"], 1);
+
     server.abort();
     let _ = server.await;
 }
@@ -146,6 +166,20 @@ async fn movie_route_disambiguates_by_year_over_real_http() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["movie"]["id"], 1);
     assert_eq!(body["movie"]["year"], 1982);
+    let (status, body) = get(
+        &client,
+        addr,
+        "/api/v1/movies/parse",
+        "Harbor.1982.1080p.Bluray.RERIP2.REAL",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["parsed"]["revision"],
+        serde_json::json!({"version":3,"real":1,"is_repack":true})
+    );
+    assert_eq!(body["movie"]["id"], 1);
+
     let (status, body) = get(
         &client,
         addr,

@@ -572,6 +572,7 @@ async fn preflight(
                 &facts.root,
                 &facts.basename,
                 facts.quality_id,
+                &facts.revision_binding.effective,
                 facts.edition.as_deref(),
                 &facts.evidence,
             )

@@ -134,7 +134,15 @@ async fn remote(
                 5030,
             )
         } else {
-            ("Harbor.2020.1080p.WEB-DL".to_string(), MOVIE, 2030)
+            (
+                s.release_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "Harbor.2020.1080p.WEB-DL".to_string()),
+                MOVIE,
+                2030,
+            )
         };
         let hash = match s.mode.load(Ordering::SeqCst) {
             6 => {
@@ -276,7 +284,8 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         if status == 204 {
             Value::Null
         } else {
-            serde_json::from_str(&text).unwrap_or_else(|_| panic!("{status} {text}"))
+            serde_json::from_str(&text)
+                .unwrap_or_else(|_| panic!("{method} {path}: {status} {text}"))
         },
     )
 }
@@ -336,6 +345,10 @@ async fn wait_status(base: &str, path: &str, status: &str) -> Value {
 }
 #[tokio::test]
 async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
+    // Keep the new end-to-end scenarios in this same serial lease owner, first so
+    // fixture failures are reported before the longer established recovery matrix.
+    search_revision_import_preserves_durable_origin_http().await;
+    legacy_receipt_requires_observed_revision_http().await;
     let scratch =
         Scratch(std::env::temp_dir().join(format!("hrrdarr-processing-{}", uuid::Uuid::new_v4())));
     std::fs::create_dir(&scratch.0).unwrap();
@@ -1306,10 +1319,8 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     std::fs::create_dir(&scratch.0).unwrap();
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let state = Arc::new(Remote::default());
-    if !movie {
-        if let Some(stem) = tv_release_stem {
-            *state.release_override.lock().unwrap() = Some(stem.to_string());
-        }
+    if let Some(stem) = tv_release_stem {
+        *state.release_override.lock().unwrap() = Some(stem.to_string());
     }
     let (origin, upstream) = serve(
         axum::Router::new()
@@ -1329,6 +1340,7 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
     let router = router
         .merge(commands::router(db.clone()))
+        .merge(hrrdarr::search::router(db.clone(), client.clone()))
         .merge(hrrdarr::library::router(db.clone()))
         .merge(hrrdarr::library::metadata_router(
             db.clone(),
@@ -1336,6 +1348,7 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
         ))
         .merge(hrrdarr::remote_paths::router(db.clone()))
         .merge(hrrdarr::naming::router(db.clone()))
+        .merge(hrrdarr::revision_policy::router(db.clone()))
         .merge(hrrdarr::import::router(db.clone()))
         .merge(hrrdarr::media_files::router(db.clone()))
         .merge(hrrdarr::history::router(db.clone()));
@@ -1365,7 +1378,10 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
         source_top.join("batch")
     };
     let name = if movie {
-        "Harbor.2020.1080p.WEB-DL.mkv".to_string()
+        format!(
+            "{}.mkv",
+            tv_release_stem.unwrap_or("Harbor.2020.1080p.WEB-DL")
+        )
     } else {
         format!(
             "{}.mkv",
@@ -2172,4 +2188,286 @@ async fn cross_type_numbering_completed_downloads_preserve_sources_http() {
     );
     assert!(!ctx.root.join(format!("{stem}.mkv")).exists());
     ctx.shutdown().await;
+}
+
+// Run in the existing serial import chain: actual durable search origin must
+// survive grab and import, not merely be supplied to a comparison helper.
+async fn search_revision_import_preserves_durable_origin_http() {
+    for movie in [false, true] {
+        let stem = if movie {
+            "Harbor.2020.1080p.WEB-DL.PROPER"
+        } else {
+            "Harbor.S01E01.1080p.WEB-DL.PROPER"
+        };
+        let ctx = naming_ctx(movie, "standard", Some(stem)).await;
+        let media = if movie { "movies" } else { "tv" };
+        let c = ctx.db.connect().await.unwrap();
+        let old = ctx.root.join("old.mkv");
+        std::fs::write(&old, b"old-revision-bytes").unwrap();
+        let column = if movie {
+            "movie_file_id"
+        } else {
+            "episode_file_id"
+        };
+        if movie {
+            c.execute(
+                "INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,?)",
+                [old.to_str().unwrap()],
+            )
+            .await
+            .unwrap();
+        } else {
+            c.execute(
+                "INSERT INTO episode_files(id,series_id,path)VALUES(1,1,?)",
+                [old.to_str().unwrap()],
+            )
+            .await
+            .unwrap();
+            c.execute("UPDATE episodes SET episode_file_id=1 WHERE id=1", ())
+                .await
+                .unwrap();
+        }
+        c.execute(&format!("INSERT INTO file_metadata(media_type,{column},quality_id,revision_json,release_group,date_added,size)VALUES(?,1,3,?,'GROUP','2020-01-01T00:00:00Z',18)"),libsql::params![media,json!({"version":1,"real":0,"is_repack":false}).to_string()]).await.unwrap();
+        let (code, v) = request(
+            &ctx.base,
+            "PUT",
+            &format!("/api/v1/{media}/revision-policy"),
+            json!({"mode":"do_not_upgrade","revision":1}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        if movie {
+            put_movie_naming(&ctx.base, 1, true, Some("{Movie Title} [{Quality Full}]")).await;
+        } else {
+            put_tv_naming(
+                &ctx.base,
+                1,
+                true,
+                Some("{Series Title} [{Quality Full}]"),
+                None,
+                None,
+            )
+            .await;
+        }
+        let rss = enqueue(&ctx.base, target(&ctx.indexer, &ctx.download, media)).await;
+        let rss_done = wait_status(
+            &ctx.base,
+            &format!("/api/v1/rss/commands/{}", rss["id"].as_str().unwrap()),
+            "succeeded",
+        )
+        .await;
+        assert_eq!(rss_done["rejected"], 1, "{rss_done}");
+        assert_eq!(rss_done["observed"], 0);
+        let (_, rejected) = request(
+            &ctx.base,
+            "GET",
+            &format!(
+                "/api/v1/rss/candidates?command_id={}",
+                rss["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert!(
+            rejected["items"][0]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "revision_upgrade_disabled"),
+            "{rejected}"
+        );
+        let intent = json!({"request_id":uuid::Uuid::new_v4(),"mode":"automatic","target":{"media_type":if movie {"movie"} else {"episode"},"id":1},"indexer_id":ctx.indexer["id"],"indexer_revision":ctx.indexer["revision"],"client_id":ctx.download["id"],"client_revision":ctx.download["revision"],"priority":"normal"});
+        let (code, search) = request(&ctx.base, "POST", "/api/v1/search/commands", intent).await;
+        assert_eq!(code, 202, "{search}");
+        let done = wait_status(
+            &ctx.base,
+            &format!("/api/v1/search/commands/{}", search["id"].as_str().unwrap()),
+            "succeeded",
+        )
+        .await;
+        let receipt = done["selected_candidate_id"].clone();
+        assert!(receipt.is_string(), "{done}");
+        // Search command success can precede candidate settlement; require the real observed receipt.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row = c
+                    .query(
+                        "SELECT status FROM rss_candidates WHERE id=?",
+                        [receipt.as_str().unwrap()],
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.get::<String>(0).unwrap() == "observed" {
+                    break;
+                }
+                drop(row);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, receipts) = request(
+            &ctx.base,
+            "GET",
+            &format!("/api/v1/rss/candidates?media_type={media}"),
+            Value::Null,
+        )
+        .await;
+        let owned = receipts["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == receipt)
+            .unwrap();
+        assert_eq!(owned["origin"]["kind"], "search");
+        ctx.state.completed.store(1, Ordering::SeqCst);
+        let (code, result) = naming_process(&ctx, &receipt).await;
+        assert_eq!(code, 202, "{result}");
+        let result = wait_status(
+            &ctx.base,
+            &format!("/api/v1/download-processing/{}", receipt.as_str().unwrap()),
+            "imported",
+        )
+        .await;
+        assert_eq!(result["import_phase"], "complete");
+        assert_eq!(
+            std::fs::read(ctx.source.join(format!("{stem}.mkv"))).unwrap(),
+            vec![1u8; 1048576]
+        );
+        assert_eq!(
+            std::fs::read(ctx.root.join("Harbor [WEBDL-1080p Proper].mkv")).unwrap(),
+            vec![1u8; 1048576]
+        );
+        let row=c.query("SELECT i.revision_json,i.provenance_json,m.revision_json FROM rss_candidate_imports i JOIN operations o ON o.id=i.operation_id JOIN file_metadata m ON m.media_type=? AND ((o.media_type='episode' AND m.episode_file_id=(SELECT episode_file_id FROM episodes WHERE id=o.episode_id)) OR (o.media_type='movie' AND m.movie_file_id=(SELECT id FROM movie_files WHERE movie_id=o.movie_id))) WHERE i.candidate_id=?",libsql::params![media,receipt.as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap();
+        let expected = json!({"version":2,"real":0,"is_repack":false});
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.get::<String>(0).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.get::<String>(2).unwrap()).unwrap(),
+            expected
+        );
+        let frozen = row.get::<String>(1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&frozen).unwrap()["revision_binding"]["effective"],
+            expected
+        );
+        // Row owns a live statement/connection; release it before the replay writes.
+        drop(row);
+        let (code, result) = naming_process(&ctx, &receipt).await;
+        assert_eq!(code, 202, "{result}");
+        let replay=c.query("SELECT provenance_json,(SELECT count(*) FROM import_history WHERE operation_id=i.operation_id) FROM rss_candidate_imports i WHERE candidate_id=?",[receipt.as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap();
+        assert_eq!(replay.get::<String>(0).unwrap(), frozen);
+        assert_eq!(replay.get::<i64>(1).unwrap(), 1);
+        drop(replay);
+        ctx.shutdown().await;
+    }
+}
+
+async fn legacy_receipt_requires_observed_revision_http() {
+    for movie in [false, true] {
+        let ctx = naming_ctx(movie, "standard", None).await;
+        let receipt = naming_grab_and_complete(&ctx).await;
+        let c = ctx.db.connect().await.unwrap();
+        // Scratch-only historical receipt: old immutable evidence had no revision
+        // observation. Restore the exact triggers before invoking any application path.
+        let tx = c.transaction().await.unwrap();
+        let mut triggers = Vec::new();
+        for name in ["rss_comparison_facts_update", "rss_candidate_transition"] {
+            let sql: String = tx
+                .query("SELECT sql FROM sqlite_master WHERE name=?", [name])
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            tx.execute_batch(&format!("DROP TRIGGER {name}"))
+                .await
+                .unwrap();
+            triggers.push(sql);
+        }
+        tx.execute("UPDATE rss_candidates SET comparison_facts_json=json_remove(comparison_facts_json,'$.revision') WHERE id=?",[receipt.as_str().unwrap()]).await.unwrap();
+        for sql in triggers {
+            tx.execute_batch(&sql).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        let frozen: String = c
+            .query(
+                "SELECT comparison_facts_json FROM rss_candidates WHERE id=?",
+                [receipt.as_str().unwrap()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let baseline = if movie {
+            "Harbor.2020.1080p.WEB-DL"
+        } else {
+            "Harbor.S01E01.1080p.WEB-DL"
+        };
+        let original = ctx.source.join(format!("{baseline}.mkv"));
+        let (code, result) = naming_process(&ctx, &receipt).await;
+        assert_eq!(code, 202, "{result}");
+        let route = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+        let blocked = wait_status(&ctx.base, &route, "blocked").await;
+        assert_eq!(blocked["error_code"], "quality_rejected", "{blocked}");
+        // Processing aggregates every rejected file when none is importable. The
+        // real fixture also advertises a sample, which must retain its independent rejection.
+        assert_eq!(
+            blocked["reasons"],
+            json!(["revision_unknown", "sample_file"]),
+            "{blocked}"
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), vec![1u8; 1048576]);
+        assert!(
+            c.query(
+                "SELECT 1 FROM rss_candidate_imports WHERE candidate_id=?",
+                [receipt.as_str().unwrap()]
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .is_none()
+        );
+        // A retry alone cannot add provenance. Supply a separately observed marked
+        // filename; keep the old immutable receipt and original bytes unchanged.
+        let marked = format!("{baseline}.RERIP2");
+        let observed = ctx.source.join(format!("{marked}.mkv"));
+        std::fs::copy(&original, &observed).unwrap();
+        *ctx.state.release_override.lock().unwrap() = Some(marked.clone());
+        let (code, result) = naming_process(&ctx, &receipt).await;
+        assert_eq!(code, 202, "{result}");
+        let imported = wait_status(&ctx.base, &route, "imported").await;
+        assert_eq!(imported["import_phase"], "complete");
+        assert_eq!(std::fs::read(&original).unwrap(), vec![1u8; 1048576]);
+        assert_eq!(std::fs::read(&observed).unwrap(), vec![1u8; 1048576]);
+        let row=c.query("SELECT r.comparison_facts_json,i.revision_json,i.provenance_json FROM rss_candidates r JOIN rss_candidate_imports i ON i.candidate_id=r.id WHERE r.id=?",[receipt.as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), frozen);
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.get::<String>(1).unwrap()).unwrap(),
+            json!({"version":3,"real":0,"is_repack":true})
+        );
+        let provenance: Value = serde_json::from_str(&row.get::<String>(2).unwrap()).unwrap();
+        assert!(provenance["revision_binding"]["release"].is_null());
+        assert_eq!(
+            provenance["revision_binding"]["filename"]["explicit_marker"],
+            true
+        );
+        drop(row);
+        ctx.shutdown().await;
+    }
 }

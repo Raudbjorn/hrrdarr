@@ -86,11 +86,13 @@ async fn remote(
         } else {
             "Harbor.2020"
         };
-        let quality = if s.mode.load(Ordering::SeqCst) == 6 {
-            if better {
-                "1080p.Other"
-            } else {
-                "1080p.Preferred"
+        let quality = if matches!(s.mode.load(Ordering::SeqCst), 6..=8) {
+            match (s.mode.load(Ordering::SeqCst), better) {
+                (7, true) => "1080p.Other.PROPER",
+                (8, true) => "1080p.Other.REAL",
+                (8, false) => "1080p.Preferred.PROPER",
+                (_, true) => "1080p.Other",
+                (_, false) => "1080p.Preferred",
             }
         } else if better {
             "1080p"
@@ -1051,7 +1053,14 @@ async fn movie_language_policy_is_enforced_at_search_and_grab() {
 #[tokio::test]
 async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_boundary() {
     for tv in [true, false] {
-        for automatic in [true, false] {
+        for (automatic, revision_case) in [
+            (true, None),
+            (false, None),
+            (true, Some((7, "prefer_and_upgrade"))),
+            (true, Some((7, "do_not_upgrade"))),
+            (true, Some((7, "do_not_prefer"))),
+            (true, Some((8, "prefer_and_upgrade"))),
+        ] {
             let scratch = Scratch(
                 std::env::temp_dir().join(format!("hrrdarr-cf-grab-{}", uuid::Uuid::new_v4())),
             );
@@ -1071,7 +1080,18 @@ async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_bounda
             .await
             .unwrap();
             let state = Arc::new(Remote::default());
-            state.mode.store(6, Ordering::SeqCst);
+            state.mode.store(
+                revision_case.map_or(6, |(offer_mode, _)| offer_mode),
+                Ordering::SeqCst,
+            );
+            if let Some((_, mode)) = revision_case {
+                c.execute(
+                    "UPDATE revision_policies SET mode=?,revision=revision+1 WHERE media_type=?",
+                    libsql::params![mode, domain],
+                )
+                .await
+                .unwrap();
+            }
             let (remote_base, remote_server) = serve(
                 axum::Router::new()
                     .fallback(remote)
@@ -1135,10 +1155,22 @@ async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_bounda
                 assert!((200..300).contains(&code), "{receipt}");
                 observed(&base, receipt["id"].as_str().unwrap()).await;
             } else {
-                let receipt = preferred["selected_candidate_id"].as_str().unwrap();
+                let selected = results
+                    .iter()
+                    .find(|offer| offer["selected_candidate_id"].is_string())
+                    .unwrap();
+                let receipt = selected["selected_candidate_id"].as_str().unwrap();
                 observed(&base, receipt).await;
             }
-            assert_eq!(state.adds.lock().unwrap().as_slice(), &[hash(tv, false)]);
+            // Revision preference must beat the higher CF score through the real
+            // automatic caller, including REAL before version. DoNotPrefer omits it;
+            // DoNotUpgrade still ranks newer revisions for explicit user search.
+            let revision_wins = revision_case.is_some_and(|(_, mode)| mode != "do_not_prefer");
+            assert_eq!(
+                state.adds.lock().unwrap().as_slice(),
+                &[hash(tv, revision_wins)],
+                "tv={tv} case={revision_case:?}"
+            );
             runtime.shutdown().await;
             server.stop().await;
             remote_server.stop().await;

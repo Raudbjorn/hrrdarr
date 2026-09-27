@@ -398,3 +398,5 @@ files with a blank original release title therefore fall back to their current
 basename; movie files also try their nonblank original path basename. Nonblank
 original title text is preserved exactly. Extending TV original-path storage is
 separate from this pending-import naming flow, which uses frozen evidence.
+
+Quality Full accepts the same file-format field scopes as Quality Title. It renders the factual quality name plus Proper for a revision above1 (TV anime uses vN), and REAL when real>0. IsRepack does not change the superiority label. Quality Title continues to render only the quality name. Owned destination calculation receives the validated factual revision directly; it does not reparse renamed destination paths. This addition does not expand folder-token scopes or remove other documented naming limits.

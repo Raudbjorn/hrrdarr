@@ -678,3 +678,198 @@ async fn cross_type_numbering_resolves_identity_before_policy_facts() {
         Disposition::Accept
     );
 }
+
+#[tokio::test]
+async fn factual_revisions_apply_domain_policy_to_every_current_file() {
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "hrrdarr-revision-decisions-{}",
+        uuid::Uuid::new_v4()
+    )));
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let db = Database::open_local(scratch.0.join("db")).await.unwrap();
+    let c = db.connect().await.unwrap();
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/fictional-tv/old.mkv'); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc,episode_file_id)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00',1); INSERT INTO movie_metadata(id,title,year,runtime,digital_release)VALUES(1,'Harbor',2020,100,'2020-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional-movie'); INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,'/fictional-movie/old.mkv'); INSERT INTO file_metadata(media_type,episode_file_id,quality_id,revision_json,release_group,date_added)VALUES('tv',1,3,'{\"version\":1,\"real\":0,\"is_repack\":false}','TEAM','2026-09-24T00:00:00Z'); INSERT INTO file_metadata(media_type,movie_file_id,quality_id,revision_json,release_group,date_added)VALUES('movies',1,3,'{\"version\":1,\"real\":0,\"is_repack\":false}','TEAM','2026-09-24T00:00:00Z'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,100,1,NULL),(2,'movies',1,3,0,100,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0); UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=3;").await.unwrap();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+        .unwrap()
+        .timestamp();
+    for (media, tv) in [(MediaDomain::Tv, true), (MediaDomain::Movies, false)] {
+        let domain = if tv { "tv" } else { "movies" };
+        let stem = if tv {
+            "Harbor.S01E01.1080p.WEB-DL"
+        } else {
+            "Harbor.2020.1080p.WEB-DL"
+        };
+        for mode in ["prefer_and_upgrade", "do_not_upgrade", "do_not_prefer"] {
+            c.execute("UPDATE revision_policies SET mode=?,revision=revision+1,locally_edited=1 WHERE media_type=?",libsql::params![mode,domain]).await.unwrap();
+            for context in [SearchContext::UserSearch, SearchContext::Rss] {
+                let decision = search::evaluate(
+                    &c,
+                    media,
+                    &release(&format!("{stem}.PROPER-team"), tv),
+                    context,
+                    now,
+                )
+                .await
+                .unwrap();
+                let accepted = mode != "do_not_prefer"
+                    && (mode != "do_not_upgrade" || context == SearchContext::UserSearch);
+                assert_eq!(
+                    decision.disposition == Disposition::Accept,
+                    accepted,
+                    "{domain}/{mode}/{context:?}: {:?}",
+                    decision.reasons
+                );
+                if context == SearchContext::Rss && mode == "do_not_upgrade" {
+                    assert!(
+                        decision
+                            .reasons
+                            .contains(&"revision_upgrade_disabled".into())
+                    );
+                }
+            }
+            let repack = search::evaluate(
+                &c,
+                media,
+                &release(&format!("{stem}.RERIP2-team"), tv),
+                SearchContext::UserSearch,
+                now,
+            )
+            .await
+            .unwrap();
+            if mode == "prefer_and_upgrade" {
+                assert_eq!(
+                    repack.disposition,
+                    Disposition::Accept,
+                    "{:?}",
+                    repack.reasons
+                );
+            }
+            if mode == "do_not_upgrade" {
+                assert!(repack.reasons.contains(&"repack_upgrade_disabled".into()));
+            }
+        }
+        c.execute("UPDATE revision_policies SET mode='prefer_and_upgrade',revision=revision+1 WHERE media_type=?",[domain]).await.unwrap();
+        c.execute(
+            "UPDATE file_metadata SET date_added='2020-01-01T00:00:00Z' WHERE media_type=?",
+            [domain],
+        )
+        .await
+        .unwrap();
+        let old = search::evaluate(
+            &c,
+            media,
+            &release(&format!("{stem}.PROPER-team"), tv),
+            SearchContext::Rss,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(old.reasons.contains(&"revision_too_old".into()));
+        let searched = search::evaluate(
+            &c,
+            media,
+            &release(&format!("{stem}.PROPER-team"), tv),
+            SearchContext::UserSearch,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(searched.disposition, Disposition::Accept);
+        c.execute(
+            "UPDATE file_metadata SET release_group=NULL WHERE media_type=?",
+            [domain],
+        )
+        .await
+        .unwrap();
+        let unknown_group = search::evaluate(
+            &c,
+            media,
+            &release(&format!("{stem}.REPACK-team"), tv),
+            SearchContext::UserSearch,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            unknown_group
+                .reasons
+                .contains(&"repack_group_mismatch".into())
+        );
+        c.execute(
+            "UPDATE file_metadata SET release_group='TEAM',revision_json=NULL WHERE media_type=?",
+            [domain],
+        )
+        .await
+        .unwrap();
+        let unknown = search::evaluate(
+            &c,
+            media,
+            &release(&format!("{stem}.PROPER-team"), tv),
+            SearchContext::UserSearch,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(unknown.reasons.contains(&"revision_unknown".into()));
+        c.execute("UPDATE file_metadata SET revision_json='{\"version\":1,\"real\":0,\"is_repack\":false}' WHERE media_type=?",[domain]).await.unwrap();
+    }
+    c.execute(
+        "UPDATE library_settings SET series_type='anime' WHERE series_id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    let anime = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &release("Harbor.S01E01.1080p.WEB-DL.PROPER-team", true),
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        anime
+            .reasons
+            .contains(&"anime_revision_group_mismatch".into())
+    );
+    // Keep WEB-DL a standalone source token: the existing bounded quality grammar
+    // does not split WEB-DL-TEAM. This case proves attached v3 and exact-case group policy.
+    let anime = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &release("Harbor.S01E01v3.1080p.WEB-DL.x264-TEAM", true),
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        anime.disposition,
+        Disposition::Accept,
+        "{:?}",
+        anime.reasons
+    );
+    c.execute_batch("UPDATE library_settings SET series_type='standard' WHERE series_id=1; INSERT INTO episode_files(id,series_id,path)VALUES(2,1,'/fictional-tv/second.mkv'); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc,episode_file_id)VALUES(2,1,1,2,'Second',45,'2020-01-01 00:00:00',2); INSERT INTO file_metadata(media_type,episode_file_id,quality_id,revision_json,release_group,date_added)VALUES('tv',2,3,'{\"version\":3,\"real\":0,\"is_repack\":false}','TEAM','2026-09-24T00:00:00Z');").await.unwrap();
+    let multi = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        &release("Harbor.S01E01E02.1080p.WEB-DL.PROPER-TEAM", true),
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        multi.reasons.contains(&"not_revision_upgrade".into()),
+        "{:?}",
+        multi.reasons
+    );
+    assert_eq!(
+        multi.target,
+        Some(ReleaseTarget::Tv {
+            series_id: 1,
+            episode_ids: vec![1, 2]
+        })
+    );
+}

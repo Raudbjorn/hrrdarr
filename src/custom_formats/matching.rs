@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Evidence {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::search::revision::Observation>,
     pub title: String,
     pub filename: Option<String>,
     pub languages: Option<Vec<i32>>,
@@ -187,6 +189,9 @@ pub(crate) fn validate_evidence(
     media: MediaDomain,
     evidence: &Evidence,
 ) -> std::result::Result<(), &'static str> {
+    if let Some(revision) = &evidence.revision {
+        revision.validate()?;
+    }
     if evidence.version != 1
         || evidence.title.is_empty()
         || evidence.title.chars().any(char::is_control)
@@ -466,6 +471,7 @@ pub(crate) fn parsed(
     }
     Evidence {
         version: 1,
+        revision: crate::search::revision::Observation::from_parsed(parsed),
         title: title.into(),
         filename: None,
         languages: (!languages.is_empty()).then_some(languages),
@@ -604,6 +610,7 @@ pub(crate) async fn existing(
     )?;
     Ok(Evidence {
         version: 1,
+        revision: None,
         title,
         filename: Some(basename(&path)),
         languages: row
@@ -632,6 +639,7 @@ mod tests {
     fn evidence() -> Evidence {
         Evidence {
             version: 1,
+            revision: None,
             title: "Harbor.2020.English.1080p.WEB-DL-GROUP".into(),
             filename: None,
             languages: Some(vec![1, 2]),
@@ -645,6 +653,35 @@ mod tests {
             resolution: 1080,
             modifier: 5,
         }
+    }
+    #[test]
+    fn revision_observation_is_optional_but_validated() {
+        let old = evidence();
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("revision").is_none());
+        let decoded: Evidence = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.revision.is_none());
+        let mut new = old.clone();
+        new.revision = Some(crate::search::revision::Observation {
+            parser_version: 1,
+            value: crate::media_files::FileRevision {
+                version: 2,
+                real: 0,
+                is_repack: true,
+            },
+            explicit_marker: true,
+        });
+        assert!(validate_evidence(MediaDomain::Tv, &new).is_ok());
+        assert_eq!(serde_json::to_value(&new).unwrap()["version"], 1);
+        new.revision.as_mut().unwrap().parser_version = 2;
+        assert_eq!(
+            validate_evidence(MediaDomain::Tv, &new).unwrap_err(),
+            "revision_evidence_version"
+        );
+        let mut malformed = encoded;
+        malformed["revision"] =
+            serde_json::json!({"parser_version":1,"value":{"version":2},"explicit_marker":true});
+        assert!(serde_json::from_value::<Evidence>(malformed).is_err());
     }
     fn spec(condition: Condition, required: bool, negate: bool) -> Specification {
         Specification {

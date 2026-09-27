@@ -26,11 +26,24 @@ pub(super) struct Facts {
     pub retirement: Option<Retirement>,
     pub evidence: Option<crate::custom_formats::Evidence>,
     pub expected_size: u64,
+    pub candidate_id: String,
 }
 pub(super) async fn facts(c: &Connection, operation: &str) -> Result<Option<Facts>> {
-    let Some(r)=c.query("SELECT quality_id,revision_json,edition,old_file_json,retirement_state,retirement_json,provenance_json,(SELECT media_type FROM operations WHERE id=operation_id) FROM rss_candidate_imports WHERE operation_id=?",[operation]).await?.next().await? else {return Ok(None)};
+    let Some(r)=c.query("SELECT quality_id,revision_json,edition,old_file_json,retirement_state,retirement_json,provenance_json,(SELECT media_type FROM operations WHERE id=operation_id),candidate_id FROM rss_candidate_imports WHERE operation_id=?",[operation]).await?.next().await? else {return Ok(None)};
     let provenance: serde_json::Value =
         serde_json::from_str(&r.get::<String>(6)?).map_err(|_| Error::internal())?;
+    let revision_json: String = r.get(1)?;
+    let revision: crate::media_files::FileRevision =
+        serde_json::from_str(&revision_json).map_err(|_| Error::internal())?;
+    revision.validate().map_err(|_| Error::internal())?;
+    if let Some(binding) = provenance.get("revision_binding") {
+        let binding: crate::search::revision::Binding =
+            serde_json::from_value(binding.clone()).map_err(|_| Error::internal())?;
+        binding.validate().map_err(|_| Error::internal())?;
+        if binding.effective != revision {
+            return Err(Error::internal());
+        }
+    }
     let expected_size = provenance
         .get("expected_size")
         .and_then(serde_json::Value::as_u64)
@@ -55,8 +68,9 @@ pub(super) async fn facts(c: &Connection, operation: &str) -> Result<Option<Fact
     Ok(Some(Facts {
         evidence,
         expected_size,
+        candidate_id: r.get(8)?,
         quality_id: r.get(0)?,
-        revision_json: r.get(1)?,
+        revision_json,
         edition: r.get(2)?,
         old: r
             .get::<Option<String>>(3)?
@@ -129,12 +143,21 @@ pub(super) async fn before(
         .await?
         .ok_or_else(Error::internal)?
         .get(0)?;
-    let decision = crate::search::downloaded::evaluate_with_evidence(
+    let frozen: crate::media_files::FileRevision =
+        serde_json::from_str(&f.revision_json).map_err(|_| Error::internal())?;
+    frozen.validate().map_err(|_| Error::internal())?;
+    let candidate = uuid::Uuid::parse_str(&f.candidate_id).map_err(|_| Error::internal())?;
+    let context = crate::commands::search::authority(c, candidate)
+        .await
+        .map_err(|_| Error::conflict("preflight_changed", "Release authority changed"))?;
+    let decision = crate::search::downloaded::evaluate_owned(
         c,
         t,
         &source,
         f.expected_size,
         f.evidence.clone(),
+        &frozen,
+        context,
     )
     .await
     .map_err(|_| Error::conflict("preflight_changed", "Import policy evaluation failed"))?;
@@ -190,10 +213,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     }
     let revision: crate::media_files::FileRevision = serde_json::from_str(&input.revision_json)
         .map_err(|_| Error::bad("Invalid factual revision"))?;
-    if revision.version < 1
-        || revision.real < 0
-        || input.edition.as_ref().is_some_and(|v| v.len() > 1024)
-    {
+    if revision.validate().is_err() || input.edition.as_ref().is_some_and(|v| v.len() > 1024) {
         return Err(Error::bad("Invalid file facts"));
     }
     let own = ownership(&c, &input.target).await?;
@@ -273,6 +293,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         &preflight.root,
         &preflight.basename,
         preflight.quality_id,
+        &preflight.revision_binding.effective,
         preflight.edition.as_deref(),
         &preflight.evidence,
     )
@@ -341,6 +362,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         &accepted.root,
         &accepted.basename,
         accepted.quality_id,
+        &accepted.revision_binding.effective,
         accepted.edition.as_deref(),
         &accepted.evidence,
     )
@@ -392,7 +414,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         params![operation.clone(), json(&plan)?],
     )
     .await?;
-    let provenance = serde_json::json!({"policy_revision":input.policy_revision,"mapping_id":input.mapping_id,"mapping_revision":input.mapping_revision,"host":input.host,"expected_size":input.expected_size,"comparison_facts":accepted.evidence});
+    let provenance = serde_json::json!({"policy_revision":input.policy_revision,"mapping_id":input.mapping_id,"mapping_revision":input.mapping_revision,"host":input.host,"expected_size":input.expected_size,"comparison_facts":accepted.evidence,"revision_binding":accepted.revision_binding});
     if json(&provenance)?.len() > 16384 {
         return Err(Error::bad("Import factual provenance exceeds limit"));
     }

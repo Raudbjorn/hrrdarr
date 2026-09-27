@@ -139,6 +139,7 @@ pub(super) async fn replacements() {
     // Keep execute() regressions within the shared serial recovery test: its permit is global.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
+    legacy_revision_marker_conflict_preserves_sources().await;
     // Real owned producer and journal transitions, not fabricated replacement sidecars.
     for (movie, shared) in [(false, false), (true, false), (false, true)] {
         let dir = Scratch::new();
@@ -707,7 +708,8 @@ async fn legacy_owned_journals_revalidate_current_policy_before_recovery() {
 }
 
 async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, invalid_size: bool) {
-    // Fixture-only historical shape: old journals had expected_size but no comparison facts.
+    // Fixture-only historical shape: old journals had expected_size but no comparison
+    // facts or revision binding. Preserve this genuinely legacy coverage as new journals evolve.
     // Temporarily relax immutable guards in this scratch transaction, restore the exact
     // trigger definitions, and only then invoke application recovery. No migration changes.
     let tx = c.transaction().await.unwrap();
@@ -735,7 +737,7 @@ async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, inv
             .unwrap();
         triggers.push(sql);
     }
-    tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_remove(provenance_json,'$.comparison_facts') WHERE operation_id=?",[operation]).await.unwrap();
+    tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_remove(provenance_json,'$.comparison_facts','$.revision_binding') WHERE operation_id=?",[operation]).await.unwrap();
     if invalid_size {
         tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_set(provenance_json,'$.expected_size',0) WHERE operation_id=?",[operation]).await.unwrap();
     }
@@ -794,6 +796,7 @@ async fn custom_format_naming_changes_reject_before_journaling() {
                 &accepted.root,
                 &accepted.basename,
                 accepted.quality_id,
+                &accepted.revision_binding.effective,
                 accepted.edition.as_deref(),
                 &accepted.evidence,
             )
@@ -831,6 +834,7 @@ async fn custom_format_naming_changes_reject_before_journaling() {
                 &accepted.root,
                 &accepted.basename,
                 accepted.quality_id,
+                &accepted.revision_binding.effective,
                 accepted.edition.as_deref(),
                 &accepted.evidence,
             )
@@ -850,6 +854,168 @@ async fn custom_format_naming_changes_reject_before_journaling() {
             );
             assert_eq!(std::fs::read(source).unwrap(), b"new-media-content");
             assert_eq!(count(&db, "operations").await, 0);
+        }
+    }
+}
+
+async fn legacy_revision_marker_conflict_preserves_sources() {
+    for movie in [false, true] {
+        for published in [false, true] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            let mut input = fixture(&dir, &db, movie, false).await;
+            let stem = if movie {
+                "Movie.2020.1080p.WEB-DL.RERIP2"
+            } else {
+                "TV.S01E01.1080p.WEB-DL.RERIP2"
+            };
+            let source = dir.path(&format!("downloads/{stem}.mkv"));
+            std::fs::copy(&input.source, &source).unwrap();
+            input.source = source.clone();
+            input.destination = dir.path(&format!(
+                "{}/{stem}.mkv",
+                if movie { "movies" } else { "tv" }
+            ));
+            let factual = serde_json::json!({"version":3,"real":0,"is_repack":true});
+            input.revision_json = serde_json::to_string(&crate::media_files::FileRevision {
+                version: 3,
+                real: 0,
+                is_repack: true,
+            })
+            .unwrap();
+            let candidate = input.candidate_id.clone();
+            let c = db.connect().await.unwrap();
+            // Construct the modern valid preparation first. This scratch-only rewrite
+            // restores trigger definitions before the application is ever invoked.
+            let tx = c.transaction().await.unwrap();
+            let mut triggers = Vec::new();
+            for name in ["rss_candidate_transition", "rss_comparison_facts_update"] {
+                let sql: String = tx
+                    .query("SELECT sql FROM sqlite_master WHERE name=?", [name])
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get(0)
+                    .unwrap();
+                tx.execute_batch(&format!("DROP TRIGGER {name}"))
+                    .await
+                    .unwrap();
+                triggers.push(sql);
+            }
+            let raw: String = tx
+                .query(
+                    "SELECT comparison_facts_json FROM rss_candidates WHERE id=?",
+                    [candidate.clone()],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            let mut evidence: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            evidence["title"] = serde_json::json!(stem);
+            evidence["revision"] =
+                serde_json::json!({"parser_version":1,"value":factual,"explicit_marker":true});
+            tx.execute(
+                "UPDATE rss_candidates SET comparison_facts_json=? WHERE id=?",
+                params![evidence.to_string(), candidate.clone()],
+            )
+            .await
+            .unwrap();
+            for sql in triggers {
+                tx.execute_batch(&sql).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+            let operation = prepare_owned(db.clone(), input)
+                .await
+                .unwrap()
+                .id
+                .to_string();
+            if published {
+                stage_and_publish(&db, &operation, true).await;
+            }
+            legacy_provenance(&c, &operation, &candidate, false).await;
+            // Historical parser missed RERIP2 and accepted baseline. Represent its
+            // immutable journal exactly; new parsing must block, not rewrite history.
+            let tx = c.transaction().await.unwrap();
+            let sql: String = tx
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE name='candidate_import_immutable'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            tx.execute_batch("DROP TRIGGER candidate_import_immutable")
+                .await
+                .unwrap();
+            tx.execute(
+                "UPDATE rss_candidate_imports SET revision_json=? WHERE operation_id=?",
+                params![
+                    serde_json::json!({"version":1,"real":0,"is_repack":false}).to_string(),
+                    operation.clone()
+                ],
+            )
+            .await
+            .unwrap();
+            tx.execute_batch(&sql).await.unwrap();
+            tx.commit().await.unwrap();
+            let row=c.query("SELECT revision_json,provenance_json FROM rss_candidate_imports WHERE operation_id=?",[operation.clone()]).await.unwrap().next().await.unwrap().unwrap();
+            let frozen = (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap());
+            // Release the retained query row as well as its connection before reopening;
+            // the fixture must not hold the old database read lock during recovery.
+            drop(row);
+            drop(c);
+            drop(db);
+            let db = dir.database().await;
+            let error = execute(db.clone(), &operation).await.unwrap_err();
+            assert_eq!(
+                error.code(),
+                "preflight_changed",
+                "movie={movie} published={published}: {error:?}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), b"new-media-content");
+            assert_eq!(
+                std::fs::read(dir.path(if movie {
+                    "movies/old.mkv"
+                } else {
+                    "tv/old.mkv"
+                }))
+                .unwrap(),
+                b"original-media"
+            );
+            assert_eq!(count(&db, "import_history").await, 0);
+            let c = db.connect().await.unwrap();
+            let persisted: String = c
+                .query(
+                    "SELECT error_code FROM import_journal WHERE operation_id=?",
+                    [operation.clone()],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(persisted, "preflight_changed");
+            let row=c.query("SELECT revision_json,provenance_json FROM rss_candidate_imports WHERE operation_id=?",[operation]).await.unwrap().next().await.unwrap().unwrap();
+            assert_eq!(
+                (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()),
+                frozen
+            );
         }
     }
 }

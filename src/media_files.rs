@@ -561,20 +561,9 @@ pub(crate) fn quality(
     let revision = match o.get("revision") {
         None | Some(JsonValue::Null) => None,
         Some(v) => {
-            let r = v.as_object().ok_or("Invalid quality revision")?;
-            if r.len() != 3
-                || r.get("version")
-                    .and_then(JsonValue::as_i64)
-                    .filter(|v| *v >= 1 && *v <= i32::MAX as i64)
-                    .is_none()
-                || r.get("real")
-                    .and_then(JsonValue::as_i64)
-                    .filter(|v| *v >= 0 && *v <= i32::MAX as i64)
-                    .is_none()
-                || r.get("is_repack").and_then(JsonValue::as_bool).is_none()
-            {
-                return Err("Invalid quality revision");
-            }
+            let revision: FileRevision =
+                serde_json::from_value(v.clone()).map_err(|_| "Invalid quality revision")?;
+            revision.validate()?;
             Some(v.to_string())
         }
     };
@@ -605,12 +594,22 @@ pub(crate) fn languages(
     Ok(Some(value.to_string()))
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct FileRevision {
     pub version: i64,
     pub real: i64,
     pub is_repack: bool,
+}
+impl FileRevision {
+    pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
+        if !(1..=i64::from(i32::MAX)).contains(&self.version)
+            || !(0..=i64::from(i32::MAX)).contains(&self.real)
+        {
+            return Err("Invalid quality revision");
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]

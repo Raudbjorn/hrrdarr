@@ -762,7 +762,7 @@ async fn commit(
             if let Ok(parsed)=crate::search::parser::parse(stem,tv){
                 let evidence=crate::custom_formats::parsed(stem,&parsed,tv,Some(stage.size()));
                 let quality=if let Some(name)=parsed.quality_name {tx.query("SELECT quality_id FROM quality_definitions WHERE media_type=? AND name=?",params![scope,name]).await?.next().await?.map(|r|r.get::<i64>(0)).transpose()?}else{None};
-                tx.execute(&format!("UPDATE file_metadata SET quality_id=?,languages_json=?,release_group=?,release_type=? WHERE media_type=? AND {column}=?"),params![quality,evidence.languages.as_ref().map(json).transpose()?,evidence.release_group,evidence.release_type,scope,fid]).await?;
+                tx.execute(&format!("UPDATE file_metadata SET quality_id=?,languages_json=?,release_group=?,release_type=?,revision_json=? WHERE media_type=? AND {column}=?"),params![quality,evidence.languages.as_ref().map(json).transpose()?,evidence.release_group,evidence.release_type,if parsed.revision_marker { parsed.revision.as_ref().map(json).transpose()? } else { None },scope,fid]).await?;
                 if let Some(fid)=file_movie {tx.execute("UPDATE movie_files SET edition=? WHERE id=?",params![evidence.edition,fid]).await?;}
             }
         }

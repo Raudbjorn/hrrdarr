@@ -255,10 +255,12 @@ fn render_field(
 fn example_episode_facts() -> render::EpisodeNamingFacts {
     render::EpisodeNamingFacts {
         series_title: "Halcyon Vale".into(),
+        anime: false,
         season: 3,
         episode: 7,
         episode_title: Some("The Long Dark".into()),
         quality_title: "WEBDL-1080p".into(),
+        revision: None,
         custom_formats: vec!["Surround Sound".into(), "x265".into()],
         air_date: Some("2024-05-14".into()),
     }
@@ -270,6 +272,7 @@ fn example_movie_facts() -> render::MovieNamingFacts {
         release_year: Some(2023),
         edition: Some("Director's Cut".into()),
         quality_title: "Bluray-1080p".into(),
+        revision: None,
         custom_formats: vec!["Surround Sound".into(), "x265".into()],
     }
 }
