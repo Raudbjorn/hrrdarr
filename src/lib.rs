@@ -40,3 +40,5 @@ pub mod tags;
 
 pub mod delay_profiles;
 pub mod revision_policy;
+
+pub mod release_profile_terms;
