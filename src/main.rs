@@ -170,6 +170,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
+        .merge(hrrdarr::tags::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))

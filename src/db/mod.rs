@@ -163,6 +163,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "snapshot_custom_formats",
         include_str!("../../migrations/0036_snapshot_custom_formats.sql"),
     ),
+    ("tags", include_str!("../../migrations/0037_tags.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -695,3 +696,6 @@ mod custom_format_tests;
 
 #[cfg(test)]
 mod candidate_fact_tests;
+
+#[cfg(test)]
+mod tag_tests;

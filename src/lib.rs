@@ -35,3 +35,5 @@ pub mod parse;
 pub mod languages;
 
 pub mod custom_formats;
+
+pub mod tags;

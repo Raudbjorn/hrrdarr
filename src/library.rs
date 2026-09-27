@@ -140,6 +140,13 @@ pub struct Patch {
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as = "Option<crate::tags::Assignment>", optional)]
+    pub tags: Change<crate::tags::Assignment>,
+    #[serde(
+        default,
+        deserialize_with = "change",
+        skip_serializing_if = "Change::is_missing"
+    )]
     #[ts(as = "Option<bool>", optional)]
     pub monitored: Change<bool>,
     #[serde(
@@ -287,6 +294,7 @@ pub struct Season {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
+    pub tag_ids: Vec<i64>,
     pub id: i64,
     pub media_type: Domain,
     pub metadata_id: Option<i64>,
@@ -575,6 +583,9 @@ async fn fetch(
     let mut bytes = 1024;
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
+            tag_ids: crate::tags::assigned(c, d, r.get(0)?)
+                .await
+                .map_err(tag_error)?,
             id: r.get(0)?,
             media_type: d,
             metadata_id: r.get(1)?,
@@ -741,7 +752,19 @@ fn boolean_value(value: &Change<bool>) -> Option<Value> {
         Change::Value(v) => Some(Value::Integer(i64::from(*v))),
     }
 }
+fn tag_error(e: crate::qualities::Error) -> Error {
+    Error(e.0, e.1, e.2)
+}
 fn patch_fields(d: Domain, p: &Patch) -> Result<Vec<(&'static str, Value)>> {
+    match &p.tags {
+        Change::Null => {
+            return Err(bad(
+                "Tags cannot be null; use replace with an empty ID array",
+            ));
+        }
+        Change::Value(a) => crate::tags::validate(a).map_err(bad)?,
+        Change::Missing => {}
+    }
     if matches!(p.monitored, Change::Null) {
         return Err(bad("Monitoring cannot be null"));
     }
@@ -783,6 +806,25 @@ fn patch_fields(d: Domain, p: &Patch) -> Result<Vec<(&'static str, Value)>> {
 }
 async fn patch(c: &Connection, d: Domain, id: i64, p: &Patch, creating: bool) -> Result<()> {
     let fields = patch_fields(d, p)?;
+    if let Change::Value(a) = &p.tags {
+        crate::tags::assign(c, d, id, a, true)
+            .await
+            .map_err(tag_error)?;
+    } else if creating && matches!(p.tags, Change::Missing) {
+        // Native creation owns its initial empty set, even if an old snapshot mapping reuses an ID.
+        crate::tags::assign(
+            c,
+            d,
+            id,
+            &crate::tags::Assignment {
+                mode: crate::tags::Mode::Replace,
+                ids: vec![],
+            },
+            true,
+        )
+        .await
+        .map_err(tag_error)?;
+    }
     if let Change::Value(profile) = p.quality_profile_id {
         let mut rows = c
             .query(
@@ -797,6 +839,7 @@ async fn patch(c: &Connection, d: Domain, id: i64, p: &Patch, creating: bool) ->
     if !creating
         && fields.is_empty()
         && !changed(&p.monitored)
+        && !changed(&p.tags)
         && p.seasons.as_ref().is_none_or(Vec::is_empty)
     {
         return Err(bad("Update requires a supported setting"));

@@ -31,6 +31,12 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::tags::Input>();
+    registry.visit::<crate::tags::Tag>();
+    registry.visit::<crate::tags::Assignment>();
+    registry.visit::<crate::tags::Detail>();
+    registry.visit::<crate::tags::Owners>();
+    registry.visit::<crate::tags::Page>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
         crate::custom_formats::Input,

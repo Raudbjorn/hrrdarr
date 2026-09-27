@@ -212,11 +212,11 @@ export type LibraryCreate = { title?: string | null, year?: number | null, tvdb_
 
 export type LibraryEditor = { ids: Array<number>, patch: LibraryPatch, };
 
-export type LibraryItem = { id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
+export type LibraryItem = { tag_ids: Array<number>, id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
 
 export type LibraryPage = { items: Array<LibraryItem>, total: number, limit: number, offset: number, };
 
-export type LibraryPatch = { monitored?: boolean, quality_profile_id?: number | null, series_type?: SeriesType | null, season_folder?: boolean | null, use_scene_numbering?: boolean | null, monitor_new_items?: MonitorNewItems | null, minimum_availability?: MinimumAvailability | null, seasons?: Array<LibrarySeasonInput> | null, };
+export type LibraryPatch = { tags?: TagAssignment, monitored?: boolean, quality_profile_id?: number | null, series_type?: SeriesType | null, season_folder?: boolean | null, use_scene_numbering?: boolean | null, monitor_new_items?: MonitorNewItems | null, minimum_availability?: MinimumAvailability | null, seasons?: Array<LibrarySeasonInput> | null, };
 
 export type LibraryQuery = { limit?: number, offset?: number, ids?: string, tvdb_id?: number, tmdb_id?: number, };
 
@@ -533,6 +533,20 @@ export type SourceHistoryEvent = { id: SourceHistoryIdentity, event_type: Source
 export type SourceHistoryEventType = "grabbed" | "series_folder_imported" | "download_folder_imported" | "download_failed" | "file_deleted" | "file_renamed" | "download_ignored" | "movie_folder_imported";
 
 export type SourceHistoryIdentity = { application: SnapshotApplication, fingerprint: string, source_id: number, };
+
+export type Tag = { id: number, media_type: MediaDomain, label: string, };
+
+export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
+
+export type TagAssignmentMode = "add" | "remove" | "replace";
+
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, };
+
+export type TagInput = { label: string, };
+
+export type TagOwners = { ids: Array<number>, total: number, limit: number, offset: number, };
+
+export type TagOwnersQuery = { limit?: number, offset?: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
 
