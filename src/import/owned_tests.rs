@@ -135,6 +135,8 @@ pub(super) async fn fixture(
 }
 
 pub(super) async fn replacements() {
+    // Keep execute() regressions within the shared serial recovery test: its permit is global.
+    changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
     // Real owned producer and journal transitions, not fabricated replacement sidecars.
     for (movie, shared) in [(false, false), (true, false), (false, true)] {
@@ -517,7 +519,6 @@ pub(super) async fn replacements() {
     );
 }
 
-#[tokio::test]
 async fn changed_original_title_or_format_policy_prevents_owned_replacement() {
     for movie in [false, true] {
         let dir = Scratch::new();
@@ -537,7 +538,11 @@ async fn changed_original_title_or_format_policy_prevents_owned_replacement() {
         let domain = if movie { "movies" } else { "tv" };
         // Original title is part of the replacement identity snapshot, not decorative metadata.
         c.execute("UPDATE file_metadata SET original_release_title='changed-after-preview' WHERE media_type=?",[domain]).await.unwrap();
-        assert!(execute(db.clone(), &operation).await.is_err());
+        // Require the identity rejection; an unrelated import_busy error proves nothing here.
+        assert_eq!(
+            execute(db.clone(), &operation).await.unwrap_err().code(),
+            "target_changed"
+        );
         assert_eq!(std::fs::read(&oldpath).unwrap(), b"original-media");
         assert_eq!(count(&db, "import_history").await, 0);
     }
@@ -563,7 +568,11 @@ async fn changed_original_title_or_format_policy_prevents_owned_replacement() {
         )
         .await
         .unwrap();
-        assert!(execute(db.clone(), &operation).await.is_err());
+        // Require policy rejection rather than any error from the execution boundary.
+        assert_eq!(
+            execute(db.clone(), &operation).await.unwrap_err().code(),
+            "preflight_changed"
+        );
         assert_eq!(std::fs::read(&oldpath).unwrap(), b"original-media");
         assert_eq!(count(&db, "import_history").await, 0);
     }
