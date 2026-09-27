@@ -58,9 +58,10 @@ atomically. Empty replacement explicitly clears their tags. Assignment requests
 contain only the tag patch, preserving unrelated settings and local settings drafts.
 Full returned library records provide assignment readback with current tag labels.
 
-Editors remain mounted across workspace navigation. Same-session catalog,
-assignment, and creation writes cannot overlap; unknown outcomes block further
-related writes until explicit catalog/owner readback. Creation reconciles by its
+Editors remain mounted across workspace navigation. Within each media domain, same-session catalog,
+assignment, and creation writes cannot overlap; independent domains can write
+concurrently. Unknown outcomes block further related writes in that domain until
+explicit catalog/owner readback. Creation reconciles by its
 external metadata identity. Catalog changes invalidate older selections; explicit
 reload clears stale tag IDs so a reused native ID cannot silently select a new label.
 Domain changes reset assignment action to Add. Reads use epochs and domain checks;
