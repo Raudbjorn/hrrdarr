@@ -48,9 +48,38 @@ silently converted into empty sets. Missing catalogs with nonempty assignments
 are reported unsupported. These limits and interpretations are native contracts,
 not a claim of V3 wire compatibility or unlimited upstream capacity.
 
+## Browser workflows
+
+Tags settings supports both domain catalogs, normalized create-or-return, rename,
+usage counts, paged owner links, and explicit delete confirmation. Assigned tags
+remain protected by the real API. The library add form offers optional catalog
+selection; Library tags applies add, remove, or replace to up to 25 selected owners
+atomically. Empty replacement explicitly clears their tags. Assignment requests
+contain only the tag patch, preserving unrelated settings and local settings drafts.
+Full returned library records provide assignment readback with current tag labels.
+
+Editors remain mounted across workspace navigation. Same-session catalog,
+assignment, and creation writes cannot overlap; unknown outcomes block further
+related writes until explicit catalog/owner readback. Creation reconciles by its
+external metadata identity. Catalog changes invalidate older selections; explicit
+reload clears stale tag IDs so a reused native ID cannot silently select a new label.
+Domain changes reset assignment action to Add. Reads use epochs and domain checks;
+usage pages contain at most 25 links and assignment reconciliation reads at most 25
+owners. Loading, error, empty, and retained-draft states use native accessible controls.
+
+Requirements were checked against the pinned Sonarr/Radarr Settings/Tags and
+Series/Movie editing surfaces (label selection, usage, and deletion intent); their
+implementation was not copied. `frontend/tests/tags-browser.mjs` exercises both
+native domain APIs through the browser, including metadata creation, atomic bulk
+assignment, remove/empty replace, in-use deletion, and controlled lost responses, 26-owner paging, and late reads across domain switches.
+The API/helper tests cover scope, payload projection, label bounds and empty semantics.
+
 ## Not claimed
 
-No tag management UI ships in this backend unit. Provider, delay/release profile,
+Concurrent external clients have no revision/CAS protection. A full browser reload
+can discard local pending/uncertain state; this editor does not introduce durable
+mutation receipts. Owner links identify native series/movie IDs rather than
+upstream provider references. Provider, delay/release profile,
 list, notification and autotag tag references are not yet implemented; their
 source fields remain archived unsupported and do not silently become active.
 No external services or real media are used. Tag reconstruction does not complete

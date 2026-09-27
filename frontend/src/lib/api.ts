@@ -1,3 +1,4 @@
+import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -224,3 +225,12 @@ export const getQualityDefinitionLimits = (domain: MediaDomain) => request<impor
 export const getQualityDefinitionDefaults = (domain: MediaDomain) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/defaults`, undefined, undefined, true);
 export const updateQualityDefinitions = (domain: MediaDomain, input: import('./api.generated').QualityDefinitionUpdate[]) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/bulk`, input, 'PUT', true);
 export const resetQualityDefinitions = (domain: MediaDomain, resetTitles: boolean) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/reset`, { reset_titles: resetTitles }, 'POST', true);
+
+const tagPath = (domain: MediaDomain) => `/api/v1/${domain}/tags`;
+export const listTags = (domain: MediaDomain) => request<Tag[]>(tagPath(domain), undefined, undefined, true);
+export const listTagDetails = (domain: MediaDomain) => request<TagDetail[]>(`${tagPath(domain)}/detail`, undefined, undefined, true);
+export const createTag = (domain: MediaDomain, label: string) => request<Tag>(tagPath(domain), {label}, 'POST', true);
+export const renameTag = (domain: MediaDomain, id: number, label: string) => validId(id) ? request<Tag>(`${tagPath(domain)}/${id}`, {label}, 'PUT', true) : invalid<Tag>();
+export const deleteTag = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`${tagPath(domain)}/${id}`, undefined, 'DELETE', true) : invalid<void>();
+export const getTagOwners = (domain: MediaDomain, id: number, offset = 0) => validId(id) && Number.isSafeInteger(offset) && offset >= 0 ? request<TagOwners>(`${tagPath(domain)}/${id}/owners?limit=25&offset=${offset}`, undefined, undefined, true) : invalid<TagOwners>();
+export const assignLibraryTags = (domain: MediaDomain, ids: number[], tags: TagAssignment) => ids.length > 0 && ids.length <= 100 && ids.every(validId) && tags.ids.length <= 200 && tags.ids.every(validId) ? request<LibraryItem[]>(`${collection(domain)}/editor`, {ids,patch:{tags}}, 'PUT', true) : invalid<LibraryItem[]>();

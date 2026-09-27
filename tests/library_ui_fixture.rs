@@ -612,6 +612,7 @@ async fn library_ui_fixture() {
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
+            .merge(hrrdarr::tags::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
             .merge(hrrdarr::naming::router(db.clone()))
