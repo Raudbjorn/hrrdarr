@@ -19,7 +19,13 @@ pub(crate) enum DestinationError {
     Internal(&'static str),
     /// The configured template failed to parse or render against the current facts. The
     /// caller must surface this to the operator rather than falling back silently.
-    Render(String),
+    Render(RenderFailure),
+}
+/// Only allowlisted field/phase identifiers may cross the process-log boundary.
+#[derive(Debug)]
+pub(crate) struct RenderFailure {
+    pub field: &'static str,
+    pub class: &'static str,
 }
 impl From<libsql::Error> for DestinationError {
     fn from(error: libsql::Error) -> Self {
@@ -67,11 +73,18 @@ fn finish_render(
     root: &str,
     basename: &str,
 ) -> Result<String, DestinationError> {
-    let parsed = render::parse(field, template).map_err(|e| {
-        DestinationError::Render(format!("{} template is invalid: {e}", field.name()))
+    let parsed = render::parse(field, template).map_err(|_| {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "invalid_template",
+        })
     })?;
-    let stem = render::render(&parsed, facts, config)
-        .map_err(|e| DestinationError::Render(format!("{} failed to render: {e}", field.name())))?;
+    let stem = render::render(&parsed, facts, config).map_err(|_| {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "render_failed",
+        })
+    })?;
     let extension = basename.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
     let budget = render::MAX_COMPONENT_BYTES.saturating_sub(extension.len() + 1);
     let stem = render::cap_bytes(&stem, budget);
@@ -275,6 +288,15 @@ mod tests {
             "release.mkv",
         )
         .unwrap_err();
-        assert!(matches!(err, DestinationError::Render(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                DestinationError::Render(RenderFailure {
+                    field: "standard_episode_format",
+                    class: "render_failed"
+                })
+            ),
+            "{err:?}"
+        );
     }
 }

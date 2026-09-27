@@ -572,15 +572,11 @@ async fn preflight(
             {
                 Ok(destination) => destination,
                 Err(crate::naming::destination::DestinationError::Render(detail)) => {
-                    // `error_code` is a closed enum (migration 0026) with no naming-specific
-                    // member, and `reasons_json` rejects anything but `[a-z0-9_]*` (<=128
-                    // bytes) -- `detail` is a free-text sentence, so it can never be stored
-                    // directly. Log the actionable detail; store a short, valid reason token
-                    // plus the closest existing error_code (this item can't be turned into a
-                    // supported import under the current naming configuration).
+                    // Stored templates may be corrupt: never log their text or parser errors.
+                    // Preserve the existing blocked reason and allowlist diagnostic identifiers.
                     eprintln!(
                         "{}",
-                        serde_json::json!({"level":"ERROR","event":"naming_render_failed","candidate_id":item.receipt_id.to_string(),"detail":detail})
+                        serde_json::json!({"level":"ERROR","event":"naming_render_failed","candidate_id":item.receipt_id.to_string(),"field":detail.field,"error_class":detail.class})
                     );
                     blocked(
                         &c,

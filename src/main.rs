@@ -123,7 +123,10 @@ async fn run() -> Result<(), ProcessFailure> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
-    println!("hrrdarr listening on http://{addr}");
+    let bound = listener
+        .local_addr()
+        .map_err(|e| ProcessFailure::at("listener_bind", e))?;
+    println!("hrrdarr listening on http://{bound}");
     let runtime = if state.db.permits_local_imports() {
         Some(
             hrrdarr::commands::start_with_metadata(
