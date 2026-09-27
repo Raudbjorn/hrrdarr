@@ -1,12 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { MediaDomain, QualityProfilePage, QualityProfileInput, QualityDefinition, CustomFormat, CustomFormatChoice, QualityProfileLeafInput } from './api.generated';
+  import type { SettingsWriteState } from './api';
   import { listQualityProfiles, getQualityProfile, getQualityProfileSchema, listQualityDefinitions, createQualityProfile, updateQualityProfile, deleteQualityProfile, listCustomFormats, getCustomFormatSchema } from './api';
   import { fromInput, toInput, reorder, addGroup, dissolve, moveLeaf, setAllowed, validateDraft, type Draft } from './profile-draft';
-  let { onchange = (_domain: MediaDomain) => {} } = $props<{ onchange?: (domain: MediaDomain) => void }>();
+  let { onchange = (_domain: MediaDomain) => {}, catalogVersions = {tv:0,movies:0}, relatedWrites = {tv:'idle',movies:'idle'}, onwritestate = (_domain:MediaDomain,_state:SettingsWriteState)=>{} } = $props<{ onchange?: (domain: MediaDomain) => void; catalogVersions?: Record<MediaDomain,number>; relatedWrites?: Record<MediaDomain,SettingsWriteState>; onwritestate?: (domain:MediaDomain,state:SettingsWriteState)=>void }>();
   let domain: MediaDomain = $state('tv'), page: QualityProfilePage | null = $state(null), draft: Draft | null = $state(null), id: number | null = $state(null);
   let catalog: QualityDefinition[] = $state([]), formats: CustomFormat[] = $state([]), languages: CustomFormatChoice[] = $state([]), template: QualityProfileInput | null = $state(null);
   let loading = $state(false), busy = $state(false), dirty = $state(false), uncertain = $state(false), error = $state(''), notice = $state(''), deleting = $state(false);
+  let stale = $state(false);
+  const seenCatalogVersions = {tv:0,movies:0};
+  $effect(() => {
+    const revision = catalogVersions[domain];
+    if (revision !== seenCatalogVersions[domain]) {
+      seenCatalogVersions[domain] = revision;
+      deleting = false;
+      if (draft) stale = true;
+    }
+  });
+  $effect(()=>{if(relatedWrites[domain]!=='idle')deleting=false;});
   let groupName = $state(''), addQuality = $state('');
   let alive = true, epoch = 0;
   const title = (quality: number) => catalog.find(d => d.quality.id === quality)?.title ?? `Unknown quality ${quality}`;
@@ -23,11 +35,11 @@
     page = p.data; catalog = c.data; formats = f.data; languages = s.data.choices.language ?? []; template = t.data;
   }
   async function changeDomain(next: MediaDomain) {
-    if (next === domain || busy || loading || !discard()) return;
-    domain = next; draft = null; id = null; dirty = false; uncertain = false; page = null; template = null; await load();
+    if (next === domain || busy || loading || uncertain || !discard()) return;
+    domain = next; draft = null; id = null; stale = false; dirty = false; uncertain = false; page = null; template = null; await load();
   }
   function fill(input: QualityProfileInput, profileId: number | null) {
-    draft = fromInput(input); id = profileId; dirty = false; uncertain = false; deleting = false; error = ''; notice = '';
+    draft = fromInput(input); id = profileId; stale = false; dirty = false; uncertain = false; deleting = false; error = ''; notice = ''; onwritestate(domain,'idle');
     if (draft.policy) {
       const scores = new Map(draft.policy.format_items.map(f => [f.format_id,f.score]));
       // Preserve unknown references so stale/deleted formats cannot silently lose a configured score.
@@ -37,12 +49,13 @@
   async function edit(profileId: number, duplicate = false) {
     if (busy || loading || !discard()) return;
     deleting = false;
-    const version = ++epoch; loading = true; error = '';
-    const result = await getQualityProfile(domain,profileId);
+    const version = ++epoch, catalogVersion = catalogVersions[domain]; loading = true; error = '';
+    const [result, definitions] = await Promise.all([getQualityProfile(domain,profileId), listQualityDefinitions(domain)]);
     if (!alive || version !== epoch) return;
     loading = false;
-    if (!result.ok) { error = result.error; return; }
-    fill({...result.data,name:duplicate ? `${result.data.name} copy` : result.data.name},duplicate ? null : profileId); dirty = duplicate;
+    if (!result.ok || !definitions.ok) { error = !result.ok ? result.error : !definitions.ok ? definitions.error : ''; return; }
+    catalog = definitions.data;
+    fill({...result.data,name:duplicate ? `${result.data.name} copy` : result.data.name},duplicate ? null : profileId); dirty = duplicate; stale = catalogVersion !== catalogVersions[domain] || relatedWrites[domain]!=='idle';
   }
   function create() { if (!busy && !loading && !uncertain && template && discard()) { fill(template,null); dirty = true; } }
   function configure() {
@@ -50,25 +63,25 @@
     draft.policy = JSON.parse(JSON.stringify(template.policy)); draft.cutoff = ''; dirty = true;
   }
   async function save() {
-    if (!draft || busy || loading || uncertain) return;
+    if (!draft || busy || loading || uncertain || stale || relatedWrites[domain]!=='idle') return;
     const problem = validateDraft(draft,domain);
     if (problem) {error = problem; return;}
-    const input = toInput(draft), scope = domain, version = epoch;
-    deleting = false; busy = true; error = ''; notice = '';
+    const input = toInput(draft), scope = domain, version = epoch, catalogVersion = catalogVersions[domain];
+    deleting = false; busy = true; error = ''; notice = ''; onwritestate(scope,'busy');
     const result = id === null ? await createQualityProfile(scope,input) : await updateQualityProfile(scope,id,input);
     if (!alive || version !== epoch) return;
     busy = false;
-    if (!result.ok) { error = result.error; uncertain = result.status === undefined || result.status >= 500; return; }
-    fill(result.data,result.data.id); notice = 'Profile saved.'; onchange(scope); await load(page?.offset ?? 0);
+    if (!result.ok) { error = result.error; uncertain = result.status === undefined || result.status >= 500; onwritestate(scope,uncertain?'uncertain':'idle'); return; }
+    fill(result.data,result.data.id); stale = catalogVersion !== catalogVersions[domain] || relatedWrites[domain]!=='idle'; notice = 'Profile saved.'; onchange(scope); await load(page?.offset ?? 0);
   }
   async function remove() {
-    if (id === null || busy || loading || uncertain || !deleting) return;
-    const scope = domain, version = epoch; busy = true; error = '';
+    if (id === null || busy || loading || uncertain || stale || relatedWrites[domain]!=='idle' || !deleting) return;
+    const scope = domain, version = epoch; busy = true; error = ''; onwritestate(scope,'busy');
     const result = await deleteQualityProfile(scope,id);
     if (!alive || version !== epoch) return;
     busy = false; deleting = false;
-    if (!result.ok) { error = result.error; uncertain = result.status === undefined || result.status >= 500; return; }
-    draft = null; id = null; dirty = false; notice = 'Profile deleted.'; onchange(scope); await load();
+    if (!result.ok) { error = result.error; uncertain = result.status === undefined || result.status >= 500; onwritestate(scope,uncertain?'uncertain':'idle'); return; }
+    draft = null; id = null; stale = false; dirty = false; notice = 'Profile deleted.'; onwritestate(scope,'idle'); onchange(scope); await load();
   }
   function insertQuality() {
     if (!draft || addQuality === '') return;
@@ -87,11 +100,13 @@
 <section aria-label="Quality profiles" class="profiles">
   <h2>Quality profiles</h2>
   <p>Configure TV and movie quality preferences separately. Higher entries in this editor are lower priority; move qualities down to prefer them.</p>
-  <nav aria-label="Profile media type"><button disabled={busy || loading} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={busy || loading} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav>
+  <nav aria-label="Profile media type"><button disabled={busy || loading || uncertain} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={busy || loading || uncertain} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if notice}<p role="status">{notice}</p>{/if}
   {#if loading}<p role="status">Loading profiles…</p>{/if}
-  {#if uncertain}<p role="alert">The write outcome is unknown. Your draft is retained and retries are blocked. Refresh the list and reopen the saved profile to reconcile before making another write.</p><button disabled={busy || loading} onclick={() => {if(window.confirm('Have you checked the saved profiles? Discard this uncertain draft and start a new action?')) {draft=null;id=null;dirty=false;uncertain=false;}}}>Discard uncertain draft after checking saved profiles</button>{/if}
+  {#if relatedWrites[domain]!=='idle'}<p role="status">Global quality write {relatedWrites[domain]==='busy'?'in progress':'outcome unknown'}. Profile writes are blocked until it completes or is reconciled in Quality settings.</p>{/if}
+  {#if stale}<p role="alert">Global quality settings changed. This profile draft is retained but cannot be saved or deleted. Reopen the profile to read its current sizes, or explicitly create a new profile.</p>{/if}
+  {#if uncertain}<p role="alert">The write outcome is unknown. Your draft is retained and retries are blocked. Refresh the list and reopen the saved profile to reconcile before making another write.</p><button disabled={busy || loading} onclick={() => {if(window.confirm('Have you checked the saved profiles? Discard this uncertain draft and start a new action?')) {draft=null;id=null;dirty=false;uncertain=false;stale=false;onwritestate(domain,'idle');}}}>Discard uncertain draft after checking saved profiles</button>{/if}
   <button disabled={busy || loading} onclick={() => load(page?.offset ?? 0)}>Refresh list and catalogs</button>
   <button disabled={busy || loading || !template || uncertain} onclick={create}>New profile</button>
   {#if page}
@@ -101,7 +116,7 @@
   {/if}
   {#if draft}
     <form onsubmit={event => {event.preventDefault(); void save();}} oninput={() => dirty = true}>
-      <fieldset disabled={busy || loading || uncertain}>
+      <fieldset disabled={busy || loading || uncertain || stale || relatedWrites[domain]!=='idle'}>
         <legend>{id === null ? 'Create profile' : 'Edit profile'}</legend>
         <label>Profile name <input required maxlength="100" bind:value={draft.name} /></label>
         <p>Changes are saved together. Concurrent edits by other users are not detected by this API.</p>
@@ -142,7 +157,7 @@
         {#if id !== null}<button type="button" onclick={() => deleting=true}>Delete profile</button>{/if}
       </fieldset>
     </form>
-    {#if deleting}<div role="group" aria-label="Confirm profile deletion"><p>Delete this profile? Assigned profiles cannot be deleted.</p><button disabled={busy || loading || uncertain} onclick={remove}>Confirm delete profile</button><button disabled={busy || loading} onclick={() => deleting=false}>Cancel deletion</button></div>{/if}
+    {#if deleting}<div role="group" aria-label="Confirm profile deletion"><p>Delete this profile? Assigned profiles cannot be deleted.</p><button disabled={busy || loading || uncertain || stale || relatedWrites[domain]!=='idle'} onclick={remove}>Confirm delete profile</button><button disabled={busy || loading} onclick={() => deleting=false}>Cancel deletion</button></div>{/if}
     {#if dirty}<p role="status">Unsaved changes</p>{/if}
   {/if}
 </section>

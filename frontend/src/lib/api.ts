@@ -1,6 +1,7 @@
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
+export type SettingsWriteState = 'idle' | 'busy' | 'uncertain';
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -218,3 +219,8 @@ export const listQualityDefinitions = (domain: MediaDomain) => request<QualityDe
 export const createQualityProfile = (domain: MediaDomain, input: QualityProfileInput) => request<QualityProfile>(`/api/v1/${domain}/quality-profiles`, input, 'POST', true);
 export const updateQualityProfile = (domain: MediaDomain, id: number, input: QualityProfileInput) => validId(id) ? request<QualityProfile>(`/api/v1/${domain}/quality-profiles/${id}`, input, 'PUT', true) : invalid<QualityProfile>();
 export const deleteQualityProfile = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`/api/v1/${domain}/quality-profiles/${id}`, undefined, 'DELETE', true) : invalid<void>();
+
+export const getQualityDefinitionLimits = (domain: MediaDomain) => request<import('./api.generated').QualityDefinitionLimits>(`/api/v1/${domain}/quality-definitions/limits`, undefined, undefined, true);
+export const getQualityDefinitionDefaults = (domain: MediaDomain) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/defaults`, undefined, undefined, true);
+export const updateQualityDefinitions = (domain: MediaDomain, input: import('./api.generated').QualityDefinitionUpdate[]) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/bulk`, input, 'PUT', true);
+export const resetQualityDefinitions = (domain: MediaDomain, resetTitles: boolean) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/reset`, { reset_titles: resetTitles }, 'POST', true);
