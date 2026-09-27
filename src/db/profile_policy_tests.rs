@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 38); // Latest open adds revision preference; historical migration starts remain unchanged.
+    assert_eq!(version(&conn).await?, 39); // Latest open adds ordered delay profiles; historical migration starts remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

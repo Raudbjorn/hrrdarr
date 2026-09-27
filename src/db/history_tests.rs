@@ -136,7 +136,7 @@ async fn history_order_upgrade_rollback_preserves_facts_and_uses_index() -> Resu
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 38); // Latest open adds revision preference; historical migration starts remain unchanged.
+    assert_eq!(version(&conn).await?, 39); // Latest open adds ordered delay profiles; historical migration starts remain unchanged.
     assert_eq!(rows(&conn).await?, before);
     for predicate in [
         "",
@@ -321,7 +321,7 @@ CREATE TABLE History(Id INTEGER,MovieId INTEGER,Date TEXT,EventType INTEGER);INS
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 38); // Latest open adds revision preference; historical migration starts remain unchanged.
+    assert_eq!(version(&conn).await?, 39); // Latest open adds ordered delay profiles; historical migration starts remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT history_version FROM snapshot_imports").await?,
         0

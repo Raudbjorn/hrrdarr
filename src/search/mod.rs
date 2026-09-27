@@ -19,7 +19,7 @@ use axum::{
 };
 pub use decision::evaluate;
 pub(crate) use decision::target_ranks;
-use libsql::{Connection, params};
+use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -224,14 +224,25 @@ async fn put_policy(
     {
         return Err(SearchError("invalid_release_policy"));
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5),async {
-    let c =
-        s.db.connect()
-            .await
-            .map_err(|_| SearchError("release_storage_error"))?;
-    c.execute("INSERT INTO release_delay_policies(media_type,torrent_delay_minutes,usenet_delay_minutes,availability_delay_days) VALUES(?,?,?,?) ON CONFLICT(media_type) DO UPDATE SET torrent_delay_minutes=excluded.torrent_delay_minutes,usenet_delay_minutes=excluded.usenet_delay_minutes,availability_delay_days=excluded.availability_delay_days",params![domain(m),i64::from(p.torrent_delay_minutes),i64::from(p.usenet_delay_minutes),p.availability_delay_days]).await?;
-    Ok(Json(p))
-    }).await.map_err(|_|SearchError("release_policy_timeout"))?
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let c =
+            s.db.connect()
+                .await
+                .map_err(|_| SearchError("release_storage_error"))?;
+        let tx = c
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        match crate::delay_profiles::write_legacy(&tx, m, &p).await {
+            Ok(()) => tx.commit().await?,
+            Err(_) => {
+                tx.rollback().await?;
+                return Err(SearchError("release_policy_update_failed"));
+            }
+        }
+        Ok(Json(p))
+    })
+    .await
+    .map_err(|_| SearchError("release_policy_timeout"))?
 }
 async fn search(
     State(s): State<SearchState>,

@@ -31,6 +31,10 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::delay_profiles::Catalog>();
+    registry.visit::<crate::delay_profiles::Input>();
+    registry.visit::<crate::delay_profiles::Write>();
+    registry.visit::<crate::delay_profiles::Reorder>();
     registry.visit::<crate::revision_policy::Policy>();
     registry.visit::<crate::revision_policy::Update>();
     registry.visit::<crate::tags::Input>();

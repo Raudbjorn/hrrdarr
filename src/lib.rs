@@ -38,4 +38,5 @@ pub mod custom_formats;
 
 pub mod tags;
 
+pub mod delay_profiles;
 pub mod revision_policy;

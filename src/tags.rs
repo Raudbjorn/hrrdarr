@@ -49,6 +49,7 @@ pub struct Detail {
     pub tag: Tag,
     pub in_use: bool,
     pub owner_count: i64,
+    pub delay_profile_ids: Vec<i64>,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "TagOwners")]
@@ -210,6 +211,7 @@ pub(crate) async fn assign(
         .await?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let before = next.clone();
     for id in &a.ids {
         if c.query(
             "SELECT 1 FROM tags WHERE id=? AND media_type=?",
@@ -237,12 +239,24 @@ pub(crate) async fn assign(
     }
     c.execute(&format!("DELETE FROM {t} WHERE {k}=?"), [owner])
         .await?;
+    let changed = next != before;
     for id in next {
         c.execute(
             &format!("INSERT INTO {t}({k},tag_id)VALUES(?,?)"),
             params![owner, id],
         )
         .await?;
+    }
+    if changed {
+        crate::revision_policy::wake_pending(c, d)
+            .await
+            .map_err(|_| {
+                Error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tag_policy_wake_failed",
+                    "Tag policy reconsideration failed",
+                )
+            })?;
     }
     if local {
         c.execute(
@@ -351,9 +365,22 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
         .await?
         .ok_or_else(missing)?
         .get(0)?;
+    let delay_profile_ids = c
+        .query(
+            "SELECT profile_id FROM delay_profile_tags WHERE tag_id=?",
+            [t.id],
+        )
+        .await?
+        .next()
+        .await?
+        .map(|r| r.get::<i64>(0))
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
     Ok(Detail {
+        in_use: count > 0 || !delay_profile_ids.is_empty(),
+        delay_profile_ids,
         tag: t,
-        in_use: count > 0,
         owner_count: count,
     })
 }

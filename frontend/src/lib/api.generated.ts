@@ -82,6 +82,22 @@ export type CustomFormatSchema = { version: number, media_type: MediaDomain, con
 
 export type CustomFormatSpecification = { name: string, negate: boolean, required: boolean, condition: CustomFormatCondition, };
 
+export type DelayProfile = { id: number, media_type: MediaDomain, is_global: boolean, position: number, tag_ids: Array<number>, settings: DelaySettings, };
+
+export type DelayProfileCatalog = { revision: number, configured: boolean, availability_delay_days: number | null, profiles: Array<DelayProfile>, };
+
+export type DelayProfileInput = { settings: DelayProfileSettings, tag_ids: Array<number>, };
+
+export type DelayProfileReorder = { revision: number, ids: Array<number>, };
+
+export type DelayProfileSettings = { torrent_delay_minutes: number, usenet_delay_minutes: number, enable_torrent: boolean, enable_usenet: boolean, preferred_protocol: DelayProtocol, bypass_if_highest_quality: boolean, bypass_if_above_custom_format_score: boolean, minimum_custom_format_score: number, };
+
+export type DelayProfileWrite = { revision: number, profile: DelayProfileInput, };
+
+export type DelayProtocol = "usenet" | "torrent";
+
+export type DelaySettings = { "semantics": "legacy_age_only", torrent_delay_minutes: number | null, usenet_delay_minutes: number | null, } | { "semantics": "profile" } & DelayProfileSettings;
+
 export type Direction = "remote_to_local" | "local_to_remote";
 
 export type Disposition = "accept" | "reject" | "delay";
@@ -546,7 +562,7 @@ export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
 
 export type TagAssignmentMode = "add" | "remove" | "replace";
 
-export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, };
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, };
 
 export type TagInput = { label: string, };
 

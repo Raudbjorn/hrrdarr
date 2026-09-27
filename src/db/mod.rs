@@ -168,6 +168,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "revision_policy",
         include_str!("../../migrations/0038_revision_policy.sql"),
     ),
+    (
+        "delay_profiles",
+        include_str!("../../migrations/0039_delay_profiles.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -706,3 +710,6 @@ mod tag_tests;
 
 #[cfg(test)]
 mod revision_policy_tests;
+
+#[cfg(test)]
+mod delay_profile_tests;

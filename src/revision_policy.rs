@@ -120,14 +120,25 @@ pub(crate) async fn set(
     }
     c.execute("UPDATE revision_policies SET mode=?,revision=revision+1,locally_edited=CASE WHEN ? THEN 1 ELSE locally_edited END WHERE media_type=? AND revision=?",params![mode.text(),local,domain(m),expected]).await?;
     if mode != old.mode {
-        c.execute("UPDATE rss_commands SET next_attempt_at=0 WHERE media_type=? AND next_attempt_at>0 AND status IN ('queued','retry_wait','running') AND EXISTS(SELECT 1 FROM rss_candidates r WHERE r.command_id=rss_commands.id AND r.status='pending' AND r.private_payload IS NOT NULL)",[domain(m)]).await?;
-        c.execute(
+        wake_pending(c, m).await?;
+    }
+    read(c, m).await
+}
+/// Shared transactional reconsideration; never changes submission ownership.
+pub(crate) async fn wake_pending(c: &Connection, m: MediaDomain) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "revision_policy_transaction_required",
+        ));
+    }
+    c.execute("UPDATE rss_commands SET next_attempt_at=0 WHERE media_type=? AND next_attempt_at>0 AND status IN ('queued','retry_wait','running') AND EXISTS(SELECT 1 FROM rss_candidates r WHERE r.command_id=rss_commands.id AND r.status='pending' AND r.private_payload IS NOT NULL)",[domain(m)]).await?;
+    c.execute(
             "UPDATE rss_candidates SET not_before=0 WHERE media_type=? AND status='pending' AND private_payload IS NOT NULL",
             [domain(m)],
         )
         .await?;
-    }
-    read(c, m).await
+    Ok(())
 }
 pub fn router(db: Arc<Database>) -> Router {
     let mut r = Router::new();

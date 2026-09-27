@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 38); // Latest open adds revision preference; historical start stays schema34.
+    assert_eq!(version(&c).await?, 39); // Latest open adds ordered delay profiles; historical start stays schema34.
     assert_eq!(
         scalar(
             &c,
