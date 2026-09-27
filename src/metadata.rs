@@ -97,6 +97,7 @@ pub struct LookupResult {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct SeriesDetails {
+    pub original_language: Option<i64>,
     pub tvdb_id: i64,
     pub title: String,
     pub year: Option<i64>,
@@ -391,6 +392,7 @@ fn validate_results(results: Vec<LookupResult>) -> Result<Vec<LookupResult>> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Show {
+    original_language: Option<String>,
     tvdb_id: i64,
     title: String,
     first_aired: Option<String>,
@@ -494,8 +496,10 @@ impl Show {
                 finale_type: episode.finale_type,
             });
         }
+        let original_language = tv_original_language(self.original_language.take())?;
         let summary = self.summary()?;
         Ok(SeriesDetails {
+            original_language,
             tvdb_id: summary.external_id,
             title: summary.title,
             year: summary.year,
@@ -524,75 +528,29 @@ struct Movie {
 struct AlternativeTitle {
     title: String,
 }
+// SkyHook originalLanguage is an ISO code, not a display name or a movie language ID.
+// IDs are the TV catalog; absence/unrecognized codes never imply English.
+fn tv_original_language(value: Option<String>) -> Result<Option<i64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 32 || !value.bytes().all(|c| c.is_ascii_alphabetic() || c == b'-') {
+        return Err(MetadataError::InvalidResponse);
+    }
+    let region = value.split_once('-').map(|(_, region)| region);
+    if region.is_some_and(|r| r.len() != 2 || !r.bytes().all(|c| c.is_ascii_alphabetic())) {
+        return Err(MetadataError::InvalidResponse);
+    }
+    Ok(crate::languages::iso_language_id(crate::api::MediaDomain::Tv, &value).map(i64::from))
+}
+
 fn original_language(value: Option<String>) -> Result<Option<i64>> {
     let Some(value) = value else { return Ok(None) };
     if !(2..=3).contains(&value.len()) || !value.bytes().all(|c| c.is_ascii_alphabetic()) {
         return Err(MetadataError::InvalidResponse);
     }
-    // ISO language identities mapped to the existing native movie language catalog.
-    // Unrepresented languages remain unknown; never guess English.
-    let languages = [
-        ("en", 1),
-        ("fr", 2),
-        ("es", 3),
-        ("de", 4),
-        ("it", 5),
-        ("da", 6),
-        ("nl", 7),
-        ("ja", 8),
-        ("is", 9),
-        ("zh", 10),
-        ("ru", 11),
-        ("pl", 12),
-        ("vi", 13),
-        ("sv", 14),
-        ("no", 15),
-        ("nb", 15),
-        ("nn", 15),
-        ("fi", 16),
-        ("tr", 17),
-        ("pt", 18),
-        ("el", 20),
-        ("ko", 21),
-        ("hu", 22),
-        ("he", 23),
-        ("lt", 24),
-        ("cs", 25),
-        ("hi", 26),
-        ("ro", 27),
-        ("th", 28),
-        ("bg", 29),
-        ("ar", 31),
-        ("uk", 32),
-        ("fa", 33),
-        ("bn", 34),
-        ("sk", 35),
-        ("lv", 36),
-        ("ca", 38),
-        ("hr", 39),
-        ("sr", 40),
-        ("bs", 41),
-        ("et", 42),
-        ("ta", 43),
-        ("id", 44),
-        ("te", 45),
-        ("mk", 46),
-        ("sl", 47),
-        ("ml", 48),
-        ("kn", 49),
-        ("sq", 50),
-        ("af", 51),
-        ("mr", 52),
-        ("tl", 53),
-        ("ur", 54),
-        ("rm", 55),
-        ("mn", 56),
-        ("ka", 57),
-    ];
-    Ok(languages
-        .iter()
-        .find(|(code, _)| *code == value.to_ascii_lowercase())
-        .map(|(_, id)| *id))
+    Ok(crate::languages::iso_language_id(crate::api::MediaDomain::Movies, &value).map(i64::from))
 }
 impl Movie {
     fn details(self) -> Result<MovieDetails> {

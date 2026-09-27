@@ -665,3 +665,191 @@ async fn lookup_selected_add_and_safe_import_create_both_domain_targets() {
     upstream_task.abort();
     let _ = upstream_task.await;
 }
+
+#[tokio::test]
+async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
+    async fn scalar(c: &libsql::Connection, sql: &str) -> i64 {
+        c.query(sql, ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    }
+    use hrrdarr::library::refresh::{self, Details, Target};
+    let scratch = Scratch::new();
+    let source = Arc::new(Mutex::new(show()));
+    source.lock().unwrap()["originalLanguage"] = json!("ara");
+    let upstream = Router::new()
+        .route(
+            "/shows/en/{id}",
+            get(|State(source): State<Arc<Mutex<Value>>>| async move {
+                Json(source.lock().unwrap().clone())
+            }),
+        )
+        .with_state(source.clone());
+    let (origin, upstream_task) = serve(upstream).await;
+    let metadata = Arc::new(
+        hrrdarr::metadata::MetadataClient::with_origins(
+            &format!("{origin}/"),
+            &format!("{origin}/"),
+        )
+        .unwrap(),
+    );
+    let path = scratch.0.join("db");
+    let db = Arc::new(Database::open_local(&path).await.unwrap());
+    let (base, api_task) = serve(
+        library::router(db.clone()).merge(library::metadata_router(db.clone(), metadata.clone())),
+    )
+    .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let root = scratch.0.join("tv");
+    std::fs::create_dir(&root).unwrap();
+    let (status, added) = request(
+        &client,
+        &base,
+        "POST",
+        "/api/v1/tv/series/lookup",
+        Some(json!({"tvdb_id":101,"path":root,"settings":{"monitored":false}})),
+    )
+    .await;
+    assert_eq!(status, 201, "{added}");
+    let id = added["id"].as_i64().unwrap();
+    let c = db.connect().await.unwrap();
+    assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 26); // TV Arabic is 26; movies use 31.
+    c.execute(
+        "INSERT INTO episode_files(id,series_id,path)VALUES(1,?,'/owned-fixture/original.mkv')",
+        [id],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE episodes SET episode_file_id=1 WHERE tvdb_id=502",
+        (),
+    )
+    .await
+    .unwrap();
+    let captured = refresh::capture(&c, Target::Tv { series_id: id })
+        .await
+        .unwrap();
+    for wire in [
+        Some(json!("ISL")),
+        None,
+        Some(Value::Null),
+        Some(json!("zz")),
+        Some(json!("English")),
+        Some(json!("")),
+    ] {
+        let mut body = show();
+        if let Some(wire) = wire {
+            body["originalLanguage"] = wire;
+        }
+        *source.lock().unwrap() = body;
+        let detail = metadata.series(101).await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        refresh::apply(&tx, &captured, Details::Series(detail))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
+        assert_eq!(scalar(&c, "SELECT monitored FROM series").await, 0);
+        assert_eq!(
+            scalar(&c, "SELECT episode_file_id FROM episodes WHERE tvdb_id=502").await,
+            1
+        );
+    }
+    // Invalid producer values never enter the write transaction.
+    for wire in [
+        json!(31),
+        json!({"id":26}),
+        json!("ar/private"),
+        json!("x".repeat(33)),
+    ] {
+        source.lock().unwrap()["originalLanguage"] = wire;
+        assert!(metadata.series(101).await.is_err());
+        assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
+    }
+    source.lock().unwrap()["originalLanguage"] = json!("ar");
+    source.lock().unwrap()["title"] = json!("Must roll back");
+    c.execute_batch("CREATE TRIGGER fixture_metadata_failure BEFORE UPDATE ON episodes BEGIN SELECT RAISE(ABORT,'fixture late failure'); END;").await.unwrap();
+    source.lock().unwrap()["episodes"][1]["title"] = json!("Changed");
+    let tx = c.transaction().await.unwrap();
+    assert!(
+        refresh::apply(
+            &tx,
+            &captured,
+            Details::Series(metadata.series(101).await.unwrap())
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM series WHERE title='Fixture series'"
+        )
+        .await,
+        1
+    );
+    c.execute("DROP TRIGGER fixture_metadata_failure", ())
+        .await
+        .unwrap();
+    // New library with absent metadata remains NULL, not English or inherited from the first series.
+    let mut absent = show();
+    absent["tvdbId"] = json!(303);
+    absent["episodes"] = json!([]);
+    absent["seasons"] = json!([]);
+    *source.lock().unwrap() = absent;
+    let root = scratch.0.join("absent");
+    std::fs::create_dir(&root).unwrap();
+    let (status, added) = request(
+        &client,
+        &base,
+        "POST",
+        "/api/v1/tv/series/lookup",
+        Some(json!({"tvdb_id":303,"path":root})),
+    )
+    .await;
+    assert_eq!(status, 201, "{added}");
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM series WHERE tvdb_id=303 AND original_language IS NULL"
+        )
+        .await,
+        1
+    );
+    api_task.abort();
+    let _ = api_task.await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
+    drop(c);
+    drop(db);
+    let db = Database::open_local(&path).await.unwrap();
+    let c = db.connect().await.unwrap();
+    assert_eq!(
+        scalar(&c, "SELECT original_language FROM series WHERE tvdb_id=101").await,
+        9
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM series WHERE tvdb_id=303 AND original_language IS NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT episode_file_id FROM episodes WHERE tvdb_id=502").await,
+        1
+    );
+}

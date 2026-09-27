@@ -224,7 +224,12 @@ fn episode_facts(episode: &EpisodeDetails) -> Vec<Value> {
     ]
 }
 async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
-    if detail.seasons.len() > MAX_SEASONS || detail.episodes.len() > MAX_EPISODES {
+    if detail.seasons.len() > MAX_SEASONS
+        || detail.episodes.len() > MAX_EPISODES
+        || detail
+            .original_language
+            .is_some_and(|v| !(0..=52).contains(&v))
+    {
         return Err(Error::Conflict);
     }
     let incoming_seasons = detail.seasons.iter().copied().collect::<BTreeSet<_>>();
@@ -324,7 +329,7 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
         }
     }
     // All ambiguous identities and monitoring policy are checked before modifying any row.
-    let mut changed=c.execute("UPDATE series SET title=?1,year=COALESCE(?2,year) WHERE id=?3 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year))",params![detail.title,detail.year,id]).await? as u16;
+    let mut changed=c.execute("UPDATE series SET title=?1,year=COALESCE(?2,year),original_language=COALESCE(?3,original_language) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR original_language IS NOT COALESCE(?3,original_language))",params![detail.title,detail.year,detail.original_language,id]).await? as u16;
     for (number, monitored) in additions {
         c.execute(
             "INSERT INTO seasons(series_id,number,monitored) VALUES(?,?,?)",

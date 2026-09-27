@@ -1331,6 +1331,7 @@ async fn selected(
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
     let mut movie_facts = None;
+    let mut tv_original_language = None;
     match ctx.domain {
         Domain::Tv => {
             let detail = ctx
@@ -1338,6 +1339,7 @@ async fn selected(
                 .series(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
+            tv_original_language = detail.original_language;
             req.title = Some(detail.title);
             req.year = detail.year;
             req.tvdb_id = Some(detail.tvdb_id);
@@ -1390,6 +1392,9 @@ async fn selected(
             if tx.query(&format!("SELECT 1 FROM episodes WHERE tvdb_id IN ({}) LIMIT 1",placeholders(values.len())),values).await?.next().await?.is_some(){return Err(conflict());}
         }
         let item=create_record(&tx,ctx.domain,&mut req,&path).await?;
+        if let Some(language)=tv_original_language {
+            tx.execute("UPDATE series SET original_language=? WHERE id=?",params![language,item.id]).await?;
+        }
         if let Some(detail)=movie_facts {
             refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }

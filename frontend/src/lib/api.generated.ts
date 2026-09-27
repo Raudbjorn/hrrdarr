@@ -494,7 +494,7 @@ export type SearchMode = "automatic" | "interactive";
 
 export type SearchResult = { id: string, command_id: string, metadata: ReleaseMetadata, decision: ReleaseDecision, expires_at: number, selected_candidate_id: string | null, };
 
-export type SeriesDetails = { tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
+export type SeriesDetails = { original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
 export type SeriesLookupAdd = { tvdb_id: number, path: string, settings?: LibraryPatch, };
 
