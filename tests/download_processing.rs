@@ -1028,6 +1028,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     naming_hostile_episode_title_renders_safely_http().await;
     daily_series_completed_download_imports_and_renders_http().await;
     anime_series_completed_download_imports_and_renders_http().await;
+    cross_type_numbering_completed_downloads_preserve_sources_http().await;
 }
 
 // Runs after the existing HTTP scenario in the same test so the global import lease is serial.
@@ -2070,5 +2071,105 @@ async fn anime_series_completed_download_imports_and_renders_http() {
         "the anime_episode_format arm must actually render, not silently preserve the raw \
          downloaded basename"
     );
+    ctx.shutdown().await;
+}
+
+// Keep these under the existing serial import fixture: native admission, receipt rechecks and
+// the final file association must all agree, without racing the process-wide import lease.
+async fn cross_type_numbering_completed_downloads_preserve_sources_http() {
+    for (kind, stem) in [
+        ("anime", "Harbor.2020.01.01.1080p.WEB-DL"),
+        ("standard", "Harbor - 001 1080p WEB-DL"),
+        ("daily", "Harbor - 001 1080p WEB-DL"),
+    ] {
+        let ctx = naming_ctx(false, kind, Some(stem)).await;
+        put_tv_naming(&ctx.base, 1, false, None, None, None).await;
+        if kind == "anime" {
+            let c = ctx.db.connect().await.unwrap();
+            // The same-date special is deliberately unmonitored and lacks runtime/date-UTC;
+            // selection must discard it before constructing release policy facts.
+            c.execute_batch("INSERT INTO seasons(series_id,number,monitored)VALUES(1,0,0);INSERT INTO episodes(id,series_id,season,number,title,monitored,air_date)VALUES(2,1,0,1,'Special',0,'2020-01-01');").await.unwrap();
+        }
+        let receipt = naming_grab_and_complete(&ctx).await;
+        let (code, value) = naming_process(&ctx, &receipt).await;
+        assert_eq!(code, 202, "{value}");
+        let done = wait_status(
+            &ctx.base,
+            &format!("/api/v1/download-processing/{}", receipt.as_str().unwrap()),
+            "imported",
+        )
+        .await;
+        assert_eq!(done["import_phase"], "complete");
+        let c = ctx.db.connect().await.unwrap();
+        let row=c.query("SELECT f.path FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id=1",()).await.unwrap().next().await.unwrap().unwrap();
+        let stored = PathBuf::from(row.get::<String>(0).unwrap());
+        assert_eq!(stored, ctx.root.join(format!("{stem}.mkv")));
+        assert_eq!(std::fs::read(&stored).unwrap(), vec![1u8; 1048576]);
+        assert_eq!(
+            std::fs::read(ctx.source.join(format!("{stem}.mkv"))).unwrap(),
+            vec![1u8; 1048576]
+        );
+        if kind == "anime" {
+            assert!(
+                c.query("SELECT episode_file_id FROM episodes WHERE id=2", ())
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<Option<i64>>(0)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(row);
+        drop(c);
+        ctx.shutdown().await;
+    }
+    // A previously grabbed absolute release cannot authorize import after catalog renumbering.
+    let stem = "Harbor - 001 1080p WEB-DL";
+    let ctx = naming_ctx(false, "standard", Some(stem)).await;
+    let receipt = naming_grab_and_complete(&ctx).await;
+    let c = ctx.db.connect().await.unwrap();
+    c.execute(
+        "UPDATE episodes SET absolute_episode_number=2 WHERE id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    let (code, value) = naming_process(&ctx, &receipt).await;
+    assert_eq!(code, 202, "{value}");
+    let done = wait_status(
+        &ctx.base,
+        &format!("/api/v1/download-processing/{}", receipt.as_str().unwrap()),
+        "blocked",
+    )
+    .await;
+    // Filename identity rejection is grouped under quality_rejected by processing::preflight;
+    // unsupported_download belongs to other admission failures. The fixture also advertises
+    // a sample (remote(), above), so preserve its independent rejection in the exact reason list.
+    assert_eq!(done["error_code"], "quality_rejected");
+    assert_eq!(
+        done["reasons"],
+        json!(["filename_target_mismatch", "sample_file"])
+    );
+    assert!(
+        c.query("SELECT episode_file_id FROM episodes WHERE id=1", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<Option<i64>>(0)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read(ctx.source.join(format!("{stem}.mkv"))).unwrap(),
+        vec![1u8; 1048576]
+    );
+    assert!(!ctx.root.join(format!("{stem}.mkv")).exists());
     ctx.shutdown().await;
 }

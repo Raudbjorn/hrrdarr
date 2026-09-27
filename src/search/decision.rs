@@ -97,34 +97,22 @@ pub async fn evaluate(
             let Some(series_type) = r.get::<Option<String>>(5)? else {
                 return Ok(ReleaseDecision::reject("series_type_unconfigured"));
             };
-            // Mirrors downloaded::match_absolute (and upstream ParsingService.GetAnimeEpisodes):
-            // a scene_absolute_episode_number match is only used when it resolves to exactly one
-            // episode in the series. An empty or ambiguous scene-column result is discarded (not
-            // treated as a mismatch) and matching falls back to the plain absolute_episode_number
-            // column below, instead of rejecting a real anime release at search/decision time.
-            // COUNT(*) is a single bounded aggregate row regardless of series size, so this needs
-            // no row-scan cap unlike the per-episode query just below.
-            let use_scene_for_absolute = if scene && series_type == "anime" {
-                if let parser::Numbering::Absolute { episode } = parsed.numbering.as_ref().unwrap()
-                {
-                    let hits = c
-                        .query(
-                            "SELECT COUNT(*) FROM episodes WHERE series_id=? AND scene_absolute_episode_number=?",
-                            params![id, *episode],
-                        )
-                        .await?
-                        .next()
-                        .await?
-                        .map(|r| r.get::<i64>(0))
-                        .transpose()?
-                        .unwrap_or(0);
-                    hits == 1
-                } else {
-                    false
+            // A release and its eventual downloaded file must select the same unique episode.
+            // Daily-on-anime and ordinary absolute numbering are admitted by source policy;
+            // query-family construction remains independently driven by the configured type.
+            let resolved = match parsed.numbering.as_ref().unwrap() {
+                parser::Numbering::Daily { date } if series_type != "standard" => {
+                    Some(downloaded::daily_candidates(c, id, date).await?)
                 }
-            } else {
-                false
+                parser::Numbering::Daily { .. } => continue,
+                parser::Numbering::Absolute { episode } => {
+                    Some(downloaded::absolute_candidates(c, id, scene, *episode).await?)
+                }
+                _ => None,
             };
+            if resolved.as_ref().is_some_and(|ids| ids.len() != 1) {
+                continue;
+            }
             let mut eps=c.query("SELECT e.id,e.season,e.number,e.absolute_episode_number,e.air_date,e.monitored,e.runtime,e.episode_file_id,e.scene_season_number,e.scene_episode_number,e.scene_absolute_episode_number,s.monitored,e.air_date_utc FROM episodes e JOIN seasons s ON s.series_id=e.series_id AND s.number=e.season WHERE e.series_id=? ORDER BY e.id LIMIT 10001",[id]).await?;
             let mut ids = Vec::new();
             let mut matched_numbers = std::collections::BTreeSet::new();
@@ -134,6 +122,7 @@ pub async fn evaluate(
             let mut monitored = r.get::<i64>(3)? == 1;
             let mut scanned_episodes = 0;
             while let Some(e) = eps.next().await? {
+                let episode_id = e.get::<i64>(0)?;
                 scanned_episodes += 1;
                 if scanned_episodes > 10000 {
                     return Err(SearchError("episode_match_limit"));
@@ -154,17 +143,10 @@ pub async fn evaluate(
                         episodes,
                     } => season == Some(*s) && number.is_some_and(|n| episodes.contains(&n)),
                     parser::Numbering::Season { season: s } => season == Some(*s),
-                    parser::Numbering::Daily { date } => {
-                        series_type == "daily"
-                            && e.get::<Option<String>>(4)?.as_deref() == Some(date)
-                    }
-                    parser::Numbering::Absolute { episode } => {
-                        series_type == "anime"
-                            && (if use_scene_for_absolute {
-                                e.get::<Option<i64>>(10)?
-                            } else {
-                                e.get(3)?
-                            }) == Some(*episode)
+                    parser::Numbering::Daily { .. } | parser::Numbering::Absolute { .. } => {
+                        resolved
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(&episode_id))
                     }
                 };
                 if matches {

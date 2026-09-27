@@ -553,3 +553,128 @@ async fn anime_scene_absolute_falls_back_to_plain_column_at_decision_time() {
     .unwrap();
     assert_eq!(result.reasons, vec!["no_library_match"]);
 }
+
+#[tokio::test]
+async fn cross_type_numbering_resolves_identity_before_policy_facts() {
+    let path =
+        std::env::temp_dir().join(format!("hrrdarr-cross-numbering-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _scratch = Scratch(path.clone());
+    let db = Database::open_local(path.join("db")).await.unwrap();
+    let c = db.connect().await.unwrap();
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/synthetic/harbor');INSERT INTO seasons(series_id,number,monitored)VALUES(1,0,0),(1,1,1);INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date,air_date_utc,absolute_episode_number,monitored)VALUES(1,1,1,1,'Regular',45,'2020-01-01','2020-01-01T00:00:00Z',23,1),(2,1,0,1,'Unmonitored special',NULL,'2020-01-01',NULL,NULL,0);INSERT INTO quality_profiles VALUES(1,'tv','HD');INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1);INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL);INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'daily',0);INSERT INTO release_delay_policies VALUES('tv',0,0,0);").await.unwrap();
+    let daily = release("Harbor.2020.01.01.1080p.WEB-DL", true);
+    let absolute = release("Harbor - 023 1080p WEB-DL", true);
+    for kind in ["daily", "anime", "standard"] {
+        c.execute(
+            "UPDATE library_settings SET series_type=? WHERE series_id=1",
+            [kind],
+        )
+        .await
+        .unwrap();
+        for context in [SearchContext::Rss, SearchContext::UserSearch] {
+            let result = search::evaluate(&c, MediaDomain::Tv, &daily, context, 1800000000)
+                .await
+                .unwrap();
+            // The excluded special's monitoring/date/runtime must not reject the regular airing.
+            assert_eq!(
+                result.disposition == Disposition::Accept,
+                kind != "standard",
+                "{kind}: {:?}",
+                result.reasons
+            );
+            if kind != "standard" {
+                assert_eq!(
+                    result.target,
+                    Some(ReleaseTarget::Tv {
+                        series_id: 1,
+                        episode_ids: vec![1]
+                    })
+                );
+            }
+            let result = search::evaluate(&c, MediaDomain::Tv, &absolute, context, 1800000000)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.disposition,
+                Disposition::Accept,
+                "{kind}: {:?}",
+                result.reasons
+            );
+            assert_eq!(
+                result.target,
+                Some(ReleaseTarget::Tv {
+                    series_id: 1,
+                    episode_ids: vec![1]
+                })
+            );
+        }
+    }
+    c.execute_batch("UPDATE library_settings SET series_type='anime' WHERE series_id=1;INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date,air_date_utc,absolute_episode_number)VALUES(3,1,1,2,'Duplicate',45,'2020-01-01','2020-01-01T00:00:00Z',23);").await.unwrap();
+    for item in [&daily, &absolute] {
+        assert_ne!(
+            search::evaluate(
+                &c,
+                MediaDomain::Tv,
+                item,
+                SearchContext::UserSearch,
+                1800000000
+            )
+            .await
+            .unwrap()
+            .disposition,
+            Disposition::Accept
+        );
+    }
+    c.execute_batch(
+        "UPDATE episodes SET air_date=NULL,absolute_episode_number=NULL WHERE id IN(1,3);",
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        search::evaluate(
+            &c,
+            MediaDomain::Tv,
+            &absolute,
+            SearchContext::UserSearch,
+            1800000000
+        )
+        .await
+        .unwrap()
+        .disposition,
+        Disposition::Accept
+    );
+    // A sole special is an exact date match; unlike the former regular/special pair,
+    // its own monitoring/runtime/airing state must now satisfy the ordinary policy checks.
+    c.execute_batch("UPDATE seasons SET monitored=1 WHERE number=0;UPDATE episodes SET monitored=1,runtime=45,air_date_utc='2020-01-01T00:00:00Z' WHERE id=2;").await.unwrap();
+    let special = search::evaluate(&c, MediaDomain::Tv, &daily, SearchContext::Rss, 1800000000)
+        .await
+        .unwrap();
+    assert_eq!(
+        special.disposition,
+        Disposition::Accept,
+        "{:?}",
+        special.reasons
+    );
+    assert_eq!(
+        special.target,
+        Some(ReleaseTarget::Tv {
+            series_id: 1,
+            episode_ids: vec![2]
+        })
+    );
+    c.execute_batch("INSERT INTO episodes(series_id,season,number,title,runtime,air_date)VALUES(1,0,2,'Another special',45,'2020-01-01');").await.unwrap();
+    assert_ne!(
+        search::evaluate(
+            &c,
+            MediaDomain::Tv,
+            &daily,
+            SearchContext::UserSearch,
+            1800000000
+        )
+        .await
+        .unwrap()
+        .disposition,
+        Disposition::Accept
+    );
+}

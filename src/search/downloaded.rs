@@ -22,6 +22,23 @@ fn rejected(reason: &str) -> DownloadedDecision {
     }
 }
 
+// This retains the existing native scene-policy switch; upstream sceneSource/origin mapping
+// is a separate unfinished contract. Local rescans deliberately do not call this resolver.
+pub(super) async fn absolute_candidates(
+    c: &Connection,
+    series_id: i64,
+    scene: bool,
+    episode: i64,
+) -> super::Result<Vec<i64>> {
+    if scene {
+        let hits = absolute_hits(c, series_id, "scene_absolute_episode_number", episode).await?;
+        if hits.len() == 1 {
+            return Ok(hits);
+        }
+    }
+    absolute_hits(c, series_id, "absolute_episode_number", episode).await
+}
+
 #[cfg(test)]
 pub(crate) async fn evaluate(
     c: &Connection,
@@ -89,10 +106,10 @@ pub(crate) async fn evaluate_with_evidence(
                             .then_some("filename_target_mismatch")
                     }
                 }
-                Some(parser::Numbering::Daily { date }) if series_type == "daily" => {
+                Some(parser::Numbering::Daily { date }) if series_type != "standard" => {
                     match_daily(c, series_id, *id, r.get::<Option<String>>(10)?, date).await?
                 }
-                Some(parser::Numbering::Absolute { episode }) if series_type == "anime" => {
+                Some(parser::Numbering::Absolute { episode }) => {
                     match_absolute(
                         c,
                         series_id,
@@ -258,6 +275,20 @@ async fn match_daily(
     if air_date != date {
         return Ok(Some("filename_target_mismatch"));
     }
+    let candidates = daily_candidates(c, series_id, date).await?;
+    if candidates.len() == 1 {
+        return Ok((candidates[0] != episode_id).then_some("filename_target_mismatch"));
+    }
+    Ok(Some("ambiguous_air_date_match"))
+}
+
+// Shared by release selection and downloaded-target validation. Resolve identity before
+// accumulating monitoring/runtime/file facts, so excluded specials cannot affect policy.
+pub(super) async fn daily_candidates(
+    c: &Connection,
+    series_id: i64,
+    date: &str,
+) -> super::Result<Vec<i64>> {
     let mut rows = c
         .query(
             "SELECT id,season FROM episodes WHERE series_id=? AND air_date=? LIMIT 1001",
@@ -265,27 +296,16 @@ async fn match_daily(
         )
         .await?;
     let mut all = Vec::new();
-    let mut count = 0;
     while let Some(row) = rows.next().await? {
-        count += 1;
-        if count > 1000 {
+        if all.len() == 1000 {
             return Err(SearchError("episode_match_limit"));
         }
         all.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
     }
-    if all.len() <= 1 {
-        // Only the target itself (already confirmed above) has this date.
-        return Ok(None);
+    if all.len() > 1 {
+        all.retain(|(_, season)| *season > 0);
     }
-    let regular: Vec<i64> = all
-        .into_iter()
-        .filter(|(_, season)| *season > 0)
-        .map(|(id, _)| id)
-        .collect();
-    if regular.len() == 1 {
-        return Ok((regular[0] != episode_id).then_some("filename_target_mismatch"));
-    }
-    Ok(Some("ambiguous_air_date_match"))
+    Ok(all.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Counts episodes in a series whose `column` equals `number`, bounded the
@@ -332,13 +352,7 @@ async fn match_absolute(
     target_absolute: Option<i64>,
     episode: i64,
 ) -> super::Result<Option<&'static str>> {
-    if scene {
-        let hits = absolute_hits(c, series_id, "scene_absolute_episode_number", episode).await?;
-        if hits.len() == 1 {
-            return Ok((hits[0] != episode_id).then_some("filename_target_mismatch"));
-        }
-    }
-    let hits = absolute_hits(c, series_id, "absolute_episode_number", episode).await?;
+    let hits = absolute_candidates(c, series_id, scene, episode).await?;
     match hits.len() {
         0 => {
             if target_absolute.is_none() && (!scene || target_scene_absolute.is_none()) {
@@ -730,6 +744,97 @@ mod tests {
         .accepted
         .unwrap();
         assert_eq!(accepted.quality_id, 3);
+        // Series type controls query construction, but source admission only excludes daily
+        // numbering on Standard. Daily-on-anime and ordinary absolute on other known types
+        // must reach the same identity/quality/size checks rather than fail at a type gate.
+        for kind in ["daily", "anime", "standard"] {
+            c.execute(
+                "UPDATE library_settings SET series_type=? WHERE series_id=10",
+                [kind],
+            )
+            .await
+            .unwrap();
+            let result = evaluate(
+                &c,
+                &MediaTarget::Episode(101),
+                "Nightly.2024.05.14.1080p.WEB-DL.mkv",
+                1073741824,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.accepted.is_some(),
+                kind != "standard",
+                "{kind}: {:?}",
+                result.reasons
+            );
+            assert!(
+                evaluate(
+                    &c,
+                    &MediaTarget::Episode(105),
+                    "Nightly.2024.05.14.1080p.WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_none()
+            );
+            assert!(
+                evaluate(
+                    &c,
+                    &MediaTarget::Episode(102),
+                    "Nightly.2024.05.15.1080p.WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_none()
+            );
+            c.execute(
+                "UPDATE library_settings SET series_type=? WHERE series_id=20",
+                [kind],
+            )
+            .await
+            .unwrap();
+            assert!(
+                evaluate(
+                    &c,
+                    &MediaTarget::Episode(201),
+                    "Aurora - 023 1080p WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_some()
+            );
+            let ambiguous = evaluate(
+                &c,
+                &MediaTarget::Episode(202),
+                "Aurora - 024 1080p WEB-DL.mkv",
+                1073741824,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ambiguous.reasons, vec!["ambiguous_absolute_match"]);
+        }
+        c.execute(
+            "UPDATE episodes SET absolute_episode_number=NULL WHERE id=201",
+            (),
+        )
+        .await
+        .unwrap();
+        let changed = evaluate(
+            &c,
+            &MediaTarget::Episode(201),
+            "Aurora - 023 1080p WEB-DL.mkv",
+            1073741824,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.reasons, vec!["episode_absolute_number_unknown"]);
     }
 
     #[tokio::test]
