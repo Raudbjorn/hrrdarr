@@ -573,6 +573,7 @@ async fn preflight(
                 &facts.basename,
                 facts.quality_id,
                 facts.edition.as_deref(),
+                &facts.evidence,
             )
             .await
             {

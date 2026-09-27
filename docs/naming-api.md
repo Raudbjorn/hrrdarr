@@ -1,6 +1,6 @@
 # Naming configuration API
 
-Only Sonarr's `76c684e097f16ac216e6213845e5cac372774995`
+The initial configuration-controller inventory inspected Sonarr's `76c684e097f16ac216e6213845e5cac372774995`
 `Sonarr.Api.V3/Config/NamingConfigController.cs` was opened, for controller/route
 shape only (singleton `GET`, `PUT` guarded by FluentValidation, and a query-driven
 `GET examples`). Radarr's controller was **not** opened; nothing here claims
@@ -19,8 +19,9 @@ change.
 The token vocabulary, grammar, sanitization rules and every line of
 implementation below are an independent, clean-room design (see
 [`src/naming/render.rs`](../src/naming/render.rs)) — no upstream filename-
-builder or validator code (`_filenameSampleService`/`_filenameValidationService`,
-in different files, not opened) was read or translated. V3 wire compatibility
+builder or validator code was copied or translated. The later CF naming extension
+inventoried both pinned filename builders for token requirements only; the
+sample/validation services remain outside this inventory. V3 wire compatibility
 is not claimed. Known shape divergences from what the Sonarr controller shows:
 
 - `PUT` here has no `{id}` path segment (this is a domain-scoped singleton, not
@@ -194,12 +195,11 @@ convention in this space, not upstream parsing logic. The vocabulary is
 closed and domain-scoped: an unrecognized token is a hard validation error
 naming the offending `{...}` text (`unknown_naming_token`), and a token from
 the other domain is a distinct, separately coded error
-(`cross_domain_naming_token`). `{Quality Title}` is the only token shared by
-both domains.
+(`cross_domain_naming_token`). `{Quality Title}` and custom-format tokens are shared by both domains.
 
 TV tokens: `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`,
-`{Air-Date}`, `{Quality Title}`. Movie tokens: `{Movie Title}`,
-`{Release Year}`, `{Edition Tags}`, `{Quality Title}`.
+`{Air-Date}`, `{Quality Title}`, custom-format tokens. Movie tokens: `{Movie Title}`,
+`{Release Year}`, `{Edition Tags}`, `{Quality Title}`, custom-format tokens.
 
 `{season:00}`/`{episode:00}` zero-pad the number to the number of `0`
 characters after the colon (1–4 digits; anything else, including `0` digits
@@ -213,10 +213,10 @@ mistake in a TV template still surfaces the more specific
 
 | Field | Allowed tokens |
 | --- | --- |
-| `standard_episode_format`, `daily_episode_format`, `anime_episode_format` | `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`, `{Air-Date}`, `{Quality Title}` |
+| `standard_episode_format`, `daily_episode_format`, `anime_episode_format` | `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`, `{Air-Date}`, `{Quality Title}`, custom-format tokens |
 | `series_folder_format` | `{Series Title}` |
 | `season_folder_format`, `specials_folder_format` | `{Series Title}`, `{season:00}` |
-| `standard_movie_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}`, `{Quality Title}` |
+| `standard_movie_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}`, `{Quality Title}`, custom-format tokens |
 | `movie_folder_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}` |
 
 Rationale: a series/season folder is not per-episode, so episode/quality
@@ -226,6 +226,39 @@ folders that vary by a per-file fact.
 
 An absent optional fact (for example a missing `{Episode Title}` or
 `{Air-Date}`) substitutes an empty string, not an error or a placeholder.
+
+### Custom formats in filenames
+
+Both domains support `{Custom Formats}` (all matching rename-enabled names),
+`{Custom Formats:A,B}` (include exact names), `{Custom Formats:-A,B}` (exclude
+exact names), and `{Custom Format:A}` (one exact name). Names use deterministic Rust ordinal ordering and are joined with spaces; score weights do not affect inclusion.
+Missing matches and a singular token without a selector produce empty text.
+Names and filters are case-sensitive. Token identifiers are case-insensitive;
+`{CUSTOM.FORMATS}` uppercases output and substitutes dots for spaces,
+while `{custom_formats}` lowercases output with underscores. Conditional
+punctuation belongs inside the token: `{[Custom Formats]}` produces brackets
+only when matches exist, and `{-Custom Format:A}` produces its dash only
+when A matches. CF filename rendering collapses repeated identical spaces,
+dots, dashes and underscores and trims those separators at the component edges.
+The existing illegal-character policy and UTF-8 filename/extension byte cap
+still apply. File-specific CF tokens are rejected in folder formats.
+
+Examples use fixed illustrative matching names `Surround Sound` and `x265`;
+they preview syntax, not the user's live catalog. Completed imports instead
+use frozen receipt/file evidence and the current domain catalog, including
+`include_when_renaming`. They reuse the bounded evaluator with no profile score
+weights. Matching is prepared outside the writer transaction; transactional
+revalidation requires an exact cached result and the same rendered destination.
+Cache misses, invalid definitions and render failures are explicit failures;
+processing diagnostics contain static field/class codes, not patterns or names.
+A journaled import resumes to its captured destination even if naming settings
+or CF names/flags change. This adds no existing-library rename command; matching
+existing files for future callers must preserve original release-title/path
+fallback through the existing evidence loader.
+
+Requirements were inventoried from the pinned Sonarr/Radarr
+`Organizer/FileNameBuilder.cs` custom-format token handlers and normalization,
+then implemented independently in the native parser/evaluator flow.
 
 ## Grammar and structural validation (parse time, no facts needed)
 
@@ -327,10 +360,7 @@ PUT round-trip/revision-bump/stale-revision-conflict for both domains called
 directly against the handlers, the examples-endpoint colon-mode-override fix,
 real query-string parsing via `axum::extract::Query::try_from_uri` (enum/bool
 values, cross-domain-field rejection), and that omitting any nullable PUT field
-is a hard error rather than a silent null. **No HTTP contract-test file exists
-yet** — a separate reviewer is expected to add `tests/naming_api.rs` exercising
-the routes end to end over a real listener, the way `tests/provider_config_api.rs`
-exercises `src/providers/mod.rs`; that file was intentionally not created here.
+is a hard error rather than a silent null. `tests/naming_api.rs` exercises real HTTP configuration and examples, including both-domain custom-format token previews.
 
 `src/naming/destination.rs` carries its own in-module unit tests for the
 pure stem/extension-capping logic (`finish_render`): a short stem passed
@@ -347,3 +377,21 @@ Outstanding: folder-format rendering
 and the directory-creation it would require; multi-episode rendering; any UI.
 No live services, network calls, or fixed ports are used anywhere in
 this module.
+
+CF naming regression evidence also includes both-domain completed-download imports
+with negative/zero/positive format scores and rename-flag filtering, captured
+path recovery after a CF change, and serial owned-import preflight cases for
+name/flag/definition changes and private invalid filename characters. Those
+preflight cases require no journal or file mutation and preserve the old media.
+These tests use scratch databases/files and loopback fixtures, not live services
+or upstream runtime equivalence. Full rename commands, folder rendering and UI
+parity remain outside this change.
+
+Name-order tests cover ASCII names. The references use their default string
+comparer; culture-specific Unicode collation equivalence is not established.
+
+The current storage contract keeps TV `original_file_path` null. Existing TV
+files with a blank original release title therefore fall back to their current
+basename; movie files also try their nonblank original path basename. Nonblank
+original title text is preserved exactly. Extending TV original-path storage is
+separate from this pending-import naming flow, which uses frozen evidence.

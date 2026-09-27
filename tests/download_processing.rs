@@ -1492,15 +1492,37 @@ async fn put_movie_naming(
     v
 }
 
+// Scores deliberately do not govern rename inclusion: these matching formats
+// have negative, zero, and positive scores; only include_when_renaming matters.
+async fn install_naming_formats(ctx: &Ctx) {
+    let c = ctx.db.connect().await.unwrap();
+    let media = if ctx.movie { "movies" } else { "tv" };
+    let specification = json!([{"name":"Web","required":false,"negate":false,"condition":{"kind":"release_title","pattern":"WEB-DL"}}]);
+    for (id, name, included, score) in [
+        (1, "Zulu", 1, -10),
+        (2, "A Format", 1, 0),
+        (3, "Hidden", 0, 20),
+    ] {
+        c.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?,?)",libsql::params![id,media,name,included,specification.to_string()]).await.unwrap();
+        c.execute(
+            "INSERT INTO quality_profile_format_scores VALUES(1,?,?,?)",
+            libsql::params![id, media, score],
+        )
+        .await
+        .unwrap();
+    }
+}
+
 // Scenario: `standard_episode_format` configured and enabled actually changes the on-disk
 // filename for TV, through the real Add->RSS->grab->completed-download pipeline.
 async fn naming_renders_tv_destination_http() {
     let ctx = naming_ctx(false, "standard", None).await;
+    install_naming_formats(&ctx).await;
     put_tv_naming(
         &ctx.base,
         1,
         true,
-        Some("{Series Title} - S{season:00}E{episode:00} - {Episode Title} [{Quality Title}]"),
+        Some("{Series Title} - S{season:00}E{episode:00} - {Episode Title} [{Quality Title}] {[Custom Formats]}"),
         Some("DAILY-{Series Title}-S{season:00}E{episode:00}"),
         Some("ANIME-{Series Title}-{episode:00}"),
     )
@@ -1511,7 +1533,8 @@ async fn naming_renders_tv_destination_http() {
     let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
     let done = wait_status(&ctx.base, &path, "imported").await;
     assert_eq!(done["import_phase"], "complete");
-    let expected = "Harbor - S01E01 - Pilot [WEBDL-1080p].mkv";
+    // Negative/zero scored names remain included, ordered by name; Hidden is excluded by its rename flag.
+    let expected = "Harbor - S01E01 - Pilot [WEBDL-1080p] [A Format Zulu].mkv";
     assert_eq!(
         std::fs::read(ctx.root.join(expected)).unwrap(),
         vec![1u8; 1048576]
@@ -1527,11 +1550,12 @@ async fn naming_renders_tv_destination_http() {
 // filename for movies, through the real pipeline.
 async fn naming_renders_movie_destination_http() {
     let ctx = naming_ctx(true, "standard", None).await;
+    install_naming_formats(&ctx).await;
     put_movie_naming(
         &ctx.base,
         1,
         true,
-        Some("{Movie Title} ({Release Year}) [{Quality Title}]"),
+        Some("{Movie Title} ({Release Year}) [{Quality Title}] {[Custom Formats]}"),
     )
     .await;
     let receipt = naming_grab_and_complete(&ctx).await;
@@ -1540,7 +1564,8 @@ async fn naming_renders_movie_destination_http() {
     let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
     let done = wait_status(&ctx.base, &path, "imported").await;
     assert_eq!(done["import_phase"], "complete");
-    let expected = "Harbor (2020) [WEBDL-1080p].mkv";
+    // Movie naming uses the same rename flag contract independently of profile scores.
+    let expected = "Harbor (2020) [WEBDL-1080p] [A Format Zulu].mkv";
     assert_eq!(
         std::fs::read(ctx.root.join(expected)).unwrap(),
         vec![1u8; 1048576]
@@ -1764,11 +1789,12 @@ async fn naming_render_failure_blocks_and_touches_nothing_http() {
 // naming config B applied while the operation was paused mid-flight.
 async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
     let ctx = naming_ctx(false, "standard", None).await;
+    install_naming_formats(&ctx).await;
     put_tv_naming(
         &ctx.base,
         1,
         true,
-        Some("CONFIG-A-{Series Title}-S{season:00}E{episode:00}"),
+        Some("CONFIG-A-{Series Title}-S{season:00}E{episode:00}-{Custom Formats}"),
         None,
         None,
     )
@@ -1800,7 +1826,8 @@ async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
         "must pause before any file materialization"
     );
     assert!(!paused["operation_id"].is_null());
-    let config_a = "CONFIG-A-Harbor-S01E01.mkv";
+    // The captured CF names belong to the journaled path even after the catalog changes.
+    let config_a = "CONFIG-A-Harbor-S01E01-A Format Zulu.mkv";
     assert!(
         !ctx.root.join(config_a).exists(),
         "nothing may be written before staging even begins"
@@ -1832,6 +1859,12 @@ async fn naming_resume_uses_captured_destination_not_reconfigured_one_http() {
         None,
     )
     .await;
+    c.execute(
+        "UPDATE custom_formats SET name='Changed',include_when_renaming=0 WHERE id=1",
+        (),
+    )
+    .await
+    .unwrap();
     c.execute_batch("DROP TRIGGER naming_resume_pause;")
         .await
         .unwrap();

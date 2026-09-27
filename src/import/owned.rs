@@ -247,7 +247,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     .await?;
     // Compile/match outside the writer lock. The transaction repeats the exact
     // facts/configuration lookup and requires its already evaluated fingerprint.
-    crate::search::downloaded::evaluate_receipt(
+    let preflight = crate::search::downloaded::evaluate_receipt(
         &c,
         &input.target,
         &input.source,
@@ -261,6 +261,29 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             "Downloaded file decision could not be validated",
         )
     })?;
+    let preflight = preflight.accepted.ok_or_else(|| {
+        Error::conflict(
+            "preflight_changed",
+            "Downloaded file no longer passes current import policy",
+        )
+    })?;
+    let destination = crate::naming::destination::resolve_owned_destination(
+        &c,
+        &input.target,
+        &preflight.root,
+        &preflight.basename,
+        preflight.quality_id,
+        preflight.edition.as_deref(),
+        &preflight.evidence,
+    )
+    .await
+    .map_err(|_| Error::conflict("preflight_changed", "Import naming could not be validated"))?;
+    if destination != input.destination {
+        return Err(Error::conflict(
+            "preflight_changed",
+            "Import naming changed during preflight",
+        ));
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -319,6 +342,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         &accepted.basename,
         accepted.quality_id,
         accepted.edition.as_deref(),
+        &accepted.evidence,
     )
     .await
     {

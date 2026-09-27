@@ -52,7 +52,7 @@ impl TemplateField {
             StandardMovie | MovieFolder => MediaDomain::Movies,
         }
     }
-    fn allows(self, token: Token) -> bool {
+    fn allows(self, token: &Token) -> bool {
         use TemplateField::*;
         match self {
             StandardEpisode | DailyEpisode | AnimeEpisode => matches!(
@@ -63,12 +63,17 @@ impl TemplateField {
                     | Token::EpisodeTitle
                     | Token::AirDate
                     | Token::QualityTitle
+                    | Token::CustomFormats { .. }
             ),
             SeriesFolder => matches!(token, Token::SeriesTitle),
             SeasonFolder | SpecialsFolder => matches!(token, Token::SeriesTitle | Token::Season(_)),
             StandardMovie => matches!(
                 token,
-                Token::MovieTitle | Token::ReleaseYear | Token::EditionTags | Token::QualityTitle
+                Token::MovieTitle
+                    | Token::ReleaseYear
+                    | Token::EditionTags
+                    | Token::QualityTitle
+                    | Token::CustomFormats { .. }
             ),
             MovieFolder => matches!(
                 token,
@@ -92,7 +97,7 @@ impl TemplateField {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     SeriesTitle,
     Season(u8),
@@ -103,10 +108,18 @@ enum Token {
     MovieTitle,
     ReleaseYear,
     EditionTags,
+    CustomFormats {
+        singular: bool,
+        filter: String,
+        separator: String,
+        case: LetterCase,
+        prefix: String,
+        suffix: String,
+    },
 }
 impl Token {
-    /// `None` means the token is shared by both domains (currently only Quality Title).
-    fn domain(self) -> Option<MediaDomain> {
+    /// `None` means the token is shared by both domains.
+    fn domain(&self) -> Option<MediaDomain> {
         match self {
             Token::SeriesTitle
             | Token::Season(_)
@@ -116,10 +129,17 @@ impl Token {
             Token::MovieTitle | Token::ReleaseYear | Token::EditionTags => {
                 Some(MediaDomain::Movies)
             }
-            Token::QualityTitle => None,
+            Token::QualityTitle | Token::CustomFormats { .. } => None,
         }
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LetterCase {
+    Preserve,
+    Lower,
+    Upper,
+}
+
 fn parse_pad(digits: &str) -> Option<u8> {
     if digits.is_empty() || digits.len() > MAX_PAD_DIGITS || !digits.bytes().all(|b| b == b'0') {
         return None;
@@ -127,6 +147,60 @@ fn parse_pad(digits: &str) -> Option<u8> {
     Some(digits.len() as u8)
 }
 fn parse_token(text: &str) -> Result<Token, TemplateError> {
+    if text.chars().any(char::is_control) {
+        return Err(TemplateError::IllegalLiteralCharacter);
+    }
+    // CF selectors are exact names; normalize only the token identifier.
+    let (identifier, filter) = text.split_once(':').unwrap_or((text, ""));
+    let start = identifier.trim_start_matches([' ', '.', '-', '_', '[', '(']);
+    let end = start.trim_end_matches([' ', '.', '-', '_', ']', ')']);
+    let normalized: String = end
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if matches!(normalized.as_str(), "customformat" | "customformats")
+        && end
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
+    {
+        let suffix_text = if text.contains(':') { filter } else { start };
+        let suffix_start = suffix_text
+            .trim_end_matches([' ', '.', '-', '_', ']', ')'])
+            .len();
+        let selector = if text.contains(':') {
+            &filter[..suffix_start]
+        } else {
+            ""
+        };
+        let separator = end
+            .chars()
+            .skip_while(|c| c.is_ascii_alphanumeric())
+            .take_while(|c| matches!(c, ' ' | '.' | '-' | '_'))
+            .collect::<String>();
+        return Ok(Token::CustomFormats {
+            singular: normalized == "customformat",
+            filter: selector.to_owned(),
+            separator,
+            case: if end
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(char::is_lowercase)
+            {
+                LetterCase::Lower
+            } else if end
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(char::is_uppercase)
+            {
+                LetterCase::Upper
+            } else {
+                LetterCase::Preserve
+            },
+            prefix: identifier[..identifier.len() - start.len()].to_owned(),
+            suffix: suffix_text[suffix_start..].to_owned(),
+        });
+    }
     match text {
         "Series Title" => Ok(Token::SeriesTitle),
         "Episode Title" => Ok(Token::EpisodeTitle),
@@ -196,6 +270,15 @@ pub struct Template {
     components: Vec<Vec<Segment>>,
 }
 
+impl Template {
+    pub(super) fn uses_custom_formats(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::CustomFormats { .. })))
+    }
+}
+
 pub fn parse(field: TemplateField, raw: &str) -> Result<Template, TemplateError> {
     if raw.is_empty() {
         return Err(TemplateError::Empty);
@@ -225,7 +308,7 @@ pub fn parse(field: TemplateField, raw: &str) -> Result<Template, TemplateError>
                 if token.domain().is_some_and(|d| d != field.domain()) {
                     return Err(TemplateError::WrongDomain(format!("{{{token_text}}}")));
                 }
-                if !field.allows(token) {
+                if !field.allows(&token) {
                     return Err(TemplateError::NotAllowedInField(format!(
                         "{{{token_text}}}"
                     )));
@@ -295,6 +378,8 @@ pub struct EpisodeNamingFacts {
     pub episode: i64,
     pub episode_title: Option<String>,
     pub quality_title: String,
+    /// Already matched, rename-enabled names; selection is independent of profile scores.
+    pub custom_formats: Vec<String>,
     pub air_date: Option<String>,
 }
 /// Trusted single-movie naming facts.
@@ -304,6 +389,8 @@ pub struct MovieNamingFacts {
     pub release_year: Option<i64>,
     pub edition: Option<String>,
     pub quality_title: String,
+    /// Already matched, rename-enabled names; selection is independent of profile scores.
+    pub custom_formats: Vec<String>,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum RenderFacts<'a> {
@@ -359,14 +446,65 @@ impl fmt::Display for RenderError {
     }
 }
 
-fn token_value(token: Token, facts: RenderFacts<'_>) -> String {
+fn token_value(token: &Token, facts: RenderFacts<'_>) -> String {
+    if let Token::CustomFormats {
+        singular,
+        filter,
+        separator,
+        case,
+        ..
+    } = token
+    {
+        let names = match facts {
+            RenderFacts::Episode(f) => &f.custom_formats,
+            RenderFacts::Movie(f) => &f.custom_formats,
+        };
+        let mut names = names
+            .iter()
+            .filter(|name| {
+                if *singular {
+                    !filter.trim().is_empty() && *name == filter
+                } else if filter.trim().is_empty() {
+                    true
+                } else if let Some(excluded) = filter.strip_prefix('-') {
+                    !excluded.split(',').any(|n| n == name.as_str())
+                } else {
+                    filter.split(',').any(|n| n == name.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        if *singular {
+            names.truncate(1);
+        }
+        let value = names
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let value = value.trim();
+        if value.is_empty() {
+            return String::new();
+        }
+        let value = match case {
+            LetterCase::Lower => value.to_lowercase(),
+            LetterCase::Upper => value.to_uppercase(),
+            LetterCase::Preserve => value.to_owned(),
+        };
+        let value = if separator.trim().is_empty() {
+            value
+        } else {
+            value.replace(' ', separator)
+        };
+        return value;
+    }
     match (token, facts) {
         (Token::SeriesTitle, RenderFacts::Episode(f)) => f.series_title.clone(),
         (Token::Season(pad), RenderFacts::Episode(f)) => {
-            format!("{:0width$}", f.season, width = pad as usize)
+            format!("{:0width$}", f.season, width = *pad as usize)
         }
         (Token::Episode(pad), RenderFacts::Episode(f)) => {
-            format!("{:0width$}", f.episode, width = pad as usize)
+            format!("{:0width$}", f.episode, width = *pad as usize)
         }
         (Token::EpisodeTitle, RenderFacts::Episode(f)) => {
             f.episode_title.clone().unwrap_or_default()
@@ -473,13 +611,36 @@ pub fn render(
             match segment {
                 Segment::Literal(text) => buf.push_str(text),
                 Segment::Token(token) => {
-                    let raw_value = token_value(*token, facts);
+                    let raw_value = token_value(token, facts);
                     let colon_replaced = replace_colons(&raw_value, config.colon);
                     let sanitized =
                         replace_illegal(&colon_replaced, config.replace_illegal_characters)?;
-                    buf.push_str(&sanitized);
+                    if let Token::CustomFormats { prefix, suffix, .. } = token {
+                        // Conditional punctuation applies after sanitization: a name made
+                        // entirely of removed characters must not leave empty brackets.
+                        if !sanitized.trim().is_empty() {
+                            buf.push_str(prefix);
+                            buf.push_str(sanitized.trim());
+                            buf.push_str(suffix);
+                        }
+                    } else {
+                        buf.push_str(&sanitized);
+                    }
                 }
             }
+        }
+        if component
+            .iter()
+            .any(|s| matches!(s, Segment::Token(Token::CustomFormats { .. })))
+        {
+            // Naming separators collapse only on the newly supported CF path.
+            let mut previous = None;
+            buf.retain(|c| {
+                let keep = previous != Some(c) || !matches!(c, ' ' | '.' | '-' | '_');
+                previous = Some(c);
+                keep
+            });
+            buf = buf.trim_matches([' ', '.', '-', '_']).to_owned();
         }
         parts.push(finish_component(&buf)?);
     }
@@ -496,6 +657,7 @@ mod tests {
             episode: 7,
             episode_title: Some("The Long Dark".into()),
             quality_title: "WEBDL-1080p".into(),
+            custom_formats: vec![],
             air_date: Some("2024-05-14".into()),
         }
     }
@@ -505,6 +667,7 @@ mod tests {
             release_year: Some(2023),
             edition: Some("Director's Cut".into()),
             quality_title: "Bluray-1080p".into(),
+            custom_formats: vec![],
         }
     }
     fn cfg(replace: bool, colon: ColonPolicy<'_>) -> RenderConfig<'_> {
@@ -512,6 +675,86 @@ mod tests {
             replace_illegal_characters: replace,
             colon,
         }
+    }
+
+    #[test]
+    fn custom_format_filters_normalization_and_bounded_paths() {
+        let mut episode = episode_facts();
+        let mut movie = movie_facts();
+        let names = vec!["Zulu".into(), "A Format".into(), "ignored".into()];
+        episode.custom_formats = names.clone();
+        movie.custom_formats = names;
+        for (field, facts) in [
+            (
+                TemplateField::StandardEpisode,
+                RenderFacts::Episode(&episode),
+            ),
+            (TemplateField::StandardMovie, RenderFacts::Movie(&movie)),
+        ] {
+            for (input, expected) in [
+                ("{Custom Formats}", "A Format Zulu ignored"),
+                ("{Custom Formats:Zulu,A Format}", "A Format Zulu"),
+                ("{Custom Formats:-ignored}", "A Format Zulu"),
+                ("{Custom Format:A Format}", "A Format"),
+                ("title {Custom Format:missing}", "title"),
+                ("title {[Custom Formats:missing]}", "title"),
+                ("title {-Custom Format}", "title"),
+                ("{CUSTOM.FORMATS:-ignored}", "A.FORMAT.ZULU"),
+                ("{custom_formats:Zulu}", "zulu"),
+                ("{[Custom Formats:A Format]}", "[A Format]"),
+                ("title  {Custom Formats:missing}.", "title"),
+                ("title {Custom Format:a format}", "title"),
+            ] {
+                let parsed = parse(field, input).unwrap();
+                assert_eq!(
+                    render(&parsed, facts, &cfg(true, ColonPolicy::Dash)).unwrap(),
+                    expected,
+                    "{input}"
+                );
+            }
+        }
+        assert!(parse(TemplateField::MovieFolder, "{Custom Formats}").is_err());
+        movie.custom_formats = vec!["Face/Off:secret".into()];
+        let parsed = parse(TemplateField::StandardMovie, "{Custom Formats}").unwrap();
+        assert_eq!(
+            render(
+                &parsed,
+                RenderFacts::Movie(&movie),
+                &cfg(true, ColonPolicy::Dash)
+            )
+            .unwrap(),
+            "Face-Off-secret"
+        );
+        assert_eq!(
+            render(
+                &parsed,
+                RenderFacts::Movie(&movie),
+                &cfg(false, ColonPolicy::Dash)
+            ),
+            Err(RenderError::IllegalCharacter)
+        );
+        movie.custom_formats = vec!["???".into()];
+        let wrapped = parse(TemplateField::StandardMovie, "title {[Custom Formats]}").unwrap();
+        assert_eq!(
+            render(
+                &wrapped,
+                RenderFacts::Movie(&movie),
+                &cfg(true, ColonPolicy::Dash)
+            )
+            .unwrap(),
+            "title"
+        );
+        movie.custom_formats = vec!["é".repeat(200)];
+        assert_eq!(
+            render(
+                &parsed,
+                RenderFacts::Movie(&movie),
+                &cfg(true, ColonPolicy::Dash)
+            )
+            .unwrap()
+            .len(),
+            254
+        );
     }
 
     #[test]

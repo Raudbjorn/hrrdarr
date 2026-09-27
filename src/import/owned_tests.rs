@@ -135,6 +135,7 @@ pub(super) async fn fixture(
 }
 
 pub(super) async fn replacements() {
+    custom_format_naming_changes_reject_before_journaling().await;
     // Keep execute() regressions within the shared serial recovery test: its permit is global.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
@@ -757,4 +758,98 @@ async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, inv
         .is_err(),
         "Historical fixture must restore immutability"
     );
+}
+
+// Kept in the existing serial import test, which owns the process-wide execution permit.
+async fn custom_format_naming_changes_reject_before_journaling() {
+    for movie in [false, true] {
+        for change in ["name", "include", "definition", "illegal"] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            let mut input = fixture(&dir, &db, movie, false).await;
+            let c = db.connect().await.unwrap();
+            let media = if movie { "movies" } else { "tv" };
+            let column = if movie {
+                "standard_movie_format"
+            } else {
+                "standard_episode_format"
+            };
+            c.execute(&format!("UPDATE naming_settings SET revision=revision+1,rename_enabled=1,replace_illegal_characters=0,{column}='CF-{{Custom Formats}}' WHERE domain=?"), [media]).await.unwrap();
+            let specs = serde_json::json!([{"name":"Title","negate":false,"required":false,"condition":{"kind":"release_title","pattern":"WEB-DL"}}]).to_string();
+            c.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,'Before',1,?)",params![media,specs]).await.unwrap();
+            let accepted = crate::search::downloaded::evaluate_receipt(
+                &c,
+                &input.target,
+                &input.source,
+                input.expected_size,
+                &input.candidate_id,
+            )
+            .await
+            .unwrap()
+            .accepted
+            .unwrap();
+            input.destination = crate::naming::destination::resolve_owned_destination(
+                &c,
+                &input.target,
+                &accepted.root,
+                &accepted.basename,
+                accepted.quality_id,
+                accepted.edition.as_deref(),
+                &accepted.evidence,
+            )
+            .await
+            .unwrap();
+            assert!(input.destination.ends_with("CF-Before.mkv"));
+            match change {
+                "name" => {
+                    c.execute("UPDATE custom_formats SET name='After'", ())
+                        .await
+                        .unwrap();
+                }
+                "include" => {
+                    c.execute("UPDATE custom_formats SET include_when_renaming=0", ())
+                        .await
+                        .unwrap();
+                }
+                "definition" => {
+                    c.execute("UPDATE custom_formats SET specifications_json=replace(specifications_json,'WEB-DL','impossible')",()).await.unwrap();
+                }
+                _ => {
+                    c.execute("UPDATE custom_formats SET name='private/secret'", ())
+                        .await
+                        .unwrap();
+                }
+            }
+            // Exact-input miss inside the writer must fail, never run regex work there.
+            let tx = c
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .unwrap();
+            let outcome = crate::naming::destination::resolve_owned_destination(
+                &tx,
+                &input.target,
+                &accepted.root,
+                &accepted.basename,
+                accepted.quality_id,
+                accepted.edition.as_deref(),
+                &accepted.evidence,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                Err(crate::naming::destination::DestinationError::Render(_))
+            ));
+            tx.rollback().await.unwrap();
+            let source = input.source.clone();
+            let error = prepare_owned(db.clone(), input).await.unwrap_err();
+            assert_eq!(error.code(), "preflight_changed", "{change}");
+            assert!(!format!("{error:?}").contains("private/secret"));
+            assert_eq!(
+                std::fs::read(dir.path(&format!("{media}/old.mkv"))).unwrap(),
+                b"original-media"
+            );
+            assert_eq!(std::fs::read(source).unwrap(), b"new-media-content");
+            assert_eq!(count(&db, "operations").await, 0);
+        }
+    }
 }
