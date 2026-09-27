@@ -135,6 +135,7 @@ pub(super) async fn fixture(
 }
 
 pub(super) async fn replacements() {
+    legacy_owned_journals_revalidate_current_policy_before_recovery().await;
     // Real owned producer and journal transitions, not fabricated replacement sidecars.
     for (movie, shared) in [(false, false), (true, false), (false, true)] {
         let dir = Scratch::new();
@@ -566,4 +567,185 @@ async fn changed_original_title_or_format_policy_prevents_owned_replacement() {
         assert_eq!(std::fs::read(&oldpath).unwrap(), b"original-media");
         assert_eq!(count(&db, "import_history").await, 0);
     }
+}
+
+async fn legacy_owned_journals_revalidate_current_policy_before_recovery() {
+    for movie in [false, true] {
+        for published in [false, true] {
+            for blocked in [false, true] {
+                let dir = Scratch::new();
+                let db = dir.database().await;
+                let input = fixture(&dir, &db, movie, false).await;
+                let candidate = input.candidate_id.clone();
+                let destination = input.destination.clone();
+                let operation = prepare_owned(db.clone(), input)
+                    .await
+                    .unwrap()
+                    .id
+                    .to_string();
+                if published {
+                    stage_and_publish(&db, &operation, true).await;
+                }
+                let c = db.connect().await.unwrap();
+                legacy_provenance(&c, &operation, &candidate, false).await;
+                assert!(
+                    owned::facts(&c, &operation)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .evidence
+                        .is_none()
+                );
+                // A reachable native policy, whose required provider flag is unavailable
+                // in the old receipt. This also exercises prewarm/cached-only commit scoring.
+                let media = if movie { "movies" } else { "tv" };
+                let specs = serde_json::json!([{"name":"Freeleech","required":false,"negate":false,"condition":{"kind":"indexer_flag","value":1}}]).to_string();
+                c.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,'Legacy flag',0,?)",params![media,specs]).await.unwrap();
+                c.execute("INSERT INTO quality_profile_format_scores(profile_id,format_id,media_type,score)VALUES(?,?,?,10)",params![if movie {2}else{1},c.last_insert_rowid(),media]).await.unwrap();
+                if blocked {
+                    c.execute(
+                        "UPDATE quality_profile_policies SET min_format_score=1 WHERE media_type=?",
+                        [if movie { "movies" } else { "tv" }],
+                    )
+                    .await
+                    .unwrap();
+                }
+                drop(c);
+                drop(db);
+                let db = dir.database().await;
+                if published && !blocked {
+                    let c = db.connect().await.unwrap();
+                    let record = load(&c, &operation).await.unwrap();
+                    let plan = record.plan.unwrap();
+                    let stage = record.stage.unwrap();
+                    owned::before(&c, &operation, &record.target).await.unwrap();
+                    commit(&c, &operation, &record.target, &plan, &stage)
+                        .await
+                        .unwrap();
+                    // The committed association is authoritative: pending retirement must
+                    // finish even when policy becomes restrictive after the commit.
+                    c.execute(
+                        "UPDATE quality_profile_policies SET min_format_score=1 WHERE media_type=?",
+                        [if movie { "movies" } else { "tv" }],
+                    )
+                    .await
+                    .unwrap();
+                }
+                let outcome = execute(db.clone(), &operation).await;
+                let old = dir.path(if movie {
+                    "movies/old.mkv"
+                } else {
+                    "tv/old.mkv"
+                });
+                if blocked {
+                    assert_eq!(outcome.unwrap_err().code(), "preflight_changed");
+                    assert_eq!(std::fs::read(&old).unwrap(), b"original-media");
+                    assert_eq!(count(&db, "import_history").await, 0);
+                    if !published {
+                        assert!(!std::path::Path::new(&destination).exists());
+                    }
+                } else {
+                    assert_eq!(outcome.unwrap().status, "complete");
+                    assert_eq!(std::fs::read(&destination).unwrap(), b"new-media-content");
+                    assert_eq!(count(&db, "import_history").await, 1);
+                    let c = db.connect().await.unwrap();
+                    let sql = if movie {
+                        "SELECT original_release_title,languages_json,indexer_flags FROM file_metadata WHERE movie_file_id=(SELECT id FROM movie_files WHERE movie_id=1)"
+                    } else {
+                        "SELECT original_release_title,languages_json,indexer_flags FROM file_metadata WHERE episode_file_id=(SELECT episode_file_id FROM episodes WHERE id=1)"
+                    };
+                    let row = c
+                        .query(sql, ())
+                        .await
+                        .unwrap()
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.get::<Option<String>>(0).unwrap(), None);
+                    assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+                    assert_eq!(row.get::<Option<i64>>(2).unwrap(), None);
+                }
+            }
+        }
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        let input = fixture(&dir, &db, movie, false).await;
+        let candidate = input.candidate_id.clone();
+        let operation = prepare_owned(db.clone(), input)
+            .await
+            .unwrap()
+            .id
+            .to_string();
+        let c = db.connect().await.unwrap();
+        legacy_provenance(&c, &operation, &candidate, true).await;
+        assert!(
+            execute(db.clone(), &operation).await.is_err(),
+            "Invalid immutable expected size must fail closed"
+        );
+        assert_eq!(count(&db, "import_history").await, 0);
+        assert_eq!(
+            std::fs::read(dir.path(if movie {
+                "movies/old.mkv"
+            } else {
+                "tv/old.mkv"
+            }))
+            .unwrap(),
+            b"original-media"
+        );
+    }
+}
+
+async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, invalid_size: bool) {
+    // Fixture-only historical shape: old journals had expected_size but no comparison facts.
+    // Temporarily relax immutable guards in this scratch transaction, restore the exact
+    // trigger definitions, and only then invoke application recovery. No migration changes.
+    let tx = c.transaction().await.unwrap();
+    let mut triggers = Vec::new();
+    for name in [
+        "candidate_import_immutable",
+        "rss_comparison_facts_update",
+        "rss_candidate_transition",
+    ] {
+        let sql: String = tx
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                [name],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        tx.execute_batch(&format!("DROP TRIGGER {name}"))
+            .await
+            .unwrap();
+        triggers.push(sql);
+    }
+    tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_remove(provenance_json,'$.comparison_facts') WHERE operation_id=?",[operation]).await.unwrap();
+    if invalid_size {
+        tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_set(provenance_json,'$.expected_size',0) WHERE operation_id=?",[operation]).await.unwrap();
+    }
+    tx.execute(
+        "UPDATE rss_candidates SET comparison_facts_json=NULL WHERE id=?",
+        [candidate],
+    )
+    .await
+    .unwrap();
+    for sql in triggers {
+        tx.execute_batch(&sql).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert!(
+        c.execute(
+            "UPDATE rss_candidate_imports SET provenance_json='{}' WHERE operation_id=?",
+            [operation]
+        )
+        .await
+        .is_err(),
+        "Historical fixture must restore immutability"
+    );
 }

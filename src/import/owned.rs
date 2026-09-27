@@ -25,16 +25,22 @@ pub(super) struct Facts {
     pub retirement_state: String,
     pub retirement: Option<Retirement>,
     pub evidence: Option<crate::custom_formats::Evidence>,
+    pub expected_size: u64,
 }
 pub(super) async fn facts(c: &Connection, operation: &str) -> Result<Option<Facts>> {
     let Some(r)=c.query("SELECT quality_id,revision_json,edition,old_file_json,retirement_state,retirement_json,provenance_json,(SELECT media_type FROM operations WHERE id=operation_id) FROM rss_candidate_imports WHERE operation_id=?",[operation]).await?.next().await? else {return Ok(None)};
-    let evidence: Option<crate::custom_formats::Evidence> =
-        serde_json::from_str::<serde_json::Value>(&r.get::<String>(6)?)
-            .map_err(|_| Error::internal())?
-            .get("comparison_facts")
-            .cloned()
-            .map(|v| serde_json::from_value(v).map_err(|_| Error::internal()))
-            .transpose()?;
+    let provenance: serde_json::Value =
+        serde_json::from_str(&r.get::<String>(6)?).map_err(|_| Error::internal())?;
+    let expected_size = provenance
+        .get("expected_size")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|size| *size > 0)
+        .ok_or_else(Error::internal)?;
+    let evidence: Option<crate::custom_formats::Evidence> = provenance
+        .get("comparison_facts")
+        .cloned()
+        .map(|v| serde_json::from_value(v).map_err(|_| Error::internal()))
+        .transpose()?;
     if let Some(evidence) = &evidence {
         crate::custom_formats::validate_evidence(
             if r.get::<String>(7)? == "episode" {
@@ -48,6 +54,7 @@ pub(super) async fn facts(c: &Connection, operation: &str) -> Result<Option<Fact
     }
     Ok(Some(Facts {
         evidence,
+        expected_size,
         quality_id: r.get(0)?,
         revision_json: r.get(1)?,
         edition: r.get(2)?,
@@ -113,28 +120,29 @@ pub(super) async fn before(
     let Some(f) = facts(c, operation).await? else {
         return owner(c, t).await;
     };
-    // Before placement and again inside commit: current definitions/profile must still accept frozen facts.
-    if let Some(evidence) = f.evidence.clone() {
-        let source: String = c
-            .query("SELECT source FROM operations WHERE id=?", [operation])
-            .await?
-            .next()
-            .await?
-            .ok_or_else(Error::internal)?
-            .get(0)?;
-        let size = evidence.size.ok_or_else(Error::internal)?;
-        let decision =
-            crate::search::downloaded::evaluate_with_evidence(c, t, &source, size, Some(evidence))
-                .await
-                .map_err(|_| {
-                    Error::conflict("preflight_changed", "Import policy evaluation failed")
-                })?;
-        if decision.accepted.is_none() {
-            return Err(Error::conflict(
-                "preflight_changed",
-                "Import no longer satisfies current policy",
-            ));
-        }
+    // Legacy journals lack comparison facts, not authorization to bypass current policy.
+    // Their immutable provenance still supplies size; missing provider facts stay unknown.
+    let source: String = c
+        .query("SELECT source FROM operations WHERE id=?", [operation])
+        .await?
+        .next()
+        .await?
+        .ok_or_else(Error::internal)?
+        .get(0)?;
+    let decision = crate::search::downloaded::evaluate_with_evidence(
+        c,
+        t,
+        &source,
+        f.expected_size,
+        f.evidence.clone(),
+    )
+    .await
+    .map_err(|_| Error::conflict("preflight_changed", "Import policy evaluation failed"))?;
+    if decision.accepted.is_none() {
+        return Err(Error::conflict(
+            "preflight_changed",
+            "Import no longer satisfies current policy",
+        ));
     }
     let current = ownership(c, t).await?;
     if current.3 != f.old.as_ref().map(|o| o.file_id) {
