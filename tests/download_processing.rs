@@ -370,7 +370,8 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     let (base, _api) = serve(router).await;
     let c = db.connect().await.unwrap();
     // Profiles are configuration fixtures; all catalog targets, receipts, import journals and history use real producers.
-    c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1),(1,'tv',7,1,1),(2,'movies',7,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,7,0,0,1,NULL),(2,'movies',1,7,0,0,1,-2); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
+    c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1),(1,'tv',7,1,1),(2,'movies',7,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,7,0,0,1,NULL),(2,'movies',1,7,0,0,1,-1); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
     // Fresh-install naming defaults must be disabled with every format unset; a naming
     // config that is *configured but disabled* must not perturb any basename assertion
     // below, since `rename_enabled` is the only automated-path gate that matters.
@@ -1045,7 +1046,8 @@ async fn same_basename_http() {
     )
     .await;
     let c = db.connect().await.unwrap();
-    c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',1,0,1),(1,'tv',3,1,1),(2,'movies',1,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
+    c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',1,0,1),(1,'tv',3,1,1),(2,'movies',1,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
     let (indexer, download) = providers(&base, &origin).await;
     let mut paths = Vec::new();
     for (i, media) in ["tv", "movies"].iter().enumerate() {
@@ -1316,7 +1318,8 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     let (base, api) = serve(router).await;
     let c = db.connect().await.unwrap();
     let media = if movie { "movies" } else { "tv" };
-    let lang = if movie { "-2" } else { "NULL" };
+    // This import fixture has no audio-language evidence, so request Any (-1).
+    let lang = if movie { "-1" } else { "NULL" };
     c.execute_batch(&format!(
         "UPDATE quality_definitions SET min_size=0; \
          INSERT INTO quality_profiles VALUES(1,'{media}','HD'); \

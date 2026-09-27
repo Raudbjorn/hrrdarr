@@ -332,7 +332,8 @@ mod tests {
             .await
             .unwrap();
         let c = db.connect().await.unwrap();
-        c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional/tv'); INSERT INTO seasons(series_id,number)VALUES(1,1);INSERT INTO episodes(id,series_id,season,number,title,runtime)VALUES(1,1,1,1,'Pilot',45);INSERT INTO movie_metadata(id,title,year,runtime)VALUES(1,'Harbor',2020,100);INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional/movie');INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD');INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1);INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2);INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0);INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released');").await.unwrap();
+        // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
+        c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional/tv'); INSERT INTO seasons(series_id,number)VALUES(1,1);INSERT INTO episodes(id,series_id,season,number,title,runtime)VALUES(1,1,1,1,'Pilot',45);INSERT INTO movie_metadata(id,title,year,runtime)VALUES(1,'Harbor',2020,100);INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional/movie');INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD');INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1);INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1);INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0);INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released');").await.unwrap();
         for (target, name, reason) in [
             (
                 MediaTarget::Episode(1),
@@ -387,6 +388,45 @@ mod tests {
                 .unwrap();
             assert_eq!(accepted.quality_id, 3);
             assert!(!accepted.basename.contains('/'));
+        }
+        // Import uses the same policy guard: no audio measurement exists for Original/concrete.
+        c.execute("UPDATE movie_metadata SET original_language=1", ())
+            .await
+            .unwrap();
+        for language in [-2, 0, 1, 57, -1] {
+            c.execute(
+                "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
+                [language],
+            )
+            .await
+            .unwrap();
+            let result = evaluate(
+                &c,
+                &MediaTarget::Movie(1),
+                "Harbor.2020.1080p.WEB-DL.mkv",
+                1073741824,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.accepted.is_some(), language == -1);
+            assert_eq!(
+                result
+                    .reasons
+                    .contains(&"language_policy_unsupported".into()),
+                language != -1
+            );
+            assert!(
+                evaluate(
+                    &c,
+                    &MediaTarget::Episode(1),
+                    "Harbor.S01E01.1080p.WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_some()
+            );
         }
         let tiny = evaluate(
             &c,

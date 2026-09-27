@@ -455,8 +455,9 @@ pub(super) async fn apply_quality(
                     if policy.min_format_score != 0 || policy.cutoff_format_score != 0 {
                         result.deny("custom_format_policy_unsupported")
                     }
-                    if !tv && policy.language_id != Some(-2) {
-                        // Protocol language strings are not a verified audio-language measurement.
+                    if !tv && policy.language_id != Some(-1) {
+                        // Only Any (-1) needs no audio-language evidence. Original (-2)
+                        // and concrete languages remain unsupported, including at import.
                         result.deny("language_policy_unsupported");
                     }
                     let cutoff = match policy.cutoff {

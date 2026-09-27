@@ -221,7 +221,8 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
     (base, server, client)
 }
 async fn seed(db: &Database) {
-    db.connect().await.unwrap().execute_batch("INSERT INTO series(id,tvdb_id,title,path)VALUES(1,101,'Harbor','/owned-fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2099-01-01 00:00:00'); INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime,digital_release)VALUES(1,201,'Harbor',2020,100,'2099-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/owned-fictional-movie'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',5,0,1),(1,'tv',3,1,1),(2,'movies',5,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
+    db.connect().await.unwrap().execute_batch("INSERT INTO series(id,tvdb_id,title,path)VALUES(1,101,'Harbor','/owned-fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2099-01-01 00:00:00'); INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime,digital_release)VALUES(1,201,'Harbor',2020,100,'2099-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/owned-fictional-movie'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',5,0,1),(1,'tv',3,1,1),(2,'movies',5,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
 }
 async fn providers(base: &str, remote: &str) -> (Value, Value) {
     let mut values = Vec::new();
@@ -943,6 +944,93 @@ async fn failed_continuation_never_exposes_or_selects_partial_results() {
     }
     assert!(remote_state.offsets.lock().unwrap().contains(&1));
     assert!(remote_state.adds.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+    server.stop().await;
+    remote_server.stop().await;
+}
+
+// Accepted offers must be re-evaluated at grab time after a policy edit.
+#[tokio::test]
+async fn movie_language_policy_is_enforced_at_search_and_grab() {
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("hrrdarr-language-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    seed(&db).await;
+    let c = db.connect().await.unwrap();
+    let state = Arc::new(Remote::default());
+    let (remote_base, remote_server) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(state.clone()),
+    )
+    .await;
+    let (base, server, client) = app(db.clone()).await;
+    let (indexer, download) = providers(&base, &remote_base).await;
+    let runtime = commands::start(db.clone(), client).await.unwrap();
+    for language in [-2, 1, -1] {
+        c.execute(
+            "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
+            [language],
+        )
+        .await
+        .unwrap();
+        let (status, command) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&indexer, &download, false, "interactive"),
+        )
+        .await;
+        assert_eq!(status, 202);
+        assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+        let results = offers(&base, &command["id"]).await;
+        assert_eq!(results.len(), 2);
+        for offer in &results {
+            assert_eq!(
+                offer["decision"]["disposition"],
+                if language == -1 { "accept" } else { "reject" }
+            );
+            assert_eq!(
+                offer["decision"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("language_policy_unsupported")),
+                language != -1
+            );
+        }
+        let path = format!(
+            "/api/v1/search/results/{}/grab",
+            results[0]["id"].as_str().unwrap()
+        );
+        if language != -1 {
+            assert_eq!(request(&base, "POST", &path, json!({})).await.0, 409);
+            continue;
+        }
+        // A previously accepted Any offer cannot bypass a newly restrictive policy.
+        for restrictive in [-2, 1] {
+            c.execute(
+                "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
+                [restrictive],
+            )
+            .await
+            .unwrap();
+            let (status, error) = request(&base, "POST", &path, json!({})).await;
+            assert_eq!(status, 409, "{error}");
+            assert_eq!(error["error"]["code"], "release_rejected");
+            assert!(state.adds.lock().unwrap().is_empty());
+        }
+        c.execute(
+            "UPDATE quality_profile_policies SET language_id=-1 WHERE media_type='movies'",
+            (),
+        )
+        .await
+        .unwrap();
+        let (status, selected) = request(&base, "POST", &path, json!({})).await;
+        assert!((200..300).contains(&status), "{selected}");
+        observed(&base, selected["id"].as_str().unwrap()).await;
+        assert_eq!(state.adds.lock().unwrap().as_slice(), &[hash(false, false)]);
+    }
     runtime.shutdown().await;
     server.stop().await;
     remote_server.stop().await;

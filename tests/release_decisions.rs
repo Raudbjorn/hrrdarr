@@ -38,7 +38,8 @@ async fn both_domain_decisions_and_real_search_consumer() {
     let _scratch = Scratch(path.clone());
     let db = Arc::new(Database::open_local(path.join("test.db")).await.unwrap());
     let c = db.connect().await.unwrap();
-    c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Harbor','/synthetic/tv'); INSERT INTO seasons(series_id,number) VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime) VALUES(1,1,1,1,'Pilot',45),(2,1,1,2,'Second',45); UPDATE episodes SET air_date_utc='2026-09-23 12:00:00'; INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime,digital_release) VALUES(1,201,'Harbor',2026,100,'2026-09-25 12:00:00'); INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/synthetic/movie'); INSERT INTO movie_alternative_titles VALUES(1,'Safe Harbor'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed) VALUES(1,'tv',5,0,1),(1,'tv',3,1,1),(2,'movies',5,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id) VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-2); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering) VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability) VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',60,60,0),('movies',60,60,0);").await.unwrap();
+    // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
+    c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Harbor','/synthetic/tv'); INSERT INTO seasons(series_id,number) VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime) VALUES(1,1,1,1,'Pilot',45),(2,1,1,2,'Second',45); UPDATE episodes SET air_date_utc='2026-09-23 12:00:00'; INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime,digital_release) VALUES(1,201,'Harbor',2026,100,'2026-09-25 12:00:00'); INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/synthetic/movie'); INSERT INTO movie_alternative_titles VALUES(1,'Safe Harbor'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed) VALUES(1,'tv',5,0,1),(1,'tv',3,1,1),(2,'movies',5,0,1),(2,'movies',3,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id) VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering) VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability) VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',60,60,0),('movies',60,60,0);").await.unwrap();
     let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:30:00Z")
         .unwrap()
         .timestamp();
@@ -75,6 +76,52 @@ async fn both_domain_decisions_and_real_search_consumer() {
                 .disposition,
             Disposition::Accept
         );
+    }
+    // Catalog original language and matching protocol text still do not prove audio language.
+    c.execute("UPDATE movie_metadata SET original_language=1", ())
+        .await
+        .unwrap();
+    let mut language_movie = release("Safe.Harbor.2026.1080p.WEB-DL", false);
+    language_movie.metadata.languages = vec!["English".into()];
+    for language in [-2, 0, 1, 57, -1] {
+        c.execute(
+            "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
+            [language],
+        )
+        .await
+        .unwrap();
+        for context in [SearchContext::UserSearch, SearchContext::Rss] {
+            let result = search::evaluate(
+                &c,
+                MediaDomain::Movies,
+                &language_movie,
+                context,
+                now + 172800,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.disposition,
+                if language == -1 {
+                    Disposition::Accept
+                } else {
+                    Disposition::Reject
+                }
+            );
+            assert_eq!(
+                result
+                    .reasons
+                    .contains(&"language_policy_unsupported".into()),
+                language != -1
+            );
+            assert_eq!(
+                search::evaluate(&c, MediaDomain::Tv, &tv, context, now + 172800)
+                    .await
+                    .unwrap()
+                    .disposition,
+                Disposition::Accept
+            );
+        }
     }
     c.execute("UPDATE seasons SET monitored=0", ())
         .await
@@ -326,6 +373,31 @@ async fn both_domain_decisions_and_real_search_consumer() {
         assert_eq!(
             value["items"][0]["decision"]["disposition"], "accept",
             "{value}"
+        );
+    }
+
+    // The public search response must expose the same unsupported-policy reason.
+    for language in [-2, 1, -1] {
+        c.execute(
+            "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
+            [language],
+        )
+        .await
+        .unwrap();
+        let response = client.post(format!("{base}/api/v1/release-search"))
+            .header("content-type", "application/json").body(serde_json::json!({"provider_id":provider["id"],"provider_revision":1,"target":{"media_type":"movie","id":1},"offset":0,"query_index":0,"limit":10}).to_string())
+            .send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["items"][0]["decision"]["disposition"],
+            if language == -1 { "accept" } else { "reject" }
+        );
+        assert_eq!(
+            value["items"][0]["decision"]["reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("language_policy_unsupported")),
+            language != -1
         );
     }
 
