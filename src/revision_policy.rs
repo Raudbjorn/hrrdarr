@@ -51,6 +51,12 @@ pub struct Update {
 }
 #[derive(Debug)]
 pub struct Error(StatusCode, &'static str);
+impl Error {
+    pub(crate) fn code(&self) -> &'static str {
+        self.1
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
