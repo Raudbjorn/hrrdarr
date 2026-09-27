@@ -206,8 +206,18 @@ pub(crate) async fn persist_validated(
         conn.execute("UPDATE custom_formats SET name=?,include_when_renaming=?,specifications_json=? WHERE id=? AND media_type=?",params![input.name.clone(),i64::from(input.include_when_renaming),json,id,crate::search::domain(media)]).await?;
         id
     } else {
-        conn.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?)",params![crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;
-        conn.last_insert_rowid()
+        // ponytail: historical mappings are scanned per creation; index destination_table/id if archive volume makes this costly.
+        let previous=conn.query("SELECT max(coalesce((SELECT max(id) FROM custom_formats),0),coalesce((SELECT max(destination_id) FROM snapshot_mappings WHERE destination_table='custom_formats'),0))",()).await?.next().await?.ok_or_else(||invalid("Custom format identity allocation failed"))?.get::<i64>(0)?;
+        let id = previous
+            .checked_add(1)
+            .filter(|id| *id <= 9_007_199_254_740_991)
+            .ok_or(Error(
+                StatusCode::CONFLICT,
+                "custom_format_id_exhausted",
+                "No safe custom format identity remains",
+            ))?;
+        conn.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?,?)",params![id,crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;
+        id
     };
     Ok(Format {
         id,

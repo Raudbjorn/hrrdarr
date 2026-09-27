@@ -135,6 +135,8 @@ The native `/api/v1/{media}/quality-profiles` API supports actual profile editin
 | GET base | `?offset=0&limit=50` | HTTP 200, paged summaries |
 | GET `/{id}` | None | HTTP 200, complete profile |
 | PUT `/{id}` | Profile input | HTTP 200, complete replaced profile |
+| GET `/schema` | None | HTTP 200, unsaved `QualityProfileInput` draft |
+| DELETE `/{id}` | None | HTTP 204, unused profile removed |
 
 Names are unique per media domain, nonblank, 1–100 characters without controls.
 Profile inputs contain `name`, `items` and optional `policy`; unknown fields are rejected. Full
@@ -191,13 +193,11 @@ profiles, nullable single/bulk propagation, all-null exclusion, movie isolation,
 late-profile-write rollback, replacement rollback, API round trips and reopened
 persistence. The existing quality contract tests continue to cover reset differences.
 
-This supports profile structure and stored policy, not complete quality-profile parity (`api.023`).
-Custom-format definitions/relationships and scoring, default profile generation,
-profile deletion and search decisions remain separate work. Native library assignments
-exist separately; snapshot-to-profile assignments remain unsupported.
-No durable `ResetQualityDefinitionsCommand`, SignalR/change events, browser
-settings flow, remote database verification, snapshot-to-active-profile mapping,
-or release size-decision enforcement is claimed here.
+Native profiles, custom formats, scoring and supported snapshot profile reconstruction
+are available; see [custom formats](custom-formats.md) and [snapshot import](snapshot-import.md).
+Complete quality-profile parity (`api.023`) still requires the editor and remaining
+consumers. No durable `ResetQualityDefinitionsCommand`, SignalR/change events,
+remote database verification or complete upstream wire compatibility is claimed.
 
 ## Explicit stored profile policy
 
@@ -230,12 +230,10 @@ and resolves the cutoff to a profile-owned relational foreign key. Replacing the
 graph and policy is atomic; an invalid cutoff or late write error preserves both.
 
 All score fields are signed 32-bit integers. `min_upgrade_format_score` must be at
-least 1. No score ordering is imposed. With the currently empty custom-format
-catalog, `min_format_score` must be at most zero. `format_items` is a closed empty
-array (`[]`), not a generic JSON extension point; nonempty arrays are unsupported
-and rejected with HTTP 400. No format definitions, condition evaluation or phantom
-foreign-key targets are created. A positive cutoff-format threshold can be retained
-as configuration, but no current worker evaluates it.
+least 1. No score ordering is imposed. Minimum score cannot exceed the sum of
+configured positive scores. `format_items` contains unique domain-valid
+`{format_id, score}` relationships. Current domain definitions absent from stored
+scores read as zero; removing a definition cascades its score relationships.
 
 TV policy requires `language_id` absent or null. Movie policy requires an explicit
 ID in -2..57: -2 means Original, -1 Any, 0 Unknown, and 1..57 are the pinned concrete
@@ -243,8 +241,7 @@ language identities. This differs from file language arrays; a missing movie
 language never becomes a guessed language. Unknown policy/cutoff fields, malformed
 scalars, overflow and a cutoff outside the supplied allowed roots are rejected.
 
-The fields are stored and editable; they are **not evaluated** by search, upgrade,
-import or cutoff-unmet logic in this unit. Existing native subset-catalog profiles
+Search and owned import evaluate current quality and custom-format policy. Existing native subset-catalog profiles
 and single-child groups remain supported; the stricter upstream whole-catalog and
 multiple-child editor rules are not claimed as V3 equivalence. Source requirements
 were checked against both pinned `Profiles/Qualities/QualityProfile.cs`, V3
@@ -253,3 +250,50 @@ were checked against both pinned `Profiles/Qualities/QualityProfile.cs`, V3
 `src/db/profile_policy_tests.rs` covers real schema18 upgrade, rollback, constraints,
 preservation and reopen using the installed libSQL engine and scratch databases.
 No snapshot profile reconstruction or assignment is introduced by migration 19.
+
+
+## Drafts, startup presets and deletion
+
+`GET /schema` returns an empty name, the entire ordered quality catalog (including
+Unknown), every root and child disabled, and a policy with Unknown cutoff0,
+upgrades disabled, minimum/cutoff scores0 and minimum increment1. Movie language
+is Original(-2); TV language is null. Every current custom format has score0.
+TV leaves use immutable catalog default sizes; movie leaves have null size overrides.
+The draft is never persisted by GET. Set a valid name and enable/select a valid cutoff
+before POST; save validation remains strict. Group cutoff positions must follow any
+client-side root reorder.
+
+Application startup seeds six presets only when a domain has **no** profiles:
+`Any`, `SD`, `HD-720p`, `HD-1080p`, `Ultra-HD`, `HD - 720p/1080p`.
+Both domains share one immediate transaction, so a failure cannot leave partial
+presets. An existing profile suppresses all seeding in its domain. Missing individual
+preset names are never repaired, and deleting every profile causes reseeding at the
+next startup. Existing library assignments and edited quality definitions are not changed.
+Database opening alone does not perform this application initialization.
+
+Every preset retains all quality roots/groups, with only its selected tier enabled.
+TV `Any` covers SD through1080p, excluding Raw-HD and Remux. Movie `Any` covers
+every quality except Unknown and Raw-HD. TV SD includes SDTV/WEB480/DVD/Bluray480/576;
+movie SD additionally includes WORKPRINT/CAM/TELESYNC/TELECINE/REGIONAL/DVDSCR,
+but excludes DVD-R. Movie1080p/2160p tiers include Remux; TV tiers do not.
+Cutoffs in the preset order above are TV IDs `1,1,4,9,16,4` and movie IDs
+`20,20,6,7,31,6`. WEB groups use Rip then DL for TV and DL then Rip for movies.
+All preset policies otherwise use the schema defaults described above.
+
+DELETE is scoped and atomic: unknown/wrong-domain profiles return404, library-assigned
+profiles return409 `profile_in_use`, and successful deletion cascades owned groups,
+items, policy and scores while preserving custom-format definitions and snapshot
+provenance. Profile and custom-format creation reserve historical snapshot destination
+IDs globally per entity table, so identical recreated records cannot impersonate deleted
+snapshot objects. Exhausted safe integer identities return409 (`profile_id_exhausted`
+or `custom_format_id_exhausted`) without mutation.
+
+`tests/profile_policy.rs` covers schema/edit/create, exact domain presets, assignment
+preservation, atomic seeding/deletion failure, domain suppression and actual process
+startup/restart. `tests/profile_snapshots.rs` covers deletion/recreation and exact-upload
+conflicts with preserved provenance. These use scratch databases and owned loopback
+servers. Future active import-list and collection profile references must join the
+in-use contract when those consumers are implemented; private archived references
+are not active assignments. Browser editor behavior, remote database operation and
+complete profile parity remain unverified by these backend tests. No migration or
+new dependency is added.

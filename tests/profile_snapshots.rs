@@ -551,3 +551,171 @@ async fn unsupported_profiles_are_never_truncated_and_conflicts_roll_back() {
             .applied
     );
 }
+
+#[tokio::test]
+async fn deleted_snapshot_profile_keeps_provenance_and_exact_upload_conflicts() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = Arc::new(Database::open_local(s.0.join("dest")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = quality_profiles::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for version in [233, 242] {
+        let app = if version == 233 {
+            Application::Sonarr
+        } else {
+            Application::Radarr
+        };
+        let media = if version == 233 { "tv" } else { "movies" };
+        let bytes = fixture(&s, version, "", None).await;
+        let report = snapshots::import(&db, app, bytes.clone(), false)
+            .await
+            .unwrap();
+        assert!(report.applied);
+        let id = profile_id(&c, &report.fingerprint).await;
+        let mut original = read(&client, &base, media, id).await;
+        original.as_object_mut().unwrap().remove("id");
+        original.as_object_mut().unwrap().remove("media_type");
+        c.execute(
+            "UPDATE library_settings SET quality_profile_id=NULL WHERE quality_profile_id=?",
+            [id],
+        )
+        .await
+        .unwrap();
+        let maps = count(&c, "snapshot_mappings").await;
+        let response = client
+            .delete(format!("{base}/api/v1/{media}/quality-profiles/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        assert_eq!(profile_id(&c, &report.fingerprint).await, id);
+        assert_eq!(count(&c, "snapshot_mappings").await, maps);
+        let replay = snapshots::import(&db, app, bytes.clone(), false)
+            .await
+            .unwrap();
+        assert!(!replay.applied);
+        assert!(replay.conflicts > 0);
+        assert_eq!(count(&c, "quality_profiles").await, 0);
+        let response = client
+            .post(format!("{base}/api/v1/{media}/quality-profiles"))
+            .header("content-type", "application/json")
+            .body(original.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let recreated: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        let new_id = recreated["id"].as_i64().unwrap();
+        assert!(new_id > id);
+        c.execute(
+            "UPDATE library_settings SET quality_profile_id=? WHERE media_type=?",
+            libsql::params![new_id, media],
+        )
+        .await
+        .unwrap();
+        let replay = snapshots::import(&db, app, bytes.clone(), false)
+            .await
+            .unwrap();
+        assert!(!replay.applied);
+        assert!(replay.conflicts > 0);
+        c.execute_batch(
+            "UPDATE library_settings SET quality_profile_id=NULL; DELETE FROM quality_profiles;",
+        )
+        .await
+        .unwrap();
+        quality_profiles::initialize_defaults(&db).await.unwrap();
+        let mut rows = c
+            .query("SELECT id FROM quality_profiles", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert!(row.get::<i64>(0).unwrap() > id);
+        }
+        drop(rows);
+        let replay = snapshots::import(&db, app, bytes, false).await.unwrap();
+        assert!(!replay.applied);
+        assert!(replay.conflicts > 0);
+        c.execute("DELETE FROM quality_profiles", ()).await.unwrap();
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn deleted_custom_format_recreation_reserves_snapshot_identity_in_both_domains() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = Arc::new(Database::open_local(s.0.join("cf-dest")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = hrrdarr::custom_formats::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for version in [233, 242] {
+        let app = if version == 233 {
+            Application::Sonarr
+        } else {
+            Application::Radarr
+        };
+        let media = if version == 233 { "tv" } else { "movies" };
+        let change = r#"ALTER TABLE CustomFormats ADD COLUMN Specifications TEXT;ALTER TABLE CustomFormats ADD COLUMN IncludeCustomFormatWhenRenaming INTEGER;INSERT INTO CustomFormats VALUES(9,'Keep identity','[{"type":"LanguageSpecification","body":{"name":"English","value":1,"exceptLanguage":false,"negate":false,"required":false}}]',0);UPDATE QualityProfiles SET FormatItems='[{"format":9,"score":0}]';"#;
+        let bytes = fixture(&s, version, change, None).await;
+        let report = snapshots::import(&db, app, bytes.clone(), false)
+            .await
+            .unwrap();
+        assert!(report.applied);
+        let old_id=c.query("SELECT destination_id FROM snapshot_mappings WHERE fingerprint=? AND destination_table='custom_formats'",[report.fingerprint.clone()]).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        let url = format!("{base}/api/v1/{media}/custom-formats");
+        let mut definition: Value = serde_json::from_str(
+            &client
+                .get(format!("{url}/{old_id}"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        definition.as_object_mut().unwrap().remove("id");
+        definition.as_object_mut().unwrap().remove("media_type");
+        assert_eq!(
+            client
+                .delete(format!("{url}/{old_id}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(definition.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let recreated: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(recreated["id"].as_i64().unwrap() > old_id);
+        let replay = snapshots::import(&db, app, bytes, false).await.unwrap();
+        assert!(!replay.applied);
+        assert!(replay.conflicts > 0);
+        assert_eq!(c.query("SELECT destination_id FROM snapshot_mappings WHERE fingerprint=? AND destination_table='custom_formats'",[report.fingerprint]).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),old_id);
+    }
+    server.abort();
+    let _ = server.await;
+}

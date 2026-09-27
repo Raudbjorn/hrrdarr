@@ -87,6 +87,9 @@ async fn run() -> Result<(), ProcessFailure> {
             .await
             .map_err(|e| ProcessFailure::at("database_open", e))?
     };
+    hrrdarr::quality_profiles::initialize_defaults(&db)
+        .await
+        .map_err(|e| ProcessFailure::at("quality_profile_defaults", e))?;
     let db = Arc::new(db);
     if db.migration_backup().is_some() {
         println!("event=migration_backup_created");
