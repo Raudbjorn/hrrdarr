@@ -62,6 +62,29 @@ try {
   const duplicateResponse=page.waitForResponse(r=>r.url().endsWith(`/api/v1/${domain}/quality-profiles`) && r.request().method()==='POST');
   await panel.getByRole('button',{name:'Save profile',exact:true}).click();const copied=await duplicateResponse;assert.equal(copied.status(),201);const duplicate=await copied.json();
   assert.deepEqual(duplicate.items,saved.items);assert.deepEqual(duplicate.policy,saved.policy);
+  // A pending read cancels deletion intent before any response can change the editor.
+  await panel.getByRole('button',{name:'Delete profile',exact:true}).click();
+  let captured;
+  const held=new Promise(resolve=>captured=resolve);
+  const detailPattern=`**/api/v1/${domain}/quality-profiles/${created.id}`;
+  await page.route(detailPattern,route=>captured(route));
+  await panel.getByRole('button',{name:`Edit ${name}`,exact:true}).click();
+  const heldRoute=await held;
+  assert.equal(await panel.getByRole('button',{name:'Confirm delete profile',exact:true}).count(),0);
+  assert.equal(await panel.getByRole('button',{name:'Save profile',exact:true}).isDisabled(),true);
+  await heldRoute.continue();await page.unroute(detailPattern);
+  await panel.getByRole('button',{name:`Edit ${name} copy`,exact:true}).click();
+  assert.equal((await read(`${domain}/quality-profiles/${created.id}`)).name,name);
+  assert.equal((await read(`${domain}/quality-profiles/${duplicate.id}`)).name,`${name} copy`);
+  // A failed catalog refresh must not restore the previous confirmation either.
+  await panel.getByRole('button',{name:'Delete profile',exact:true}).click();
+  const listPattern=`**/api/v1/${domain}/quality-profiles?*`;
+  await page.route(listPattern,route=>route.abort('failed'));
+  await panel.getByRole('button',{name:'Refresh list and catalogs',exact:true}).click();
+  await panel.getByRole('alert').waitFor();
+  assert.equal(await panel.getByRole('button',{name:'Confirm delete profile',exact:true}).count(),0);
+  await page.unroute(listPattern);
+
   await panel.getByRole('button',{name:'Delete profile',exact:true}).click();await panel.getByRole('button',{name:'Confirm delete profile',exact:true}).click();
   await panel.getByText('Profile deleted.',{exact:true}).waitFor();
   assert.equal((await page.request.get(`${origin}/api/v1/${domain}/quality-profiles/${duplicate.id}`)).status(),404);

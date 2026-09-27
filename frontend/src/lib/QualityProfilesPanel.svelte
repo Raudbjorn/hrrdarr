@@ -13,6 +13,8 @@
   const used = $derived.by(() => new Set(draft?.roots.flatMap(r => r.item.kind === 'group' ? r.item.items.map(l => l.quality_id) : [r.item.quality_id]) ?? []));
   function discard(): boolean { return !dirty || window.confirm('Discard unsaved profile changes?'); }
   async function load(offset = 0) {
+    if (busy || loading) return;
+    deleting = false;
     const version = ++epoch, scope = domain; loading = true; error = '';
     const [p,c,f,s,t] = await Promise.all([listQualityProfiles(scope,offset),listQualityDefinitions(scope),listCustomFormats(scope),getCustomFormatSchema(scope),getQualityProfileSchema(scope)]);
     if (!alive || version !== epoch) return;
@@ -21,7 +23,7 @@
     page = p.data; catalog = c.data; formats = f.data; languages = s.data.choices.language ?? []; template = t.data;
   }
   async function changeDomain(next: MediaDomain) {
-    if (next === domain || busy || !discard()) return;
+    if (next === domain || busy || loading || !discard()) return;
     domain = next; draft = null; id = null; dirty = false; uncertain = false; page = null; template = null; await load();
   }
   function fill(input: QualityProfileInput, profileId: number | null) {
@@ -33,7 +35,8 @@
     }
   }
   async function edit(profileId: number, duplicate = false) {
-    if (!discard()) return;
+    if (busy || loading || !discard()) return;
+    deleting = false;
     const version = ++epoch; loading = true; error = '';
     const result = await getQualityProfile(domain,profileId);
     if (!alive || version !== epoch) return;
@@ -41,17 +44,17 @@
     if (!result.ok) { error = result.error; return; }
     fill({...result.data,name:duplicate ? `${result.data.name} copy` : result.data.name},duplicate ? null : profileId); dirty = duplicate;
   }
-  function create() { if (template && discard()) { fill(template,null); dirty = true; } }
+  function create() { if (!busy && !loading && !uncertain && template && discard()) { fill(template,null); dirty = true; } }
   function configure() {
     if (!draft || !template?.policy) return;
     draft.policy = JSON.parse(JSON.stringify(template.policy)); draft.cutoff = ''; dirty = true;
   }
   async function save() {
-    if (!draft || busy || uncertain) return;
+    if (!draft || busy || loading || uncertain) return;
     const problem = validateDraft(draft,domain);
     if (problem) {error = problem; return;}
     const input = toInput(draft), scope = domain, version = epoch;
-    busy = true; error = ''; notice = '';
+    deleting = false; busy = true; error = ''; notice = '';
     const result = id === null ? await createQualityProfile(scope,input) : await updateQualityProfile(scope,id,input);
     if (!alive || version !== epoch) return;
     busy = false;
@@ -59,7 +62,7 @@
     fill(result.data,result.data.id); notice = 'Profile saved.'; onchange(scope); await load(page?.offset ?? 0);
   }
   async function remove() {
-    if (id === null || busy || uncertain) return;
+    if (id === null || busy || loading || uncertain || !deleting) return;
     const scope = domain, version = epoch; busy = true; error = '';
     const result = await deleteQualityProfile(scope,id);
     if (!alive || version !== epoch) return;
@@ -139,7 +142,7 @@
         {#if id !== null}<button type="button" onclick={() => deleting=true}>Delete profile</button>{/if}
       </fieldset>
     </form>
-    {#if deleting}<div role="group" aria-label="Confirm profile deletion"><p>Delete this profile? Assigned profiles cannot be deleted.</p><button disabled={busy || uncertain} onclick={remove}>Confirm delete profile</button><button disabled={busy} onclick={() => deleting=false}>Cancel deletion</button></div>{/if}
+    {#if deleting}<div role="group" aria-label="Confirm profile deletion"><p>Delete this profile? Assigned profiles cannot be deleted.</p><button disabled={busy || loading || uncertain} onclick={remove}>Confirm delete profile</button><button disabled={busy || loading} onclick={() => deleting=false}>Cancel deletion</button></div>{/if}
     {#if dirty}<p role="status">Unsaved changes</p>{/if}
   {/if}
 </section>
