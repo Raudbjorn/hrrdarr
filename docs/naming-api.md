@@ -1,8 +1,8 @@
 # Naming configuration API
 
-The initial configuration-controller inventory inspected Sonarr's `76c684e097f16ac216e6213845e5cac372774995`
-`Sonarr.Api.V3/Config/NamingConfigController.cs` was opened, for controller/route
-shape only (singleton `GET`, `PUT` guarded by FluentValidation, and a query-driven
+The initial configuration-controller inventory inspected
+`Sonarr.Api.V3/Config/NamingConfigController.cs` at Sonarr commit
+`76c684e097f16ac216e6213845e5cac372774995` for controller/route shape only (singleton `GET`, `PUT` guarded by FluentValidation, and a query-driven
 `GET examples`). Radarr's controller was **not** opened; nothing here claims
 Radarr route parity, only that migration 0029 (built independently) provides
 the movie columns this API serves. The `NamingConfigResource` schema was read
@@ -374,7 +374,8 @@ exercised only indirectly today, through whichever integration tests cover
 
 Outstanding: folder-format rendering
 (`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
-and the directory-creation it would require; multi-episode rendering; any UI.
+and the directory-creation it would require; multi-episode rendering; full naming
+UI parity. `NamingPanel.svelte` already provides configuration, previews and token help.
 No live services, network calls, or fixed ports are used anywhere in
 this module.
 
