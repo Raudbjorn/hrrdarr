@@ -117,3 +117,25 @@ test('future schema conditions cannot silently export without a community mappin
  const input={...draft,specifications:[{...draft.specifications[0],condition:{kind:'future',value:0}}]};
  assert.deepEqual(exportCommunityCustomFormat(input,future),{ok:false,error:'Condition has no supported community representation.'});
 });
+
+import { exportNativeCustomFormat } from '../src/lib/custom-format-draft.ts';
+test('native export validates the actual pretty bytes and preserves its import roundtrip',()=>{
+ const contract=interchangeSchema('tv');
+ const many={name:'Bounded',include_when_renaming:false,specifications:Array.from({length:64},(_,i)=>({name:`Condition ${i}`,negate:false,required:false,condition:{kind:'release_title',pattern:'界'.repeat(333)}}))};
+ assert.equal(parseCustomFormatDraft(JSON.stringify(many),contract).ok,true);
+ const exported=exportNativeCustomFormat(many,contract);
+ assert.equal(exported.ok,false);assert.match(exported.error,/72 KiB/);
+ const valid=exportNativeCustomFormat(draft,contract);assert.equal(valid.ok,true);
+ assert.deepEqual(parseCustomFormatDraft(valid.data,contract),{ok:true,data:draft});
+ assert.equal(exportNativeCustomFormat({...draft,specifications:[]},contract).ok,false);
+});
+test('community explicit null follows each pinned importer instead of assuming omission',()=>{
+ const valid={name:'Null flags',specifications:[{name:'Source',implementation:'SourceSpecification',fields:{value:0}}]};
+ for(const field of ['negate','required','includeCustomFormatWhenRenaming','fields']) {
+  const input=structuredClone(valid);
+  if(field==='includeCustomFormatWhenRenaming') input[field]=null;
+  else input.specifications[0][field]=null;
+  assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema('tv')).ok,true,field);
+  assert.equal(parseCommunityCustomFormat(JSON.stringify(input),interchangeSchema('movies')).ok,false,field);
+ }
+});

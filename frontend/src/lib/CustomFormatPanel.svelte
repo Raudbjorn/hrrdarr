@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { parseCustomFormatDraft, parseCommunityCustomFormat, exportCommunityCustomFormat } from './custom-format-draft';
+  import { parseCustomFormatDraft, parseCommunityCustomFormat, exportCommunityCustomFormat, exportNativeCustomFormat } from './custom-format-draft';
   import type { CustomFormat, CustomFormatInput, CustomFormatSchema, CustomFormatSpecification, MediaDomain } from './api.generated';
   import { listCustomFormats, getCustomFormatSchema, createCustomFormat, updateCustomFormat, deleteCustomFormat } from './api';
   let domain: MediaDomain = $state('tv');
@@ -62,8 +62,7 @@
   }
   function exportJson() {
     if (!draft || !schema) return;
-    if (jsonFormat === 'native') { jsonText = JSON.stringify(draft, null, 2); error = ''; return; }
-    const result = exportCommunityCustomFormat(copy(draft), schema);
+    const result = jsonFormat === 'native' ? exportNativeCustomFormat(copy(draft), schema) : exportCommunityCustomFormat(copy(draft), schema);
     if (!result.ok) { error = result.error; return; }
     jsonText = result.data; error = '';
   }

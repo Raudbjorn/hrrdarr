@@ -29,6 +29,13 @@ export function parseCustomFormatDraft(text: string, schema: CustomFormatSchema)
   return {ok:true,data:value as unknown as CustomFormatInput};
 }
 
+export function exportNativeCustomFormat(draft: CustomFormatInput, schema: CustomFormatSchema): Result<string> {
+  const text=JSON.stringify(draft,null,2);
+  // Validate the actual exported bytes, including pretty-print expansion, for roundtrip safety.
+  const checked=parseCustomFormatDraft(text,schema);
+  return checked.ok ? {ok:true,data:text} : checked;
+}
+
 const communityKinds = {
   ReleaseTitleSpecification: 'release_title', ReleaseGroupSpecification: 'release_group',
   EditionSpecification: 'edition', LanguageSpecification: 'language', SizeSpecification: 'size',
@@ -48,11 +55,13 @@ export function parseCommunityCustomFormat(text: string, schema: CustomFormatSch
   const rows=document.specifications ?? [];
   if (!Array.isArray(rows) || rows.length>schema.max_specifications) return invalid('Invalid community specifications.');
   const specifications: unknown[]=[];
+  // Sonarr's importer explicitly defaults null flags; Radarr forwards supplied null values.
+  const flag=(value:Record<string,unknown>,key:string)=>schema.media_type==='tv' ? value[key] ?? false : Object.hasOwn(value,key) ? value[key] : false;
   for(const row of rows) {
     if (!object(row) || !allowedKeys(row,['name','implementation','negate','required','fields','id','implementationName','infoLink']) || typeof row.implementation!=='string' || !Object.hasOwn(communityKinds,row.implementation)) return invalid('Unknown community condition or condition fields.');
     const kind=communityKinds[row.implementation as keyof typeof communityKinds];
     if (!schema.conditions.some(condition=>condition.kind===kind)) return invalid('Community condition is unsupported in this library.');
-    const fields=row.fields ?? {};
+    const fields=schema.media_type==='tv' ? row.fields ?? {} : Object.hasOwn(row,'fields') ? row.fields : {};
     const options=kind==='size'||kind==='year' ? ['min','max'] : kind==='language' ? ['value','exceptLanguage'] : ['value'];
     if (!object(fields) || !allowedKeys(fields,options)) return invalid('Unknown community condition option.');
     const field=(key:string, fallback:unknown)=>Object.hasOwn(fields,key) ? fields[key] : fallback;
@@ -61,9 +70,9 @@ export function parseCommunityCustomFormat(text: string, schema: CustomFormatSch
       : kind==='year' ? {kind,min:field('min',0),max:field('max',0)}
       : kind==='language' ? {kind,value:field('value',0),except_language:field('exceptLanguage',false)}
       : {kind,value:field('value',0)};
-    specifications.push({name:row.name,negate:row.negate ?? false,required:row.required ?? false,condition});
+    specifications.push({name:row.name,negate:flag(row,'negate'),required:flag(row,'required'),condition});
   }
-  const result=parseCustomFormatDraft(JSON.stringify({name:document.name ?? '',include_when_renaming:document.includeCustomFormatWhenRenaming ?? false,specifications}),schema);
+  const result=parseCustomFormatDraft(JSON.stringify({name:document.name ?? '',include_when_renaming:flag(document,'includeCustomFormatWhenRenaming'),specifications}),schema);
   return result.ok ? result : invalid(`Community definition cannot be represented without changes: ${result.error} No conditions were imported. Complete omitted fields rather than relying on native example values.`);
 }
 
