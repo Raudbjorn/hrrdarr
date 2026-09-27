@@ -169,7 +169,7 @@ async fn remote(
             format!("magnet:?xt=urn:btih:{hash}")
         };
         let magnet = if tv { magnet } else { String::new() };
-        return format!(r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>{title}</title><guid>PRIVATE_RSS_GUID-{hash}</guid><pubDate>{date}</pubDate><link>{link}</link>{magnet}<torznab:attr name="category" value="{cat}"/><torznab:attr name="size" value="1073741824"/></item></channel></rss>"#).into_response();
+        return format!(r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>{title}</title><guid>PRIVATE_RSS_GUID-{hash}</guid><pubDate>{date}</pubDate><link>{link}</link>{magnet}<torznab:attr name="language" value="English"/><torznab:attr name="downloadvolumefactor" value="0"/><torznab:attr name="category" value="{cat}"/><torznab:attr name="size" value="1073741824"/></item></channel></rss>"#).into_response();
     }
     if uri.path().ends_with("webapiVersion") {
         return "2.8.4".into_response();
@@ -372,6 +372,22 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     // Profiles are configuration fixtures; all catalog targets, receipts, import journals and history use real producers.
     // Any (-1) keeps this fixture language-unrestricted; Original (-2) requires audio matching.
     c.execute_batch("UPDATE quality_definitions SET min_size=0; INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1),(1,'tv',7,1,1),(2,'movies',7,1,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,7,0,0,1,NULL),(2,'movies',1,7,0,0,1,-1); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
+    // Both actual RSS→grab→download→import paths require facts unavailable in the
+    // language-free filenames: provider audio language plus the freeleech flag.
+    let cf = json!([{"name":"English","required":true,"negate":false,"condition":{"kind":"language","value":1,"except_language":false}},{"name":"Freeleech","required":true,"negate":false,"condition":{"kind":"indexer_flag","value":1}}]);
+    for (id, domain) in [(1, "tv"), (2, "movies")] {
+        c.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specification_version,specifications_json)VALUES(?,?,'Provider facts',0,1,?)",libsql::params![id,domain,cf.to_string()]).await.unwrap();
+        c.execute(
+            "INSERT INTO quality_profile_format_scores VALUES(?,?,?,10)",
+            libsql::params![id, id, domain],
+        )
+        .await
+        .unwrap();
+    }
+    c.execute_batch("UPDATE quality_profile_policies SET min_format_score=10;")
+        .await
+        .unwrap();
+
     // Fresh-install naming defaults must be disabled with every format unset; a naming
     // config that is *configured but disabled* must not perturb any basename assertion
     // below, since `rename_enabled` is the only automated-path gate that matters.
@@ -564,6 +580,13 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
             .unwrap(),
         2
     );
+
+    let retained=c.query("SELECT count(*) FROM file_metadata WHERE original_release_title IS NOT NULL AND languages_json='[1]' AND indexer_flags=1",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+    assert_eq!(
+        retained, 2,
+        "receipt-only facts must survive private payload removal and import"
+    );
+    assert_eq!(c.query("SELECT count(*) FROM rss_candidates WHERE comparison_facts_json IS NOT NULL AND private_payload IS NULL",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),2);
 
     // A second real RSS grab upgrades the completed target; original torrent ownership remains retained.
     state.mode.store(6, Ordering::SeqCst);

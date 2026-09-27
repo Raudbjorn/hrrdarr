@@ -183,7 +183,7 @@ fn parse(row: &Record, items: &J, formats: &J, tv: bool, old: bool) -> Option<Pr
             } else {
                 Some(i32::try_from(int(row, "Language")?).ok()?)
             },
-            format_items: [],
+            format_items: vec![],
         }),
     })
 }

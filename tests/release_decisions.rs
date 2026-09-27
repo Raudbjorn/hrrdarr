@@ -77,7 +77,8 @@ async fn both_domain_decisions_and_real_search_consumer() {
             Disposition::Accept
         );
     }
-    // Catalog original language and matching protocol text still do not prove audio language.
+    // Explicit indexer language is now trusted parsed evidence (not media-stream verification).
+    // Original/concrete English match; Unknown and other languages remain rejected.
     c.execute("UPDATE movie_metadata SET original_language=1", ())
         .await
         .unwrap();
@@ -102,17 +103,15 @@ async fn both_domain_decisions_and_real_search_consumer() {
             .unwrap();
             assert_eq!(
                 result.disposition,
-                if language == -1 {
+                if matches!(language, -2 | 1 | -1) {
                     Disposition::Accept
                 } else {
                     Disposition::Reject
                 }
             );
             assert_eq!(
-                result
-                    .reasons
-                    .contains(&"language_policy_unsupported".into()),
-                language != -1
+                result.reasons.contains(&"language_not_wanted".into()),
+                !matches!(language, -2 | 1 | -1)
             );
             assert_eq!(
                 search::evaluate(&c, MediaDomain::Tv, &tv, context, now + 172800)
@@ -227,8 +226,9 @@ async fn both_domain_decisions_and_real_search_consumer() {
     )
     .await
     .unwrap();
+    // A nonzero format cutoff is supported; without matching formats it adds no rejection.
     assert!(
-        search::evaluate(&c, MediaDomain::Tv, &tv, SearchContext::UserSearch, now)
+        !search::evaluate(&c, MediaDomain::Tv, &tv, SearchContext::UserSearch, now)
             .await
             .unwrap()
             .reasons
@@ -376,7 +376,7 @@ async fn both_domain_decisions_and_real_search_consumer() {
         );
     }
 
-    // The public search response must expose the same unsupported-policy reason.
+    // Missing audio evidence now rejects with the actual language mismatch reason.
     for language in [-2, 1, -1] {
         c.execute(
             "UPDATE quality_profile_policies SET language_id=? WHERE media_type='movies'",
@@ -396,7 +396,7 @@ async fn both_domain_decisions_and_real_search_consumer() {
             value["items"][0]["decision"]["reasons"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("language_policy_unsupported")),
+                .contains(&serde_json::json!("language_not_wanted")),
             language != -1
         );
     }

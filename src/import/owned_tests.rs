@@ -82,9 +82,19 @@ pub(super) async fn fixture(
     )
     .await
     .unwrap();
+    // Freeze actual provider facts at submission; renamed filenames cannot reconstruct these flags.
+    let mut evidence = crate::custom_formats::parsed(
+        basename.trim_end_matches(".mkv"),
+        &crate::search::parser::parse(basename.trim_end_matches(".mkv"), !movie).unwrap(),
+        !movie,
+        Some(17),
+    );
+    evidence.languages = Some(vec![1]);
+    evidence.indexer_flags = Some(1);
+    evidence.release_group = Some("GROUP".into());
     c.execute(
-        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
-        [candidate.clone()],
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL,comparison_facts_json=? WHERE id=?",
+        params![serde_json::to_string(&evidence).unwrap(),candidate.clone()],
     )
     .await
     .unwrap();
@@ -298,6 +308,12 @@ pub(super) async fn replacements() {
             .get(0)
             .unwrap();
         assert_eq!(quality, 3);
+        // Import/restart retains the immutable receipt facts alongside the new quality.
+        let factual=c.query(&format!("SELECT original_release_title,languages_json,indexer_flags FROM file_metadata WHERE {table}=?"),[fid]).await.unwrap().next().await.unwrap().unwrap();
+        assert!(factual.get::<String>(0).unwrap().contains("1080p.WEB-DL"));
+        assert_eq!(factual.get::<String>(1).unwrap(), "[1]");
+        assert_eq!(factual.get::<i64>(2).unwrap(), 1);
+
         if movie {
             assert_eq!(fid, 1);
         } else {
@@ -498,4 +514,56 @@ pub(super) async fn replacements() {
         std::fs::read(dir.path("movies/old.mkv")).unwrap(),
         b"original-media"
     );
+}
+
+#[tokio::test]
+async fn changed_original_title_or_format_policy_prevents_owned_replacement() {
+    for movie in [false, true] {
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        let input = fixture(&dir, &db, movie, false).await;
+        let oldpath = dir.path(if movie {
+            "movies/old.mkv"
+        } else {
+            "tv/old.mkv"
+        });
+        let operation = prepare_owned(db.clone(), input)
+            .await
+            .unwrap()
+            .id
+            .to_string();
+        let c = db.connect().await.unwrap();
+        let domain = if movie { "movies" } else { "tv" };
+        // Original title is part of the replacement identity snapshot, not decorative metadata.
+        c.execute("UPDATE file_metadata SET original_release_title='changed-after-preview' WHERE media_type=?",[domain]).await.unwrap();
+        assert!(execute(db.clone(), &operation).await.is_err());
+        assert_eq!(std::fs::read(&oldpath).unwrap(), b"original-media");
+        assert_eq!(count(&db, "import_history").await, 0);
+    }
+    for movie in [false, true] {
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        let input = fixture(&dir, &db, movie, false).await;
+        let oldpath = dir.path(if movie {
+            "movies/old.mkv"
+        } else {
+            "tv/old.mkv"
+        });
+        let operation = prepare_owned(db.clone(), input)
+            .await
+            .unwrap()
+            .id
+            .to_string();
+        let c = db.connect().await.unwrap();
+        // Frozen facts never freeze policy: a changed minimum is checked before placement.
+        c.execute(
+            "UPDATE quality_profile_policies SET min_format_score=1 WHERE media_type=?",
+            [if movie { "movies" } else { "tv" }],
+        )
+        .await
+        .unwrap();
+        assert!(execute(db.clone(), &operation).await.is_err());
+        assert_eq!(std::fs::read(&oldpath).unwrap(), b"original-media");
+        assert_eq!(count(&db, "import_history").await, 0);
+    }
 }

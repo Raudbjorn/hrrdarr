@@ -525,9 +525,15 @@ async fn preflight(
         {
             return Err(Error(StatusCode::CONFLICT, "invalid_download_files"));
         }
-        let result = crate::search::downloaded::evaluate(&c, &target, &file.name, file.size_bytes)
-            .await
-            .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
+        let result = crate::search::downloaded::evaluate_receipt(
+            &c,
+            &target,
+            &file.name,
+            file.size_bytes,
+            &item.receipt_id.to_string(),
+        )
+        .await
+        .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
         if let Some(facts) = result.accepted {
             if accepted.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "ambiguous_files"));

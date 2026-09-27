@@ -17,6 +17,8 @@ pub struct ParsedRelease {
     pub quality_name: Option<String>,
     pub edition: Option<String>,
     pub revision: u8,
+    #[serde(default)]
+    pub technical_start: Option<usize>,
 }
 pub fn normalize(value: &str) -> String {
     value
@@ -179,7 +181,20 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
     } else {
         None
     };
+    let identity_tokens = match &parsed_numbering {
+        Some(Numbering::Daily { .. }) => 3,
+        Some(Numbering::Absolute { .. }) => 2,
+        _ => 1,
+    };
+    let technical_start = Some(
+        tokens
+            .get(boundary + identity_tokens)
+            .map_or(value.len(), |token| {
+                token.as_ptr() as usize - value.as_ptr() as usize
+            }),
+    );
     Ok(ParsedRelease {
+        technical_start,
         title,
         year,
         numbering: parsed_numbering,

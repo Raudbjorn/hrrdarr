@@ -86,7 +86,17 @@ async fn remote(
         } else {
             "Harbor.2020"
         };
-        let quality = if better { "1080p" } else { "720p" };
+        let quality = if s.mode.load(Ordering::SeqCst) == 6 {
+            if better {
+                "1080p.Other"
+            } else {
+                "1080p.Preferred"
+            }
+        } else if better {
+            "1080p"
+        } else {
+            "720p"
+        };
         let cat = if s.mode.load(Ordering::SeqCst) == 1 {
             if tv { 2030 } else { 5030 }
         } else if tv {
@@ -991,11 +1001,13 @@ async fn movie_language_policy_is_enforced_at_search_and_grab() {
                 offer["decision"]["disposition"],
                 if language == -1 { "accept" } else { "reject" }
             );
+            // These filenames have no audio evidence: real language matching now
+            // reports a mismatch instead of the former blanket unsupported guard.
             assert_eq!(
                 offer["decision"]["reasons"]
                     .as_array()
                     .unwrap()
-                    .contains(&json!("language_policy_unsupported")),
+                    .contains(&json!("language_not_wanted")),
                 language != -1
             );
         }
@@ -1034,4 +1046,102 @@ async fn movie_language_policy_is_enforced_at_search_and_grab() {
     runtime.shutdown().await;
     server.stop().await;
     remote_server.stop().await;
+}
+
+#[tokio::test]
+async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_boundary() {
+    for tv in [true, false] {
+        for automatic in [true, false] {
+            let scratch = Scratch(
+                std::env::temp_dir().join(format!("hrrdarr-cf-grab-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+            seed(&db).await;
+            let c = db.connect().await.unwrap();
+            let domain = if tv { "tv" } else { "movies" };
+            let profile = if tv { 1 } else { 2 };
+            c.execute_batch("UPDATE episodes SET air_date_utc='2020-01-01 00:00:00';UPDATE movie_metadata SET digital_release='2020-01-01 00:00:00';").await.unwrap();
+            let specs = json!([{"name":"Preferred","required":false,"negate":false,"condition":{"kind":"release_title","pattern":"Preferred"}}]);
+            c.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specification_version,specifications_json)VALUES(1,?,'Preferred',0,1,?)",libsql::params![domain,specs.to_string()]).await.unwrap();
+            c.execute(
+                "INSERT INTO quality_profile_format_scores VALUES(?,1,?,10)",
+                libsql::params![profile, domain],
+            )
+            .await
+            .unwrap();
+            let state = Arc::new(Remote::default());
+            state.mode.store(6, Ordering::SeqCst);
+            let (remote_base, remote_server) = serve(
+                axum::Router::new()
+                    .fallback(remote)
+                    .with_state(state.clone()),
+            )
+            .await;
+            let (base, server, client) = app(db.clone()).await;
+            let (indexer, download) = providers(&base, &remote_base).await;
+            let runtime = commands::start(db.clone(), client).await.unwrap();
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(
+                    &indexer,
+                    &download,
+                    tv,
+                    if automatic {
+                        "automatic"
+                    } else {
+                        "interactive"
+                    },
+                ),
+            )
+            .await;
+            assert_eq!(code, 202);
+            assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+            let results = offers(&base, &command["id"]).await;
+            let preferred = results
+                .iter()
+                .find(|v| {
+                    v["metadata"]["title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Preferred")
+                })
+                .unwrap();
+            assert_eq!(preferred["decision"]["custom_formats"]["score"], 10);
+            if !automatic {
+                let path = format!(
+                    "/api/v1/search/results/{}/grab",
+                    preferred["id"].as_str().unwrap()
+                );
+                // A retained accepted offer cannot use its old score after the profile changes.
+                c.execute(
+                    "UPDATE quality_profile_policies SET min_format_score=11 WHERE profile_id=?",
+                    [profile],
+                )
+                .await
+                .unwrap();
+                let (code, error) = request(&base, "POST", &path, json!({})).await;
+                assert_eq!(code, 409, "{error}");
+                assert!(state.adds.lock().unwrap().is_empty());
+                c.execute(
+                    "UPDATE quality_profile_policies SET min_format_score=10 WHERE profile_id=?",
+                    [profile],
+                )
+                .await
+                .unwrap();
+                let (code, receipt) = request(&base, "POST", &path, json!({})).await;
+                assert!((200..300).contains(&code), "{receipt}");
+                observed(&base, receipt["id"].as_str().unwrap()).await;
+            } else {
+                let receipt = preferred["selected_candidate_id"].as_str().unwrap();
+                observed(&base, receipt).await;
+            }
+            assert_eq!(state.adds.lock().unwrap().as_slice(), &[hash(tv, false)]);
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
 }

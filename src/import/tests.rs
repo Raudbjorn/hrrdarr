@@ -385,3 +385,45 @@ async fn filesystem_identity_checks_reject_swaps_and_retain_unrecorded_staging()
     drop(c);
     drop(db);
 }
+
+#[tokio::test]
+async fn manual_hidden_extension_filename_preserves_explicit_mapping() {
+    for movie in [false, true] {
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        dir.setup(&db).await;
+        let source = dir.path("downloads/.mkv");
+        std::fs::write(&source, b"explicit-media").unwrap();
+        let input = ImportInput::Typed(ManualImportRequest {
+            target: if movie {
+                MediaTarget::Movie(1)
+            } else {
+                MediaTarget::Episode(1)
+            },
+            source,
+            mode: Mode::Copy,
+            destination: dir.path(if movie {
+                "movies/explicit.mkv"
+            } else {
+                "tv/explicit.mkv"
+            }),
+        });
+        let operation = preview(db.clone(), input).await.unwrap().id.to_string();
+        assert_eq!(
+            execute(db.clone(), &operation).await.unwrap().status,
+            "complete"
+        );
+        let c = db.connect().await.unwrap();
+        let title: String = c
+            .query("SELECT original_release_title FROM file_metadata", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(title, ".mkv");
+    }
+}

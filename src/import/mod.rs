@@ -665,6 +665,7 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
     let mut stage = rec.stage.ok_or_else(Error::internal)?;
     let same_path = owned::placement_old(&c, opid, &plan).await?.is_some();
     if same_path && matches!(rec.phase.as_str(), "staged" | "published") {
+        owned::before(&c, opid, &rec.target).await?;
         owned::install(&c, opid, &rec.target, &plan, &stage, lease).await?;
     }
     if rec.phase == "staged" {
@@ -688,6 +689,8 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
         let p = plan.clone();
         let s = stage.clone();
         leased(lease, move || p.verify_destination(&s)).await?;
+        // Recovery also warms current scoring before acquiring the writer lock.
+        owned::before(&c, opid, &rec.target).await?;
         commit(&c, opid, &rec.target, &plan, &stage).await?;
         rec.phase = "committed".into();
     }
@@ -744,7 +747,24 @@ async fn commit(
         };
         if let Some(facts)=facts { let (scope,column,fid)=match t {MediaTarget::Episode(_)=>("tv","episode_file_id",file_episode),MediaTarget::Movie(_)=>("movies","movie_file_id",file_movie)};
             tx.execute(&format!("UPDATE file_metadata SET quality_id=?,revision_json=? WHERE media_type=? AND {column}=?"),params![facts.quality_id,facts.revision_json,scope,fid]).await?;
+            if let Some(evidence)=facts.evidence {tx.execute(&format!("UPDATE file_metadata SET original_release_title=?,languages_json=?,release_group=?,indexer_flags=?,release_type=? WHERE media_type=? AND {column}=?"),params![evidence.title,evidence.languages.as_ref().map(json).transpose()?,evidence.release_group,evidence.indexer_flags,evidence.release_type,scope,fid]).await?;}
             if let Some(fid)=file_movie {tx.execute("UPDATE movie_files SET edition=? WHERE id=?",params![facts.edition,fid]).await?;}
+        }
+        // Explicit manual target mappings retain their established override semantics.
+        // Preserve source facts for future current-definition comparisons even for an
+        // arbitrary filename; only facts the native parser recognizes are populated.
+        if owned::facts(&tx,opid).await?.is_none() {
+            let basename=plan.source.rsplit(['/', '\\']).next().unwrap_or(&plan.source);
+            let stem=basename.rsplit_once('.').map_or(basename,|(s,_)|if s.is_empty(){basename}else{s});
+            let tv=matches!(t,MediaTarget::Episode(_));
+            let (scope,column,fid)=if tv {("tv","episode_file_id",file_episode)}else{("movies","movie_file_id",file_movie)};
+            tx.execute(&format!("UPDATE file_metadata SET original_release_title=? WHERE media_type=? AND {column}=?"),params![stem,scope,fid]).await?;
+            if let Ok(parsed)=crate::search::parser::parse(stem,tv){
+                let evidence=crate::custom_formats::parsed(stem,&parsed,tv,Some(stage.size()));
+                let quality=if let Some(name)=parsed.quality_name {tx.query("SELECT quality_id FROM quality_definitions WHERE media_type=? AND name=?",params![scope,name]).await?.next().await?.map(|r|r.get::<i64>(0)).transpose()?}else{None};
+                tx.execute(&format!("UPDATE file_metadata SET quality_id=?,languages_json=?,release_group=?,release_type=? WHERE media_type=? AND {column}=?"),params![quality,evidence.languages.as_ref().map(json).transpose()?,evidence.release_group,evidence.release_type,scope,fid]).await?;
+                if let Some(fid)=file_movie {tx.execute("UPDATE movie_files SET edition=? WHERE id=?",params![evidence.edition,fid]).await?;}
+            }
         }
         tx.execute("INSERT INTO import_history(operation_id,media_type,episode_id,movie_id,episode_file_id,movie_file_id,source,destination,size,sha256)VALUES(?,?,?,?,?,?,?,?,?,?)",params![opid,domain,episode,movie,file_episode,file_movie,plan.source.clone(),plan.destination.clone(),size,stage.sha256.clone().ok_or_else(Error::internal)?]).await?;
         tx.execute("UPDATE import_journal SET phase='committed',error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",[opid]).await?;
