@@ -16,6 +16,8 @@ pub enum MediaTarget {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+pub mod custom_formats;
+
 const MIGRATIONS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -148,6 +150,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "command_capacity_active_only",
         include_str!("../../migrations/0033_command_capacity_active_only.sql"),
+    ),
+    (
+        "custom_formats",
+        include_str!("../../migrations/0034_custom_formats.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -675,3 +681,6 @@ mod search_tests;
 
 #[cfg(test)]
 mod same_path_tests;
+
+#[cfg(test)]
+mod custom_format_tests;

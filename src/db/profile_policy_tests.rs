@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 33); // Latest open adds active-only command capacity; fixed predecessors remain unchanged.
+    assert_eq!(version(&conn).await?, 34); // Latest open adds custom formats; fixed predecessor migrations remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,
@@ -74,7 +74,8 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
         "INSERT INTO quality_profile_policies VALUES(1,'movies',1,1,NULL,0,0,1,1)",
         "INSERT INTO quality_profile_policies VALUES(1,'tv',1,7,NULL,0,0,1,NULL)",
         "INSERT INTO quality_profile_policies VALUES(1,'tv',1,1,100,0,0,1,NULL)",
-        "INSERT INTO quality_profile_policies VALUES(1,'tv',1,1,NULL,1,0,1,NULL)",
+        // Migration 0034 permits positive custom-format minimums; retain the i32 bound.
+        "INSERT INTO quality_profile_policies VALUES(1,'tv',1,1,NULL,2147483648,0,1,NULL)",
         "INSERT INTO quality_profile_policies VALUES(1,'tv',1,1,NULL,0,0,0,NULL)",
         "INSERT INTO quality_profile_policies VALUES(1,'tv',1,1,NULL,0,0,1,1)",
         "INSERT INTO quality_profile_policies VALUES(2,'movies',1,1,NULL,0,0,1,NULL)",

@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 33); // Latest open adds active-only command capacity.
+    assert_eq!(version(&c).await?, 34); // Latest open adds custom formats; fixed predecessor migrations remain unchanged.
     for op in &operations {
         let r = c
             .query(
