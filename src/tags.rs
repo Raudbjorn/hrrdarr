@@ -50,6 +50,8 @@ pub struct Detail {
     pub in_use: bool,
     pub owner_count: i64,
     pub delay_profile_ids: Vec<i64>,
+    pub release_profile_ids: Vec<i64>,
+    pub excluded_release_profile_ids: Vec<i64>,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "TagOwners")]
@@ -377,8 +379,37 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
         .transpose()?
         .into_iter()
         .collect::<Vec<_>>();
+    let mut release_profile_ids = vec![];
+    let mut excluded_release_profile_ids = vec![];
+    let mut rows=c.query("SELECT profile_id,kind FROM release_profile_tags WHERE tag_id=? ORDER BY profile_id LIMIT 1025",[t.id]).await?;
+    while let Some(row) = rows.next().await? {
+        let id = row.get(0)?;
+        match row.get::<String>(1)?.as_str() {
+            "include" => release_profile_ids.push(id),
+            "exclude" => excluded_release_profile_ids.push(id),
+            _ => {
+                return Err(Error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tag_reference_invariant",
+                    "Tag reference graph is invalid",
+                ));
+            }
+        }
+    }
+    if release_profile_ids.len() + excluded_release_profile_ids.len() > 1024 {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tag_reference_invariant",
+            "Tag reference graph exceeds its bound",
+        ));
+    }
     Ok(Detail {
-        in_use: count > 0 || !delay_profile_ids.is_empty(),
+        in_use: count > 0
+            || !delay_profile_ids.is_empty()
+            || !release_profile_ids.is_empty()
+            || !excluded_release_profile_ids.is_empty(),
+        release_profile_ids,
+        excluded_release_profile_ids,
         delay_profile_ids,
         tag: t,
         owner_count: count,

@@ -123,13 +123,14 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 39); // Latest open adds ordered delay profiles; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 40); // Latest open adds release profiles; historical migration starts remain unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "snapshot_imports" {
-            // Migrations 36 through 39 append inactive CF/tag/revision-policy/delay-profile markers; all prior fields stay identical.
+            // Migrations 36 through 40 append inactive CF/tag/revision-policy/delay-profile/release-profile markers; all prior fields stay identical.
             for row in &mut expected {
                 row.extend([
+                    libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),

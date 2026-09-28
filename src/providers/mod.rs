@@ -1103,6 +1103,7 @@ async fn update(
         secret,
         &input.config.credentials,
     )?;
+    release_profile_references(&tx,&id,Some(&input.config.settings)).await?;
     let changed=tx.execute("UPDATE providers SET name=?,enabled=?,priority=?,revision=revision+1,endpoint=?,credentials=? WHERE id=? AND revision=?",params![input.config.name,i64::from(input.config.enabled),i64::from(input.config.priority),input.config.settings.endpoint(),secret,id.clone(),input.revision]).await?;
     if changed != 1 {
         return Err(conflict());
@@ -1151,6 +1152,29 @@ async fn list(
         offset: query.offset,
     })
 }
+async fn release_profile_references(
+    c: &Connection,
+    id: &str,
+    settings: Option<&ProviderSettings>,
+) -> Result<()> {
+    crate::release_profiles::provider_scopes_allowed(c, id, settings)
+        .await
+        .map_err(|error| {
+            if error.code() == "provider_in_use" {
+                Error::Plain(
+                    StatusCode::CONFLICT,
+                    "provider_in_use",
+                    "Unassign release profiles before removing this provider scope",
+                )
+            } else {
+                Error::Plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "release_profile_storage_error",
+                    "Release profile references could not be checked",
+                )
+            }
+        })
+}
 async fn delete(
     State(context): State<Context>,
     Path(value): Path<String>,
@@ -1174,6 +1198,7 @@ async fn delete(
             secret,
             &Change::Null,
         )?;
+        release_profile_references(&tx, &id, None).await?;
         if tx
             .execute(
                 "DELETE FROM providers WHERE id=? AND revision=?",

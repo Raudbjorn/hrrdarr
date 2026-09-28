@@ -173,6 +173,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::tags::router(state.db.clone()))
         .merge(hrrdarr::revision_policy::router(state.db.clone()))
         .merge(hrrdarr::delay_profiles::router(state.db.clone()))
+        .merge(hrrdarr::release_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
@@ -216,9 +217,7 @@ async fn migrate(
         )
         .await
     };
-    result
-        .map(Json)
-        .map_err(|error| ApiError::bad_request(error.to_string()))
+    result.map(Json).map_err(ApiError::from)
 }
 
 #[derive(Debug)]
@@ -226,11 +225,15 @@ struct ApiError {
     status: StatusCode,
     message: String,
 }
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+impl From<snapshots::ImportError> for ApiError {
+    fn from(error: snapshots::ImportError) -> Self {
         Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
+            status: if error.retryable() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message: error.to_string(),
         }
     }
 }
@@ -257,6 +260,37 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_handler_error_mapping_preserves_matcher_retryability() {
+        // Exact migrate conversion; this does not simulate runtime saturation.
+        for code in [
+            "release_term_busy",
+            "release_term_timeout",
+            "release_term_worker_failed",
+            "release_term_state_changed",
+        ] {
+            assert_eq!(
+                ApiError::from(snapshots::ImportError(code))
+                    .into_response()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        for code in [
+            "release_term_invalid_syntax",
+            "release_term_unsupported_dialect",
+            "release_term_limit_exceeded",
+            "invalid snapshot",
+        ] {
+            assert_eq!(
+                ApiError::from(snapshots::ImportError(code))
+                    .into_response()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_handler_previews_then_applies_uploaded_core_library() {

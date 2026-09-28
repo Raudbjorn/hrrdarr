@@ -39,6 +39,7 @@ pub mod custom_formats;
 pub mod tags;
 
 pub mod delay_profiles;
+pub mod release_profiles;
 pub mod revision_policy;
 
 pub mod release_profile_terms;

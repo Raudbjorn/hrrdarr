@@ -318,6 +318,8 @@ export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, rep
 
 export type MovieParseResult = { title: string, parsed: ParsedRelease | null, movie: MatchedMovie | null, };
 
+export type MovieReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
+
 export type NamingErrorDetail = { code: string, message: string, };
 
 export type NamingErrorEnvelope = { error: NamingErrorDetail, };
@@ -470,6 +472,18 @@ export type ReleaseMetadata = { title: string | null, size_bytes: number | null,
 
 export type ReleasePolicy = { torrent_delay_minutes: number, usenet_delay_minutes: number, availability_delay_days: number, };
 
+export type ReleaseProfile = { "media_type": "tv", id: number, name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, excluded_tag_ids: Array<number>, air_date_restriction: boolean, air_date_grace_period_days: number, allow_season_pack_without_all_episodes_aired: boolean, } | { "media_type": "movies", id: number, name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
+
+export type ReleaseProfileCatalog = { media_type: MediaDomain, revision: number, profiles: Array<ReleaseProfile>, };
+
+export type ReleaseProfileDetail = { revision: number, profile: ReleaseProfile, };
+
+export type ReleaseProfileIndexer = { "kind": "provider", id: string, } | { "kind": "unresolved_source", application: ReleaseProfileSourceApplication, fingerprint: string, source_id: number, };
+
+export type ReleaseProfileSourceApplication = "sonarr" | "radarr";
+
+export type ReleaseProfileWrite<T> = { revision: number, profile: T, };
+
 export type ReleaseSearchInput = { provider_id: string, provider_revision: number, target: MediaTarget, offset: number, query_index: number, limit: number, };
 
 export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: IndexerContinuation | null, };
@@ -562,7 +576,7 @@ export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
 
 export type TagAssignmentMode = "add" | "remove" | "replace";
 
-export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, };
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, };
 
 export type TagInput = { label: string, };
 
@@ -587,6 +601,8 @@ export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replac
 export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
 
 export type TvParseResult = { title: string, parsed: ParsedRelease | null, series: MatchedSeries | null, episodes: Array<MatchedEpisode>, };
+
+export type TvReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, excluded_tag_ids: Array<number>, air_date_restriction: boolean, air_date_grace_period_days: number, allow_season_pack_without_all_episodes_aired: boolean, };
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 

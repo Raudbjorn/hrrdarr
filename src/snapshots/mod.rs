@@ -8,6 +8,7 @@ mod history;
 mod profiles;
 mod providers;
 mod readers;
+mod release_profiles;
 mod revision_policy;
 mod tags;
 
@@ -70,6 +71,19 @@ pub struct Unsupported {
 // Deliberately static: SQL/parser errors may include source values or credentials.
 #[derive(Debug)]
 pub struct ImportError(pub &'static str);
+impl ImportError {
+    /// Temporary matcher admission/execution failures must not become invalid uploads.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self.0,
+            "release_term_busy"
+                | "release_term_timeout"
+                | "release_term_worker_failed"
+                | "release_term_state_changed"
+        )
+    }
+}
+
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)
@@ -192,6 +206,7 @@ async fn import_inner(
         Application::Radarr => readers::radarr(&source)?,
     };
     let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
+    let release_profile_plan = release_profiles::read(&source, app, &mut plan.unsupported).await?;
     let delay_plan = delay_profiles::read(&source, app, &mut plan.unsupported)?;
     let tag_plan = tags::read(&source, app, &mut plan.unsupported)?;
     let profile_plan = profiles::read(&source, app, &mut plan.unsupported).await?;
@@ -214,10 +229,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -233,7 +248,8 @@ async fn import_inner(
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
-        providers::write(&tx, &provider_plan, key, &mut report).await
+        providers::write(&tx, &provider_plan, key, &mut report).await?;
+        release_profiles::write(&tx, release_profile_plan.as_ref(), &mut report).await
     }
     .await;
     match result {
