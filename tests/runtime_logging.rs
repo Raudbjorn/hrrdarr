@@ -351,7 +351,18 @@ async fn exercise() {
     for media in ["tv", "movies"] {
         let (code,value)=request(&base,"POST",&format!("/api/v1/{media}/remote-path-mappings"),json!({"host":"127.0.0.1","remote_path":"/remote","local_path":directory.join(format!("source-{media}"))})).await;
         assert_eq!(code, 201, "{value}");
-        let (code,value)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",client["id"].as_str().unwrap()),json!({"provider_revision":client["revision"],"revision":null,"enabled":true,"mode":"copy"})).await;
+        // Provider creation provisions an inherited policy in both domains. Capture
+        // its CAS revision so the explicit setup still reaches the real logging paths.
+        let policy_path = format!(
+            "/api/v1/download-processing/policies/{}/{media}",
+            client["id"].as_str().unwrap()
+        );
+        let (code, policy) = request(&base, "GET", &policy_path, Value::Null).await;
+        assert_eq!(code, 200, "{policy}");
+        assert_eq!(policy["enabled_override"], Value::Null);
+        assert_eq!(policy["enabled"], true);
+        assert_eq!(policy["mode"], "copy");
+        let (code,value)=request(&base,"PUT",&policy_path,json!({"provider_revision":client["revision"],"revision":policy["revision"],"enabled":true,"mode":"copy"})).await;
         assert_eq!(code, 200, "{value}");
         let command = enqueue(&base, target(&indexer, &client, media)).await;
         let done = wait_status(
