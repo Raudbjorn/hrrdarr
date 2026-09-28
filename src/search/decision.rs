@@ -27,7 +27,7 @@ struct Candidate {
     language: Option<i64>,
     monitored: bool,
     files: Vec<Option<i64>>,
-    aired: bool,
+    air_dates: Vec<Option<chrono::DateTime<chrono::Utc>>>,
 }
 fn id_agrees(actual: Option<i64>, supplied: Option<u32>) -> bool {
     supplied.is_none_or(|id| actual == Some(i64::from(id)))
@@ -37,19 +37,34 @@ fn id_agrees(actual: Option<i64>, supplied: Option<u32>) -> bool {
 pub async fn evaluate(
     c: &Connection,
     media: MediaDomain,
+    indexer: uuid::Uuid,
     release: &Release,
     context: SearchContext,
     now: i64,
 ) -> Result<ReleaseDecision> {
-    evaluate_with_pending(c, media, release, context, now, None).await
+    let mut operation = super::operation_evidence()?;
+    evaluate_with_evidence(c, media, indexer, release, context, now, &mut operation).await
+}
+pub(crate) async fn evaluate_with_evidence(
+    c: &Connection,
+    media: MediaDomain,
+    indexer: uuid::Uuid,
+    release: &Release,
+    context: SearchContext,
+    now: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
+) -> Result<ReleaseDecision> {
+    evaluate_with_pending(c, media, indexer, release, context, now, None, operation).await
 }
 pub(crate) async fn evaluate_with_pending(
     c: &Connection,
     media: MediaDomain,
+    indexer: uuid::Uuid,
     release: &Release,
     context: SearchContext,
     now: i64,
     oldest_pending_publication: Option<i64>,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<ReleaseDecision> {
     let tv = matches!(media, MediaDomain::Tv);
     let title = release.metadata.title.as_deref().unwrap_or("");
@@ -136,7 +151,7 @@ pub(crate) async fn evaluate_with_pending(
             let mut eps=c.query("SELECT e.id,e.season,e.number,e.absolute_episode_number,e.air_date,e.monitored,e.runtime,e.episode_file_id,e.scene_season_number,e.scene_episode_number,e.scene_absolute_episode_number,s.monitored,e.air_date_utc FROM episodes e JOIN seasons s ON s.series_id=e.series_id AND s.number=e.season WHERE e.series_id=? ORDER BY e.id LIMIT 10001",[id]).await?;
             let mut ids = Vec::new();
             let mut matched_numbers = std::collections::BTreeSet::new();
-            let mut aired = true;
+            let mut air_dates = Vec::new();
             let mut files = Vec::new();
             let mut runtime = Some(0i64);
             let mut monitored = r.get::<i64>(3)? == 1;
@@ -174,11 +189,11 @@ pub(crate) async fn evaluate_with_pending(
                     if let Some(n) = number {
                         matched_numbers.insert(n);
                     }
-                    aired &= e
-                        .get::<Option<String>>(12)?
-                        .as_deref()
-                        .and_then(timestamp)
-                        .is_some_and(|t| t <= now);
+                    air_dates.push(
+                        e.get::<Option<String>>(12)?
+                            .as_deref()
+                            .and_then(super::restrictions::instant),
+                    );
                     files.push(e.get(7)?);
                     monitored &= e.get::<i64>(5)? == 1 && e.get::<i64>(11)? == 1;
                     runtime = runtime
@@ -217,7 +232,7 @@ pub(crate) async fn evaluate_with_pending(
                 language: r.get(7)?,
                 monitored,
                 files,
-                aired,
+                air_dates,
             });
         }
     } else {
@@ -277,7 +292,7 @@ pub(crate) async fn evaluate_with_pending(
                 language: r.get(15)?,
                 monitored: r.get::<i64>(7)? == 1,
                 files: vec![r.get(16)?],
-                aired: true,
+                air_dates: Vec::new(),
             });
         }
     }
@@ -311,9 +326,21 @@ pub(crate) async fn evaluate_with_pending(
     if candidate.status.as_deref() == Some("deleted") {
         result.deny("movie_deleted")
     }
-    if context == SearchContext::Rss && !candidate.aired {
-        result.deny("episode_not_aired")
-    }
+    // Publication/grace and full-season rules replace the former blanket now-based
+    // veto: negative grace and the explicit 24-hour pack window must remain usable.
+    super::restrictions::apply(
+        c,
+        media,
+        indexer,
+        release,
+        &candidate.target,
+        &candidate.air_dates,
+        matches!(parsed.numbering, Some(parser::Numbering::Season { .. })),
+        now,
+        &mut result,
+        operation,
+    )
+    .await?;
     if context == SearchContext::Rss && !candidate.monitored {
         result.deny("not_monitored")
     }

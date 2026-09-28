@@ -10,6 +10,8 @@ The native RSS consumer fetches Torznab/Newznab release facts, evaluates the cur
 
 All paths above have the `/api/v1` prefix. Request bodies are at most 8 KiB, responses at most 1 MiB, and API I/O has a five-second deadline. A timeout is an unknown request outcome: read back commands/schedules before deciding whether to issue another request.
 
+Release-profile admission uses each receipt's own indexer, including candidates from another command in the same pending cohort. All applicable profiles are enforced again under the writer before preparation and after network reads. Operation-owned exact term evidence survives global-cache eviction for the complete bounded cohort; current applicability and temporal fields are never cached as an admission decision. Transient matcher/storage errors preserve private pending state for retry. A restrictive edit after preparation prevents submission; observed/submitting/reconciling ownership remains governed by existing recovery rules. See [release profiles](release-profiles.md) for semantics and memory/concurrency limits.
+
 ## Execution and recovery
 
 Each pass captures at most 1,000 releases across ten pages, with a 4 MiB aggregate private encoding limit and a 35-second capture deadline. Malformed-page/item warnings currently fail the pass visibly. The entire feed capture and decision checkpoint commits together; retries reuse that checkpoint. Rejected or cancelled, unclaimed releases may be evaluated again on a later feed pass as availability, monitoring or policy changes. Existing owned submissions are never replaced by that reevaluation.

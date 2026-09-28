@@ -1,6 +1,6 @@
 # Release profile settings
 
-The native `/api/v1/{tv|movies}/release-profiles` API stores a set of restrictions. Every applicable enabled profile is selected; there is no priority order or fallback profile. Decision enforcement and a settings editor are separate integration work.
+The native `/api/v1/{tv|movies}/release-profiles` API stores a set of restrictions. Every applicable enabled profile is selected; there is no priority order or fallback profile. Search, RSS and grab admission enforce the current applicable set; the settings editor is documented with its separate UI delivery.
 
 GET returns a catalog with a domain revision and profiles. GET `/schema` returns a draft, which may be invalid until a term or TV-specific rule is added. GET `/{id}` includes the catalog revision. POST and PUT `/{id}` accept `{revision, profile}`; DELETE `/{id}?revision=...` also checks that revision. Successful mutations return the complete catalog. A stale revision returns 409 without changing data. Every accepted native mutation records local intent and atomically wakes resumable same-domain pending candidates; prepared/submitting/reconciling ownership remains unchanged.
 
@@ -9,6 +9,18 @@ Both domains support nullable names, enabled state, ordered required/ignored ter
 The matcher prepares all terms before opening a write transaction. The writer rechecks the domain revision and exact prepared content before committing. Literal and regex terms use the independent release-term matcher, not custom-format regex defaults. Invalid syntax rejects the write. Explicit unsupported dialect, limits and temporary matcher failures have distinct static error codes. Temporary admission, timeout, worker and state-change failures return 503. No matching runs inside a writer transaction.
 
 Limits: 1024 profiles per domain, 200 terms per list, 2048 UTF-8 bytes per term, 4096 total term occurrences and 1 MiB term bytes per catalog, 8192 total tag/indexer memberships, 200 combined include/exclude tags per profile, 200 TV indexers or one movie indexer, 256 UTF-8 bytes per name, 128 KiB request bodies and 4 MiB catalog responses. These are native resource bounds, not claims that upstream has identical ceilings.
+
+## Admission and current-policy checks
+
+Each nonempty required list uses any-match semantics; every applicable profile must pass. Any ignored match rejects. The actual indexer UUID is carried from the request or durable receipt, including each cross-command RSS sibling. User search does not bypass these restrictions. Restrictions filter admission and do not change quality/custom-format ranking.
+
+TV air-date restrictions compare immutable release publication with every matched episode's UTC air date plus the greatest signed grace among active restrictions. Equality passes. Missing/date-only/naive UTC values are unknown; RFC3339 offsets and fractional episode instants retain precision. The provider's existing publication parser normalizes to whole seconds, so this does not claim fractional publication preservation through remote feed ingestion. The former blanket RSS “aired by now” veto is replaced by these rules, including negative grace. Movie availability remains independent.
+
+Only full-season parsing invokes the pack rule. Unless a nonempty applicable set unanimously permits incomplete airing, every target UTC air date must be known and no later than now plus 24 hours (equality passes). Allowing an incomplete pack does not bypass publication/grace restrictions. Existing singleton download-submission guards remain: pack admission tests are not pack download/import evidence.
+
+The writer rereads applicability, current target metadata and time policy. Only exact completed term results may be reused; no regex executes inside the transaction. Operation-owned evidence retains up to 1024 results/128 MiB across prewarm and writer checks, independent of the smaller global cache. Two concurrent evidence owners are admitted without a waiting queue (256 MiB maximum retained budget); matcher CPU admission is separately bounded. Capacity exhaustion or changed/cold evidence retries a fresh operation, never becomes a false term result. No compiled patterns or private titles are retained by this evidence owner.
+
+The four transient matcher classes and release-profile storage failures retain pending payloads. Search/RSS command journals keep their existing coarse `storage_error` label with bounded retry; direct HTTP preserves exact static matcher codes and search retry diagnostics identify them without terms/titles. Malformed configuration remains permanent. Admission changes do not revoke an already observed receipt or rejudge completed file retirement; import keeps its independent factual quality/revision and ownership checks.
 
 ## Snapshot behavior
 
@@ -20,4 +32,4 @@ An independent activation marker and durable source mappings distinguish archive
 
 ## Not claimed
 
-This dependency does not yet enforce release restrictions in search/RSS/grab/import decisions or provide an editor. TV publication grace and season-pack decisions remain consumer work. The independent matcher has explicit unsupported dialect and resource boundaries; no claim of arbitrary .NET regex equivalence is made. Tests use scratch databases, synthetic credentials and owned loopback listeners; no live providers or media are accessed. Handler classification tests exercise the exact error conversion and response status, not end-to-end runtime saturation.
+This unit does not establish full pack submission/import, arbitrary upstream regex compatibility or every search/provider workflow. The independent matcher has explicit unsupported dialect and resource boundaries; no claim of arbitrary .NET regex equivalence is made. Tests use scratch databases, synthetic credentials and owned loopback listeners; no live providers or media are accessed. Handler classification tests exercise the exact error conversion and response status, not end-to-end runtime saturation.
