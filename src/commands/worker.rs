@@ -75,6 +75,13 @@ pub async fn start_with_metadata(
         }
     }
     let owner = Owner(Some(db.clone()));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::completed_download_handling::startup(&db),
+    )
+    .await
+    .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "cdh_timeout"))?
+    .map_err(|e| Error(e.0, e.1))?;
     tokio::time::timeout(Duration::from_secs(10), recover(&db, "interrupted"))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;

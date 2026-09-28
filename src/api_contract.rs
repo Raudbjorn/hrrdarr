@@ -41,6 +41,11 @@ pub fn render() -> String {
     registry.visit::<crate::delay_profiles::Input>();
     registry.visit::<crate::delay_profiles::Write>();
     registry.visit::<crate::delay_profiles::Reorder>();
+    registry.visit::<crate::commands::RefreshScheduleReset>();
+    registry.visit::<crate::completed_download_handling::Settings>();
+    registry.visit::<crate::completed_download_handling::ReconciliationReason>();
+    registry.visit::<crate::completed_download_handling::Update>();
+    registry.visit::<crate::commands::processing::ProcessingPolicyReset>();
     registry.visit::<crate::revision_policy::Policy>();
     registry.visit::<crate::revision_policy::Update>();
     registry.visit::<crate::tags::Input>();

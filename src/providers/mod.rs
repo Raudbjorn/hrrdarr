@@ -1070,6 +1070,7 @@ async fn create(
     let outcome = async {
     tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,?,?,1,1,?,?)",params![id.clone(),input.settings.implementation(),input.name,i64::from(input.enabled),i64::from(input.priority),input.settings.endpoint(),secret]).await?;
     write_scopes(&tx, &id, &input.settings).await?;
+    crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     Ok((StatusCode::CREATED, bounded(read(&tx, &id).await?.0)?))
     }.await;
     finish(tx, outcome).await
@@ -1109,6 +1110,7 @@ async fn update(
         return Err(conflict());
     }
     write_scopes(&tx, &id, &input.config.settings).await?;
+    crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     bounded(read(&tx, &id).await?.0)
     }.await;
     finish(tx, outcome).await
@@ -1209,6 +1211,15 @@ async fn delete(
         {
             return Err(conflict());
         }
+        crate::completed_download_handling::reconcile_pending(&tx)
+            .await
+            .map_err(|e| {
+                Error::Plain(
+                    e.0,
+                    e.1,
+                    "Completed download handling reconciliation failed",
+                )
+            })?;
         Ok(StatusCode::NO_CONTENT)
     }
     .await;
@@ -1828,6 +1839,9 @@ pub(crate) async fn import_configuration(
         .transpose()?;
     conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),input.settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
     write_scopes(conn, &id, &input.settings)
+        .await
+        .map_err(|_| FAILED)?;
+    crate::completed_download_handling::reconcile(conn, Some(&id), None)
         .await
         .map_err(|_| FAILED)?;
     Ok(Some((id, 1, true)))

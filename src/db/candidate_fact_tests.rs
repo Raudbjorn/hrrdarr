@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 40); // Latest open adds release profiles; historical start stays schema34.
+    assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical start stays schema34.
     assert_eq!(
         scalar(
             &c,

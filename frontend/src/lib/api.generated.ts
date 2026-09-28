@@ -66,6 +66,12 @@ export type CommandQuery = { media_type?: MediaDomain, status?: CommandStatus, l
 
 export type CommandStatus = "queued" | "running" | "retry_wait" | "succeeded" | "failed" | "cancelled";
 
+export type CompletedDownloadHandling = { media_type: MediaDomain, enabled: boolean, defined: boolean, revision: number, locally_edited: boolean, reconciliation_pending: boolean, reconciliation_reason: CompletedDownloadHandlingReconciliationReason | null, effective_scopes: number, observation_disabled_scopes: number, };
+
+export type CompletedDownloadHandlingReconciliationReason = "pending" | "schedule_limit";
+
+export type CompletedDownloadHandlingUpdate = { enabled: boolean, revision: number, };
+
 export type CustomFormat = { id: number, media_type: MediaDomain, name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
 
 export type CustomFormatBulkInput = { ids: Array<number>, include_when_renaming?: boolean | null, };
@@ -340,9 +346,11 @@ export type ProcessingInput = { provider_id: string, provider_revision: number, 
 
 export type ProcessingMode = "copy" | "hardlink";
 
-export type ProcessingPolicy = { provider_id: string, media_type: MediaDomain, provider_revision: number, revision: number | null, enabled: boolean, mode: ProcessingMode, };
+export type ProcessingPolicy = { observation_suppressed: boolean, observation_enabled: boolean, enabled_override: boolean | null, desired_enabled: boolean, provider_id: string, media_type: MediaDomain, provider_revision: number, revision: number | null, enabled: boolean, mode: ProcessingMode, };
 
 export type ProcessingPolicyInput = { provider_revision: number, revision: number | null, enabled: boolean, mode: ProcessingMode, };
+
+export type ProcessingPolicyReset = { provider_revision: number, revision: number | null, mode: ProcessingMode, };
 
 export type ProcessingQuery = { provider_id?: string, media_type?: MediaDomain, status?: ProcessingStatus, receipt_id?: string, limit?: number, offset?: number, };
 
@@ -458,11 +466,15 @@ export type QueueQuery = { provider_id: string, media_type: MediaDomain, limit?:
 
 export type QueueSnapshot = { target: RefreshTarget, provider_revision: number, observed_at: number, command_id: string | null, items: Array<QueueObservation>, total: number, limit: number, offset: number, };
 
-export type RefreshSchedule = { target: RefreshTarget, revision: number, provider_revision: number, enabled: boolean, interval_seconds: number, next_run_at: number, last_run_at: number | null, error_code: string | null, };
+export type RefreshSchedule = { intent: RefreshScheduleIntent, requested_enabled: boolean | null, target: RefreshTarget, revision: number, provider_revision: number, enabled: boolean, interval_seconds: number, next_run_at: number, last_run_at: number | null, error_code: string | null, };
 
 export type RefreshScheduleDelete = { target: RefreshTarget, revision: number, };
 
 export type RefreshScheduleInput = { target: RefreshTarget, revision: number | null, provider_revision: number, enabled: boolean, interval_seconds: number, };
+
+export type RefreshScheduleIntent = "inherited" | "explicit";
+
+export type RefreshScheduleReset = { target: RefreshTarget, revision: number | null, provider_revision: number, };
 
 export type RefreshTarget = { provider_id: string, media_type: MediaDomain, };
 
