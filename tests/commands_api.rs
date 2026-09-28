@@ -132,6 +132,84 @@ async fn submit(base: &str, provider: &Value, media: &str) -> Value {
     assert_eq!(c, 202, "{v}");
     v
 }
+// These command/lease tests control every admitted read. CDH now provisions
+// inherited observation, so explicitly suppress only this fixture's scopes before
+// starting a worker. The separate CDH default-flow test retains automatic schedules.
+async fn suppress_observation(base: &str, provider: &Value) {
+    let (code, schedules) = request(
+        base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    let mut domains = schedules
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["target"]["provider_id"] == provider["id"])
+        .map(|s| s["target"]["media_type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    domains.sort_unstable();
+    assert_eq!(
+        domains,
+        vec!["movies", "tv"],
+        "suppress both actual provider scopes"
+    );
+    for schedule in schedules
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["target"]["provider_id"] == provider["id"])
+    {
+        let (code, value) = request(
+            base,
+            "DELETE",
+            "/api/v1/download-refresh/schedules",
+            json!({"target":schedule["target"],"revision":schedule["revision"]}),
+        )
+        .await;
+        assert_eq!(code, 204, "{value}");
+    }
+    let (code, schedules) = request(
+        base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    assert!(
+        !schedules
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["target"]["provider_id"] == provider["id"])
+    );
+}
+async fn enable_observation(base: &str, provider: &Value, media: &str) {
+    // Respect provisioned-row CAS; a deliberately suppressed row is publicly absent.
+    let (code, schedules) = request(
+        base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    let revision = schedules
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["target"]["provider_id"] == provider["id"] && s["target"]["media_type"] == media
+        })
+        .map(|s| s["revision"].clone())
+        .unwrap_or(Value::Null);
+    let (code,value)=request(base,"PUT","/api/v1/download-refresh/schedules",json!({"target":{"provider_id":provider["id"],"media_type":media},"revision":revision,"provider_revision":provider["revision"],"enabled":true,"interval_seconds":60})).await;
+    assert_eq!(code, 200, "{value}");
+}
 async fn stop(task: JoinHandle<()>) {
     task.abort();
     let _ = task.await;
@@ -157,6 +235,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
     let (code, provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201, "{provider}");
+    suppress_observation(&base, &provider).await;
     for body in [
         json!({}),
         json!({"name":"refresh_series","target":{"provider_id":provider["id"],"media_type":"tv"},"provider_revision":1,"priority":"normal"}),
@@ -313,8 +392,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     runtime.shutdown().await;
     // Explicit schedules survive restart, enqueue both scopes once, and do not catch up missed ticks.
     for media in ["tv", "movies"] {
-        let(code,schedule)=request(&base,"PUT","/api/v1/download-refresh/schedules",json!({"target":{"provider_id":provider["id"],"media_type":media},"revision":null,"provider_revision":1,"enabled":true,"interval_seconds":60})).await;
-        assert_eq!(code, 200, "{schedule}");
+        enable_observation(&base, &provider, media).await;
     }
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
@@ -351,7 +429,8 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
             .1["total"],
         total
     );
-    // Provider edit invalidates snapshots and disables preserved schedules; queued old revision fails.
+    // Provider edit invalidates snapshots and fences queued old revisions. CDH preserves
+    // explicit observation intent and reauthorizes schedules for the current provider.
     let stale = submit(&base, &provider, "tv").await;
     let mut changed = config;
     changed["revision"] = json!(1);
@@ -373,8 +452,11 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     .await;
     assert_eq!(schedules.as_array().unwrap().len(), 2);
     for s in schedules.as_array().unwrap() {
-        assert_eq!(s["enabled"], false);
-        assert_eq!(s["error_code"], "provider_changed");
+        assert_eq!(s["enabled"], true);
+        assert_eq!(s["intent"], "explicit");
+        assert_eq!(s["requested_enabled"], true);
+        assert_eq!(s["provider_revision"], new_provider["revision"]);
+        assert!(s["error_code"].is_null());
     }
     assert_eq!(
         request(
@@ -390,6 +472,9 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
         .0,
         404
     );
+    // Isolate the stale command from valid new-revision scheduled reads, while
+    // retaining the exact no-network-call assertion for its rejection.
+    suppress_observation(&base, &new_provider).await;
     let calls = remote_state.calls.lock().unwrap().len();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, stale["id"].as_str().unwrap(), "failed").await;
@@ -432,6 +517,7 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
     let (code, provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201);
+    suppress_observation(&base, &provider).await;
     let tv = submit(&base, &provider, "tv").await;
     let mut high = input(&provider, "movies");
     high["priority"] = json!("high");
@@ -527,8 +613,7 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     runtime.shutdown().await;
     assert_eq!(state.calls.lock().unwrap().len(), calls);
     // Fill explicitly retained history without network calls; no implicit pruning or ignored scheduler failure.
-    let(code,_)=request(&base,"PUT","/api/v1/download-refresh/schedules",json!({"target":{"provider_id":provider["id"],"media_type":"movies"},"revision":null,"provider_revision":provider["revision"],"enabled":true,"interval_seconds":60})).await;
-    assert_eq!(code, 200);
+    enable_observation(&base, &provider, "movies").await;
     let tx = conn
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await
@@ -723,6 +808,7 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
     let config = json!({"name": "shared", "enabled": true, "priority": 1, "settings": {"implementation": "qbittorrent", "endpoint": endpoint, "tv": scope("tv"), "movies": scope("movies")}, "credentials": null});
     let (code, mut provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201);
+    suppress_observation(&base, &provider).await;
     for media in ["tv", "movies"] {
         for mode in [2, 3] {
             state
@@ -878,6 +964,7 @@ async fn process_ownership_rejects_competitor_and_recovers_killed_reads_in_both_
             "settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null
         })).await;
         assert_eq!(code, 201, "{provider}");
+        suppress_observation(&base, &provider).await;
         let command = submit(&base, &provider, media).await;
         let id = command["id"].as_str().unwrap();
         stop(setup).await;
