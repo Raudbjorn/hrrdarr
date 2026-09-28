@@ -244,7 +244,8 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
     let (base, server) = serve(
         router
             .merge(commands::router(db.clone()))
-            .merge(hrrdarr::delay_profiles::router(db)),
+            .merge(hrrdarr::delay_profiles::router(db.clone()))
+            .merge(hrrdarr::release_profiles::router(db)),
     )
     .await;
     (base, server, client)
@@ -1148,7 +1149,12 @@ async fn delayed_release_never_silently_switches_to_a_new_library_target() {
 
 #[tokio::test]
 async fn pending_cross_command_winner_keeps_provider_and_submits_once() {
-    for media in ["tv", "movies"] {
+    for (media, restriction) in [
+        ("tv", false),
+        ("movies", false),
+        ("tv", true),
+        ("movies", true),
+    ] {
         let scratch = Scratch(std::env::temp_dir().join(format!(
             "hrrdarr-rss-cohort-worker-{}",
             uuid::Uuid::new_v4()
@@ -1204,12 +1210,25 @@ async fn pending_cross_command_winner_keeps_provider_and_submits_once() {
         runtime.shutdown().await;
         assert!(old_state.adds.lock().unwrap().is_empty());
         assert!(young_state.adds.lock().unwrap().is_empty());
-        c.execute(
-            "UPDATE providers SET enabled=0,revision=revision+1 WHERE id=?",
-            [old_indexer["id"].as_str().unwrap()],
-        )
-        .await
-        .unwrap();
+        if restriction {
+            let mut profile = admission_profile(media);
+            profile["indexers"] = json!([{"kind":"provider","id":old_indexer["id"]}]);
+            let (code, value) = request(
+                &base,
+                "POST",
+                &format!("/api/v1/{media}/release-profiles"),
+                json!({"revision":1,"profile":profile}),
+            )
+            .await;
+            assert_eq!(code, 201, "{value}");
+        } else {
+            c.execute(
+                "UPDATE providers SET enabled=0,revision=revision+1 WHERE id=?",
+                [old_indexer["id"].as_str().unwrap()],
+            )
+            .await
+            .unwrap();
+        }
         save_delay(&base, media, 10).await;
         let young_id: String = c
             .query(
@@ -1361,6 +1380,188 @@ async fn prepared_owner_still_rechecks_increased_delay_before_post() {
         assert_eq!(rejected["error_code"], "target_changed");
         assert_eq!(rejected["reasons"], json!([]));
         assert!(state.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+    }
+}
+
+fn admission_profile(media: &str) -> Value {
+    let mut p = json!({"name":"Admission","enabled":true,"required":["NEVER_MATCH_THIS_TITLE"],"ignored":[],"tag_ids":[],"indexers":[]});
+    if media == "tv" {
+        p["excluded_tag_ids"] = json!([]);
+        p["air_date_restriction"] = json!(false);
+        p["air_date_grace_period_days"] = json!(0);
+        p["allow_season_pack_without_all_episodes_aired"] = json!(false);
+    }
+    p
+}
+#[tokio::test]
+async fn release_restriction_change_during_preparation_never_posts() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-restriction-held-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let state = Arc::new(Remote::default());
+        state.mode.store(4, Ordering::SeqCst);
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(state.clone()),
+        )
+        .await;
+        *state.endpoint.lock().unwrap() = remote_base.clone();
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let command = enqueue(&base, target(&indexer, &download, media)).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+            .await
+            .unwrap();
+        let c = db.connect().await.unwrap();
+        let id = c
+            .query(
+                "SELECT id FROM rss_candidates WHERE command_id=?",
+                [command["id"].as_str().unwrap()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        let payload_before: Vec<u8> = c
+            .query(
+                "SELECT private_payload FROM rss_candidates WHERE id=?",
+                [id.clone()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        // A unique term forces cold writer evidence even when another serial test
+        // has warmed the global cache. The writer must retry without submitting.
+        let mut profile = admission_profile(media);
+        profile["required"] = json!([format!("NEVER_{}", uuid::Uuid::new_v4())]);
+        let (code, value) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/{media}/release-profiles"),
+            json!({"revision":1,"profile":profile}),
+        )
+        .await;
+        assert_eq!(code, 201, "{value}");
+        let released_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        state.release.notify_one();
+        let retry = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let (code, value) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(code, 200, "{value}");
+                if value["status"] == "retry_wait" {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("cold policy evidence must retain a retryable parent");
+        assert_eq!(retry["error_code"], "storage_error");
+        assert_eq!(retry["attempts"], 1);
+        assert_eq!(retry["fetch_complete"], true);
+        let retry_deadline = retry["next_attempt_at"].as_i64().unwrap();
+        assert!((released_at + 30..=released_at + 42).contains(&retry_deadline));
+        assert_eq!(retry["completed_at"], Value::Null);
+        let pending = receipt_until(&base, "pending").await;
+        assert_eq!(pending["id"], id);
+        assert!(state.adds.lock().unwrap().is_empty());
+        let payload_after: Vec<u8> = c
+            .query(
+                "SELECT private_payload FROM rss_candidates WHERE id=?",
+                [id.clone()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(payload_after, payload_before);
+        let rejected = if media == "tv" {
+            // A real accepted save wakes pending ownership and its parent atomically.
+            let (code, saved) = request(
+                &base,
+                "PUT",
+                &format!(
+                    "/api/v1/{media}/release-profiles/{}",
+                    value["profiles"][0]["id"].as_i64().unwrap()
+                ),
+                json!({"revision":value["revision"],"profile":profile}),
+            )
+            .await;
+            assert_eq!(code, 200, "{saved}");
+            receipt_until(&base, "rejected").await
+        } else {
+            // Observe the actual 30-second automatic retry without a settings wake.
+            // This separate bound includes that backoff; existing request/receipt
+            // timeouts remain unchanged for all immediate-settlement scenarios.
+            tokio::time::timeout(Duration::from_secs(45), async {
+                loop {
+                    let (code, values) =
+                        request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
+                    assert_eq!(code, 200, "{values}");
+                    if let Some(value) = values["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|v| v["id"] == id && v["status"] == "rejected")
+                    {
+                        break value.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("automatic retry must evaluate fresh policy after its backoff")
+        };
+        assert_eq!(rejected["id"], id);
+        // A current policy veto records its precise decision reason; target_changed
+        // is reserved for identity changes or a prepared candidate becoming delayed.
+        assert_eq!(rejected["error_code"], Value::Null);
+        assert_eq!(
+            rejected["reasons"],
+            json!(["release_required_term_missing"])
+        );
+        assert!(state.adds.lock().unwrap().is_empty());
+        assert_eq!(
+            c.query("SELECT count(*) FROM rss_hash_claims", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
         runtime.shutdown().await;
     }
 }

@@ -225,9 +225,20 @@ fn matches_target(requested: &MediaTarget, actual: &Option<crate::search::Releas
 fn decision_error(error: crate::search::SearchError, invalid: &'static str) -> Error {
     if matches!(
         error.0,
-        "release_storage_error" | "delay_profile_storage_error" | "revision_policy_storage_error"
+        "release_storage_error"
+            | "delay_profile_storage_error"
+            | "revision_policy_storage_error"
+            | "release_profile_storage_error"
     ) {
         Error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error")
+    } else if matches!(
+        error.0,
+        "release_term_busy"
+            | "release_term_timeout"
+            | "release_term_worker_failed"
+            | "release_term_state_changed"
+    ) {
+        Error(StatusCode::SERVICE_UNAVAILABLE, error.0)
     } else if error.0.starts_with("custom_format_") {
         Error(
             if matches!(
@@ -248,13 +259,16 @@ async fn evaluate(
     c: &Connection,
     command: &SearchCommand,
     release: &indexer::Release,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<ReleaseDecision> {
-    let mut decision = crate::search::evaluate(
+    let mut decision = crate::search::evaluate_with_evidence(
         c,
         command.source.media_type,
+        command.source.indexer_id,
         release,
         SearchContext::UserSearch,
         now()?,
+        operation,
     )
     .await
     .map_err(|e| decision_error(e, "invalid_release"))?;
@@ -453,12 +467,14 @@ async fn grab(
     let _ = body.map_err(|_| bad())?;
     let id = uuid(id)?;
     let c = connection(&s.db).await?;
+    let mut operation = crate::search::operation_evidence()
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
     if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await? {
         if let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
             let command=read(&c,uuid(row.get::<String>(0)?)?).await?;
             let mut bytes=s.client.open_release(&envelope(id,&command),&payload).map_err(|e|Error(StatusCode::CONFLICT,e.code))?;
             let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::CONFLICT,"invalid_release"))?;
-            evaluate(&c,&command,&release).await?;
+            evaluate(&c,&command,&release, &mut operation).await?;
         }
     }
     let tx = c
@@ -479,7 +495,7 @@ async fn grab(
         if command.mode != SearchMode::Interactive {
             return Err(conflict());
         }
-        let candidate = select(&tx, &s.client, &command, id).await?;
+        let candidate = select(&tx, &s.client, &command, id, &mut operation).await?;
         bounded(rss::public_candidate(&tx, candidate).await?)
     }
     .await;
@@ -491,6 +507,7 @@ async fn select(
     client: &RefreshClient,
     command: &SearchCommand,
     id: Uuid,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<Uuid> {
     let row=c.query("SELECT selected_candidate_id,expires_at,private_payload,fingerprint,title FROM search_results WHERE id=? AND command_id=?",params![id.to_string(),command.id.to_string()]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"search_result_not_found"))?;
     // Receipt readback survives expiry and mutable provider/library policy changes.
@@ -528,7 +545,7 @@ async fn select(
         indexer::decode_private(&bytes).map_err(|_| Error(StatusCode::CONFLICT, "invalid_release"));
     bytes.fill(0);
     let release = release?;
-    let decision = evaluate(c, command, &release).await?;
+    let decision = evaluate(c, command, &release, operation).await?;
     if !matches!(decision.disposition, Disposition::Accept) {
         return Err(Error(StatusCode::CONFLICT, "release_rejected"));
     }
@@ -647,11 +664,13 @@ async fn publish(
     releases: Vec<Vec<u8>>,
 ) -> Result<()> {
     let c = connection(db).await?;
+    let mut operation = crate::search::operation_evidence()
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
     // Prepare bounded CPU decisions before taking the writer; exact-input cache hits guard inside.
     for bytes in &releases {
         let release = indexer::decode_private(bytes)
             .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
-        evaluate(&c, command, &release).await?;
+        evaluate(&c, command, &release, &mut operation).await?;
     }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -664,7 +683,7 @@ async fn publish(
  let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;
  let identity=release.guid.as_deref().filter(|s|!s.is_empty()).unwrap_or(&release.download_url);
  let fingerprint=rss::digest(format!("user_search/{}/{}/{}",command.id,serde_json::to_string(&command.target).map_err(|_|bad())?,identity).as_bytes());if !seen.insert(fingerprint.clone()){continue}
- let decision=evaluate(&tx,command,&release).await?;let id=Uuid::new_v4();
+ let decision=evaluate(&tx,command,&release, &mut operation).await?;let id=Uuid::new_v4();
  let title=release.metadata.title.clone().filter(|s|!s.is_empty()).unwrap_or_else(||"(untitled release)".into());if title.len()>1024{return Err(Error(StatusCode::BAD_GATEWAY,"invalid_release"))}
  let metadata=serde_json::to_string(&release.metadata).map_err(|_|bad())?;let decision_json=serde_json::to_string(&decision).map_err(|_|bad())?;
  let payload=if matches!(decision.disposition,Disposition::Accept){
@@ -677,7 +696,7 @@ async fn publish(
  }
  tx.execute("UPDATE search_commands SET fetched=?,fetch_complete=1 WHERE id=?",params![count,command.id.to_string()]).await?;
  if command.mode==SearchMode::Automatic {
- if let Some((_,_,id))=best{select(&tx,client,command,id).await?;}else{tx.execute("UPDATE search_commands SET status='failed',completed_at=?,error_code='no_eligible_release' WHERE id=?",params![timestamp,command.id.to_string()]).await?;return Ok(())}
+ if let Some((_,_,id))=best{select(&tx,client,command,id, &mut operation).await?;}else{tx.execute("UPDATE search_commands SET status='failed',completed_at=?,error_code='no_eligible_release' WHERE id=?",params![timestamp,command.id.to_string()]).await?;return Ok(())}
  }
  tx.execute("UPDATE search_commands SET status='succeeded',completed_at=?,error_code=NULL WHERE id=?",params![timestamp,command.id.to_string()]).await?;Ok(())
  }.await;
@@ -699,34 +718,59 @@ pub(super) async fn run(
         Err(_) => Err(Error(StatusCode::GATEWAY_TIMEOUT, "refresh_timeout")),
     };
     if let Err(Error(_, code)) = outcome {
-        let code = match code {
-            "command_storage_error" => "storage_error",
-            "invalid_command_request" => "invalid_release",
-            v @ ("interrupted"
-            | "storage_error"
-            | "provider_changed"
-            | "provider_unavailable"
-            | "refresh_timeout"
-            | "refresh_limit"
-            | "refresh_failed"
-            | "key_unavailable"
-            | "invalid_release"
-            | "candidate_limit"
-            | "target_changed"
-            | "search_limit"
-            | "no_eligible_release"
-            | "result_expired"
-            | "invalid_search_target") => v,
-            _ => "invalid_release",
-        };
-        let retry = command.attempts < 3
-            && matches!(
-                code,
-                "storage_error" | "refresh_timeout" | "refresh_failed" | "provider_unavailable"
-            );
-        let c = connection(db).await?;
-        let timestamp = now()?;
-        c.execute("UPDATE search_commands SET status=?,next_attempt_at=MAX(next_attempt_at,?),completed_at=?,error_code=? WHERE id=? AND status='running'",params![if retry{"retry_wait"}else{"failed"},timestamp+(1i64<<command.attempts),if retry{None}else{Some(timestamp)},code,command.id.to_string()]).await?;
+        settle_failure(db, &command, code).await?;
     }
     Ok(())
 }
+async fn settle_failure(db: &Database, command: &SearchCommand, code: &str) -> Result<()> {
+    // Durable enum remains coarse; exact static diagnostics and HTTP errors retain
+    // matcher classification. A cold cache is retryable, never an invalid release.
+    let code = if matches!(
+        code,
+        "release_term_busy"
+            | "release_term_timeout"
+            | "release_term_worker_failed"
+            | "release_term_state_changed"
+    ) {
+        eprintln!(
+            "event=search_admission_retry command_id={} code={}",
+            command.id, code
+        );
+        "storage_error"
+    } else {
+        code
+    };
+    let code = match code {
+        "command_storage_error" => "storage_error",
+        "invalid_command_request" => "invalid_release",
+        v @ ("interrupted"
+        | "storage_error"
+        | "provider_changed"
+        | "provider_unavailable"
+        | "refresh_timeout"
+        | "refresh_limit"
+        | "refresh_failed"
+        | "key_unavailable"
+        | "invalid_release"
+        | "candidate_limit"
+        | "target_changed"
+        | "search_limit"
+        | "no_eligible_release"
+        | "result_expired"
+        | "invalid_search_target") => v,
+        _ => "invalid_release",
+    };
+    let retry = command.attempts < 3
+        && matches!(
+            code,
+            "storage_error" | "refresh_timeout" | "refresh_failed" | "provider_unavailable"
+        );
+    let c = connection(db).await?;
+    let timestamp = now()?;
+    c.execute("UPDATE search_commands SET status=?,next_attempt_at=MAX(next_attempt_at,?),completed_at=?,error_code=? WHERE id=? AND status='running'",params![if retry{"retry_wait"}else{"failed"},timestamp+(1i64<<command.attempts),if retry{None}else{Some(timestamp)},code,command.id.to_string()]).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "search_restriction_tests.rs"]
+mod restriction_tests;

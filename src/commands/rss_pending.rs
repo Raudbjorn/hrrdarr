@@ -149,13 +149,17 @@ pub(super) async fn evaluate(
     c: &Connection,
     client: &RefreshClient,
     media: MediaDomain,
+    indexer: Uuid,
     release: &indexer::Release,
     context: SearchContext,
     timestamp: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<crate::search::ReleaseDecision> {
-    let decision = crate::search::evaluate(c, media, release, context, timestamp)
-        .await
-        .map_err(|error| Error(StatusCode::INTERNAL_SERVER_ERROR, error.0))?;
+    let decision = crate::search::evaluate_with_evidence(
+        c, media, indexer, release, context, timestamp, operation,
+    )
+    .await
+    .map_err(|error| Error(StatusCode::INTERNAL_SERVER_ERROR, error.0))?;
     let Some(target) = decision.target.as_ref() else {
         return Ok(decision);
     };
@@ -170,14 +174,24 @@ pub(super) async fn evaluate(
         return Ok(decision);
     }
     let items = cohort(c, client, target).await?;
-    crate::search::evaluate_with_pending(c, media, release, context, timestamp, oldest(&items))
-        .await
-        .map_err(|error| Error(StatusCode::INTERNAL_SERVER_ERROR, error.0))
+    crate::search::evaluate_with_pending(
+        c,
+        media,
+        indexer,
+        release,
+        context,
+        timestamp,
+        oldest(&items),
+        operation,
+    )
+    .await
+    .map_err(|error| Error(StatusCode::INTERNAL_SERVER_ERROR, error.0))
 }
 pub(super) async fn best(
     c: &Connection,
     items: &[Pending],
     timestamp: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<Option<Uuid>> {
     if c.is_autocommit() {
         return Err(bad());
@@ -192,10 +206,12 @@ pub(super) async fn best(
         let decision = match crate::search::evaluate_with_pending(
             c,
             p.source.media_type,
+            p.source.indexer_id,
             &item.release,
             SearchContext::Rss,
             timestamp,
             oldest,
+            operation,
         )
         .await
         {
@@ -239,6 +255,7 @@ pub(super) async fn select_work(
     db: &Database,
     client: &RefreshClient,
     work: CandidateWork,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<CandidateWork> {
     if work.public.status != "pending"
         || !matches!(
@@ -254,12 +271,14 @@ pub(super) async fn select_work(
     let c = connection(db).await?;
     // Compile only outside the writer; the same complete cohort is read afresh below.
     for item in cohort(&c, client, target).await? {
-        if let Err(error) = crate::search::evaluate(
+        if let Err(error) = crate::search::evaluate_with_evidence(
             &c,
             item.work.public.source.media_type,
+            item.work.public.source.indexer_id,
             &item.release,
             SearchContext::Rss,
             now()?,
+            operation,
         )
         .await
         {
@@ -286,7 +305,9 @@ pub(super) async fn select_work(
             return Ok(owner);
         }
         let items = cohort(&tx, client, target).await?;
-        let winner = best(&tx, &items, now()?).await?.unwrap_or(work.public.id);
+        let winner = best(&tx, &items, now()?, operation)
+            .await?
+            .unwrap_or(work.public.id);
         candidate(&tx, winner).await
     }
     .await;

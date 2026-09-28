@@ -299,6 +299,7 @@ async fn insert_captured(
     command: &RssCommand,
     item: CapturedRelease,
     timestamp: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<()> {
     if c.is_autocommit() {
         return Err(bad());
@@ -314,9 +315,11 @@ async fn insert_captured(
         c,
         client,
         t.media_type,
+        t.indexer_id,
         &release,
         SearchContext::Rss,
         timestamp,
+        operation,
     )
     .await?;
     if !singleton(&decision.target) {
@@ -367,6 +370,8 @@ async fn insert_captured(
 
 async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssCommand) -> Result<()> {
     let t = command.target;
+    let mut operation = crate::search::operation_evidence()
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
     let mut releases = Vec::new();
     let mut query_index = 0;
     let mut offset = 0;
@@ -426,9 +431,17 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
             .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid_release"))?;
         encoded.fill(0);
         // Warm bounded CF work outside the writer; no prewarm decision is durable.
-        crate::search::evaluate(&c, t.media_type, &release, SearchContext::Rss, timestamp)
-            .await
-            .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
+        crate::search::evaluate_with_evidence(
+            &c,
+            t.media_type,
+            t.indexer_id,
+            &release,
+            SearchContext::Rss,
+            timestamp,
+            &mut operation,
+        )
+        .await
+        .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
         let fingerprint = digest(
             release
                 .guid
@@ -465,7 +478,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
         }
         let count = captured.len() as i64;
         for item in captured {
-            insert_captured(&tx, client, command, item, timestamp).await?;
+            insert_captured(&tx, client, command, item, timestamp, &mut operation).await?;
         }
         tx.execute(
             "UPDATE rss_commands SET fetch_complete=1,fetched=?,evaluated=? WHERE id=?",
@@ -627,6 +640,7 @@ async fn settle_local(
     expected: &RssCandidate,
     release: &indexer::Release,
     timestamp: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<Option<crate::search::ReleaseDecision>> {
     if c.is_autocommit() {
         return Err(bad());
@@ -645,9 +659,11 @@ async fn settle_local(
         c,
         client,
         current.public.source.media_type,
+        current.public.source.indexer_id,
         release,
         super::search::authority(c, expected.id).await?,
         timestamp,
+        operation,
     )
     .await?;
     if !singleton(&decision.target) || matches!(decision.disposition, Disposition::Reject) {
@@ -678,6 +694,7 @@ async fn process_candidate(
     db: &Database,
     client: &RefreshClient,
     work: CandidateWork,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<()> {
     if work.public.status == "reconciling" {
         return reconcile(db, client, work).await;
@@ -701,19 +718,21 @@ async fn process_candidate(
     let release = decoded.map_err(|_| bad())?;
     // Prewarm may compile bounded CF expressions; current policy is read again
     // together with every early state/deadline write under the Immediate lock.
-    crate::search::evaluate(
+    crate::search::evaluate_with_evidence(
         &c,
         p.source.media_type,
+        p.source.indexer_id,
         &release,
         super::search::authority(&c, p.id).await?,
         now()?,
+        operation,
     )
     .await
     .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome = settle_local(&tx, client, &p, &release, now()?).await;
+    let outcome = settle_local(&tx, client, &p, &release, now()?, operation).await;
     let Some(decision) = finish(tx, outcome).await? else {
         return Ok(());
     };
@@ -776,10 +795,10 @@ async fn process_candidate(
         if !valid_target(&tx,p.source).await?{candidate_state(&tx,p.id,"rejected",Some("provider_changed"),None).await?;return Ok(false)}
         // Recheck all current local decision facts after preparation's network reads.
         let timestamp=now()?;
-        let Some(latest)=settle_local(&tx,client,&p,&release,timestamp).await? else {return Ok(false)};
+        let Some(latest)=settle_local(&tx,client,&p,&release,timestamp, operation).await? else {return Ok(false)};
         if p.status=="pending" && matches!(p.origin,super::search::CandidateOrigin::Rss) {
             let items=pending::cohort(&tx,client,&target).await?;
-            if pending::best(&tx,&items,timestamp).await?.is_some_and(|winner|winner!=p.id){return Ok(false)}
+            if pending::best(&tx,&items,timestamp, operation).await?.is_some_and(|winner|winner!=p.id){return Ok(false)}
         }
         if !matches!(latest.disposition,Disposition::Accept) || latest.target.as_ref()!=Some(&target) {
             candidate_state(&tx,p.id,"rejected",Some("target_changed"),None).await?;return Ok(false)
@@ -1071,14 +1090,20 @@ pub(super) async fn run(db: &Database, client: &RefreshClient, command: RssComma
     let id=c.query("SELECT id FROM rss_candidates WHERE command_id=? AND (status='prepared' OR (status='pending' AND (not_before IS NULL OR not_before<=?))) ORDER BY created_at,id LIMIT 1",params![command.id.to_string(),now()?]).await?.next().await?.map(|r|r.get::<String>(0)).transpose()?;
     if let Some(id) = id {
         let id = Uuid::parse_str(&id).map_err(|_| bad())?;
-        let work = match pending::select_work(db, client, candidate(&c, id).await?).await {
+        let mut operation = match crate::search::operation_evidence() {
+            Ok(value) => value,
+            Err(error) => return settle_error(db, &command, error.0).await,
+        };
+        let work = match pending::select_work(db, client, candidate(&c, id).await?, &mut operation)
+            .await
+        {
             Ok(work) => work,
             Err(error) => return settle_error(db, &command, error.1).await,
         };
         // A cohort winner may belong to another RSS command. Ownership/error reads
         // use the selected candidate; this command retries the attempted cohort work.
         let id = work.public.id;
-        if let Err(error) = process_candidate(db, client, work).await {
+        if let Err(error) = process_candidate(db, client, work, &mut operation).await {
             let status: String = c
                 .query(
                     "SELECT status FROM rss_candidates WHERE id=?",
@@ -1119,6 +1144,11 @@ fn transient_local_error(code: &str) -> bool {
             | "custom_format_worker_failed"
             | "delay_profile_storage_error"
             | "revision_policy_storage_error"
+            | "release_profile_storage_error"
+            | "release_term_busy"
+            | "release_term_timeout"
+            | "release_term_worker_failed"
+            | "release_term_state_changed"
             | "release_storage_error"
             | "command_storage_error"
     )
@@ -1159,12 +1189,15 @@ async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> 
 }
 pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> Result<()> {
     let c = connection(db).await?;
-    let work = match pending::select_work(db, client, candidate(&c, id).await?).await {
-        Ok(work) => work,
-        Err(error) => return settle_due_error(&c, id, error).await,
-    };
+    let mut operation = crate::search::operation_evidence()
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
+    let work =
+        match pending::select_work(db, client, candidate(&c, id).await?, &mut operation).await {
+            Ok(work) => work,
+            Err(error) => return settle_due_error(&c, id, error).await,
+        };
     let id = work.public.id;
-    if let Err(error) = process_candidate(db, client, work).await {
+    if let Err(error) = process_candidate(db, client, work, &mut operation).await {
         settle_due_error(&c, id, error).await?;
     }
     Ok(())

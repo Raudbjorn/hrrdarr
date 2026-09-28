@@ -1341,6 +1341,7 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     let router = router
         .merge(commands::router(db.clone()))
         .merge(hrrdarr::search::router(db.clone(), client.clone()))
+        .merge(hrrdarr::release_profiles::router(db.clone()))
         .merge(hrrdarr::library::router(db.clone()))
         .merge(hrrdarr::library::metadata_router(
             db.clone(),
@@ -2324,6 +2325,23 @@ async fn search_revision_import_preserves_durable_origin_http() {
             .find(|r| r["id"] == receipt)
             .unwrap();
         assert_eq!(owned["origin"]["kind"], "search");
+        // Release restrictions govern admission. Editing them after an observed
+        // receipt must not retroactively revoke completed-download ownership.
+        let mut restriction = json!({"name":"After grab","enabled":true,"required":["NEVER_MATCH_THIS_TITLE"],"ignored":[],"tag_ids":[],"indexers":[]});
+        if !movie {
+            restriction["excluded_tag_ids"] = json!([]);
+            restriction["air_date_restriction"] = json!(false);
+            restriction["air_date_grace_period_days"] = json!(0);
+            restriction["allow_season_pack_without_all_episodes_aired"] = json!(false);
+        }
+        let (code, value) = request(
+            &ctx.base,
+            "POST",
+            &format!("/api/v1/{media}/release-profiles"),
+            json!({"revision":1,"profile":restriction}),
+        )
+        .await;
+        assert_eq!(code, 201, "{value}");
         ctx.state.completed.store(1, Ordering::SeqCst);
         let (code, result) = naming_process(&ctx, &receipt).await;
         assert_eq!(code, 202, "{result}");

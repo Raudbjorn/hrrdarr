@@ -3,6 +3,8 @@ mod decision;
 pub(crate) mod delay;
 pub(crate) mod downloaded;
 pub mod parser;
+mod restrictions;
+pub(crate) use restrictions::operation as operation_evidence;
 pub(crate) mod revision;
 use crate::api::MediaDomain;
 use crate::{
@@ -20,8 +22,8 @@ use axum::{
     routing::{get, post},
 };
 pub use decision::evaluate;
-pub(crate) use decision::evaluate_with_pending;
 pub(crate) use decision::target_ranks;
+pub(crate) use decision::{evaluate_with_evidence, evaluate_with_pending};
 use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -84,12 +86,17 @@ impl IntoResponse for SearchError {
         eprintln!("event=release_request_error code={}", self.0);
         (
             match self.0 {
-                "delay_profile_storage_error" | "revision_policy_storage_error" => {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
+                "delay_profile_storage_error"
+                | "revision_policy_storage_error"
+                | "release_profile_storage_error"
+                | "release_term_busy"
+                | "release_term_timeout"
+                | "release_term_worker_failed"
+                | "release_term_state_changed" => StatusCode::SERVICE_UNAVAILABLE,
                 "release_storage_error"
                 | "release_profile_error"
                 | "delay_profile_invariant"
+                | "release_profile_invariant"
                 | "revision_policy_missing"
                 | "revision_policy_invalid" => StatusCode::INTERNAL_SERVER_ERROR,
                 "release_search_timeout" | "release_policy_timeout" => StatusCode::GATEWAY_TIMEOUT,
@@ -301,8 +308,15 @@ async fn search(
             .as_secs() as i64;
         let mut items = Vec::new();
         for release in page.items {
-            let mut decision =
-                evaluate(&c, media, &release, SearchContext::UserSearch, now).await?;
+            let mut decision = evaluate(
+                &c,
+                media,
+                input.provider_id,
+                &release,
+                SearchContext::UserSearch,
+                now,
+            )
+            .await?;
             let matches = match (&input.target, &decision.target) {
                 (
                     crate::db::MediaTarget::Episode(id),

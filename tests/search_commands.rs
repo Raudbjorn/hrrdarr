@@ -227,7 +227,8 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
     let (base, server) = serve(
         router
             .merge(commands::router(db.clone()))
-            .merge(hrrdarr::search::router(db, client.clone())),
+            .merge(hrrdarr::search::router(db.clone(), client.clone()))
+            .merge(hrrdarr::release_profiles::router(db)),
     )
     .await;
     (base, server, client)
@@ -340,6 +341,15 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
         let (base, server, client) = app(db.clone()).await;
         let (indexer, download) = providers(&base, &remote_base).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
+        // Precise release-profile timing replaces the old blanket future-airdate
+        // veto. Keep this search-vs-RSS authority test using the real monitoring
+        // exception; movies still exercise their independent future availability.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE series SET monitored=0", ())
+            .await
+            .unwrap();
         for tv in [true, false] {
             // The same private release was already rejected by background RSS.
             // A user search must retain its exception without weakening RSS rules.
@@ -1175,5 +1185,100 @@ async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_bounda
             server.stop().await;
             remote_server.stop().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn release_profiles_revalidate_search_offers_and_automatic_admission() {
+    for tv in [true, false] {
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "hrrdarr-search-restrictions-{}",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let state = Arc::new(Remote::default());
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(state.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&indexer, &download, tv, "interactive"),
+        )
+        .await;
+        assert_eq!(code, 202);
+        assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+        let rows = offers(&base, &command["id"]).await;
+        assert_eq!(rows.len(), 2);
+        let d = if tv { "tv" } else { "movies" };
+        let mut p = json!({"name":"Admission","enabled":true,"required":["NEVER_MATCH_THIS_TITLE"],"ignored":[],"tag_ids":[],"indexers":[{"kind":"provider","id":indexer["id"]}]});
+        if tv {
+            p["excluded_tag_ids"] = json!([]);
+            p["air_date_restriction"] = json!(false);
+            p["air_date_grace_period_days"] = json!(0);
+            p["allow_season_pack_without_all_episodes_aired"] = json!(false);
+        }
+        let (code, value) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/{d}/release-profiles"),
+            json!({"revision":1,"profile":p}),
+        )
+        .await;
+        assert_eq!(code, 201, "{value}");
+        let (code, error) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                rows[0]["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, 409, "{error}");
+        let (code, automatic) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&indexer, &download, tv, "automatic"),
+        )
+        .await;
+        assert_eq!(code, 202);
+        let done = settled(&base, &automatic["id"]).await;
+        assert_eq!(done["status"], "failed");
+        assert_eq!(done["error_code"], "no_eligible_release");
+        let rejected = offers(&base, &automatic["id"]).await;
+        assert_eq!(rejected.len(), 2);
+        for offer in rejected {
+            assert_eq!(
+                offer["decision"]["reasons"],
+                json!(["release_required_term_missing"])
+            );
+        }
+        assert!(state.adds.lock().unwrap().is_empty());
+        let c = db.connect().await.unwrap();
+        assert_eq!(
+            c.query("SELECT count(*) FROM rss_candidates", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        runtime.shutdown().await;
     }
 }
