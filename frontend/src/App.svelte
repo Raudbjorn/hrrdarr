@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
@@ -27,10 +28,13 @@
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
-  let delayVisited=$state(false), revisionVisited=$state(false), profileSection=$state<'quality'|'delay'>('quality');
+  let delayVisited=$state(false), revisionVisited=$state(false), profileSection=$state<'quality'|'delay'|'release'>('quality');
   let delayWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}),delayUsageVersion=$state({tv:0,movies:0});
   let delayRequest=$state<{domain:MediaDomain;id?:number;nonce:number}|null>(null),delayNonce=0;
   function openDelay(scope:MediaDomain,id?:number){delayVisited=true;profilesVisited=true;profileSection='delay';view='profiles';delayRequest={domain:scope,id,nonce:++delayNonce};}
+  let releaseVisited=$state(false),releaseWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}),releaseUsageVersion=$state({tv:0,movies:0});
+  let releaseRequest=$state<{domain:MediaDomain;id?:number;nonce:number}|null>(null),releaseNonce=0;
+  function openRelease(scope:MediaDomain,id?:number){releaseVisited=true;profilesVisited=true;profileSection='release';view='profiles';releaseRequest={domain:scope,id,nonce:++releaseNonce};}
   let tagsVisited=$state(false), tagVersions=$state({tv:0,movies:0});
   let tagWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), assignmentWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let creationIds=$state<number[]>([]), creationReady=$state(true), creationUncertain=$state(false);
@@ -44,6 +48,8 @@
   const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle');
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
   const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
+  const tagRelatedWithProfiles=$derived<Record<MediaDomain,SettingsWriteState>>({tv:releaseWrites.tv!=='idle'?releaseWrites.tv:tagRelatedWithDelay.tv,movies:releaseWrites.movies!=='idle'?releaseWrites.movies:tagRelatedWithDelay.movies});
+  const profileUsageVersion=$derived({tv:delayUsageVersion.tv+releaseUsageVersion.tv,movies:delayUsageVersion.movies+releaseUsageVersion.movies});
   let adding = $state(false), term = $state(''), results: LookupResult[] = $state([]), choice: LookupResult | null = $state(null), path = $state(''), searching = $state(false), searched = $state(false);
   let seriesType = $state(''), seasonFolder = $state(''), sceneNumbering = $state(''), newItems = $state(''), availability = $state('');
   let profiles: QualityProfilePage | null = $state(null), profileId: number | null = $state(null), profilesLoading = $state(false), profilesError = $state('');
@@ -130,11 +136,11 @@
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
   {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
   {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
-  {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
+  {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button><button aria-pressed={profileSection==='release'} onclick={()=>{releaseVisited=true;profileSection='release';}}>Release profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}{#if releaseVisited}<div hidden={profileSection!=='release'}><ReleaseProfilesPanel request={releaseRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>releaseWrites={...releaseWrites,[scope]:state}} onchange={scope=>releaseUsageVersion={...releaseUsageVersion,[scope]:releaseUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
   {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
-  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithDelay} usageVersions={delayUsageVersion} ondelay={openDelay} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
+  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProfiles} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
   {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}{#if saving}<p role="status">Saving library changes…</p>{/if}

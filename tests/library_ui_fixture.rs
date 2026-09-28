@@ -537,6 +537,42 @@ async fn blocklist_fixture(
     })
 }
 
+// Genuine source backups seed historical unresolved references through the importer.
+async fn release_profile_fixture(
+    db: Arc<Database>,
+    root: &std::path::Path,
+) -> Arc<BlocklistFixture> {
+    let mut bytes = Vec::new();
+    for tv in [true, false] {
+        let path = root.join(if tv {
+            "release-sonarr.db"
+        } else {
+            "release-radarr.db"
+        });
+        let source = libsql::Builder::new_local(&path).build().await.unwrap();
+        let c = source.connect().unwrap();
+        c.execute_batch(if tv {r#"CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(233);
+CREATE TABLE Series(Id INTEGER,TvdbId INTEGER,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,Seasons TEXT);
+CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);
+CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);
+CREATE TABLE ReleaseProfiles(Id INTEGER,Name TEXT,Enabled INTEGER,Required TEXT,Ignored TEXT,IndexerIds TEXT,Tags TEXT,ExcludedTags TEXT,AirDateRestriction INTEGER,AirDateGracePeriod INTEGER,AllowSeasonPackWithoutAllEpisodesAired INTEGER);
+INSERT INTO ReleaseProfiles VALUES(77,'Historical unresolved',0,'["WEB"]','[]','[77]','[]','[]',0,0,0);"#} else {r#"CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(242);
+CREATE TABLE MovieMetadata(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER);
+CREATE TABLE Movies(Id INTEGER,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);
+CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);
+CREATE TABLE ReleaseProfiles(Id INTEGER,Name TEXT,Enabled INTEGER,Required TEXT,Ignored TEXT,IndexerId INTEGER,Tags TEXT);
+INSERT INTO ReleaseProfiles VALUES(77,'Historical unresolved',0,'["WEB"]','[]',77,'[]');"#}).await.unwrap();
+        drop(c);
+        drop(source);
+        bytes.push(std::fs::read(path).unwrap());
+    }
+    Arc::new(BlocklistFixture {
+        db,
+        tv: bytes.remove(0),
+        movies: bytes.remove(0),
+    })
+}
+
 #[tokio::test]
 #[ignore = "manual browser fixture; owned loopback servers, max 15 minutes"]
 async fn library_ui_fixture() {
@@ -597,6 +633,7 @@ async fn library_ui_fixture() {
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let release_fixture = release_profile_fixture(db.clone(), &scratch.0).await;
     let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0, 901).await;
     let clear_root = scratch.0.join("clear-source");
     std::fs::create_dir(&clear_root).unwrap();
@@ -615,6 +652,15 @@ async fn library_ui_fixture() {
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
+            .merge(hrrdarr::release_profiles::router(db.clone()))
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/fixture/import-release-profiles",
+                        post(import_blocklists),
+                    )
+                    .with_state(release_fixture),
+            )
             .merge(hrrdarr::delay_profiles::router(db.clone()))
             .merge(hrrdarr::revision_policy::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
