@@ -61,6 +61,7 @@ pub(crate) async fn evaluate_fresh_release(
         .map(|parsed| crate::custom_formats::parsed(stem, &parsed, tv, Some(size)));
     evaluate_with_evidence(c, target, filename, size, receipt).await
 }
+#[cfg(test)]
 pub(crate) async fn evaluate_with_evidence(
     c: &Connection,
     target: &MediaTarget,

@@ -1,4 +1,6 @@
 //! Durable RSS decisions and guarded qBittorrent submission receipts.
+#[path = "rss_pending.rs"]
+mod pending;
 use super::*;
 use crate::providers::{RefreshClient, indexer, qbittorrent};
 use crate::search::{Disposition, ReleaseTarget, SearchContext};
@@ -308,10 +310,15 @@ async fn insert_captured(
         title,
         release,
     } = item;
-    let mut decision =
-        crate::search::evaluate(c, t.media_type, &release, SearchContext::Rss, timestamp)
-            .await
-            .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
+    let mut decision = pending::evaluate(
+        c,
+        client,
+        t.media_type,
+        &release,
+        SearchContext::Rss,
+        timestamp,
+    )
+    .await?;
     if !singleton(&decision.target) {
         decision.disposition = Disposition::Reject;
         decision.reasons.push("unsupported_target".into());
@@ -616,6 +623,7 @@ async fn reconcile(db: &Database, client: &RefreshClient, work: CandidateWork) -
 /// Only the writer's fresh decision can discard a payload or park a pending row.
 async fn settle_local(
     c: &Connection,
+    client: &RefreshClient,
     expected: &RssCandidate,
     release: &indexer::Release,
     timestamp: i64,
@@ -633,15 +641,15 @@ async fn settle_local(
         candidate_state(c, expected.id, "rejected", Some("provider_changed"), None).await?;
         return Ok(None);
     }
-    let decision = crate::search::evaluate(
+    let decision = pending::evaluate(
         c,
+        client,
         current.public.source.media_type,
         release,
         super::search::authority(c, expected.id).await?,
         timestamp,
     )
-    .await
-    .map_err(|e| Error(StatusCode::INTERNAL_SERVER_ERROR, e.0))?;
+    .await?;
     if !singleton(&decision.target) || matches!(decision.disposition, Disposition::Reject) {
         let reasons = if singleton(&decision.target) {
             decision.reasons
@@ -674,6 +682,9 @@ async fn process_candidate(
     if work.public.status == "reconciling" {
         return reconcile(db, client, work).await;
     }
+    if !matches!(work.public.status.as_str(), "pending" | "prepared") {
+        return Ok(());
+    }
     let p = work.public;
     let c = connection(db).await?;
     if !valid_target(&c, p.source).await? {
@@ -702,7 +713,7 @@ async fn process_candidate(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome = settle_local(&tx, &p, &release, now()?).await;
+    let outcome = settle_local(&tx, client, &p, &release, now()?).await;
     let Some(decision) = finish(tx, outcome).await? else {
         return Ok(());
     };
@@ -764,7 +775,12 @@ async fn process_candidate(
         if current.public.status!=p.status{return Ok(false)}
         if !valid_target(&tx,p.source).await?{candidate_state(&tx,p.id,"rejected",Some("provider_changed"),None).await?;return Ok(false)}
         // Recheck all current local decision facts after preparation's network reads.
-        let latest=crate::search::evaluate(&tx,p.source.media_type,&release,super::search::authority(&tx,p.id).await?,now()?).await.map_err(|e|Error(StatusCode::INTERNAL_SERVER_ERROR,e.0))?;
+        let timestamp=now()?;
+        let Some(latest)=settle_local(&tx,client,&p,&release,timestamp).await? else {return Ok(false)};
+        if p.status=="pending" && matches!(p.origin,super::search::CandidateOrigin::Rss) {
+            let items=pending::cohort(&tx,client,&target).await?;
+            if pending::best(&tx,&items,timestamp).await?.is_some_and(|winner|winner!=p.id){return Ok(false)}
+        }
         if !matches!(latest.disposition,Disposition::Accept) || latest.target.as_ref()!=Some(&target) {
             candidate_state(&tx,p.id,"rejected",Some("target_changed"),None).await?;return Ok(false)
         }
@@ -1055,7 +1071,14 @@ pub(super) async fn run(db: &Database, client: &RefreshClient, command: RssComma
     let id=c.query("SELECT id FROM rss_candidates WHERE command_id=? AND (status='prepared' OR (status='pending' AND (not_before IS NULL OR not_before<=?))) ORDER BY created_at,id LIMIT 1",params![command.id.to_string(),now()?]).await?.next().await?.map(|r|r.get::<String>(0)).transpose()?;
     if let Some(id) = id {
         let id = Uuid::parse_str(&id).map_err(|_| bad())?;
-        if let Err(error) = process_candidate(db, client, candidate(&c, id).await?).await {
+        let work = match pending::select_work(db, client, candidate(&c, id).await?).await {
+            Ok(work) => work,
+            Err(error) => return settle_error(db, &command, error.1).await,
+        };
+        // A cohort winner may belong to another RSS command. Ownership/error reads
+        // use the selected candidate; this command retries the attempted cohort work.
+        let id = work.public.id;
+        if let Err(error) = process_candidate(db, client, work).await {
             let status: String = c
                 .query(
                     "SELECT status FROM rss_candidates WHERE id=?",
@@ -1087,17 +1110,24 @@ pub(super) async fn run(db: &Database, client: &RefreshClient, command: RssComma
     }.await;
     finish(tx, outcome).await
 }
-async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> {
-    // Exact transient classes only. Malformed durable facts/configuration retain
-    // permanent rejection. For standalone run_due work the one-second worker tick
-    // retries these. Parent-command/capture paths instead use settle_error retry_wait.
-    if matches!(
-        error.1,
+fn transient_local_error(code: &str) -> bool {
+    matches!(
+        code,
         "custom_format_state_changed"
             | "custom_format_busy"
             | "custom_format_timeout"
             | "custom_format_worker_failed"
-    ) {
+            | "delay_profile_storage_error"
+            | "revision_policy_storage_error"
+            | "release_storage_error"
+            | "command_storage_error"
+    )
+}
+async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> {
+    // Exact transient classes only. Malformed durable facts/configuration retain
+    // permanent rejection. For standalone run_due work the one-second worker tick
+    // retries these. Parent-command/capture paths instead use settle_error retry_wait.
+    if transient_local_error(error.1) {
         return Err(error);
     }
     let code = match error.1 {
@@ -1129,7 +1159,12 @@ async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> 
 }
 pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> Result<()> {
     let c = connection(db).await?;
-    if let Err(error) = process_candidate(db, client, candidate(&c, id).await?).await {
+    let work = match pending::select_work(db, client, candidate(&c, id).await?).await {
+        Ok(work) => work,
+        Err(error) => return settle_due_error(&c, id, error).await,
+    };
+    let id = work.public.id;
+    if let Err(error) = process_candidate(db, client, work).await {
         settle_due_error(&c, id, error).await?;
     }
     Ok(())

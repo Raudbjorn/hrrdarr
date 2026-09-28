@@ -20,7 +20,7 @@ Activation requires an unconfigured, untouched destination. Exact complete graph
 
 ## Not claimed
 
-This dependency exposes and preserves settings. It does not implement protocol rejection, preferred-protocol ranking, revision/highest-quality/custom-format bypass evaluation, or oldest-pending overlap behavior. The browser editor below covers settings only. Existing consumer guards remain until the separate pipeline integration is verified. It does not establish complete api046 or the full slice acceptance gate. Bounds are native operational limits; oversized catalogs are rejected and other unrepresentable settings remain explicitly unsupported. Runtime tests are recorded separately from source review.
+The settings dependency and native revision/delay consumers do not establish complete api046 or the full slice acceptance gate. Consumer behavior and focused evidence are documented in [release decisions](release-search.md) and [RSS](rss.md). Preferred-protocol ordering is tested, but end-to-end Usenet client submission is not proven. Prepared receipts newly delayed by current policy are rejected; only pending receipts retain payloads for later delay retry. Bounds are native operational limits; oversized catalogs are rejected and other unrepresentable settings remain explicitly unsupported. Runtime tests are recorded separately from source review.
 
 ## Native browser editor
 

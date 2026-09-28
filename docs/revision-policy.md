@@ -2,7 +2,7 @@
 
 `GET /api/v1/{tv|movies}/revision-policy` returns `{media_type, mode, revision}`. `PUT` accepts `{mode, revision}` with the current revision. Modes are `prefer_and_upgrade`, `do_not_upgrade`, and `do_not_prefer`; each domain initially uses `prefer_and_upgrade`. Unknown fields, null modes and unknown queries are rejected. Requests are bounded to4KiB and5seconds; revisions are positive JavaScript-safe integers. Stale or exhausted revisions return409. Storage failures return503 with static errors.
 
-A successful save records local intent even if the mode is unchanged. Changing mode atomically wakes same-domain pending candidates that retain their private payload and active parent RSS commands. Other domains and prepared/submitting/reconciling ownership stay unchanged. Waking is not submission authorization. The revision pipeline must integrate this policy reader into its pre-submission and precommit reevaluations before revision support is enabled; that consumer integration is not delivered here. Existing unsupported guards remain. Settings writers share an immediate transaction; future consumers must read current policy inside their committing transaction rather than trust a prewarm-time setting.
+A successful save records local intent even if the mode is unchanged. Changing mode atomically wakes same-domain pending candidates that retain their private payload and active parent RSS commands. Other domains and prepared/submitting/reconciling ownership stay unchanged. Waking is not submission authorization. The native revision pipeline reads current policy before submission and import commit. Settings and decision writers share immediate transactions; a prewarm-time setting is not admission authority. Structured parser observations, unknown legacy provenance and the shared comparison boundary are documented in [release decisions](release-search.md) and [download processing](download-processing.md).
 
 Migration38 adds only policy configuration and a snapshot activation marker. Existing file metadata and immutable import receipt revisions are untouched. Its RSS transition adjustment permits a queued/retry-wait parent deadline to decrease to0 with every other column unchanged; existing claim, attempts and ownership guards remain.
 
@@ -14,7 +14,7 @@ Focused evidence lives in `tests/revision_policy.rs` and `src/db/revision_policy
 
 ## Not claimed
 
-This unit supplies settings and snapshot preservation. Existing unsupported proper/repack guards remain until the complete parser/comparison/import pipeline is integrated. The browser control below covers this singleton only. There is no new dependency, no V3 wire-compatibility claim and no full delay-profile or parity-gate completion claim. Tests use isolated scratch databases and synthetic endpoints; they do not contact providers or access real media.
+Settings, snapshot preservation and native revision consumers do not establish complete parser equivalence or parity-gate completion. Unknown legacy evidence remains unknown and requires independently observed facts before automatic import retry. No V3 wire compatibility is claimed. Tests use isolated scratch databases and synthetic endpoints; they do not contact providers or access real media.
 
 ## Native browser control
 

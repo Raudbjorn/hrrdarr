@@ -330,7 +330,7 @@ export type Operation = { id: string, target: MediaTarget, status: string, messa
 
 export type ParseQuery = { title: string, };
 
-export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: number, technical_start: number | null, };
+export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: FileRevision | null, revision_marker: boolean, technical_start: number | null, };
 
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
 

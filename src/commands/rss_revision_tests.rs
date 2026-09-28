@@ -91,6 +91,7 @@ async fn put_capture(
 }
 async fn settle(
     c: &Connection,
+    client: &RefreshClient,
     expected: &RssCandidate,
     timestamp: i64,
 ) -> Result<Option<crate::search::ReleaseDecision>> {
@@ -99,6 +100,7 @@ async fn settle(
         .await?;
     let outcome = settle_local(
         &tx,
+        client,
         expected,
         &release(expected.source.media_type, timestamp),
         timestamp,
@@ -164,7 +166,12 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         // PUT commits first; old Delay must not overwrite wake or fresh rejection.
         mode(&base, media, Mode::PreferAndUpgrade).await;
         assert_eq!(candidate(&c, id).await.unwrap().public.not_before, Some(0));
-        assert!(settle(&c, &expected, timestamp).await.unwrap().is_none());
+        assert!(
+            settle(&c, &client, &expected, timestamp)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let fresh = candidate(&c, id).await.unwrap().public;
         assert_eq!(fresh.status, "rejected");
         assert!(fresh.not_before.is_none());
@@ -195,13 +202,23 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         assert_eq!(expected.status, "pending");
         assert_eq!(expected.not_before, Some(timestamp + 3600));
         // Consumer commits first; later PUT must win the serialized ordering.
-        assert!(settle(&c, &expected, timestamp).await.unwrap().is_none());
+        assert!(
+            settle(&c, &client, &expected, timestamp)
+                .await
+                .unwrap()
+                .is_none()
+        );
         mode(&base, media, Mode::PreferAndUpgrade).await;
         assert_eq!(
             candidate(&c, captured_id).await.unwrap().public.not_before,
             Some(0)
         );
-        assert!(settle(&c, &expected, timestamp).await.unwrap().is_none());
+        assert!(
+            settle(&c, &client, &expected, timestamp)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             candidate(&c, captured_id).await.unwrap().public.status,
             "rejected"
@@ -230,7 +247,12 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
                 }
             }
             let before = bytes(&c, id).await;
-            assert!(settle(&c, &expected, timestamp).await.unwrap().is_none());
+            assert!(
+                settle(&c, &client, &expected, timestamp)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(bytes(&c, id).await, before, "{status}");
             if status == "submitting" {
                 // Reuse the same owner for reconciliation: a second prepared row
@@ -242,7 +264,12 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
                 .await
                 .unwrap();
                 let before = bytes(&c, id).await;
-                assert!(settle(&c, &expected, timestamp).await.unwrap().is_none());
+                assert!(
+                    settle(&c, &client, &expected, timestamp)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(bytes(&c, id).await, before);
             }
 
@@ -250,7 +277,12 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
                 // Already-prepared expected work retains the previous rule: a newly
                 // delayed decision invalidates preparation, unlike a policy wake.
                 let prepared = candidate(&c, id).await.unwrap().public;
-                assert!(settle(&c, &prepared, timestamp).await.unwrap().is_none());
+                assert!(
+                    settle(&c, &client, &prepared, timestamp)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(
                     candidate(&c, id)
                         .await
@@ -266,7 +298,7 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         let expected = candidate(&c, id).await.unwrap().public;
         let before = bytes(&c, id).await;
         c.execute_batch("CREATE TRIGGER reject_revision_deadline BEFORE UPDATE OF not_before ON rss_candidates BEGIN SELECT RAISE(ABORT,'fixture deadline rollback'); END").await.unwrap();
-        assert!(settle(&c, &expected, timestamp).await.is_err());
+        assert!(settle(&c, &client, &expected, timestamp).await.is_err());
         assert_eq!(bytes(&c, id).await, before);
         c.execute_batch("DROP TRIGGER reject_revision_deadline; CREATE TRIGGER reject_revision_capture BEFORE INSERT ON rss_candidate_episodes BEGIN SELECT RAISE(ABORT,'fixture capture rollback'); END").await.unwrap();
         if matches!(media, MediaDomain::Tv) {
@@ -332,6 +364,294 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         .unwrap();
         assert_eq!(candidate(&c, id).await.unwrap().public.status, "rejected");
         assert!(candidate(&c, id).await.unwrap().payload.is_none());
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+async fn cohort_command(c: &Connection, media: MediaDomain, endpoint: &str) -> RssCommand {
+    let indexer = Uuid::new_v4();
+    let downloader = Uuid::new_v4();
+    for (id, implementation) in [(indexer, "torznab"), (downloader, "qbittorrent")] {
+        c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,?,?,1,1,1,1,?)",params![id.to_string(),implementation,implementation,endpoint]).await.unwrap();
+    }
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year)VALUES(?,'torznab',?,'[5000]','[]',?,?)",params![indexer.to_string(),domain(media),matches!(media,MediaDomain::Tv).then_some(0),matches!(media,MediaDomain::Movies).then_some(0)]).await.unwrap();
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES(?,'qbittorrent',?,?,0,0,'started','default',0,0,0)",params![downloader.to_string(),domain(media),domain(media)]).await.unwrap();
+    let id = Uuid::new_v4();
+    c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at)VALUES(?,'rss_sync',?,?,1,?,1,100,100)",params![id.to_string(),domain(media),indexer.to_string(),downloader.to_string()]).await.unwrap();
+    read(c, id).await.unwrap()
+}
+async fn full_delay(base: &str, media: MediaDomain, minutes: u32) {
+    full_delay_preferred(base, media, minutes, "torrent").await;
+}
+async fn full_delay_preferred(base: &str, media: MediaDomain, minutes: u32, preferred: &str) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("{base}/api/v1/{}/delay-profiles", domain(media));
+    let old: serde_json::Value = serde_json::from_slice(
+        &client
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let global = old["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["is_global"] == true)
+        .unwrap();
+    let response = client.put(format!("{url}/{}",global["id"]))
+        .header("content-type", "application/json").body(json!({"revision":old["revision"],"profile":{"tag_ids":[],"settings":{"torrent_delay_minutes":minutes,"usenet_delay_minutes":minutes,"enable_torrent":true,"enable_usenet":true,"preferred_protocol":preferred,"bypass_if_highest_quality":false,"bypass_if_above_custom_format_score":false,"minimum_custom_format_score":0}}}).to_string())
+        .send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+}
+async fn replace_scratch_payload(c: &Connection, id: Uuid, payload: Vec<u8>) {
+    // Simulate corrupt historical evidence only in this isolated DB. Restore the
+    // exact installed transition guard in the same transaction before exercising readers.
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let sql: String = tx.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='rss_candidate_transition'",()).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+    tx.execute_batch("DROP TRIGGER rss_candidate_transition")
+        .await
+        .unwrap();
+    tx.execute(
+        "UPDATE rss_candidates SET private_payload=? WHERE id=?",
+        params![payload, id.to_string()],
+    )
+    .await
+    .unwrap();
+    tx.execute_batch(&sql).await.unwrap();
+    tx.commit().await.unwrap();
+}
+#[tokio::test]
+async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("hrrdarr-delay-cohort-{}", Uuid::new_v4())));
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00'); INSERT INTO movie_metadata(id,title,year,runtime,digital_release)VALUES(1,'Harbor',2020,100,'2020-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional-movie'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',60,60,0),('movies',60,60,0); UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=3;").await.unwrap();
+    let key = Arc::new(crate::providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (_, client) = crate::providers::router_with_refresh(db.clone(), Some(key));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::delay_profiles::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for media in [MediaDomain::Tv, MediaDomain::Movies] {
+        let timestamp = now().unwrap();
+        let old_command = cohort_command(&c, media, &base).await;
+        let new_command = cohort_command(&c, media, &base).await;
+        let cancelled = put_capture(&c, &client, &old_command, timestamp - 9999).await;
+        candidate_state(&c, cancelled, "cancelled", None, None)
+            .await
+            .unwrap();
+        let cancelled_before = bytes(&c, cancelled).await;
+        if media == MediaDomain::Tv {
+            c.execute("INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(2,1,1,2,'Second',45,'2020-01-01 00:00:00')",()).await.unwrap();
+            let mut other = captured(media, timestamp - 9999);
+            other.title = "Harbor.S01E02.1080p.WEB-DL.BONUS".into();
+            other.release.metadata.title = Some(other.title.clone());
+            crate::search::evaluate(&c, media, &other.release, SearchContext::Rss, timestamp)
+                .await
+                .unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .unwrap();
+            insert_captured(&tx, &client, &old_command, other, timestamp)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let old = put_capture(&c, &client, &old_command, timestamp - 601).await;
+        let young = put_capture(&c, &client, &new_command, timestamp).await;
+        assert_ne!(old_command.id, new_command.id);
+        c.execute(
+            "UPDATE providers SET enabled=0,revision=revision+1 WHERE id=?",
+            [old_command.target.indexer_id.to_string()],
+        )
+        .await
+        .unwrap();
+        full_delay(&base, media, 10).await;
+        let target = candidate(&c, young).await.unwrap().public.target.unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        let items = pending::cohort(&tx, &client, &target).await.unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "Cancelled, other-media and disjoint-TV-episode rows are outside this cohort"
+        );
+        assert_eq!(pending::oldest(&items), Some(timestamp - 601));
+        // Oldest publication is independent of the old candidate's disabled provider.
+        // Its age==delay does not bypass; age>delay does, even across command IDs.
+        assert_eq!(
+            pending::best(&tx, &items, timestamp - 1).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            pending::best(&tx, &items, timestamp).await.unwrap(),
+            Some(young)
+        );
+        tx.commit().await.unwrap();
+        let before = bytes(&c, young).await;
+        let selected = pending::select_work(&db, &client, candidate(&c, old).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(selected.public.id, young);
+        assert_eq!(bytes(&c, young).await, before);
+        assert_eq!(bytes(&c, cancelled).await, cancelled_before);
+        assert_eq!(candidate(&c, old).await.unwrap().public.status, "pending");
+        for decoded_but_invalid in [false, true] {
+            let broken_command = cohort_command(&c, media, &base).await;
+            let broken = put_capture(&c, &client, &broken_command, timestamp).await;
+            let payload = if decoded_but_invalid {
+                let work = candidate(&c, broken).await.unwrap();
+                let mut release = pending::decode(&client, &work).unwrap();
+                release.metadata.languages = vec!["English".into(); 65];
+                let mut encoded = indexer::encode_private(release).unwrap();
+                let payload = client
+                    .seal_release(&payload_context(broken, work.public.source), &encoded)
+                    .unwrap();
+                encoded.fill(0);
+                payload
+            } else {
+                vec![0; 29]
+            };
+            replace_scratch_payload(&c, broken, payload).await;
+            // Exercise the actual selector with the corrupt sibling as original trigger.
+            // A permanent sibling failure must never reject the healthy winner.
+            let selected = pending::select_work(&db, &client, candidate(&c, broken).await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(selected.public.id, young);
+            let rejected = candidate(&c, broken).await.unwrap();
+            assert_eq!(rejected.public.status, "rejected");
+            assert!(rejected.payload.is_none());
+            assert_eq!(bytes(&c, young).await, before);
+        }
+        for (table, code) in [
+            ("delay_profile_domains", "delay_profile_storage_error"),
+            ("revision_policies", "revision_policy_storage_error"),
+            ("episodes", "release_storage_error"),
+            ("quality_profile_items", "release_storage_error"),
+            ("custom_formats", "release_storage_error"),
+            ("series_tags", "delay_profile_storage_error"),
+            ("movie_tags", "delay_profile_storage_error"),
+        ] {
+            if ((table == "episodes" || table == "series_tags") && media == MediaDomain::Movies)
+                || (table == "movie_tags" && media == MediaDomain::Tv)
+            {
+                continue;
+            }
+            let before_old = bytes(&c, old).await;
+            // Actual readers, not injected Error values: temporarily unavailable
+            // tables abort run_due and leave the awakened due receipt retryable.
+            c.execute_batch(&format!(
+                "ALTER TABLE {table} RENAME TO scratch_unavailable"
+            ))
+            .await
+            .unwrap();
+            let outcome = run_due(&db, &client, young).await;
+            c.execute_batch(&format!(
+                "ALTER TABLE scratch_unavailable RENAME TO {table}"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(outcome.unwrap_err().1, code);
+            assert_eq!(bytes(&c, young).await, before);
+            assert_eq!(bytes(&c, old).await, before_old);
+            assert_eq!(
+                candidate(&c, young).await.unwrap().public.not_before,
+                Some(0)
+            );
+        }
+        // The shared rank boundary reads the real selected profile. This proves
+        // preference ordering, not an unavailable Usenet submission transport.
+        let torrent = release(media, timestamp);
+        let mut usenet = release(media, timestamp);
+        usenet.facts.torrent = None;
+        let torrent_decision =
+            crate::search::evaluate(&c, media, &torrent, SearchContext::UserSearch, timestamp)
+                .await
+                .unwrap();
+        let usenet_decision =
+            crate::search::evaluate(&c, media, &usenet, SearchContext::UserSearch, timestamp)
+                .await
+                .unwrap();
+        let torrent_rank =
+            crate::search::revision::release_preference(&c, media, &torrent, &torrent_decision)
+                .await
+                .unwrap();
+        let usenet_rank =
+            crate::search::revision::release_preference(&c, media, &usenet, &usenet_decision)
+                .await
+                .unwrap();
+        assert!(torrent_rank > usenet_rank);
+        full_delay_preferred(&base, media, 10, "usenet").await;
+        let torrent_rank =
+            crate::search::revision::release_preference(&c, media, &torrent, &torrent_decision)
+                .await
+                .unwrap();
+        let usenet_rank =
+            crate::search::revision::release_preference(&c, media, &usenet, &usenet_decision)
+                .await
+                .unwrap();
+        assert!(usenet_rank > torrent_rank);
+        // Excess stored assignments are semantic corruption, not temporary SQL
+        // unavailability. They must retain the permanent failure classification.
+        let (table, owner, start) = if media == MediaDomain::Tv {
+            ("series_tags", "series_id", 1000)
+        } else {
+            ("movie_tags", "movie_id", 2000)
+        };
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        for offset in 0..201 {
+            let id = start + offset;
+            tx.execute(
+                "INSERT INTO tags(id,media_type,label)VALUES(?,?,?)",
+                params![id, domain(media), format!("stored-{id}")],
+            )
+            .await
+            .unwrap();
+            tx.execute(
+                &format!("INSERT INTO {table}({owner},tag_id)VALUES(1,?)"),
+                [id],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let invalid = crate::delay_profiles::select(&c, media, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), "delay_profile_invariant");
+        let old_before = bytes(&c, old).await;
+        run_due(&db, &client, young).await.unwrap();
+        let rejected = candidate(&c, young).await.unwrap();
+        assert_eq!(rejected.public.status, "rejected");
+        assert_eq!(rejected.public.error_code.as_deref(), Some("storage_error"));
+        assert!(rejected.payload.is_none());
+        assert_eq!(bytes(&c, old).await, old_before);
     }
     server.abort();
     let _ = server.await;

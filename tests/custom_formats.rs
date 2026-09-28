@@ -65,7 +65,8 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = hrrdarr::custom_formats::router(db.clone())
-        .merge(hrrdarr::quality_profiles::router(db.clone()));
+        .merge(hrrdarr::quality_profiles::router(db.clone()))
+        .merge(hrrdarr::revision_policy::router(db.clone()));
     let _server = Server(tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap()
     }));
@@ -116,6 +117,41 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             MediaDomain::Movies
         };
         let candidate = release(tv, "Preferred");
+        // These historical file rows genuinely lack revision facts. Default
+        // revision preference must not invent baseline facts from their old titles.
+        // Explicit DoNotPrefer then isolates the original CF-only upgrade checks.
+        for context in [SearchContext::UserSearch, SearchContext::Rss] {
+            let decision = search::evaluate(&c, domain, &candidate, context, 1800000000)
+                .await
+                .unwrap();
+            assert_eq!(decision.disposition, Disposition::Reject);
+            assert_eq!(decision.reasons, vec!["revision_unknown"]);
+        }
+        let policy_path = format!("/api/v1/{media}/revision-policy");
+        let (code, policy) = request(&base, "GET", &policy_path, Value::Null).await;
+        assert_eq!(code, 200);
+        let (code, result) = request(
+            &base,
+            "PUT",
+            &policy_path,
+            json!({"mode":"do_not_prefer","revision":policy["revision"]}),
+        )
+        .await;
+        assert_eq!(code, 200, "{result}");
+        let unchanged: i64 = c
+            .query(
+                "SELECT count(*) FROM file_metadata WHERE media_type=? AND revision_json IS NULL",
+                [media],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(unchanged, 1);
         for context in [SearchContext::UserSearch, SearchContext::Rss] {
             let d = search::evaluate(&c, domain, &candidate, context, 1800000000)
                 .await

@@ -5,6 +5,16 @@ use crate::{
 };
 use libsql::{Connection, params};
 
+// Settings readers distinguish SQL availability from invalid persisted policy.
+// Only the former can retry without permanently discarding a pending receipt.
+fn settings_error(error: crate::qualities::Error, invalid: &'static str) -> SearchError {
+    SearchError(if error.1 == "database_error" {
+        "release_storage_error"
+    } else {
+        invalid
+    })
+}
+
 struct Candidate {
     target: ReleaseTarget,
     profile: Option<i64>,
@@ -30,6 +40,16 @@ pub async fn evaluate(
     release: &Release,
     context: SearchContext,
     now: i64,
+) -> Result<ReleaseDecision> {
+    evaluate_with_pending(c, media, release, context, now, None).await
+}
+pub(crate) async fn evaluate_with_pending(
+    c: &Connection,
+    media: MediaDomain,
+    release: &Release,
+    context: SearchContext,
+    now: i64,
+    oldest_pending_publication: Option<i64>,
 ) -> Result<ReleaseDecision> {
     let tv = matches!(media, MediaDomain::Tv);
     let title = release.metadata.title.as_deref().unwrap_or("");
@@ -304,7 +324,7 @@ pub async fn evaluate(
     let mut evidence = crate::custom_formats::release(release, &parsed, tv);
     crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
         .await?;
-    apply_quality(
+    let quality = apply_quality(
         c,
         media,
         candidate.profile,
@@ -319,31 +339,31 @@ pub async fn evaluate(
         &mut result,
     )
     .await?;
-    let policy=c.query("SELECT torrent_delay_minutes,usenet_delay_minutes,availability_delay_days FROM release_delay_policies WHERE media_type=?",[domain(media)]).await?.next().await?;
-    if context == SearchContext::Rss {
-        if let Some(p) = policy {
-            if !tv && !available(&candidate, now, p.get::<i64>(2)?) {
-                result.deny("movie_unavailable")
+    let delay = super::delay::select(c, media, &candidate.target).await?;
+    if context == SearchContext::Rss && !tv {
+        let availability = c
+            .query(
+                "SELECT availability_delay_days FROM release_delay_policies WHERE media_type=?",
+                [domain(media)],
+            )
+            .await?
+            .next()
+            .await?;
+        if let Some(policy) = availability {
+            if !available(&candidate, now, policy.get(0)?) {
+                result.deny("movie_unavailable");
             }
-            let delay = p.get::<i64>(if release.facts.torrent.is_some() {
-                0
-            } else {
-                1
-            })? * 60;
-            if let Some(published) = timestamp(&release.metadata.published_at) {
-                let until = published.saturating_add(delay);
-                if until > now && result.disposition == Disposition::Accept {
-                    result.disposition = Disposition::Delay;
-                    result.not_before = Some(until);
-                    result.reasons.push("configured_delay".into());
-                }
-            } else {
-                result.deny("release_date_unknown")
-            }
-        } else {
-            result.deny("release_policy_unconfigured")
         }
     }
+    super::delay::apply(
+        &delay,
+        release,
+        context,
+        now,
+        oldest_pending_publication,
+        quality,
+        &mut result,
+    );
     let (column, id) = match &candidate.target {
         ReleaseTarget::Tv { series_id, .. } => ("series_id", *series_id),
         ReleaseTarget::Movies { movie_id } => ("movie_id", *movie_id),
@@ -394,6 +414,11 @@ fn available(c: &Candidate, now: i64, delay_days: i64) -> bool {
 }
 
 /// Shared profile/rank/size/cutoff checks for releases and already downloaded files.
+#[derive(Default, Clone, Copy)]
+pub(super) struct QualityAssessment {
+    pub highest_allowed: bool,
+    pub revision_bypass: bool,
+}
 pub(super) async fn apply_quality(
     c: &Connection,
     media: MediaDomain,
@@ -407,7 +432,8 @@ pub(super) async fn apply_quality(
     search_context: SearchContext,
     now: i64,
     result: &mut ReleaseDecision,
-) -> Result<()> {
+) -> Result<QualityAssessment> {
+    let mut assessment = QualityAssessment::default();
     let tv = matches!(media, MediaDomain::Tv);
     let quality = if let Some(name) = &parsed.quality_name {
         c.query("SELECT quality_id,min_size,max_size FROM quality_definitions WHERE media_type=? AND name=?",params![domain(media),name.as_str()]).await?.next().await?
@@ -420,11 +446,18 @@ pub(super) async fn apply_quality(
         if let Some(profile_id) = profile_id {
             let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
                 .await
-                .map_err(|_| SearchError("release_profile_error"))?;
+                .map_err(|error| settings_error(error, "release_profile_error"))?;
             let ranked = profile_ranks(&profile.items);
             if let Some((_, rank, allowed, min, max)) =
                 ranked.iter().find(|(id, ..)| *id == quality_id)
             {
+                assessment.highest_allowed = *allowed
+                    && ranked
+                        .iter()
+                        .filter(|(_, _, allowed, _, _)| *allowed)
+                        .map(|(_, rank, ..)| *rank)
+                        .max()
+                        == Some(*rank);
                 if !allowed {
                     result.deny("quality_not_allowed")
                 }
@@ -445,7 +478,7 @@ pub(super) async fn apply_quality(
                 if let Some(policy) = profile.policy {
                     let formats = crate::custom_formats::catalog(c, media)
                         .await
-                        .map_err(|_| SearchError("custom_format_catalog_invalid"))?;
+                        .map_err(|error| settings_error(error, "custom_format_catalog_invalid"))?;
                     let score = crate::custom_formats::score(
                         &formats,
                         media,
@@ -485,7 +518,7 @@ pub(super) async fn apply_quality(
                     };
                     let mode = crate::revision_policy::read(c, media)
                         .await
-                        .map_err(|_| SearchError("revision_policy_unavailable"))?
+                        .map_err(|error| SearchError(error.code()))?
                         .mode;
                     let anime = if let Some(ReleaseTarget::Tv { series_id, .. }) = &result.target {
                         c.query(
@@ -578,6 +611,7 @@ pub(super) async fn apply_quality(
                         };
                         let comparison =
                             revision::compare(&incoming, &current, &comparison_policy, &context);
+                        assessment.revision_bypass |= comparison.delay_bypass(tv, true, mode);
                         for reason in comparison.reasons {
                             result.deny(reason);
                         }
@@ -594,7 +628,7 @@ pub(super) async fn apply_quality(
     } else {
         result.deny("quality_unknown")
     }
-    Ok(())
+    Ok(assessment)
 }
 
 fn profile_ranks(items: &[ProfileItem]) -> Vec<(i64, usize, bool, Option<f64>, Option<f64>)> {
@@ -649,7 +683,7 @@ pub(crate) async fn target_ranks(
         .ok_or(SearchError("release_profile_error"))?;
     let profile = crate::quality_profiles::fetch(c, domain(media), profile)
         .await
-        .map_err(|_| SearchError("release_profile_error"))?;
+        .map_err(|error| settings_error(error, "release_profile_error"))?;
     Ok(profile_ranks(&profile.items)
         .into_iter()
         .filter(|(_, _, allowed, ..)| *allowed)

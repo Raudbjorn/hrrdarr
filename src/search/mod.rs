@@ -1,5 +1,6 @@
 //! Native release evaluation shared by interactive search and durable RSS.
 mod decision;
+pub(crate) mod delay;
 pub(crate) mod downloaded;
 pub mod parser;
 pub(crate) mod revision;
@@ -19,6 +20,7 @@ use axum::{
     routing::{get, post},
 };
 pub use decision::evaluate;
+pub(crate) use decision::evaluate_with_pending;
 pub(crate) use decision::target_ranks;
 use libsql::Connection;
 use serde::{Deserialize, Serialize};
@@ -82,9 +84,14 @@ impl IntoResponse for SearchError {
         eprintln!("event=release_request_error code={}", self.0);
         (
             match self.0 {
-                "release_storage_error" | "release_profile_error" => {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                "delay_profile_storage_error" | "revision_policy_storage_error" => {
+                    StatusCode::SERVICE_UNAVAILABLE
                 }
+                "release_storage_error"
+                | "release_profile_error"
+                | "delay_profile_invariant"
+                | "revision_policy_missing"
+                | "revision_policy_invalid" => StatusCode::INTERNAL_SERVER_ERROR,
                 "release_search_timeout" | "release_policy_timeout" => StatusCode::GATEWAY_TIMEOUT,
                 "release_target_missing" => StatusCode::NOT_FOUND,
                 code if code.starts_with("provider_") || code.starts_with("refresh_") => {

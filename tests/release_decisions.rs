@@ -873,3 +873,193 @@ async fn factual_revisions_apply_domain_policy_to_every_current_file() {
         })
     );
 }
+
+async fn selected_delay(base: &str, domain: &str, settings: serde_json::Value) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("{base}/api/v1/{domain}/delay-profiles");
+    let old: serde_json::Value = serde_json::from_slice(
+        &client
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let global = old["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["is_global"] == true)
+        .unwrap();
+    let response = client.put(format!("{url}/{}",global["id"]))
+        .header("content-type","application/json")
+        .body(serde_json::json!({"revision":old["revision"],"profile":{"settings":settings,"tag_ids":[]}}).to_string())
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+}
+#[tokio::test]
+async fn selected_full_delay_uses_domain_revision_and_highest_allowed_quality() {
+    use serde_json::json;
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "hrrdarr-full-delay-decisions-{}",
+        uuid::Uuid::new_v4()
+    )));
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/fictional-tv/old.mkv'); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc,episode_file_id)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00',1); INSERT INTO movie_metadata(id,title,year,runtime,digital_release)VALUES(1,'Harbor',2020,100,'2020-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional-movie'); INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,'/fictional-movie/old.mkv'); INSERT INTO file_metadata(media_type,episode_file_id,quality_id,revision_json,release_group,date_added)VALUES('tv',1,3,'{\"version\":1,\"real\":0,\"is_repack\":false}','TEAM','2026-09-24T00:00:00Z'); INSERT INTO file_metadata(media_type,movie_file_id,quality_id,revision_json,release_group,date_added)VALUES('movies',1,3,'{\"version\":1,\"real\":0,\"is_repack\":false}','TEAM','2026-09-24T00:00:00Z'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,100,1,NULL),(2,'movies',1,3,0,100,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0); UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=3;").await.unwrap();
+    for (id, domain) in [(1, "tv"), (2, "movies")] {
+        let specs = json!([{"name":"Bonus","required":false,"negate":false,"condition":{"kind":"release_title","pattern":"BONUS"}}]);
+        c.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specifications_json)VALUES(?,?,'Bonus',0,?)",libsql::params![id,domain,specs.to_string()]).await.unwrap();
+        c.execute(
+            "INSERT INTO quality_profile_format_scores VALUES(?,?,?,10)",
+            libsql::params![id, id, domain],
+        )
+        .await
+        .unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = hrrdarr::delay_profiles::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+        .unwrap()
+        .timestamp();
+    let settings = json!({"torrent_delay_minutes":60,"usenet_delay_minutes":60,"enable_torrent":true,"enable_usenet":true,"preferred_protocol":"torrent","bypass_if_highest_quality":false,"bypass_if_above_custom_format_score":false,"minimum_custom_format_score":10});
+    for (media, tv, domain) in [
+        (MediaDomain::Tv, true, "tv"),
+        (MediaDomain::Movies, false, "movies"),
+    ] {
+        let stem = if tv { "Harbor.S01E01" } else { "Harbor.2020" };
+        let proper = release(&format!("{stem}.1080p.WEB-DL.PROPER.BONUS-team"), tv);
+        selected_delay(&base, domain, settings.clone()).await;
+        let result = search::evaluate(&c, media, &proper, SearchContext::Rss, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.disposition,
+            Disposition::Accept,
+            "{domain}: {:?}",
+            result.reasons
+        );
+        let mut nonpreferred = settings.clone();
+        nonpreferred["preferred_protocol"] = json!("usenet");
+        selected_delay(&base, domain, nonpreferred).await;
+        assert_eq!(
+            search::evaluate(&c, media, &proper, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Delay
+        );
+        selected_delay(&base, domain, settings.clone()).await;
+        c.execute("UPDATE revision_policies SET mode='do_not_prefer',revision=revision+1,locally_edited=1 WHERE media_type=?",[domain]).await.unwrap();
+        // Both offers are legitimate CF upgrades. Only movie delay bypass lacks
+        // TV's PreferAndUpgrade mode condition on the exact revision predicate.
+        let result = search::evaluate(&c, media, &proper, SearchContext::Rss, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.disposition,
+            if tv {
+                Disposition::Delay
+            } else {
+                Disposition::Accept
+            },
+            "{domain}: {:?}",
+            result.reasons
+        );
+        let mut disabled = settings.clone();
+        disabled["enable_torrent"] = json!(false);
+        disabled["preferred_protocol"] = json!("usenet");
+        selected_delay(&base, domain, disabled).await;
+        for context in [SearchContext::Rss, SearchContext::UserSearch] {
+            let result = search::evaluate(&c, media, &proper, context, now)
+                .await
+                .unwrap();
+            assert_eq!(result.disposition, Disposition::Reject);
+            assert!(
+                result
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "protocol_disabled")
+            );
+        }
+    }
+    // File metadata deliberately restricts file deletion; remove its scratch facts
+    // before resetting the fixture to missing files for highest-quality admission.
+    c.execute_batch("UPDATE episodes SET episode_file_id=NULL;DELETE FROM file_metadata;DELETE FROM episode_files;DELETE FROM movie_files;UPDATE quality_profile_items SET position=1;INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',5,0,1),(2,'movies',5,0,1);UPDATE quality_profile_policies SET cutoff_quality_id=5;UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=5;").await.unwrap();
+    for (media, tv, domain) in [
+        (MediaDomain::Tv, true, "tv"),
+        (MediaDomain::Movies, false, "movies"),
+    ] {
+        let stem = if tv { "Harbor.S01E01" } else { "Harbor.2020" };
+        let high = release(&format!("{stem}.1080p.WEB-DL"), tv);
+        let low = release(&format!("{stem}.720p.WEB-DL"), tv);
+        let mut highest = settings.clone();
+        highest["bypass_if_highest_quality"] = json!(true);
+        selected_delay(&base, domain, highest).await;
+        assert_eq!(
+            search::evaluate(&c, media, &high, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Accept
+        );
+        assert_eq!(
+            search::evaluate(&c, media, &low, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Delay,
+            "The configured cutoff is not the highest allowed quality"
+        );
+        c.execute(
+            "UPDATE quality_profile_items SET allowed=0 WHERE media_type=? AND quality_id=3",
+            [domain],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            search::evaluate(&c, media, &low, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Accept,
+            "Disabled higher leaves do not prevent highest-allowed bypass"
+        );
+        c.execute(
+            "UPDATE quality_profile_items SET allowed=1 WHERE media_type=? AND quality_id=3",
+            [domain],
+        )
+        .await
+        .unwrap();
+        let mut score = settings.clone();
+        score["bypass_if_above_custom_format_score"] = json!(true);
+        selected_delay(&base, domain, score).await;
+        let bonus = release(&format!("{stem}.1080p.WEB-DL.BONUS"), tv);
+        assert_eq!(
+            search::evaluate(&c, media, &bonus, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Accept,
+            "Exact configured CF threshold bypasses"
+        );
+        assert_eq!(
+            search::evaluate(&c, media, &high, SearchContext::Rss, now)
+                .await
+                .unwrap()
+                .disposition,
+            Disposition::Delay
+        );
+    }
+    server.abort();
+    let _ = server.await;
+}

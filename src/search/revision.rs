@@ -99,7 +99,6 @@ pub(crate) fn order(a: &FileRevision, b: &FileRevision) -> Ordering {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EvaluationClock {
-    pub now_utc: i64,
     pub proper_cutoff_utc: i64,
 }
 fn single_midnight<T: TimeZone>(
@@ -124,7 +123,6 @@ impl EvaluationClock {
             .and_then(|date| date.and_hms_opt(0, 0, 0))
             .ok_or("proper_age_clock_invalid")?;
         Ok(Self {
-            now_utc,
             proper_cutoff_utc: single_midnight(Local.from_local_datetime(&midnight))?,
         })
     }
@@ -278,6 +276,59 @@ pub(crate) fn preference_key(
     Ok((rank, real, version, score))
 }
 
+/// The native preference boundary is shared by retained search and pending RSS.
+/// Protocol preference follows quality/revision/CF; existing deterministic ties remain.
+pub(crate) type ReleasePreference = ((usize, i64, i64, i64), bool, u32, i64);
+pub(crate) async fn release_preference(
+    c: &libsql::Connection,
+    media: crate::api::MediaDomain,
+    release: &crate::providers::indexer::Release,
+    decision: &super::ReleaseDecision,
+) -> super::Result<ReleasePreference> {
+    let target = decision
+        .target
+        .as_ref()
+        .ok_or(super::SearchError("invalid_stored_target"))?;
+    let owned = match target {
+        super::ReleaseTarget::Tv { episode_ids, .. } => crate::db::MediaTarget::Episode(
+            *episode_ids
+                .first()
+                .ok_or(super::SearchError("invalid_stored_target"))?,
+        ),
+        super::ReleaseTarget::Movies { movie_id } => crate::db::MediaTarget::Movie(*movie_id),
+    };
+    let ranks = super::target_ranks(c, &owned).await?;
+    let rank = ranks
+        .iter()
+        .find(|(id, _)| Some(*id) == decision.quality_id)
+        .map(|(_, rank)| *rank)
+        .ok_or(super::SearchError("invalid_stored_quality"))?;
+    let mode = crate::revision_policy::read(c, media)
+        .await
+        .map_err(|error| super::SearchError(error.code()))?
+        .mode;
+    let quality = preference_key(
+        rank,
+        decision
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.revision.as_ref()),
+        decision
+            .custom_formats
+            .as_ref()
+            .map_or(0, |score| score.score),
+        mode,
+    )
+    .map_err(super::SearchError)?;
+    let delay = super::delay::select(c, media, target).await?;
+    Ok((
+        quality,
+        super::delay::preferred(&delay, release),
+        release.metadata.seeders.unwrap_or(0),
+        super::timestamp(&release.metadata.published_at).unwrap_or(0),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +393,6 @@ mod tests {
             anime: false,
             queued: false,
             clock: EvaluationClock {
-                now_utc: 1000,
                 proper_cutoff_utc: 100,
             },
         };
@@ -427,7 +477,6 @@ mod tests {
             anime: false,
             queued: false,
             clock: EvaluationClock {
-                now_utc: 0,
                 proper_cutoff_utc: 0,
             },
         };
@@ -496,7 +545,6 @@ mod tests {
             anime: false,
             queued: false,
             clock: EvaluationClock {
-                now_utc: 0,
                 proper_cutoff_utc: 0,
             },
         };
@@ -519,7 +567,6 @@ mod tests {
         };
         let timestamp = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
         let clock = EvaluationClock::local(timestamp(now)).unwrap();
-        assert_eq!(clock.now_utc, timestamp(now));
         assert_eq!(clock.proper_cutoff_utc, timestamp(cutoff));
     }
     #[test]
