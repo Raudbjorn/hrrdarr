@@ -63,7 +63,22 @@ pub(super) async fn schedule(
     provider: &str,
     media: &str,
 ) -> Result<(), libsql::Error> {
-    conn.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at) VALUES(?,?,1,1,60,100) ON CONFLICT(provider_id,media_type) DO UPDATE SET interval_seconds=120,revision=revision+1",params![provider,media]).await?;
+    // The same fixture exercises historical schemas and latest intent-aware schedules.
+    let latest = conn
+        .query(
+            "SELECT 1 FROM pragma_table_info('download_refresh_schedules') WHERE name='intent'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    let sql = if latest {
+        "INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at,intent,requested_enabled) VALUES(?,?,1,1,60,100,'explicit',1) ON CONFLICT(provider_id,media_type) DO UPDATE SET interval_seconds=120,revision=revision+1"
+    } else {
+        "INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at) VALUES(?,?,1,1,60,100) ON CONFLICT(provider_id,media_type) DO UPDATE SET interval_seconds=120,revision=revision+1"
+    };
+    conn.execute(sql, params![provider, media]).await?;
     Ok(())
 }
 /// Every table in the shared 1024-row command-capacity pool (migration 0033: active rows only).
@@ -181,7 +196,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 40); // Latest open adds release profiles; historical migration starts remain unchanged.
+    assert_eq!(version(&conn).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

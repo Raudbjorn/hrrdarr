@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 40); // Latest open includes release profiles; historical starting schema is unchanged.
+    assert_eq!(version(&c).await?, 41); // Latest open includes release profiles and CDH intent; historical starting schema is unchanged.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 40); // Latest open includes release profiles; historical starting schema is unchanged.
+    assert_eq!(version(&reopened.connect().await?).await?, 41); // Latest open includes release profiles and CDH intent; historical starting schema is unchanged.
     Ok(())
 }

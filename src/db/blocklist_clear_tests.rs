@@ -123,11 +123,11 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 40); // Latest open adds release profiles; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "snapshot_imports" {
-            // Migrations 36 through 40 append inactive CF/tag/revision-policy/delay-profile/release-profile markers; all prior fields stay identical.
+            // Migrations36 through41 append inactive CF/tag/revision-policy/delay-profile/release-profile/CDH markers; all prior fields stay identical.
             for row in &mut expected {
                 row.extend([
                     libsql::Value::Integer(0),
@@ -135,7 +135,15 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
                 ]);
+            }
+        }
+        if *table == "download_refresh_schedules" {
+            //0041 appends explicit intent and preserves the old effective bit as requested intent.
+            for row in &mut expected {
+                let enabled = row[3].clone();
+                row.extend([libsql::Value::Text("explicit".into()), enabled]);
             }
         }
         assert_eq!(rows(&c, table).await?, expected);

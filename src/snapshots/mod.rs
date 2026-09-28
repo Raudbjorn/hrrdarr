@@ -2,6 +2,7 @@
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
 mod blocklist;
+mod completed_download_handling;
 mod custom_formats;
 mod delay_profiles;
 mod history;
@@ -205,6 +206,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let cdh_plan = completed_download_handling::read(&source, &mut plan.unsupported)?;
     let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
     let release_profile_plan = release_profiles::read(&source, app, &mut plan.unsupported).await?;
     let delay_plan = delay_profiles::read(&source, app, &mut plan.unsupported)?;
@@ -229,10 +231,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -249,7 +251,8 @@ async fn import_inner(
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
         providers::write(&tx, &provider_plan, key, &mut report).await?;
-        release_profiles::write(&tx, release_profile_plan.as_ref(), &mut report).await
+        release_profiles::write(&tx, release_profile_plan.as_ref(), &mut report).await?;
+        completed_download_handling::write(&tx, cdh_plan, &mut report).await
     }
     .await;
     match result {

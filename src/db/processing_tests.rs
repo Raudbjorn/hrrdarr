@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 40); // Latest open adds release profiles; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,
@@ -121,7 +121,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     for (domain, id) in [("tv", &tv), ("movies", &movie)] {
         assert!(c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) VALUES(?,1,'queued',100,100,100)",[id.clone()]).await.is_err());
         c.execute(
-            "INSERT INTO download_processing_policies VALUES(?,?,1,1,1,'copy')",
+            "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode) VALUES(?,?,1,1,1,'copy')",
             params![client.clone(), domain],
         )
         .await?;
