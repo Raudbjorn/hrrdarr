@@ -180,6 +180,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "completed_download_handling",
         include_str!("../../migrations/0041_completed_download_handling.sql"),
     ),
+    (
+        "health_checks",
+        include_str!("../../migrations/0042_health_checks.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -724,5 +728,7 @@ mod delay_profile_tests;
 
 #[cfg(test)]
 mod cdh_tests;
+#[cfg(test)]
+mod health_tests;
 #[cfg(test)]
 mod release_profile_tests;

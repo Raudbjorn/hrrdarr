@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version42 remains unknown after migration41 adds CDH intent.
+    // Version43 remains unknown after migration42 adds health storage.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (42,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (43,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(
@@ -2906,6 +2906,14 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
                 1,
             );
         }
+        // Reopening also applies migration42: append only its exact health capacity term;
+        // byte equality still detects changes to every historical admission predicate.
+        assert_eq!(expected.matches(">=1024").count(), 1);
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
 
@@ -3243,7 +3251,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Latest schema adds release profiles and CDH intent; historical migration starts remain unchanged.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -3294,10 +3302,19 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
                 1,
             );
         }
+        // Reopening also applies migration42: append only its exact health capacity term;
+        // byte equality still detects changes to every historical admission predicate.
+        assert_eq!(expected.matches(">=1024").count(), 1);
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
     // The new eighth pool member carries the same full eight-way capacity sum from the start
     // (migration 32), then the same active-only rewrite as every sibling (migration 33).
+    // The current reopen also appends health in migration42, so verify both final terms.
     let rescan_admit_sql: String = c
         .query(
             "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='rescan_admit'",
@@ -3310,7 +3327,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
         .get(0)?;
     assert!(
         rescan_admit_sql.contains(
-            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
+            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
         ),
         "{rescan_admit_sql}"
     );
@@ -3920,9 +3937,9 @@ fn normalize_whitespace(sql: &str) -> String {
 
 // Standing guard: every shared-pool admit trigger must count every pool table. The pool
 // membership is *derived* from the triggers actually found (by their shared
-// 'command capacity reached' abort message), not hardcoded, so a future migration that adds a 9th
+// 'command capacity reached' abort message), not hardcoded, so a future migration that adds another
 // pool table but forgets to update every sibling body fails this test loudly instead of silently
-// under-counting capacity in production. The fixed comparison against today's known eight tables
+// under-counting capacity in production. The fixed comparison against today's known nine tables
 // additionally catches the opposite failure: a table silently and consistently dropped from every
 // trigger body at once (which the cross-reference check alone would not detect, since a shrunken
 // but internally consistent set would still pass it).
@@ -3955,13 +3972,14 @@ async fn pool_admit_triggers_cross_reference_every_capacity_table() -> Result<()
         "manual_import_commands",
         "quality_reset_commands",
         "rescan_commands",
+        "health_commands", // Migration0042 joins the active pool; terminal history remains excluded.
     ]
     .into_iter()
     .map(String::from)
     .collect();
     assert_eq!(
         pool_tables, known_pool_tables,
-        "the shared command-capacity pool must have exactly these eight member tables; update \
+        "the shared command-capacity pool must have exactly these nine member tables; update \
          both this list and every admit trigger body together if that ever changes"
     );
     assert_eq!(
@@ -4237,7 +4255,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        41 // Opening also applies custom formats, durable facts, snapshot activation, tags, revision policy, delay profiles and release profiles and CDH intent after the tested capacity migration.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.
@@ -4279,6 +4297,14 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
                 1,
             );
         }
+        // Reopening also applies migration42: append only its exact health capacity term;
+        // byte equality still detects changes to every historical admission predicate.
+        assert_eq!(expected.matches(">=1024").count(), 1);
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
     }
 
