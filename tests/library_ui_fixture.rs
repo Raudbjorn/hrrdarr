@@ -187,6 +187,51 @@ async fn search_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCo
     state.2.store(2, Ordering::SeqCst);
     StatusCode::NO_CONTENT
 }
+// Only already-submitted owned mock torrents may complete; no application rows are fabricated.
+async fn complete_search(
+    State(state): State<Arc<ProviderObservations>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let Some(hash) = query
+        .get("hash")
+        .filter(|hash| hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut downloads = state.3.lock().unwrap();
+    let Some(download) = downloads
+        .iter_mut()
+        .find(|row| row["hash"] == hash.as_str())
+    else {
+        return StatusCode::NOT_FOUND;
+    };
+    download["state"] = json!("uploading");
+    download["progress"] = json!(1.0);
+    download["amount_left"] = json!(0);
+    StatusCode::NO_CONTENT
+}
+fn search_download_name(hash: &str) -> Option<String> {
+    let digit = hash.as_bytes().first().copied()?;
+    if hash.len() != 40 || !hash.bytes().all(|b| b == digit) {
+        return None;
+    }
+    let (tv, external, quality) = match digit {
+        b'1' => (true, 202, "720p"),
+        b'2' => (true, 202, "1080p"),
+        b'3' => (false, 202, "720p"),
+        b'4' => (false, 202, "1080p"),
+        b'5' => (true, 203, "720p"),
+        b'6' => (true, 203, "1080p"),
+        b'7' => (false, 203, "720p"),
+        b'8' => (false, 203, "1080p"),
+        _ => return None,
+    };
+    Some(if tv {
+        format!("Search.series.{external}.S01E01.{quality}.WEB-DL.mkv")
+    } else {
+        format!("Search.movie.{external}.2030.{quality}.WEB-DL.English.mkv")
+    })
+}
 async fn completed_observations(
     State(state): State<Arc<ProviderObservations>>,
 ) -> Json<Vec<serde_json::Value>> {
@@ -391,7 +436,15 @@ async fn provider_mock(
                 "b".repeat(40)
             };
             let searching = state.2.load(Ordering::SeqCst) == 2;
-            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":name(tv),"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{}",name(tv))}));
+            let download_name = if searching {
+                let Some(name) = search_download_name(&hash) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                name
+            } else {
+                name(tv).to_owned()
+            };
+            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":download_name,"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{download_name}")}));
             return "Ok.".into_response();
         }
         if uri.path() == "/api/v2/torrents/setForceStart" {
@@ -430,11 +483,15 @@ async fn provider_mock(
             return Json(rows).into_response();
         }
         if uri.path() == "/api/v2/torrents/files" {
-            let tv = query.get("hash").is_some_and(|v| v == &"a".repeat(40));
-            return Json(
-                json!([{"index":0,"name":name(tv),"size":1048576,"progress":1.0,"priority":1}]),
-            )
-            .into_response();
+            let downloads = state.3.lock().unwrap();
+            let Some(row) = downloads.iter().find(|row| {
+                query
+                    .get("hash")
+                    .is_some_and(|hash| row["hash"] == hash.as_str())
+            }) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            return Json(json!([{"index":0,"name":row["name"],"size":1048576,"progress":row["progress"],"priority":1}])).into_response();
         }
         if uri.path() == "/api/v2/torrents/properties" {
             return Json(json!({"save_path":"/remote","total_size":1048576,"addition_date":1,"completion_date":2,"seeding_time":0})).into_response();
@@ -596,6 +653,13 @@ async fn library_ui_fixture() {
     ] {
         std::fs::write(incoming.join(name), vec![7u8; 1048576]).unwrap();
     }
+    for digit in ["1", "3", "6", "8"] {
+        std::fs::write(
+            incoming.join(search_download_name(&digit.repeat(40)).unwrap()),
+            vec![7u8; 1048576],
+        )
+        .unwrap();
+    }
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
@@ -627,6 +691,7 @@ async fn library_ui_fixture() {
             .route("/fixture-processing", post(processing_mode))
             .route("/fixture-search", post(search_mode))
             .route("/fixture-completed", get(completed_observations))
+            .route("/fixture-complete-search", post(complete_search))
             .fallback(provider_mock)
             .with_state(Arc::new(ProviderObservations::default())),
     )
@@ -648,6 +713,7 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))

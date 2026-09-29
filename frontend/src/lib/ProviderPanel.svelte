@@ -1,18 +1,25 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { ApiPage, DownloadScope, Provider, ProviderImplementation, ProviderInput, ProviderSettings, ProviderTemplate, ProviderTestResult } from './api.generated';
-  import { listProviders, getProvider, getProviderSchema, createProvider, updateProvider, deleteProvider, testProvider } from './api';
+  import {matchesPendingProvider,type PendingProvider} from './provider-draft';
+  import type {SettingsWriteState} from './api';
+  import {readDownloadHandling, listProviders, getProvider, getProviderSchema, createProvider, updateProvider, deleteProvider, testProvider } from './api';
+  let {relatedWrite='idle',onwrite=()=>{},onchange=()=>{}}:{relatedWrite?:SettingsWriteState;onwrite?:(state:SettingsWriteState)=>void;onchange?:()=>void}=$props();
+  $effect(()=>onwrite(busy?'busy':uncertain?'uncertain':'idle'));
+  function discard(){return !busy&&relatedWrite==='idle'&&(!dirty||window.confirm('Discard unsaved provider changes?'));}
+  let pendingCreation=$state<PendingProvider|null>(null);
   let page: ApiPage<Provider> | null = $state(null), templates: ProviderTemplate[] = $state([]), selected: Provider | null = $state(null);
   let editing = $state(false), implementation: ProviderImplementation = $state('torznab'), name = $state(''), endpoint = $state(''), enabled = $state(true), priority = $state(1);
   let tv = $state(true), movies = $state(false), tvCategories = $state(''), animeCategories = $state(''), movieCategories = $state(''), tvCategory = $state(''), movieCategory = $state('');
   let credentialAction = $state('preserve'), credentialKind = $state<'api_key' | 'username_password'>('api_key'), apiKey = $state(''), username = $state(''), password = $state('');
   let loading = $state(false), busy = $state(false), dirty = $state(false), confirmingDelete = $state(false), conflict = $state(false), uncertain = $state(false);
   let error = $state(''), notice = $state(''), testResult: ProviderTestResult | null = $state(null);
+  const locked=$derived(busy||uncertain||relatedWrite!=='idle');
   let alive = true, selectionVersion = 0, listVersion = 0;
   const template = $derived(templates.find(item => item.implementation === implementation));
   function clearSecrets() { apiKey = ''; username = ''; password = ''; }
   function fill(item: Provider | null) {
-    selected = item; editing = true; confirmingDelete = false; conflict = false; uncertain = false; error = ''; notice = ''; testResult = null; clearSecrets(); credentialAction = 'preserve';
+    pendingCreation=null;selected = item; editing = true; confirmingDelete = false; conflict = false; uncertain = false; error = ''; notice = ''; testResult = null; clearSecrets(); credentialAction = 'preserve';
     if (item) {
       implementation = item.settings.implementation; name = item.name; endpoint = item.settings.endpoint; enabled = item.enabled; priority = item.priority; tv = !!item.settings.tv; movies = !!item.settings.movies;
       if (item.settings.implementation === 'qbittorrent') {tvCategory = item.settings.tv?.category ?? ''; movieCategory = item.settings.movies?.category ?? ''; tvCategories = ''; animeCategories = ''; movieCategories = '';}
@@ -36,11 +43,14 @@
     loading = false; if (result.ok) page = result.data; else error = result.error;
   }
   async function select(id: string) {
-    if (busy) return;
-    const version = ++selectionVersion; busy = true; error = ''; clearSecrets();
-    const result = await getProvider(id);
-    if (!alive || version !== selectionVersion) return;
-    busy = false; if (result.ok) fill(result.data); else error = result.error;
+    if(uncertain&&selected&&id!==selected.id){error='Reload the provider with the unresolved write before selecting another provider.';return;}
+    if (!discard()) return;
+    const version=++selectionVersion;busy=true;error='';
+    const result=await readDownloadHandling(id);
+    if(!alive||version!==selectionVersion)return;
+    busy=false;
+    if(result.ok){if(uncertain&&!selected&&pendingCreation){if(!result.data.provider||!matchesPendingProvider(result.data.provider,pendingCreation)){error='This saved provider does not match the pending creation. Review matching records; another creation will not be sent.';return;}if(!window.confirm(`Adopt saved provider ${id} to resolve the unknown creation? Matching configuration does not prove this request created it. Review any duplicate records separately.`))return;}if(result.data.provider)fill(result.data.provider);else{selected=null;editing=false;dirty=false;uncertain=false;conflict=false;clearSecrets();notice='Provider is no longer present; related settings checked.';}onchange();}
+    else error=result.error;
   }
   function categories(value: string): number[] | null {
     if (!value.trim()) return [];
@@ -75,18 +85,19 @@
     return {name, enabled, priority, settings, ...(credentialAction === 'clear' ? {credentials:null} : credentialAction === 'replace' ? {credentials:implementation === 'qbittorrent' && credentialKind === 'username_password' ? {kind:'username_password' as const,username,password} : {kind:'api_key' as const,api_key:apiKey}} : {})};
   }
   async function save() {
-    if (busy || conflict || uncertain) return;
+    if (locked || conflict) return;
     error = ''; notice = ''; const body = input(); if (!body) return;
     const version = selectionVersion; busy = true;
+    if(!selected){const {credentials:_,...publicConfig}=body;pendingCreation=publicConfig;}
     const result = selected ? await updateProvider(selected.id, {...body, revision:selected.revision}) : await createProvider(body);
     clearSecrets();
     if (!alive || version !== selectionVersion) return;
     busy = false;
-    if (result.ok) {fill(result.data); notice = 'Provider saved. Test it to check the saved connection.'; void load(page?.offset ?? 0);}
-    else {error = result.error; conflict = result.status === 409; uncertain = !result.status; if (uncertain) error += ' The response was lost or unreadable. Refresh the list and reload the saved provider before another save; the change may have committed.';}
+    if (result.ok) {fill(result.data);notice='Provider saved. Test it to check the saved connection.';busy=true;const checked=await readDownloadHandling(result.data.id);busy=false;if(!checked.ok){uncertain=true;error='Provider saved, but related settings readback failed. Reload saved provider.';}onchange();void load(page?.offset??0);}
+    else {error = result.error; conflict = result.status === 409; uncertain = result.status===undefined||result.status>=500; if (uncertain) error += ' The response was lost or unreadable. Refresh the list and reload the saved provider before another save; the change may have committed.';}
   }
   async function test() {
-    if (!selected || busy || dirty || conflict || uncertain) return;
+    if (!selected || locked || dirty || conflict) return;
     const id = selected.id, revision = selected.revision, version = selectionVersion; busy = true; error = ''; notice = ''; testResult = null;
     const result = await testProvider(id);
     if (!alive || version !== selectionVersion) return;
@@ -104,13 +115,13 @@
     void load(page?.offset ?? 0);
   }
   async function remove() {
-    if (!selected || busy || !confirmingDelete || conflict || uncertain) return;
+    if (!selected || locked || !confirmingDelete || conflict) return;
     const id = selected.id, revision = selected.revision, version = selectionVersion; busy = true; error = ''; clearSecrets();
     const result = await deleteProvider(id, revision);
     if (!alive || version !== selectionVersion) return;
     busy = false; confirmingDelete = false;
-    if (result.ok) {selected = null; editing = false; notice = 'Provider configuration deleted. Media and remote downloads were not deleted.'; void load();}
-    else {error = result.error; conflict = result.status === 409; uncertain = !result.status; if (uncertain) error += ' Deletion may have completed. Refresh the list before retrying.';}
+    if(result.ok){busy=true;const checked=await readDownloadHandling(id);busy=false;if(checked.ok){selected=null;editing=false;dirty=false;notice='Provider configuration deleted. Media and remote downloads were not deleted.';}else{uncertain=true;error='Delete accepted; related settings readback failed. Reload saved provider.';}onchange();void load();}
+    else {error = result.error; conflict = result.status === 409; uncertain = result.status===undefined||result.status>=500; if (uncertain) error += ' Deletion may have completed. Refresh the list before retrying.';}
   }
   onMount(() => {
     alive = true; void load();
@@ -122,41 +133,44 @@
     return () => {alive = false; ++selectionVersion; ++listVersion; clearSecrets();};
   });
 </script>
+<svelte:window onbeforeunload={event=>{if(dirty||busy||uncertain){event.preventDefault();event.returnValue='';}}} />
 
 <section aria-labelledby="providers-heading">
-  <div class="heading"><div><h1 id="providers-heading">Providers</h1><p>Configure indexers and download clients for TV, movies or both.</p></div><button class="primary" disabled={busy || !templates.length} onclick={() => {++selectionVersion; implementation = 'torznab'; fill(null);}}>New provider</button></div>
+  {#if uncertain&&pendingCreation}<p role="alert">Creation outcome unknown. Browse saved providers and explicitly adopt a matching configuration. Matching records are shown separately by ID; none is assumed to be this request’s result. A new creation will not be sent while unresolved.</p>{/if}
+  {#if relatedWrite!=='idle'}<p role="alert">Completed-download settings have a pending or unknown write. Resolve it in Activity before changing providers.</p>{/if}
+  <div class="heading"><div><h1 id="providers-heading">Providers</h1><p>Configure indexers and download clients for TV, movies or both.</p></div><button class="primary" disabled={locked || !templates.length} onclick={() => {if(!discard())return;++selectionVersion; implementation = 'torznab'; fill(null);}}>New provider</button></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
   <div class="providers-workspace">
     <aside aria-label="Saved providers"><button disabled={loading} onclick={() => load(page?.offset ?? 0)}>Refresh providers</button>{#if loading}<p role="status">Loading providers…</p>{/if}
-      {#if page}<p>{page.total} configured</p><ul>{#each page.items as provider (provider.id)}<li><button disabled={busy} aria-current={selected?.id === provider.id ? 'true' : undefined} onclick={() => select(provider.id)}><strong>{provider.name}</strong><span>{provider.settings.implementation} / {provider.settings.tv ? 'TV' : ''}{provider.settings.tv && provider.settings.movies ? ' + ' : ''}{provider.settings.movies ? 'Movies' : ''}</span><span>{provider.enabled ? 'Enabled' : 'Disabled'} · {provider.test_status.replaceAll('_',' ')}</span></button></li>{:else}<li>No providers yet. Add an indexer or download client to begin.</li>{/each}</ul><div class="pagination"><button disabled={loading || page.offset === 0} onclick={() => load(Math.max(0,page!.offset - 25))}>Previous providers</button><button disabled={loading || page.offset + page.limit >= page.total} onclick={() => load(page!.offset + page!.limit)}>Next providers</button></div>{/if}
+      {#if page}<p>{page.total} configured</p><ul>{#each page.items as provider (provider.id)}<li><button disabled={busy || relatedWrite!=='idle'} aria-current={selected?.id === provider.id ? 'true' : undefined} onclick={() => select(provider.id)}><strong>{provider.name}</strong>{#if uncertain&&pendingCreation}<small>ID {provider.id}{matchesPendingProvider(provider,pendingCreation)?' — matches pending configuration':''}</small>{/if}<span>{provider.settings.implementation} / {provider.settings.tv ? 'TV' : ''}{provider.settings.tv && provider.settings.movies ? ' + ' : ''}{provider.settings.movies ? 'Movies' : ''}</span><span>{provider.enabled ? 'Enabled' : 'Disabled'} · {provider.test_status.replaceAll('_',' ')}</span></button></li>{:else}<li>No providers yet. Add an indexer or download client to begin.</li>{/each}</ul><div class="pagination"><button disabled={loading || page.offset === 0} onclick={() => load(Math.max(0,page!.offset - 25))}>Previous providers</button><button disabled={loading || page.offset + page.limit >= page.total} onclick={() => load(page!.offset + page!.limit)}>Next providers</button></div>{/if}
     </aside>
     <article aria-label="Provider editor">
       {#if busy}<p role="status">Working on provider…</p>{/if}
       {#if editing}
         <h2>{selected ? selected.name : 'New provider'}</h2>
-        {#if selected}<p>Saved revision {selected.revision}. Credentials: {selected.has_credentials ? 'stored (write-only)' : 'none stored'}.</p><p>Saved test: {selected.test_status.replaceAll('_',' ')}{selected.last_test ? ` at ${new Date(selected.last_test.tested_at * 1000).toLocaleString()} (revision ${selected.last_test.revision})` : ''}{selected.last_test?.error_code ? `: ${selected.last_test.error_code}` : ''}.</p><button disabled={busy} onclick={() => select(selected!.id)}>Reload saved provider</button>{/if}
+        {#if selected}<p>Saved revision {selected.revision}. Credentials: {selected.has_credentials ? 'stored (write-only)' : 'none stored'}.</p><p>Saved test: {selected.test_status.replaceAll('_',' ')}{selected.last_test ? ` at ${new Date(selected.last_test.tested_at * 1000).toLocaleString()} (revision ${selected.last_test.revision})` : ''}{selected.last_test?.error_code ? `: ${selected.last_test.error_code}` : ''}.</p><button disabled={busy || relatedWrite!=='idle'} onclick={() => select(selected!.id)}>Reload saved provider</button>{/if}
         <form onsubmit={(event) => {event.preventDefault(); void save();}} oninput={() => dirty = true} onchange={() => {dirty = true; confirmingDelete = false; testResult = null;}}>
-          <fieldset disabled={busy || conflict || uncertain}><legend>Connection</legend>
+          <fieldset disabled={locked || conflict}><legend>Connection</legend>
             <label>Provider type<select bind:value={implementation} disabled={!!selected} onchange={changeImplementation}><option value="torznab">Torznab</option><option value="newznab">Newznab</option><option value="qbittorrent">qBittorrent</option></select></label>
             <label>Name<input bind:value={name} required maxlength="128" /></label><label>Endpoint<input type="url" bind:value={endpoint} required maxlength="2048" placeholder="https://indexer.example/api" /></label>
             <p>Use an endpoint without credentials. Saving does not contact it; Test saved provider contacts every configured scope.</p>
             <label class="check"><input type="checkbox" bind:checked={enabled} />Enabled</label><label>Priority<input type="number" bind:value={priority} min="1" max="100" step="1" required /></label>
           </fieldset>
-          <fieldset disabled={busy || conflict || uncertain}><legend>Media scopes</legend>
+          <fieldset disabled={locked || conflict}><legend>Media scopes</legend>
             <label class="check"><input type="checkbox" bind:checked={tv} />TV scope</label>
             {#if tv}{#if implementation === 'qbittorrent'}<label>TV download category<input bind:value={tvCategory} required maxlength="64" /></label>{:else}<label>TV categories<input bind:value={tvCategories} placeholder="5000" /></label><label>Anime categories<input bind:value={animeCategories} placeholder="5070" /></label>{/if}{/if}
             <label class="check"><input type="checkbox" bind:checked={movies} />Movie scope</label>
             {#if movies}{#if implementation === 'qbittorrent'}<label>Movie download category<input bind:value={movieCategory} required maxlength="64" /></label>{:else}<label>Movie categories<input bind:value={movieCategories} required placeholder="2000" /></label>{/if}{/if}
             <p>{implementation === 'qbittorrent' ? 'Use distinct, non-overlapping categories for TV and movies. Existing imported categories, priorities and download options are preserved.' : 'Enter the numeric category IDs advertised by your indexer, separated by commas. Existing search options are preserved.'} Disabling a scope removes its saved settings.</p>
           </fieldset>
-          <fieldset disabled={busy || conflict || uncertain}><legend>Credentials</legend>
+          <fieldset disabled={locked || conflict}><legend>Credentials</legend>
             <label>Credential action<select bind:value={credentialAction} onchange={clearSecrets}><option value="preserve">{selected ? 'Preserve stored credentials' : 'No credentials'}</option><option value="replace">Replace entire credential bundle</option><option value="clear">Clear entire credential bundle</option></select></label>
             {#if credentialAction !== 'preserve'}<p class="credential-warning">{credentialAction === 'clear' ? 'Clearing removes' : 'Replacing discards'} the entire saved credential bundle, including any private TV/movie parameters not shown here.</p>{/if}
             {#if credentialAction === 'replace'}{#if implementation === 'qbittorrent'}<label>Credential type<select bind:value={credentialKind} onchange={clearSecrets}><option value="username_password">Username and password</option><option value="api_key">API key</option></select></label>{/if}{#if implementation === 'qbittorrent' && credentialKind === 'username_password'}<label>Username<input bind:value={username} autocomplete="off" required maxlength="4096" /></label><label>Password<input type="password" bind:value={password} autocomplete="new-password" required maxlength="4096" /></label>{:else}<label>API key<input type="password" bind:value={apiKey} autocomplete="new-password" required maxlength="4096" /></label>{/if}{/if}
           </fieldset>
-          <button class="primary" disabled={busy || conflict || uncertain || !dirty || (!selected && !template)}>Save provider</button>
+          <button class="primary" disabled={locked || conflict || !dirty || (!selected && !template)}>Save provider</button>
         </form>
-        {#if selected}<div class="actions"><button disabled={busy || dirty || conflict || uncertain || !selected.test_supported} onclick={test}>Test saved provider</button><button disabled={busy || conflict || uncertain} onclick={() => confirmingDelete = !confirmingDelete}>Delete provider</button></div>{#if dirty}<p>Save or reload changes before testing. Tests always use the saved configuration.</p>{/if}{/if}
+        {#if selected}<div class="actions"><button disabled={locked || dirty || conflict || !selected.test_supported} onclick={test}>Test saved provider</button><button disabled={locked || conflict} onclick={() => confirmingDelete = !confirmingDelete}>Delete provider</button></div>{#if dirty}<p>Save or reload changes before testing. Tests always use the saved configuration.</p>{/if}{/if}
         {#if confirmingDelete}<div class="delete-confirm"><p>Delete configuration for {selected?.name}? This removes both saved scopes and credentials. It does not delete media or remote downloads.</p><button disabled={busy} onclick={remove}>Confirm delete configuration</button><button disabled={busy} onclick={() => confirmingDelete = false}>Cancel delete</button></div>{/if}
         {#if testResult}<div role="status"><h3>Connection test result</h3><p>Tested revision {testResult.revision}: {testResult.result.domains.join(', ')}.</p>{#if 'missing_categories' in testResult.result}<p>qBittorrent {testResult.result.application_version}; API {testResult.result.api_version}. Queueing {testResult.result.queueing_enabled ? 'enabled' : 'disabled'}.</p><p>{testResult.result.missing_categories.length ? `Missing categories: ${testResult.result.missing_categories.join(', ')}. These were not created by this test.` : 'Configured categories exist.'}</p>{:else}<p>Indexer capabilities and scoped feed probes passed.</p>{/if}<p>This is a connection observation, not proof that downloads or imports work.</p></div>{/if}
       {:else}<h2>Select a provider</h2><p>Review saved settings or add Torznab, Newznab or qBittorrent.</p>{/if}

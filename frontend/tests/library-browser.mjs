@@ -10,6 +10,7 @@ assert.equal(new URL(origin).hostname, '127.0.0.1');
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
 page.setDefaultTimeout(10000);
+page.on('dialog', dialog=>dialog.accept());
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 // This Playwright version treats an async waitForFunction predicate as a truthy
@@ -167,9 +168,13 @@ async function verifyRss() {
 async function verifyDownloadProcessing() {
   const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
   const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
-  const client=providers.find(p=>p.name==='Browser qbittorrent'),indexer=providers.find(p=>p.name==='Browser torznab');
+  const template=providers.find(p=>p.name==='Browser qbittorrent'),indexer=providers.find(p=>p.name==='Browser torznab');
+  // Use a fresh independent client: earlier Activity intentionally suppressed a movie schedule.
+  // Default-flow evidence must not undo that explicit intent or use policy/schedule PUT setup.
+  const created=await page.request.post(`${origin}/api/v1/providers`,{data:{name:'Browser default qbittorrent',enabled:true,priority:template.priority,settings:template.settings,credentials:{kind:'username_password',username:'fixture-user',password:'fixture-good'}}});
+  assert.equal(created.status(),201,await created.text());const client=await created.json();
   const expectStatus=async(response,status)=>assert.equal(response.status(),status,await response.text());
-  const poll=async(read,accept,label)=>{const deadline=Date.now()+15000;let last;while(Date.now()<deadline){last=await read(Math.max(1,deadline-Date.now()));if(accept(last))return last;await new Promise(r=>setTimeout(r,100));}assert.fail(`${label}: ${JSON.stringify(last)}`);};
+  const poll=async(read,accept,label)=>{const deadline=Date.now()+90000;let last;while(Date.now()<deadline){last=await read(Math.max(1,deadline-Date.now()));if(accept(last))return last;await new Promise(r=>setTimeout(r,100));}assert.fail(`${label}: ${JSON.stringify(last)}`);};
   const processing=async(domain,timeout=10000)=>(await (await page.request.get(`${origin}/api/v1/download-processing?provider_id=${client.id}&media_type=${domain}`,{timeout})).json()).items;
   await expectStatus(await page.request.post(`${providerOrigin}/fixture-processing`),204);
   await expectStatus(await page.request.post(`${providerOrigin}/fixture-mode?mode=0`),204);
@@ -189,46 +194,40 @@ async function verifyDownloadProcessing() {
     const accepted=page.waitForResponse(r=>r.url().endsWith('/api/v1/rss/commands')&&r.request().method()==='POST');
     await rss.getByRole('button',{name:'Run RSS now',exact:true}).click();const response=await accepted;await expectStatus(response,202);await waitForCommand('/api/v1/rss/commands',(await response.json()).id,'succeeded');
     // Keep all candidate decisions in a failed poll: selecting first hid rejection reasons.
-    const receipts=await poll(async(timeout)=>(await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`,{timeout})).json()).items,items=>items.some(r=>r.status==='observed'),`observed ${domain} receipt`);
-    const receipt=receipts.find(r=>r.status==='observed');
+    const receipts=await poll(async(timeout)=>(await (await page.request.get(`${origin}/api/v1/rss/candidates?media_type=${domain}`,{timeout})).json()).items,items=>items.some(r=>r.status==='observed'&&r.source.client_id===client.id),`observed ${domain} receipt`);
+    const receipt=receipts.find(r=>r.status==='observed'&&r.source.client_id===client.id);
     assert.equal(receipt.target.media_type,domain);
     await page.getByRole('button',{name:'Activity',exact:true}).click();
     await page.getByLabel('Download client').selectOption(client.id);await page.getByLabel('Refresh media').selectOption(domain);
     const panel=page.getByRole('region',{name:'Completed downloads',exact:true});
     await panel.getByRole('button',{name:'Save import policy',exact:true}).waitFor();
     const policyUrl=`${origin}/api/v1/download-processing/policies/${client.id}/${domain}`;
-    if(domain==='tv') {
-      // Concurrent policy write invalidates the panel's revision; explicit readback resolves it.
-      const current=await (await page.request.get(policyUrl)).json();
-      await expectStatus(await page.request.put(policyUrl,{data:{provider_revision:client.revision,revision:current.revision,enabled:false,mode:'copy'}}),200);
-      await panel.getByLabel('Enable completed-download imports').check();
-      await panel.getByRole('button',{name:'Save import policy',exact:true}).click();
-      await panel.getByRole('alert').filter({hasText:'Check processing status'}).waitFor();
-      await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
-      await panel.getByText('Processing status checked. Inspect saved policy and imports before another action.',{exact:true}).waitFor();
-    }
-    await panel.getByLabel('Enable completed-download imports').check();await panel.getByLabel('Import transfer',{exact:true}).selectOption(domain==='tv'?'hardlink':'copy');
-    let writes=0;
-    if(domain==='tv')await page.route('**/api/v1/download-processing/policies/**',async route=>{if(route.request().method()!=='PUT')return route.continue();writes++;const result=await route.fetch();assert.equal(result.status(),200);await route.abort('failed');});
-    await panel.getByRole('button',{name:'Save import policy',exact:true}).click();
-    if(domain==='tv'){
-      await panel.getByText('The request may have committed. Check processing status before another action.',{exact:true}).waitFor();
-      assert.equal(await panel.getByRole('button',{name:'Save import policy',exact:true}).isDisabled(),true);assert.equal(writes,1);
-      await page.unroute('**/api/v1/download-processing/policies/**');await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
-      await panel.getByText('Processing status checked. Inspect saved policy and imports before another action.',{exact:true}).waitFor();
-    }else await panel.getByText('Completed-download policy saved.',{exact:true}).waitFor();
-    // First attempt has no mapping and surfaces a real blocked preflight, with no import yet.
-    await page.getByRole('button',{name:'Refresh downloads',exact:true}).click();
+    const inherited=await (await page.request.get(policyUrl)).json();assert.equal(inherited.enabled_override,null);assert.equal(inherited.enabled,true);assert.equal(inherited.mode,'copy');
+    // A real inherited periodic observation admits the receipt; no manual refresh or policy save.
     const blocked=await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='blocked'),'mapping conflict');
     assert.ok(blocked.some(r=>r.error_code==='path_mapping_missing'));assert.ok(blocked.every(r=>r.operation_id===null));
     await expectStatus(await page.request.post(`${origin}/api/v1/${domain}/remote-path-mappings`,{data:{host:'127.0.0.1',remote_path:'/remote',local_path:`${scratch}/incoming`}}),201);
     if(domain==='movies')await expectStatus(await page.request.post(`${origin}/api/fixture/fail-import-history?enabled=1`),204);
     await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
+    let retryAccepted=false,retryWrites=0;
+    if(domain==='tv'){
+      await page.route('**/api/v1/download-processing',async route=>{if(route.request().method()!=='POST')return route.continue();retryWrites++;const response=await route.fetch();assert.equal(response.status(),202);retryAccepted=true;await route.fulfill({response});});
+      await page.route('**/api/v1/download-processing?*',route=>retryAccepted?route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:{code:'processing_storage_error',message:'Owned accepted retry readback failure'}})}):route.continue());
+    }
     await panel.getByRole('button',{name:`Retry processing ${receipt.id}`,exact:true}).click();
+    if(domain==='tv'){
+      await panel.getByText('Write accepted; related settings or processing status readback incomplete. Check processing status.',{exact:true}).waitFor();assert.equal(await panel.getByRole('button',{name:`Retry processing ${receipt.id}`,exact:true}).isDisabled(),true,'An old blocked row cannot retry after accepted write with failed status readback');
+      await page.getByRole('button',{name:'Providers',exact:true}).click();assert.equal(await page.getByRole('button',{name:'New provider',exact:true}).isDisabled(),true);await page.getByRole('button',{name:'Activity',exact:true}).click();
+      await page.unroute('**/api/v1/download-processing?*');await page.unroute('**/api/v1/download-processing');await panel.getByRole('button',{name:'Check processing status',exact:true}).click();await panel.getByText('Saved policy and related settings checked. Review before another action.',{exact:true}).waitFor();assert.equal(retryWrites,1);
+    }
     if(domain==='movies'){
       const failed=(await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='importing'&&r.error_code==='import_failed'),'failed replacement'))[0];
       assert.ok(failed.operation_id);assert.equal(failed.import_phase,'published');
       assert.equal(await readFile(`${scratch}/movies/movie.mkv`,'utf8'),'scratch movie media','Failed replacement commit preserves original bytes');
+      // Master-off denies new admission but cannot revoke recovery of this linked operation.
+      await page.getByLabel('Enable completed-download handling',{exact:true}).uncheck();await page.getByRole('button',{name:'Save completed-download handling',exact:true}).click();
+      await page.getByText('Completed-download domain setting saved.',{exact:true}).waitFor();
+      assert.equal((await (await page.request.get(policyUrl)).json()).enabled,false);
       await expectStatus(await page.request.post(`${origin}/api/fixture/fail-import-history?enabled=0`),204);
       await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
       let retries=0;
@@ -239,6 +238,7 @@ async function verifyDownloadProcessing() {
       await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
       const done=(await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='imported'),'resumed movie import'))[0];assert.equal(done.operation_id,failed.operation_id);assert.equal(done.retirement_state,'quarantined');assert.equal(done.recovery_bytes_retained,true);
       assert.equal(await readFile(`${scratch}/movies/.hrrdarr-replaced-${done.operation_id}/original`,'utf8'),'scratch movie media');
+      await page.getByLabel('Enable completed-download handling',{exact:true}).check();await page.getByRole('button',{name:'Save completed-download handling',exact:true}).click();await page.getByText('Completed-download domain setting saved.',{exact:true}).waitFor();
     } else await poll(timeout=>processing(domain,timeout),rows=>rows.some(r=>r.status==='imported'),'TV import');
     await panel.getByRole('button',{name:'Check processing status',exact:true}).click();
     await panel.getByText(domain==='tv'?'Episode 2: imported':'Movie 1: imported',{exact:true}).waitFor();
@@ -246,7 +246,7 @@ async function verifyDownloadProcessing() {
     await page.setViewportSize({width:390,height:844});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Completed import feedback must fit mobile');await page.setViewportSize({width:1280,height:720});
     const filename=domain==='tv'?'Refreshed.series.S01E02.1080p.WEB-DL.mkv':'Refreshed.movie.2021.1080p.WEB-DL.mkv';
     assert.equal((await readFile(`${scratch}/${domain}/${filename}`)).length,1048576);assert.equal((await readFile(`${scratch}/incoming/${filename}`)).length,1048576);
-    if(domain==='tv')assert.equal((await stat(`${scratch}/tv/${filename}`)).ino,(await stat(`${scratch}/incoming/${filename}`)).ino,'TV hardlink preserves source inode');
+    assert.notEqual((await stat(`${scratch}/${domain}/${filename}`)).ino,(await stat(`${scratch}/incoming/${filename}`)).ino,'Inherited default copy retains independent source inode');
   }
   const added=await (await page.request.get(`${providerOrigin}/fixture-completed`)).json();assert.equal(added.length,2,'Retry/recovery must not add torrents again');assert.deepEqual(added.map(r=>r.category).sort(),['movies','tv']);
 }
@@ -255,10 +255,10 @@ async function verifySearchGrab() {
   const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
   assert.equal((await page.request.post(`${providerOrigin}/fixture-search`)).status(),204);
   const providers=(await (await page.request.get(`${origin}/api/v1/providers`)).json()).items;
-  const indexer=providers.find(p=>p.name==='Browser torznab'),client=providers.find(p=>p.name==='Browser qbittorrent');
+  const indexer=providers.find(p=>p.name==='Browser torznab'),client=providers.find(p=>p.name==='Browser default qbittorrent');
   let expectedAdds=2;
   for(const domain of ['tv','movies']) {
-    const created=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Target search ${domain}`,items:[{kind:'quality',quality_id:5,allowed:true},{kind:'quality',quality_id:3,allowed:true}],policy:{upgrade_allowed:true,cutoff:{kind:'quality',quality_id:3},min_format_score:0,cutoff_format_score:0,min_upgrade_format_score:1,language_id:domain==='movies'?-2:null,format_items:[]}}});
+    const created=await page.request.post(`${origin}/api/v1/${domain}/quality-profiles`,{data:{name:`Target search ${domain}`,items:[{kind:'quality',quality_id:5,allowed:true,min_size:0},{kind:'quality',quality_id:3,allowed:true,min_size:0}],policy:{upgrade_allowed:true,cutoff:{kind:'quality',quality_id:3},min_format_score:0,cutoff_format_score:0,min_upgrade_format_score:1,language_id:domain==='movies'?-2:null,format_items:[]}}});
     assert.equal(created.status(),201,await created.text());const profile=await created.json();
     for(const [external,mode] of [[202,'interactive'],[203,'automatic']]) {
       const title=`Search ${domain==='tv'?'series':'movie'} ${external}`;
@@ -297,6 +297,22 @@ async function verifySearchGrab() {
       await page.reload();await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();await page.getByRole('button',{name:new RegExp(`${title}.*0 files`)}).click();await page.getByRole('button',{name:domain==='tv'?'Search releases for Search pilot':'Search movie releases',exact:true}).click();
       panel=page.getByRole('region',{name:'Search and download',exact:true});await panel.getByText(new RegExp(`Download ${last.selected_candidate_id}: observed`)).waitFor();
       await page.setViewportSize({width:390,height:844});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Search receipt and rejected offers must fit mobile');await page.setViewportSize({width:1280,height:720});
+      // Complete only this mock's actual submitted torrent, then let the inherited worker observe it.
+      assert.equal((await page.request.post(`${providerOrigin}/fixture-complete-search?hash=malformed`)).status(),400);
+      assert.equal((await page.request.post(`${providerOrigin}/fixture-complete-search?hash=${'f'.repeat(40)}`)).status(),404);
+      assert.equal((await page.request.post(`${providerOrigin}/fixture-complete-search?hash=${digit.repeat(40)}`)).status(),204);
+      const finish=Date.now()+90000;let imported;
+      while(Date.now()<finish){const response=await page.request.get(`${origin}/api/v1/download-processing?receipt_id=${last.selected_candidate_id}`);assert.equal(response.status(),200);imported=(await response.json()).items.find(row=>row.status==='imported');if(imported)break;await page.waitForTimeout(250);}
+      assert.ok(imported,`Default ${domain} ${mode} completion did not import`);
+      await page.getByRole('button',{name:'Activity',exact:true}).click();await page.getByLabel('Download client').selectOption(client.id);await page.getByLabel('Refresh media').selectOption(domain);
+      await page.getByRole('region',{name:'Completed downloads',exact:true}).getByText(`Import ${imported.operation_id}: ${imported.import_phase}`,{exact:true}).waitFor();
+      await page.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();
+      // Reload library through navigation/API, then inspect the real file association in the UI.
+      await page.reload();await page.getByRole('button',{name:domain==='tv'?'TV':'Movies',exact:true}).click();await page.getByRole('button',{name:new RegExp(`${title}.*1 files`)}).click();
+      const file=domain==='tv'?`Search.series.${external}.S01E01.${mode==='interactive'?'720p':'1080p'}.WEB-DL.mkv`:`Search.movie.${external}.2030.${mode==='interactive'?'720p':'1080p'}.WEB-DL.English.mkv`;
+      assert.equal((await readFile(`${scratch}/search-${domain}-${external}/${file}`)).length,1048576);assert.equal((await readFile(`${scratch}/incoming/${file}`)).length,1048576);
+      assert.equal((await (await page.request.get(`${origin}/api/v1/download-processing/policies/${client.id}/${domain}`)).json()).enabled_override,null);
+
     }
   }
 }
@@ -327,9 +343,19 @@ async function verifyActivity() {
     const result=await response;assert.equal(result.status(),202);
     return result.json();
   };
+  // Enabled scopes now inherit observation immediately. Use a separate disabled client
+  // for the deterministic never-observed contract; the default import clients stay untouched.
+  const unobservedResponse=await page.request.post(`${origin}/api/v1/providers`,{data:{name:'Browser never-observed qbittorrent',enabled:false,priority:provider.priority,settings:provider.settings}});
+  assert.equal(unobservedResponse.status(),201,await unobservedResponse.text());const unobserved=await unobservedResponse.json();assert.equal(unobserved.enabled,false);
   await page.getByRole('button',{name:'Activity',exact:true}).click();
+  await page.getByLabel('Download client').selectOption(unobserved.id);
+  for(const media of ['tv','movies']){
+    await page.getByLabel('Refresh media').selectOption(media);
+    await page.getByText('No successful snapshot yet. Download contents are unknown.',{exact:true}).waitFor();
+    assert.equal((await page.request.get(`${origin}/api/v1/queue?provider_id=${unobserved.id}&media_type=${media}`)).status(),404);
+    assert.equal(await page.getByRole('button',{name:'Refresh downloads',exact:true}).isDisabled(),true);
+  }
   await page.getByLabel('Download client').selectOption(provider.id);
-  await page.getByText('No successful snapshot yet. Download contents are unknown.',{exact:true}).waitFor();
   for(const media of ['tv','movies']) {
     await page.getByLabel('Refresh media').selectOption(media);
     const command=await trigger();
@@ -368,39 +394,45 @@ async function verifyActivity() {
     await route.abort('failed');
   });
   await page.getByRole('button',{name:'Refresh downloads',exact:true}).click();
-  await page.getByRole('alert').filter({hasText:/may have committed/}).waitFor();
+  await page.getByRole('region',{name:'Activity',exact:true}).getByText('The request may have committed. Related writes remain blocked until a complete readback. Reload activity to inspect saved settings.',{exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Refresh downloads',exact:true}).isDisabled(),true);
   await page.unroute('**/api/v1/commands');
   await waitCommand(lostId,'succeeded');
   await page.getByRole('button',{name:'Reload activity',exact:true}).click();
   await page.getByRole('button',{name:`Inspect command ${lostId}`,exact:true}).waitFor();
   assert.equal(posted,1,'Unknown request outcome must not automatically replay');
-  // Explicit schedule creation is the only point that enables repeated refreshes.
+  // Fresh provider scopes already inherit automatic observation. This explicit save changes only the selected movie schedule; the TV default remains independent.
   await page.getByLabel('Interval seconds',{exact:true}).fill('86400');
-  await page.getByLabel('Enable schedule',{exact:true}).check();
+  await page.getByLabel('Request automatic observation',{exact:true}).check();
   await page.getByRole('button',{name:'Save refresh schedule',exact:true}).click();
   await page.getByText('Refresh schedule saved.',{exact:true}).waitFor();
   let schedules=await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json();
-  assert.equal(schedules.length,1);assert.equal(schedules[0].target.media_type,'movies');
-  assert.equal(schedules[0].enabled,true);assert.equal(schedules[0].interval_seconds,86400);
+  let movieSchedule=schedules.find(s=>s.target.provider_id===provider.id&&s.target.media_type==='movies');
+  assert.ok(movieSchedule);assert.equal(movieSchedule.intent,'explicit');assert.equal(movieSchedule.requested_enabled,true);
+  assert.equal(movieSchedule.enabled,true);assert.equal(movieSchedule.interval_seconds,86400);
+  const savedRevision=movieSchedule.revision;
   const before=await commands();
   await page.reload();await page.getByRole('button',{name:'Activity',exact:true}).click();
   await page.getByLabel('Download client').selectOption(provider.id);
   await page.getByLabel('Refresh media').selectOption('movies');
   await page.waitForFunction(()=>Array.from(document.querySelectorAll('input[type=number]')).some(input=>input.value==='86400'));
   assert.equal(await page.getByLabel('Interval seconds',{exact:true}).inputValue(),'86400');
-  assert.equal(await page.getByLabel('Enable schedule',{exact:true}).isChecked(),true);
-  await page.getByLabel('Enable schedule',{exact:true}).uncheck();
+  assert.equal(await page.getByLabel('Request automatic observation',{exact:true}).isChecked(),true);
+  await page.getByLabel('Request automatic observation',{exact:true}).uncheck();
   await page.getByRole('button',{name:'Save refresh schedule',exact:true}).click();
   await page.getByText('Refresh schedule saved.',{exact:true}).waitFor();
   schedules=await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json();
-  assert.equal(schedules[0].enabled,false);assert.equal(schedules[0].revision,2);
+  movieSchedule=schedules.find(s=>s.target.provider_id===provider.id&&s.target.media_type==='movies');
+  assert.equal(movieSchedule.enabled,false);assert.equal(movieSchedule.requested_enabled,false);assert.ok(movieSchedule.revision>savedRevision);
   await page.getByRole('button',{name:'Delete schedule',exact:true}).click();
   await page.getByRole('button',{name:'Confirm delete schedule',exact:true}).click();
-  await page.getByText('Refresh schedule deleted.',{exact:true}).waitFor();
-  assert.deepEqual(await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json(),[]);
-  // Reads/reload must not enqueue; only the immediately due saved schedule may add one command.
-  assert.ok((await commands()).length<=before.length+1);
+  await page.getByText('Automatic observation suppressed. Existing imports remain.',{exact:true}).waitFor();
+  schedules=await (await page.request.get(`${origin}/api/v1/download-refresh/schedules`)).json();
+  assert.ok(!schedules.some(s=>s.target.provider_id===provider.id&&s.target.media_type==='movies'));
+  assert.equal((await (await page.request.get(`${origin}/api/v1/download-processing/policies/${provider.id}/movies`)).json()).observation_suppressed,true);
+  // Ignore independent TV defaults: reads must not enqueue on the now-suppressed movie scope.
+  const scoped=items=>items.filter(c=>c.target.provider_id===provider.id&&c.target.media_type==='movies');
+  assert.ok(scoped(await commands()).length<=scoped(before).length+1);
   const filtered=page.waitForResponse(r=>r.url().includes('/api/v1/commands?')&&r.url().includes('media_type=tv'));
   await page.getByLabel('Command media').selectOption('tv');
   assert.ok((await (await filtered).json()).items.every(command=>command.target.media_type==='tv'));
@@ -750,7 +782,7 @@ try {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile viewport must not overflow');
   if (process.env.UI_SCREENSHOT) await page.screenshot({path:process.env.UI_SCREENSHOT, fullPage:true});
   assert.deepEqual(errors, []);
-  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, completed owned RSS imports (TV hardlink and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, policy CAS, retained recovery feedback, both-domain automatic/interactive search and exact grab, lost create/grab reply readback and retained history, naming fresh-install defaults/live preview/save round trip in both domains and a real rejected validation error, mobile overflow and browser errors');
+  console.log('PASS: both-domain add/monitor/import, typed ID collision, reload, stale lookup, lost-response reconciliation, provider create/edit/test/credentials/revision conflict/reload, Activity scoped refresh/retry/cancel/history/schedules, metadata typed refresh/preservation/uncertainty/cancellation/retry, imported blocklist filters/identity/privacy/single-bulk removal/replay, whole-domain clear confirmation/cancel/unknown-response/both-domain completion/replay, profile assignment/reload and release decisions/policies/RSS rejection/schedule/request loss in both domains, default inherited RSS imports (TV copy and movie replacement copy), missing-mapping retry, failed replacement preservation, same-operation resume/uncertain writes, master-off linked recovery, retained recovery feedback, both-domain automatic/interactive search, exact grab and default periodic imports, lost create/grab reply readback and retained history, naming fresh-install defaults/live preview/save round trip in both domains and a real rejected validation error, mobile overflow and browser errors');
 } catch (error) {
   console.error('Browser errors:',errors);
   if(process.env.UI_SCREENSHOT)await page.screenshot({path:process.env.UI_SCREENSHOT,fullPage:true});
