@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
+        assert_eq!(version(&c).await?, 42); // Latest schema42 includes health storage; historical starting version is unchanged.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

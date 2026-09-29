@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 42); // Latest schema42 includes health storage; historical starting version is unchanged.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

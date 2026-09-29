@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 41); // Latest open adds release profiles and CDH intent; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 42); // Latest schema42 includes health storage; historical starting version is unchanged.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 41); // Latest open includes release profiles and CDH intent; historical starting schema is unchanged.
+    assert_eq!(version(&c).await?, 42); // Latest schema42 includes health storage; historical starting version is unchanged.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        41 // Latest open now includes CDH intent; tested historical start remains39.
+        42 // Latest schema42 includes health storage; historical starting version is unchanged.
     );
     Ok(())
 }
