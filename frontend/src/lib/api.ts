@@ -251,3 +251,29 @@ export const getReleaseProfileSchema=(domain:MediaDomain)=>request<import('./rel
 export const createReleaseProfile=(domain:MediaDomain,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(input.revision)&&input.profile.indexers.every(r=>r.kind==='provider')?request<import('./api.generated').ReleaseProfileCatalog>(releaseProfilePath(domain),input,'POST',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 export const updateReleaseProfile=(domain:MediaDomain,id:number,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(id)&&validId(input.revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}`,input,'PUT',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 export const deleteReleaseProfile=(domain:MediaDomain,id:number,revision:number)=>validId(id)&&validId(revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}?revision=${revision}`,undefined,'DELETE',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
+
+// One readback boundary for settings which reconcile policies and schedules together.
+export const getCompletedDownloadHandling = (media: MediaDomain) => request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,undefined,undefined,true);
+export const saveCompletedDownloadHandling = (media: MediaDomain, input: import('./api.generated').CompletedDownloadHandlingUpdate) => validId(input.revision) ? request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,input,'PUT',true) : invalidProvider<import('./api.generated').CompletedDownloadHandling>();
+export const inheritProcessingPolicy = (provider: string, media: MediaDomain, input: import('./api.generated').ProcessingPolicyReset) => validOperation(provider)&&validId(input.provider_revision)&&(input.revision===null||validId(input.revision)) ? request<ProcessingPolicy>(`/api/v1/download-processing/policies/${provider}/${media}/inherit`,input,'PUT',true) : invalidProvider<ProcessingPolicy>();
+export const inheritRefreshSchedule = (input: import('./api.generated').RefreshScheduleReset) => validOperation(input.target.provider_id)&&validId(input.provider_revision)&&(input.revision===null||validId(input.revision)) ? request<RefreshSchedule>('/api/v1/download-refresh/schedules/inherit',input,'PUT',true) : invalidProvider<RefreshSchedule>();
+export async function readDownloadHandling(providerId?: string): Promise<Result<{settings:Record<MediaDomain,import('./api.generated').CompletedDownloadHandling>;schedules:RefreshSchedule[];provider:Provider|null;policies:Partial<Record<MediaDomain,ProcessingPolicy>>}>> {
+  const [tv,movies,schedules] = await Promise.all([getCompletedDownloadHandling('tv'),getCompletedDownloadHandling('movies'),listRefreshSchedules()]);
+  if(!tv.ok)return tv;if(!movies.ok)return movies;if(!schedules.ok)return schedules;
+  let provider:Provider|null=null;
+  const policies:Partial<Record<MediaDomain,ProcessingPolicy>>={};
+  if(providerId){
+    const saved=await getProvider(providerId);
+    if(!saved.ok && saved.status!==404)return saved;
+    if(saved.ok){
+      provider=saved.data;
+      if(provider.settings.implementation==='qbittorrent')for(const media of ['tv','movies'] as const){
+        if(!provider.settings[media])continue;
+        const policy=await getProcessingPolicy(providerId,media);
+        if(!policy.ok)return policy;
+        policies[media]=policy.data;
+      }
+    }
+  }
+  return {ok:true,data:{settings:{tv:tv.data,movies:movies.data},schedules:schedules.data,provider,policies}};
+}
