@@ -15,6 +15,7 @@
   import ReleaseSearchPanel from './lib/ReleaseSearchPanel.svelte';
   import ImportPanel from './lib/ImportPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
+  import HealthPanel from './lib/HealthPanel.svelte';
   import ActivityPanel from './lib/ActivityPanel.svelte';
   import BlocklistPanel from './lib/BlocklistPanel.svelte';
   import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
@@ -23,10 +24,12 @@
   import NamingPanel from './lib/NamingPanel.svelte';
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
+  let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
+  function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;activityVisited=true;view='activity';}
   let activityVisited=$state(false),providersVisited=$state(false),providerVersion=$state(0);
   let activityWrite=$state<SettingsWriteState>('idle'),providerWrite=$state<SettingsWriteState>('idle');
   let searchTarget: MediaTarget | null = $state(null);
-  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles' | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management'>('library');
+  let view = $state<'health' | 'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles' | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management'>('library');
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
@@ -131,10 +134,12 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => {providersVisited=true;view='providers';}}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => {activityVisited=true;view='activity';}}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>{tagsVisited=true;view='tags';}}>Tags</button><button aria-pressed={view === 'custom-formats'} onclick={() => {customFormatsVisited=true; view = 'custom-formats';}}>Custom formats</button><button aria-pressed={view === 'qualities'} onclick={() => {qualitiesVisited=true; view = 'qualities';}}>Quality settings</button><button aria-pressed={view === 'profiles'} onclick={() => {profilesVisited=true; view = 'profiles';}}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>{revisionVisited=true;view='media-management';}}>Media management</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => {providersVisited=true;view='providers';}}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => {activityVisited=true;view='activity';}}>Activity</button><button aria-pressed={view === 'health'} onclick={() => {healthVisited=true;view='health';}}>Health</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>{tagsVisited=true;view='tags';}}>Tags</button><button aria-pressed={view === 'custom-formats'} onclick={() => {customFormatsVisited=true; view = 'custom-formats';}}>Custom formats</button><button aria-pressed={view === 'qualities'} onclick={() => {qualitiesVisited=true; view = 'qualities';}}>Quality settings</button><button aria-pressed={view === 'profiles'} onclick={() => {profilesVisited=true; view = 'profiles';}}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>{revisionVisited=true;view='media-management';}}>Media management</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
   {#if view === 'rss'}<RssPanel />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={activityWrite} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
-  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
+  {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
   {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
   {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
