@@ -7,12 +7,26 @@ impl Drop for Scratch {
         }
     }
 }
-async fn fixture() -> (Scratch, Database, Connection) {
+async fn fixture_all() -> (Scratch, Database, Connection) {
     let path = std::env::temp_dir().join(format!("hrrdarr-health-{}", Uuid::new_v4()));
     std::fs::create_dir(&path).unwrap();
     let db = Database::open_local(path.join("db")).await.unwrap();
     let c = db.connect().await.unwrap();
     (Scratch(path), db, c)
+}
+// These existing lifecycle cases deliberately use the original two-check registry.
+// Extension cases below use fixture_all and exercise the actual four migration seeds.
+async fn fixture() -> (Scratch, Database, Connection) {
+    let fixture = fixture_all().await;
+    fixture
+        .2
+        .execute(
+            "DELETE FROM health_checks WHERE check_key='download_client_communication'",
+            (),
+        )
+        .await
+        .unwrap();
+    fixture
 }
 async fn init(c: &Connection, at: i64) -> Uuid {
     let epoch = Uuid::new_v4();
@@ -393,8 +407,18 @@ async fn health_sequence_exhaustion_rolls_back_entire_publication() {
     init(&c, 100).await;
     tick(&c, 100).await;
     let cmd = take(&c, active(&c).await.unwrap().unwrap().id, 100).await;
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM sqlite_sequence WHERE name='health_transitions'"
+        )
+        .await,
+        1
+    );
+    // Migration43 preserves even an empty-ring high-water row; update it rather than
+    // inserting duplicate sqlite_sequence metadata that no valid migration produces.
     c.execute(
-        "INSERT INTO sqlite_sequence(name,seq) VALUES('health_transitions',?)",
+        "UPDATE sqlite_sequence SET seq=? WHERE name='health_transitions'",
         [MAX_INTEGER - 1],
     )
     .await
@@ -734,4 +758,449 @@ async fn health_counter_exhaustion_reports_without_poisoning_shared_worker() {
         Err(Error(_, "health_generation_exhausted"))
     ));
     tx.rollback().await.unwrap();
+}
+
+fn mixed(cmd: &HealthCommand, issue_present: bool) -> Vec<CheckOutcome> {
+    cmd.members
+        .iter()
+        .map(|m| {
+            if m.identity.check_key == "download_client_communication" {
+                Ok(if issue_present {
+                    warning(m, "communication fixture").map(|mut v| {
+                        v.severity = HealthSeverity::Error;
+                        v.compatibility_type = "DownloadClientCheck".into();
+                        v
+                    })
+                } else {
+                    None
+                })
+            } else {
+                Err("check_failed")
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn communication_partial_attempts_preserve_failed_payload_and_retry_membership() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    let baseline = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, baseline, 100).await;
+    publish(
+        &c,
+        &cmd,
+        Ok(cmd
+            .members
+            .iter()
+            .map(|m| {
+                if m.identity.check_key == "completed_download_handling" {
+                    warning(m, "previous CDH")
+                } else {
+                    None
+                }
+            })
+            .collect()),
+        101,
+    )
+    .await
+    .unwrap();
+    let id = admit(&c, HealthScope::All, 102).await;
+    for attempt in 1..=3 {
+        let cmd = take(&c, id, 110 + attempt * 10).await;
+        assert_eq!(cmd.members.len(), 4);
+        assert_eq!(i64::from(cmd.attempts), attempt);
+        publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
+            .await
+            .unwrap();
+        // Each retry captures every member with nonempty reasons, including successful ones.
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='completed_download_handling' AND message='previous CDH' AND last_error='check_failed'").await,2);
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='download_client_communication' AND last_error IS NULL").await,2);
+        assert_eq!(
+            count(
+                &c,
+                "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
+            )
+            .await,
+            if attempt < 3 { 4 } else { 0 }
+        );
+        assert_eq!(
+            lifecycle(&c).await.unwrap().last_batch_completed_at,
+            Some(101)
+        );
+        // Replayed callbacks cannot duplicate an already settled attempt.
+        publish_outcomes(&c, &cmd, mixed(&cmd, true), 112 + attempt * 10)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        read(&c, id).await.unwrap().status,
+        CommandStatus::Failed
+    ));
+    let mut rows=c.query("SELECT command_attempt,kind FROM health_transitions WHERE command_id=? AND scope='tv' ORDER BY sequence",[id.to_string()]).await.unwrap();
+    for (attempt, kind) in [(1, "issue"), (2, "restored"), (3, "issue")] {
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), attempt);
+        assert_eq!(row.get::<String>(1).unwrap(), kind);
+    }
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_later_completion() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    tick(&c, 1000).await;
+    let id = active(&c).await.unwrap().unwrap().id;
+    for attempt in 1..=3 {
+        let cmd = take(&c, id, 1000 + attempt * 10).await;
+        assert!(cmd.is_grace);
+        publish_outcomes(&c, &cmd, mixed(&cmd, true), 1001 + attempt * 10)
+            .await
+            .unwrap();
+        assert_ne!(lifecycle(&c).await.unwrap().grace_phase, "expired");
+        assert_eq!(
+            count(
+                &c,
+                "SELECT count(*) FROM health_transitions WHERE in_grace=0"
+            )
+            .await,
+            0
+        );
+    }
+    assert_eq!(lifecycle(&c).await.unwrap().grace_due_at, 1091);
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
+        )
+        .await,
+        4
+    );
+    tick(&c, 1032).await;
+    let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
+    assert!(!ordinary.is_grace);
+    publish(
+        &c,
+        &ordinary,
+        Ok(ordinary
+            .members
+            .iter()
+            .map(|m| {
+                if m.identity.check_key == "download_client_communication" {
+                    warning(m, "continuing")
+                } else {
+                    None
+                }
+            })
+            .collect()),
+        1033,
+    )
+    .await
+    .unwrap();
+    tick(&c, 1091).await;
+    let grace = take(&c, active(&c).await.unwrap().unwrap().id, 1091).await;
+    publish(
+        &c,
+        &grace,
+        Ok(grace
+            .members
+            .iter()
+            .map(|m| {
+                if m.identity.check_key == "download_client_communication" {
+                    warning(m, "continuing")
+                } else {
+                    None
+                }
+            })
+            .collect()),
+        1092,
+    )
+    .await
+    .unwrap();
+    assert_eq!(lifecycle(&c).await.unwrap().grace_phase, "expired");
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_transitions WHERE in_grace=0 AND kind='issue'"
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+// Stale-input settlement deliberately preserves every pending selection for a fresh batch,
+// including unchanged members: no part of that invalidated attempt was published.
+async fn communication_status_deadline_rollback_and_whole_attempt_invalidation() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    let id = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, id, 100).await;
+    publish(&c, &cmd, Ok(vec![None; 4]), 101).await.unwrap();
+    for at in 200..212 {
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        communication_status_at(&tx, MediaDomain::Tv, at)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(count(&c,"SELECT due_at FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,205);
+        tick(&c, at).await;
+    }
+    let queued = active(&c).await.unwrap().unwrap();
+    assert_eq!(queued.created_at, 205);
+    assert_eq!(queued.members.len(), 1);
+    let generation=count(&c,"SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    communication_status_at(&tx, MediaDomain::Tv, 212)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(count(&c,"SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,generation);
+    // Coalesce all four while queued, then change one input while the batch is running.
+    assert_eq!(admit(&c, HealthScope::All, 212).await, queued.id);
+    let cmd = take(&c, queued.id, 212).await;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    communication_status_at(&tx, MediaDomain::Tv, 213)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    publish_outcomes(&c, &cmd, mixed(&cmd, true), 214)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&c, "SELECT count(*) FROM health_transitions").await,
+        0
+    );
+    assert_eq!(
+        read(&c, cmd.id).await.unwrap().error_code.as_deref(),
+        Some("stale_inputs")
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
+        )
+        .await,
+        4
+    );
+}
+
+#[tokio::test]
+async fn communication_status_exhaustion_preserves_authoritative_fact_and_reports() {
+    let (_scratch, _db, c) = fixture_all().await;
+    // Fresh fixture, before membership exists; seed the actual selected key at exhaustion.
+    c.execute(
+        "DELETE FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'",
+        (),
+    )
+    .await
+    .unwrap();
+    c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES('tv','download_client_communication',1,1,?,'DownloadClientCheck')",[MAX_INTEGER]).await.unwrap();
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    tx.execute("CREATE TABLE status_fact(value INTEGER NOT NULL)", ())
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO status_fact VALUES(1)", ())
+        .await
+        .unwrap();
+    communication_status_at(&tx, MediaDomain::Tv, 200)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(count(&c, "SELECT value FROM status_fact").await, 1);
+    assert_eq!(
+        lifecycle(&c).await.unwrap().schedule_error.as_deref(),
+        Some("health_invariant")
+    );
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE observed_generation IS NOT NULL OR pending_reasons!=0").await,0);
+}
+
+async fn communication_client(c: &Connection, endpoint: &str) {
+    let provider = Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Communication fixture',1,1,1,1,?)",params![provider.clone(),endpoint]).await.unwrap();
+    for domain in ["tv", "movies"] {
+        c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,1,'started','default',0,0,0)",params![provider.clone(),domain,domain]).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn communication_real_tv_and_all_failure_is_visible_despite_cdh_failure() {
+    for scope in [HealthScope::Tv, HealthScope::All] {
+        let (_scratch, db, c) = fixture_all().await;
+        init(&c, 100).await;
+        let remote = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        communication_client(&c, &format!("http://{}", listener.local_addr().unwrap())).await;
+        let server = tokio::spawn(async move { axum::serve(listener, remote).await.unwrap() });
+        let db = std::sync::Arc::new(db);
+        let (_, client) = crate::providers::router_with_refresh(db.clone(), None);
+        let id = admit(&c, scope, 100).await;
+        let cmd = take(&c, id, 100).await;
+        publish(
+            &c,
+            &cmd,
+            Ok(cmd
+                .members
+                .iter()
+                .map(|m| {
+                    if m.identity.check_key == "completed_download_handling" {
+                        warning(m, "previous")
+                    } else {
+                        None
+                    }
+                })
+                .collect()),
+            101,
+        )
+        .await
+        .unwrap();
+        let id = admit(&c, scope, 102).await;
+        let cmd = take(&c, id, 102).await;
+        run(&db, &client, cmd).await.unwrap();
+        assert!(matches!(
+            read(&c, id).await.unwrap().status,
+            CommandStatus::RetryWait
+        ));
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='download_client_communication' AND severity=3 AND last_error IS NULL").await,if scope==HealthScope::All {2}else{1});
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling' AND message='previous' AND last_error='check_failed'").await,1);
+        // Direct probes neither record provider tests nor dirty their own generations.
+        assert_eq!(count(&c, "SELECT count(*) FROM provider_tests").await, 0);
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE generation!=observed_generation AND check_key='download_client_communication' AND observed_generation IS NOT NULL").await,0);
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn communication_aggregate_deadline_retains_completed_results_and_releases_probe() {
+    let (_scratch, db, c) = fixture_all().await;
+    init(&c, 100).await;
+    // A later registered fixture must remain explicitly unevaluated at aggregate expiry.
+    c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type) VALUES('tv','zzz_unvisited_fixture',1,1,'Fixture')",()).await.unwrap();
+
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal = entered.clone();
+    let remote = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let signal = signal.clone();
+        async move {
+            if uri.path().ends_with("webapiVersion") {
+                return "2.8.3";
+            }
+            if uri.path().ends_with("torrents/info") {
+                return "[]";
+            }
+            signal.notify_one();
+            std::future::pending::<&'static str>().await
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    communication_client(&c, &format!("http://{}", listener.local_addr().unwrap())).await;
+    let server = tokio::spawn(async move { axum::serve(listener, remote).await.unwrap() });
+    let db = std::sync::Arc::new(db);
+    let (_, client) = crate::providers::router_with_refresh(db.clone(), None);
+    let id = admit(&c, HealthScope::Tv, 101).await;
+    let cmd = take(&c, id, 101).await;
+    let work = run_with_deadline(&db, &client, cmd, Duration::from_secs(2));
+    tokio::pin!(work);
+    tokio::select! {r=&mut work=>panic!("did not reach blocked CDH: {}",r.is_ok()),_=entered.notified()=>{}}
+    work.await.unwrap();
+    assert_eq!(
+        read(&c, id).await.unwrap().error_code.as_deref(),
+        Some("check_timeout")
+    );
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND severity=0 AND last_error IS NULL").await,1);
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling' AND observed_generation IS NULL AND last_error='check_timeout'").await,1);
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='zzz_unvisited_fixture' AND observed_generation IS NULL AND last_error='check_timeout'").await,1);
+    // The deadline-dropped CDH future releases the same-provider permit.
+    assert!(matches!(
+        crate::health_detectors::evaluate_communication(&db, &client, MediaDomain::Tv).await,
+        Ok(None)
+    ));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    let id = admit(&c, HealthScope::All, 100).await;
+    let first = take(&c, id, 100).await;
+    let mut invalid = mixed(&first, true);
+    // Late storage failure must roll back an earlier completed member and its transition.
+    invalid
+        .last_mut()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .message = "x".repeat(4097);
+    assert!(publish_outcomes(&c, &first, invalid, 101).await.is_err());
+    assert_eq!(
+        count(&c, "SELECT count(*) FROM health_transitions").await,
+        0
+    );
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE observed_generation IS NOT NULL OR last_error IS NOT NULL").await,0);
+    assert!(matches!(
+        read(&c, id).await.unwrap().status,
+        CommandStatus::Running
+    ));
+    publish_outcomes(&c, &first, mixed(&first, true), 102)
+        .await
+        .unwrap();
+    // A new TV request belongs to a later generation and cannot be cancelled with old admission.
+    assert_eq!(admit(&c, HealthScope::Tv, 103).await, id);
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    cancel(&tx, id, 104).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE scope='movies' AND pending_reasons>0"
+        )
+        .await,
+        0
+    );
+    publish_outcomes(&c, &first, mixed(&first, false), 105)
+        .await
+        .unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='download_client_communication' AND severity=3").await,2);
+    assert_eq!(
+        count(&c, "SELECT count(*) FROM health_transitions").await,
+        2
+    );
+    tick(&c, 106).await;
+    let next = active(&c).await.unwrap().unwrap();
+    assert_ne!(next.id, id);
+    assert_eq!(next.members.len(), 2);
+    assert!(
+        next.members
+            .iter()
+            .all(|m| m.identity.scope == HealthScope::Tv)
+    );
 }

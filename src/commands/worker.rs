@@ -300,8 +300,9 @@ async fn publish(
         .await?;
     let outcome=async{
         let Some(current)=retained_command(&tx,command.id).await? else {return Ok(None)};
-        if !matches!(current.status,CommandStatus::Running){return Ok(None)}
-        let result=if valid_provider(&tx,command.target,command.provider_revision).await?{result}else{Err(RefreshError{code:"provider_changed",retryable:false,retry_after_seconds:None})};
+        if !matches!(current.status,CommandStatus::Running) || current.attempts != command.attempts {return Ok(None)}
+        let provider_current=valid_provider(&tx,command.target,command.provider_revision).await?;
+        let result=if provider_current{result}else{Err(RefreshError{code:"provider_changed",retryable:false,retry_after_seconds:None})};
         let timestamp=now()?;
         match result {
             Ok(items)=>{
@@ -315,6 +316,11 @@ async fn publish(
                 }
             },
             Err(error)=>fail(&tx,&command,timestamp,error).await?,
+        }
+        // A synthesized stale-provider failure is not a current status observation.
+        // This hook shares the snapshot/processing transaction, including rollback.
+        if provider_current {
+            crate::health::communication_status_changed(&tx,command.target.media_type).await?;
         }
         Ok(Some(read_command(&tx, command.id).await?))
     }.await;
@@ -366,6 +372,159 @@ mod tests {
                 eprintln!("scratch cleanup failed: {error}");
             }
         }
+    }
+
+    async fn health_refresh_fixture() -> (Scratch, Database, Connection, Uuid) {
+        let path = std::env::temp_dir().join(format!("hrrdarr-health-refresh-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let db = Database::open_local(path.join("db")).await.unwrap();
+        let c = db.connect().await.unwrap();
+        let provider = Uuid::new_v4();
+        c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'qbittorrent','Status fixture',1,1,1,1,'http://127.0.0.1:1/')",[provider.to_string()]).await.unwrap();
+        for media in ["tv", "movies"] {
+            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,1,'started','default',0,0,0)",params![provider.to_string(),media,media]).await.unwrap();
+        }
+        (Scratch(path), db, c, provider)
+    }
+    async fn health_running_refresh(c: &Connection, provider: Uuid, media: MediaDomain) -> Command {
+        let cmd = enqueue(
+            c,
+            CommandInput {
+                name: CommandName::RefreshDownloads,
+                target: RefreshTarget {
+                    provider_id: provider,
+                    media_type: media,
+                },
+                provider_revision: 1,
+                priority: CommandPriority::Normal,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        c.execute("UPDATE commands SET status='running',attempts=attempts+1,started_at=1,error_code=NULL WHERE id=?",[cmd.id.to_string()]).await.unwrap();
+        read_command(c, cmd.id).await.unwrap()
+    }
+    async fn scalar(c: &Connection, sql: &str) -> i64 {
+        c.query(sql, ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn health_refresh_status_publication_is_scoped_atomic_and_revision_fenced() {
+        let (_scratch, db, c, provider) = health_refresh_fixture().await;
+        let first = health_running_refresh(&c, provider, MediaDomain::Tv).await;
+        let id = first.id;
+        // A marker write failure must also roll back the accepted snapshot and command finish.
+        c.execute("CREATE TRIGGER fail_health_marker BEFORE UPDATE ON health_checks WHEN NEW.generation>OLD.generation BEGIN SELECT RAISE(ABORT,'fixture'); END",()).await.unwrap();
+        assert!(publish(&db, first, Ok(vec![])).await.is_err());
+        assert!(matches!(
+            read_command(&c, id).await.unwrap().status,
+            CommandStatus::Running
+        ));
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM download_refresh_snapshots").await,
+            0
+        );
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            0
+        );
+        c.execute("DROP TRIGGER fail_health_marker", ())
+            .await
+            .unwrap();
+        publish(&db, read_command(&c, id).await.unwrap(), Ok(vec![]))
+            .await
+            .unwrap();
+        assert_eq!(scalar(&c,"SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,1);
+        assert_eq!(scalar(&c,"SELECT sum(generation) FROM health_checks WHERE scope='movies' OR check_key='completed_download_handling'").await,0);
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM download_refresh_snapshots").await,
+            1
+        );
+        // A legitimate local/remote failed refresh also requests reevaluation, not an Error issue.
+        let failure = health_running_refresh(&c, provider, MediaDomain::Movies).await;
+        publish(
+            &db,
+            failure,
+            Err(RefreshError {
+                code: "refresh_timeout",
+                retryable: false,
+                retry_after_seconds: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scalar(&c,"SELECT generation FROM health_checks WHERE scope='movies' AND check_key='download_client_communication'").await,1);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM health_checks WHERE severity IS NOT NULL"
+            )
+            .await,
+            0
+        );
+        let stale = health_running_refresh(&c, provider, MediaDomain::Tv).await;
+        c.execute(
+            "UPDATE providers SET revision=2 WHERE id=?",
+            [provider.to_string()],
+        )
+        .await
+        .unwrap();
+        publish(&db, stale, Ok(vec![])).await.unwrap();
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            2
+        );
+        // Existing provider-revision trigger invalidates the old snapshot immediately.
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM download_refresh_snapshots").await,
+            0
+        );
+    }
+    #[tokio::test]
+    async fn health_refresh_exhaustion_keeps_snapshot_and_cancelled_callback_does_not_mark() {
+        let (_scratch, db, c, provider) = health_refresh_fixture().await;
+        c.execute("DELETE FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();
+        c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES('tv','download_client_communication',1,1,9007199254740991,'DownloadClientCheck')",()).await.unwrap();
+        let cmd = health_running_refresh(&c, provider, MediaDomain::Tv).await;
+        let id = cmd.id;
+        publish(&db, cmd, Ok(vec![])).await.unwrap();
+        assert!(matches!(
+            read_command(&c, id).await.unwrap().status,
+            CommandStatus::Succeeded
+        ));
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM download_refresh_snapshots").await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM health_lifecycle WHERE schedule_error='health_invariant'"
+            )
+            .await,
+            1
+        );
+        let cancelled = health_running_refresh(&c, provider, MediaDomain::Movies).await;
+        c.execute(
+            "UPDATE commands SET status='cancelled',completed_at=2 WHERE id=?",
+            [cancelled.id.to_string()],
+        )
+        .await
+        .unwrap();
+        publish(&db, cancelled, Ok(vec![])).await.unwrap();
+        assert_eq!(scalar(&c,"SELECT generation FROM health_checks WHERE scope='movies' AND check_key='download_client_communication'").await,0);
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM download_refresh_snapshots").await,
+            1
+        );
     }
 
     #[tokio::test]

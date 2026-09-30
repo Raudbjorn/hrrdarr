@@ -38,8 +38,14 @@ pub struct HttpResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpError {
     InvalidRequest,
+    /// Local state or pacing failed before a request could be observed.
+    LocalUnavailable {
+        timeout: bool,
+    },
     Authentication,
-    RateLimited { retry_after_seconds: Option<u32> },
+    RateLimited {
+        retry_after_seconds: Option<u32>,
+    },
     Redirect,
     Transport,
     Timeout,
@@ -96,7 +102,10 @@ impl HttpClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| HttpError::Busy)?;
-        let mut lanes = self.lanes.lock().map_err(|_| HttpError::Transport)?;
+        let mut lanes = self
+            .lanes
+            .lock()
+            .map_err(|_| HttpError::LocalUnavailable { timeout: false })?;
         let now = Instant::now();
         // ponytail: bounded lanes reject excess active provider identities; raise this ceiling if measured demand needs it.
         lanes.retain(|_, lane| {
@@ -128,7 +137,10 @@ impl HttpClient {
             .try_acquire_owned()
             .map_err(|_| HttpError::Busy)?;
         {
-            let mut state = lane.state.lock().map_err(|_| HttpError::Transport)?;
+            let mut state = lane
+                .state
+                .lock()
+                .map_err(|_| HttpError::LocalUnavailable { timeout: false })?;
             state.used = now;
             if let Some(until) = state.cooldown.filter(|until| *until > now) {
                 return Err(HttpError::RateLimited {
@@ -158,7 +170,7 @@ impl HttpOperation<'_> {
     pub fn rate_limit(&self, seconds: Option<u32>) -> HttpError {
         let seconds = seconds.unwrap_or(60).clamp(1, 86400);
         let Ok(mut state) = self.lane.state.lock() else {
-            return HttpError::Transport;
+            return HttpError::LocalUnavailable { timeout: false };
         };
         let until = Instant::now() + Duration::from_secs(u64::from(seconds));
         state.cooldown = Some(state.cooldown.map_or(until, |previous| previous.max(until)));
@@ -308,15 +320,21 @@ impl HttpOperation<'_> {
         {
             return Err(HttpError::InvalidRequest);
         }
+        let mut dispatched = false;
         let work = async {
             let start = {
-                let mut state = self.lane.state.lock().map_err(|_| HttpError::Transport)?;
+                let mut state = self
+                    .lane
+                    .state
+                    .lock()
+                    .map_err(|_| HttpError::LocalUnavailable { timeout: false })?;
                 let start = state.next.max(Instant::now());
                 state.next = start + MIN_REQUEST_INTERVAL;
                 state.used = Instant::now();
                 start
             };
             tokio::time::sleep_until(start).await;
+            dispatched = true;
             let mut response = self
                 .client
                 .client
@@ -379,7 +397,13 @@ impl HttpOperation<'_> {
         };
         tokio::time::timeout_at(self.deadline - STATUS_RESERVE, work)
             .await
-            .map_err(|_| HttpError::Timeout)?
+            .map_err(|_| {
+                if dispatched {
+                    HttpError::Timeout
+                } else {
+                    HttpError::LocalUnavailable { timeout: true }
+                }
+            })?
     }
 }
 fn safe_part_name(value: &str, limit: usize) -> bool {
@@ -765,5 +789,71 @@ mod tests {
             HttpError::ResponseTooLarge
         );
         oversized.await.unwrap();
+    }
+    #[tokio::test]
+    async fn health_provenance_distinguishes_local_pacing_from_dispatched_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let entered = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let notify = reached.clone();
+        let seen = entered.clone();
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                let notify = notify.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_one();
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    "late"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpClient::new().unwrap();
+        let mut operation = client.operation(Uuid::new_v4()).unwrap();
+        operation.deadline = Instant::now() + STATUS_RESERVE + Duration::from_millis(40);
+        operation.lane.state.lock().unwrap().next = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            operation.get(&url, &[]).await.unwrap_err(),
+            HttpError::LocalUnavailable { timeout: true }
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "local pacing never dispatched"
+        );
+        drop(operation);
+        let mut operation = client.operation(Uuid::new_v4()).unwrap();
+        operation.deadline = Instant::now() + STATUS_RESERVE + Duration::from_secs(1);
+        {
+            let request = operation.get(&url, &[]);
+            tokio::pin!(request);
+            tokio::select! {
+                outcome = &mut request => panic!("request ended before handler-entry evidence: {outcome:?}"),
+                started = tokio::time::timeout(Duration::from_secs(5), reached.notified()) => started.unwrap(),
+            }
+            assert_eq!(request.await.unwrap_err(), HttpError::Timeout);
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "network timeout follows actual dispatch"
+        );
+        // A prior successful/failed request cannot bless a later undispatched timeout.
+        operation.deadline = Instant::now() + STATUS_RESERVE + Duration::from_millis(40);
+        operation.lane.state.lock().unwrap().next = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            operation.get(&url, &[]).await.unwrap_err(),
+            HttpError::LocalUnavailable { timeout: true }
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
     }
 }

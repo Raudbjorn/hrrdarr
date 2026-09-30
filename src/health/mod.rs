@@ -323,3 +323,53 @@ pub(crate) async fn configuration_changed(c: &Connection, media: MediaDomain) ->
     let keys = selection(c, scope, "check_key='completed_download_handling'").await?;
     mark(c, &keys, CONFIG, now()?).await
 }
+
+/// Provider configuration affects both CDH and communication in the caller's transaction.
+pub(crate) async fn provider_configuration_changed(
+    c: &Connection,
+    media: MediaDomain,
+) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('completed_download_handling','download_client_communication')",
+    )
+    .await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+/// Status is not trailing configuration debounce. Repeated observations cannot postpone work.
+/// Callers deduplicate concurrent provider tests; the sole worker serializes refresh outcomes.
+pub(crate) async fn communication_status_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    communication_status_at(c, media, now()?).await
+}
+async fn communication_status_at(c: &Connection, media: MediaDomain, timestamp: i64) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key='download_client_communication'").await?;
+    // Preflight before any updates, retaining the authoritative status even at exhaustion.
+    if keys.iter().any(|k| k.generation >= MAX_INTEGER) {
+        c.execute(
+            "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1",
+            (),
+        )
+        .await?;
+        return Ok(());
+    }
+    let due = timestamp
+        .checked_add(5)
+        .filter(|v| *v <= MAX_INTEGER)
+        .ok_or_else(invariant)?;
+    for k in keys {
+        if c.execute("UPDATE health_checks SET generation=generation+1,due_at=CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END,pending_reasons=pending_reasons|8 WHERE scope=? AND check_key=? AND generation=?",params![due,due,k.identity.scope.text(),k.identity.check_key,k.generation]).await? != 1 { return Err(invariant()); }
+    }
+    Ok(())
+}

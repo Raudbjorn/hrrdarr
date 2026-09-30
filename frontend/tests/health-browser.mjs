@@ -14,19 +14,27 @@ const idle=region=>until(()=>region.getAttribute('aria-busy'),value=>value==='fa
 const refresh=async()=>{await idle(health);await health.getByRole('button',{name:'Refresh health',exact:true}).click();await idle(health);};
 const openHealth=async()=>{await nav.getByRole('button',{name:'Health',exact:true}).click();await idle(health);};
 const run=async scope=>{await health.getByLabel('Health scope').selectOption(scope);await idle(health);const reply=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/v1/health/commands'&&response.request().method()==='POST');await health.getByRole('button',{name:`Run ${scope} health checks`,exact:true}).click();const response=await reply;assert.equal(response.status(),202);return response.json();};
-const current=()=>until(()=>get('/api/v1/health'),snapshot=>snapshot.summary.current===2&&!snapshot.active_command,'Checks did not become current');
+const identities=['movies:completed_download_handling','movies:download_client_communication','tv:completed_download_handling','tv:download_client_communication'];
+const identity=check=>`${check.identity.scope}:${check.identity.check_key}`;
+const issueFor=(snapshot,domain,key)=>snapshot.issues.find(issue=>identity(issue)===`${domain}:${key}`);
+const current=async()=>{const snapshot=await until(()=>get('/api/v1/health'),snapshot=>snapshot.summary.current===4&&!snapshot.active_command,'All four scoped checks did not become current');assert.equal(snapshot.summary.total,4);assert.deepEqual(snapshot.checks.map(identity).sort(),identities);assert.deepEqual(snapshot.coverage.identities.map(value=>`${value.scope}:${value.check_key}`).sort(),identities);for(const check of snapshot.checks){assert.equal(check.evaluation,'current');assert.equal(check.last_error,null);}return snapshot;};
+const communicationRow=domain=>health.getByRole('article',{name:`${domain}:download_client_communication`,exact:true});
 const settings=async domain=>{await health.getByLabel('Health scope').selectOption('all');await idle(health);await health.getByRole('button',{name:`Open ${domain} completed-download settings`,exact:true}).click();await activity.getByText(`Opened ${domain} completed-download settings.`,{exact:true}).waitFor();await idle(activity);assert.equal(await master.getByLabel('Completed-download media').inputValue(),domain);};
 const save=async enabled=>{await idle(activity);await master.getByLabel('Enable completed-download handling',{exact:true}).setChecked(enabled);await master.getByRole('button',{name:'Save completed-download handling',exact:true}).click();await activity.getByText('Completed-download domain setting saved.',{exact:true}).waitFor();await idle(activity);};
 const dismiss=async()=>{const buttons=health.getByRole('button',{name:/Dismiss request .* tracking/});const count=await buttons.count();assert.ok(count<=8);for(let n=0;n<count;n++)await buttons.first().click();assert.equal(await buttons.count(),0);};
 try{
- await page.goto(origin);await openHealth();let fresh=await current();assert.equal(fresh.issues.some(issue=>issue.identity.scope==='tv'&&issue.reason.startsWith('cdh_undefined')),true);assert.equal(fresh.issues.some(issue=>issue.identity.scope==='movies'),false);await refresh();
+ await page.goto(origin);await openHealth();let fresh=await current();assert.equal(fresh.issues.some(issue=>issue.identity.scope==='tv'&&issue.reason.startsWith('cdh_undefined')),true);assert.equal(issueFor(fresh,'movies','completed_download_handling'),undefined);await health.getByLabel('Health scope').selectOption('all');await idle(health);await refresh();
+ for(const domain of ['tv','movies']){
+  const warning=issueFor(fresh,domain,'download_client_communication');assert.equal(warning.reason,'download_client_none_available');assert.equal(warning.severity,'warning');assert.equal(warning.compatibility_type,'DownloadClientCheck');
+  await communicationRow(domain).getByText(`warning: ${warning.message} (${warning.reason})`,{exact:true}).waitFor();assert.equal(await communicationRow(domain).getByRole('link',{name:'Check help'}).getAttribute('href'),`https://wiki.servarr.com/${domain==='tv'?'sonarr':'radarr'}/system#no-download-client-is-available`);
+ }
  await run('all');await current();await refresh();await health.getByText('Requested generations observed in the current epoch.',{exact:true}).waitFor();
  // First lazy Activity mount, both domains, equal-true explicit save and observed issue/restore.
  for(const domain of ['movies','tv']){
   const before=posts.length;await settings(domain);assert.equal(posts.length,before,'Navigation must not mutate settings');
   assert.equal((await get(`/api/v1/${domain}/completed-download-handling`)).defined,false);
   await save(true);assert.equal((await get(`/api/v1/${domain}/completed-download-handling`)).defined,true);
-  await openHealth();await run(domain);await current();await refresh();assert.equal((await get('/api/v1/health')).issues.some(issue=>issue.identity.scope===domain),false);
+  await openHealth();await run(domain);await current();await refresh();assert.equal(issueFor(await get('/api/v1/health'),domain,'completed_download_handling'),undefined);
   await settings(domain);await save(false);await openHealth();await run(domain);await current();await refresh();assert.equal((await get('/api/v1/health')).issues.some(issue=>issue.identity.scope===domain&&issue.reason==='cdh_disabled'),true);
   await settings(domain);await save(true);await openHealth();await run(domain);await current();await refresh();await dismiss();
  }
@@ -41,10 +49,29 @@ try{
  // Unknown settings write blocks Health navigation until explicit Activity readback.
  const masterPattern='**/api/v1/tv/completed-download-handling';await page.route(masterPattern,async route=>{if(route.request().method()!=='PUT')return route.continue();assert.equal((await route.fetch()).status(),200);await route.abort('failed');});
  await master.getByLabel('Enable completed-download handling',{exact:true}).uncheck();await master.getByRole('button',{name:'Save completed-download handling',exact:true}).click();await activity.getByRole('alert').filter({hasText:'The request may have committed. Related writes'}).waitFor();await page.unroute(masterPattern);await openHealth();await health.getByRole('button',{name:'Open movies completed-download settings',exact:true}).click();await activity.getByText('Settings navigation refused: resolve the unknown write outcome, then request navigation again.',{exact:true}).waitFor();assert.equal(await master.getByLabel('Completed-download media').inputValue(),'tv');await activity.getByRole('button',{name:'Reload activity',exact:true}).click();await idle(activity);await save(true);await openHealth();await current();
- // Real remote probe delay keeps a global multi-domain batch running.
+ // One owned shared client, with distinct TV/movie categories.
  const scope=category=>({category,imported_category:null,recent_priority:0,older_priority:0});
  const created=await page.request.post(origin+'/api/v1/providers',{data:{name:'Health browser client',enabled:true,priority:1,settings:{implementation:'qbittorrent',endpoint:remote,tv:scope('tv'),movies:scope('movies')},credentials:{kind:'username_password',username:'fixture-user',password:'fixture-good'}}});assert.equal(created.status(),201,await created.text());await current();
  const provider=await created.json();
+ // Real category-scoped item probes restore both no-client warnings; this is not an overlay.
+ await run('all');let healthy=await current();await refresh();await dismiss();
+ for(const domain of ['tv','movies']){assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
+ // Mode1 returns503 only from the actual item-list endpoint, after successful auth/version.
+ // CDH uses client_status (preferences/categories), not test_connection or item-list probing.
+ // Item-only503 therefore leaves both CDH checks current/healthy and communication current/Error.
+ assert.equal((await page.request.post(remote+'/fixture-mode?mode=1')).status(),204);await run('all');
+ const failed=await until(()=>get('/api/v1/health'),snapshot=>!snapshot.active_command&&['tv','movies'].every(domain=>issueFor(snapshot,domain,'download_client_communication')?.reason==='download_client_communication_failed'),'Both scoped item-list failures were not published');
+ assert.equal(failed.summary.total,4);assert.deepEqual(failed.checks.map(identity).sort(),identities);for(const domain of ['tv','movies']){assert.equal(failed.checks.find(check=>identity(check)===`${domain}:completed_download_handling`).evaluation,'current');assert.equal(issueFor(failed,domain,'completed_download_handling'),undefined);}assert.equal(failed.summary.current,4);assert.equal(failed.summary.failed,0);assert.equal(failed.summary.non_ok,2);
+ for(const domain of ['tv','movies']){
+  const issue=issueFor(failed,domain,'download_client_communication');assert.equal(issue.severity,'error');assert.equal(issue.compatibility_type,'DownloadClientCheck');assert.equal(failed.checks.find(check=>identity(check)===`${domain}:download_client_communication`).evaluation,'current');
+  assert.equal(issue.message,`Unable to retrieve items from download client Health browser client (${provider.id}). Review its connection, authentication and protocol settings.`);assert.equal(issue.message.includes('PRIVATE_FIXTURE'),false);assert.equal(issue.message.includes(remote),false);
+  await health.getByLabel('Health scope').selectOption(domain);await idle(health);await refresh();
+  const scoped=await get(`/api/v1/health?scope=${domain}`);assert.equal(scoped.summary.total,2);assert.deepEqual(scoped.checks.map(identity).sort(),[`${domain}:completed_download_handling`,`${domain}:download_client_communication`]);
+  await communicationRow(domain).getByText(`error: ${issue.message} (${issue.reason})`,{exact:true}).waitFor();assert.equal(await communicationRow(domain).getByRole('link',{name:'Check help'}).getAttribute('href'),`https://wiki.servarr.com/${domain==='tv'?'sonarr':'radarr'}/system#unable-to-communicate-with-download-client`);assert.equal(await communicationRow(domain==='tv'?'movies':'tv').count(),0);
+ }
+ assert.equal((await page.request.post(remote+'/fixture-mode?mode=0')).status(),204);await run('all');healthy=await current();await refresh();await dismiss();
+ for(const domain of ['tv','movies']){assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
+ console.log('PASS actual API: four scoped registry identities; TV/movie communication Warning→healthy→named-client Error→healthy; scoped help links; item-only failure leaves both CDH checks current/healthy');
  // Shared provider write and child policy write cannot be bypassed by Health navigation.
  await nav.getByRole('button',{name:'Providers',exact:true}).click();await page.getByRole('button').filter({hasText:'Health browser client'}).click();await page.getByLabel('Name',{exact:true}).fill('Health browser client edited');
  let releaseProvider,providerStarted;const providerGate=new Promise(resolve=>releaseProvider=resolve),providerBegun=new Promise(resolve=>providerStarted=resolve);held.push(releaseProvider);
