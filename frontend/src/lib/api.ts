@@ -277,3 +277,19 @@ export async function readDownloadHandling(providerId?: string): Promise<Result<
   }
   return {ok:true,data:{settings:{tv:tv.data,movies:movies.data},schedules:schedules.data,provider,policies}};
 }
+
+// Native health is scoped by registry identity, never by a synthetic media ID.
+import type { HealthScope, HealthSnapshot, HealthAdmission, HealthCommand, HealthTransitions, CommandStatus } from './api.generated';
+const healthScope = (scope:HealthScope) => ['all','tv','movies','system'].includes(scope);
+const healthOffset = (value:number,max:number) => Number.isSafeInteger(value)&&value>=0&&value<=max;
+const invalidHealth = <T>():Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid health scope, identifier or pagination.'});
+export const getHealth = (scope:HealthScope='all',offset=0) => healthScope(scope)&&healthOffset(offset,127)?request<HealthSnapshot>(`/api/v1/health?${new URLSearchParams({scope,limit:'16',offset:String(offset)})}`,undefined,undefined,true):invalidHealth<HealthSnapshot>();
+export const createHealthCommand = (scope:HealthScope) => healthScope(scope)?request<HealthAdmission>('/api/v1/health/commands',{scope,priority:'normal'},'POST',true):invalidHealth<HealthAdmission>();
+export const listHealthCommands = (scope:HealthScope='all',offset=0,status:CommandStatus|''='') => {
+  if(!healthScope(scope)||!healthOffset(offset,128)||!['','queued','running','retry_wait','succeeded','failed','cancelled'].includes(status))return invalidHealth<ApiPage<HealthCommand>>();
+  const params=new URLSearchParams({scope,limit:'20',offset:String(offset)});if(status)params.set('status',status);
+  return request<ApiPage<HealthCommand>>(`/api/v1/health/commands?${params}`,undefined,undefined,true);
+};
+export const getHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}`,undefined,undefined,true):invalidHealth<HealthCommand>();
+export const cancelHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}/cancel`,undefined,'POST',true):invalidHealth<HealthCommand>();
+export const getHealthTransitions = (after=0) => healthOffset(after,Number.MAX_SAFE_INTEGER)?request<HealthTransitions>(`/api/v1/health/transitions?${new URLSearchParams({after_sequence:String(after),limit:'16'})}`,undefined,undefined,true):invalidHealth<HealthTransitions>();
