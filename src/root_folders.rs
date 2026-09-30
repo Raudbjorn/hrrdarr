@@ -43,6 +43,11 @@ impl From<libsql::Error> for Error {
         Self(StatusCode::INTERNAL_SERVER_ERROR, "root_storage_error")
     }
 }
+impl From<crate::health::Error> for Error {
+    fn from(e: crate::health::Error) -> Self {
+        Self(e.0, e.1)
+    }
+}
 fn bad() -> Error {
     Error(StatusCode::BAD_REQUEST, "invalid_root_request")
 }
@@ -470,6 +475,7 @@ async fn create(
             return Err(error);
         }
     };
+    crate::health::download_roots_changed(&tx, None).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, response))
 }
@@ -485,15 +491,21 @@ async fn delete(
         .connect()
         .await
         .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "root_storage_error"))?;
-    if c.execute(
-        "DELETE FROM root_folders WHERE media_type=? AND id=?",
-        params![domain_name(media), key],
-    )
-    .await?
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    if tx
+        .execute(
+            "DELETE FROM root_folders WHERE media_type=? AND id=?",
+            params![domain_name(media), key],
+        )
+        .await?
         == 0
     {
         return Err(Error(StatusCode::NOT_FOUND, "root_not_found"));
     }
+    crate::health::download_roots_changed(&tx, None).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

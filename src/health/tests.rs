@@ -15,13 +15,13 @@ async fn fixture_all() -> (Scratch, Database, Connection) {
     (Scratch(path), db, c)
 }
 // These existing lifecycle cases deliberately use the original two-check registry.
-// Extension cases below use fixture_all and exercise the actual four migration seeds.
+// Extension cases below use fixture_all and exercise the actual six migration seeds.
 async fn fixture() -> (Scratch, Database, Connection) {
     let fixture = fixture_all().await;
     fixture
         .2
         .execute(
-            "DELETE FROM health_checks WHERE check_key='download_client_communication'",
+            "DELETE FROM health_checks WHERE check_key!='completed_download_handling'",
             (),
         )
         .await
@@ -774,6 +774,8 @@ fn mixed(cmd: &HealthCommand, issue_present: bool) -> Vec<CheckOutcome> {
                 } else {
                     None
                 })
+            } else if m.identity.check_key == "download_client_root_folder" {
+                Ok(None)
             } else {
                 Err("check_failed")
             }
@@ -808,7 +810,8 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     let id = admit(&c, HealthScope::All, 102).await;
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
-        assert_eq!(cmd.members.len(), 4);
+        // Registry now contains three checks per domain; retry must retain all six.
+        assert_eq!(cmd.members.len(), 6);
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
             .await
@@ -822,7 +825,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 4 } else { 0 }
+            if attempt < 3 { 6 } else { 0 }
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -875,7 +878,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        4
+        6 // All registered checks retain their pending reasons.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -937,7 +940,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     init(&c, 100).await;
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
-    publish(&c, &cmd, Ok(vec![None; 4]), 101).await.unwrap();
+    publish(&c, &cmd, Ok(vec![None; 6]), 101).await.unwrap();
     for at in 200..212 {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -963,7 +966,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
         .unwrap();
     tx.rollback().await.unwrap();
     assert_eq!(count(&c,"SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,generation);
-    // Coalesce all four while queued, then change one input while the batch is running.
+    // Coalesce all six while queued, then change one input while the batch is running.
     assert_eq!(admit(&c, HealthScope::All, 212).await, queued.id);
     let cmd = take(&c, queued.id, 212).await;
     let tx = c
@@ -991,7 +994,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        4
+        6 // All registered checks retain their pending reasons.
     );
 }
 
@@ -1141,8 +1144,14 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     let first = take(&c, id, 100).await;
     let mut invalid = mixed(&first, true);
     // Late storage failure must roll back an earlier completed member and its transition.
+    // Select the last communication payload explicitly: the newer root member is OK.
+    let last_communication = first
+        .members
+        .iter()
+        .rposition(|m| m.identity.check_key == "download_client_communication")
+        .unwrap();
     invalid
-        .last_mut()
+        .get_mut(last_communication)
         .unwrap()
         .as_mut()
         .unwrap()
@@ -1176,7 +1185,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        2
+        3 // A new TV request now selects all three TV checks.
     );
     assert_eq!(
         count(
@@ -1197,7 +1206,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 2);
+    assert_eq!(next.members.len(), 3); // All three newly requested TV checks survive.
     assert!(
         next.members
             .iter()

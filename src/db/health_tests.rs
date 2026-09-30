@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 43); // Reopen applies communication migration too.
+    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
     for (table, expected) in tables.iter().zip(&before) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
@@ -174,7 +174,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 43); // Current schema, not historical input.
+    assert_eq!(version(&db.connect().await?).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
     Ok(())
 }
 #[tokio::test]
@@ -218,10 +218,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Exactly both TV members must retain generation1; an extra or changed member fails.
+    // All three TV registry identities must retain generation1 after migration44 adds root health.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        2
+        3
     );
     assert_eq!(
         scalar(
@@ -229,7 +229,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        2, // Both TV identities retain admission generation1 despite later dirtying.
+        3, // Three scoped registry identities retain admission generation1 despite later dirtying.
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -392,7 +392,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        2 // The same successful publication covers both registered movie checks.
+        3 // The same publication covers all three registered movie checks after migration44.
     );
     assert!(
         c.execute(
@@ -403,8 +403,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Four registered checks leave exactly124 slots before the unchanged128 ceiling.
-    for i in 0..124 {
+    // Six registered checks leave122 slots; migration44 does not change the128 ceiling.
+    for i in 0..122 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -423,7 +423,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        256 // Each retained command admitted both TV identities.
+        384 // Each of128 retained commands admitted three TV identities after migration44.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -606,8 +606,8 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 43);
-    // Existing states are unchanged; only the two requested registry identities are appended.
+    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
@@ -691,10 +691,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 43);
+        assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 4);
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 6); // Latest registry includes the root-health pair; historical42 checks stay2.
     }
     Ok(())
 }

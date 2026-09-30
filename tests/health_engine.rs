@@ -33,7 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            if v["summary"]["current"] == 4 {
+            // Migration44 adds one root check per domain; wait for all six.
+            if v["summary"]["current"] == 6 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -63,8 +64,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    // Migration43 registers CDH and communication independently in both domains.
-    assert_eq!(fresh["summary"]["never_run"], 4);
+    // Migration44 registers CDH, communication and root checks independently in both domains.
+    assert_eq!(fresh["summary"]["never_run"], 6);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -134,7 +135,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(detail["members"].as_array().unwrap().len(), 4);
+    // Admission includes all three checks in each domain after migration44.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 6);
     let (_, filtered) = request(
         &client,
         &base,

@@ -494,6 +494,8 @@ async fn write(
     let old_metadata=conn.query("SELECT episode_metadata_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let mut ids = BTreeMap::new();
     let mut seasons_done = false;
+    let mut roots_changed = false;
+    let mut mappings_changed = false;
     // Predecessor-schema fixture writers also use this core before retirement exists.
     let has_retirement = conn
         .query(
@@ -630,6 +632,8 @@ async fn write(
                     values,
                 )
                 .await?;
+                roots_changed |= entity.table == "root_folders";
+                mappings_changed |= entity.table == "remote_path_mappings";
                 report.mapped += 1;
                 conn.last_insert_rowid()
             }
@@ -645,6 +649,26 @@ async fn write(
         write_seasons(conn, seasons, &ids, report).await?;
     }
     readers::verify_remote_order(conn, entities, &ids, report).await?;
+    // Historical-schema fixture imports predate health; live imports always have this registry.
+    if (roots_changed || mappings_changed)
+        && conn
+            .query(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='health_checks'",
+                (),
+            )
+            .await?
+            .next()
+            .await?
+            .is_some()
+    {
+        let media = match report.application {
+            Application::Sonarr => crate::api::MediaDomain::Tv,
+            Application::Radarr => crate::api::MediaDomain::Movies,
+        };
+        crate::health::download_roots_changed(conn, if roots_changed { None } else { Some(media) })
+            .await
+            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
+    }
     for (table, data) in &source.tables {
         for (i, row) in data.rows.iter().enumerate() {
             conn.execute("INSERT INTO snapshot_records (application,fingerprint,source_table,ordinal,record_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),table.clone(),i as i64,archive(row)?]).await?;

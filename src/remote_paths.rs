@@ -29,6 +29,11 @@ impl From<libsql::Error> for Error {
         Self(StatusCode::INTERNAL_SERVER_ERROR, "mapping_storage_error")
     }
 }
+impl From<crate::health::Error> for Error {
+    fn from(e: crate::health::Error) -> Self {
+        Self(e.0, e.1)
+    }
+}
 fn bad() -> Error {
     Error(StatusCode::BAD_REQUEST, "invalid_mapping_request")
 }
@@ -512,6 +517,7 @@ async fn write(
    if revision<1||revision>=9007199254740991{return Err(bad())}
    if tx.execute("UPDATE remote_path_mappings SET host=?,remote_path=?,remote_kind=?,remote_key=?,local_path=?,revision=revision+1 WHERE id=? AND media_type=? AND revision=?",params![input.host,input.remote_path,kind,key,input.local_path,id,name(media),revision]).await?!=1{return Err(conflict())}id
   }else{tx.execute("INSERT INTO remote_path_mappings(media_type,host,remote_path,remote_kind,remote_key,local_path) VALUES(?,?,?,?,?,?)",params![name(media),input.host,input.remote_path,kind,key,input.local_path]).await?;tx.last_insert_rowid()};
+  crate::health::download_roots_changed(&tx, Some(media)).await?;
   read(&tx,media,id).await
  }.await;
     match result {
@@ -580,8 +586,11 @@ async fn delete(
     if !(1..=9007199254740991).contains(&revision) {
         return Err(bad());
     }
-    if connection(&db)
-        .await?
+    let c = connection(&db).await?;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    if tx
         .execute(
             "DELETE FROM remote_path_mappings WHERE id=? AND media_type=? AND revision=?",
             params![id(&key)?, name(media), revision],
@@ -591,6 +600,8 @@ async fn delete(
     {
         return Err(conflict());
     }
+    crate::health::download_roots_changed(&tx, Some(media)).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn preview(

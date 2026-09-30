@@ -520,6 +520,17 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
         | Q::Rejected => RemoteFailure,
     }
 }
+// Identity mapping is valid only for local POSIX syntax; never reinterpret an unmapped UNC.
+fn local_download_root(path: &str) -> Option<String> {
+    if path.starts_with("//") {
+        return None;
+    }
+    if path == "/" {
+        return Some(path.into());
+    }
+    crate::library::normalized_path(path)
+}
+
 /// Private download paths and file facts; never directly serialize these into an API response.
 pub(crate) struct OwnedDownloadDetails {
     pub details: qbittorrent::TorrentDetails,
@@ -600,6 +611,70 @@ impl RefreshClient {
         revision: i64,
         domain: MediaDomain,
     ) -> std::result::Result<qbittorrent::EndpointLocality, AutomationError> {
+        self.inspect_client_status_snapshot(provider_id, revision, domain)
+            .await
+            .map(|(_, status, _)| status.locality)
+    }
+
+    /// Fresh active-scope output directories in the configured local path namespace.
+    /// Private facts only: the health engine owns comparisons, invalidation and publication.
+    pub(crate) async fn inspect_download_roots(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<Vec<String>, AutomationError> {
+        let (provider, status, deadline) = self
+            .inspect_client_status_snapshot(provider_id, revision, domain)
+            .await?;
+        let endpoint = url::Url::parse(provider.settings.endpoint())
+            .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let host = crate::remote_paths::host(
+            endpoint
+                .host_str()
+                .ok_or_else(|| RefreshError::new("provider_unavailable", false))?,
+        )
+        .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let work = async {
+            // No DB connection or transaction spans the remote status request above.
+            let connection = self
+                .0
+                .db
+                .connect()
+                .await
+                .map_err(|_| RefreshError::new("storage_error", true))?;
+            let resolution = crate::remote_paths::resolve(
+                &connection,
+                domain,
+                crate::remote_paths::ResolveInput {
+                    host,
+                    path: status.remote_root,
+                    direction: crate::remote_paths::Direction::RemoteToLocal,
+                },
+            )
+            .await
+            .map_err(|_| RefreshError::new("download_root_mapping_failed", false))?;
+            let path = local_download_root(&resolution.output)
+                .ok_or_else(|| RefreshError::new("download_root_unresolved", false))?;
+            current_revision(&self.0.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            Ok::<_, AutomationError>(vec![path])
+        };
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+
+    async fn inspect_client_status_snapshot(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<
+        (Provider, qbittorrent::ClientStatus, tokio::time::Instant),
+        AutomationError,
+    > {
         let context = &self.0;
         let (provider, credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -637,11 +712,13 @@ impl RefreshClient {
             operation
                 .ensure_active()
                 .map_err(|e| refresh_error(http_error(e).0))?;
-            Ok(status.locality)
+            Ok::<_, AutomationError>(status)
         };
-        tokio::time::timeout_at(operation.deadline(), work)
+        let deadline = operation.deadline();
+        let status = tokio::time::timeout_at(deadline, work)
             .await
-            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+            .map_err(|_| RefreshError::new("refresh_timeout", true))??;
+        Ok((provider, status, deadline))
     }
     pub(crate) async fn inspect_download(
         &self,
@@ -1437,6 +1514,24 @@ async fn finish<T>(tx: libsql::Transaction, outcome: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_root_namespace_requires_posix_or_explicit_mapping() {
+        assert_eq!(super::local_download_root("/"), Some("/".into()));
+        assert_eq!(
+            super::local_download_root("/media//downloads/"),
+            Some("/media/downloads".into())
+        );
+        for invalid in [
+            "//server/share",
+            "\\\\server\\share",
+            "C:/downloads",
+            "relative",
+            "/a/../b",
+            "/a\0b",
+        ] {
+            assert_eq!(super::local_download_root(invalid), None, "{invalid}");
+        }
+    }
     use super::*;
     #[test]
     fn configuration_wire_and_domain_validation_are_closed() {

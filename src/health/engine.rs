@@ -513,6 +513,20 @@ async fn evaluate(
             wiki_url: v.wiki_url.into(),
             compatibility_type: v.compatibility_type.into(),
         })),
+        "download_client_root_folder" => {
+            download_roots::evaluate(db, client, domain)
+                .await
+                .map(|issue| {
+                    issue.map(|v| HealthIssue {
+                        identity: member.identity.clone(),
+                        severity: HealthSeverity::Warning,
+                        reason: v.reason.into(),
+                        message: v.message.into(),
+                        wiki_url: v.wiki_url.into(),
+                        compatibility_type: v.compatibility_type.into(),
+                    })
+                })
+        }
         _ => Err("check_failed"),
     }
 }
