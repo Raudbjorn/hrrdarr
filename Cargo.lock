@@ -791,6 +791,7 @@ dependencies = [
  "html-escape",
  "icu_normalizer",
  "icu_properties",
+ "ipnet",
  "libsql",
  "reqwest",
  "ring",

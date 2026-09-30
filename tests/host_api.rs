@@ -28,6 +28,14 @@ struct Process {
 }
 impl Process {
     fn spawn(directory: &Path, bind: &OsStr, hosts: Option<&OsStr>) -> Self {
+        Self::spawn_with_trust(directory, bind, hosts, None)
+    }
+    fn spawn_with_trust(
+        directory: &Path,
+        bind: &OsStr,
+        hosts: Option<&OsStr>,
+        trust: Option<&OsStr>,
+    ) -> Self {
         let output = directory.join("output");
         let file = std::fs::File::create(&output).unwrap();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hrrdarr"));
@@ -42,6 +50,9 @@ impl Process {
             .stderr(file);
         if let Some(hosts) = hosts {
             command.env("HRRDARR_ALLOWED_HOSTS", hosts);
+        }
+        if let Some(trust) = trust {
+            command.env("HRRDARR_TRUSTED_NETWORKS", trust);
         }
         Self {
             child: command.spawn().unwrap(),
@@ -260,9 +271,10 @@ async fn configured_host_filter_guards_real_routes_and_preserves_both_domains() 
     )
     .await;
     assert_eq!(code, 200, "{settings}");
+    // Forwarding is now supported but remains disabled without an explicit trust list.
     assert_eq!(
         settings,
-        json!({"authentication":"none","configured_bind":"127.0.0.1:0","bound_address":origin.strip_prefix("http://").unwrap(),"bind_source":"environment","allowed_hosts":["127.0.0.1","[::1]","allowed.example"],"allowed_hosts_source":"environment","filtering_enabled":true,"mutability":"deployment","apply_mode":"process_restart","capabilities":{"persisted_edits":false,"tls":false,"url_base":false,"trusted_forwarding":false}})
+        json!({"authentication":"none","configured_bind":"127.0.0.1:0","bound_address":origin.strip_prefix("http://").unwrap(),"bind_source":"environment","allowed_hosts":["127.0.0.1","[::1]","allowed.example"],"allowed_hosts_source":"environment","filtering_enabled":true,"mutability":"deployment","apply_mode":"process_restart","trusted_networks":[],"trusted_networks_source":"default","forwarding_enabled":false,"capabilities":{"persisted_edits":false,"tls":false,"url_base":false,"trusted_forwarding":true}})
     );
     let serialized = settings.to_string();
     for secret in [
@@ -561,6 +573,179 @@ async fn invalid_startup_is_rejected_before_database_creation_or_modification() 
                 } else {
                     vec![OsString::from("output")]
                 }
+            );
+        }
+    }
+}
+
+async fn forwarded_request(
+    origin: &str,
+    method: &str,
+    path: &str,
+    forwarded_host: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut request = client
+        .request(method.parse().unwrap(), format!("{origin}{path}"))
+        .header("Host", "internal-proxy.example")
+        .header("X-Forwarded-For", "203.0.113.9")
+        .header("X-Forwarded-Host", forwarded_host)
+        .header("X-Forwarded-Proto", "https")
+        .header("Authorization", "Bearer sentinel-never-authorizes")
+        .header("X-Api-Key", "sentinel-never-authorizes");
+    if let Some(body) = body {
+        request = request
+            .header("content-type", "application/json")
+            .body(body.to_string());
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    )
+}
+#[tokio::test]
+async fn real_binary_forwarded_authority_guards_both_domain_mutations_and_fallbacks() {
+    let scratch = Scratch::new();
+    let mut process = Process::spawn_with_trust(
+        &scratch.0,
+        OsStr::new("127.0.0.1:0"),
+        Some(OsStr::new("external.example")),
+        Some(OsStr::new("127.0.0.1/32")),
+    );
+    let origin = process.ready().await;
+    let (code, settings) = forwarded_request(
+        &origin,
+        "GET",
+        "/api/v1/config/host",
+        "external.example:443",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{settings}");
+    assert_eq!(settings["forwarding_enabled"], true);
+    assert_eq!(settings["trusted_networks_source"], "environment");
+    assert_eq!(settings["trusted_networks"], json!(["127.0.0.1/32"]));
+    assert_eq!(settings["capabilities"]["trusted_forwarding"], true);
+    assert!(!settings.to_string().contains("sentinel"));
+    assert!(!settings.to_string().contains(scratch.0.to_str().unwrap()));
+    for domain in ["tv", "movies"] {
+        let path = format!("/api/v1/{domain}/tags");
+        let (code, error) = forwarded_request(
+            &origin,
+            "POST",
+            &path,
+            "external.example.evil",
+            Some(json!({"label":"denied"})),
+        )
+        .await;
+        assert_eq!(code, 403);
+        assert_eq!(error["error"]["code"], "host_not_allowed");
+        let (code, tag) = forwarded_request(
+            &origin,
+            "POST",
+            &path,
+            "external.example",
+            Some(json!({"label":"forwarded-permitted"})),
+        )
+        .await;
+        assert_eq!(code, 201, "{tag}");
+        assert_eq!(tag["media_type"], domain);
+    }
+    for (method, path) in [
+        ("GET", "/unknown-forwarding-test"),
+        (
+            "POST",
+            "/api/v1/migrations?application=sonarr&dry_run=false",
+        ),
+        ("GET", "/api/v1/filesystem?path=/"),
+        ("POST", "/api/v1/imports"),
+        ("PUT", "/api/v1/config/host"),
+    ] {
+        assert_eq!(
+            forwarded_request(&origin, method, path, "evil.example", Some(json!({})))
+                .await
+                .0,
+            403
+        );
+    }
+    assert_eq!(
+        forwarded_request(
+            &origin,
+            "PUT",
+            "/api/v1/config/host",
+            "external.example",
+            Some(json!({}))
+        )
+        .await
+        .0,
+        405
+    );
+    // Forwarded host cannot repair ambiguous original authority, even from a trusted peer.
+    assert_eq!(raw(&origin,"http://different.example/api/v1/config/host","Host: internal-proxy.example\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Host: external.example\r\n").await,400);
+    assert_eq!(raw(&origin,"/api/v1/config/host","Host: internal-proxy.example\r\nHost: internal-proxy.example\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Host: external.example\r\n").await,400);
+    drop(process);
+    let db = Database::open_local(scratch.0.join("db")).await.unwrap();
+    let connection = db.connect().await.unwrap();
+    let mut rows = connection
+        .query("SELECT media_type,label FROM tags ORDER BY media_type", ())
+        .await
+        .unwrap();
+    for domain in ["movies", "tv"] {
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), domain);
+        assert_eq!(row.get::<String>(1).unwrap(), "forwarded-permitted");
+    }
+    assert!(rows.next().await.unwrap().is_none());
+}
+#[tokio::test]
+async fn invalid_trusted_network_configuration_is_rejected_before_database_access() {
+    let mut inputs = vec![
+        OsString::from("sentinel-private.invalid/24"),
+        OsString::from("127.0.0.1/33"),
+        OsString::from("127.0.0.1\n"),
+        OsString::from("::ffff:127.0.0.1/95"),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        inputs.push(OsString::from_vec(vec![0xff]));
+    }
+    for input in inputs {
+        for existing in [false, true] {
+            let scratch = Scratch::new();
+            let db = scratch.0.join("db");
+            if existing {
+                std::fs::write(&db, b"must-not-be-opened").unwrap();
+            }
+            let mut process = Process::spawn_with_trust(
+                &scratch.0,
+                OsStr::new("127.0.0.1:0"),
+                None,
+                Some(&input),
+            );
+            process.rejected().await;
+            let output = process.output();
+            let diagnostic: Value = serde_json::from_str(output.trim()).unwrap();
+            assert_eq!(diagnostic["event"], "process_failed");
+            assert_eq!(diagnostic["phase"], "host_configuration");
+            assert!(!output.contains("sentinel"));
+            assert!(!output.contains("listening"));
+            if existing {
+                assert_eq!(std::fs::read(&db).unwrap(), b"must-not-be-opened");
+            } else {
+                assert!(!db.exists());
+            }
+            assert_eq!(
+                std::fs::read_dir(&scratch.0).unwrap().count(),
+                if existing { 2 } else { 1 }
             );
         }
     }

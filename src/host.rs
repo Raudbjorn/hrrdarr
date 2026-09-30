@@ -7,6 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+mod forwarding;
+pub use forwarding::EffectiveRequestContext;
+use forwarding::{TrustedNetworks, format_authority};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -59,6 +62,9 @@ pub struct HostSettings {
     pub allowed_hosts: Vec<String>,
     pub allowed_hosts_source: HostSettingSource,
     pub filtering_enabled: bool,
+    pub trusted_networks: Vec<String>,
+    pub trusted_networks_source: HostSettingSource,
+    pub forwarding_enabled: bool,
     pub mutability: HostMutability,
     pub apply_mode: HostApplyMode,
     pub capabilities: HostCapabilities,
@@ -70,17 +76,33 @@ pub struct HostConfig {
     bind_source: HostSettingSource,
     allowed_hosts: Vec<String>,
     allowed_hosts_source: HostSettingSource,
+    trusted_networks: TrustedNetworks,
+    trusted_networks_source: HostSettingSource,
 }
 
 impl HostConfig {
     pub fn from_env() -> Result<Self, &'static str> {
         let bind = environment_value("HRRDARR_BIND")?;
         let hosts = environment_value("HRRDARR_ALLOWED_HOSTS")?;
-        Self::from_values(bind.as_deref(), hosts.as_deref())
+        let networks = environment_value("HRRDARR_TRUSTED_NETWORKS")?;
+        Self::from_values_with_trusted_networks(
+            bind.as_deref(),
+            hosts.as_deref(),
+            networks.as_deref(),
+        )
     }
 
     /// Pure startup parser. Missing and explicitly empty lists preserve permissive behavior.
     pub fn from_values(bind: Option<&str>, hosts: Option<&str>) -> Result<Self, &'static str> {
+        Self::from_values_with_trusted_networks(bind, hosts, None)
+    }
+
+    pub fn from_values_with_trusted_networks(
+        bind: Option<&str>,
+        hosts: Option<&str>,
+        networks: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let trusted_networks = TrustedNetworks::parse(networks)?;
         let bind_value = bind.unwrap_or(DEFAULT_BIND);
         if bind_value.len() > MAX_BIND_BYTES {
             return Err("invalid_bind_address");
@@ -111,6 +133,12 @@ impl HostConfig {
                 HostSettingSource::Default
             },
             allowed_hosts: allowed_hosts.into_iter().collect(),
+            trusted_networks,
+            trusted_networks_source: if networks.is_some() {
+                HostSettingSource::Environment
+            } else {
+                HostSettingSource::Default
+            },
             allowed_hosts_source: if hosts.is_some() {
                 HostSettingSource::Environment
             } else {
@@ -132,6 +160,9 @@ impl HostConfig {
             bound_address: bound.to_string(),
             bind_source: self.bind_source,
             filtering_enabled: !self.allowed_hosts.is_empty(),
+            trusted_networks: self.trusted_networks.strings(),
+            trusted_networks_source: self.trusted_networks_source,
+            forwarding_enabled: self.trusted_networks.enabled(),
             allowed_hosts: self.allowed_hosts,
             allowed_hosts_source: self.allowed_hosts_source,
             mutability: HostMutability::Deployment,
@@ -140,7 +171,7 @@ impl HostConfig {
                 persisted_edits: false,
                 tls: false,
                 url_base: false,
-                trusted_forwarding: false,
+                trusted_forwarding: true,
             },
         });
         app.merge(
@@ -148,7 +179,13 @@ impl HostConfig {
                 .route("/api/v1/config/host", get(read_settings))
                 .with_state(settings.clone()),
         )
-        .layer(middleware::from_fn_with_state(settings, enforce_authority))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(HostPolicy {
+                settings,
+                trusted_networks: self.trusted_networks,
+            }),
+            enforce_authority,
+        ))
     }
 }
 
@@ -219,7 +256,7 @@ fn parse_authority(value: &str) -> Option<(String, Option<u16>)> {
     Some((canonical_host(host)?, port))
 }
 
-fn request_host(request: &Request) -> Option<String> {
+fn request_authority(request: &Request) -> Option<(String, Option<u16>)> {
     let mut values = request.headers().get_all(HOST).iter();
     let header = values
         .next()
@@ -246,42 +283,79 @@ fn request_host(request: &Request) -> Option<String> {
             if uri.0 != header.0 || uri.1.or(default_port) != header.1.or(default_port) {
                 return None;
             }
-            Some(uri.0)
+            Some(uri)
         }
-        (Some(uri), None) => Some(uri.0),
-        (None, Some(header)) => Some(header.0),
+        (Some(uri), None) => Some(uri),
+        (None, Some(header)) => Some(header),
         (None, None) => None,
     }
 }
 
+struct HostPolicy {
+    settings: Arc<HostSettings>,
+    trusted_networks: TrustedNetworks,
+}
+
 async fn enforce_authority(
-    State(settings): State<Arc<HostSettings>>,
-    request: Request,
+    State(policy): State<Arc<HostPolicy>>,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    if settings.filtering_enabled {
-        let Some(host) = request_host(&request) else {
-            return (
+    let settings = &policy.settings;
+    let authority = request_authority(&request).map(format_authority);
+    if (settings.filtering_enabled || settings.forwarding_enabled) && authority.is_none() {
+        return host_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_host_authority",
+            "A single valid HTTP host authority is required",
+        );
+    }
+    let context = match policy.trusted_networks.resolve(&mut request, authority) {
+        Ok(context) => context,
+        Err("transport_peer_unavailable") => {
+            return host_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transport_peer_unavailable",
+                "HTTP transport peer information is unavailable",
+            );
+        }
+        Err(_) => {
+            return host_error(
                 StatusCode::BAD_REQUEST,
-                Json(crate::api::ApiErrorEnvelope::new(
-                    "invalid_host_authority",
-                    "A single valid HTTP host authority is required",
-                )),
-            )
-                .into_response();
-        };
-        if !settings.allowed_hosts.contains(&host) {
-            return (
+                "invalid_forwarded_headers",
+                "Forwarded headers are invalid or exceed supported bounds",
+            );
+        }
+    };
+    if settings.filtering_enabled {
+        let allowed = context
+            .authority
+            .as_deref()
+            .and_then(parse_authority)
+            .is_some_and(|(host, _)| settings.allowed_hosts.contains(&host));
+        if !allowed {
+            return host_error(
                 StatusCode::FORBIDDEN,
-                Json(crate::api::ApiErrorEnvelope::new(
-                    "host_not_allowed",
-                    "HTTP host authority is not allowed",
-                )),
-            )
-                .into_response();
+                "host_not_allowed",
+                "HTTP host authority is not allowed",
+            );
         }
     }
+    request.extensions_mut().insert(context);
     next.run(request).await
+}
+
+fn host_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    (
+        status,
+        Json(crate::api::ApiErrorEnvelope::new(code, message)),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+fn request_host(request: &Request) -> Option<String> {
+    request_authority(request).map(|(host, _)| host)
 }
 
 #[cfg(test)]

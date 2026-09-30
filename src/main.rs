@@ -142,7 +142,11 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
