@@ -33,7 +33,7 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            if v["summary"]["current"] == 2 {
+            if v["summary"]["current"] == 4 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -63,7 +63,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    assert_eq!(fresh["summary"]["never_run"], 2);
+    // Migration43 registers CDH and communication independently in both domains.
+    assert_eq!(fresh["summary"]["never_run"], 4);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -133,7 +134,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(detail["members"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["members"].as_array().unwrap().len(), 4);
     let (_, filtered) = request(
         &client,
         &base,
@@ -170,7 +171,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     // Real provider mutations dirty the union of old/new domains, including bulk deletion.
     let c = db.connect().await.unwrap();
     let tv_before = c
-        .query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        .query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
         .await
         .unwrap()
         .next()
@@ -192,7 +193,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     .await;
     assert_eq!(status, 201, "{provider}");
     assert_eq!(
-        c.query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        c.query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
             .await
             .unwrap()
             .next()
@@ -216,7 +217,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     .await;
     assert_eq!(status, 200, "{updated}");
     assert_eq!(
-        c.query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        c.query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
             .await
             .unwrap()
             .next()
@@ -229,7 +230,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     );
     let movie_before = c
         .query(
-            "SELECT generation FROM health_checks WHERE scope='movies'",
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='completed_download_handling'",
             (),
         )
         .await
@@ -262,7 +263,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     assert_eq!(status, 204, "{error}");
     assert_eq!(
         c.query(
-            "SELECT generation FROM health_checks WHERE scope='movies'",
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='completed_download_handling'",
             ()
         )
         .await
@@ -278,8 +279,16 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let runtime = commands::start(db.clone(), refresh.clone()).await.unwrap();
     assert!(commands::start(db.clone(), refresh).await.is_err());
     let result = wait_current(&client, &base).await;
-    assert_eq!(result["issues"].as_array().unwrap().len(), 1);
-    assert_eq!(result["issues"][0]["identity"]["scope"], "tv");
+    // Two communication warnings now coexist with the original TV CDH warning.
+    assert_eq!(result["issues"].as_array().unwrap().len(), 3);
+    assert!(
+        result["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["identity"]["scope"] == "tv"
+                && v["identity"]["check_key"] == "completed_download_handling")
+    );
     let (_, settings) = request(
         &client,
         &base,
@@ -312,7 +321,16 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     assert_eq!(pending["summary"]["stale"], 1);
-    let generation = pending["checks"][0]["generation"].clone();
+    let cdh = |snapshot: &Value| {
+        snapshot["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identity"]["check_key"] == "completed_download_handling")
+            .unwrap()["generation"]
+            .clone()
+    };
+    let generation = cdh(&pending);
     assert_eq!(
         request(
             &client,
@@ -333,9 +351,16 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(unchanged["checks"][0]["generation"], generation);
+    assert_eq!(cdh(&unchanged), generation);
     let healthy = wait_current(&client, &base).await;
-    assert!(healthy["issues"].as_array().unwrap().is_empty());
+    assert_eq!(healthy["issues"].as_array().unwrap().len(), 2);
+    assert!(
+        healthy["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["identity"]["check_key"] == "download_client_communication")
+    );
     let (_, transitions) = request(
         &client,
         &base,
@@ -344,17 +369,27 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(transitions["items"].as_array().unwrap().len(), 2);
-    assert_eq!(transitions["items"][1]["kind"], "restored");
+    assert_eq!(transitions["items"].as_array().unwrap().len(), 4);
+    let restored = transitions["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["kind"] == "restored")
+        .unwrap();
     assert_eq!(
-        transitions["items"][1]["issue"]["compatibility_type"],
+        restored["issue"]["identity"]["check_key"],
+        "completed_download_handling"
+    );
+    assert_eq!(
+        restored["issue"]["compatibility_type"],
         "ImportMechanismCheck"
     );
     runtime.shutdown().await;
     let c = db.connect().await.unwrap();
     let epoch = healthy["lifecycle"]["epoch"].as_str().unwrap();
+    // Synthetic diagnostic events explicitly belong to first attempts; no legacy provenance is invented.
     for _ in 0..1025 {
-        c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,'tv','completed_download_handling','issue',0,1,2,'test','test','https://example.invalid','ImportMechanismCheck')",libsql::params![uuid::Uuid::new_v4().to_string(),epoch,uuid::Uuid::new_v4().to_string()]).await.unwrap();
+        c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,1,'tv','completed_download_handling','issue',0,1,2,'test','test','https://example.invalid','ImportMechanismCheck')",libsql::params![uuid::Uuid::new_v4().to_string(),epoch,uuid::Uuid::new_v4().to_string()]).await.unwrap();
     }
     let (_, gap) = request(
         &client,
@@ -382,7 +417,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     // Maximum-byte issue text with worst-case JSON escaping remains a bounded real response.
     let message = "\u{0001}".repeat(4096);
     let wiki = "\u{0001}".repeat(2048);
-    c.execute("UPDATE health_checks SET severity=2,reason='bounded',message=?,wiki_url=? WHERE scope='tv'",libsql::params![message,wiki]).await.unwrap();
+    c.execute("UPDATE health_checks SET severity=2,reason='bounded',message=?,wiki_url=? WHERE scope='tv' AND check_key='completed_download_handling'",libsql::params![message,wiki]).await.unwrap();
     let response = client
         .get(format!("{base}/api/v1/health"))
         .send()
@@ -392,7 +427,13 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let bytes = response.bytes().await.unwrap();
     assert!(bytes.len() < 1024 * 1024);
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["issues"][0]["message"].as_str().unwrap().len(), 4096);
+    assert!(
+        body["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["message"].as_str().unwrap().len() == 4096)
+    );
     server.abort();
     let _ = server.await;
 }

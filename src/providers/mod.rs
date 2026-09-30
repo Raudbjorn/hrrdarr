@@ -483,12 +483,116 @@ fn refresh_error(error: Error) -> RefreshError {
         _ => RefreshError::new("refresh_failed", true),
     }
 }
+/// Private health distinction, before lossy public automation error mapping.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommunicationProbeError {
+    RemoteFailure,
+    Unevaluated(&'static str),
+}
+fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError {
+    use CommunicationProbeError::{RemoteFailure, Unevaluated};
+    use http::HttpError as H;
+    use qbittorrent::QbitError as Q;
+    match error {
+        Q::Http(H::LocalUnavailable { timeout: true }) => Unevaluated("check_timeout"),
+        Q::Http(
+            H::LocalUnavailable { timeout: false }
+            | H::Busy
+            | H::InvalidRequest
+            | H::ResponseTooLarge,
+        )
+        | Q::InvalidRequest
+        | Q::ScopeConflict
+        | Q::UnsupportedFeature
+        | Q::UnsafeRetention
+        | Q::NotFound
+        | Q::MutationUnknown => Unevaluated("check_failed"),
+        Q::Http(
+            H::Authentication
+            | H::RateLimited { .. }
+            | H::Redirect
+            | H::Transport
+            | H::Timeout
+            | H::InvalidResponse,
+        )
+        | Q::InvalidResponse
+        | Q::UnsupportedVersion
+        | Q::Rejected => RemoteFailure,
+    }
+}
 /// Private download paths and file facts; never directly serialize these into an API response.
 pub(crate) struct OwnedDownloadDetails {
     pub details: qbittorrent::TorrentDetails,
     pub host: String,
 }
 impl RefreshClient {
+    /// Read the actual scoped item list; connection/version success alone is insufficient.
+    pub(crate) async fn probe_download_communication(
+        &self,
+        id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<(), CommunicationProbeError> {
+        use CommunicationProbeError::Unevaluated;
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, id),
+        )
+        .await
+        .map_err(|_| Unevaluated("check_timeout"))?
+        .map_err(|error| match error {
+            Error::Plain(_, "provider_database_error", _) => Unevaluated("storage_error"),
+            _ => Unevaluated("check_failed"),
+        })?;
+        let scoped = match &provider.settings {
+            ProviderSettings::Qbittorrent { tv, movies, .. } => match domain {
+                MediaDomain::Tv => tv.is_some(),
+                MediaDomain::Movies => movies.is_some(),
+            },
+            _ => false,
+        };
+        if provider.revision != revision || !provider.enabled || !scoped {
+            return Err(Unevaluated("check_failed"));
+        }
+        provider
+            .settings
+            .validate()
+            .map_err(|_| Unevaluated("check_failed"))?;
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|_| Unevaluated("check_failed"))?;
+        // Acquisition cooldown is old evidence; an HTTP429 returned by the probe is new evidence.
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|_| Unevaluated("check_failed"))?;
+        let work = async {
+            let result = qbittorrent::refresh_pages(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                domain,
+            )
+            .await
+            .map(|_| ())
+            .map_err(communication_error);
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(|error| match error {
+                    Error::Plain(_, "provider_database_error", _) => Unevaluated("storage_error"),
+                    _ => Unevaluated("check_failed"),
+                })?;
+            operation
+                .ensure_active()
+                .map_err(|_| Unevaluated("check_timeout"))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| Unevaluated("check_timeout"))?
+    }
     /// Fresh, revision-fenced status for health; never exposes remote paths or credentials.
     pub(crate) async fn inspect_client_status(
         &self,
@@ -1118,7 +1222,7 @@ async fn health_configuration_changed(
     }
     for (selected, domain) in [(tv, MediaDomain::Tv), (movies, MediaDomain::Movies)] {
         if selected {
-            crate::health::configuration_changed(c, domain)
+            crate::health::provider_configuration_changed(c, domain)
                 .await
                 .map_err(|e| {
                     Error::Plain(e.0, e.1, "Health configuration could not be recorded")
@@ -1475,6 +1579,9 @@ fn http_error(error: http::HttpError) -> (Error, &'static str) {
     use http::HttpError as H;
     match error {
         H::InvalidRequest => (bad(), "invalid_request"),
+        H::LocalUnavailable { timeout } => {
+            http_error(if timeout { H::Timeout } else { H::Transport })
+        }
         H::Authentication => (
             Error::Plain(
                 StatusCode::BAD_GATEWAY,
@@ -1590,10 +1697,35 @@ async fn record_test(
     let tested_at = i64::try_from(now).map_err(|_| corrupt())?;
     let conn = db.connect().await?;
     let status = if code.is_none() { "success" } else { "failure" };
-    let changed=conn.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,?,?,? FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code",params![tested_at,status,code,provider.id.to_string(),provider.revision]).await?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let previous = tx.query("SELECT status,error_code FROM provider_tests WHERE provider_id=? AND config_revision=?", params![provider.id.to_string(),provider.revision]).await?.next().await?
+        .map(|row| -> Result<(String,Option<String>)> { Ok((row.get(0)?,row.get(1)?)) }).transpose()?;
+    let changed=tx.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,?,?,? FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code",params![tested_at,status,code,provider.id.to_string(),provider.revision]).await?;
     if changed != 1 {
         return Err(conflict());
     }
+    let different = previous
+        .as_ref()
+        .is_none_or(|(old_status, old_code)| old_status != status || old_code.as_deref() != code);
+    if different {
+        if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
+            for (selected, domain) in [
+                (tv.is_some(), MediaDomain::Tv),
+                (movies.is_some(), MediaDomain::Movies),
+            ] {
+                if selected {
+                    crate::health::communication_status_changed(&tx, domain)
+                        .await
+                        .map_err(|e| {
+                            Error::Plain(e.0, e.1, "Health observation could not be recorded")
+                        })?;
+                }
+            }
+        }
+    }
+    tx.commit().await?;
     eprintln!(
         "{}",
         serde_json::json!({"level":if code.is_none(){"INFO"}else{"ERROR"},"event":"provider_test_completed","provider_id":provider.id,"revision":provider.revision,"result":status,"error_code":code,"correlation_id":Uuid::new_v4()})
@@ -1990,4 +2122,53 @@ async fn path_preview(
         provider_revision: provider.revision,
         resolution,
     }))
+}
+
+#[cfg(test)]
+mod communication_error_tests {
+    use super::*;
+    #[test]
+    fn raw_probe_classification_keeps_local_limits_unevaluated_and_legacy_errors() {
+        use CommunicationProbeError::*;
+        use http::HttpError as H;
+        use qbittorrent::QbitError as Q;
+        for error in [
+            H::Authentication,
+            H::Transport,
+            H::Timeout,
+            H::Redirect,
+            H::InvalidResponse,
+            H::RateLimited {
+                retry_after_seconds: Some(60),
+            },
+        ] {
+            assert_eq!(communication_error(Q::Http(error)), RemoteFailure);
+        }
+        for error in [Q::UnsupportedVersion, Q::InvalidResponse, Q::Rejected] {
+            assert_eq!(communication_error(error), RemoteFailure);
+        }
+        for error in [
+            Q::UnsupportedFeature,
+            Q::InvalidRequest,
+            Q::ScopeConflict,
+            Q::Http(H::Busy),
+            Q::Http(H::ResponseTooLarge),
+            Q::Http(H::LocalUnavailable { timeout: false }),
+        ] {
+            assert_eq!(communication_error(error), Unevaluated("check_failed"));
+        }
+        assert_eq!(
+            communication_error(Q::Http(H::LocalUnavailable { timeout: true })),
+            Unevaluated("check_timeout")
+        );
+        for timeout in [false, true] {
+            let local = refresh_error(http_error(H::LocalUnavailable { timeout }).0);
+            let prior =
+                refresh_error(http_error(if timeout { H::Timeout } else { H::Transport }).0);
+            assert_eq!(
+                (local.code, local.retryable, local.retry_after_seconds),
+                (prior.code, prior.retryable, prior.retry_after_seconds)
+            );
+        }
+    }
 }

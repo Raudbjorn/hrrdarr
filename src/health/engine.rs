@@ -282,6 +282,15 @@ async fn fail(c: &Connection, cmd: &HealthCommand, timestamp: i64, code: &str) -
         )
         .await?;
     }
+    settle_failure(c, cmd, timestamp, code, retry).await
+}
+async fn settle_failure(
+    c: &Connection,
+    cmd: &HealthCommand,
+    timestamp: i64,
+    code: &str,
+    retry: bool,
+) -> Result<()> {
     let delay = (1i64 << cmd.attempts) + i64::from(Uuid::new_v4().as_bytes()[0] % 3);
     c.execute("UPDATE health_commands SET status=?,next_attempt_at=?,completed_at=?,error_code=? WHERE id=?",params![if retry{"retry_wait"}else{"failed"},timestamp+delay,if retry{None}else{Some(timestamp)},code,cmd.id.to_string()]).await?;
     Ok(())
@@ -337,36 +346,90 @@ async fn transition(
     if seq >= MAX_INTEGER {
         return Err(Error(StatusCode::CONFLICT, "health_generation_exhausted"));
     }
-    c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![Uuid::new_v4().to_string(),cmd.epoch.to_string(),cmd.id.to_string(),v.identity.scope.text(),v.identity.check_key.clone(),kind,in_grace,timestamp,v.severity.number(),v.reason.clone(),v.message.clone(),v.wiki_url.clone(),v.compatibility_type.clone()]).await?;
+    c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![Uuid::new_v4().to_string(),cmd.epoch.to_string(),cmd.id.to_string(),i64::from(cmd.attempts),v.identity.scope.text(),v.identity.check_key.clone(),kind,in_grace,timestamp,v.severity.number(),v.reason.clone(),v.message.clone(),v.wiki_url.clone(),v.compatibility_type.clone()]).await?;
     Ok(())
 }
+/// A completed observation (including an Error issue) differs from inability to evaluate.
+type CheckOutcome = std::result::Result<Option<HealthIssue>, &'static str>;
+
+#[cfg(test)]
 async fn publish(
     c: &Connection,
     cmd: &HealthCommand,
     results: std::result::Result<Vec<Option<HealthIssue>>, &'static str>,
     timestamp: i64,
 ) -> Result<()> {
+    let outcomes = match results {
+        Ok(values) => values.into_iter().map(Ok).collect(),
+        Err(code) => cmd.members.iter().map(|_| Err(code)).collect(),
+    };
+    publish_outcomes(c, cmd, outcomes, timestamp).await
+}
+
+async fn publish_outcomes(
+    c: &Connection,
+    cmd: &HealthCommand,
+    results: Vec<CheckOutcome>,
+    timestamp: i64,
+) -> Result<()> {
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
-if !still_running(&tx,cmd).await?{return Ok(())}
-let stale=tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1",[cmd.id.to_string()]).await?.next().await?.is_some();if stale{return fail(&tx,cmd,timestamp,"stale_inputs").await}
-let results=match results {Ok(v)=>v,Err(code)=>return fail(&tx,cmd,timestamp,code).await};if results.len()!=cmd.members.len(){return Err(invariant())}
-let life=lifecycle(&tx).await?;let in_grace=life.grace_phase!="expired";
-for (m,new) in cmd.members.iter().zip(results){if new.as_ref().is_some_and(|v|v.identity!=m.identity||v.severity==HealthSeverity::Ok){return Err(invariant())}
-let old=issue(&tx,&m.identity).await?;match (&old,&new){(None,Some(v))=>transition(&tx,cmd,v,"issue",in_grace,timestamp).await?,(Some(v),None)=>transition(&tx,cmd,v,"restored",in_grace,timestamp).await?,_=>{}}
-tx.execute("UPDATE health_checks SET observed_generation=generation,observed_epoch=?,checked_at=?,last_error=NULL,severity=?,reason=?,message=?,wiki_url=?,pending_reasons=0,due_at=NULL WHERE scope=? AND check_key=?",params![cmd.epoch.to_string(),timestamp,new.as_ref().map_or(0,|v|v.severity.number()),new.as_ref().map(|v|v.reason.clone()),new.as_ref().map(|v|v.message.clone()),new.as_ref().map(|v|v.wiki_url.clone()),m.identity.scope.text(),m.identity.check_key.clone()]).await?;}
-if cmd.is_grace {
-if life.epoch!=cmd.epoch||life.grace_phase!="rechecking"||life.grace_due_at>timestamp{return Err(invariant())}
-let missing=tx.query("SELECT 1 FROM health_checks h WHERE startup=1 AND NOT EXISTS(SELECT 1 FROM health_command_checks m WHERE m.command_id=? AND m.scope=h.scope AND m.check_key=h.check_key) LIMIT 1",[cmd.id.to_string()]).await?.next().await?.is_some();if missing{return Err(invariant())}
-for key in selection(&tx,HealthScope::All,"severity>0").await?{if let Some(v)=issue(&tx,&key.identity).await?{transition(&tx,cmd,&v,"issue",false,timestamp).await?;}}
-tx.execute("UPDATE health_lifecycle SET grace_phase='expired',last_batch_completed_at=? WHERE id=1",[timestamp]).await?;
-}else{tx.execute("UPDATE health_lifecycle SET last_batch_completed_at=? WHERE id=1",[timestamp]).await?;}
-tx.execute("UPDATE health_commands SET status='succeeded',completed_at=?,error_code=NULL WHERE id=?",params![timestamp,cmd.id.to_string()]).await?;Ok(())}.await;
+    let outcome = async {
+        if !still_running(&tx, cmd).await? { return Ok(()); }
+        // A changed input invalidates this whole attempt, including completed observations.
+        let stale = tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1", [cmd.id.to_string()]).await?.next().await?.is_some();
+        if stale { return fail(&tx,cmd,timestamp,"stale_inputs").await; }
+        if results.len() != cmd.members.len() { return Err(invariant()); }
+        let error = results.iter().find_map(|v| v.as_ref().err().copied());
+        let retry = error.is_some() && cmd.attempts < 3;
+        let life = lifecycle(&tx).await?;
+        let in_grace = life.grace_phase != "expired";
+        for (member, result) in cmd.members.iter().zip(results) {
+            match result {
+                Ok(new) => {
+                    if new.as_ref().is_some_and(|v| v.identity != member.identity || v.severity == HealthSeverity::Ok) { return Err(invariant()); }
+                    let old = issue(&tx,&member.identity).await?;
+                    match (&old,&new) {
+                        (None,Some(v)) => transition(&tx,cmd,v,"issue",in_grace,timestamp).await?,
+                        (Some(v),None) => transition(&tx,cmd,v,"restored",in_grace,timestamp).await?,
+                        _ => {}
+                    }
+                    tx.execute("UPDATE health_checks SET observed_generation=generation,observed_epoch=?,checked_at=?,last_error=NULL,severity=?,reason=?,message=?,wiki_url=? WHERE scope=? AND check_key=?",params![cmd.epoch.to_string(),timestamp,new.as_ref().map_or(0,|v|v.severity.number()),new.as_ref().map(|v|v.reason.clone()),new.as_ref().map(|v|v.message.clone()),new.as_ref().map(|v|v.wiki_url.clone()),member.identity.scope.text(),member.identity.check_key.clone()]).await?;
+                }
+                Err(code) => {
+                    // Only the failed member's error changes; its observed payload remains intact.
+                    tx.execute("UPDATE health_checks SET last_error=? WHERE scope=? AND check_key=?",params![code,member.identity.scope.text(),member.identity.check_key.clone()]).await?;
+                }
+            }
+            if !retry {
+                // Partial grace exhaustion services only its grace reason, preserving other work.
+                let grace_only = cmd.is_grace && error.is_some();
+                tx.execute("UPDATE health_checks SET pending_reasons=CASE WHEN ? THEN pending_reasons & 15 ELSE 0 END,due_at=CASE WHEN ? AND (pending_reasons & 15)!=0 THEN due_at ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![grace_only,grace_only,member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;
+            }
+        }
+        if let Some(code) = error {
+            // Retain ALL selected pending markers while retrying: claim must recapture every
+            // frozen member, and a previously completed observation may change next attempt.
+            if !retry { reset_grace(&tx,cmd,timestamp,60).await?; }
+            settle_failure(&tx,cmd,timestamp,code,retry).await?;
+            return Ok(());
+        }
+        if cmd.is_grace {
+            if life.epoch != cmd.epoch || life.grace_phase != "rechecking" || life.grace_due_at > timestamp { return Err(invariant()); }
+            let missing=tx.query("SELECT 1 FROM health_checks h WHERE startup=1 AND NOT EXISTS(SELECT 1 FROM health_command_checks m WHERE m.command_id=? AND m.scope=h.scope AND m.check_key=h.check_key) LIMIT 1",[cmd.id.to_string()]).await?.next().await?.is_some();
+            if missing { return Err(invariant()); }
+            for key in selection(&tx,HealthScope::All,"severity>0").await? {
+                if let Some(v)=issue(&tx,&key.identity).await? { transition(&tx,cmd,&v,"issue",false,timestamp).await?; }
+            }
+            tx.execute("UPDATE health_lifecycle SET grace_phase='expired',last_batch_completed_at=? WHERE id=1",[timestamp]).await?;
+        }
+        tx.execute("UPDATE health_lifecycle SET last_batch_completed_at=? WHERE id=1",[timestamp]).await?;
+        tx.execute("UPDATE health_commands SET status='succeeded',completed_at=?,error_code=NULL WHERE id=?",params![timestamp,cmd.id.to_string()]).await?;
+        Ok(())
+    }.await;
     let result = finish(tx, outcome).await;
     if matches!(&result, Err(Error(_, "health_generation_exhausted"))) {
-        // Publication has rolled back. Preserve the cause across generic worker recovery.
         c.execute(
             "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1 AND epoch=?",
             [cmd.epoch.to_string()],
@@ -388,37 +451,70 @@ async fn run_with_deadline(
     cmd: HealthCommand,
     deadline: Duration,
 ) -> Result<()> {
-    let probe = async {
-        let mut results = Vec::new();
-        for member in &cmd.members {
-            let domain = match member.identity.scope {
-                HealthScope::Tv => MediaDomain::Tv,
-                HealthScope::Movies => MediaDomain::Movies,
-                _ => return Err("check_failed"),
-            };
-            if member.identity.check_key != "completed_download_handling" {
-                return Err("check_failed");
-            }
-            let result = crate::health_detectors::evaluate_current(db, client, domain).await?;
-            results.push(result.map(|v| HealthIssue {
-                identity: member.identity.clone(),
-                severity: HealthSeverity::Warning,
-                reason: v.reason.into(),
-                message: v.message.into(),
-                wiki_url: v.wiki_url.into(),
-                compatibility_type: v.compatibility_type.into(),
-            }));
-        }
-        Ok(results)
-    };
-    let bounded = tokio::time::timeout(deadline, probe);
-    tokio::pin!(bounded);
+    // Keep outcomes outside the cancellable current-check future: deadline must not erase
+    // completed independent observations. Communication runs first to observe remote failures
+    // before a CDH status probe can populate the shared transport's cooldown.
+    let mut results: Vec<CheckOutcome> = cmd.members.iter().map(|_| Err("check_timeout")).collect();
+    let mut order: Vec<usize> = (0..cmd.members.len()).collect();
+    order.sort_by_key(|&i| cmd.members[i].identity.check_key != "download_client_communication");
+    let until = tokio::time::Instant::now() + deadline;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let result = loop {
-        tokio::select! {result=&mut bounded=>break result.unwrap_or(Err("check_timeout")),_=tick.tick()=>{if !still_running(&db.connect().await?,&cmd).await?{return Ok(())}}}
+    for index in order {
+        let probe = evaluate(db, client, &cmd.members[index]);
+        tokio::pin!(probe);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _=tokio::time::sleep_until(until)=>break None,
+                _=tick.tick()=>{if !still_running(&db.connect().await?,&cmd).await? { return Ok(()); }},
+                value=&mut probe=>break Some(value),
+            }
+        };
+        match outcome {
+            Some(value) => results[index] = value,
+            None => break,
+        }
+    }
+    publish_outcomes(&db.connect().await?, &cmd, results, now()?).await
+}
+async fn evaluate(
+    db: &Database,
+    client: &crate::providers::RefreshClient,
+    member: &HealthMember,
+) -> CheckOutcome {
+    let domain = match member.identity.scope {
+        HealthScope::Tv => MediaDomain::Tv,
+        HealthScope::Movies => MediaDomain::Movies,
+        _ => return Err("check_failed"),
     };
-    publish(&db.connect().await?, &cmd, result, now()?).await
+    match member.identity.check_key.as_str() {
+        "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
+            db, client, domain,
+        )
+        .await?
+        .map(|v| HealthIssue {
+            identity: member.identity.clone(),
+            severity: HealthSeverity::Warning,
+            reason: v.reason.into(),
+            message: v.message.into(),
+            wiki_url: v.wiki_url.into(),
+            compatibility_type: v.compatibility_type.into(),
+        })),
+        "download_client_communication" => Ok(crate::health_detectors::evaluate_communication(
+            db, client, domain,
+        )
+        .await?
+        .map(|v| HealthIssue {
+            identity: member.identity.clone(),
+            severity: v.severity,
+            reason: v.reason.into(),
+            message: v.message.into(),
+            wiki_url: v.wiki_url.into(),
+            compatibility_type: v.compatibility_type.into(),
+        })),
+        _ => Err("check_failed"),
+    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ impl Drop for Scratch {
 struct Remote {
     mode: AtomicU8,
     calls: Mutex<Vec<String>>,
+    blocked_prefix: Mutex<Option<String>>,
     started: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
 }
@@ -38,12 +39,25 @@ impl Default for Remote {
         Self {
             mode: AtomicU8::new(0),
             calls: Mutex::new(vec![]),
+            blocked_prefix: Mutex::new(None),
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
         }
     }
 }
 impl Remote {
+    fn refresh_reads_for(&self, prefix: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|uri| {
+                uri.split('?').next().is_some_and(|path| {
+                    path.starts_with(prefix) && path.ends_with("/torrents/info")
+                })
+            })
+            .count()
+    }
     fn refresh_reads(&self) -> usize {
         self.calls
             .lock()
@@ -67,7 +81,7 @@ async fn remote(
     if uri.path().ends_with("webapiVersion") {
         return "2.8.3".into_response();
     }
-    // Health uses the same read-only transport but does not fetch queue pages.
+    // CDH status checks use preferences/categories; communication health also fetches items.
     if uri.path().ends_with("app/preferences") {
         return axum::Json(json!({"save_path":"/fixture-downloads","max_ratio_enabled":false,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response();
     }
@@ -78,7 +92,19 @@ async fn remote(
         .into_response();
     }
     if uri.path().ends_with("torrents/info") {
-        match s.mode.load(Ordering::SeqCst) {
+        // Revision-specific endpoint prefixes let the edit-race test hold only the old
+        // configuration's request. New-revision health traffic has independent ownership.
+        let selected = s
+            .blocked_prefix
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|prefix| uri.path().starts_with(prefix));
+        match if selected {
+            s.mode.load(Ordering::SeqCst)
+        } else {
+            0
+        } {
             1 => return (StatusCode::SERVICE_UNAVAILABLE, "PRIVATE_REMOTE_ERROR").into_response(),
             mode @ (2 | 3) => {
                 s.started.notify_one();
@@ -155,6 +181,15 @@ async fn submit(base: &str, provider: &Value, media: &str) -> Value {
     let (c, v) = request(base, "POST", "/api/v1/commands", input(provider, media)).await;
     assert_eq!(c, 202, "{v}");
     v
+}
+// A held-request handshake must belong to the commanded refresh, not normal-priority
+// startup communication health. Other tests retain normal priority to exercise ordering.
+async fn submit_high(base: &str, provider: &Value, media: &str) -> Value {
+    let mut body = input(provider, media);
+    body["priority"] = json!("high");
+    let (code, command) = request(base, "POST", "/api/v1/commands", body).await;
+    assert_eq!(code, 202, "{command}");
+    command
 }
 // These command/lease tests control every admitted read. CDH now provisions
 // inherited observation, so explicitly suppress only this fixture's scopes before
@@ -256,7 +291,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     let (app, client) = providers::router_with_refresh(db.clone(), None);
     let (base, server) = serve(app.merge(commands::router(db.clone()))).await;
     let scope = |category| json!({"category":category,"imported_category":null,"recent_priority":0,"older_priority":1});
-    let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
+    let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("{endpoint}/config-1/"),"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
     let (code, provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201, "{provider}");
     suppress_observation(&base, &provider).await;
@@ -346,7 +381,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     runtime.shutdown().await;
     // Active cancellation wins publication and releases the actual transport operation.
     remote_state.mode.store(2, Ordering::SeqCst);
-    let cancelled = submit(&base, &provider, "movies").await;
+    let cancelled = submit_high(&base, &provider, "movies").await;
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), remote_state.started.notified())
         .await
@@ -385,7 +420,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
         .release
         .forget_permits(remote_state.release.available_permits());
     remote_state.mode.store(2, Ordering::SeqCst);
-    let interrupted = submit(&base, &provider, "tv").await;
+    let interrupted = submit_high(&base, &provider, "tv").await;
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), remote_state.started.notified())
         .await
@@ -459,6 +494,7 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     let mut changed = config;
     changed["revision"] = json!(1);
     changed["name"] = json!("edited");
+    changed["settings"]["endpoint"] = json!(format!("{endpoint}/config-2/"));
     let (code, new_provider) = request(
         &base,
         "PUT",
@@ -496,16 +532,16 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
         .0,
         404
     );
-    // Isolate the stale command from valid new-revision scheduled reads, while
-    // retaining exact queue-read and attempt assertions; startup health may probe status.
+    // Distinct endpoint paths identify captured old-revision requests. New health may
+    // fetch items on config-2; the obsolete command must never fetch config-1 again.
     suppress_observation(&base, &new_provider).await;
-    let calls = remote_state.refresh_reads();
+    let calls = remote_state.refresh_reads_for("/config-1/");
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, stale["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["error_code"], "provider_changed");
     assert_eq!(failed["attempts"], 0);
     runtime.shutdown().await;
-    assert_eq!(remote_state.refresh_reads(), calls);
+    assert_eq!(remote_state.refresh_reads_for("/config-1/"), calls);
     assert_eq!(
         request(
             &base,
@@ -538,7 +574,7 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     let (base, server) = serve(app.merge(commands::router(db.clone()))).await;
     let scope =
         |c| json!({"category":c,"imported_category":null,"recent_priority":0,"older_priority":1});
-    let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
+    let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("{endpoint}/config-1/"),"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
     let (code, provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201);
     suppress_observation(&base, &provider).await;
@@ -596,9 +632,10 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     .await
     .unwrap();
     conn.execute("UPDATE commands SET status='retry_wait',next_attempt_at=9007199254740000,error_code='refresh_failed' WHERE id=?",[stale["id"].as_str().unwrap()]).await.unwrap();
-    let mut change = config;
+    let mut change = config.clone();
     change["revision"] = json!(1);
     change["name"] = json!("new revision");
+    change["settings"]["endpoint"] = json!(format!("{endpoint}/config-2/"));
     let (code, provider) = request(
         &base,
         "PUT",
@@ -607,13 +644,14 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     )
     .await;
     assert_eq!(code, 200);
-    // Health status GETs are independent; an obsolete refresh must fetch no queue page.
-    let calls = state.refresh_reads();
+    // New-revision health GetItems is legitimate; only the captured old endpoint
+    // must remain unread by the obsolete retry.
+    let calls = state.refresh_reads_for("/config-1/");
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, stale["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["attempts"], 1);
     assert_eq!(failed["error_code"], "provider_changed");
-    assert_eq!(state.refresh_reads(), calls);
+    assert_eq!(state.refresh_reads_for("/config-1/"), calls);
     let corrected = submit(&base, &provider, "tv").await;
     until(&base, corrected["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
@@ -630,14 +668,46 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
             .unwrap();
         }
     }
-    // Exhausted refresh attempts cannot repeat a queue read; health still evaluates normally.
-    let calls = state.refresh_reads();
+    // Keep the same valid revision: attempt exhaustion, not provider invalidation,
+    // must prevent another refresh. Startup health legitimately reads one item page
+    // per configured domain; wait for that exact batch before checking traffic below.
+    let calls = state.refresh_reads_for("/config-2/");
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, exhausted["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["attempts"], 3);
     assert_eq!(failed["error_code"], "interrupted");
+    // Let the actual startup-health batch finish before constructing the full-pool case.
+    // Otherwise an already-admitted health command could legitimately fetch items even
+    // though capacity correctly rejects every NEW refresh/health admission below.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+            if current == 4 { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.unwrap();
     runtime.shutdown().await;
-    assert_eq!(state.refresh_reads(), calls);
+    assert_eq!(
+        state.refresh_reads_for("/config-2/"),
+        calls + 2,
+        "exactly one communication-health page per domain; exhausted refresh adds none"
+    );
+    assert_eq!(failed["id"], exhausted["id"]);
+    assert_eq!(
+        request(
+            &base,
+            "GET",
+            &format!(
+                "/api/v1/queue?provider_id={}&media_type=tv",
+                provider["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .await
+        .1["command_id"],
+        corrected["id"],
+        "health and exhausted recovery must preserve the previous snapshot owner"
+    );
     // Fill explicitly retained history without network calls; no implicit pruning or ignored scheduler failure.
     enable_observation(&base, &provider, "movies").await;
     let tx = conn
@@ -669,7 +739,7 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     // occupy the shared pool), so it is not actually full yet. Pad it with genuinely active
     // search_commands rows (no per-target uniqueness, unlike `commands` itself) against a minimal
     // fixture episode, using a far-future next_attempt_at so neither live worker below claims them.
-    // The joined worker may leave active health work; count it in the same 1024-slot pool.
+    // Count every command kind in the same 1024-slot pool; health has settled above.
     const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
     conn.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Pad','/pad');INSERT INTO seasons VALUES(1,1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One');").await.unwrap();
     let search_indexer_id = uuid::Uuid::new_v4().to_string();
@@ -721,7 +791,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
             .0,
         429
     );
-    // Capacity rejection prevents refresh queue reads, independently of health status traffic.
+    // All slots now belong to future-due padding, so both new refresh and new health
+    // admission are rejected. With no previously active probe, zero item reads is exact.
     let calls = state.refresh_reads();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let full = tokio::time::timeout(Duration::from_secs(5), async {
@@ -833,7 +904,7 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
     let (app, client) = providers::router_with_refresh(db.clone(), None);
     let (base, server) = serve(app.merge(commands::router(db.clone()))).await;
     let scope = |category| json!({"category": category, "imported_category": null, "recent_priority": 0, "older_priority": 1});
-    let config = json!({"name": "shared", "enabled": true, "priority": 1, "settings": {"implementation": "qbittorrent", "endpoint": endpoint, "tv": scope("tv"), "movies": scope("movies")}, "credentials": null});
+    let config = json!({"name": "shared", "enabled": true, "priority": 1, "settings": {"implementation": "qbittorrent", "endpoint": format!("{endpoint}/config-1/"), "tv": scope("tv"), "movies": scope("movies")}, "credentials": null});
     let (code, mut provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
     assert_eq!(code, 201);
     suppress_observation(&base, &provider).await;
@@ -842,8 +913,16 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             state
                 .release
                 .forget_permits(state.release.available_permits());
+            let old_prefix = format!("/config-{}/", provider["revision"].as_i64().unwrap());
+            *state.blocked_prefix.lock().unwrap() = Some(old_prefix.clone());
             state.mode.store(mode, Ordering::SeqCst);
-            let command = submit(&base, &provider, media).await;
+            let old_calls = state.refresh_reads_for(&old_prefix);
+            // An explicit high-priority command runs before the normal startup-health batch,
+            // so this fixture's started notification cannot belong to health instead.
+            let mut command_input = input(&provider, media);
+            command_input["priority"] = json!("high");
+            let (code, command) = request(&base, "POST", "/api/v1/commands", command_input).await;
+            assert_eq!(code, 202, "{command}");
             let id = command["id"].as_str().unwrap();
             let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), state.started.notified())
@@ -858,6 +937,8 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             let mut edited = config.clone();
             edited["revision"] = provider["revision"].clone();
             edited["name"] = json!(format!("edited {media} {mode}"));
+            let new_prefix = format!("/config-{}/", provider["revision"].as_i64().unwrap() + 1);
+            edited["settings"]["endpoint"] = json!(format!("{endpoint}{new_prefix}"));
             let (code, updated) = request(
                 &base,
                 "PUT",
@@ -892,16 +973,45 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
                 .0,
                 404
             );
-            // Health may check the new revision; the failed refresh must never read again.
-            let calls = state.refresh_reads();
-            tokio::time::sleep(Duration::from_millis(1100)).await;
+            // The old refresh owns config-N's endpoint; new health probes use config-(N+1).
+            // Wait for the actual new-revision health batch, rather than counting its legal
+            // GetItems requests as retries or relying on an arbitrary sleep/count allowance.
+            assert_eq!(state.refresh_reads_for(&old_prefix), old_calls + 1);
+            let conn = db.connect().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+                    if current == 4 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.unwrap();
             assert_eq!(
                 request(&base, "GET", &format!("/api/v1/commands/{id}"), Value::Null)
                     .await
                     .1["status"],
                 "failed"
             );
-            assert_eq!(state.refresh_reads(), calls);
+            assert_eq!(
+                state.refresh_reads_for(&old_prefix),
+                old_calls + 1,
+                "old revision must never reread"
+            );
+            assert_eq!(
+                conn.query(
+                    "SELECT count(*) FROM download_refresh_snapshots WHERE provider_id=?",
+                    [provider["id"].as_str().unwrap()]
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+                0,
+                "neither stale refresh nor observation-only health may publish a snapshot"
+            );
             runtime.shutdown().await;
         }
     }
@@ -994,7 +1104,7 @@ async fn process_ownership_rejects_competitor_and_recovers_killed_reads_in_both_
         })).await;
         assert_eq!(code, 201, "{provider}");
         suppress_observation(&base, &provider).await;
-        let command = submit(&base, &provider, media).await;
+        let command = submit_high(&base, &provider, media).await;
         let id = command["id"].as_str().unwrap();
         stop(setup).await;
         drop(db);
@@ -1008,7 +1118,10 @@ async fn process_ownership_rejects_competitor_and_recovers_killed_reads_in_both_
         let running = until(&base, id, "running").await;
         assert_eq!(running["attempts"], 1);
         assert_eq!(running["target"], command["target"]);
+        // High priority plus the actual handler handshake identifies the sole worker's
+        // refresh request; no startup-health request can stand in for this blocked read.
         let before = state.calls.lock().unwrap().len();
+        assert_eq!(state.refresh_reads(), 1);
 
         let rejected = scratch.0.join("rejected");
         let mut competitor = owner_child(&path, &rejected, true);
@@ -1024,6 +1137,11 @@ async fn process_ownership_rejects_competitor_and_recovers_killed_reads_in_both_
         let unchanged = until(&base, id, "running").await;
         assert_eq!(unchanged["attempts"], 1);
         assert_eq!(state.calls.lock().unwrap().len(), before);
+        assert_eq!(
+            state.refresh_reads(),
+            1,
+            "rejected process must not dispatch a second items read"
+        );
 
         // Child::kill terminates without Runtime::shutdown or Database destructors.
         first.kill().await.unwrap();

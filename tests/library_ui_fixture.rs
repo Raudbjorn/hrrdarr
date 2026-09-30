@@ -174,6 +174,7 @@ async fn mode(
         Some("0") => 0,
         Some("1") => 1,
         Some("2") => 2,
+        Some("3") => 3,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
@@ -389,6 +390,10 @@ async fn provider_mock(
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
     }
+    // Bounded owned health probe delay for pending-generation/cancel browser checks.
+    if uri.path() == "/api/v2/app/preferences" && state.1.load(Ordering::SeqCst) == 3 {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
     if uri.path() == "/api/v2/torrents/info" {
         match state.1.load(Ordering::SeqCst) {
             1 => {
@@ -500,7 +505,7 @@ async fn provider_mock(
     match uri.path() {
         "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
         "/api/v2/app/version"=>"v4.6.0".into_response(),
-        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/app/preferences"=>Json(json!({"save_path":"/remote","queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
         "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
         "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([{"hash":"1111111111111111111111111111111111111111","category":query.get("category"),"name":"Fixture download","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0}])).into_response(),
         _=>StatusCode::NOT_FOUND.into_response(),
@@ -713,6 +718,7 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::health::router(db.clone()))
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
