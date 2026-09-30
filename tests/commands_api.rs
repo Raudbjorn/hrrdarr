@@ -43,6 +43,20 @@ impl Default for Remote {
         }
     }
 }
+impl Remote {
+    fn refresh_reads(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|uri| {
+                uri.split('?')
+                    .next()
+                    .is_some_and(|path| path.ends_with("/torrents/info"))
+            })
+            .count()
+    }
+}
 async fn remote(
     State(s): State<Arc<Remote>>,
     method: Method,
@@ -52,6 +66,16 @@ async fn remote(
     s.calls.lock().unwrap().push(uri.to_string());
     if uri.path().ends_with("webapiVersion") {
         return "2.8.3".into_response();
+    }
+    // Health uses the same read-only transport but does not fetch queue pages.
+    if uri.path().ends_with("app/preferences") {
+        return axum::Json(json!({"save_path":"/fixture-downloads","max_ratio_enabled":false,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response();
+    }
+    if uri.path().ends_with("torrents/categories") {
+        return axum::Json(
+            json!({"tv":{"name":"tv","savePath":""},"movies":{"name":"movies","savePath":""}}),
+        )
+        .into_response();
     }
     if uri.path().ends_with("torrents/info") {
         match s.mode.load(Ordering::SeqCst) {
@@ -473,15 +497,15 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
         404
     );
     // Isolate the stale command from valid new-revision scheduled reads, while
-    // retaining the exact no-network-call assertion for its rejection.
+    // retaining exact queue-read and attempt assertions; startup health may probe status.
     suppress_observation(&base, &new_provider).await;
-    let calls = remote_state.calls.lock().unwrap().len();
+    let calls = remote_state.refresh_reads();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, stale["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["error_code"], "provider_changed");
     assert_eq!(failed["attempts"], 0);
     runtime.shutdown().await;
-    assert_eq!(remote_state.calls.lock().unwrap().len(), calls);
+    assert_eq!(remote_state.refresh_reads(), calls);
     assert_eq!(
         request(
             &base,
@@ -583,12 +607,13 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     )
     .await;
     assert_eq!(code, 200);
-    let calls = state.calls.lock().unwrap().len();
+    // Health status GETs are independent; an obsolete refresh must fetch no queue page.
+    let calls = state.refresh_reads();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, stale["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["attempts"], 1);
     assert_eq!(failed["error_code"], "provider_changed");
-    assert_eq!(state.calls.lock().unwrap().len(), calls);
+    assert_eq!(state.refresh_reads(), calls);
     let corrected = submit(&base, &provider, "tv").await;
     until(&base, corrected["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
@@ -605,13 +630,14 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
             .unwrap();
         }
     }
-    let calls = state.calls.lock().unwrap().len();
+    // Exhausted refresh attempts cannot repeat a queue read; health still evaluates normally.
+    let calls = state.refresh_reads();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let failed = until(&base, exhausted["id"].as_str().unwrap(), "failed").await;
     assert_eq!(failed["attempts"], 3);
     assert_eq!(failed["error_code"], "interrupted");
     runtime.shutdown().await;
-    assert_eq!(state.calls.lock().unwrap().len(), calls);
+    assert_eq!(state.refresh_reads(), calls);
     // Fill explicitly retained history without network calls; no implicit pruning or ignored scheduler failure.
     enable_observation(&base, &provider, "movies").await;
     let tx = conn
@@ -643,7 +669,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     // occupy the shared pool), so it is not actually full yet. Pad it with genuinely active
     // search_commands rows (no per-target uniqueness, unlike `commands` itself) against a minimal
     // fixture episode, using a far-future next_attempt_at so neither live worker below claims them.
-    const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
+    // The joined worker may leave active health work; count it in the same 1024-slot pool.
+    const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
     conn.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Pad','/pad');INSERT INTO seasons VALUES(1,1,1);INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One');").await.unwrap();
     let search_indexer_id = uuid::Uuid::new_v4().to_string();
     conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Padding Indexer',1,1,1,1,'http://127.0.0.1:1/')",[search_indexer_id.clone()]).await.unwrap();
@@ -694,7 +721,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
             .0,
         429
     );
-    let calls = state.calls.lock().unwrap().len();
+    // Capacity rejection prevents refresh queue reads, independently of health status traffic.
+    let calls = state.refresh_reads();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
     let full = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -716,7 +744,7 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     assert!(full[0]["last_run_at"].is_null());
     assert!(full[0]["next_run_at"].as_i64().unwrap() > 0);
     runtime.shutdown().await;
-    assert_eq!(state.calls.lock().unwrap().len(), calls);
+    assert_eq!(state.refresh_reads(), calls);
     assert_eq!(
         request(
             &base,
@@ -864,7 +892,8 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
                 .0,
                 404
             );
-            let calls = state.calls.lock().unwrap().len();
+            // Health may check the new revision; the failed refresh must never read again.
+            let calls = state.refresh_reads();
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert_eq!(
                 request(&base, "GET", &format!("/api/v1/commands/{id}"), Value::Null)
@@ -872,7 +901,7 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
                     .1["status"],
                 "failed"
             );
-            assert_eq!(state.calls.lock().unwrap().len(), calls);
+            assert_eq!(state.refresh_reads(), calls);
             runtime.shutdown().await;
         }
     }

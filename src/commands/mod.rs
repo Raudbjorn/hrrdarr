@@ -32,13 +32,13 @@ pub mod search;
 mod worker;
 pub use worker::{Runtime, start, start_with_metadata};
 
-const MAX_COMMANDS: i64 = 1024;
+pub(crate) const MAX_COMMANDS: i64 = 1024;
 const MAX_SNAPSHOTS: i64 = 64;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_REVISION: i64 = 9007199254740991;
 
 #[derive(Debug)]
-pub struct Error(StatusCode, &'static str);
+pub struct Error(pub(crate) StatusCode, pub(crate) &'static str);
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.1)
@@ -69,11 +69,11 @@ fn conflict() -> Error {
 /// Every command table admitted through the shared 1024-row capacity pool (see each
 /// `*_admit` trigger) must be counted here; a table left out here can still be inserted
 /// past the trigger's own limit undetected by any pre-check. Only non-terminal rows count
-/// (migration 0033): a capacity limit bounds concurrent/pending work, not historical audit
-/// rows, and nothing in this schema prunes terminal rows -- counting them here too would let
-/// ordinary scheduled churn alone exhaust the pool over long uptimes.
-const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
-async fn command_capacity(c: &Connection) -> Result<i64> {
+/// (migration 0033): capacity bounds concurrent/pending work independently of history
+/// retention. Health retains 128 terminal rows; other command histories remain retained.
+/// Counting either terminal history here would let ordinary scheduled churn exhaust the pool.
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
+pub(crate) async fn command_capacity(c: &Connection) -> Result<i64> {
     Ok(c.query(COMMAND_CAPACITY_SQL, ())
         .await?
         .next()
@@ -87,7 +87,7 @@ fn domain(value: MediaDomain) -> &'static str {
         MediaDomain::Movies => "movies",
     }
 }
-fn now() -> Result<i64> {
+pub(crate) fn now() -> Result<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -119,7 +119,7 @@ pub enum CommandPriority {
     High,
 }
 impl CommandPriority {
-    fn number(self) -> i64 {
+    pub(crate) fn number(self) -> i64 {
         match self {
             Self::Normal => 0,
             Self::High => 1,
@@ -258,7 +258,7 @@ pub struct QueueSnapshot {
 }
 
 impl CommandStatus {
-    fn text(self) -> &'static str {
+    pub(crate) fn text(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -268,7 +268,7 @@ impl CommandStatus {
             Self::Cancelled => "cancelled",
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
