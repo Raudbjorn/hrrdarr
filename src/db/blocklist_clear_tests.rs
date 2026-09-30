@@ -123,9 +123,18 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 43); // Latest schema43 includes communication storage; historical starting version is unchanged.
+    assert_eq!(version(&c).await?, 44); // Latest schema44 includes backoff storage; historical starting version is unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
+        // Migration44 adds provenance defaults; keep every preceding field identical.
+        if *table == "commands" {
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Text("legacy_unknown".into()),
+                    libsql::Value::Integer(0),
+                ]);
+            }
+        }
         if *table == "snapshot_imports" {
             // Migrations36 through41 append inactive CF/tag/revision-policy/delay-profile/release-profile/CDH markers; all prior fields stay identical.
             for row in &mut expected {

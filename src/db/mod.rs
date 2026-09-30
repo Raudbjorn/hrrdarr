@@ -188,6 +188,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "health_communication",
         include_str!("../../migrations/0043_health_communication.sql"),
     ),
+    (
+        "download_client_backoff",
+        include_str!("../../migrations/0044_download_client_backoff.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -736,3 +740,6 @@ mod cdh_tests;
 mod health_tests;
 #[cfg(test)]
 mod release_profile_tests;
+
+#[cfg(test)]
+mod backoff_tests;

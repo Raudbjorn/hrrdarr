@@ -126,7 +126,14 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 43); // Reopen applies communication migration too.
+    assert_eq!(version(&c).await?, 44); // Reopen applies backoff migration too.
+    // Migration44 appends honest provenance defaults; every historical field stays exact.
+    for row in &mut before[2] {
+        row.extend([
+            libsql::Value::Text("legacy_unknown".into()),
+            libsql::Value::Integer(0),
+        ]);
+    }
     for (table, expected) in tables.iter().zip(&before) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
@@ -174,7 +181,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 43); // Current schema, not historical input.
+    assert_eq!(version(&db.connect().await?).await?, 44); // Current schema, not historical input.
     Ok(())
 }
 #[tokio::test]
@@ -218,10 +225,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Exactly both TV members must retain generation1; an extra or changed member fails.
+    // Exactly all three TV members must retain generation1; an extra or changed member fails.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        2
+        3
     );
     assert_eq!(
         scalar(
@@ -229,7 +236,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        2, // Both TV identities retain admission generation1 despite later dirtying.
+        3, // All three TV identities retain admission generation1 despite later dirtying.
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -392,7 +399,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        2 // The same successful publication covers both registered movie checks.
+        3 // Migration44 adds a third movie identity covered by the same publication.
     );
     assert!(
         c.execute(
@@ -403,8 +410,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Four registered checks leave exactly124 slots before the unchanged128 ceiling.
-    for i in 0..124 {
+    // Six registered checks leave exactly122 slots before the unchanged128 ceiling.
+    for i in 0..122 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -423,7 +430,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        256 // Each retained command admitted both TV identities.
+        384 // Migration44 gives each retained command three TV identities.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -606,13 +613,18 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 43);
+    assert_eq!(version(&c).await?, 44); // Current reopen also applies backoff migration.
     // Existing states are unchanged; only the two requested registry identities are appended.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
     let registry = rows(&c, "health_checks").await?;
-    assert_eq!(&registry[..2], &original[0]);
+    // Migration44 appends NULL expiry authority; all historical values remain exact.
+    let mut expected_registry = original[0].clone();
+    for row in &mut expected_registry {
+        row.push(libsql::Value::Null);
+    }
+    assert_eq!(&registry[..2], &expected_registry);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND check_key='download_client_communication' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='DownloadClientCheck'").await?, 2);
     let migrated = rows(&c, "health_transitions").await?;
     assert_eq!(migrated.len(), 1);
@@ -691,10 +703,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 43);
+        assert_eq!(version(&c).await?, 44); // Current reopen also applies backoff migration.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 4);
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 6); // Two backoff identities added by current reopen.
     }
     Ok(())
 }
