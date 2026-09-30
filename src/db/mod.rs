@@ -184,6 +184,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "health_checks",
         include_str!("../../migrations/0042_health_checks.sql"),
     ),
+    (
+        "health_communication",
+        include_str!("../../migrations/0043_health_communication.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
