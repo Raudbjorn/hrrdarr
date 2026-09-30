@@ -489,6 +489,56 @@ pub(crate) struct OwnedDownloadDetails {
     pub host: String,
 }
 impl RefreshClient {
+    /// Fresh, revision-fenced status for health; never exposes remote paths or credentials.
+    pub(crate) async fn inspect_client_status(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<qbittorrent::EndpointLocality, AutomationError> {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let status = qbittorrent::client_status(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                domain,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0))?;
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            Ok(status.locality)
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
     pub(crate) async fn inspect_download(
         &self,
         provider_id: &str,
@@ -551,8 +601,8 @@ impl RefreshClient {
             .await
             .map_err(|_| RefreshError::new("refresh_timeout", true))?
     }
-    pub(crate) fn matches_database(&self, db: &Arc<Database>) -> bool {
-        Arc::ptr_eq(&self.0.db, db)
+    pub(crate) fn matches_database(&self, db: &Database) -> bool {
+        std::ptr::eq(self.0.db.as_ref(), db)
     }
 
     pub(crate) fn seal_release(
