@@ -190,6 +190,40 @@ export type FilesystemPath = { path: string, };
 
 export type FilesystemType = { type: FilesystemKind, };
 
+export type HealthAdmission = { "outcome": "queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "coalesced_queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "pending", active_command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, };
+
+export type HealthCheckState = { identity: HealthIdentity, startup: boolean, scheduled: boolean, generation: number, observed_generation: number | null, checked_at: number | null, observed_epoch: string | null, evaluation: HealthEvaluation, last_error: string | null, pending_reasons: number, due_at: number | null, };
+
+export type HealthCommand = { id: string, scope: HealthScope, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, epoch: string, is_grace: boolean, members: Array<HealthMember>, };
+
+export type HealthCommandInput = { scope: HealthScope, priority: CommandPriority, };
+
+export type HealthCoverage = { registered_only: boolean, identities: Array<HealthIdentity>, };
+
+export type HealthEvaluation = "never_run" | "current" | "pending" | "running" | "stale" | "failed";
+
+export type HealthIdentity = { scope: HealthScope, check_key: string, };
+
+export type HealthIssue = { identity: HealthIdentity, severity: HealthSeverity, reason: string, message: string, wiki_url: string, compatibility_type: string, };
+
+export type HealthLifecycle = { epoch: string, started_at: number, grace_due_at: number, grace_phase: string, next_scheduled_at: number, schedule_error: string | null, last_batch_completed_at: number | null, };
+
+export type HealthMember = { identity: HealthIdentity, admitted_generation: number, captured_generation: number | null, captured_reasons: number | null, captured_due_at: number | null, };
+
+export type HealthScope = "tv" | "movies" | "system" | "all";
+
+export type HealthSelectionToken = { identity: HealthIdentity, generation: number, };
+
+export type HealthSeverity = "ok" | "notice" | "warning" | "error";
+
+export type HealthSnapshot = { checks: Array<HealthCheckState>, issues: Array<HealthIssue>, total: number, limit: number, offset: number, lifecycle: HealthLifecycle, active_command: HealthCommand | null, pending_keys: Array<HealthSelectionToken>, summary: HealthSummary, coverage: HealthCoverage, };
+
+export type HealthSummary = { total: number, current: number, never_run: number, stale: number, failed: number, non_ok: number, };
+
+export type HealthTransition = { sequence: number, event_id: string, epoch: string, command_id: string, kind: string, in_grace: boolean, created_at: number, issue: HealthIssue, };
+
+export type HealthTransitions = { oldest_retained_sequence: number | null, latest_sequence: number | null, next_cursor: number, gap: boolean, items: Array<HealthTransition>, };
+
 export type HistoricalFile = { media_type: MediaDomain, id: number, };
 
 export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent;

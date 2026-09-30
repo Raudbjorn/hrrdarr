@@ -1099,6 +1099,34 @@ fn credentials(
             .map_err(|_| locked()),
     }
 }
+// Old and new scope union is captured before replacement/deletion in the same transaction.
+async fn health_configuration_changed(
+    c: &Connection,
+    old: Option<&ProviderSettings>,
+    new: Option<&ProviderSettings>,
+) -> Result<()> {
+    let mut tv = false;
+    let mut movies = false;
+    for settings in [old, new].into_iter().flatten() {
+        if let ProviderSettings::Qbittorrent {
+            tv: t, movies: m, ..
+        } = settings
+        {
+            tv |= t.is_some();
+            movies |= m.is_some();
+        }
+    }
+    for (selected, domain) in [(tv, MediaDomain::Tv), (movies, MediaDomain::Movies)] {
+        if selected {
+            crate::health::configuration_changed(c, domain)
+                .await
+                .map_err(|e| {
+                    Error::Plain(e.0, e.1, "Health configuration could not be recorded")
+                })?;
+        }
+    }
+    Ok(())
+}
 async fn create(
     State(context): State<Context>,
     input: std::result::Result<Json<ProviderInput>, JsonRejection>,
@@ -1119,6 +1147,7 @@ async fn create(
         .await?;
     let outcome = async {
     tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,?,?,1,1,?,?)",params![id.clone(),input.settings.implementation(),input.name,i64::from(input.enabled),i64::from(input.priority),input.settings.endpoint(),secret]).await?;
+    health_configuration_changed(&tx, None, Some(&input.settings)).await?;
     write_scopes(&tx, &id, &input.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     Ok((StatusCode::CREATED, bounded(read(&tx, &id).await?.0)?))
@@ -1159,6 +1188,7 @@ async fn update(
     if changed != 1 {
         return Err(conflict());
     }
+    health_configuration_changed(&tx, Some(&old.settings), Some(&input.config.settings)).await?;
     write_scopes(&tx, &id, &input.config.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     bounded(read(&tx, &id).await?.0)
@@ -1251,6 +1281,7 @@ async fn delete(
             &Change::Null,
         )?;
         release_profile_references(&tx, &id, None).await?;
+        health_configuration_changed(&tx, Some(&old.settings), None).await?;
         if tx
             .execute(
                 "DELETE FROM providers WHERE id=? AND revision=?",
@@ -1888,6 +1919,9 @@ pub(crate) async fn import_configuration(
         })
         .transpose()?;
     conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),input.settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
+    health_configuration_changed(conn, None, Some(&input.settings))
+        .await
+        .map_err(|_| FAILED)?;
     write_scopes(conn, &id, &input.settings)
         .await
         .map_err(|_| FAILED)?;

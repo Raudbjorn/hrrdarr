@@ -369,6 +369,9 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
             .0,
         400
     );
+    // Worker/restart behavior is proved above. Join it before capacity-only assertions so
+    // a health completion cannot free a slot between padding and the HTTP 429 checks.
+    runtime.shutdown().await;
     // Bounded synthetic terminal history isolates HTTP admission at the shared cap;
     // blocklist facts above still come exclusively from real snapshot imports.
     let retained:i64=c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)",()).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
@@ -382,8 +385,8 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     // Every row above is terminal (migration 0033: only active queued/running/retry_wait rows
     // occupy the shared pool), so it is not actually full yet. Pad it with genuinely active
     // search_commands rows (no per-target uniqueness, unlike the tables above) against the real
-    // imported TV episode, using a far-future next_attempt_at so the live worker never claims them.
-    const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
+    // imported TV episode, with far-future readiness to keep the padding inert.
+    const POOL_ACTIVE_SQL: &str = "(SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
     let search_indexer_id = uuid::Uuid::new_v4().to_string();
     c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Padding Indexer',1,1,1,1,'http://127.0.0.1:1/')",[search_indexer_id.clone()]).await.unwrap();
     c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)",[search_indexer_id.clone()]).await.unwrap();
@@ -407,7 +410,12 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
         )
     };
     let captured = json!({"media_type":"tv","series_id":series_id,"episode_id":episode_id,"tvdb_id":tvdb_id,"title":"Padding","season":1,"number":1,"series_type":"standard","use_scene_numbering":false});
-    let active: i64 = c
+    // Count and fill the complete shared pool against one stable writer snapshot.
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let active: i64 = tx
         .query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
         .await
         .unwrap()
@@ -420,7 +428,7 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     let mut padding = Vec::new();
     for _ in 0..1024 - active {
         let id = uuid::Uuid::new_v4().to_string();
-        c.execute(
+        tx.execute(
             "INSERT INTO search_commands(id,mode,media_type,requested_episode_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'automatic','tv',?,?,?,1,?,?,9007199254740000,0)",
             libsql::params![
                 id.clone(),
@@ -436,7 +444,7 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
         padding.push(id);
     }
     assert_eq!(
-        c.query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
+        tx.query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
             .await
             .unwrap()
             .next()
@@ -447,6 +455,7 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
             .unwrap(),
         1024
     );
+    tx.commit().await.unwrap();
     for (route, body) in [
         (
             ROUTE,
@@ -492,7 +501,6 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     .await
     .unwrap();
     enqueue(&base, "tv", "normal").await;
-    runtime.shutdown().await;
     stop(server).await;
     stop(upstream).await;
 }

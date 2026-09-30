@@ -193,6 +193,9 @@ pub(crate) async fn set(
         return Err(bad());
     }
     if c.execute("UPDATE completed_download_handling_settings SET enabled=?,defined=?,revision=revision+1,locally_edited=CASE WHEN ? THEN 1 ELSE locally_edited END WHERE media_type=? AND revision=?",params![enabled,defined,local,domain(m),revision]).await?!=1{return Err(Error(StatusCode::CONFLICT,"cdh_conflict"))}
+    crate::health::configuration_changed(c, m)
+        .await
+        .map_err(|e| Error(e.0, e.1))?;
     // Disabling cannot require a schedule slot. The projection gates explicit-on policies too.
     reconcile(c, None, Some(m)).await?;
     read(c, m).await
