@@ -44,3 +44,5 @@ pub mod release_profiles;
 pub mod revision_policy;
 
 pub mod release_profile_terms;
+
+pub mod health_detectors;
