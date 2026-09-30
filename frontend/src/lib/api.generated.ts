@@ -232,6 +232,18 @@ export type HistoryEventType = "file_imported";
 
 export type HistoryQuery = { media_type?: MediaDomain, episode_id?: number, movie_id?: number, series_id?: number, season?: number, from?: string, to?: string, limit?: number, offset?: number, };
 
+export type HostApplyMode = "process_restart";
+
+export type HostAuthentication = "none";
+
+export type HostCapabilities = { persisted_edits: boolean, tls: boolean, url_base: boolean, trusted_forwarding: boolean, };
+
+export type HostMutability = "deployment";
+
+export type HostSettingSource = "default" | "environment";
+
+export type HostSettings = { authentication: HostAuthentication, configured_bind: string, bound_address: string, bind_source: HostSettingSource, allowed_hosts: Array<string>, allowed_hosts_source: HostSettingSource, filtering_enabled: boolean, mutability: HostMutability, apply_mode: HostApplyMode, capabilities: HostCapabilities, };
+
 export type ImportInput = ManualImportRequest | ImportRequest;
 
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };

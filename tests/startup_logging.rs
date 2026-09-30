@@ -175,7 +175,18 @@ fn invalid_environment_values_have_safe_phase_diagnostics() {
             "sentinel-invalid-provider-key",
             "provider_key",
         ),
-        ("HRRDARR_BIND", "sentinel-invalid-bind", "bind_address"),
+        // HostConfig now validates bind/list together before opening the database.
+        // Assert that intentional preflight phase; failure and secret checks stay strict.
+        (
+            "HRRDARR_BIND",
+            "sentinel-invalid-bind",
+            "host_configuration",
+        ),
+        (
+            "HRRDARR_ALLOWED_HOSTS",
+            "https://sentinel-invalid-host",
+            "host_configuration",
+        ),
         (
             "HRRDARR_DATABASE_PATH",
             "sentinel-missing-directory/db",

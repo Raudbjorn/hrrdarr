@@ -47,3 +47,5 @@ pub mod release_profile_terms;
 
 pub mod health;
 pub mod health_detectors;
+
+pub mod host;

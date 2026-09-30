@@ -31,6 +31,7 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::host::HostSettings>();
     registry.visit::<crate::release_profiles::Catalog>();
     registry.visit::<crate::release_profiles::Detail>();
     registry.visit::<crate::release_profiles::TvInput>();
