@@ -449,34 +449,94 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     let done = until(&base, interrupted["id"].as_str().unwrap(), "succeeded").await;
     assert_eq!(done["attempts"], 2);
     runtime.shutdown().await;
-    // Explicit schedules survive restart, enqueue both scopes once, and do not catch up missed ticks.
+    // Schedule last_run_at records admission, not completion. Capture history first,
+    // then wait for the actual new command in each domain before stopping the worker.
+    let (code, prior_history) =
+        request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+    assert_eq!(code, 200, "{prior_history}");
+    let prior_ids: Vec<Value> = prior_history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    assert_eq!(
+        prior_history["total"].as_u64().unwrap(),
+        prior_ids.len() as u64,
+        "capture every pre-schedule ID"
+    );
     for media in ["tv", "movies"] {
         enable_observation(&base, &provider, media).await;
     }
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(8), async {
+    let mut scheduled_ids = std::collections::BTreeMap::<String, Value>::new();
+    let mut last_history = Value::Null;
+    let completion = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            let (_, v) = request(
-                &base,
-                "GET",
-                "/api/v1/download-refresh/schedules",
-                Value::Null,
-            )
-            .await;
-            if v.as_array()
-                .unwrap()
-                .iter()
-                .all(|s| !s["last_run_at"].is_null())
+            let (code, history) =
+                request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+            last_history = history;
+            if code != 200 {
+                return false;
+            }
+            let items = last_history["items"].as_array().unwrap();
+            if last_history["total"].as_u64().unwrap() != items.len() as u64 {
+                return false;
+            }
+            for command in items.iter().filter(|v| !prior_ids.contains(&v["id"])) {
+                let Some(media) = command["target"]["media_type"].as_str() else {
+                    return false;
+                };
+                if !matches!(media, "tv" | "movies")
+                    || command["target"]["provider_id"] != provider["id"]
+                    || command["provider_revision"] != provider["revision"]
+                {
+                    return false;
+                }
+                if let Some(previous) =
+                    scheduled_ids.insert(media.to_string(), command["id"].clone())
+                {
+                    if previous != command["id"] {
+                        return false;
+                    }
+                }
+                if matches!(command["status"].as_str(), Some("failed" | "cancelled")) {
+                    return false;
+                }
+            }
+            if scheduled_ids.len() == 2
+                && scheduled_ids.values().all(|id| {
+                    items
+                        .iter()
+                        .any(|v| v["id"] == *id && v["status"] == "succeeded")
+                })
             {
-                break;
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    .await;
     runtime.shutdown().await;
+    if !matches!(completion, Ok(true)) {
+        stop(server).await;
+        stop(upstream).await;
+        panic!(
+            "scheduled TV/movie commands did not both succeed: {last_history}; captured={scheduled_ids:?}; outcome={completion:?}"
+        );
+    }
+    let (code, schedules) = request(
+        &base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    assert_eq!(schedules.as_array().unwrap().len(), 2);
+    for schedule in schedules.as_array().unwrap() {
+        assert!(!schedule["last_run_at"].is_null(), "{schedules}");
+    }
     let (_, history) = request(&base, "GET", "/api/v1/commands", Value::Null).await;
     let total = history["total"].clone();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
@@ -490,7 +550,31 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     );
     // Provider edit invalidates snapshots and fences queued old revisions. CDH preserves
     // explicit observation intent and reauthorizes schedules for the current provider.
+    // Shutdown cannot reset attempts on recovered work. Prove this is fresh admission
+    // before expecting provider revision fencing to fail it without a first attempt.
+    let (code, before_stale) =
+        request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+    assert_eq!(code, 200, "{before_stale}");
+    let previous = before_stale["items"].as_array().unwrap();
+    assert_eq!(
+        before_stale["total"].as_u64().unwrap(),
+        previous.len() as u64
+    );
+    assert!(
+        !previous
+            .iter()
+            .any(|v| v["target"]["provider_id"] == provider["id"]
+                && v["target"]["media_type"] == "tv"
+                && matches!(
+                    v["status"].as_str(),
+                    Some("queued" | "running" | "retry_wait")
+                )),
+        "{before_stale}"
+    );
     let stale = submit(&base, &provider, "tv").await;
+    assert!(!previous.iter().any(|v| v["id"] == stale["id"]), "{stale}");
+    assert_eq!(stale["status"], "queued", "{stale}");
+    assert_eq!(stale["attempts"], 0, "{stale}");
     let mut changed = config;
     changed["revision"] = json!(1);
     changed["name"] = json!("edited");

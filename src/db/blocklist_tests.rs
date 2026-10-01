@@ -100,7 +100,7 @@ async fn blocklist_schema21_backfill_rollback_reopen_and_complete_target_constra
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

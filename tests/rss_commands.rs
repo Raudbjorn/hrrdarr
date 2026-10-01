@@ -931,17 +931,51 @@ async fn delayed_payloads_are_private_and_missing_key_rejects_without_starvation
     let (router, client) = providers::router_with_refresh(db.clone(), None);
     let (base, _server) = serve(router.merge(commands::router(db.clone()))).await;
     db.connect().await.unwrap().execute_batch("CREATE TABLE owned_order(seq INTEGER PRIMARY KEY,kind TEXT); CREATE TRIGGER owned_candidate AFTER UPDATE ON rss_candidates WHEN NEW.status='rejected' BEGIN INSERT INTO owned_order(kind)VALUES('candidate'); END; CREATE TRIGGER owned_command AFTER UPDATE ON blocklist_clear_commands WHEN NEW.status='running' BEGIN INSERT INTO owned_order(kind)VALUES('command'); END;").await.unwrap();
-    for media in ["tv", "movies"] {
-        assert_eq!(
-            request(
-                &base,
-                "POST",
-                "/api/v1/blocklist/clear-commands",
-                json!({"target":{"media_type":media},"priority":"normal"})
+    let candidate_created_at = {
+        let c = db.connect().await.unwrap();
+        let row = c
+            .query(
+                "SELECT count(*),max(created_at) FROM rss_candidates WHERE status='pending'",
+                (),
             )
             .await
-            .0,
-            202
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 2);
+        row.get::<i64>(1).unwrap()
+    };
+    // Claims order equal priorities by whole-second created_at, then UUID, not
+    // admission order. Establish the strict age assumed by the assertion below
+    // through the real clock/API rather than bypassing immutable timestamps.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if i64::try_from(now).unwrap() > candidate_created_at {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("setup clock must advance beyond the captured candidate creation second");
+    for media in ["tv", "movies"] {
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/blocklist/clear-commands",
+            json!({"target":{"media_type":media},"priority":"normal"}),
+        )
+        .await;
+        assert_eq!(code, 202, "{command}");
+        assert!(
+            command["created_at"].as_i64().unwrap() > candidate_created_at,
+            "clear command must be strictly newer than both candidates: {command}; candidate max={candidate_created_at}"
         );
     }
     let runtime = commands::start(db.clone(), client).await.unwrap();

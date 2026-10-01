@@ -123,13 +123,14 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "snapshot_imports" {
-            // Migrations36 through41 append inactive CF/tag/revision-policy/delay-profile/release-profile/CDH markers; all prior fields stay identical.
+            // Migrations36 through41 and45 append seven inactive metadata markers; retain every prior field and assert the new AutoTagging marker is0.
             for row in &mut expected {
                 row.extend([
+                    libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),

@@ -185,8 +185,11 @@ async fn remote(
     );
     if uri.path().ends_with("webapiVersion") {
         s.started.notify_one();
-        let permit = s.release.acquire().await.unwrap();
-        permit.forget();
+        // Closing this test gate permanently releases current and future callers.
+        // Health/recovery may probe the same endpoint; no fixed request count is assumed.
+        if let Ok(permit) = s.release.acquire().await {
+            permit.forget();
+        }
         return "2.8.3".into_response();
     }
     if uri.path().ends_with("torrents/info") {
@@ -260,7 +263,7 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
         json!({"category":"tv","imported_category":null,"recent_priority":0,"older_priority":1});
     let(code,p)=request(&base,"POST","/api/v1/providers",json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":endpoint,"tv":scope,"movies":null},"credentials":null})).await;
     assert_eq!(code, 201, "{p}");
-    let(code,_)=request(&base,"POST","/api/v1/commands",json!({"name":"refresh_downloads","target":{"provider_id":p["id"],"media_type":"tv"},"provider_revision":p["revision"],"priority":"normal"})).await;
+    let(code,refresh)=request(&base,"POST","/api/v1/commands",json!({"name":"refresh_downloads","target":{"provider_id":p["id"],"media_type":"tv"},"provider_revision":p["revision"],"priority":"normal"})).await;
     assert_eq!(code, 202);
     let runtime = commands::start(db.clone(), client).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), state.started.notified())
@@ -292,7 +295,7 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     // A queued typed target survives reopen, while an unrelated running download is safely recovered.
     let db = Arc::new(Database::open_local(&dbpath).await.unwrap());
     let (base, server, client) = app(db.clone()).await;
-    state.release.add_permits(3);
+    state.release.close();
     let c = db.connect().await.unwrap();
     c.execute_batch("CREATE TRIGGER fixture_clear_settlement BEFORE UPDATE ON blocklist_clear_commands WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'owned failure injection'); END;").await.unwrap();
     let runtime = commands::start(db.clone(), client).await.unwrap();
@@ -310,6 +313,44 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     assert_eq!(done["target"]["media_type"], "movies");
     assert_eq!(done["records_removed"], 1);
     assert_eq!(count(&base, "movies").await, 0);
+    // A successful clear does not prove the unrelated recovered refresh settled.
+    // Keep its exact admission identity so the later capacity POST is genuinely new.
+    let mut last_refresh = Value::Null;
+    let recovered = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let (code, value) = request(
+                &base,
+                "GET",
+                &format!("/api/v1/commands/{}", refresh["id"].as_str().unwrap()),
+                Value::Null,
+            )
+            .await;
+            last_refresh = value;
+            if code != 200
+                || matches!(
+                    last_refresh["status"].as_str(),
+                    Some("failed" | "cancelled")
+                )
+            {
+                return false;
+            }
+            if last_refresh["status"] == "succeeded" {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if !matches!(recovered, Ok(true)) {
+        runtime.shutdown().await;
+        stop(server).await;
+        stop(upstream).await;
+        panic!("recovered refresh did not succeed: {last_refresh}; outcome={recovered:?}");
+    }
+    assert_eq!(last_refresh["id"], refresh["id"]);
+    assert_eq!(last_refresh["target"], refresh["target"]);
+    assert_eq!(last_refresh["provider_revision"], p["revision"]);
+    assert_eq!(last_refresh["items_observed"], 0);
     let empty = enqueue(&base, "movies", "normal").await;
     assert_eq!(
         until(&base, &empty["id"], "succeeded").await["records_removed"],
@@ -372,6 +413,18 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     // Worker/restart behavior is proved above. Join it before capacity-only assertions so
     // a health completion cannot free a slot between padding and the HTTP 429 checks.
     runtime.shutdown().await;
+    assert_eq!(
+        request(
+            &base,
+            "GET",
+            &format!("/api/v1/commands/{}", refresh["id"].as_str().unwrap()),
+            Value::Null
+        )
+        .await
+        .1["status"],
+        "succeeded"
+    );
+    assert_eq!(c.query("SELECT count(*) FROM commands WHERE provider_id=? AND media_type='tv' AND status IN ('queued','running','retry_wait')",[p["id"].as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),0,"capacity assertion requires a fresh target");
     // Bounded synthetic terminal history isolates HTTP admission at the shared cap;
     // blocklist facts above still come exclusively from real snapshot imports.
     let retained:i64=c.query("SELECT (SELECT count(*) FROM commands)+(SELECT count(*) FROM metadata_refresh_commands)+(SELECT count(*) FROM blocklist_clear_commands)",()).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
@@ -500,7 +553,22 @@ async fn domain_clear_is_explicit_durable_atomic_and_shares_existing_worker() {
     )
     .await
     .unwrap();
-    enqueue(&base, "tv", "normal").await;
+    let admitted = enqueue(&base, "tv", "normal").await;
+    // A duplicate owns no additional slot, even when the pool is full again.
+    let duplicate = enqueue(&base, "tv", "normal").await;
+    assert_eq!(duplicate["id"], admitted["id"]);
+    assert_eq!(
+        c.query(&format!("SELECT {POOL_ACTIVE_SQL}"), ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        1024
+    );
     stop(server).await;
     stop(upstream).await;
 }

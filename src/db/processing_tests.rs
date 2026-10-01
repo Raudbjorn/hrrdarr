@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

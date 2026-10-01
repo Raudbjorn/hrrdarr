@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&reopened.connect().await?).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     Ok(())
 }

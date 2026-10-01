@@ -192,6 +192,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "health_download_client_roots",
         include_str!("../../migrations/0044_health_download_client_roots.sql"),
     ),
+    (
+        "autotagging_metadata",
+        include_str!("../../migrations/0045_autotagging_metadata.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest reopen includes root health44; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
     //0041 appends explicit scheduler intent; compare every historical field unchanged.
     for row in &mut before[1] {
         let enabled = row[3].clone();

@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44);
+    assert_eq!(version(&c).await?, 45); // Latest adds metadata45; migration44 checksum witnesses below stay pinned.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 6);
     new_registry(&c).await?;
     let tx = c.transaction().await?;
@@ -132,7 +132,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
         "SELECT * FROM health_transitions ORDER BY sequence",
         "SELECT * FROM sqlite_sequence ORDER BY name,seq",
-        "SELECT * FROM series ORDER BY id",
+        // Metadata45 appends nullable facts; preserve every predecessor series column by name.
+        "SELECT id,tvdb_id,title,year,path,poster,monitored,original_language FROM series ORDER BY id",
         "SELECT * FROM episodes ORDER BY id",
         "SELECT * FROM movies ORDER BY id",
         "SELECT * FROM root_folders ORDER BY id",
@@ -177,7 +178,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 44);
+        assert_eq!(version(&c).await?, 45); // Latest adds metadata45; migration44 checksum witnesses below stay pinned.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 6);
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
