@@ -309,6 +309,17 @@ async fn configured_host_filter_guards_real_routes_and_preserves_both_domains() 
         assert_eq!(code, 403, "{rejected}: {body}");
         assert_eq!(body["error"]["code"], "host_not_allowed");
     }
+    // Even an unknown movie lookup must pass the final router's authority guard first.
+    let preview = "/api/v1/movies/rename-preview?movie_ids=1";
+    assert_eq!(
+        request(&origin, "GET", preview, "allowed.example", None)
+            .await
+            .0,
+        404
+    );
+    let (status, body) = request(&origin, "GET", preview, "evil.example", None).await;
+    assert_eq!(status, 403);
+    assert_eq!(body["error"]["code"], "host_not_allowed");
     for domain in ["tv", "movies"] {
         let path = format!("/api/v1/{domain}/tags");
         assert_eq!(

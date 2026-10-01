@@ -372,6 +372,14 @@ export type MovieParseResult = { title: string, parsed: ParsedRelease | null, mo
 
 export type MovieReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
 
+export type MovieRenamePreview = { naming_revision: number, rename_enabled: boolean, standard_movie_format: string | null, movie_ids: Array<number>, files_considered: number, unchanged_count: number, unavailable_count: number, items: Array<MovieRenamePreviewItem>, };
+
+export type MovieRenamePreviewItem = { movie_id: number, movie_file_id: number, existing_path: string | null, new_path: string | null, status: MovieRenamePreviewStatus, reasons: Array<MovieRenamePreviewReason>, };
+
+export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "invalid_file_facts" | "naming_render_failed";
+
+export type MovieRenamePreviewStatus = "change" | "unavailable";
+
 export type NamingErrorDetail = { code: string, message: string, };
 
 export type NamingErrorEnvelope = { error: NamingErrorDetail, };

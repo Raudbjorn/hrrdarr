@@ -275,6 +275,36 @@ pub struct Template {
 }
 
 impl Template {
+    pub(super) fn uses_movie_title(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::MovieTitle)))
+    }
+    pub(super) fn uses_year(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::ReleaseYear)))
+    }
+    pub(super) fn uses_edition(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::EditionTags)))
+    }
+    pub(super) fn uses_quality(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::QualityTitle | Token::QualityFull)))
+    }
+    pub(super) fn uses_revision(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::QualityFull)))
+    }
     pub(super) fn uses_custom_formats(&self) -> bool {
         self.components
             .iter()
@@ -616,6 +646,26 @@ pub(super) fn cap_bytes(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+/// Preview's original-name fallback uses the source's default cleanup policy,
+/// independently of the configured enabled-template policy. No I/O.
+pub(super) fn preview_original_stem(raw: &str) -> Result<String, RenderError> {
+    // Source-default original-name cleanup keeps a dash before an existing
+    // space. Enabled native Smart has a different, already accepted contract.
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ':' {
+            if chars.peek() == Some(&' ') {
+                cleaned.push(' ');
+            }
+            cleaned.push('-');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    finish_component(&replace_illegal(&cleaned, true)?)
+}
+
 fn finish_component(raw: &str) -> Result<String, RenderError> {
     let trimmed = trim_edges(raw);
     let capped = cap_bytes(trimmed, MAX_COMPONENT_BYTES);

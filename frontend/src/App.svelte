@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MovieRenamePreviewPanel from './lib/MovieRenamePreviewPanel.svelte';
   import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
@@ -186,6 +187,9 @@
           {#if profilesError}<p role="alert" class="error">{profilesError}</p><button type="button" onclick={() => loadProfiles()}>Retry quality profiles</button>{/if}
           {#if profiles}<div class="actions"><button type="button" disabled={profilesLoading || profiles.offset === 0} onclick={() => loadProfiles(Math.max(0, profiles!.offset - 50))}>Previous profiles</button><button type="button" disabled={profilesLoading || profiles.offset + profiles.limit >= profiles.total} onclick={() => loadProfiles(profiles!.offset + profiles!.limit)}>Next profiles</button></div>{/if}
           <button disabled={saving || profilesLoading}>Save settings</button></form></details>
+        {#if domain === 'movies'}
+          {#key selected.id}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+        {/if}
         {#if domain === 'tv'}
           <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={saving} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
           <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={saving} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
