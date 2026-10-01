@@ -273,7 +273,10 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         "SELECT * FROM metadata_refresh_commands ORDER BY id",
         "SELECT * FROM schema_migrations WHERE version<=44 ORDER BY version",
         "SELECT * FROM sqlite_sequence ORDER BY name",
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports') ORDER BY type,name",
+        // The latest runner adds46's three movie-membership invalidation triggers;
+        // compare every predecessor object exactly, with those explicit additions
+        // covered by removed_metadata_health_tests. Existing45 exclusions stay fixed.
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -488,7 +491,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        45
+        46 // Latest adds removed-health46; predecessor44 and injected45 failure remain fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -614,7 +617,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        45
+        46 // Latest adds removed-health46; predecessor44 and injected45 failure remain fixed.
     );
     integrity(&c).await?;
     drop(c);

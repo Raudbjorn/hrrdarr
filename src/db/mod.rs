@@ -196,6 +196,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "autotagging_metadata",
         include_str!("../../migrations/0045_autotagging_metadata.sql"),
     ),
+    (
+        "removed_metadata_health",
+        include_str!("../../migrations/0046_removed_metadata_health.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -747,3 +751,6 @@ mod release_profile_tests;
 
 #[cfg(test)]
 mod download_root_health_tests;
+
+#[cfg(test)]
+mod removed_metadata_health_tests;

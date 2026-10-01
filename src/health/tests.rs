@@ -15,7 +15,7 @@ async fn fixture_all() -> (Scratch, Database, Connection) {
     (Scratch(path), db, c)
 }
 // These existing lifecycle cases deliberately use the original two-check registry.
-// Extension cases below use fixture_all and exercise the actual six migration seeds.
+// Extension cases below use fixture_all and exercise the actual eight migration seeds (including both removed-metadata checks).
 async fn fixture() -> (Scratch, Database, Connection) {
     let fixture = fixture_all().await;
     fixture
@@ -774,7 +774,10 @@ fn mixed(cmd: &HealthCommand, issue_present: bool) -> Vec<CheckOutcome> {
                 } else {
                     None
                 })
-            } else if m.identity.check_key == "download_client_root_folder" {
+            } else if matches!(
+                m.identity.check_key.as_str(),
+                "download_client_root_folder" | "removed_metadata"
+            ) {
                 Ok(None)
             } else {
                 Err("check_failed")
@@ -810,8 +813,8 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     let id = admit(&c, HealthScope::All, 102).await;
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
-        // Registry now contains three checks per domain; retry must retain all six.
-        assert_eq!(cmd.members.len(), 6);
+        // Registry now contains four checks per domain; retry must retain all eight.
+        assert_eq!(cmd.members.len(), 8);
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
             .await
@@ -825,7 +828,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 6 } else { 0 }
+            if attempt < 3 { 8 } else { 0 }
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -878,7 +881,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        6 // All registered checks retain their pending reasons.
+        8 // Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -940,7 +943,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     init(&c, 100).await;
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
-    publish(&c, &cmd, Ok(vec![None; 6]), 101).await.unwrap();
+    publish(&c, &cmd, Ok(vec![None; 8]), 101).await.unwrap();
     for at in 200..212 {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -966,7 +969,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
         .unwrap();
     tx.rollback().await.unwrap();
     assert_eq!(count(&c,"SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,generation);
-    // Coalesce all six while queued, then change one input while the batch is running.
+    // Coalesce all eight while queued, then change one input while the batch is running.
     assert_eq!(admit(&c, HealthScope::All, 212).await, queued.id);
     let cmd = take(&c, queued.id, 212).await;
     let tx = c
@@ -994,7 +997,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        6 // All registered checks retain their pending reasons.
+        8 // Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
 }
 
@@ -1185,7 +1188,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        3 // A new TV request now selects all three TV checks.
+        4 // Removed metadata adds a fourth TV check to the scoped request.
     );
     assert_eq!(
         count(
@@ -1206,10 +1209,278 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 3); // All three newly requested TV checks survive.
+    assert_eq!(next.members.len(), 4); // All four newly requested TV checks survive.
     assert!(
         next.members
             .iter()
             .all(|m| m.identity.scope == HealthScope::Tv)
     );
+}
+
+fn removed_identity(scope: HealthScope) -> HealthIdentity {
+    HealthIdentity {
+        scope,
+        check_key: "removed_metadata".into(),
+    }
+}
+
+#[tokio::test]
+async fn removed_metadata_counts_library_owners_and_bounds_snapshot_messages() {
+    let (_scratch, db, c) = fixture_all().await;
+    c.execute_batch("INSERT INTO series(id,title,path,monitored,status) VALUES(1,'Missing source','/tv1',0,'deleted'),(2,'Unknown','/tv2',0,NULL); INSERT INTO movie_metadata(id,title,status) VALUES(1,'Orphan','deleted'),(2,'Library movie','deleted'),(3,'Unknown',NULL); INSERT INTO movies(id,metadata_id,path,monitored) VALUES(1,2,'/movie1',0),(2,3,'/movie2',0);").await.unwrap();
+    for (scope, title, source, compatibility) in [
+        (
+            HealthScope::Tv,
+            "Missing source",
+            "TVDB",
+            "RemovedSeriesCheck",
+        ),
+        (
+            HealthScope::Movies,
+            "Library movie",
+            "TMDb",
+            "RemovedMovieCheck",
+        ),
+    ] {
+        let issue = removed_metadata::evaluate(&db, &removed_identity(scope))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.severity, HealthSeverity::Error);
+        assert!(issue.reason.ends_with("_single"));
+        assert_eq!(issue.compatibility_type, compatibility);
+        assert!(issue.message.starts_with("1 library"));
+        assert!(issue.message.contains(title));
+        assert!(issue.message.contains(&format!("{source} ID unavailable")));
+        assert!(!issue.message.contains("Orphan"));
+        assert!(!issue.message.contains("Unknown"));
+    }
+    c.execute_batch("INSERT INTO movie_metadata(id,tmdb_id,title,status) VALUES(4,404,'Second movie','deleted'); INSERT INTO movies(id,metadata_id,path,monitored) VALUES(4,4,'/movie4',0);").await.unwrap();
+    let multiple = removed_metadata::evaluate(&db, &removed_identity(HealthScope::Movies))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(multiple.reason, "removed_movie_multiple");
+    assert!(multiple.message.starts_with("2 library movies"));
+    assert!(multiple.message.contains("TMDb ID 404"));
+    assert!(
+        multiple.message.find("Library movie").unwrap()
+            < multiple.message.find("Second movie").unwrap()
+    );
+    c.execute("DELETE FROM movies WHERE id=4", ())
+        .await
+        .unwrap();
+    c.execute(
+        "UPDATE series SET title=? WHERE id=1",
+        ["\0hidden title suffix"],
+    )
+    .await
+    .unwrap();
+    let nul = removed_metadata::evaluate(&db, &removed_identity(HealthScope::Tv))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(nul.message.contains("(untitled) [title truncated]"));
+    assert!(!nul.message.contains('\0'));
+    // Huge direct/snapshot data is projected to <=161 characters by SQL, then clipped by bytes.
+    let huge = format!("\n{}\tTAIL", "🦀".repeat(100_000));
+    for id in 3..=20 {
+        c.execute("INSERT INTO series(id,tvdb_id,title,path,status,monitored) VALUES(?,?,?,?, 'deleted',0)",params![id, 1000+id, huge.clone(),format!("/tv{id}")]).await.unwrap();
+    }
+    let issue = removed_metadata::evaluate(&db, &removed_identity(HealthScope::Tv))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(issue.message.starts_with("19 library series"));
+    assert_eq!(issue.reason, "removed_series_multiple");
+    assert!(issue.message.contains("3 additional titles omitted"));
+    assert!(issue.message.contains("[title truncated]"));
+    assert!(issue.message.contains("TVDB ID 1017"));
+    assert!(!issue.message.contains("TVDB ID 1018"));
+    assert!(!issue.message.chars().any(char::is_control));
+    assert!(issue.message.len() <= 4096);
+    c.execute("DELETE FROM movies WHERE metadata_id=2", ())
+        .await
+        .unwrap();
+    assert!(
+        removed_metadata::evaluate(&db, &removed_identity(HealthScope::Movies))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A failed database read must not become an empty, healthy observation.
+    c.execute("ALTER TABLE series RENAME TO series_unavailable", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        removed_metadata::evaluate(&db, &removed_identity(HealthScope::Tv))
+            .await
+            .unwrap_err(),
+        "storage_error"
+    );
+}
+
+async fn removed_outcomes(db: &Database, cmd: &HealthCommand) -> Vec<CheckOutcome> {
+    let mut outcomes = Vec::new();
+    for member in &cmd.members {
+        outcomes.push(if member.identity.check_key == "removed_metadata" {
+            removed_metadata::evaluate(db, &member.identity).await
+        } else {
+            Ok(None)
+        });
+    }
+    outcomes
+}
+
+#[tokio::test]
+async fn removed_metadata_rejects_stale_healthy_and_error_snapshots_and_rolls_back() {
+    let (_scratch, db, c) = fixture_all().await;
+    c.execute_batch("INSERT INTO series(id,tvdb_id,title,path,status) VALUES(1,101,'TV original','/tv','continuing'); INSERT INTO movie_metadata(id,tmdb_id,title,status) VALUES(1,202,'Movie original','released'); INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movie');").await.unwrap();
+    init(&c, 100).await;
+    let first = take(&c, admit(&c, HealthScope::All, 100).await, 100).await;
+    let healthy = removed_outcomes(&db, &first).await;
+    c.execute_batch(
+        "UPDATE series SET status='deleted'; UPDATE movie_metadata SET status='deleted';",
+    )
+    .await
+    .unwrap();
+    publish_outcomes(&c, &first, healthy, 101).await.unwrap();
+    assert_eq!(
+        read(&c, first.id).await.unwrap().error_code.as_deref(),
+        Some("stale_inputs")
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE observed_generation IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    let current = take(&c, admit(&c, HealthScope::All, 102).await, 102).await;
+    let errors = removed_outcomes(&db, &current).await;
+    publish_outcomes(&c, &current, errors, 103).await.unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=3 AND observed_generation=generation").await,2);
+    let stale = take(&c, admit(&c, HealthScope::All, 104).await, 104).await;
+    let old_errors = removed_outcomes(&db, &stale).await;
+    c.execute_batch("UPDATE series SET title='TV restored',status='continuing'; UPDATE movie_metadata SET title='Movie restored',status='released';").await.unwrap();
+    publish_outcomes(&c, &stale, old_errors, 105).await.unwrap();
+    assert_eq!(
+        read(&c, stale.id).await.unwrap().error_code.as_deref(),
+        Some("stale_inputs")
+    );
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=3 AND observed_generation<generation").await,2);
+    let restored = take(&c, admit(&c, HealthScope::All, 106).await, 106).await;
+    // Fail the final command settlement, after health rows/transitions were written.
+    c.execute_batch("CREATE TRIGGER reject_health_settlement BEFORE UPDATE OF status ON health_commands WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'fixture late settlement'); END;").await.unwrap();
+    assert!(
+        publish_outcomes(&c, &restored, removed_outcomes(&db, &restored).await, 107)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_transitions WHERE kind='restored'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=3"
+        )
+        .await,
+        2
+    );
+    c.execute("DROP TRIGGER reject_health_settlement", ())
+        .await
+        .unwrap();
+    publish_outcomes(&c, &restored, removed_outcomes(&db, &restored).await, 108)
+        .await
+        .unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=0 AND observed_generation=generation").await,2);
+    assert_eq!(count(&c,"SELECT count(*) FROM health_transitions WHERE kind='restored' AND (message LIKE '%TV original%' OR message LIKE '%Movie original%')").await,2);
+    // Source mutation rollback restores the exact generation along with authoritative status.
+    let generation = count(
+        &c,
+        "SELECT generation FROM health_checks WHERE scope='tv' AND check_key='removed_metadata'",
+    )
+    .await;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    tx.execute("UPDATE series SET status='deleted'", ())
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        count(
+            &c,
+            "SELECT generation FROM health_checks WHERE scope='tv' AND check_key='removed_metadata'"
+        )
+        .await,
+        generation
+    );
+    assert!(
+        removed_metadata::evaluate(&db, &removed_identity(HealthScope::Tv))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn removed_metadata_scheduled_dispatch_and_invalid_identity_preserve_prior_issue() {
+    let (_scratch, db, c) = fixture_all().await;
+    let db = std::sync::Arc::new(db);
+    let (_, client) = crate::providers::router_with_refresh(db.clone(), None);
+    c.execute_batch("INSERT INTO series(id,tvdb_id,title,path,status,monitored) VALUES(1,101,'Original TV','/tv','deleted',0); INSERT INTO movie_metadata(id,tmdb_id,title,status) VALUES(1,202,'Original movie','deleted'); INSERT INTO movies(id,metadata_id,path,monitored) VALUES(1,1,'/movie',0);").await.unwrap();
+    init(&c, 100).await;
+    // Exercise the actual dispatcher on startup and the existing six-hour sweep.
+    for timestamp in [100, 21700] {
+        tick(&c, timestamp).await;
+        let queued = active(&c).await.unwrap().unwrap();
+        let cmd = take(&c, queued.id, timestamp).await;
+        let mut results = Vec::new();
+        for member in &cmd.members {
+            if timestamp == 21700 {
+                assert_ne!(member.captured_reasons.unwrap() & SCHEDULED, 0);
+            }
+            results.push(evaluate(&db, &client, member).await);
+        }
+        publish_outcomes(&c, &cmd, results, timestamp + 1)
+            .await
+            .unwrap();
+        assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=3 AND last_error IS NULL AND observed_generation=generation").await,2);
+    }
+    // SQLite's affinity/check semantics can admit nonnumeric text. Never decode it as
+    // a native-ID fallback or fabricate a healthy observation; retain the last snapshot.
+    c.execute_batch(
+        "UPDATE series SET tvdb_id='invalid'; UPDATE movie_metadata SET tmdb_id='invalid';",
+    )
+    .await
+    .unwrap();
+    let cmd = take(&c, admit(&c, HealthScope::All, 21702).await, 21702).await;
+    let results = removed_outcomes(&db, &cmd).await;
+    for (member, result) in cmd.members.iter().zip(&results) {
+        if member.identity.check_key == "removed_metadata" {
+            assert_eq!(result.as_ref().unwrap_err(), &"check_failed");
+        }
+    }
+    publish_outcomes(&c, &cmd, results, 21703).await.unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND severity=3 AND last_error='check_failed' AND observed_generation<generation AND (message LIKE '%TVDB ID 101%' OR message LIKE '%TMDb ID 202%')").await,2);
+    // Corrupt legacy nonpositive IDs also fail; constraints are bypassed only on this
+    // fixture connection to exercise defensive reading of an old/imported database.
+    c.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE series SET tvdb_id=0; UPDATE movie_metadata SET tmdb_id=-1; PRAGMA ignore_check_constraints=OFF;").await.unwrap();
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        assert_eq!(
+            removed_metadata::evaluate(&db, &removed_identity(scope))
+                .await
+                .unwrap_err(),
+            "check_failed"
+        );
+    }
 }

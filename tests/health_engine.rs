@@ -33,8 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Migration44 adds one root check per domain; wait for all six.
-            if v["summary"]["current"] == 6 {
+            // Migration46 adds removed metadata per domain; wait for all eight current checks.
+            if v["summary"]["current"] == 8 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -64,8 +64,34 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    // Migration44 registers CDH, communication and root checks independently in both domains.
-    assert_eq!(fresh["summary"]["never_run"], 6);
+    // Migration46 adds removed metadata to CDH, communication and roots in each domain.
+    assert_eq!(fresh["summary"]["never_run"], 8);
+    let identities = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["identity"]["scope"].as_str().unwrap().to_owned(),
+                    row["identity"]["check_key"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let expected = ["tv", "movies"]
+        .into_iter()
+        .flat_map(|scope| {
+            [
+                "completed_download_handling",
+                "download_client_communication",
+                "download_client_root_folder",
+                "removed_metadata",
+            ]
+            .into_iter()
+            .map(move |key| (scope.to_owned(), key.to_owned()))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(identities(&fresh["checks"]), expected);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -135,8 +161,9 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Admission includes all three checks in each domain after migration44.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 6);
+    // Admission includes all four identities per domain, not only a larger count.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 8);
+    assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
         &base,

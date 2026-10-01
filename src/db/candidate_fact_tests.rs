@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,

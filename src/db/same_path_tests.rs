@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 45); // Latest includes AutoTagging metadata45; historical migration prefixes stay unchanged.
+    assert_eq!(version(&c).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

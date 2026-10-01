@@ -15,6 +15,7 @@ use uuid::Uuid;
 mod api;
 mod download_roots;
 mod engine;
+mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
     HealthTransition, HealthTransitions, router,

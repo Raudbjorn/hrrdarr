@@ -140,15 +140,26 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    let started = std::time::Instant::now();
     let response = client
         .request(method.parse().unwrap(), format!("{base}{path}"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "owned request failed: method={method} path={path} elapsed={:?} error={error:?}",
+                started.elapsed()
+            )
+        });
     let status = response.status().as_u16();
-    let text = response.text().await.unwrap();
+    let text = response.text().await.unwrap_or_else(|error| {
+        panic!(
+            "owned response body failed: method={method} path={path} status={status} elapsed={:?} error={error:?}",
+            started.elapsed()
+        )
+    });
     assert!(!text.contains("PRIVATE_REMOTE_ERROR"));
     (
         status,
@@ -655,7 +666,26 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     )
     .await;
     let (app, client) = providers::router_with_refresh(db.clone(), None);
-    let (base, server) = serve(app.merge(commands::router(db.clone()))).await;
+    // Only this fixture traces owned command reads. Sequential polling correlates
+    // method/path with the phase IDs below; no request headers or budgets change.
+    let trace_origin = std::time::Instant::now();
+    let app = app.merge(commands::router(db.clone())).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let trace = request.method() == Method::GET
+                && request.uri().path().starts_with("/api/v1/commands/");
+            let path = request.uri().path().to_owned();
+            let arrived = std::time::Instant::now();
+            if trace {
+                eprintln!("event=owned_command_read_arrived path={path} since_start={:?}", trace_origin.elapsed());
+            }
+            let response = next.run(request).await;
+            if trace {
+                eprintln!("event=owned_command_read_completed path={path} status={} elapsed={:?} since_start={:?}", response.status(), arrived.elapsed(), trace_origin.elapsed());
+            }
+            response
+        },
+    ));
+    let (base, server) = serve(app).await;
     let scope =
         |c| json!({"category":c,"imported_category":null,"recent_priority":0,"older_priority":1});
     let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("{endpoint}/config-1/"),"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
@@ -704,6 +734,10 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     .await;
     state.mode.store(0, Ordering::SeqCst);
     state.release.add_permits(1);
+    eprintln!(
+        "event=owned_command_wait phase=initial_normal id={}",
+        tv["id"]
+    );
     until(&base, tv["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
     // Synthetic persisted Retry-After boundary: a future obsolete retry must not reserve its scope for a day.
@@ -737,6 +771,10 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     assert_eq!(failed["error_code"], "provider_changed");
     assert_eq!(state.refresh_reads_for("/config-1/"), calls);
     let corrected = submit(&base, &provider, "tv").await;
+    eprintln!(
+        "event=owned_command_wait phase=corrected_revision id={}",
+        corrected["id"]
+    );
     until(&base, corrected["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
     // Restart cannot reset a consumed attempt budget, even when the third attempt was interrupted.
@@ -766,8 +804,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-            // Migration44 adds two root checks; startup must settle all six.
-            if current == 6 { break; }
+            // Migration46 adds two removed-metadata checks; startup must settle all eight.
+            if current == 8 { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.unwrap();
@@ -1066,8 +1104,9 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-                    // Migration44 adds two root checks; keep the exact communication traffic assertion below.
-                    if current == 6 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
+                    // Migration46 adds two local removed-metadata checks; all eight must settle
+                    // without changing the exact communication traffic assertion below.
+                    if current == 8 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }).await.unwrap();

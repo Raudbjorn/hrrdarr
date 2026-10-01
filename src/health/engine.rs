@@ -489,6 +489,7 @@ async fn evaluate(
         _ => return Err("check_failed"),
     };
     match member.identity.check_key.as_str() {
+        "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
             db, client, domain,
         )

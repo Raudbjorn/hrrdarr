@@ -3,7 +3,7 @@ use axum::{
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use hrrdarr::{commands, db::Database, library, metadata::MetadataClient, providers};
+use hrrdarr::{commands, db::Database, health, library, metadata::MetadataClient, providers};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -105,6 +105,7 @@ async fn serve(app: axum::Router) -> (String, JoinHandle<()>) {
     )
 }
 async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
+    let started = std::time::Instant::now();
     let response = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -115,9 +116,14 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "owned request failed: method={method} path={path} elapsed={:?} error={error:?}",
+                started.elapsed()
+            )
+        });
     let code = response.status().as_u16();
-    let text = response.text().await.unwrap();
+    let text = response.text().await.unwrap_or_else(|error| panic!("owned response body failed: method={method} path={path} status={code} elapsed={:?} error={error:?}", started.elapsed()));
     assert!(!text.contains("PRIVATE_METADATA_ERROR"));
     (
         code,
@@ -137,11 +143,27 @@ async fn app(
     client: Arc<MetadataClient>,
 ) -> (String, JoinHandle<()>, providers::RefreshClient) {
     let (providers, refresh) = providers::router_with_refresh(db.clone(), None);
+    // Owned app reads only: path correlates sequential polls with until entry.
+    let origin = std::time::Instant::now();
     let (base, server) = serve(
         providers
             .merge(commands::router(db.clone()))
+            .merge(health::router(db.clone()))
             .merge(library::router(db.clone()))
-            .merge(library::metadata_router(db, client)),
+            .merge(library::metadata_router(db, client))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let trace = request.method() == Method::GET
+                        && (request.uri().path().starts_with("/api/v1/metadata-refresh/commands/")
+                            || request.uri().path().starts_with("/api/v1/commands/"));
+                    let path = request.uri().path().to_owned();
+                    let arrived = std::time::Instant::now();
+                    if trace { eprintln!("event=owned_metadata_read_arrived path={path} since_start={:?}", origin.elapsed()); }
+                    let response = next.run(request).await;
+                    if trace { eprintln!("event=owned_metadata_read_completed path={path} status={} elapsed={:?} since_start={:?}", response.status(), arrived.elapsed(), origin.elapsed()); }
+                    response
+                },
+            )),
     )
     .await;
     (base, server, refresh)
@@ -158,6 +180,7 @@ async fn enqueue(base: &str, target: &Value, priority: &str) -> Value {
     value
 }
 async fn until(base: &str, id: &Value, status: &str) -> Value {
+    eprintln!("event=owned_metadata_wait id={id} expected={status}");
     tokio::time::timeout(Duration::from_secs(16), async {
         loop {
             let (code, value) = request(
@@ -453,6 +476,7 @@ async fn cancellation_stale_identity_and_remote_failures_never_publish_partial_m
     for (media, target) in [("tv", &targets[0]), ("movies", &targets[1])] {
         let original = title(&db, media).await;
         let original_statuses = lifecycle(&db).await;
+        let generations = removed_generations(&db).await;
         state.mode.store(2, Ordering::SeqCst);
         let cancelled = enqueue(&base, target, "normal").await;
         tokio::time::timeout(Duration::from_secs(5), state.started.notified())
@@ -490,6 +514,7 @@ async fn cancellation_stale_identity_and_remote_failures_never_publish_partial_m
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(title(&db, media).await, original);
         assert_eq!(lifecycle(&db).await, original_statuses);
+        assert_eq!(removed_generations(&db).await, generations);
         state.mode.store(3, Ordering::SeqCst);
         let invalid = enqueue(&base, target, "normal").await;
         let failed = until(&base, &invalid["id"], "failed").await;
@@ -497,12 +522,14 @@ async fn cancellation_stale_identity_and_remote_failures_never_publish_partial_m
         assert_eq!(failed["attempts"], 1);
         assert_eq!(title(&db, media).await, original);
         assert_eq!(lifecycle(&db).await, original_statuses);
+        assert_eq!(removed_generations(&db).await, generations);
         state.mode.store(1, Ordering::SeqCst);
         let unavailable = enqueue(&base, target, "normal").await;
         let retrying = until(&base, &unavailable["id"], "retry_wait").await;
         assert_eq!(retrying["error_code"], "metadata_unavailable");
         assert_eq!(title(&db, media).await, original);
         assert_eq!(lifecycle(&db).await, original_statuses);
+        assert_eq!(removed_generations(&db).await, generations);
         state.mode.store(0, Ordering::SeqCst);
         assert_eq!(
             until(&base, &unavailable["id"], "succeeded").await["attempts"],
@@ -510,6 +537,7 @@ async fn cancellation_stale_identity_and_remote_failures_never_publish_partial_m
         );
         // A successful refresh may restore lifecycle facts; later failures must preserve that result.
         let refreshed_statuses = lifecycle(&db).await;
+        let refreshed_generations = removed_generations(&db).await;
         // A captured external identity changed while HTTP was pending must never apply old facts.
         state.mode.store(2, Ordering::SeqCst);
         let stale = enqueue(&base, target, "normal").await;
@@ -554,6 +582,7 @@ async fn cancellation_stale_identity_and_remote_failures_never_publish_partial_m
         let waiting = until(&base, &limited["id"], "retry_wait").await;
         assert_eq!(waiting["error_code"], "metadata_rate_limited");
         assert_eq!(lifecycle(&db).await, refreshed_statuses);
+        assert_eq!(removed_generations(&db).await, refreshed_generations);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -705,6 +734,7 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
         ]
     );
     for (index, target) in targets.iter().enumerate() {
+        let generations = removed_generations(&db).await;
         state.mode.store(6, Ordering::SeqCst); // actual HTTP404 held until cancellation/identity edit
         let cancelled = enqueue(&base, target, "normal").await;
         tokio::time::timeout(Duration::from_secs(5), state.started.notified())
@@ -733,6 +763,7 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
             .await
             .unwrap();
         assert_eq!(lifecycle(&db).await, statuses);
+        assert_eq!(removed_generations(&db).await, generations);
         assert_eq!(preserved_metadata(&db).await, original);
         let (change, restore) = if index == 0 {
             (
@@ -769,6 +800,7 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
         assert_eq!(recovered["attempts"], 3);
         assert_eq!(recovered["records_updated"], 0);
         assert_eq!(lifecycle(&db).await, statuses);
+        assert_eq!(removed_generations(&db).await, generations);
         assert_eq!(preserved_metadata(&db).await, original);
         c.execute_batch("DROP TRIGGER fixture_404_settlement_failure")
             .await
@@ -778,6 +810,9 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
         assert_eq!(failed["error_code"], "metadata_not_found");
         assert_eq!(failed["attempts"], 1);
         assert_eq!(failed["records_updated"], 0);
+        let after = removed_generations(&db).await;
+        assert_eq!(after[index], generations[index] + 1);
+        assert_eq!(after[1 - index], generations[1 - index]);
         statuses[if index == 0 { 0 } else { 2 }] = Some("deleted".into());
         assert_eq!(lifecycle(&db).await, statuses);
         assert_eq!(preserved_metadata(&db).await, original);
@@ -803,7 +838,7 @@ async fn successful_refresh_after_actual_404_restores_both_lifecycles() {
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let (base, server, refresh) = app(db.clone(), client.clone()).await;
     let targets = seed(&base, &scratch).await;
-    let runtime = commands::start_with_metadata(db.clone(), refresh, client)
+    let runtime = commands::start_with_metadata(db.clone(), refresh, client.clone())
         .await
         .unwrap();
     state.mode.store(5, Ordering::SeqCst);
@@ -818,7 +853,45 @@ async fn successful_refresh_after_actual_404_restores_both_lifecycles() {
         lifecycle(&db).await,
         vec![Some("deleted".into()), Some("deleted".into())]
     );
+    let remote_calls = state.calls.lock().unwrap().len();
+    let mut issues = Vec::new();
+    for (media, source, compatibility) in [
+        ("tv", "TVDB", "RemovedSeriesCheck"),
+        ("movies", "TMDb", "RemovedMovieCheck"),
+    ] {
+        let snapshot = until_removed_health(&base, media, true).await;
+        let issue = snapshot["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identity"]["check_key"] == "removed_metadata")
+            .unwrap()
+            .clone();
+        assert_eq!(issue["severity"], "error");
+        assert_eq!(issue["compatibility_type"], compatibility);
+        assert!(
+            issue["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{source} ID 101"))
+        );
+        issues.push(issue);
+    }
+    assert_eq!(state.calls.lock().unwrap().len(), remote_calls);
     let preserved = preserved_metadata(&db).await;
+    // Reopen the real file database; startup must re-observe persisted removals.
+    runtime.shutdown().await;
+    stop(server).await;
+    drop(db);
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let (base, server, refresh) = app(db.clone(), client.clone()).await;
+    let runtime = commands::start_with_metadata(db.clone(), refresh, client)
+        .await
+        .unwrap();
+    for media in ["tv", "movies"] {
+        until_removed_health(&base, media, true).await;
+    }
+    assert_eq!(state.calls.lock().unwrap().len(), remote_calls);
     state.mode.store(0, Ordering::SeqCst);
     for target in &targets {
         let command = enqueue(&base, target, "normal").await;
@@ -830,7 +903,71 @@ async fn successful_refresh_after_actual_404_restores_both_lifecycles() {
         vec![Some("continuing".into()), Some("announced".into())]
     );
     assert_eq!(preserved_metadata(&db).await, preserved);
+    for media in ["tv", "movies"] {
+        until_removed_health(&base, media, false).await;
+    }
+    let (code, transitions) =
+        request(&base, "GET", "/api/v1/health/transitions", Value::Null).await;
+    assert_eq!(code, 200);
+    for issue in issues {
+        let relevant: Vec<_> = transitions["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["issue"]["identity"] == issue["identity"])
+            .collect();
+        assert_eq!(relevant.len(), 2, "{transitions}");
+        assert_eq!(relevant[0]["kind"], "issue");
+        assert_eq!(relevant[1]["kind"], "restored");
+        assert_eq!(relevant[1]["issue"], issue); // Immutable original diagnostic, not restored metadata.
+    }
     runtime.shutdown().await;
     stop(server).await;
     stop(upstream).await;
+}
+
+async fn removed_generations(db: &Database) -> Vec<i64> {
+    let c = db.connect().await.unwrap();
+    let mut rows = c.query("SELECT generation FROM health_checks WHERE check_key='removed_metadata' ORDER BY CASE scope WHEN 'tv' THEN 0 ELSE 1 END", ()).await.unwrap();
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        values.push(row.get(0).unwrap());
+    }
+    assert_eq!(values.len(), 2);
+    values
+}
+
+async fn until_removed_health(base: &str, media: &str, has_issue: bool) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(16);
+    loop {
+        let (code, value) = request(
+            base,
+            "GET",
+            &format!("/api/v1/health?scope={media}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, 200, "{value}");
+        let check = value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identity"]["check_key"] == "removed_metadata")
+            .unwrap();
+        let issue = value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["identity"]["check_key"] == "removed_metadata");
+        if check["evaluation"] == "current" && issue == has_issue {
+            assert_eq!(check["observed_generation"], check["generation"]);
+            assert_eq!(check["pending_reasons"], 0);
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "health did not settle: {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
