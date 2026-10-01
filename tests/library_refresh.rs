@@ -49,6 +49,10 @@ fn episode(id: i64, season: i64, number: i64, title: &str) -> EpisodeDetails {
 }
 fn series() -> SeriesDetails {
     SeriesDetails {
+        network: None,
+        original_country: None,
+        status: None,
+        genres: None,
         original_language: None,
         tvdb_id: 101,
         title: "New TV".into(),
@@ -68,6 +72,9 @@ fn series() -> SeriesDetails {
 }
 fn movie() -> MovieDetails {
     MovieDetails {
+        studio: None,
+        genres: None,
+        keywords: None,
         tmdb_id: 101,
         title: "New Movie".into(),
         year: None,
@@ -165,6 +172,60 @@ async fn metadata_reconciliation_preserves_local_identity_policy_and_files() -> 
         scalar(&c, "SELECT year FROM movie_metadata WHERE id=7").await,
         2019
     );
+    // Direct Rust DTOs receive full-document preflight too: a late bad episode
+    // or fact cannot update title/network first, even before caller rollback.
+    for kind in 0..5 {
+        let mut incoming = series();
+        incoming.title = "Must not write".into();
+        incoming.network = Some("Must not write".into());
+        match kind {
+            0 => incoming.genres = Some(vec!["valid".into(), "bad\0".into()]),
+            1 => incoming.original_country = Some("US".into()),
+            2 => incoming.episodes.last_mut().unwrap().title = "".into(),
+            3 => incoming.episodes.last_mut().unwrap().air_date = Some("".into()),
+            _ => incoming.episodes.last_mut().unwrap().air_date_utc = Some("invalid".into()),
+        }
+        let tx = c.transaction().await?;
+        assert_eq!(
+            refresh::apply(&tx, &tv, Details::Series(incoming)).await,
+            Err(refresh::Error::Conflict)
+        );
+        assert_eq!(
+            scalar(
+                &tx,
+                "SELECT count(*) FROM series WHERE title='New TV' AND network IS NULL"
+            )
+            .await,
+            1
+        );
+        tx.rollback().await?;
+    }
+    for kind in 0..5 {
+        let mut incoming = movie();
+        incoming.title = "Must not write".into();
+        incoming.studio = Some("Must not write".into());
+        match kind {
+            0 => incoming.keywords = Some(vec!["valid".into(), "bad\0".into()]),
+            1 => incoming.runtime = Some(-1),
+            2 => incoming.status = Some("Unknown enum".into()),
+            3 => incoming.digital_release = Some("".into()),
+            _ => incoming.alternative_titles = Some(vec!["".into()]),
+        }
+        let tx = c.transaction().await?;
+        assert_eq!(
+            refresh::apply(&tx, &film, Details::Movie(incoming)).await,
+            Err(refresh::Error::Conflict)
+        );
+        assert_eq!(
+            scalar(
+                &tx,
+                "SELECT count(*) FROM movie_metadata WHERE title='New Movie' AND studio IS NULL"
+            )
+            .await,
+            1
+        );
+        tx.rollback().await?;
+    }
     let before = facts(&c).await;
     for kind in 0..3 {
         let mut incoming = series();
@@ -222,12 +283,13 @@ async fn metadata_reconciliation_preserves_local_identity_policy_and_files() -> 
     );
     tx.rollback().await?;
     c.execute(
-        "INSERT INTO movie_metadata(id,title,imdb_id) VALUES(99,'Other','tt999')",
+        "INSERT INTO movie_metadata(id,title,imdb_id) VALUES(99,'Other','tt0000999')",
         (),
     )
     .await?;
     let mut incoming = movie();
-    incoming.imdb_id = Some("tt999".into());
+    // Valid IMDb syntax keeps this a duplicate-identity conflict, not input validation.
+    incoming.imdb_id = Some("tt0000999".into());
     assert_eq!(
         apply(&c, &film, Details::Movie(incoming)).await,
         Err(refresh::Error::Conflict)

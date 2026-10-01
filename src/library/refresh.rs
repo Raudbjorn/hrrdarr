@@ -103,6 +103,7 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
     }
 }
 async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
+    let detail = detail.validated().map_err(|_| Error::Conflict)?;
     if let Some(imdb) = &detail.imdb_id {
         if c.query(
             "SELECT 1 FROM movie_metadata WHERE imdb_id=? AND id!=? LIMIT 1",
@@ -129,7 +130,8 @@ pub(crate) async fn movie_facts(
     detail: &MovieDetails,
     replace: bool,
 ) -> Result<bool> {
-    const FIELDS: &str = "runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language";
+    let detail = detail.clone().validated().map_err(|_| Error::Conflict)?;
+    const FIELDS: &str = "runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language,studio,genres_json,keywords_json";
     let supplied: Vec<Value> = vec![
         detail.runtime.into(),
         detail.status.clone().into(),
@@ -138,6 +140,9 @@ pub(crate) async fn movie_facts(
         detail.physical_release.clone().into(),
         detail.secondary_year.into(),
         detail.original_language.into(),
+        detail.studio.clone().into(),
+        set_json(&detail.genres)?,
+        set_json(&detail.keywords)?,
     ];
     let row = c
         .query(
@@ -152,7 +157,7 @@ pub(crate) async fn movie_facts(
     let mut values = Vec::with_capacity(8);
     for (i, incoming) in supplied.into_iter().enumerate() {
         let prior = row.get_value(i as i32)?;
-        let value = if incoming == Value::Null {
+        let value = if incoming == Value::Null || (i >= 8 && same_set(&incoming, &prior)?) {
             prior.clone()
         } else {
             incoming
@@ -188,7 +193,7 @@ pub(crate) async fn movie_facts(
     };
     if changed {
         values.push(id.into());
-        c.execute("UPDATE movie_metadata SET runtime=?,status=?,in_cinemas=?,digital_release=?,physical_release=?,secondary_year=?,original_language=? WHERE id=?",values).await?;
+        c.execute("UPDATE movie_metadata SET runtime=?,status=?,in_cinemas=?,digital_release=?,physical_release=?,secondary_year=?,original_language=?,studio=?,genres_json=?,keywords_json=? WHERE id=?",values).await?;
     }
     if aliases_changed {
         c.execute(
@@ -205,6 +210,87 @@ pub(crate) async fn movie_facts(
         }
     }
     Ok(changed || aliases_changed)
+}
+
+fn set_json(values: &Option<Vec<String>>) -> Result<Value> {
+    values
+        .as_ref()
+        .map(|values| {
+            serde_json::to_string(values)
+                .map(Value::Text)
+                .map_err(|_| Error::Conflict)
+        })
+        .unwrap_or(Ok(Value::Null))
+}
+fn same_set(left: &Value, right: &Value) -> Result<bool> {
+    let (Value::Text(left), Value::Text(right)) = (left, right) else {
+        return Ok(false);
+    };
+    let keys = |raw: &str| -> Result<BTreeSet<String>> {
+        let values: Vec<String> = serde_json::from_str(raw).map_err(|_| Error::Conflict)?;
+        let values = crate::metadata::canonical_set(Some(values))
+            .map_err(|_| Error::Conflict)?
+            .ok_or(Error::Conflict)?;
+        Ok(values
+            .into_iter()
+            .map(|value| value.to_lowercase())
+            .collect())
+    };
+    Ok(keys(left)? == keys(right)?)
+}
+/// Facts only: shared by catalog add and refresh, without touching the episode graph.
+/// All validation and adoption conflicts precede the single write.
+pub(crate) async fn series_facts(
+    c: &Connection,
+    id: i64,
+    detail: &SeriesDetails,
+    replace: bool,
+) -> Result<bool> {
+    // Callers validate the whole document before graph/create work; only clone
+    // scalar/set facts here, not the potentially 10,000-episode graph.
+    use crate::metadata::{canonical_country, canonical_scalar, canonical_set};
+    if detail
+        .original_language
+        .is_some_and(|v| !(0..=52).contains(&v))
+        || detail
+            .status
+            .as_deref()
+            .is_some_and(|v| !matches!(v, "deleted" | "continuing" | "ended" | "upcoming"))
+    {
+        return Err(Error::Conflict);
+    }
+    let supplied: Vec<Value> = vec![
+        detail.original_language.into(),
+        canonical_scalar(detail.network.clone())
+            .map_err(|_| Error::Conflict)?
+            .into(),
+        canonical_country(detail.original_country.clone())
+            .map_err(|_| Error::Conflict)?
+            .into(),
+        detail.status.clone().into(),
+        set_json(&canonical_set(detail.genres.clone()).map_err(|_| Error::Conflict)?)?,
+    ];
+    let row = c.query("SELECT original_language,network,original_country,status,genres_json FROM series WHERE id=?", [id]).await?.next().await?.ok_or(Error::TargetChanged)?;
+    let mut changed = false;
+    let mut values = Vec::with_capacity(6);
+    for (i, incoming) in supplied.into_iter().enumerate() {
+        let prior = row.get_value(i as i32)?;
+        let value = if incoming == Value::Null || (i == 4 && same_set(&incoming, &prior)?) {
+            prior.clone()
+        } else {
+            incoming
+        };
+        if !replace && prior != Value::Null && value != prior {
+            return Err(Error::Conflict);
+        }
+        changed |= value != prior;
+        values.push(value);
+    }
+    if changed {
+        values.push(id.into());
+        c.execute("UPDATE series SET original_language=?,network=?,original_country=?,status=?,genres_json=? WHERE id=?",values).await?;
+    }
+    Ok(changed)
 }
 
 struct StoredEpisode {
@@ -224,30 +310,13 @@ fn episode_facts(episode: &EpisodeDetails) -> Vec<Value> {
     ]
 }
 async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
-    if detail.seasons.len() > MAX_SEASONS
-        || detail.episodes.len() > MAX_EPISODES
-        || detail
-            .original_language
-            .is_some_and(|v| !(0..=52).contains(&v))
-    {
-        return Err(Error::Conflict);
-    }
+    let detail = detail.validated().map_err(|_| Error::Conflict)?;
     let incoming_seasons = detail.seasons.iter().copied().collect::<BTreeSet<_>>();
-    if incoming_seasons.len() != detail.seasons.len() || incoming_seasons.iter().any(|n| *n < 0) {
-        return Err(Error::Conflict);
-    }
-    let mut incoming_ids = BTreeSet::new();
-    let mut incoming_numbers = BTreeSet::new();
-    for episode in &detail.episodes {
-        if !(1..=MAX_ID).contains(&episode.tvdb_id)
-            || episode.number < 0
-            || !incoming_seasons.contains(&episode.season)
-            || !incoming_ids.insert(episode.tvdb_id)
-            || !incoming_numbers.insert((episode.season, episode.number))
-        {
-            return Err(Error::Conflict);
-        }
-    }
+    let incoming_ids = detail
+        .episodes
+        .iter()
+        .map(|episode| episode.tvdb_id)
+        .collect::<BTreeSet<_>>();
     let row=c.query("SELECT l.monitor_new_items FROM series s LEFT JOIN library_settings l ON l.series_id=s.id AND l.media_type='tv' WHERE s.id=?",[id]).await?.next().await?.ok_or(Error::TargetChanged)?;
     let new_policy = row.get::<Option<String>>(0)?;
     drop(row);
@@ -329,7 +398,9 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
         }
     }
     // All ambiguous identities and monitoring policy are checked before modifying any row.
-    let mut changed=c.execute("UPDATE series SET title=?1,year=COALESCE(?2,year),original_language=COALESCE(?3,original_language) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR original_language IS NOT COALESCE(?3,original_language))",params![detail.title,detail.year,detail.original_language,id]).await? as u16;
+    let facts_changed = series_facts(c, id, &detail, true).await?;
+    let title_changed=c.execute("UPDATE series SET title=?1,year=COALESCE(?2,year) WHERE id=?3 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year))",params![detail.title,detail.year,id]).await?;
+    let mut changed = u16::from(facts_changed || title_changed > 0);
     for (number, monitored) in additions {
         c.execute(
             "INSERT INTO seasons(series_id,number,monitored) VALUES(?,?,?)",
@@ -362,4 +433,150 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
         }
     }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn autotag_adoption_checks_all_facts_before_writes() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("autotag-facts-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = crate::db::Database::open_local(scratch.0.join("db"))
+            .await
+            .unwrap();
+        let c = db.connect().await.unwrap();
+        c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,1,'TV','/tv'); INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,1,'Movie');").await.unwrap();
+        let tv: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","seasons":[],"episodes":[],"network":"Network","original_country":"isl","status":"continuing","genres":["Drama","drama"]})).unwrap();
+        let film: MovieDetails = serde_json::from_value(json!({"tmdb_id":1,"title":"Movie","runtime":0,"studio":"Studio","genres":["Drama","drama"],"keywords":[]})).unwrap();
+        let tx = c.transaction().await.unwrap();
+        assert!(series_facts(&tx, 1, &tv, false).await.unwrap());
+        assert!(movie_facts(&tx, 1, &film, false).await.unwrap());
+        tx.commit().await.unwrap();
+        let mut tv = tv;
+        let mut film = film;
+        tv.genres = Some(vec!["DRAMA".into()]);
+        film.genres = tv.genres.clone();
+        assert!(!series_facts(&c, 1, &tv, false).await.unwrap());
+        assert!(!movie_facts(&c, 1, &film, false).await.unwrap());
+        // Sparse facts retain everything; zero is concrete, not absent.
+        let sparse: MovieDetails =
+            serde_json::from_value(json!({"tmdb_id":1,"title":"Movie"})).unwrap();
+        assert!(!movie_facts(&c, 1, &sparse, false).await.unwrap());
+        for empty_prior in [false, true] {
+            c.execute(
+                "UPDATE series SET genres_json=?",
+                [if empty_prior { "[]" } else { "[\"Drama\"]" }],
+            )
+            .await
+            .unwrap();
+            c.execute(
+                "UPDATE movie_metadata SET genres_json=?",
+                [if empty_prior { "[]" } else { "[\"Drama\"]" }],
+            )
+            .await
+            .unwrap();
+            let incoming = if empty_prior {
+                vec!["Drama".into()]
+            } else {
+                vec![]
+            };
+            tv.genres = Some(incoming.clone());
+            film.genres = Some(incoming);
+            // Earlier NULL language could fill, but a later set conflict must prevent it.
+            tv.original_language = Some(0);
+            film.original_language = Some(0);
+            let tx = c.transaction().await.unwrap();
+            assert_eq!(series_facts(&tx, 1, &tv, false).await, Err(Error::Conflict));
+            assert_eq!(
+                movie_facts(&tx, 1, &film, false).await,
+                Err(Error::Conflict)
+            );
+            for table in ["series", "movie_metadata"] {
+                let row = tx
+                    .query(
+                        &format!("SELECT original_language FROM {table} WHERE id=1"),
+                        (),
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    row.get_value(0).unwrap(),
+                    Value::Null,
+                    "preflight, before rollback"
+                );
+            }
+            tx.rollback().await.unwrap();
+        }
+        // Keywords [] is equally concrete; a late conflict blocks an earlier NULL fill.
+        film.genres = None;
+        film.keywords = Some(vec!["New".into()]);
+        film.runtime = None;
+        assert_eq!(movie_facts(&c, 1, &film, false).await, Err(Error::Conflict));
+        assert_eq!(
+            c.query("SELECT original_language FROM movie_metadata", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get_value(0)
+                .unwrap(),
+            Value::Null
+        );
+        // A late malformed keyword cannot update runtime or aliases first.
+        film.genres = None;
+        film.keywords = Some(vec!["bad\0".into()]);
+        film.runtime = Some(10080);
+        film.alternative_titles = Some(vec!["Never inserted".into()]);
+        let tx = c.transaction().await.unwrap();
+        assert_eq!(movie_facts(&tx, 1, &film, true).await, Err(Error::Conflict));
+        assert_eq!(
+            tx.query("SELECT runtime FROM movie_metadata", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        tx.rollback().await.unwrap();
+        film.keywords = Some(vec![]);
+        assert!(movie_facts(&c, 1, &film, true).await.unwrap());
+        assert_eq!(
+            c.query("SELECT runtime FROM movie_metadata", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            10080
+        );
+        // Scalar adoption conflicts do not replace existing facts either.
+        tv.genres = None;
+        tv.network = Some("Other".into());
+        film.studio = Some("Other".into());
+        assert_eq!(series_facts(&c, 1, &tv, false).await, Err(Error::Conflict));
+        assert_eq!(movie_facts(&c, 1, &film, false).await, Err(Error::Conflict));
+    }
 }
