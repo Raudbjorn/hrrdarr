@@ -52,6 +52,8 @@ export type CategoryOrigin = "advertised" | "standard_fallback";
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
+export type CollectionMonitoring = "movie_only" | "movie_and_collection" | "none";
+
 export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
 
 export type Command = { id: string, name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, items_observed: number, };
@@ -358,7 +360,7 @@ export type MovieFileResource = { movie_id: number, edition: string | null, orig
 
 export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
 
-export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
+export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, monitor?: CollectionMonitoring, collection_expected_revision?: number | null, };
 
 export type MovieNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
 

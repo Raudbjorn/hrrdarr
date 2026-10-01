@@ -200,6 +200,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "removed_metadata_health",
         include_str!("../../migrations/0046_removed_metadata_health.sql"),
     ),
+    (
+        "collections",
+        include_str!("../../migrations/0047_collections.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0048_provider_authority.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

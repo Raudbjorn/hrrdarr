@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

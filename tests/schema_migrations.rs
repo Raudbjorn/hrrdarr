@@ -58,8 +58,8 @@ async fn fresh_relations_enforce_domain_ownership_and_catalog_membership() -> Re
         INSERT INTO movie_metadata (id,tmdb_id,title,year) VALUES (1,10,'Film',2024),(2,20,'Catalog only',2025);
         INSERT INTO movies (id,metadata_id,path) VALUES (1,1,'/movies/Film');
         INSERT INTO movie_files (id,movie_id,path,edition) VALUES (8,1,'/movies/Film/film.mkv','Extended');
-        INSERT INTO movie_collections VALUES (1,30,'Collection');
-        INSERT INTO movie_collection_members VALUES (1,1),(1,2);
+        INSERT INTO movie_collections(id,tmdb_id,title) VALUES (1,30,'Collection');
+        INSERT INTO movie_collection_members(collection_id,metadata_id) VALUES (1,1),(1,2);
         INSERT INTO operations VALUES ('tv','episode',1,NULL,'source','copy','dest','preview','');
         INSERT INTO operations VALUES ('film','movie',NULL,1,'source','copy','dest','preview','');").await?;
     assert_eq!(
@@ -86,7 +86,7 @@ async fn fresh_relations_enforce_domain_ownership_and_catalog_membership() -> Re
         "INSERT INTO movies (id,metadata_id,path) VALUES (2,999,'/missing')",
         "INSERT INTO movie_files (movie_id,path) VALUES (999,'/orphan')",
         "INSERT INTO movie_files (movie_id,path) VALUES (1,'/second-edition')",
-        "INSERT INTO movie_collection_members VALUES (1,999)",
+        "INSERT INTO movie_collection_members(collection_id,metadata_id) VALUES (1,999)",
         "INSERT INTO operations VALUES ('bad','movie',1,NULL,'s','copy','d','preview','')",
         "INSERT INTO operations VALUES ('bad','episode',1,1,'s','copy','d','preview','')",
         "INSERT INTO operations VALUES ('bad','movie',NULL,2,'s','copy','d','preview','')",
@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Version47 is unallocated after removed metadata health46; insertion must precede unknown-history rejection.
+    // Version49 is unallocated after provider authority48; insertion must precede unknown-history rejection.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (47,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (49,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(
@@ -3251,7 +3251,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -4255,7 +4255,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        46 // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        48 // Provider authority48 is latest; preserve every historical migration prefix.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.

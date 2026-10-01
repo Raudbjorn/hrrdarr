@@ -112,7 +112,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
     assert_eq!(count(&c,"SELECT count(*) FROM download_processing_policies WHERE enabled_override=enabled AND revision IN (1,2)").await?,2);
     assert_eq!(count(&c,"SELECT count(*) FROM download_refresh_schedules WHERE requested_enabled=enabled AND intent='explicit' AND interval_seconds IN (123,777)").await?,2);
     assert_eq!(
@@ -208,7 +208,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
     Ok(())
 }
 

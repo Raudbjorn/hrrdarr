@@ -257,8 +257,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
     for sql in [
         "SELECT id,tmdb_id,imdb_id,title,year,runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language FROM movie_metadata ORDER BY id",
         "SELECT * FROM movies ORDER BY id",
-        "SELECT * FROM movie_collections ORDER BY id",
-        "SELECT * FROM movie_collection_members ORDER BY collection_id,metadata_id",
+        "SELECT id,tmdb_id,title FROM movie_collections ORDER BY id",
+        "SELECT collection_id,metadata_id FROM movie_collection_members ORDER BY collection_id,metadata_id",
         "SELECT * FROM movie_alternative_titles ORDER BY metadata_id,title",
         "SELECT * FROM movie_files ORDER BY id",
         "SELECT * FROM file_metadata ORDER BY id",
@@ -275,8 +275,13 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         "SELECT * FROM sqlite_sequence ORDER BY name",
         // The latest runner adds46's three movie-membership invalidation triggers;
         // compare every predecessor object exactly, with those explicit additions
-        // covered by removed_metadata_health_tests. Existing45 exclusions stay fixed.
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // covered by removed_metadata_health_tests. Collections47 appends facts to two
+        // existing tables and adds precisely the named objects below; collection_schema
+        // independently asserts every new object and legacy row/FK preservation.
+        // Provider authority48 adds only the explicitly named tables/triggers below;
+        // provider_authority_schema independently checks their presence and old facts.
+        // Existing45 exclusions and all predecessor data projections stay fixed.
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_indexer_modes','provider_scope_tags','provider_scope_client_overrides','provider_status','provider_selection_cursors') AND name NOT IN ('provider_indexer_modes','provider_modes_owner_insert','provider_modes_owner_update','provider_modes_required','provider_scope_initialize_modes','provider_modes_invalidate_test','provider_scope_authority_identity','provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_scope_client_overrides','provider_client_override_usage','provider_override_owner','provider_override_identity','provider_override_insert_invalidates_test','provider_override_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -491,7 +496,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        46 // Latest adds removed-health46; predecessor44 and injected45 failure remain fixed.
+        48 // Provider authority48 is latest; predecessor44 and injected45 failure remain fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -617,7 +622,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        46 // Latest adds removed-health46; predecessor44 and injected45 failure remain fixed.
+        48 // Provider authority48 is latest; predecessor44 and injected45 failure remain fixed.
     );
     integrity(&c).await?;
     drop(c);

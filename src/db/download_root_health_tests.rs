@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 8);
     new_registry(&c).await?;
@@ -180,7 +180,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 8); // Migration46 adds two removed-metadata identities.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {

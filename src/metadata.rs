@@ -86,6 +86,12 @@ impl From<HttpError> for MetadataError {
         }
     }
 }
+pub mod collections;
+pub use collections::{
+    CollectionAssociation, CollectionDetails, CollectionMember, CollectionSummary,
+    MovieWithCollection,
+};
+
 type Result<T> = std::result::Result<T, MetadataError>;
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct LookupResult {
@@ -596,6 +602,8 @@ impl Show {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Movie {
+    #[serde(default)]
+    collection: collections::WireAssociation,
     studio: Option<String>,
     genres: Option<Vec<String>>,
     keywords: Option<Vec<String>>,
@@ -641,6 +649,7 @@ fn original_language(value: Option<String>) -> Result<Option<i64>> {
 }
 impl Movie {
     fn details(self) -> Result<MovieDetails> {
+        self.collection.normalize()?;
         identity(self.tmdb_id)?;
         text(&self.title, 1024, false)?;
         let year = self.year.filter(|year| *year != 0);

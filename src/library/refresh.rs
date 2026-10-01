@@ -20,6 +20,7 @@ pub struct CapturedTarget {
 pub enum Details {
     Series(SeriesDetails),
     Movie(MovieDetails),
+    MovieWithCollection(crate::metadata::MovieWithCollection),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -98,6 +99,21 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
                 details,
             )
             .await
+        }
+        (Target::Movies { movie_id }, Details::MovieWithCollection(details))
+            if details.movie.tmdb_id == captured.external_id =>
+        {
+            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
+            let changed = movie(c, metadata_id, details.movie).await?;
+            let associated = crate::collections::repository::adopt(
+                c,
+                movie_id,
+                metadata_id,
+                details.collection,
+                None,
+            )
+            .await?;
+            Ok(changed.max(u16::from(associated)))
         }
         _ => Err(Error::TargetChanged),
     }
