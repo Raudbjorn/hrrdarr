@@ -1,4 +1,5 @@
 pub mod api;
+pub mod credits;
 pub mod db;
 pub mod episodes;
 pub mod library;

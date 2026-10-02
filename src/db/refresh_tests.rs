@@ -196,7 +196,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 46); // Latest adds removed metadata health46; historical migration prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

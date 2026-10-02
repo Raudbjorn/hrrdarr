@@ -191,6 +191,10 @@ pub(crate) async fn movie_facts(
     } else {
         None
     };
+    let credits_changed = match &detail.credits {
+        Some(credits) => credits_replace(c, id, credits, replace).await?,
+        None => false,
+    };
     if changed {
         values.push(id.into());
         c.execute("UPDATE movie_metadata SET runtime=?,status=?,in_cinemas=?,digital_release=?,physical_release=?,secondary_year=?,original_language=?,studio=?,genres_json=?,keywords_json=? WHERE id=?",values).await?;
@@ -209,7 +213,115 @@ pub(crate) async fn movie_facts(
             .await?;
         }
     }
-    Ok(changed || aliases_changed)
+    Ok(changed || aliases_changed || credits_changed)
+}
+
+type CreditRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+    String,
+);
+fn credit_row(credit: &crate::metadata::CreditDetails) -> Result<CreditRow> {
+    let images = credit
+        .images
+        .iter()
+        .map(|image| serde_json::json!({"cover_type":image.cover_type,"url":image.url}))
+        .collect::<Vec<_>>();
+    Ok((
+        credit.person_tmdb_id,
+        credit.person_name.clone(),
+        credit.department.clone(),
+        credit.job.clone(),
+        credit.character.clone(),
+        credit.order,
+        credit.kind.as_str().into(),
+        serde_json::to_string(&images).map_err(|_| Error::Conflict)?,
+    ))
+}
+/// Caller owns the transaction. The desired set replaces the stored set; credit row ids stay
+/// stable per provider credit id. Adoption (`replace=false`) never overwrites differing credits.
+async fn credits_replace(
+    c: &Connection,
+    metadata: i64,
+    credits: &[crate::metadata::CreditDetails],
+    replace: bool,
+) -> Result<bool> {
+    if credits.len() > crate::metadata::MAX_CREDITS {
+        return Err(Error::Conflict);
+    }
+    let mut desired = BTreeMap::new();
+    for credit in credits {
+        if desired
+            .insert(credit.credit_tmdb_id.clone(), credit_row(credit)?)
+            .is_some()
+        {
+            return Err(Error::Conflict);
+        }
+    }
+    let mut rows = c
+        .query(
+            "SELECT credit_tmdb_id,person_tmdb_id,person_name,department,job,character,credit_order,credit_type,images_json FROM movie_credits WHERE metadata_id=? LIMIT 501",
+            [metadata],
+        )
+        .await?;
+    let mut prior: BTreeMap<String, CreditRow> = BTreeMap::new();
+    while let Some(row) = rows.next().await? {
+        prior.insert(
+            row.get(0)?,
+            (
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ),
+        );
+    }
+    drop(rows);
+    if prior.len() > crate::metadata::MAX_CREDITS {
+        return Err(Error::Conflict);
+    }
+    if prior == desired {
+        return Ok(false);
+    }
+    if !replace && !prior.is_empty() {
+        return Err(Error::Conflict);
+    }
+    for key in prior.keys().filter(|key| !desired.contains_key(*key)) {
+        c.execute(
+            "DELETE FROM movie_credits WHERE metadata_id=? AND credit_tmdb_id=?",
+            params![metadata, key.clone()],
+        )
+        .await?;
+    }
+    for (key, row) in desired {
+        if prior.get(&key) == Some(&row) {
+            continue;
+        }
+        let (person, name, department, job, character, order, kind, images) = row;
+        if prior.contains_key(&key) {
+            c.execute(
+                "UPDATE movie_credits SET person_tmdb_id=?,person_name=?,department=?,job=?,character=?,credit_order=?,credit_type=?,images_json=? WHERE metadata_id=? AND credit_tmdb_id=?",
+                params![person, name, department, job, character, order, kind, images, metadata, key],
+            )
+            .await?;
+        } else {
+            c.execute(
+                "INSERT INTO movie_credits(person_tmdb_id,person_name,department,job,character,credit_order,credit_type,images_json,metadata_id,credit_tmdb_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                params![person, name, department, job, character, order, kind, images, metadata, key],
+            )
+            .await?;
+        }
+    }
+    Ok(true)
 }
 
 fn set_json(values: &Option<Vec<String>>) -> Result<Value> {

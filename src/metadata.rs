@@ -140,7 +140,54 @@ pub struct MovieDetails {
     pub original_language: Option<i64>,
     // None is absent metadata; Some([]) is an explicitly empty title set.
     pub alternative_titles: Option<Vec<String>>,
+    // None is absent metadata (existing credits are preserved); Some([]) explicitly clears them.
+    #[serde(default)]
+    pub credits: Option<Vec<CreditDetails>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditKind {
+    Cast,
+    Crew,
+}
+impl CreditKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cast => "cast",
+            Self::Crew => "crew",
+        }
+    }
+}
+/// Remote provider image reference; never a local media-cover path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct CreditImage {
+    pub cover_type: String,
+    pub url: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct CreditDetails {
+    pub credit_tmdb_id: String,
+    pub person_tmdb_id: i64,
+    pub person_name: String,
+    pub department: Option<String>,
+    pub job: Option<String>,
+    pub character: Option<String>,
+    pub order: i64,
+    pub kind: CreditKind,
+    pub images: Vec<CreditImage>,
+}
+pub const MAX_CREDITS: usize = 500;
+const MAX_CREDIT_IMAGES: usize = 8;
+const MAX_IMAGE_URL: usize = 2048;
+const MAX_CREDIT_ORDER: i64 = 100_000;
+const CREDIT_COVER_TYPES: [&str; 6] = [
+    "poster",
+    "banner",
+    "fanart",
+    "screenshot",
+    "headshot",
+    "clearlogo",
+];
 pub struct MetadataClient {
     http: HttpClient,
     tv: String,
@@ -610,6 +657,27 @@ struct Movie {
     premier: Option<String>,
     original_language: Option<String>,
     alternative_titles: Option<Vec<AlternativeTitle>>,
+    credits: Option<Vec<WireCredit>>,
+}
+// Fixture-defined contract: the live service shape is not verified by this crate's tests.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCredit {
+    name: String,
+    person_tmdb_id: i64,
+    credit_id: String,
+    department: Option<String>,
+    job: Option<String>,
+    character: Option<String>,
+    order: Option<i64>,
+    r#type: String,
+    images: Option<Vec<WireCreditImage>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCreditImage {
+    cover_type: String,
+    url: String,
 }
 #[derive(Deserialize)]
 struct AlternativeTitle {
@@ -671,6 +739,43 @@ impl Movie {
                 Ok(result.into_iter().collect::<Vec<_>>())
             })
             .transpose()?;
+        let credits = self
+            .credits
+            .map(|credits| {
+                if credits.len() > MAX_CREDITS {
+                    return Err(MetadataError::InvalidResponse);
+                }
+                credits
+                    .into_iter()
+                    .map(|credit| {
+                        let kind = match credit.r#type.as_str() {
+                            "cast" => CreditKind::Cast,
+                            "crew" => CreditKind::Crew,
+                            _ => return Err(MetadataError::InvalidResponse),
+                        };
+                        Ok(CreditDetails {
+                            credit_tmdb_id: credit.credit_id,
+                            person_tmdb_id: credit.person_tmdb_id,
+                            person_name: credit.name,
+                            department: credit.department,
+                            job: credit.job,
+                            character: credit.character,
+                            order: credit.order.unwrap_or(0),
+                            kind,
+                            images: credit
+                                .images
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|image| CreditImage {
+                                    cover_type: image.cover_type,
+                                    url: image.url,
+                                })
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let in_cinemas = timestamp(self.in_cinema)?;
         let digital_release = timestamp(self.digital_release)?;
         let physical_release = timestamp(self.physical_release)?;
@@ -697,6 +802,7 @@ impl Movie {
             secondary_year,
             original_language: original_language(self.original_language)?,
             alternative_titles,
+            credits: credits.map(validate_credits).transpose()?,
         })
     }
 }
@@ -770,6 +876,69 @@ impl SeriesDetails {
         Ok(self)
     }
 }
+fn credit_text(value: Option<String>, max: usize) -> Result<Option<String>> {
+    let Some(value) = canonical_scalar(value)? else {
+        return Ok(None);
+    };
+    if value.len() > max {
+        return Err(MetadataError::InvalidResponse);
+    }
+    Ok(Some(value))
+}
+/// Remote provider references only: https, a registrable-looking DNS name, no credentials or fragment.
+pub(crate) fn credit_image_url(value: &str) -> Result<String> {
+    if value.len() > MAX_IMAGE_URL || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(MetadataError::InvalidResponse);
+    }
+    let url = url::Url::parse(value).map_err(|_| MetadataError::InvalidResponse)?;
+    let host_ok = matches!(url.host(), Some(url::Host::Domain(host))
+        if host.contains('.') && !host.eq_ignore_ascii_case("localhost") && !host.ends_with('.'));
+    if url.scheme() != "https"
+        || !host_ok
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(MetadataError::InvalidResponse);
+    }
+    Ok(url.into())
+}
+pub(crate) fn validate_credits(credits: Vec<CreditDetails>) -> Result<Vec<CreditDetails>> {
+    if credits.len() > MAX_CREDITS {
+        return Err(MetadataError::InvalidResponse);
+    }
+    let mut seen = BTreeSet::new();
+    credits
+        .into_iter()
+        .map(|mut credit| {
+            if credit.credit_tmdb_id.is_empty()
+                || credit.credit_tmdb_id.len() > 64
+                || !credit
+                    .credit_tmdb_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+                || !seen.insert(credit.credit_tmdb_id.clone())
+                || !(1..=i64::from(i32::MAX)).contains(&credit.person_tmdb_id)
+                || !(0..=MAX_CREDIT_ORDER).contains(&credit.order)
+                || credit.images.len() > MAX_CREDIT_IMAGES
+            {
+                return Err(MetadataError::InvalidResponse);
+            }
+            text(&credit.person_name, 512, false)?;
+            credit.department = credit_text(credit.department, 256)?;
+            credit.job = credit_text(credit.job, 256)?;
+            credit.character = credit_text(credit.character, 1024)?;
+            for image in &mut credit.images {
+                if !CREDIT_COVER_TYPES.contains(&image.cover_type.as_str()) {
+                    return Err(MetadataError::InvalidResponse);
+                }
+                image.url = credit_image_url(&image.url)?;
+            }
+            Ok(credit)
+        })
+        .collect()
+}
 impl MovieDetails {
     pub(crate) fn validated(mut self) -> Result<Self> {
         identity(self.tmdb_id)?;
@@ -780,6 +949,7 @@ impl MovieDetails {
         self.studio = canonical_scalar(self.studio)?;
         self.genres = canonical_set(self.genres)?;
         self.keywords = canonical_set(self.keywords)?;
+        self.credits = self.credits.map(validate_credits).transpose()?;
         if self.runtime.is_some_and(|v| !(0..=10080).contains(&v))
             || self
                 .original_language

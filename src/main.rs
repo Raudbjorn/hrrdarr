@@ -181,6 +181,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::release_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
+        .merge(hrrdarr::credits::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
         .merge(hrrdarr::library::metadata_router(
             state.db.clone(),

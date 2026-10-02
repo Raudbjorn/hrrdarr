@@ -87,6 +87,7 @@ fn movie() -> MovieDetails {
         secondary_year: None,
         original_language: None,
         alternative_titles: None,
+        credits: None, // Reasoning: new MovieDetails field; None preserves stored credits, keeping this fixture's prior semantics.
     }
 }
 async fn apply(
