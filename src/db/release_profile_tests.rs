@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        47 // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+        48 // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     );
     Ok(())
 }

@@ -322,6 +322,15 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
             "remove_year"
         };
         expected_settings[media][flag] = json!(false);
+        // Reasoning: the 0048 indexer policy DTO fields default true (existing behavior preserved), so an old
+        // request body reads back with all three operation flags explicitly enabled.
+        for operation in [
+            "enable_rss",
+            "enable_automatic_search",
+            "enable_interactive_search",
+        ] {
+            expected_settings[media][operation] = json!(true);
+        }
         assert_eq!(read["settings"], expected_settings);
         assert_eq!(read["has_credentials"], false);
         let mut update = body.clone();

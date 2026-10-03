@@ -383,3 +383,131 @@ async fn indexer_api_transport_status_staleness_and_redaction() -> Result<(), Er
     let _ = upstream_task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn scoped_operation_policy_precedes_http_and_survives_toggle_and_reopen() -> Result<(), Error>
+{
+    let scratch = Sandbox::new();
+    let path = scratch.0.join("policy.db");
+    let db = Arc::new(Database::open_local(&path).await?);
+    let upstream = Arc::new(Upstream::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_address = listener.local_addr()?;
+    let app = axum::Router::new()
+        .route("/torznab", axum::routing::get(fixture))
+        .with_state(upstream.clone());
+    let peer = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(db.clone(), None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = json!({"name":"Policy","enabled":true,"priority":1,"settings":{"implementation":"torznab","endpoint":format!("http://{upstream_address}/torznab"),"tv":{"categories":[5030],"anime_categories":[],"enable_rss":false,"enable_automatic_search":false,"enable_interactive_search":true},"movies":{"categories":[2000],"enable_rss":true,"enable_automatic_search":true,"enable_interactive_search":false}}});
+    let (status, created) =
+        request(address, "POST", "/api/v1/providers", &config.to_string()).await;
+    assert_eq!(status, 201, "{created}");
+    config["settings"] = created["settings"].clone();
+    let resource = format!("/api/v1/providers/{}", created["id"].as_str().unwrap());
+    let targeted = |domain| {
+        if domain == "tv" {
+            json!({"kind":"tv","title":"Show","numbering":{"kind":"episode","season":1,"episode":1}})
+        } else {
+            // The fixture advertises tmdbid; title-only movie fallback requires a year.
+            json!({"kind":"movie","title":"Film","tmdb_id":34})
+        }
+    };
+    // Reverse the two domain policies on the same provider to prove independent scopes.
+    for reverse in [false, true] {
+        if reverse {
+            for (domain, rss) in [("tv", true), ("movies", false)] {
+                config["settings"][domain]["enable_rss"] = rss.into();
+                config["settings"][domain]["enable_interactive_search"] = (!rss).into();
+            }
+            config["revision"] = 1.into();
+            let (status, updated) = request(address, "PUT", &resource, &config.to_string()).await;
+            assert_eq!(status, 200, "{updated}");
+        }
+        for domain in ["tv", "movies"] {
+            for (query, allowed) in [
+                (
+                    json!({"kind":"rss","media_type":domain}),
+                    (domain == "movies") != reverse,
+                ),
+                (targeted(domain), (domain == "tv") != reverse),
+            ] {
+                let before = upstream.queries.lock().unwrap().len();
+                let (status, result) = request(
+                    address,
+                    "POST",
+                    &format!("{resource}/search"),
+                    &query.to_string(),
+                )
+                .await;
+                assert_eq!(status, if allowed { 200 } else { 409 }, "{result}");
+                let after = upstream.queries.lock().unwrap().len();
+                if allowed {
+                    assert!(after > before);
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "Disabled policy must send neither CAPS nor query"
+                    );
+                }
+            }
+        }
+    }
+    for (enabled, revision) in [(false, 2), (true, 3)] {
+        config["enabled"] = enabled.into();
+        config["revision"] = revision.into();
+        let (status, updated) = request(address, "PUT", &resource, &config.to_string()).await;
+        assert_eq!(status, 200, "{updated}");
+        assert_eq!(updated["settings"], config["settings"]);
+        if !enabled {
+            for domain in ["tv", "movies"] {
+                for query in [targeted(domain), json!({"kind":"rss","media_type":domain})] {
+                    let before = upstream.queries.lock().unwrap().len();
+                    assert_eq!(
+                        request(
+                            address,
+                            "POST",
+                            &format!("{resource}/search"),
+                            &query.to_string()
+                        )
+                        .await
+                        .0,
+                        409
+                    );
+                    assert_eq!(upstream.queries.lock().unwrap().len(), before);
+                }
+            }
+            let before = upstream.queries.lock().unwrap().len();
+            let (status, tested) = request(address, "POST", &format!("{resource}/test"), "").await;
+            assert_eq!(status, 200, "{tested}");
+            assert!(
+                upstream.queries.lock().unwrap().len() > before,
+                "Diagnostic Test is exempt"
+            );
+        }
+    }
+    server.abort();
+    let _ = server.await;
+    drop(db);
+    let reopened = Arc::new(Database::open_local(&path).await?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(reopened, None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (status, saved) = request(address, "GET", &resource, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(saved["settings"], config["settings"]);
+    server.abort();
+    let _ = server.await;
+    peer.abort();
+    let _ = peer.await;
+    Ok(())
+}

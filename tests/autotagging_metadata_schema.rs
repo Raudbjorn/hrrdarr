@@ -278,7 +278,11 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // The latest runner adds46's three movie-membership invalidation triggers;
         // compare every predecessor object exactly, with those explicit additions
         // covered by removed_metadata_health_tests. Existing45 exclusions stay fixed.
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // Reasoning: migration 0048 ALTERs provider_scopes (three appended enable_* columns), which rewrites that
+        // one CREATE TABLE text. Its predecessor columns are still compared exactly via the table_info row below;
+        // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
+        "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search') ORDER BY cid",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits') AND NOT (type='table' AND name='provider_scopes') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -493,7 +497,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        47 // Reasoning: latest migration is now 0047 movie credits (was 46: removed-health46); predecessor44 and injected45 failure remain fixed.
+        48 // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -619,7 +623,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        47 // Reasoning: latest migration is now 0047 movie credits (was 46: removed-health46); predecessor44 and injected45 failure remain fixed.
+        48 // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

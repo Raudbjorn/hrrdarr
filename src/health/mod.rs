@@ -15,6 +15,7 @@ use uuid::Uuid;
 mod api;
 mod download_roots;
 mod engine;
+mod indexers;
 mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
@@ -341,6 +342,21 @@ pub(crate) async fn provider_configuration_changed(
         "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder')",
     )
     .await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+/// Indexer policy mutations mark only their scoped checks in the caller's transaction.
+pub(crate) async fn indexer_configuration_changed(
+    c: &Connection,
+    media: MediaDomain,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key IN ('indexer_search','indexer_rss')").await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 /// Status is not trailing configuration debounce. Repeated observations cannot postpone work.

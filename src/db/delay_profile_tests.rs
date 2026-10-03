@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     Ok(())
 }

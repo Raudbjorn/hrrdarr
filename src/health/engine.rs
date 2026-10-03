@@ -490,6 +490,7 @@ async fn evaluate(
     };
     match member.identity.check_key.as_str() {
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
+        "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
         "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
             db, client, domain,
         )

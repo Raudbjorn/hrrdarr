@@ -36,6 +36,7 @@ impl Drop for Server {
 struct Remote {
     items: Mutex<Vec<Value>>,
     adds: Mutex<Vec<String>>,
+    indexer_requests: Mutex<Vec<String>>,
     mode: AtomicU8,
     v2: AtomicU8,
     date: Mutex<Option<String>>,
@@ -60,6 +61,7 @@ async fn remote(
             .into_owned()
             .collect();
     if uri.path() == "/api" || uri.path() == "/" {
+        s.indexer_requests.lock().unwrap().push(uri.to_string());
         if s.mode.load(Ordering::SeqCst) == 8 {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1596,6 +1598,152 @@ async fn release_restriction_change_during_preparation_never_posts() {
                 .unwrap(),
             0
         );
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_rss_schedule_and_queued_revision_send_no_http() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-rss-operation-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let peer = Arc::new(Remote::default());
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(peer.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let queued = enqueue(&base, target(&indexer, &download, media)).await;
+        let (code, schedule) = request(
+            &base,
+            "POST",
+            "/api/v1/rss/schedules",
+            json!({"target":target(&indexer,&download,media),"interval_seconds":60,"enabled":true}),
+        )
+        .await;
+        assert_eq!(code, 200, "{schedule}");
+        let mut settings = indexer["settings"].clone();
+        settings[media]["enable_rss"] = json!(false);
+        let (code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",indexer["id"].as_str().unwrap()),json!({"revision":indexer["revision"],"name":"RSS disabled","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        assert_eq!(request(&base,"POST","/api/v1/rss/schedules",json!({"revision":schedule["revision"],"target":target(&updated,&download,media),"interval_seconds":60,"enabled":true})).await.0,409);
+        // Advance only the owned scheduler fixture deadline; provider policy uses the real API.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE rss_schedules SET next_run_at=0", ())
+            .await
+            .unwrap();
+        let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
+        assert_eq!(until(&base, &queued["id"]).await["status"], "failed");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, rows) = request(&base, "GET", "/api/v1/rss/schedules", Value::Null).await;
+                if rows[0]["enabled"] == false {
+                    assert_eq!(rows[0]["error_code"], "provider_changed");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("stale schedule records disabled provider policy");
+        assert!(
+            peer.indexer_requests.lock().unwrap().is_empty(),
+            "stale queued feed and schedule must send neither CAPS nor query"
+        );
+        assert!(peer.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+        // Search switches are independent: re-enable RSS alone and execute actual feed/send.
+        let mut settings = updated["settings"].clone();
+        settings[media]["enable_rss"] = json!(true);
+        settings[media]["enable_automatic_search"] = json!(false);
+        settings[media]["enable_interactive_search"] = json!(false);
+        let(code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",updated["id"].as_str().unwrap()),json!({"revision":updated["revision"],"name":"RSS only","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        let runtime = commands::start(db, client).await.unwrap();
+        let command = enqueue(&base, target(&updated, &download, media)).await;
+        let done = until(&base, &command["id"]).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["observed"], 1, "{done}");
+        assert_eq!(peer.adds.lock().unwrap().len(), 1);
+        assert!(!peer.indexer_requests.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_retry_wait_feed_never_reuses_changed_revision() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-rss-policy-retry-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let peer = Arc::new(Remote::default());
+        peer.mode.store(8, Ordering::SeqCst);
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(peer.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
+        let command = enqueue(&base, target(&indexer, &download, media)).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, row) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                if row["status"] == "retry_wait" {
+                    assert_eq!(row["attempts"], 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("real remote rate limit leaves retry intent");
+        runtime.shutdown().await;
+        let before = peer.indexer_requests.lock().unwrap().len();
+        assert!(before > 0);
+        let mut settings = indexer["settings"].clone();
+        settings[media]["enable_rss"] = json!(false);
+        let (code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",indexer["id"].as_str().unwrap()),json!({"revision":indexer["revision"],"name":"policy changed","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        peer.mode.store(0, Ordering::SeqCst);
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE rss_commands SET next_attempt_at=0 WHERE status='retry_wait'",
+                (),
+            )
+            .await
+            .unwrap();
+        let runtime = commands::start(db, client).await.unwrap();
+        let done = until(&base, &command["id"]).await;
+        assert_eq!(done["status"], "failed", "{done}");
+        assert_eq!(
+            peer.indexer_requests.lock().unwrap().len(),
+            before,
+            "retry must reject captured stale revision before CAPS"
+        );
+        assert!(peer.adds.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
 }

@@ -298,6 +298,7 @@ async fn search(
             .raw_search(
                 &input.provider_id.to_string(),
                 input.provider_revision,
+                crate::providers::IndexerOperation::Interactive,
                 &request,
             )
             .await

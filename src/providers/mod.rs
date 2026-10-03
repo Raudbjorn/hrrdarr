@@ -100,9 +100,90 @@ fn corrupt() -> Error {
     )
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// Server-owned intent: request payloads cannot select automatic authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexerOperation {
+    Rss,
+    Automatic,
+    Interactive,
+}
+
+pub(crate) fn indexer_operation_enabled(
+    provider: &Provider,
+    domain: MediaDomain,
+    operation: IndexerOperation,
+) -> bool {
+    if !provider.enabled {
+        return false;
+    }
+    let flags = match (&provider.settings, domain) {
+        (
+            ProviderSettings::Torznab {
+                tv: Some(scope), ..
+            }
+            | ProviderSettings::Newznab {
+                tv: Some(scope), ..
+            },
+            MediaDomain::Tv,
+        ) => (
+            scope.enable_rss,
+            scope.enable_automatic_search,
+            scope.enable_interactive_search,
+        ),
+        (
+            ProviderSettings::Torznab {
+                movies: Some(scope),
+                ..
+            }
+            | ProviderSettings::Newznab {
+                movies: Some(scope),
+                ..
+            },
+            MediaDomain::Movies,
+        ) => (
+            scope.enable_rss,
+            scope.enable_automatic_search,
+            scope.enable_interactive_search,
+        ),
+        _ => return false,
+    };
+    match operation {
+        IndexerOperation::Rss => flags.0,
+        IndexerOperation::Automatic => flags.1,
+        IndexerOperation::Interactive => flags.2,
+    }
+}
+
+fn request_policy(
+    provider: &Provider,
+    operation: IndexerOperation,
+    request: &indexer::IndexerSearch,
+) -> bool {
+    let (domain, rss) = match request {
+        indexer::IndexerSearch::Rss { media_type, .. } => (*media_type, true),
+        indexer::IndexerSearch::Tv { .. } => (MediaDomain::Tv, false),
+        indexer::IndexerSearch::Movie { .. } => (MediaDomain::Movies, false),
+    };
+    rss == (operation == IndexerOperation::Rss)
+        && indexer_operation_enabled(provider, domain, operation)
+}
+
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct TvIndexerScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_automatic_search: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_interactive_search: bool,
     pub categories: Vec<u32>,
     pub anime_categories: Vec<u32>,
     #[serde(default)]
@@ -112,6 +193,15 @@ pub struct TvIndexerScope {
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct MovieIndexerScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_automatic_search: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_interactive_search: bool,
     pub categories: Vec<u32>,
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
@@ -976,6 +1066,7 @@ impl RefreshClient {
         &self,
         provider_id: &str,
         revision: i64,
+        operation: IndexerOperation,
         request: &indexer::IndexerSearch,
     ) -> std::result::Result<indexer::RawIndexerPage, AutomationError> {
         let context = &self.0;
@@ -989,7 +1080,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        if !provider.enabled || matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        if !request_policy(&provider, operation, request) {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let transport = context
@@ -1113,7 +1204,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -1152,6 +1243,9 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 serde_json::from_str(&scope.get::<String>(1)?).map_err(|_| corrupt())?;
             if media == "tv" {
                 tv_index = Some(TvIndexerScope {
+                    enable_rss: stored_bool(scope.get(14)?)?,
+                    enable_automatic_search: stored_bool(scope.get(15)?)?,
+                    enable_interactive_search: stored_bool(scope.get(16)?)?,
                     categories: cats,
                     anime_standard_format_search: stored_bool(scope.get::<i64>(7)?)?,
                     anime_categories: serde_json::from_str(&scope.get::<String>(2)?)
@@ -1159,6 +1253,9 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 })
             } else {
                 movie_index = Some(MovieIndexerScope {
+                    enable_rss: stored_bool(scope.get(14)?)?,
+                    enable_automatic_search: stored_bool(scope.get(15)?)?,
+                    enable_interactive_search: stored_bool(scope.get(16)?)?,
                     categories: cats,
                     remove_year: stored_bool(scope.get::<i64>(8)?)?,
                 })
@@ -1214,30 +1311,36 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
     match settings {
         ProviderSettings::Torznab { tv, movies, .. }
         | ProviderSettings::Newznab { tv, movies, .. } => {
-            for (domain, categories, anime, standard, remove_year) in tv
-                .iter()
-                .map(|s| {
-                    (
-                        "tv",
-                        &s.categories,
-                        s.anime_categories.as_slice(),
-                        Some(i64::from(s.anime_standard_format_search)),
-                        None::<i64>,
-                    )
-                })
-                .chain(movies.iter().map(|s| {
-                    (
-                        "movies",
-                        &s.categories,
-                        &[][..],
-                        None,
-                        Some(i64::from(s.remove_year)),
-                    )
-                }))
+            for (domain, categories, anime, standard, remove_year, rss, automatic, interactive) in
+                tv.iter()
+                    .map(|s| {
+                        (
+                            "tv",
+                            &s.categories,
+                            s.anime_categories.as_slice(),
+                            Some(i64::from(s.anime_standard_format_search)),
+                            None::<i64>,
+                            i64::from(s.enable_rss),
+                            i64::from(s.enable_automatic_search),
+                            i64::from(s.enable_interactive_search),
+                        )
+                    })
+                    .chain(movies.iter().map(|s| {
+                        (
+                            "movies",
+                            &s.categories,
+                            &[][..],
+                            None,
+                            Some(i64::from(s.remove_year)),
+                            i64::from(s.enable_rss),
+                            i64::from(s.enable_automatic_search),
+                            i64::from(s.enable_interactive_search),
+                        )
+                    }))
             {
                 let categories = serde_json::to_string(categories).map_err(|_| bad())?;
                 let anime = serde_json::to_string(anime).map_err(|_| bad())?;
-                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year]).await?;
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year,enable_rss,enable_automatic_search,enable_interactive_search) VALUES(?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year,rss,automatic,interactive]).await?;
             }
         }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -1286,19 +1389,33 @@ async fn health_configuration_changed(
     old: Option<&ProviderSettings>,
     new: Option<&ProviderSettings>,
 ) -> Result<()> {
-    let mut tv = false;
-    let mut movies = false;
+    let mut indexers = [false; 2];
+    let mut clients = [false; 2];
     for settings in [old, new].into_iter().flatten() {
-        if let ProviderSettings::Qbittorrent {
-            tv: t, movies: m, ..
-        } = settings
-        {
-            tv |= t.is_some();
-            movies |= m.is_some();
-        }
+        let (selected, tv, movies) = match settings {
+            ProviderSettings::Torznab { tv, movies, .. }
+            | ProviderSettings::Newznab { tv, movies, .. } => {
+                (&mut indexers, tv.is_some(), movies.is_some())
+            }
+            ProviderSettings::Qbittorrent { tv, movies, .. } => {
+                (&mut clients, tv.is_some(), movies.is_some())
+            }
+        };
+        selected[0] |= tv;
+        selected[1] |= movies;
     }
-    for (selected, domain) in [(tv, MediaDomain::Tv), (movies, MediaDomain::Movies)] {
-        if selected {
+    for (i, domain) in [MediaDomain::Tv, MediaDomain::Movies]
+        .into_iter()
+        .enumerate()
+    {
+        if indexers[i] {
+            crate::health::indexer_configuration_changed(c, domain)
+                .await
+                .map_err(|e| {
+                    Error::Plain(e.0, e.1, "Health configuration could not be recorded")
+                })?;
+        }
+        if clients[i] {
             crate::health::provider_configuration_changed(c, domain)
                 .await
                 .map_err(|e| {
@@ -1533,6 +1650,79 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn operation_policy_requires_intent_global_scope_and_strict_flags() {
+        let value = serde_json::json!({"implementation":"torznab","endpoint":"https://example.test/api","tv":{"categories":[5030],"anime_categories":[],"enable_rss":false},"movies":{"categories":[2000],"enable_automatic_search":false,"enable_interactive_search":false}});
+        let settings: ProviderSettings = serde_json::from_value(value.clone()).unwrap();
+        let mut provider = Provider {
+            id: Uuid::nil(),
+            revision: 1,
+            name: "policy".into(),
+            enabled: true,
+            priority: 1,
+            settings,
+            has_credentials: false,
+            test_supported: true,
+            test_status: TestStatus::NeverTested,
+            last_test: None,
+        };
+        for (domain, expected) in [
+            (MediaDomain::Tv, [false, true, true]),
+            (MediaDomain::Movies, [true, false, false]),
+        ] {
+            for (operation, expected) in [
+                IndexerOperation::Rss,
+                IndexerOperation::Automatic,
+                IndexerOperation::Interactive,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    indexer_operation_enabled(&provider, domain, operation),
+                    expected
+                );
+            }
+        }
+        let rss = indexer::IndexerSearch::Rss {
+            media_type: MediaDomain::Movies,
+            offset: 0,
+            query_index: 0,
+            limit: 10,
+        };
+        assert!(request_policy(&provider, IndexerOperation::Rss, &rss));
+        assert!(!request_policy(
+            &provider,
+            IndexerOperation::Interactive,
+            &rss
+        ));
+        assert!(!request_policy(
+            &provider,
+            IndexerOperation::Automatic,
+            &rss
+        ));
+        let tv: indexer::IndexerSearch = serde_json::from_value(serde_json::json!({"kind":"tv","title":"Show","numbering":{"kind":"episode","season":1,"episode":1}})).unwrap();
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &tv));
+        assert!(request_policy(&provider, IndexerOperation::Automatic, &tv));
+        provider.enabled = false;
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &rss));
+        provider.enabled = true;
+        if let ProviderSettings::Torznab { movies, .. } = &mut provider.settings {
+            *movies = None;
+        }
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &rss));
+        provider.settings = serde_json::from_value(serde_json::json!({"implementation":"qbittorrent","endpoint":"https://example.test","tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":null})).unwrap();
+        assert!(!request_policy(&provider, IndexerOperation::Automatic, &tv));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!("true"),
+        ] {
+            let mut malformed = value.clone();
+            malformed["tv"]["enable_rss"] = invalid;
+            assert!(serde_json::from_value::<ProviderSettings>(malformed).is_err());
+        }
+    }
     #[test]
     fn configuration_wire_and_domain_validation_are_closed() {
         let input = serde_json::json!({"revision":1,"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"newznab","endpoint":"https://example.invalid/api","tv":null,"movies":{"categories":[2147483647]}}});
@@ -1903,6 +2093,17 @@ async fn search(
     let (provider, credentials) = network_snapshot(&context, &id).await?;
     if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
         return Err(unsupported_operation());
+    }
+    let intent = match &input {
+        indexer::IndexerSearch::Rss { .. } => IndexerOperation::Rss,
+        _ => IndexerOperation::Interactive,
+    };
+    if !request_policy(&provider, intent, &input) {
+        return Err(Error::Plain(
+            StatusCode::CONFLICT,
+            "provider_unavailable",
+            "Provider operation is disabled or out of scope",
+        ));
     }
     let transport = context
         .transport

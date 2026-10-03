@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 8);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 12); // Reasoning: migration 0048 seeds four indexer_search/indexer_rss health_checks rows (two per domain), so the registry is 12 (was 8).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -126,9 +126,9 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     )
     .await?;
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO root_folders(media_type,path)VALUES('tv','/unused/tv'),('movies','/unused/movies');").await?;
-    // Compare every predecessor check; only migration44 and46 registrations are new.
+    // Compare every predecessor check; only migration44, 46 and 48 registrations are new (Reasoning: 0048 indexer_search/indexer_rss rows are excluded from the predecessor witness like the earlier additions).
     let queries = [
-        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata') ORDER BY scope,check_key",
+        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss') ORDER BY scope,check_key",
         "SELECT * FROM health_lifecycle",
         "SELECT * FROM health_commands ORDER BY id",
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
@@ -180,8 +180,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 8); // Migration46 adds two removed-metadata identities.
+        assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 12); // Migration46 adds two removed-metadata identities; 0048 adds four indexer identities (registry 8 -> 12).
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");

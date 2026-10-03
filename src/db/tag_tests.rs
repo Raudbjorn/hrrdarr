@@ -73,7 +73,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version_of(&c).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+            assert_eq!(version_of(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
             assert_eq!(
                 scalar(&c, "SELECT tag_version FROM snapshot_imports").await?,
                 0
@@ -141,7 +141,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             drop(c);
             drop(db);
             let reopened = Database::open_local(&path).await?;
-            assert_eq!(version_of(&reopened.connect().await?).await?, 47); // Reasoning: latest migration is now 0047 movie credits (was 46: removed metadata health46); historical migration prefixes stay fixed.
+            assert_eq!(version_of(&reopened.connect().await?).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
         }
     }
     Ok(())

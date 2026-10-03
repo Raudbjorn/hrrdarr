@@ -33,8 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Migration46 adds removed metadata per domain; wait for all eight current checks.
-            if v["summary"]["current"] == 8 {
+            // Migration46 adds removed metadata per domain; wait for all twelve current checks (0048 adds the indexer pair per domain).
+            if v["summary"]["current"] == 12 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -65,7 +65,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
     // Migration46 adds removed metadata to CDH, communication and roots in each domain.
-    assert_eq!(fresh["summary"]["never_run"], 8);
+    // Reasoning: 0048 adds indexer_search and indexer_rss per domain, so the fresh registry has twelve identities (was 8).
+    assert_eq!(fresh["summary"]["never_run"], 12);
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -85,6 +86,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
                 "completed_download_handling",
                 "download_client_communication",
                 "download_client_root_folder",
+                "indexer_rss",
+                "indexer_search",
                 "removed_metadata",
             ]
             .into_iter()
@@ -162,7 +165,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     // Admission includes all four identities per domain, not only a larger count.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 8);
+    // Reasoning: six identities per domain after 0048 (indexer_search/indexer_rss added); the union is twelve.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 12);
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -309,7 +313,9 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     assert!(commands::start(db.clone(), refresh).await.is_err());
     let result = wait_current(&client, &base).await;
     // Two communication warnings now coexist with the original TV CDH warning.
-    assert_eq!(result["issues"].as_array().unwrap().len(), 3);
+    // Reasoning: the fixture configures no indexer, so each domain's indexer_search check now also reports the
+    // none-enabled Error (indexer_rss reports nothing without an enabled indexer): 3 + 2 = 5 issues.
+    assert_eq!(result["issues"].as_array().unwrap().len(), 5);
     assert!(
         result["issues"]
             .as_array()
@@ -382,13 +388,25 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     .await;
     assert_eq!(cdh(&unchanged), generation);
     let healthy = wait_current(&client, &base).await;
-    assert_eq!(healthy["issues"].as_array().unwrap().len(), 2);
-    assert!(
-        healthy["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|v| v["identity"]["check_key"] == "download_client_communication")
+    // Reasoning: the fixture has no indexer, so after the CDH warning is restored the remaining issues are the two
+    // communication warnings plus each domain's none-enabled indexer_search Error (0048): 2 + 2 = 4. Intent is kept
+    // by asserting no CDH issue remains and that exactly the expected keys are present.
+    assert_eq!(healthy["issues"].as_array().unwrap().len(), 4);
+    let mut keys = healthy["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["identity"]["check_key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "download_client_communication",
+            "download_client_communication",
+            "indexer_search",
+            "indexer_search"
+        ]
     );
     let (_, transitions) = request(
         &client,
@@ -398,7 +416,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(transitions["items"].as_array().unwrap().len(), 4);
+    // Reasoning: two additional "issue" transitions record the none-enabled indexer_search Errors (one per domain).
+    assert_eq!(transitions["items"].as_array().unwrap().len(), 6);
     let restored = transitions["items"]
         .as_array()
         .unwrap()

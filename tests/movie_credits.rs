@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        47
+        48 // Reasoning: latest migration is now 0048 indexer operation policy; 0047 movie credits remains verified by the version=47 row below.
     );
     assert_eq!(
         count(
@@ -214,7 +214,10 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     c.execute("DELETE FROM movie_credits WHERE metadata_id=2", ())
         .await?;
     // Upgrade from 0046: drop the 0047 objects and history row, then reopen through the real runner.
-    c.execute_batch("DROP TABLE movie_credits; DELETE FROM schema_migrations WHERE version=47;")
+    // Reasoning: 0048 now sits above 0047, so a faithful 0046 state must also undo 0048 (its three provider_scopes
+    // columns, four indexer health rows and history row); otherwise max(version) stays 48 and the runner would
+    // re-run ALTER ADD COLUMN against columns that already exist.
+    c.execute_batch("DROP TABLE movie_credits; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss'); DELETE FROM schema_migrations WHERE version IN (47,48);")
         .await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
@@ -230,7 +233,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        47
+        48 // Reasoning: latest migration is now 0048 indexer operation policy (was 47).
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

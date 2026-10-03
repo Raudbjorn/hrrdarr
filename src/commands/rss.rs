@@ -2,7 +2,7 @@
 #[path = "rss_pending.rs"]
 mod pending;
 use super::*;
-use crate::providers::{RefreshClient, indexer, qbittorrent};
+use crate::providers::{IndexerOperation, RefreshClient, indexer, qbittorrent};
 use crate::search::{Disposition, ReleaseTarget, SearchContext};
 
 #[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
@@ -123,7 +123,11 @@ async fn read(c: &Connection, id: Uuid) -> Result<RssCommand> {
         .await?
         .ok_or(Error(StatusCode::NOT_FOUND, "rss_command_not_found"))?)
 }
-pub(super) async fn valid_target(c: &Connection, t: RssTarget) -> Result<bool> {
+pub(super) async fn valid_target(
+    c: &Connection,
+    t: RssTarget,
+    operation: IndexerOperation,
+) -> Result<bool> {
     if t.indexer_revision <= 0
         || t.client_revision <= 0
         || t.indexer_revision > MAX_REVISION
@@ -131,7 +135,12 @@ pub(super) async fn valid_target(c: &Connection, t: RssTarget) -> Result<bool> {
     {
         return Ok(false);
     }
-    Ok(c.query("SELECT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?) AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?)",params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.client_id.to_string(),t.client_revision,domain(t.media_type)]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1)
+    let flag = match operation {
+        IndexerOperation::Rss => "enable_rss",
+        IndexerOperation::Automatic => "enable_automatic_search",
+        IndexerOperation::Interactive => "enable_interactive_search",
+    };
+    Ok(c.query(&format!("SELECT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?) AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.client_id.to_string(),t.client_revision,domain(t.media_type)]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1)
 }
 pub(super) fn router(db: Arc<Database>) -> Router {
     Router::new()
@@ -160,7 +169,7 @@ async fn deadline(request: axum::extract::Request, next: axum::middleware::Next)
 }
 async fn enqueue(c: &Connection, input: RssInput, timestamp: i64) -> Result<RssCommand> {
     let t = input.target;
-    if !valid_target(c, t).await? {
+    if !valid_target(c, t, IndexerOperation::Rss).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     if let Some(r)=c.query(&format!("SELECT {COLUMNS} FROM rss_commands WHERE indexer_id=? AND client_id=? AND media_type=? AND status IN ('queued','running','retry_wait')"),params![t.indexer_id.to_string(),t.client_id.to_string(),domain(t.media_type)]).await?.next().await?{return row(r)}
@@ -381,6 +390,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
             .raw_search(
                 &t.indexer_id.to_string(),
                 t.indexer_revision,
+                IndexerOperation::Rss,
                 &indexer::IndexerSearch::Rss {
                     media_type: t.media_type,
                     offset,
@@ -473,7 +483,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
         if !matches!(read(&tx, command.id).await?.status, CommandStatus::Running) {
             return Ok(());
         }
-        if !valid_target(&tx, t).await? {
+        if !valid_target(&tx, t, IndexerOperation::Rss).await? {
             return Err(Error(StatusCode::CONFLICT, "provider_changed"));
         }
         let count = captured.len() as i64;
@@ -651,7 +661,7 @@ async fn settle_local(
     {
         return Ok(None);
     }
-    if !valid_target(c, current.public.source).await? {
+    if !valid_target(c, current.public.source, current.public.origin.operation()).await? {
         candidate_state(c, expected.id, "rejected", Some("provider_changed"), None).await?;
         return Ok(None);
     }
@@ -704,7 +714,7 @@ async fn process_candidate(
     }
     let p = work.public;
     let c = connection(db).await?;
-    if !valid_target(&c, p.source).await? {
+    if !valid_target(&c, p.source, p.origin.operation()).await? {
         return candidate_state(&c, p.id, "rejected", Some("provider_changed"), None).await;
     }
     let mut bytes = client
@@ -792,7 +802,7 @@ async fn process_candidate(
     let outcome=async{
         let current=candidate(&tx,p.id).await?;
         if current.public.status!=p.status{return Ok(false)}
-        if !valid_target(&tx,p.source).await?{candidate_state(&tx,p.id,"rejected",Some("provider_changed"),None).await?;return Ok(false)}
+        if !valid_target(&tx,p.source,current.public.origin.operation()).await?{candidate_state(&tx,p.id,"rejected",Some("provider_changed"),None).await?;return Ok(false)}
         // Recheck all current local decision facts after preparation's network reads.
         let timestamp=now()?;
         let Some(latest)=settle_local(&tx,client,&p,&release,timestamp, operation).await? else {return Ok(false)};
@@ -1003,7 +1013,7 @@ async fn save_schedule(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async{
-        if !valid_target(&tx,t).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
+        if !valid_target(&tx,t,IndexerOperation::Rss).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
         let prior=tx.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM rss_schedules WHERE indexer_id=? AND client_id=? AND media_type=?"),params![t.indexer_id.to_string(),t.client_id.to_string(),domain(t.media_type)]).await?.next().await?.map(schedule_row).transpose()?;
         let timestamp=now()?;
         let id=match prior {

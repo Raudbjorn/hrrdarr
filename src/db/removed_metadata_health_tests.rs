@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 47); // Reasoning: latest is now 0047 movie credits; 46 stays injected-failure target below.
+    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -363,7 +363,9 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     ] {
         out.push(rows(c, &format!("SELECT * FROM {table} ORDER BY 1")).await?);
     }
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key!='removed_metadata' ORDER BY scope,check_key").await?);
+    // Reasoning: the witness covers predecessor (version<=45) health rows only; 0048 later appends four
+    // indexer_search/indexer_rss identities, which are not predecessor state and are asserted separately.
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -427,9 +429,10 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 47); // Reasoning: latest is now 0047 movie credits.
+    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);
     integrity(&c).await?;
     let complete = health(&c).await?;
     drop(c);

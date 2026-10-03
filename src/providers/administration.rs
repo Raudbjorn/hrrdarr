@@ -113,6 +113,9 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
     match media {
         MediaDomain::Tv => PresetScope::Tv {
             settings: TvIndexerScope {
+                enable_rss: true,
+                enable_automatic_search: true,
+                enable_interactive_search: true,
                 categories: if finder {
                     vec![5030, 5040, 5045]
                 } else {
@@ -124,6 +127,9 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
         },
         MediaDomain::Movies => PresetScope::Movies {
             settings: MovieIndexerScope {
+                enable_rss: true,
+                enable_automatic_search: true,
+                enable_interactive_search: true,
                 categories: if finder {
                     vec![2030, 2040, 2045, 2050, 2060, 2070]
                 } else {
@@ -248,11 +254,17 @@ pub(super) async fn schema(
             priority: 1,
             defaults: ProviderDefaults::Indexer {
                 tv: TvIndexerScope {
+                    enable_rss: true,
+                    enable_automatic_search: true,
+                    enable_interactive_search: true,
                     categories: vec![],
                     anime_categories: vec![],
                     anime_standard_format_search: false,
                 },
                 movies: MovieIndexerScope {
+                    enable_rss: true,
+                    enable_automatic_search: true,
+                    enable_interactive_search: true,
                     categories: vec![],
                     remove_year: false,
                 },

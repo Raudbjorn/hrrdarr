@@ -29,6 +29,34 @@ fn flag(settings: &Map<String, Json>, key: &str) -> Result<bool> {
         _ => Err(INVALID),
     }
 }
+// Older/partial snapshots carry no evidence that an absent operation was enabled.
+// Preserve reconstruction, but keep each absent policy disabled and report the gap.
+fn operation_flags(row: &Record, unsupported: &mut Vec<Unsupported>) -> Result<[bool; 3]> {
+    let mut flags = [false; 3];
+    for (index, key) in [
+        "EnableRss",
+        "EnableAutomaticSearch",
+        "EnableInteractiveSearch",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        flags[index] = match row.get(key) {
+            Some(Value::Integer(0)) => false,
+            Some(Value::Integer(1)) => true,
+            None => {
+                unsupported.push(Unsupported {
+                    table: "Indexers".into(),
+                    rows: 1,
+                    columns: vec![format!("{key} (absent; imported disabled)")],
+                });
+                false
+            }
+            _ => return Err(INVALID),
+        };
+    }
+    Ok(flags)
+}
 fn number(settings: &Map<String, Json>, key: &str, default: i64) -> Result<i64> {
     match settings.get(key) {
         None => Ok(default),
@@ -144,6 +172,11 @@ pub(super) fn read(
             let settings = settings.as_object().ok_or(INVALID)?;
             let mut used = vec!["apiKey"];
             let (config, credentials) = if table_name == "Indexers" {
+                let [
+                    enable_rss,
+                    enable_automatic_search,
+                    enable_interactive_search,
+                ] = operation_flags(row, unsupported)?;
                 used.extend(["baseUrl", "apiPath", "categories", "additionalParameters"]);
                 let base = string(settings, "baseUrl")?.ok_or(INVALID)?;
                 let url = endpoint(
@@ -165,6 +198,9 @@ pub(super) fn read(
                     used.extend(["animeCategories", "animeStandardFormatSearch"]);
                     (
                         Some(TvIndexerScope {
+                            enable_rss,
+                            enable_automatic_search,
+                            enable_interactive_search,
                             categories: cats,
                             anime_categories: categories(settings, "animeCategories", false)?,
                             anime_standard_format_search: flag(
@@ -179,6 +215,9 @@ pub(super) fn read(
                     (
                         None,
                         Some(MovieIndexerScope {
+                            enable_rss,
+                            enable_automatic_search,
+                            enable_interactive_search,
                             categories: cats,
                             remove_year: flag(settings, "removeYear")?,
                         }),
@@ -347,14 +386,19 @@ pub(super) fn read(
                 .columns
                 .iter()
                 .filter(|c| {
-                    !matches!(
-                        c.as_str(),
-                        "Id" | "Name"
-                            | "Implementation"
-                            | "ConfigContract"
-                            | "Settings"
-                            | "Priority"
-                    )
+                    !(table_name == "Indexers"
+                        && matches!(
+                            c.as_str(),
+                            "EnableRss" | "EnableAutomaticSearch" | "EnableInteractiveSearch"
+                        ))
+                        && !matches!(
+                            c.as_str(),
+                            "Id" | "Name"
+                                | "Implementation"
+                                | "ConfigContract"
+                                | "Settings"
+                                | "Priority"
+                        )
                 })
                 .cloned()
                 .collect();
@@ -436,6 +480,58 @@ mod tests {
                     rows: vec![row],
                 },
             )]),
+        }
+    }
+    #[test]
+    fn source_operation_flags_are_top_level_strict_and_missing_is_disabled() {
+        for app in [Application::Sonarr, Application::Radarr] {
+            let mut snapshot = source(
+                "Indexers",
+                "Torznab",
+                r#"{"baseUrl":"https://example.test","enableRss":true}"#,
+            );
+            let mut unsupported = vec![];
+            let records = read(&snapshot, app, &mut unsupported).unwrap();
+            let domain = if matches!(app, Application::Sonarr) {
+                "tv"
+            } else {
+                "movies"
+            };
+            let settings = serde_json::to_value(&records[0].input.settings).unwrap();
+            for key in [
+                "enable_rss",
+                "enable_automatic_search",
+                "enable_interactive_search",
+            ] {
+                assert_eq!(settings[domain][key], false);
+            }
+            assert!(!records[0].input.enabled);
+            assert_eq!(
+                unsupported
+                    .iter()
+                    .filter(|u| u.columns.iter().any(|c| c.contains("absent")))
+                    .count(),
+                3
+            );
+            let table = snapshot.tables.get_mut("Indexers").unwrap();
+            for (key, value) in [
+                ("EnableRss", 0),
+                ("EnableAutomaticSearch", 1),
+                ("EnableInteractiveSearch", 0),
+            ] {
+                table.columns.push(key.into());
+                table.rows[0].insert(key.into(), Value::Integer(value));
+            }
+            let records = read(&snapshot, app, &mut vec![]).unwrap();
+            let settings = serde_json::to_value(&records[0].input.settings).unwrap();
+            assert_eq!(settings[domain]["enable_rss"], false);
+            assert_eq!(settings[domain]["enable_automatic_search"], true);
+            assert_eq!(settings[domain]["enable_interactive_search"], false);
+            for invalid in [Value::Integer(2), Value::Text("1".into()), Value::Null] {
+                snapshot.tables.get_mut("Indexers").unwrap().rows[0]
+                    .insert("EnableRss".into(), invalid);
+                assert!(read(&snapshot, app, &mut vec![]).is_err());
+            }
         }
     }
     #[test]

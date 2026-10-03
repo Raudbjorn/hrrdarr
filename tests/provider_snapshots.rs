@@ -5,6 +5,9 @@ use hrrdarr::{
 };
 use libsql::{Connection, params};
 use std::path::{Path, PathBuf};
+// The importer has a process-wide admission gate, even for separate scratch databases.
+static IMPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Sandbox(PathBuf);
 impl Sandbox {
     fn new() -> Self {
@@ -53,7 +56,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
 CREATE TABLE MovieMetadata(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER);INSERT INTO MovieMetadata VALUES(1,456,'tt456','Film',2021);
 CREATE TABLE Movies(Id INTEGER,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);INSERT INTO Movies VALUES(1,1,'/movies/Film',1,0);
 CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);"#}).await.unwrap();
-    c.execute_batch("CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER); CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);").await.unwrap();
+    c.execute_batch("CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER,EnableAutomaticSearch INTEGER,EnableInteractiveSearch INTEGER); CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);").await.unwrap();
     for (id, implementation) in [(1, "Torznab"), (2, "Newznab")] {
         let settings = if tv {
             serde_json::json!({"baseUrl":format!("https://{}.example",implementation.to_lowercase()),"apiPath":"/api","apiKey":"PRIVATE_INDEXER_SECRET","categories":[5000],"animeCategories":[5070],"animeStandardFormatSearch":true,"additionalParameters":"&custom=PRIVATE_QUERY_SECRET","PRIVATE_UNKNOWN_KEY_SECRET":{"unknown":true}})
@@ -61,7 +64,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
             serde_json::json!({"baseUrl":format!("https://{}.example",implementation.to_lowercase()),"apiPath":"/api","apiKey":"PRIVATE_INDEXER_SECRET","categories":[2000],"removeYear":true,"additionalParameters":"&custom=PRIVATE_QUERY_SECRET"})
         };
         c.execute(
-            "INSERT INTO Indexers VALUES(?,?,?,?,?,1,1)",
+            "INSERT INTO Indexers VALUES(?,?,?,?,?,1,0,1,0)",
             params![
                 id,
                 implementation,
@@ -84,7 +87,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
     )
     .await
     .unwrap();
-    c.execute("INSERT INTO Indexers VALUES(3,'Unknown','FutureIndexer','FutureSettings','{\"unknown\":1}',1,1)",()).await.unwrap();
+    c.execute("INSERT INTO Indexers VALUES(3,'Unknown','FutureIndexer','FutureSettings','{\"unknown\":1}',1,1,1,1)",()).await.unwrap();
     drop(c);
     drop(db);
     std::fs::read(path).unwrap()
@@ -92,6 +95,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
 #[tokio::test]
 async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe()
 -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
     let s = Sandbox::new();
     let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
     let wrong = CredentialKey::from_hex(&"cd".repeat(32)).unwrap();
@@ -125,7 +129,12 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
         snapshots::import_with_providers(&db, Application::Sonarr, tv.clone(), false, Some(&key))
             .await?;
     assert!(report.applied);
+    assert_eq!(
+        serde_json::to_value(&preview.unsupported)?,
+        serde_json::to_value(&report.unsupported)?
+    );
     assert_eq!(report.mapped, 3);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=0 AND enable_automatic_search=1 AND enable_interactive_search=0").await, 2);
     let public = serde_json::to_string(&report)?;
     assert!(!public.contains("PRIVATE_"));
     assert!(!public.contains("client.example"));
@@ -222,8 +231,10 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
             .applied
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 6);
-    // Any local revision change conflicts even if values are changed back.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=0 AND enable_automatic_search=1 AND enable_interactive_search=0").await, 4);
+    // A native policy edit is revisioned and must conflict rather than overwrite source intent.
     c.execute("UPDATE providers SET revision=revision+1 WHERE id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='sonarr' AND source_table='Indexers' AND source_id=1 LIMIT 1)",()).await?;
+    c.execute("UPDATE provider_scopes SET enable_rss=1 WHERE provider_id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='sonarr' AND source_table='Indexers' AND source_id=1 LIMIT 1)", ()).await?;
     let conflict =
         snapshots::import_with_providers(&db, Application::Sonarr, tv.clone(), false, Some(&key))
             .await?;
@@ -300,5 +311,90 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
     let c = db.connect().await?;
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 5);
     assert!(scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await > 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_and_malformed_snapshot_policy_is_conservative_and_atomic() -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        let source_path = scratch.0.join(format!("{label}-source.db"));
+        fixture(&source_path, app, false).await;
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let c = raw.connect()?;
+        c.execute_batch("ALTER TABLE Indexers DROP COLUMN EnableAutomaticSearch;")
+            .await?;
+        drop(c);
+        drop(raw);
+        let bytes = std::fs::read(&source_path)?;
+        let db = destination(&scratch.0.join(format!("{label}-dest.db"))).await;
+        let preview =
+            snapshots::import_with_providers(&db, app, bytes.clone(), true, Some(&key)).await?;
+        let report =
+            snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key)).await?;
+        assert!(report.applied);
+        assert_eq!(
+            serde_json::to_value(&preview.unsupported)?,
+            serde_json::to_value(&report.unsupported)?
+        );
+        assert!(report.unsupported.iter().any(|u| {
+            u.columns
+                .iter()
+                .any(|c| c == "EnableAutomaticSearch (absent; imported disabled)")
+        }));
+        let c = db.connect().await?;
+        assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_automatic_search=0 AND enable_rss=0 AND enable_interactive_search=0").await, 2);
+        let repeat = snapshots::import_with_providers(&db, app, bytes, false, Some(&key)).await?;
+        assert!(repeat.applied && repeat.conflicts == 0 && repeat.duplicates >= 3);
+        let before = scalar(&c, "SELECT sum(generation) FROM health_checks").await;
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute("UPDATE Indexers SET EnableRss=1 WHERE Id=1", ())
+            .await?;
+        drop(source);
+        drop(raw);
+        let changed = snapshots::import_with_providers(
+            &db,
+            app,
+            std::fs::read(&source_path)?,
+            false,
+            Some(&key),
+        )
+        .await?;
+        assert!(
+            !changed.applied && changed.conflicts > 0,
+            "Changed source policies must not overwrite a native provider"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute("UPDATE Indexers SET EnableRss='unknown' WHERE Id=2", ())
+            .await?;
+        drop(source);
+        drop(raw);
+        assert!(
+            snapshots::import_with_providers(
+                &db,
+                app,
+                std::fs::read(&source_path)?,
+                false,
+                Some(&key)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 3);
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+    }
     Ok(())
 }

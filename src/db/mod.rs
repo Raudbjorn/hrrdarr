@@ -204,6 +204,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "movie_credits",
         include_str!("../../migrations/0047_movie_credits.sql"),
     ),
+    (
+        "indexer_operation_policy",
+        include_str!("../../migrations/0048_indexer_operation_policy.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -758,3 +762,6 @@ mod download_root_health_tests;
 
 #[cfg(test)]
 mod removed_metadata_health_tests;
+
+#[cfg(test)]
+mod indexer_policy_tests;

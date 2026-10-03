@@ -366,7 +366,7 @@ export type MovieDetails = { studio: string | null, genres: Array<string> | null
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
+export type MovieIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, categories: Array<number>, remove_year?: boolean, };
 
 export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
 
@@ -664,7 +664,7 @@ export type TestStatus = "never_tested" | "success" | "failure";
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
+export type TvIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
 
 export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
