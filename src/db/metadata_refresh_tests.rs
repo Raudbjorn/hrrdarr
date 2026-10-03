@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     //0041 appends explicit scheduler intent; compare every historical field unchanged.
     for row in &mut before[1] {
         let enabled = row[3].clone();

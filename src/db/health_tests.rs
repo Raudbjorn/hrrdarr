@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -135,6 +135,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             for row in &mut expected {
                 row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
                 // Reasoning: 0049 then appends the NULL download_client_id preference column.
+                row.push(libsql::Value::Null);
+                // Reasoning: 0050 appends the nullable feed-only minimum_seeders column (NULL for old rows).
                 row.push(libsql::Value::Null);
             }
         }
@@ -151,7 +153,15 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             .await?
             .unwrap()
             .get::<String>(0)?;
-        assert_eq!(actual.replace(added, ""), *sql);
+        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
+        // indexer implementation list to torrentrss; reversing that one exact edit must recover the predecessor.
+        assert_eq!(
+            actual.replace(added, "").replace(
+                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab')"
+            ),
+            *sql
+        );
     }
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE severity IS NULL AND checked_at IS NULL AND observed_generation IS NULL AND pending_reasons=0 AND compatibility_type='ImportMechanismCheck'").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_lifecycle WHERE started_at=0 AND grace_due_at=0 AND next_scheduled_at=0 AND last_batch_completed_at IS NULL").await?,1);
@@ -184,7 +194,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -616,7 +626,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -701,7 +711,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Migration46 adds removed metadata; historical42 checks stay2; 0048 adds four indexer identities (8 -> 12); 0049 adds two indexer_download_client identities (12 -> 14).

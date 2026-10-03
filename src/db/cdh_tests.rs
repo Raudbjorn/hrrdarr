@@ -112,7 +112,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert_eq!(count(&c,"SELECT count(*) FROM download_processing_policies WHERE enabled_override=enabled AND revision IN (1,2)").await?,2);
     assert_eq!(count(&c,"SELECT count(*) FROM download_refresh_schedules WHERE requested_enabled=enabled AND intent='explicit' AND interval_seconds IN (123,777)").await?,2);
     assert_eq!(
@@ -208,7 +208,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     Ok(())
 }
 

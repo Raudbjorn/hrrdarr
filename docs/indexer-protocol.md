@@ -49,3 +49,5 @@ Public results contain nullable title and byte size, normalized publication date
 Normalization reuses the already locked `icu_normalizer` and `icu_properties` 2.3.0 dependencies with compiled data; no new crate versions were introduced. The [Sphinx query syntax](https://sphinxsearch.com/docs/current/extended-syntax.html) explains why punctuation is semantically significant. Compatibility cases listed here are explicit fixture evidence; they do not establish behavior of every vendor deployment or complete Sonarr/Radarr automation.
 
 HTML title decoding uses pinned `html-escape 0.2.15`, a dependency without runtime dependencies. Both raw and normalized title queries reject whitespace-only title content; no suffix/year-only query is substituted.
+
+Generic torrent feeds are RSS-only and use their own parser; see [torrent-rss.md](torrent-rss.md). The shared XML helper additionally rejects element nesting deeper than 32 levels for every indexer response.

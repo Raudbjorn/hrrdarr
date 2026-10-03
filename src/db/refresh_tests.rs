@@ -196,7 +196,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

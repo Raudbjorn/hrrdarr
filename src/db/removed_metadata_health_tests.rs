@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -430,7 +430,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);

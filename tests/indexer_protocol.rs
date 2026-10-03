@@ -375,6 +375,7 @@ async fn owned_http_requests_authentication_and_redaction() {
             &settings,
             &hrrdarr::providers::IndexerAccess {
                 api_key: Some("PRIVATE & +/KEY"),
+                cookie: None,
                 tv_parameters: &tv_private,
                 movie_parameters: &movie_private,
             },
@@ -387,6 +388,7 @@ async fn owned_http_requests_authentication_and_redaction() {
             &settings,
             &hrrdarr::providers::IndexerAccess {
                 api_key: Some("PRIVATE & +/KEY"),
+                cookie: None,
                 tv_parameters: &tv_private,
                 movie_parameters: &movie_private,
             },
@@ -413,6 +415,7 @@ async fn owned_http_requests_authentication_and_redaction() {
                 &settings,
                 &hrrdarr::providers::IndexerAccess {
                     api_key: None,
+                    cookie: None,
                     tv_parameters: &[],
                     movie_parameters: &[]
                 }
@@ -503,6 +506,7 @@ async fn fallback_alias_cursors_and_errors_keep_query_scope() {
     let client = HttpClient::new().unwrap();
     let access = IndexerAccess {
         api_key: None,
+        cookie: None,
         tv_parameters: &[],
         movie_parameters: &[],
     };
@@ -1166,6 +1170,7 @@ async fn category_discovery_is_caps_only_bounded_and_preserves_advertised_choice
     }];
     let access = IndexerAccess {
         api_key: Some("API_SECRET"),
+        cookie: None,
         tv_parameters: &tv,
         movie_parameters: &movies,
     };

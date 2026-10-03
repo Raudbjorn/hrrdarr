@@ -149,6 +149,19 @@ pub enum Credentials {
         #[ts(as = "Option<Vec<IndexerParameter>>", optional)]
         movie_parameters: Vec<IndexerParameter>,
     },
+    /// Generic feed access (`torrentrss` only): an optional Cookie header and per-domain query
+    /// parameters such as a passkey. Everything is write-only and sealed with the envelope.
+    Feed {
+        #[serde(default)]
+        #[ts(optional=nullable)]
+        cookie: Option<String>,
+        #[serde(default)]
+        #[ts(as = "Option<Vec<IndexerParameter>>", optional)]
+        tv_parameters: Vec<IndexerParameter>,
+        #[serde(default)]
+        #[ts(as = "Option<Vec<IndexerParameter>>", optional)]
+        movie_parameters: Vec<IndexerParameter>,
+    },
 }
 /// Write-only additional query parameters; names and values never enter public configuration.
 #[derive(Deserialize, Serialize, ts_rs::TS)]
@@ -161,6 +174,8 @@ pub struct IndexerParameter {
 #[derive(Default)]
 pub struct IndexerAccess<'a> {
     pub api_key: Option<&'a str>,
+    /// Feed-only secret sent as a Cookie header; never logged, echoed or stored in releases.
+    pub cookie: Option<&'a str>,
     pub tv_parameters: &'a [IndexerParameter],
     pub movie_parameters: &'a [IndexerParameter],
 }
@@ -168,8 +183,17 @@ impl<'a> IndexerAccess<'a> {
     pub(super) fn validate(&self) -> bool {
         self.api_key.is_none_or(|key| {
             !key.is_empty() && key.len() <= 4096 && !key.chars().any(char::is_control)
-        }) && valid_parameters(self.tv_parameters)
+        }) && self.cookie.is_none_or(valid_cookie)
+            && valid_parameters(self.tv_parameters)
             && valid_parameters(self.movie_parameters)
+    }
+
+    /// Feed requests use the generic parameter rules and never an API key.
+    pub(super) fn validate_feed(&self) -> bool {
+        self.api_key.is_none()
+            && self.cookie.is_none_or(valid_cookie)
+            && valid_feed_parameters(self.tv_parameters)
+            && valid_feed_parameters(self.movie_parameters)
     }
 
     pub(super) fn from_credentials(credentials: &'a Option<Credentials>) -> Self {
@@ -186,43 +210,65 @@ impl<'a> IndexerAccess<'a> {
                 api_key: api_key.as_deref(),
                 tv_parameters,
                 movie_parameters,
+                ..Self::default()
+            },
+            Some(Credentials::Feed {
+                cookie,
+                tv_parameters,
+                movie_parameters,
+            }) => Self {
+                cookie: cookie.as_deref(),
+                tv_parameters,
+                movie_parameters,
+                ..Self::default()
             },
             _ => Self::default(),
         }
     }
 }
+/// Visible ASCII (and space) only: no control characters can reach a request header.
+fn valid_cookie(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 4096 && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
 fn valid_parameters(parameters: &[IndexerParameter]) -> bool {
-    const RESERVED: &[&str] = &[
-        "t",
-        "apikey",
-        "api_key",
-        "api-key",
-        "cat",
-        "categories",
-        "q",
-        "title",
-        "tvdbid",
-        "tvmazeid",
-        "rid",
-        "rageid",
-        "imdbid",
-        "imdbtitle",
-        "imdbyear",
-        "tmdbid",
-        "traktid",
-        "doubanid",
-        "year",
-        "season",
-        "ep",
-        "episode",
-        "offset",
-        "limit",
-        "extended",
-        "o",
-        "attrs",
-        "id",
-        "r",
-    ];
+    valid_parameters_except(parameters, TORZNAB_RESERVED)
+}
+/// A feed has no Torznab vocabulary to protect, so only the generic name/value rules apply.
+fn valid_feed_parameters(parameters: &[IndexerParameter]) -> bool {
+    valid_parameters_except(parameters, &[])
+}
+const TORZNAB_RESERVED: &[&str] = &[
+    "t",
+    "apikey",
+    "api_key",
+    "api-key",
+    "cat",
+    "categories",
+    "q",
+    "title",
+    "tvdbid",
+    "tvmazeid",
+    "rid",
+    "rageid",
+    "imdbid",
+    "imdbtitle",
+    "imdbyear",
+    "tmdbid",
+    "traktid",
+    "doubanid",
+    "year",
+    "season",
+    "ep",
+    "episode",
+    "offset",
+    "limit",
+    "extended",
+    "o",
+    "attrs",
+    "id",
+    "r",
+];
+fn valid_parameters_except(parameters: &[IndexerParameter], reserved: &[&str]) -> bool {
     let mut names = std::collections::BTreeSet::new();
     parameters.len() <= 16
         && parameters.iter().all(|p| {
@@ -233,7 +279,7 @@ fn valid_parameters(parameters: &[IndexerParameter]) -> bool {
                 && name
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
-                && !RESERVED.contains(&name.as_str())
+                && !reserved.contains(&name.as_str())
                 && names.insert(name)
                 && p.value.len() <= 1024
                 && !p.value.chars().any(char::is_control)
@@ -246,7 +292,20 @@ impl Credentials {
             return false;
         }
         match self {
-            Self::ApiKey { api_key } => valid(api_key),
+            Self::ApiKey { api_key } => implementation != "torrentrss" && valid(api_key),
+            Self::Feed {
+                cookie,
+                tv_parameters,
+                movie_parameters,
+            } => {
+                implementation == "torrentrss"
+                    && cookie.as_deref().is_none_or(valid_cookie)
+                    && (cookie.is_some()
+                        || !tv_parameters.is_empty()
+                        || !movie_parameters.is_empty())
+                    && valid_feed_parameters(tv_parameters)
+                    && valid_feed_parameters(movie_parameters)
+            }
             Self::Indexer {
                 api_key,
                 tv_parameters,
@@ -421,5 +480,56 @@ mod tests {
             "credential envelopes cannot be repurposed as release payloads"
         );
         assert!(key.seal_release(context, &vec![0; 65537]).is_err());
+    }
+    #[test]
+    fn feed_credentials_are_sealed_owner_bound_and_header_safe() {
+        let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+        let input = r#"{"kind":"feed","cookie":"uid=1; pass=PRIVATE_COOKIE_SENTINEL","tv_parameters":[{"name":"cat","value":"PRIVATE_PARAMETER_SENTINEL"}]}"#;
+        let credentials: Credentials = serde_json::from_str(input).unwrap();
+        assert!(credentials.valid("torrentrss"));
+        for other in ["torznab", "newznab", "qbittorrent"] {
+            assert!(!credentials.valid(other), "{other}");
+        }
+        let sealed = key.seal("feed-id", "torrentrss", &credentials).unwrap();
+        for secret in [
+            b"PRIVATE_COOKIE_SENTINEL".as_slice(),
+            b"PRIVATE_PARAMETER_SENTINEL".as_slice(),
+        ] {
+            assert!(!sealed.windows(secret.len()).any(|w| w == secret));
+        }
+        assert!(key.open("feed-id", "torznab", &sealed).is_err());
+        let opened = Some(key.open("feed-id", "torrentrss", &sealed).unwrap());
+        let access = IndexerAccess::from_credentials(&opened);
+        assert_eq!(access.cookie, Some("uid=1; pass=PRIVATE_COOKIE_SENTINEL"));
+        assert_eq!(access.api_key, None);
+        assert!(access.validate_feed());
+        // `cat` is a Torznab-reserved name, but plain feeds have no such vocabulary.
+        assert!(!access.validate());
+        // Native credential kinds never validate for a feed.
+        for kind in [
+            r#"{"kind":"api_key","api_key":"k"}"#,
+            r#"{"kind":"indexer","api_key":"k"}"#,
+            r#"{"kind":"username_password","username":"u","password":"p"}"#,
+        ] {
+            let credentials: Credentials = serde_json::from_str(kind).unwrap();
+            assert!(!credentials.valid("torrentrss"), "{kind}");
+        }
+        for bad_cookie in ["", "a\r\nb", "tab\there", "caf\u{e9}", &"x".repeat(4097)] {
+            let credentials = Credentials::Feed {
+                cookie: Some(bad_cookie.to_string()),
+                tv_parameters: vec![],
+                movie_parameters: vec![],
+            };
+            assert!(!credentials.valid("torrentrss"), "{bad_cookie:?}");
+        }
+        let empty = Credentials::Feed {
+            cookie: None,
+            tv_parameters: vec![],
+            movie_parameters: vec![],
+        };
+        assert!(
+            !empty.valid("torrentrss"),
+            "an empty credential is not a credential"
+        );
     }
 }
