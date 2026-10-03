@@ -1,0 +1,11 @@
+# History panel (read-only)
+
+The History tab in the workspace nav lists `GET /api/v1/history` ([contract](history.md)) for both domains. It has no mutating actions.
+
+- **Events.** Native imports and source-snapshot events render distinctly. Native events show operation, domain-qualified historical file, recorded source/destination paths, size and SHA-256; the timestamp is labelled as association commit. Source events show composite identity, semantic event type and the original numeric `source_event_type` (code 6 is annotated as rename for TV and deletion for movies), and show `not recorded` for null title, download ID, quality and languages. They never show paths, size, hash or a local import time.
+- **Targets.** Every event shows its domain with the id (`TV episode 5`, `Movie 5`); keys include origin and identity so equal numeric ids never merge.
+- **Filters.** `media_type`, `episode_id`, `movie_id`, `series_id`, `season`, `from`, `to`, `limit`, `offset`. Client-side checks mirror the contract before sending: positive safe integer ids, season requires series, movie selectors conflict with TV selectors/media TV, TV selectors conflict with media Movies, RFC3339 with explicit timezone (no leap seconds, at most nine fractional digits, UTC year 0001-9999), `from` strictly before `to`, limit 1-100, offset 0-10000. The query string is built with `URLSearchParams`, so `+` in an offset is sent as `%2B`. The server remains authoritative.
+- **Errors.** The envelope code is shown with a Retry button for `invalid_history_query` (400, change filters), `history_response_limit` (413, narrow), `history_timeout` (503) and 500. Responses that do not match the contract are rejected rather than shown.
+- **Caveats displayed in the UI.** Native timestamps mark association commit, not cleanup completion; paths do not assert a file exists now; offset pages are not a frozen snapshot; series/season filters use current numbering. Offsets beyond 10000 are unreachable and the UI says so.
+
+Not covered: V3 wire compatibility, full History parity (other native event producers such as grabbed/failed, event-type/download/quality/language filters, custom-format columns, mark-failed), live updates, and any browser/Playwright workflow evidence. Logic is unit-tested in `frontend/tests/history-view.test.mjs`.

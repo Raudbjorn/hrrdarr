@@ -302,5 +302,11 @@ export const getMovieRenamePreview = (movieIds: number[]): Promise<Result<import
   return request<import('./api.generated').MovieRenamePreview>(`/api/v1/movies/rename-preview?${query}`, undefined, undefined, true);
 };
 
-export const getHostSettings = (): Promise<Result<import('./api.generated').HostSettings>> =>
+export const getHistory = (query: import('./api.generated').HistoryQuery = {}): Promise<Result<ApiPage<import('./api.generated').HistoryEvent>>> => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  const suffix = params.size ? `?${params}` : '';
+  return request<ApiPage<import('./api.generated').HistoryEvent>>(`/api/v1/history${suffix}`, undefined, undefined, true);
+};
+export const getHostSettings =(): Promise<Result<import('./api.generated').HostSettings>> =>
   request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);
