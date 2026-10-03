@@ -301,3 +301,6 @@ export const getMovieRenamePreview = (movieIds: number[]): Promise<Result<import
   const query = new URLSearchParams({ movie_ids: [...movieIds].sort((a, b) => a - b).join(',') });
   return request<import('./api.generated').MovieRenamePreview>(`/api/v1/movies/rename-preview?${query}`, undefined, undefined, true);
 };
+
+export const getHostSettings = (): Promise<Result<import('./api.generated').HostSettings>> =>
+  request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);
