@@ -9,6 +9,9 @@
   import { findLibraryByExternalId } from './lib/api';
   import { unknownTagWrite } from './lib/tag-draft';
   import { onMount } from 'svelte';
+  import SettingsIndex from './lib/SettingsIndex.svelte';
+  import NotFound from './lib/NotFound.svelte';
+  import { parseHash, hashFor, SETTINGS_INDEX_HASH, type ViewId } from './lib/routes';
   import type { QualityProfilePage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, MediaDomain, MediaTarget, SeriesType, MinimumAvailability } from './lib/api.generated';
   import type { SettingsWriteState } from './lib/api';
   import { listQualityProfiles, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode } from './lib/api';
@@ -28,11 +31,32 @@
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
   let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
-  function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;activityVisited=true;view='activity';}
+  function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;navigate('activity');}
   let activityVisited=$state(false),providersVisited=$state(false),providerVersion=$state(0);
   let activityWrite=$state<SettingsWriteState>('idle'),providerWrite=$state<SettingsWriteState>('idle');
   let searchTarget: MediaTarget | null = $state(null);
-  let view = $state<'health' | 'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles' | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'>('library');
+  let view = $state<ViewId | 'settings-index' | 'not-found'>('library'), notFoundPath = $state('');
+  // Hash routing: the URL is the source of truth. showView is idempotent so the hashchange after navigate() is harmless.
+  function showView(next: ViewId | 'settings-index' | 'not-found') {
+    if (next === 'providers') providersVisited = true; else if (next === 'activity') activityVisited = true;
+    else if (next === 'health') healthVisited = true; else if (next === 'tags') tagsVisited = true;
+    else if (next === 'custom-formats') customFormatsVisited = true; else if (next === 'qualities') qualitiesVisited = true;
+    else if (next === 'profiles') profilesVisited = true; else if (next === 'media-management') revisionVisited = true;
+    else if (next === 'history') historyVisited = true; else if (next === 'general') generalVisited = true;
+    else if (next === 'import-existing') importVisited = true;
+    view = next;
+  }
+  function applyHash() {
+    const route = parseHash(location.hash);
+    if (route.kind === 'view') showView(route.view);
+    else if (route.kind === 'settings-index') showView('settings-index');
+    else { notFoundPath = route.path; showView('not-found'); }
+  }
+  function navigate(next: ViewId | 'settings-index') {
+    const target = next === 'settings-index' ? SETTINGS_INDEX_HASH : hashFor(next);
+    if (location.hash !== target) location.hash = target;
+    showView(next);
+  }
   let historyVisited=$state(false);
   let generalVisited=$state(false);
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
@@ -133,13 +157,15 @@
     void patch(domain === 'tv' ? {quality_profile_id: profileId, series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {quality_profile_id: profileId, minimum_availability: (availability || null) as MinimumAvailability | null});
   }
   function refreshAfterImport() { void load(page?.offset ?? 0); if (selected) void select(selected.id, episodeOffset); }
-  onMount(() => { alive = true; void load(); return () => {alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
+  onMount(() => { alive = true; applyHash(); window.addEventListener('hashchange', applyHash); void load(); return () => {window.removeEventListener('hashchange', applyHash); alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
 </script>
 
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
-<header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
+<header class="masthead"><a href="#/" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => {providersVisited=true;view='providers';}}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => {activityVisited=true;view='activity';}}>Activity</button><button aria-pressed={view === 'health'} onclick={() => {healthVisited=true;view='health';}}>Health</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>{tagsVisited=true;view='tags';}}>Tags</button><button aria-pressed={view === 'custom-formats'} onclick={() => {customFormatsVisited=true; view = 'custom-formats';}}>Custom formats</button><button aria-pressed={view === 'qualities'} onclick={() => {qualitiesVisited=true; view = 'qualities';}}>Quality settings</button><button aria-pressed={view === 'profiles'} onclick={() => {profilesVisited=true; view = 'profiles';}}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>{revisionVisited=true;view='media-management';}}>Media management</button><button aria-pressed={view==='history'} onclick={()=>{historyVisited=true;view='history';}}>History</button><button aria-pressed={view==='general'} onclick={()=>{generalVisited=true;view='general';}}>General</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
+  {#if view === 'settings-index'}<SettingsIndex />{/if}
+  {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={activityWrite} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
   {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
