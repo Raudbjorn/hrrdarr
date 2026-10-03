@@ -359,6 +359,22 @@ pub(crate) async fn indexer_configuration_changed(
     let keys = selection(c, scope, "check_key IN ('indexer_search','indexer_rss')").await?;
     mark(c, &keys, CONFIG, now()?).await
 }
+/// Indexer download-client bindings are evaluated separately from search/RSS capability checks.
+/// The caller deduplicates affected referencing domains in the authoritative mutation transaction.
+pub(crate) async fn indexer_client_configuration_changed(
+    c: &Connection,
+    media: MediaDomain,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key='indexer_download_client'").await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
 /// Status is not trailing configuration debounce. Repeated observations cannot postpone work.
 /// Callers deduplicate concurrent provider tests; the sole worker serializes refresh outcomes.
 pub(crate) async fn communication_status_changed(c: &Connection, media: MediaDomain) -> Result<()> {

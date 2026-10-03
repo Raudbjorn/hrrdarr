@@ -184,6 +184,9 @@ pub struct TvIndexerScope {
     #[serde(default = "enabled_by_default")]
     #[ts(as = "Option<bool>", optional)]
     pub enable_interactive_search: bool,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub download_client_id: Option<Uuid>,
     pub categories: Vec<u32>,
     pub anime_categories: Vec<u32>,
     #[serde(default)]
@@ -202,6 +205,9 @@ pub struct MovieIndexerScope {
     #[serde(default = "enabled_by_default")]
     #[ts(as = "Option<bool>", optional)]
     pub enable_interactive_search: bool,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub download_client_id: Option<Uuid>,
     pub categories: Vec<u32>,
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
@@ -1204,7 +1210,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -1246,6 +1252,10 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                     enable_rss: stored_bool(scope.get(14)?)?,
                     enable_automatic_search: stored_bool(scope.get(15)?)?,
                     enable_interactive_search: stored_bool(scope.get(16)?)?,
+                    download_client_id: scope
+                        .get::<Option<String>>(17)?
+                        .map(|id| Uuid::parse_str(&id).map_err(|_| corrupt()))
+                        .transpose()?,
                     categories: cats,
                     anime_standard_format_search: stored_bool(scope.get::<i64>(7)?)?,
                     anime_categories: serde_json::from_str(&scope.get::<String>(2)?)
@@ -1256,6 +1266,10 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                     enable_rss: stored_bool(scope.get(14)?)?,
                     enable_automatic_search: stored_bool(scope.get(15)?)?,
                     enable_interactive_search: stored_bool(scope.get(16)?)?,
+                    download_client_id: scope
+                        .get::<Option<String>>(17)?
+                        .map(|id| Uuid::parse_str(&id).map_err(|_| corrupt()))
+                        .transpose()?,
                     categories: cats,
                     remove_year: stored_bool(scope.get::<i64>(8)?)?,
                 })
@@ -1306,41 +1320,69 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
 }
 async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) -> Result<()> {
     let implementation = settings.implementation();
+    if let ProviderSettings::Torznab { tv, movies, .. }
+    | ProviderSettings::Newznab { tv, movies, .. } = settings
+    {
+        for (domain, client) in [
+            ("tv", tv.as_ref().and_then(|s| s.download_client_id)),
+            ("movies", movies.as_ref().and_then(|s| s.download_client_id)),
+        ] {
+            if let Some(client) = client {
+                // Existence and native domain are configuration facts at write time; a later
+                // disabled or removed client stays a stored preference that health reports.
+                if conn.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?", params![client.to_string(), domain]).await?.next().await?.is_none() {
+                    return Err(bad());
+                }
+            }
+        }
+    }
     conn.execute("DELETE FROM provider_scopes WHERE provider_id=?", [id])
         .await?;
     match settings {
         ProviderSettings::Torznab { tv, movies, .. }
         | ProviderSettings::Newznab { tv, movies, .. } => {
-            for (domain, categories, anime, standard, remove_year, rss, automatic, interactive) in
-                tv.iter()
-                    .map(|s| {
-                        (
-                            "tv",
-                            &s.categories,
-                            s.anime_categories.as_slice(),
-                            Some(i64::from(s.anime_standard_format_search)),
-                            None::<i64>,
-                            i64::from(s.enable_rss),
-                            i64::from(s.enable_automatic_search),
-                            i64::from(s.enable_interactive_search),
-                        )
-                    })
-                    .chain(movies.iter().map(|s| {
-                        (
-                            "movies",
-                            &s.categories,
-                            &[][..],
-                            None,
-                            Some(i64::from(s.remove_year)),
-                            i64::from(s.enable_rss),
-                            i64::from(s.enable_automatic_search),
-                            i64::from(s.enable_interactive_search),
-                        )
-                    }))
+            for (
+                domain,
+                categories,
+                anime,
+                standard,
+                remove_year,
+                rss,
+                automatic,
+                interactive,
+                client,
+            ) in tv
+                .iter()
+                .map(|s| {
+                    (
+                        "tv",
+                        &s.categories,
+                        s.anime_categories.as_slice(),
+                        Some(i64::from(s.anime_standard_format_search)),
+                        None::<i64>,
+                        i64::from(s.enable_rss),
+                        i64::from(s.enable_automatic_search),
+                        i64::from(s.enable_interactive_search),
+                        s.download_client_id.map(|id| id.to_string()),
+                    )
+                })
+                .chain(movies.iter().map(|s| {
+                    (
+                        "movies",
+                        &s.categories,
+                        &[][..],
+                        None,
+                        Some(i64::from(s.remove_year)),
+                        i64::from(s.enable_rss),
+                        i64::from(s.enable_automatic_search),
+                        i64::from(s.enable_interactive_search),
+                        s.download_client_id.map(|id| id.to_string()),
+                    )
+                }))
             {
                 let categories = serde_json::to_string(categories).map_err(|_| bad())?;
                 let anime = serde_json::to_string(anime).map_err(|_| bad())?;
-                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year,enable_rss,enable_automatic_search,enable_interactive_search) VALUES(?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year,rss,automatic,interactive]).await?;
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year,rss,automatic,interactive,client]).await?;
             }
         }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -1383,47 +1425,84 @@ fn credentials(
             .map_err(|_| locked()),
     }
 }
-// Old and new scope union is captured before replacement/deletion in the same transaction.
-async fn health_configuration_changed(
-    c: &Connection,
-    old: Option<&ProviderSettings>,
-    new: Option<&ProviderSettings>,
-) -> Result<()> {
-    let mut indexers = [false; 2];
-    let mut clients = [false; 2];
-    for settings in [old, new].into_iter().flatten() {
-        let (selected, tv, movies) = match settings {
-            ProviderSettings::Torznab { tv, movies, .. }
-            | ProviderSettings::Newznab { tv, movies, .. } => {
-                (&mut indexers, tv.is_some(), movies.is_some())
+// One collector per writer transaction deduplicates bulk/import invalidation. The old and new
+// scope union and the indexer references to a client are captured before replacement/deletion.
+#[derive(Default)]
+pub(crate) struct HealthConfigurationChanges {
+    // Indexer edits affect capability checks (0048) and the download-client binding check.
+    indexers: [bool; 2],
+    // Client edits affect client checks; the binding check is marked through `referenced`.
+    clients: [bool; 2],
+    // Domains where some indexer references the changed client; only the binding check applies.
+    referenced: [bool; 2],
+}
+impl HealthConfigurationChanges {
+    async fn capture(
+        &mut self,
+        c: &Connection,
+        id: &str,
+        old: Option<&ProviderSettings>,
+        new: Option<&ProviderSettings>,
+    ) -> Result<()> {
+        let mut client = false;
+        for settings in [old, new].into_iter().flatten() {
+            let (selected, tv, movies) = match settings {
+                ProviderSettings::Torznab { tv, movies, .. }
+                | ProviderSettings::Newznab { tv, movies, .. } => {
+                    (&mut self.indexers, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Qbittorrent { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+            };
+            selected[0] |= tv;
+            selected[1] |= movies;
+        }
+        if client {
+            // The client may already lack a referenced domain, so read references before mutation.
+            let mut rows = c.query("SELECT DISTINCT media_type FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND download_client_id=?", [id]).await?;
+            while let Some(row) = rows.next().await? {
+                match row.get::<String>(0)?.as_str() {
+                    "tv" => self.referenced[0] = true,
+                    "movies" => self.referenced[1] = true,
+                    _ => return Err(corrupt()),
+                }
             }
-            ProviderSettings::Qbittorrent { tv, movies, .. } => {
-                (&mut clients, tv.is_some(), movies.is_some())
-            }
+        }
+        Ok(())
+    }
+    async fn mark(self, c: &Connection) -> Result<()> {
+        let recorded = |e: crate::health::Error| {
+            Error::Plain(e.0, e.1, "Health configuration could not be recorded")
         };
-        selected[0] |= tv;
-        selected[1] |= movies;
-    }
-    for (i, domain) in [MediaDomain::Tv, MediaDomain::Movies]
-        .into_iter()
-        .enumerate()
-    {
-        if indexers[i] {
-            crate::health::indexer_configuration_changed(c, domain)
-                .await
-                .map_err(|e| {
-                    Error::Plain(e.0, e.1, "Health configuration could not be recorded")
-                })?;
+        for (i, domain) in [MediaDomain::Tv, MediaDomain::Movies]
+            .into_iter()
+            .enumerate()
+        {
+            if self.indexers[i] {
+                crate::health::indexer_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
+            if self.indexers[i] || self.referenced[i] {
+                crate::health::indexer_client_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
+            if self.clients[i] {
+                crate::health::provider_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
         }
-        if clients[i] {
-            crate::health::provider_configuration_changed(c, domain)
-                .await
-                .map_err(|e| {
-                    Error::Plain(e.0, e.1, "Health configuration could not be recorded")
-                })?;
-        }
+        Ok(())
     }
-    Ok(())
+    pub(crate) async fn finish(self, c: &Connection) -> std::result::Result<(), &'static str> {
+        self.mark(c)
+            .await
+            .map_err(|_| "provider health configuration could not be recorded")
+    }
 }
 async fn create(
     State(context): State<Context>,
@@ -1444,10 +1523,12 @@ async fn create(
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
     let outcome = async {
+    let mut changes = HealthConfigurationChanges::default();
+    changes.capture(&tx, &id, None, Some(&input.settings)).await?;
     tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,?,?,1,1,?,?)",params![id.clone(),input.settings.implementation(),input.name,i64::from(input.enabled),i64::from(input.priority),input.settings.endpoint(),secret]).await?;
-    health_configuration_changed(&tx, None, Some(&input.settings)).await?;
     write_scopes(&tx, &id, &input.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
+    changes.mark(&tx).await?;
     Ok((StatusCode::CREATED, bounded(read(&tx, &id).await?.0)?))
     }.await;
     finish(tx, outcome).await
@@ -1482,13 +1563,15 @@ async fn update(
         &input.config.credentials,
     )?;
     release_profile_references(&tx,&id,Some(&input.config.settings)).await?;
+    let mut changes = HealthConfigurationChanges::default();
+    changes.capture(&tx, &id, Some(&old.settings), Some(&input.config.settings)).await?;
     let changed=tx.execute("UPDATE providers SET name=?,enabled=?,priority=?,revision=revision+1,endpoint=?,credentials=? WHERE id=? AND revision=?",params![input.config.name,i64::from(input.config.enabled),i64::from(input.config.priority),input.config.settings.endpoint(),secret,id.clone(),input.revision]).await?;
     if changed != 1 {
         return Err(conflict());
     }
-    health_configuration_changed(&tx, Some(&old.settings), Some(&input.config.settings)).await?;
     write_scopes(&tx, &id, &input.config.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
+    changes.mark(&tx).await?;
     bounded(read(&tx, &id).await?.0)
     }.await;
     finish(tx, outcome).await
@@ -1579,7 +1662,8 @@ async fn delete(
             &Change::Null,
         )?;
         release_profile_references(&tx, &id, None).await?;
-        health_configuration_changed(&tx, Some(&old.settings), None).await?;
+        let mut changes = HealthConfigurationChanges::default();
+        changes.capture(&tx, &id, Some(&old.settings), None).await?;
         if tx
             .execute(
                 "DELETE FROM providers WHERE id=? AND revision=?",
@@ -1599,6 +1683,7 @@ async fn delete(
                     "Completed download handling reconciliation failed",
                 )
             })?;
+        changes.mark(&tx).await?;
         Ok(StatusCode::NO_CONTENT)
     }
     .await;
@@ -2244,16 +2329,31 @@ pub(crate) async fn import_configuration(
     conn: &Connection,
     key: Option<&CredentialKey>,
     input: &ProviderInput,
+    download_client_id: Option<Uuid>,
+    changes: &mut HealthConfigurationChanges,
     mapped: Option<(&str, i64)>,
 ) -> std::result::Result<Option<(String, i64, bool)>, &'static str> {
     const INVALID: &str = "invalid source provider configuration";
     const FAILED: &str = "provider reconstruction failed; transaction not committed";
     const LOCKED: &str = "provider reconstruction requires the matching credential key";
     validate(input).map_err(|_| INVALID)?;
+    let mut settings = input.settings.clone();
+    if let ProviderSettings::Torznab { tv, movies, .. }
+    | ProviderSettings::Newznab { tv, movies, .. } = &mut settings
+    {
+        if let Some(scope) = tv {
+            scope.download_client_id = download_client_id;
+        }
+        if let Some(scope) = movies {
+            scope.download_client_id = download_client_id;
+        }
+    } else if download_client_id.is_some() {
+        return Err(INVALID);
+    }
     if input.enabled {
         return Err(INVALID);
     }
-    let implementation = input.settings.implementation();
+    let implementation = settings.implementation();
     let wanted_secret = match &input.credentials {
         Change::Value(value) => Some(value),
         Change::Null => None,
@@ -2262,7 +2362,7 @@ pub(crate) async fn import_configuration(
     if wanted_secret.is_some() && key.is_none() {
         return Err(LOCKED);
     }
-    let domain = match &input.settings {
+    let domain = match &settings {
         ProviderSettings::Torznab {
             tv: Some(_),
             movies: None,
@@ -2302,7 +2402,7 @@ pub(crate) async fn import_configuration(
             .await
             .map_err(|_| FAILED)?
     } else {
-        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,input.settings.endpoint(),domain]).await.map_err(|_| FAILED)?
+        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,settings.endpoint(),domain]).await.map_err(|_| FAILED)?
     };
     let candidate = rows
         .next()
@@ -2330,7 +2430,7 @@ pub(crate) async fn import_configuration(
             && existing.last_test.is_none()
             && mapped.is_none_or(|(_, revision)| existing.revision == revision)
             && serde_json::to_value(&existing.settings).map_err(|_| FAILED)?
-                == serde_json::to_value(&input.settings).map_err(|_| FAILED)?
+                == serde_json::to_value(&settings).map_err(|_| FAILED)?
             && serde_json::to_value(&secret).map_err(|_| FAILED)?
                 == serde_json::to_value(wanted_secret).map_err(|_| FAILED)?;
         return Ok(equals.then_some((id, existing.revision, false)));
@@ -2346,11 +2446,12 @@ pub(crate) async fn import_configuration(
                 .map_err(|_| LOCKED)
         })
         .transpose()?;
-    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),input.settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
-    health_configuration_changed(conn, None, Some(&input.settings))
+    changes
+        .capture(conn, &id, None, Some(&settings))
         .await
         .map_err(|_| FAILED)?;
-    write_scopes(conn, &id, &input.settings)
+    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
+    write_scopes(conn, &id, &settings)
         .await
         .map_err(|_| FAILED)?;
     crate::completed_download_handling::reconcile(conn, Some(&id), None)

@@ -250,3 +250,110 @@ pub async fn evaluate_communication(
         compatibility_type: "DownloadClientCheck",
     }))
 }
+
+/// Pure relationship observation. Endpoint validity and transport compatibility belong to
+/// other checks; the caller owns the deadline and generation-fenced publication.
+pub async fn evaluate_indexer_client(
+    db: &Database,
+    domain: MediaDomain,
+) -> Result<Option<CommunicationIssue>, &'static str> {
+    const MAX_SCOPED_PROVIDERS: i64 = 256;
+    let media = match domain {
+        MediaDomain::Tv => "tv",
+        MediaDomain::Movies => "movies",
+    };
+    let c = db.connect().await.map_err(|_| "storage_error")?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::ReadOnly)
+        .await
+        .map_err(|_| "storage_error")?;
+    // No enabled filter: corrupt enable values must not disappear from evaluation.
+    // Validate storage types in SQL because libsql's integer getter permits coercion.
+    // Truncate before materializing strings so damaged storage cannot allocate unbounded data.
+    let mut rows = tx.query(
+        "SELECT substr(s.provider_id,1,37), substr(p.name,1,129), substr(p.implementation,1,16),
+         p.enabled, substr(s.download_client_id,1,37),
+         CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
+          AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
+          AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','qbittorrent')
+          AND typeof(p.settings_version)='integer' AND p.settings_version=1
+          AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
+          AND typeof(s.implementation)='text' AND s.implementation=p.implementation
+          AND (s.download_client_id IS NULL OR (typeof(s.download_client_id)='text'
+           AND length(CAST(s.download_client_id AS BLOB))=36 AND instr(s.download_client_id,char(0))=0))
+         THEN 1 ELSE 0 END,
+         t.id IS NOT NULL,
+         CASE WHEN t.implementation='qbittorrent' AND typeof(t.implementation)='text'
+          AND typeof(t.settings_version)='integer' AND t.settings_version=1
+          AND typeof(t.enabled)='integer' AND t.enabled IN (0,1)
+         THEN 1 ELSE 0 END,
+         t.enabled, ts.provider_id IS NOT NULL,
+         CASE WHEN ts.provider_id IS NULL OR (typeof(ts.implementation)='text' AND ts.implementation=t.implementation) THEN 1 ELSE 0 END
+         FROM provider_scopes s LEFT JOIN providers p ON p.id=s.provider_id
+         LEFT JOIN providers t ON t.id=s.download_client_id
+         LEFT JOIN provider_scopes ts ON ts.provider_id=t.id AND ts.media_type=s.media_type
+         WHERE s.media_type=? ORDER BY s.provider_id LIMIT ?",
+        libsql::params![media, MAX_SCOPED_PROVIDERS + 1],
+    ).await.map_err(|_| "storage_error")?;
+    let mut first = None;
+    let mut broken = 0usize;
+    let mut count = 0;
+    while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
+        count += 1;
+        if count > MAX_SCOPED_PROVIDERS || row.get::<i64>(5).map_err(|_| "check_failed")? != 1 {
+            return Err("check_failed");
+        }
+        let id = row.get::<String>(0).map_err(|_| "check_failed")?;
+        let name = row.get::<String>(1).map_err(|_| "check_failed")?;
+        let canonical_uuid = |s: &str| uuid::Uuid::parse_str(s).is_ok_and(|id| id.to_string() == s);
+        if !canonical_uuid(&id)
+            || name.trim().is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+        {
+            return Err("check_failed");
+        }
+        let implementation = row.get::<String>(2).map_err(|_| "check_failed")?;
+        let binding = row.get::<Option<String>>(4).map_err(|_| "check_failed")?;
+        if binding.as_deref().is_some_and(|id| !canonical_uuid(id))
+            || (implementation == "qbittorrent" && binding.is_some())
+        {
+            return Err("check_failed");
+        }
+        if implementation == "qbittorrent" || row.get::<i64>(3).map_err(|_| "check_failed")? == 0 {
+            continue;
+        }
+        if binding.is_none() {
+            continue;
+        }
+        let exists = row.get::<i64>(6).map_err(|_| "check_failed")? == 1;
+        if exists
+            && (row.get::<i64>(7).map_err(|_| "check_failed")? != 1
+                || row.get::<i64>(10).map_err(|_| "check_failed")? != 1)
+        {
+            return Err("check_failed");
+        }
+        if !exists
+            || row.get::<i64>(8).map_err(|_| "check_failed")? == 0
+            || row.get::<i64>(9).map_err(|_| "check_failed")? == 0
+        {
+            broken += 1;
+            if first.is_none() {
+                first = Some((name, id));
+            }
+        }
+    }
+    drop(rows);
+    tx.commit().await.map_err(|_| "storage_error")?;
+    Ok(first.map(|(name, id)| CommunicationIssue {
+        severity: crate::health::HealthSeverity::Warning,
+        reason: "IndexerDownloadClient",
+        message: format!("{broken} indexer(s) reference a missing, disabled or unscoped download client. Review indexer {name} ({id}) and its download client setting."),
+        wiki_url: match domain {
+            MediaDomain::Tv => "https://wiki.servarr.com/sonarr/system#invalid-indexer-download-client-setting",
+            MediaDomain::Movies => "https://wiki.servarr.com/radarr/system#invalid-indexer-download-client-setting",
+        },
+        compatibility_type: "IndexerDownloadClientCheck",
+    }))
+}

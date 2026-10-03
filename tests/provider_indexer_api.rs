@@ -511,3 +511,361 @@ async fn scoped_operation_policy_precedes_http_and_survives_toggle_and_reopen() 
     let _ = peer.await;
     Ok(())
 }
+
+fn editable(provider: &Value) -> Value {
+    json!({"name":provider["name"],"enabled":provider["enabled"],"priority":provider["priority"],"revision":provider["revision"],"settings":provider["settings"]})
+}
+async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
+    let mut rows = c
+        .query(
+            "SELECT scope,check_key,generation FROM health_checks ORDER BY scope,check_key",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut values = vec![];
+    while let Some(row) = rows.next().await.unwrap() {
+        values.push((
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        ));
+    }
+    values
+}
+// Reasoning: the registry holds seven identities per domain (CDH, communication, root folder, removed
+// metadata, indexer search/RSS from 0048 and the 0049 binding check). Every one is compared so an
+// unexpected marker on a sibling check fails; the helpers below name the intended marker sets.
+const IDENTITIES: [(&str, &str); 14] = [
+    ("movies", "completed_download_handling"),
+    ("movies", "download_client_communication"),
+    ("movies", "download_client_root_folder"),
+    ("movies", "indexer_download_client"),
+    ("movies", "indexer_rss"),
+    ("movies", "indexer_search"),
+    ("movies", "removed_metadata"),
+    ("tv", "completed_download_handling"),
+    ("tv", "download_client_communication"),
+    ("tv", "download_client_root_folder"),
+    ("tv", "indexer_download_client"),
+    ("tv", "indexer_rss"),
+    ("tv", "indexer_search"),
+    ("tv", "removed_metadata"),
+];
+/// Indexer edits invalidate capability and binding checks for their domain.
+fn indexer_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+    domains
+        .iter()
+        .flat_map(|d| {
+            [
+                (*d, "indexer_download_client"),
+                (*d, "indexer_rss"),
+                (*d, "indexer_search"),
+            ]
+        })
+        .collect()
+}
+/// Client edits invalidate the client checks for their domain.
+fn client_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+    domains
+        .iter()
+        .flat_map(|d| {
+            [
+                (*d, "completed_download_handling"),
+                (*d, "download_client_communication"),
+                (*d, "download_client_root_folder"),
+            ]
+        })
+        .collect()
+}
+fn marked(
+    before: &[(String, String, i64)],
+    after: &[(String, String, i64)],
+    keys: &[(&str, &str)],
+) {
+    assert_eq!(
+        before.len(),
+        IDENTITIES.len(),
+        "All native health identities must be compared"
+    );
+    assert_eq!(after.len(), before.len());
+    assert_eq!(
+        before
+            .iter()
+            .map(|(scope, key, _)| (scope.as_str(), key.as_str()))
+            .collect::<Vec<_>>(),
+        IDENTITIES.to_vec()
+    );
+    for ((scope, key, old), (new_scope, new_key, new)) in before.iter().zip(after) {
+        assert_eq!((scope, key), (new_scope, new_key));
+        assert_eq!(
+            *new,
+            old + i64::from(keys.contains(&(scope.as_str(), key.as_str()))),
+            "{scope}/{key}"
+        );
+    }
+}
+#[tokio::test]
+async fn client_preferences_are_scoped_validated_retained_and_marked_atomically()
+-> Result<(), Error> {
+    let scratch = Sandbox::new();
+    let db_path = scratch.0.join("bindings.db");
+    let db = Arc::new(Database::open_local(&db_path).await?);
+    let c = db.connect().await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(db.clone(), None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client_config = |name, movies| json!({"name":name,"enabled":false,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":"http://example.invalid","tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":if movies {json!({"category":"movies","imported_category":null,"recent_priority":0,"older_priority":0})} else {Value::Null}}});
+    let (status, tv_client) = request(
+        address,
+        "POST",
+        "/api/v1/providers",
+        &client_config("TV", false).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{tv_client}");
+    let (status, both_client) = request(
+        address,
+        "POST",
+        "/api/v1/providers",
+        &client_config("Both", true).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{both_client}");
+    let mut config = json!({"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"torznab","endpoint":"http://example.invalid/api","tv":{"categories":[5030],"anime_categories":[],"download_client_id":tv_client["id"]},"movies":{"categories":[2000],"download_client_id":both_client["id"]}}});
+    let mut unbound = config.clone();
+    unbound["name"] = "Newznab".into();
+    unbound["settings"]["implementation"] = "newznab".into();
+    for domain in ["tv", "movies"] {
+        unbound["settings"][domain]
+            .as_object_mut()
+            .unwrap()
+            .remove("download_client_id");
+    }
+    let (status, newznab) =
+        request(address, "POST", "/api/v1/providers", &unbound.to_string()).await;
+    assert_eq!(status, 201, "{newznab}");
+    for domain in ["tv", "movies"] {
+        assert_eq!(
+            newznab["settings"][domain].get("download_client_id"),
+            Some(&Value::Null)
+        );
+    }
+    let newznab_path = format!("/api/v1/providers/{}", newznab["id"].as_str().unwrap());
+    let mut bound = editable(&newznab);
+    bound["settings"]["tv"]["download_client_id"] = tv_client["id"].clone();
+    bound["settings"]["movies"]["download_client_id"] = both_client["id"].clone();
+    let (status, newznab) = request(address, "PUT", &newznab_path, &bound.to_string()).await;
+    assert_eq!(
+        status, 200,
+        "Usenet-to-torrent mismatch is a dispatch check, not erased configuration: {newznab}"
+    );
+    assert_eq!(newznab["settings"], bound["settings"]);
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &format!("{newznab_path}?revision={}", newznab["revision"]),
+            ""
+        )
+        .await
+        .0,
+        204
+    );
+    let before = generations(&c).await;
+    let (status, mut indexer) =
+        request(address, "POST", "/api/v1/providers", &config.to_string()).await;
+    assert_eq!(
+        status, 201,
+        "Disabled existing clients are valid preferences: {indexer}"
+    );
+    marked(
+        &before,
+        &generations(&c).await,
+        &indexer_keys(&["tv", "movies"]),
+    );
+    let indexer_path = format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap());
+    let both_path = format!("/api/v1/providers/{}", both_client["id"].as_str().unwrap());
+    // Type/existence/domain checks are atomic; wrong transport is a later dispatch rule.
+    for (domain, invalid) in [
+        ("tv", json!(uuid::Uuid::new_v4())),
+        ("tv", indexer["id"].clone()),
+        ("movies", tv_client["id"].clone()),
+        ("tv", json!("malformed")),
+    ] {
+        let before = generations(&c).await;
+        let mut bad = editable(&indexer);
+        bad["settings"][domain]["download_client_id"] = invalid;
+        assert_eq!(
+            request(address, "PUT", &indexer_path, &bad.to_string())
+                .await
+                .0,
+            400
+        );
+        assert_eq!(generations(&c).await, before);
+        assert_eq!(
+            request(address, "GET", &indexer_path, "").await.1["revision"],
+            indexer["revision"]
+        );
+    }
+    for enabled in [false, true] {
+        let mut update = editable(&indexer);
+        update["enabled"] = enabled.into();
+        let (status, saved) = request(address, "PUT", &indexer_path, &update.to_string()).await;
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["settings"], indexer["settings"]);
+        indexer = saved;
+    }
+    config["name"] = "Peer".into();
+    let (status, peer) = request(address, "POST", "/api/v1/providers", &config.to_string()).await;
+    assert_eq!(status, 201, "{peer}");
+    // Removing the client's movie scope invalidates all referencing indexers once, without erasing preferences.
+    let mut update = editable(&both_client);
+    update["settings"]["movies"] = Value::Null;
+    let before = generations(&c).await;
+    let (status, both_client) = request(address, "PUT", &both_path, &update.to_string()).await;
+    assert_eq!(status, 200, "{both_client}");
+    marked(
+        &before,
+        &generations(&c).await,
+        // Reasoning: the client change marks its own client checks in both domains it served, plus only
+        // the binding check of the domain where an indexer references it (movies).
+        &[
+            client_keys(&["tv", "movies"]),
+            vec![("movies", "indexer_download_client")],
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        request(address, "GET", &indexer_path, "").await.1["settings"]["movies"]["download_client_id"],
+        both_client["id"]
+    );
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            &indexer_path,
+            &editable(&indexer).to_string()
+        )
+        .await
+        .0,
+        400
+    );
+    let before = generations(&c).await;
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &format!("{both_path}?revision={}", both_client["revision"]),
+            ""
+        )
+        .await
+        .0,
+        204
+    );
+    // The deleted client had only TV left; reverse references still require the movies marker.
+    marked(
+        &before,
+        &generations(&c).await,
+        // Reasoning: the client had only TV left (client checks for tv), yet the movies reference to it still
+        // exists, so the binding check in movies is marked once.
+        &[
+            client_keys(&["tv"]),
+            vec![("movies", "indexer_download_client")],
+        ]
+        .concat(),
+    );
+    let selection = json!({"media_type":"tv","kind":"indexer","items":[{"id":indexer["id"],"revision":indexer["revision"]},{"id":peer["id"],"revision":peer["revision"]}]});
+    let mut bulk = selection.clone();
+    bulk["changes"] = json!({"enabled":false});
+    let before = generations(&c).await;
+    let (status, disabled) =
+        request(address, "PUT", "/api/v1/providers/bulk", &bulk.to_string()).await;
+    assert_eq!(
+        status, 200,
+        "Bulk disable repairs operational enable without clearing a broken reference: {disabled}"
+    );
+    marked(
+        &before,
+        &generations(&c).await,
+        &indexer_keys(&["tv", "movies"]),
+    );
+    indexer = disabled["items"][0].clone();
+    assert_eq!(
+        indexer["settings"]["movies"]["download_client_id"],
+        both_client["id"]
+    );
+    let broken_peer = disabled["items"][1].clone();
+    let before = generations(&c).await;
+    let delete = json!({"media_type":"tv","kind":"indexer","items":[{"id":broken_peer["id"],"revision":broken_peer["revision"]}]});
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            "/api/v1/providers/bulk",
+            &delete.to_string()
+        )
+        .await
+        .0,
+        204
+    );
+    marked(
+        &before,
+        &generations(&c).await,
+        &indexer_keys(&["tv", "movies"]),
+    );
+    let mut repair = editable(&indexer);
+    repair["settings"]["movies"]["download_client_id"] = Value::Null;
+    let (status, repaired) = request(address, "PUT", &indexer_path, &repair.to_string()).await;
+    assert_eq!(status, 200, "{repaired}");
+    let (_, defaults) = request(
+        address,
+        "GET",
+        "/api/v1/providers/schema?kind=indexer&media_type=tv",
+        "",
+    )
+    .await;
+    assert!(defaults["templates"][0]["defaults"]["tv"]["download_client_id"].is_null());
+    // Marker exhaustion must roll back binding and revision changes, not leave stale health authority.
+    c.execute(
+        "DELETE FROM health_checks WHERE scope='tv' AND check_key='indexer_download_client'",
+        (),
+    )
+    .await?;
+    c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES('tv','indexer_download_client',1,1,9007199254740991,'IndexerDownloadClientCheck')",()).await?;
+    let mut repair = editable(&repaired);
+    repair["settings"]["tv"]["download_client_id"] = Value::Null;
+    let before = generations(&c).await;
+    assert_eq!(
+        request(address, "PUT", &indexer_path, &repair.to_string())
+            .await
+            .0,
+        409
+    );
+    assert_eq!(generations(&c).await, before);
+    assert_eq!(
+        request(address, "GET", &indexer_path, "").await.1["settings"],
+        repaired["settings"]
+    );
+    server.abort();
+    let _ = server.await;
+    drop(c);
+    drop(db);
+    let reopened = Arc::new(Database::open_local(&db_path).await?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(reopened, None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    assert_eq!(
+        request(address, "GET", &indexer_path, "").await.1["settings"],
+        repaired["settings"]
+    );
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}

@@ -331,6 +331,9 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
         ] {
             expected_settings[media][operation] = json!(true);
         }
+        // Reasoning: the 0049 DTO field download_client_id is always serialized; an old request body that
+        // omitted it reads back as an explicit null (no preference), never an inferred client.
+        expected_settings[media]["download_client_id"] = serde_json::Value::Null;
         assert_eq!(read["settings"], expected_settings);
         assert_eq!(read["has_credentials"], false);
         let mut update = body.clone();

@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -134,6 +134,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             // so every predecessor scope row is preserved byte-for-byte plus exactly three Integer(1) values.
             for row in &mut expected {
                 row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
+                // Reasoning: 0049 then appends the NULL download_client_id preference column.
+                row.push(libsql::Value::Null);
             }
         }
         assert_eq!(&rows(&c, table).await?, &expected);
@@ -182,7 +184,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -226,10 +228,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Migration46 adds a fourth TV identity; every admission retains generation1. 0048 adds tv indexer_search/indexer_rss so six TV identities (was four); Reasoning: registry growth, intent unchanged.
+    // Migration46 adds a fourth TV identity; every admission retains generation1. 0048 adds tv indexer_search/indexer_rss and 0049 indexer_download_client so seven TV identities (was six); Reasoning: registry growth, intent unchanged.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        6
+        7
     );
     assert_eq!(
         scalar(
@@ -237,7 +239,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        6, // Reasoning: migration46 added a fourth and 0048 a fifth/sixth scoped TV identity; admission generation stays fixed.
+        7, // Reasoning: migration46 added a fourth, 0048 a fifth/sixth and 0049 a seventh scoped TV identity; admission generation stays fixed.
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -400,7 +402,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        6 // Reasoning: migration46 added a fourth and 0048 a fifth/sixth movie check; publication still covers the full scope.
+        7 // Reasoning: migration46 added a fourth, 0048 a fifth/sixth and 0049 a seventh movie check; publication still covers the full scope.
     );
     assert!(
         c.execute(
@@ -411,8 +413,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Reasoning: 0048 raises the registry to twelve identities, leaving 116 slots within the unchanged 128 ceiling.
-    for i in 0..116 {
+    // Reasoning: 0049 raises the registry to fourteen identities, leaving 114 slots within the unchanged 128 ceiling.
+    for i in 0..114 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -431,7 +433,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        768 // Reasoning: 0048 gives six TV identities per admitted command (was four): 128 retained commands * 6.
+        896 // Reasoning: 0049 gives seven TV identities per admitted command (was six): 128 retained commands * 7.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -614,7 +616,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -699,10 +701,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 48); // Reasoning: latest migration is now 0048 indexer operation policy (was 47: movie credits); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 12); // Migration46 adds removed metadata; historical42 checks stay2; 0048 adds four indexer identities (registry 8 -> 12).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Migration46 adds removed metadata; historical42 checks stay2; 0048 adds four indexer identities (8 -> 12); 0049 adds two indexer_download_client identities (12 -> 14).
     }
     Ok(())
 }

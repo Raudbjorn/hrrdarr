@@ -491,6 +491,18 @@ async fn evaluate(
     match member.identity.check_key.as_str() {
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
+        "indexer_download_client" => {
+            Ok(crate::health_detectors::evaluate_indexer_client(db, domain)
+                .await?
+                .map(|v| HealthIssue {
+                    identity: member.identity.clone(),
+                    severity: v.severity,
+                    reason: v.reason.into(),
+                    message: v.message,
+                    wiki_url: v.wiki_url.into(),
+                    compatibility_type: v.compatibility_type.into(),
+                }))
+        }
         "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
             db, client, domain,
         )

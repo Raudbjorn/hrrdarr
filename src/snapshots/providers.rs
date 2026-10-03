@@ -13,6 +13,7 @@ pub(super) struct ProviderRecord {
     table: &'static str,
     id: i64,
     input: ProviderInput,
+    download_client_source_id: Option<i64>,
 }
 const INVALID: ImportError = ImportError("invalid source provider settings");
 fn string<'a>(settings: &'a Map<String, Json>, key: &str) -> Result<Option<&'a str>> {
@@ -170,6 +171,26 @@ pub(super) fn read(
             let settings: Json =
                 serde_json::from_str(text(row, "Settings")?).map_err(|_| INVALID)?;
             let settings = settings.as_object().ok_or(INVALID)?;
+            let download_client_source_id = if table_name == "Indexers" {
+                match row.get("DownloadClientId") {
+                    // Source sentinel zero means no preference; it is absence, not an identity.
+                    Some(Value::Integer(0)) => None,
+                    Some(Value::Integer(id)) if *id > 0 => Some(*id),
+                    None => {
+                        unsupported.push(Unsupported {
+                            table: table_name.into(),
+                            rows: 1,
+                            columns: vec![
+                                "DownloadClientId (absent; source association unknown)".into(),
+                            ],
+                        });
+                        None
+                    }
+                    _ => return Err(INVALID),
+                }
+            } else {
+                None
+            };
             let mut used = vec!["apiKey"];
             let (config, credentials) = if table_name == "Indexers" {
                 let [
@@ -198,6 +219,7 @@ pub(super) fn read(
                     used.extend(["animeCategories", "animeStandardFormatSearch"]);
                     (
                         Some(TvIndexerScope {
+                            download_client_id: None,
                             enable_rss,
                             enable_automatic_search,
                             enable_interactive_search,
@@ -215,6 +237,7 @@ pub(super) fn read(
                     (
                         None,
                         Some(MovieIndexerScope {
+                            download_client_id: None,
                             enable_rss,
                             enable_automatic_search,
                             enable_interactive_search,
@@ -389,7 +412,10 @@ pub(super) fn read(
                     !(table_name == "Indexers"
                         && matches!(
                             c.as_str(),
-                            "EnableRss" | "EnableAutomaticSearch" | "EnableInteractiveSearch"
+                            "EnableRss"
+                                | "EnableAutomaticSearch"
+                                | "EnableInteractiveSearch"
+                                | "DownloadClientId"
                         ))
                         && !matches!(
                             c.as_str(),
@@ -415,6 +441,7 @@ pub(super) fn read(
             output.push(ProviderRecord {
                 table: table_name,
                 id,
+                download_client_source_id,
                 input: ProviderInput {
                     name: text(row, "Name")?.into(),
                     enabled: false,
@@ -433,12 +460,43 @@ pub(super) async fn write(
     key: Option<&CredentialKey>,
     report: &mut Report,
 ) -> Result<()> {
-    for record in records {
+    let mut changes = crate::providers::HealthConfigurationChanges::default();
+    let mut reconciled_clients = std::collections::BTreeSet::new();
+    // The source iterator places indexers first; resolve client mappings before executable indexers.
+    for record in records
+        .iter()
+        .filter(|r| r.table == "DownloadClients")
+        .chain(records.iter().filter(|r| r.table == "Indexers"))
+    {
+        let download_client_id = if let Some(source_id) = record.download_client_source_id {
+            let mapped = if reconciled_clients.contains(&source_id) {
+                conn.query("SELECT m.provider_id FROM snapshot_provider_mappings m JOIN providers p ON p.id=m.provider_id JOIN provider_scopes s ON s.provider_id=p.id WHERE m.application=? AND m.fingerprint=? AND m.source_table='DownloadClients' AND m.source_id=? AND p.implementation='qbittorrent' AND s.media_type=?", params![report.application.name(),report.fingerprint.clone(),source_id,if matches!(report.application, Application::Sonarr) { "tv" } else { "movies" }]).await?.next().await?
+            } else {
+                None
+            };
+            let Some(mapped) = mapped else {
+                // Never turn an explicit but unresolved source preference into an unbound executable indexer.
+                report.unsupported.push(Unsupported {
+                    table: "Indexers".into(),
+                    rows: 1,
+                    columns: vec!["DownloadClientId (unmapped; indexer not reconstructed)".into()],
+                });
+                continue;
+            };
+            let id = mapped.get::<String>(0)?;
+            // The mapped row must be fully released before another statement uses the connection.
+            drop(mapped);
+            Some(uuid::Uuid::parse_str(&id).map_err(|_| INVALID)?)
+        } else {
+            None
+        };
         let mapped=conn.query("SELECT provider_id,provider_revision FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table=? AND source_id=?",params![report.application.name(),report.fingerprint.clone(),record.table,record.id]).await?.next().await?.map(|r|->Result<(String,i64)>{Ok((r.get(0)?,r.get(1)?))}).transpose()?;
         let outcome = crate::providers::import_configuration(
             conn,
             key,
             &record.input,
+            download_client_id,
+            &mut changes,
             mapped
                 .as_ref()
                 .map(|(id, revision)| (id.as_str(), *revision)),
@@ -452,11 +510,14 @@ pub(super) async fn write(
                 report.duplicates += 1
             }
             conn.execute("INSERT INTO snapshot_provider_mappings(application,fingerprint,source_table,source_id,provider_id,provider_revision) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![report.application.name(),report.fingerprint.clone(),record.table,record.id,id,revision]).await?;
+            if record.table == "DownloadClients" {
+                reconciled_clients.insert(record.id);
+            }
         } else {
             report.conflicts += 1
         }
     }
-    Ok(())
+    changes.finish(conn).await.map_err(ImportError)
 }
 
 #[cfg(test)]
@@ -511,7 +572,9 @@ mod tests {
                     .iter()
                     .filter(|u| u.columns.iter().any(|c| c.contains("absent")))
                     .count(),
-                3
+                // Reasoning: three absent operation flags plus the absent DownloadClientId association column
+                // (0049) are each reported once per source indexer row; the fixture omits all four columns.
+                4
             );
             let table = snapshot.tables.get_mut("Indexers").unwrap();
             for (key, value) in [

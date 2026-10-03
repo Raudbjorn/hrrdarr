@@ -804,8 +804,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-            // Reasoning: 0048 adds four indexer checks to the two removed-metadata additions; startup must settle all twelve (was eight).
-            if current == 12 { break; }
+            // Reasoning: 0049 adds two indexer_download_client checks to 0048's four indexer checks and the two removed-metadata additions; startup must settle all fourteen (was twelve).
+            if current == 14 { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.unwrap();
@@ -1104,9 +1104,9 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-                    // Reasoning: all twelve checks (0048 adds the local-only indexer pair per domain) must settle
+                    // Reasoning: all fourteen checks (0048 adds the local-only indexer pair and 0049 the binding check per domain) must settle
                     // without changing the exact communication traffic assertion below.
-                    if current == 12 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
+                    if current == 14 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }).await.unwrap();
