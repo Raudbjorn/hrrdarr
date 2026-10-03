@@ -5,6 +5,9 @@ use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod feed;
+pub use feed::{FeedDomainTest, FeedTest};
+
 const XML_BYTES: usize = 1024 * 1024;
 const MAX_ITEMS: u32 = 500;
 const MAX_QUERY_TEXT_BYTES: usize = 8192;
@@ -332,6 +335,8 @@ pub(crate) struct RawIndexerPage {
     pub limit: u32,
     pub total: Option<u32>,
     pub next_offset: Option<u32>,
+    /// Generic feeds drop malformed items individually; native Torznab/Newznab pages do not.
+    pub tolerates_item_warnings: bool,
 }
 pub struct ReleasePage {
     pub warnings: Vec<IndexerItemWarning>,
@@ -342,8 +347,83 @@ pub struct ReleasePage {
     pub next_offset: Option<u32>,
 }
 
+/// Maximum element nesting accepted from a remote document. Real Torznab/RSS responses nest
+/// fewer than ten levels; the XML parser recurses per level, so unbounded depth inside the node
+/// cap could exhaust a worker thread's stack and abort the process.
+const XML_DEPTH: usize = 32;
+/// Linear pre-scan that never builds a tree. Ambiguous input counts as nesting, so a document
+/// this accepts cannot be deeper than the parser sees it; the parser still rejects bad syntax.
+fn depth_within(input: &str, max: usize) -> bool {
+    let bytes = input.as_bytes();
+    let find = |from: usize, needle: &[u8]| {
+        bytes
+            .get(from..)
+            .and_then(|rest| rest.windows(needle.len()).position(|w| w == needle))
+            .map(|at| from + at)
+    };
+    let (mut index, mut depth) = (0usize, 0usize);
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+        let rest = &bytes[index..];
+        let skip = if rest.starts_with(b"<!--") {
+            find(index + 4, b"-->").map(|at| at + 3)
+        } else if rest.starts_with(b"<![CDATA[") {
+            find(index + 9, b"]]>").map(|at| at + 3)
+        } else if rest.starts_with(b"<?") {
+            find(index + 2, b"?>").map(|at| at + 2)
+        } else if rest.starts_with(b"<!") {
+            find(index + 2, b">").map(|at| at + 1)
+        } else {
+            None
+        };
+        if rest.starts_with(b"<!") || rest.starts_with(b"<?") {
+            // Unterminated markup is for the parser to reject.
+            match skip {
+                Some(next) => {
+                    index = next;
+                    continue;
+                }
+                None => return true,
+            }
+        }
+        let closing = rest.starts_with(b"</");
+        let mut quote = None;
+        let mut end = index + 1;
+        let mut previous = b'<';
+        while end < bytes.len() {
+            let byte = bytes[end];
+            match quote {
+                Some(q) if byte == q => quote = None,
+                Some(_) => {}
+                None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                None if byte == b'>' => break,
+                None => {}
+            }
+            if quote.is_none() && !byte.is_ascii_whitespace() && byte != b'>' {
+                previous = byte;
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            return true;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else if previous != b'/' {
+            depth += 1;
+            if depth > max {
+                return false;
+            }
+        }
+        index = end + 1;
+    }
+    true
+}
 fn xml(input: &str) -> Result<Document<'_>> {
-    if input.len() > XML_BYTES {
+    if input.len() > XML_BYTES || !depth_within(input, XML_DEPTH) {
         return Err(IndexerError::InvalidResponse);
     }
     let doc = Document::parse_with_options(
@@ -1886,7 +1966,7 @@ async fn fetch(
     }
     let bytes = operation.get(endpoint, &params).await?;
     let body = String::from_utf8(bytes).map_err(|_| IndexerError::InvalidResponse)?;
-    if api_key.is_none() {
+    if api_key.is_none() && body.len() <= XML_BYTES && depth_within(&body, XML_DEPTH) {
         if let Ok(doc) = Document::parse_with_options(
             &body,
             ParsingOptions {
@@ -1950,6 +2030,7 @@ fn private_parameters(
     parameters.extend(private.iter().map(|p| (p.name.clone(), p.value.clone())));
     parameters
 }
+pub use feed::test as test_feed;
 pub async fn test(
     operation: &super::http::HttpOperation<'_>,
     settings: &ProviderSettings,
@@ -2006,6 +2087,9 @@ pub(crate) async fn raw_search(
     access: &IndexerAccess<'_>,
     request: &IndexerSearch,
 ) -> Result<RawIndexerPage> {
+    if matches!(settings, ProviderSettings::Torrentrss { .. }) {
+        return raw_feed(operation, settings, access, request).await;
+    }
     if !access.validate() {
         return Err(IndexerError::InvalidRequest);
     }
@@ -2053,29 +2137,9 @@ pub(crate) async fn raw_search(
         None
     };
     let mut page = page;
-    // Raw locators remain private, but metadata may later appear in decision receipts.
-    for secret in access
-        .api_key
-        .into_iter()
-        .chain(
-            access
-                .tv_parameters
-                .iter()
-                .chain(access.movie_parameters)
-                .map(|p| p.value.as_str()),
-        )
-        .filter(|v| !v.is_empty())
-    {
-        for item in &mut page.items {
-            if let Some(title) = &mut item.metadata.title {
-                *title = title.replace(secret, "[redacted]");
-            }
-            for language in &mut item.metadata.languages {
-                *language = language.replace(secret, "[redacted]");
-            }
-        }
-    }
+    redact_secrets(&mut page.items, access);
     Ok(RawIndexerPage {
+        tolerates_item_warnings: false,
         warnings: page.warnings,
         query_index: selected as u32,
         query_count: plans.len() as u32,
@@ -2086,6 +2150,76 @@ pub(crate) async fn raw_search(
         limit: page.limit,
         total: page.total,
         next_offset: page.next_offset,
+    })
+}
+
+/// Raw locators remain private, but metadata may later appear in decision receipts.
+fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
+    for secret in access
+        .api_key
+        .into_iter()
+        .chain(access.cookie)
+        .chain(
+            access
+                .tv_parameters
+                .iter()
+                .chain(access.movie_parameters)
+                .map(|p| p.value.as_str()),
+        )
+        .filter(|v| !v.is_empty())
+    {
+        for item in items.iter_mut() {
+            if let Some(title) = &mut item.metadata.title {
+                *title = title.replace(secret, "[redacted]");
+            }
+            for language in &mut item.metadata.languages {
+                *language = language.replace(secret, "[redacted]");
+            }
+        }
+    }
+}
+/// A generic feed answers only RSS: one document, paged locally by `offset`/`limit`.
+async fn raw_feed(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+    request: &IndexerSearch,
+) -> Result<RawIndexerPage> {
+    let IndexerSearch::Rss {
+        media_type,
+        offset,
+        query_index,
+        limit,
+    } = request
+    else {
+        return Err(IndexerError::Unsupported);
+    };
+    if *limit == 0 || *limit > MAX_ITEMS || *query_index != 0 {
+        return Err(IndexerError::InvalidRequest);
+    }
+    let fetched = feed::fetch(operation, settings, access, *media_type).await?;
+    let warnings = fetched.feed.warnings;
+    let mut items = fetched.feed.items;
+    let total = items.len() as u32;
+    let start = (*offset).min(total);
+    let end = start.saturating_add(*limit).min(total);
+    items = items.drain(start as usize..end as usize).collect();
+    redact_secrets(&mut items, access);
+    Ok(RawIndexerPage {
+        tolerates_item_warnings: true,
+        warnings: if start == 0 { warnings } else { Vec::new() },
+        query_index: 0,
+        query_count: 1,
+        next_query: (end < total).then_some(IndexerContinuation {
+            query_index: 0,
+            offset: end,
+        }),
+        media_type: *media_type,
+        items,
+        offset: start,
+        limit: *limit,
+        total: Some(total),
+        next_offset: (end < total).then_some(end),
     })
 }
 

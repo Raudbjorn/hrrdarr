@@ -488,7 +488,7 @@ async fn validate_references(c: &Connection, m: MediaDomain, v: &Definition) -> 
     }
     for reference in &v.indexers {
         if let IndexerReference::Provider { id } = reference {
-            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
+            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab','torrentrss')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
         }
     }
     Ok(())

@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        49 // Reasoning: latest migration is now 0049 indexer client binding; 0047 movie credits remains verified by the version=47 row below.
+        50 // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -216,9 +216,12 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     // Upgrade from 0046: drop the 0047 objects and history row, then reopen through the real runner.
     // Reasoning: 0048 now sits above 0047, so a faithful 0046 state must also undo 0048 (its three provider_scopes
     // columns, four indexer health rows and history row) and 0049 (its download_client_id column, two
-    // indexer_download_client health rows and history row); otherwise max(version) stays 49 and the runner
+    // indexer_download_client health rows and history row) and 0050 (its minimum_seeders column and history row; the widened
+    // CHECK/trigger edits are idempotent on rerun; the two scope-option triggers 0050 rewrote now name the
+    // enable_* columns, so SQLite refuses to drop those columns until the triggers are dropped, which 0050's
+    // DROP TRIGGER IF EXISTS tolerates); otherwise max(version) stays 50 and the runner
     // would re-run ALTER ADD COLUMN against columns that already exist.
-    c.execute_batch("DROP TABLE movie_credits; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); DELETE FROM schema_migrations WHERE version IN (47,48,49);")
+    c.execute_batch("DROP TABLE movie_credits; DROP TRIGGER provider_scope_options_insert; DROP TRIGGER provider_scope_options_update; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); ALTER TABLE provider_scopes DROP COLUMN minimum_seeders; DELETE FROM schema_migrations WHERE version IN (47,48,49,50);")
         .await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
@@ -234,7 +237,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        49 // Reasoning: latest migration is now 0049 indexer client binding (was 47 before 0048/0049).
+        50 // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

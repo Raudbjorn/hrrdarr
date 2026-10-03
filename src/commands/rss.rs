@@ -140,7 +140,7 @@ pub(super) async fn valid_target(
         IndexerOperation::Automatic => "enable_automatic_search",
         IndexerOperation::Interactive => "enable_interactive_search",
     };
-    Ok(c.query(&format!("SELECT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?) AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.client_id.to_string(),t.client_revision,domain(t.media_type)]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1)
+    Ok(c.query(&format!("SELECT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss') AND s.media_type=?) AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.client_id.to_string(),t.client_revision,domain(t.media_type)]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?==1)
 }
 pub(super) fn router(db: Arc<Database>) -> Router {
     Router::new()
@@ -408,7 +408,8 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
                 return Err(Error(StatusCode::BAD_GATEWAY, error.code));
             }
         };
-        if !page.warnings.is_empty() {
+        // Native Torznab/Newznab pages fail on any bad item; a generic feed drops bad items one by one.
+        if !page.warnings.is_empty() && !page.tolerates_item_warnings {
             return Err(Error(StatusCode::BAD_GATEWAY, "invalid_release"));
         }
         if releases.len() + page.items.len() > 1000 {
