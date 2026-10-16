@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { ApiPage, DownloadScope, Provider, ProviderImplementation, ProviderInput, ProviderSettings, ProviderTemplate, ProviderTestResult } from './api.generated';
-  import {matchesPendingProvider,type PendingProvider} from './provider-draft';
+  import {eligibleDownloadClient,indexerOptions,matchesPendingProvider,type PendingProvider} from './provider-draft';
   import type {SettingsWriteState} from './api';
   import {readDownloadHandling, listProviders, getProvider, getProviderSchema, createProvider, updateProvider, deleteProvider, testProvider } from './api';
   let {relatedWrite='idle',onwrite=()=>{},onchange=()=>{}}:{relatedWrite?:SettingsWriteState;onwrite?:(state:SettingsWriteState)=>void;onchange?:()=>void}=$props();
@@ -11,6 +11,7 @@
   let page: ApiPage<Provider> | null = $state(null), templates: ProviderTemplate[] = $state([]), selected: Provider | null = $state(null);
   let editing = $state(false), implementation: ProviderImplementation = $state('torznab'), name = $state(''), endpoint = $state(''), enabled = $state(true), priority = $state(1);
   let tv = $state(true), movies = $state(false), tvCategories = $state(''), animeCategories = $state(''), movieCategories = $state(''), tvCategory = $state(''), movieCategory = $state('');
+  let tvOptions=$state(indexerOptions(null)), movieOptions=$state(indexerOptions(null));
   let credentialAction = $state('preserve'), credentialKind = $state<'api_key' | 'username_password'>('api_key'), apiKey = $state(''), username = $state(''), password = $state('');
   let loading = $state(false), busy = $state(false), dirty = $state(false), confirmingDelete = $state(false), conflict = $state(false), uncertain = $state(false);
   let error = $state(''), notice = $state(''), testResult: ProviderTestResult | null = $state(null);
@@ -23,13 +24,15 @@
     if (item) {
       implementation = item.settings.implementation; name = item.name; endpoint = item.settings.endpoint; enabled = item.enabled; priority = item.priority; tv = !!item.settings.tv; movies = !!item.settings.movies;
       if (item.settings.implementation === 'qbittorrent') {tvCategory = item.settings.tv?.category ?? ''; movieCategory = item.settings.movies?.category ?? ''; tvCategories = ''; animeCategories = ''; movieCategories = '';}
-      else {tvCategories = item.settings.tv?.categories.join(', ') ?? ''; animeCategories = item.settings.tv?.anime_categories.join(', ') ?? ''; movieCategories = item.settings.movies?.categories.join(', ') ?? ''; tvCategory = ''; movieCategory = '';}
+      else {tvOptions=indexerOptions(item.settings.tv);movieOptions=indexerOptions(item.settings.movies);tvCategories = item.settings.tv?.categories.join(', ') ?? ''; animeCategories = item.settings.tv?.anime_categories.join(', ') ?? ''; movieCategories = item.settings.movies?.categories.join(', ') ?? ''; tvCategory = ''; movieCategory = '';}
     } else {name = ''; endpoint = ''; tv = true; movies = false; tvCategory = ''; movieCategory = ''; defaults();}
     credentialKind = implementation === 'qbittorrent' ? 'username_password' : 'api_key';
     dirty = !item;
   }
   function defaults() {
     const current = templates.find(item => item.implementation === implementation);
+    tvOptions=indexerOptions(current?.defaults.kind==='indexer'?current.defaults.tv:null);
+    movieOptions=indexerOptions(current?.defaults.kind==='indexer'?current.defaults.movies:null);
     enabled = current?.enabled ?? true; priority = current?.priority ?? 1;
     tvCategories = current?.defaults.kind === 'indexer' ? current.defaults.tv.categories.join(', ') : '';
     animeCategories = current?.defaults.kind === 'indexer' ? current.defaults.tv.anime_categories.join(', ') : '';
@@ -79,7 +82,7 @@
       const saved = selected && selected.settings.implementation !== 'qbittorrent' ? selected.settings : null;
       const defaults = template?.defaults.kind === 'indexer' ? template.defaults : null;
       if ((!saved?.tv && tv || !saved?.movies && movies) && !defaults) {error = 'Provider defaults are unavailable. Reload provider settings.'; return null;}
-      settings = {implementation, endpoint, tv:tv ? {...(saved?.tv ?? defaults!.tv), categories:tvIds!, anime_categories:animeIds!} : null, movies:movies ? {...(saved?.movies ?? defaults!.movies), categories:movieIds!} : null};
+      settings = {implementation, endpoint, tv:tv ? {...(saved?.tv ?? defaults!.tv), ...tvOptions, categories:tvIds!, anime_categories:animeIds!} : null, movies:movies ? {...(saved?.movies ?? defaults!.movies), ...movieOptions, categories:movieIds!} : null};
     }
     if (selected?.has_credentials && endpoint !== selected.settings.endpoint && credentialAction === 'preserve') {error = 'The endpoint changed. Explicitly replace or clear credentials before saving to another destination.'; return null;}
     return {name, enabled, priority, settings, ...(credentialAction === 'clear' ? {credentials:null} : credentialAction === 'replace' ? {credentials:implementation === 'qbittorrent' && credentialKind === 'username_password' ? {kind:'username_password' as const,username,password} : {kind:'api_key' as const,api_key:apiKey}} : {})};
@@ -158,10 +161,12 @@
           </fieldset>
           <fieldset disabled={locked || conflict}><legend>Media scopes</legend>
             <label class="check"><input type="checkbox" bind:checked={tv} />TV scope</label>
-            {#if tv}{#if implementation === 'qbittorrent'}<label>TV download category<input bind:value={tvCategory} required maxlength="64" /></label>{:else}<label>TV categories<input bind:value={tvCategories} placeholder="5000" /></label><label>Anime categories<input bind:value={animeCategories} placeholder="5070" /></label>{/if}{/if}
+            {#if tv}{#if implementation === 'qbittorrent'}<label>TV download category<input bind:value={tvCategory} required maxlength="64" /></label>{:else}<label>TV categories<input bind:value={tvCategories} placeholder="5000" /></label><label>Anime categories<input bind:value={animeCategories} placeholder="5070" /></label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_rss} />TV RSS</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_automatic_search} />TV automatic search</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_interactive_search} />TV interactive search</label>
+              <label>TV bound download client<select bind:value={tvOptions.download_client_id}><option value={null}>Any enabled TV client</option>{#if tvOptions.download_client_id&&!page?.items.some(p=>p.id===tvOptions.download_client_id&&eligibleDownloadClient(p,'tv'))}<option value={tvOptions.download_client_id}>Saved client {tvOptions.download_client_id} (unavailable on this page)</option>{/if}{#each page?.items.filter(p=>eligibleDownloadClient(p,'tv'))??[] as client(client.id)}<option value={client.id}>{client.name}</option>{/each}</select></label>{/if}{/if}
             <label class="check"><input type="checkbox" bind:checked={movies} />Movie scope</label>
-            {#if movies}{#if implementation === 'qbittorrent'}<label>Movie download category<input bind:value={movieCategory} required maxlength="64" /></label>{:else}<label>Movie categories<input bind:value={movieCategories} required placeholder="2000" /></label>{/if}{/if}
-            <p>{implementation === 'qbittorrent' ? 'Use distinct, non-overlapping categories for TV and movies. Existing imported categories, priorities and download options are preserved.' : 'Enter the numeric category IDs advertised by your indexer, separated by commas. Existing search options are preserved.'} Disabling a scope removes its saved settings.</p>
+            {#if movies}{#if implementation === 'qbittorrent'}<label>Movie download category<input bind:value={movieCategory} required maxlength="64" /></label>{:else}<label>Movie categories<input bind:value={movieCategories} required placeholder="2000" /></label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_rss} />Movie RSS</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_automatic_search} />Movie automatic search</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_interactive_search} />Movie interactive search</label>
+              <label>Movie bound download client<select bind:value={movieOptions.download_client_id}><option value={null}>Any enabled Movie client</option>{#if movieOptions.download_client_id&&!page?.items.some(p=>p.id===movieOptions.download_client_id&&eligibleDownloadClient(p,'movies'))}<option value={movieOptions.download_client_id}>Saved client {movieOptions.download_client_id} (unavailable on this page)</option>{/if}{#each page?.items.filter(p=>eligibleDownloadClient(p,'movies'))??[] as client(client.id)}<option value={client.id}>{client.name}</option>{/each}</select></label>{/if}{/if}
+            <p>{implementation === 'qbittorrent' ? 'Use distinct, non-overlapping categories for TV and movies. Existing imported categories, priorities and download options are preserved.' : 'Enter the numeric category IDs advertised by your indexer, separated by commas. Use provider-list pages to browse client choices. A saved client binding is preserved even when unavailable; new requests require that client to be enabled for this scope. Other search options are preserved.'} Disabling a scope removes its saved settings.</p>
           </fieldset>
           <fieldset disabled={locked || conflict}><legend>Credentials</legend>
             <label>Credential action<select bind:value={credentialAction} onchange={clearSecrets}><option value="preserve">{selected ? 'Preserve stored credentials' : 'No credentials'}</option><option value="replace">Replace entire credential bundle</option><option value="clear">Clear entire credential bundle</option></select></label>

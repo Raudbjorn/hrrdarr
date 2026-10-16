@@ -261,6 +261,16 @@ async fn providers(base: &str, remote: &str) -> (Value, Value) {
     }
     (values.remove(0), values.remove(0))
 }
+async fn bind_client(base: &str, indexer: &Value, media: &str, client: &Value) -> Value {
+    let mut settings = indexer["settings"].clone();
+    settings[media]["download_client_id"] = client["id"].clone();
+    let (code, updated) = request(
+        base, "PUT", &format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap()),
+        json!({"revision":indexer["revision"],"name":"bound indexer","enabled":true,"priority":1,"settings":settings}),
+    ).await;
+    assert_eq!(code, 200, "{updated}");
+    updated
+}
 fn input(indexer: &Value, client: &Value, tv: bool, mode: &str) -> Value {
     json!({"request_id":uuid::Uuid::new_v4(),"mode":mode,"target":{"media_type":if tv {"episode"}else{"movie"},"id":1},"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":client["id"],"client_revision":client["revision"],"priority":"normal"})
 }
@@ -899,6 +909,8 @@ async fn interrupted_selected_submission_reopens_and_only_reconciles() {
         let receipt = page["items"][0].clone();
         assert_eq!(receipt["status"], "submitting");
         // A policy change cannot erase an already uncertain send or authorize a resend.
+        let (_, other) = providers(&base, &remote_base).await;
+        let indexer = bind_client(&base, &indexer, if tv { "tv" } else { "movies" }, &other).await;
         policy_flags(
             &base,
             &indexer,
@@ -1460,6 +1472,7 @@ async fn indexer_policy_search_candidates_ignore_disabled_rss_and_replay_after_p
                 policy_fixture().await;
             let media = if tv { "tv" } else { "movies" };
             let indexer = policy_flags(&base, &indexer, media, false, true, true).await;
+            let indexer = bind_client(&base, &indexer, media, &download).await;
             let runtime = commands::start(db, client).await.unwrap();
             let (code, command) = request(
                 &base,
@@ -1641,6 +1654,135 @@ async fn indexer_policy_origin_is_rechecked_after_preparation_before_post() {
                 peer.adds.lock().unwrap().is_empty(),
                 "changed origin policy must stop irreversible POST"
             );
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_binding_fences_search_admission_and_retained_offer_selection() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let remote_base = peer.endpoint.lock().unwrap().clone();
+        let (_, other) = providers(&base, &remote_base).await;
+        let media = if tv { "tv" } else { "movies" };
+        let bound = bind_client(&base, &indexer, media, &download).await;
+        for mode in ["automatic", "interactive"] {
+            for invalid in [
+                input(&bound, &other, tv, mode),
+                input(&indexer, &download, tv, mode),
+            ] {
+                let (code, error) =
+                    request(&base, "POST", "/api/v1/search/commands", invalid).await;
+                assert_eq!(code, 409, "{error}");
+                assert_eq!(error["error"]["code"], "provider_changed");
+            }
+            // Binding one domain must leave the other domain's explicit choice intact.
+            let (code, unbound) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&bound, &other, !tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{unbound}");
+            assert_eq!(
+                request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/commands/{}/cancel",
+                        unbound["id"].as_str().unwrap()
+                    ),
+                    json!({})
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        assert!(peer.indexer_requests.lock().unwrap().is_empty());
+        let runtime = commands::start(db, client).await.unwrap();
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&bound, &download, tv, "interactive"),
+        )
+        .await;
+        assert_eq!(code, 202, "{command}");
+        assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+        let rows = offers(&base, &command["id"]).await;
+        bind_client(&base, &bound, media, &other).await;
+        let (code, error) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                rows[0]["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, 409, "{error}");
+        assert_eq!(error["error"]["code"], "provider_changed");
+        assert!(peer.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn client_binding_change_during_search_preparation_never_reroutes_or_posts() {
+    for tv in [true, false] {
+        for mode in ["automatic", "interactive"] {
+            let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+                policy_fixture().await;
+            let remote_base = peer.endpoint.lock().unwrap().clone();
+            let (_, other) = providers(&base, &remote_base).await;
+            peer.mode.store(3, Ordering::SeqCst);
+            let runtime = commands::start(db, client).await.unwrap();
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&indexer, &download, tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{command}");
+            let done = settled(&base, &command["id"]).await;
+            assert_eq!(done["status"], "succeeded", "{done}");
+            let id = if mode == "interactive" {
+                let rows = offers(&base, &command["id"]).await;
+                let (code, receipt) = request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/results/{}/grab",
+                        rows[0]["id"].as_str().unwrap()
+                    ),
+                    json!({}),
+                )
+                .await;
+                assert_eq!(code, 202, "{receipt}");
+                receipt["id"].as_str().unwrap().to_owned()
+            } else {
+                done["selected_candidate_id"].as_str().unwrap().to_owned()
+            };
+            tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+                .await
+                .expect("torrent preparation boundary");
+            bind_client(&base, &indexer, if tv { "tv" } else { "movies" }, &other).await;
+            peer.mode.store(0, Ordering::SeqCst);
+            peer.release.notify_one();
+            let rejected = candidate_status(&base, &id, "rejected").await;
+            assert_eq!(rejected["error_code"], "provider_changed");
+            assert_eq!(rejected["source"]["client_id"], download["id"]);
+            assert!(peer.adds.lock().unwrap().is_empty());
             runtime.shutdown().await;
             server.stop().await;
             remote_server.stop().await;

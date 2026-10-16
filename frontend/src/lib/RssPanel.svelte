@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import {clientMatchesIndexer,eligibleDownloadClient,indexerScope} from './provider-draft';
   import type { ApiPage, Provider, MediaDomain, RssTarget, RssCommand, RssCandidate, RssSchedule } from './api.generated';
   import { getProvider, listProviders, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule } from './api';
   let domain:MediaDomain=$state('tv'), providers:ApiPage<Provider>|null=$state(null), indexer:Provider|null=$state(null), client:Provider|null=$state(null);
   let indexerId=$state(''),clientId=$state(''),interval=$state(900),enabled=$state(false),busy=$state(false),loadingProviders=$state(false),ready=$state(false),uncertain=$state(false),error=$state(''),notice=$state('');
   let commands:ApiPage<RssCommand>|null=$state(null),candidates:ApiPage<RssCandidate>|null=$state(null),schedules:RssSchedule[]=$state([]),commandOffset=$state(0),candidateOffset=$state(0);
   let alive=true,version=0,timer:ReturnType<typeof setTimeout>|undefined;
-  const target:RssTarget|null=$derived.by(()=>indexer&&client?{media_type:domain,indexer_id:indexer.id,indexer_revision:indexer.revision,client_id:client.id,client_revision:client.revision}:null);
+  const boundClientId=$derived(indexerScope(indexer,domain)?.download_client_id);
+  const bindingError=$derived(boundClientId&&!loadingProviders&&!clientMatchesIndexer(indexer,client,domain)?`Bound download client ${boundClientId} is unavailable or disabled for ${domain}. Update the indexer binding or enable that client before requesting RSS.`:'');
+  const target:RssTarget|null=$derived.by(()=>indexer&&client&&clientMatchesIndexer(indexer,client,domain)&&indexerScope(indexer,domain)?.enable_rss!==false?{media_type:domain,indexer_id:indexer.id,indexer_revision:indexer.revision,client_id:client.id,client_revision:client.revision}:null);
   const eligible=(p:Provider,kind:'indexer'|'client')=>p.enabled&&p.settings[domain]!==null&&(kind==='client'?p.settings.implementation==='qbittorrent':p.settings.implementation!=='qbittorrent');
   const active=(c:RssCommand)=>['queued','running','retry_wait'].includes(c.status);
   function later(){clearTimeout(timer);if(alive&&!document.hidden)timer=setTimeout(()=>void read(),5000);}
@@ -16,7 +19,23 @@
     if(result.ok)providers=result.data;else error=result.error;
     if(indexer){const fresh=await getProvider(indexer.id);if(!alive||v!==version)return;indexer=fresh.ok&&eligible(fresh.data,'indexer')?fresh.data:null;indexerId=indexer?.id??'';}
     if(client){const fresh=await getProvider(client.id);if(!alive||v!==version)return;client=fresh.ok&&eligible(fresh.data,'client')?fresh.data:null;clientId=client?.id??'';}
-    loadingProviders=false;
+    await loadBoundClient(v);
+    if(alive&&v===version)loadingProviders=false;
+  }
+  async function loadBoundClient(v:number){
+    const id=indexerScope(indexer,domain)?.download_client_id;
+    if(!id)return;
+    client=null;clientId='';
+    const result=await getProvider(id);if(!alive||v!==version)return;
+    if(result.ok&&eligibleDownloadClient(result.data,domain)){client=result.data;clientId=client.id;}
+    else if(!result.ok)error=result.error;
+  }
+  async function chooseIndexer(){
+    indexer=providers?.items.find(p=>p.id===indexerId)??null;
+    if(!eligibleDownloadClient(client,domain)){client=null;clientId='';}
+    const v=version;loadingProviders=true;
+    await loadBoundClient(v);
+    if(alive&&v===version)loadingProviders=false;
   }
   async function read(explicit=false){
     if(busy||!alive||document.hidden)return;
@@ -47,9 +66,12 @@
   <h1>RSS automation</h1><p>RSS can submit matching releases to the selected download client. Configure a quality profile and background release delays in Library first.</p>
   <label>RSS media<select bind:value={domain} disabled={busy} onchange={scope}><option value="tv">TV</option><option value="movies">Movies</option></select></label>
   <form onsubmit={e=>{e.preventDefault();void mutate('run');}}>
-    <label>RSS indexer<select bind:value={indexerId} disabled={busy||loadingProviders} onchange={()=>indexer=providers?.items.find(p=>p.id===indexerId)??null}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'indexer'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
-    <label>RSS download client<select bind:value={clientId} disabled={busy||loadingProviders} onchange={()=>client=providers?.items.find(p=>p.id===clientId)??null}><option value="">Choose a download client</option>{#if client&&!providers?.items.some(p=>p.id===client!.id)}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'client'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
+    <label>RSS indexer<select bind:value={indexerId} disabled={busy||loadingProviders} onchange={chooseIndexer}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'indexer'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
+    <label>RSS download client<select bind:value={clientId} disabled={busy||loadingProviders||!!boundClientId} onchange={()=>client=providers?.items.find(p=>p.id===clientId)??null}><option value="">Choose a download client</option>{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'client'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
     {#if providers}<div class="actions"><button type="button" disabled={busy||loadingProviders||providers.offset===0} onclick={()=>loadProviders(Math.max(0,providers!.offset-25))}>Previous RSS providers</button><button type="button" disabled={busy||loadingProviders||providers.offset+providers.limit>=providers.total} onclick={()=>loadProviders(providers!.offset+providers!.limit)}>Next RSS providers</button><button type="button" disabled={busy||loadingProviders} onclick={()=>loadProviders(providers!.offset)}>Reload RSS providers</button></div>{/if}
+    {#if boundClientId}<p>Download client is fixed by this indexer’s {domain} binding: {client?.name??boundClientId}.</p>{/if}
+    {#if bindingError}<p role="alert">{bindingError}</p>{/if}
+    {#if indexerScope(indexer,domain)?.enable_rss===false}<p role="alert">RSS is disabled for this indexer’s {domain} scope.</p>{/if}
     <button disabled={busy||loadingProviders||!ready||uncertain||!target}>Run RSS now</button>
   </form>
   <form onsubmit={e=>{e.preventDefault();void mutate('schedule');}}><label>RSS interval (seconds)<input type="number" min="60" max="86400" step="1" required bind:value={interval}/></label><label>RSS scheduling<select bind:value={enabled}><option value={false}>Disabled</option><option value={true}>Enabled</option></select></label><button disabled={busy||loadingProviders||!ready||uncertain||!target}>Save RSS schedule</button></form>

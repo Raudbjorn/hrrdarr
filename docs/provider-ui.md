@@ -11,8 +11,12 @@ New scope options come from the existing schema endpoint. Users supply endpoint,
 category IDs or download category names. Editing preserves the complete saved scope
 object, including indexer search flags and qBittorrent imported categories,
 priorities, initial state, content layout, sequential/first-last options and tags.
-The minimal form edits active categories only; these additional options are not
-editable here. Disabling a scope removes its settings when saved. Backend validation
+The form edits categories, per-domain RSS/automatic/interactive search switches,
+and each indexer scope’s download-client binding. Other options are preserved.
+Client choices include enabled qBittorrent clients supporting that domain; use the
+provider-list pages to browse choices. An existing binding outside the current page
+or no longer available remains visible by ID and is preserved until explicitly
+changed or cleared. Disabling a scope removes its settings when saved. Backend validation
 remains authoritative for categories, endpoint, credentials and domain rules.
 
 Credentials are write-only, never read back or stored by the UI. Preserve omits the
@@ -41,7 +45,27 @@ Development uses the explicit server-side `HRRDARR_API_ORIGIN` Vite proxy descri
 in [library-ui.md](library-ui.md); no production static serving, CORS bypass or live
 service default is introduced.
 
+RSS and download-search forms honor the selected indexer’s domain-specific binding.
+They fetch the bound client by ID even when it is outside the current provider page,
+lock that selection, and block new requests with a visible explanation when the
+client is missing, disabled, or does not support the domain. Unbound indexers retain
+manual client selection. RSS and search actions also respect their corresponding
+scope switches. Switching RSS domains resets provider selection; the library keys
+search components by media target so their selections and pending reads are disposed
+when the target changes. Backend revision and binding checks remain authoritative
+if a provider changes after the form loads. Reconciliation of previously submitted
+work is independent of this selection UI.
+
 ## Verification limits
+
+Run `node frontend/tests/indexer-binding-browser.mjs` against a fresh
+[owned browser fixture](library-ui.md#runnable-isolated-browser-verification),
+with its `UI_URL`, `UI_PROVIDER_ORIGIN` and `UI_SCRATCH`. The scenario checks
+both-domain binding and policy save/reload, actual RSS schedule/search admission,
+disabled/deleted client handling, restoration of unbound client selection, and
+explicit clearing of deleted-client bindings.
+Backend binding and interrupted-submission regressions live in
+`tests/rss_commands.rs` and `tests/search_commands.rs`.
 
 Frontend contract checks, build and transport tests validate types, request methods,
 revision payloads, credential omission/clear/replacement, DELETE 204, and bounded

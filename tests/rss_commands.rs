@@ -224,7 +224,12 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "owned HTTP request {method} {path} failed: {}",
+                error.without_url()
+            )
+        });
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
     assert!(
@@ -297,6 +302,16 @@ async fn providers(base: &str, remote: &str) -> (Value, Value) {
     }
     (values.remove(0), values.remove(0))
 }
+async fn bind_client(base: &str, indexer: &Value, media: &str, client: &Value) -> Value {
+    let mut settings = indexer["settings"].clone();
+    settings[media]["download_client_id"] = client["id"].clone();
+    let (code, updated) = request(
+        base, "PUT", &format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap()),
+        json!({"revision":indexer["revision"],"name":"bound indexer","enabled":true,"priority":1,"settings":settings}),
+    ).await;
+    assert_eq!(code, 200, "{updated}");
+    updated
+}
 fn target(indexer: &Value, client: &Value, media: &str) -> Value {
     json!({"media_type":media,"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":client["id"],"client_revision":client["revision"]})
 }
@@ -328,6 +343,8 @@ async fn rss_grabs_both_domains_and_replay_does_not_duplicate_submissions() {
     *remote_state.endpoint.lock().unwrap() = remote_base.clone();
     let (base, _server, client) = app(db.clone()).await;
     let (indexer, download) = providers(&base, &remote_base).await;
+    let indexer = bind_client(&base, &indexer, "tv", &download).await;
+    let indexer = bind_client(&base, &indexer, "movies", &download).await;
     let runtime = commands::start(db.clone(), client).await.unwrap();
     for media in ["tv", "movies"] {
         let command = enqueue(&base, target(&indexer, &download, media)).await;
@@ -477,6 +494,8 @@ async fn interrupted_submission_reopens_with_typed_identity_and_only_reconciles(
         let (_, before) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
         let id = before["items"][0]["id"].clone();
         assert_eq!(before["items"][0]["status"], "submitting");
+        let (_, other) = providers(&base, &remote_base).await;
+        bind_client(&base, &indexer, media, &other).await;
         runtime.shutdown().await;
         server.stop().await;
         drop(db);
@@ -1745,5 +1764,104 @@ async fn indexer_policy_retry_wait_feed_never_reuses_changed_revision() {
         );
         assert!(peer.adds.lock().unwrap().is_empty());
         runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn client_binding_fences_rss_admission_schedules_and_prepared_dispatch() {
+    for media in ["tv", "movies"] {
+        for preparing in [false, true] {
+            eprintln!("event=binding_fixture media_type={media} preparing={preparing}");
+            let scratch = Scratch(
+                std::env::temp_dir().join(format!("hrrdarr-rss-binding-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+            seed(&db).await;
+            let peer = Arc::new(Remote::default());
+            let (remote_base, _remote) = serve(
+                axum::Router::new()
+                    .fallback(remote)
+                    .with_state(peer.clone()),
+            )
+            .await;
+            *peer.endpoint.lock().unwrap() = remote_base.clone();
+            let (base, _server, client) = app(db.clone()).await;
+            let (indexer, download) = providers(&base, &remote_base).await;
+            let (_, other) = providers(&base, &remote_base).await;
+            let bound = bind_client(&base, &indexer, media, &download).await;
+            for invalid in [
+                target(&bound, &other, media),
+                target(&indexer, &download, media),
+            ] {
+                for (path, body) in [
+                    (
+                        "/api/v1/rss/commands",
+                        json!({"target":invalid,"priority":"normal"}),
+                    ),
+                    (
+                        "/api/v1/rss/schedules",
+                        json!({"target":invalid,"interval_seconds":60,"enabled":true}),
+                    ),
+                ] {
+                    let (code, error) = request(&base, "POST", path, body).await;
+                    assert_eq!(code, 409, "{error}");
+                    assert_eq!(error["error"]["code"], "provider_changed");
+                }
+            }
+            assert!(peer.indexer_requests.lock().unwrap().is_empty());
+            let command = enqueue(&base, target(&bound, &download, media)).await;
+            let (code, schedule) = request(&base, "POST", "/api/v1/rss/schedules", json!({"target":target(&bound,&download,media),"interval_seconds":60,"enabled":true})).await;
+            assert_eq!(code, 200, "{schedule}");
+            let mut runtime = None;
+            if preparing {
+                peer.mode.store(4, Ordering::SeqCst);
+                runtime = Some(commands::start(db.clone(), client.clone()).await.unwrap());
+                tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+                    .await
+                    .expect("torrent preparation boundary");
+            }
+            bind_client(&base, &bound, media, &other).await;
+            // Advance only the owned scheduler deadline; binding changes use the provider API.
+            db.connect()
+                .await
+                .unwrap()
+                .execute("UPDATE rss_schedules SET next_run_at=0", ())
+                .await
+                .unwrap();
+            if preparing {
+                peer.release.notify_one();
+            } else {
+                runtime = Some(commands::start(db.clone(), client).await.unwrap());
+            }
+            let done = until(&base, &command["id"]).await;
+            if preparing {
+                assert_eq!(done["rejected"], 1, "{done}");
+                assert_eq!(
+                    receipt_until(&base, "rejected").await["error_code"],
+                    "provider_changed"
+                );
+            } else {
+                assert_eq!(done["status"], "failed", "{done}");
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let (_, schedules) =
+                        request(&base, "GET", "/api/v1/rss/schedules", Value::Null).await;
+                    if schedules[0]["enabled"] == false {
+                        assert_eq!(schedules[0]["error_code"], "provider_changed");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            })
+            .await
+            .expect("changed binding disables old schedule");
+            assert!(
+                peer.adds.lock().unwrap().is_empty(),
+                "binding change must never reroute or submit old intent"
+            );
+            runtime.unwrap().shutdown().await;
+        }
     }
 }

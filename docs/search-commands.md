@@ -2,6 +2,8 @@
 
 Native targeted search supports one episode or movie and one explicitly chosen indexer/client pair. `automatic` searches all bounded continuations and selects the best eligible result; `interactive` retains results without authorizing a client submission until the user selects one. Both routes are explicitly user-invoked. Automatic *selection* does not mean a background trigger: both use the persisted `user_search` decision context, including its availability/delay exception. RSS retains its background availability, monitoring and configured-delay checks.
 
+If the indexer's matching TV or movie scope has a `download_client_id`, the explicit client must match it. A mismatch or stale provider revision returns `provider_changed` at admission or selection and rejects unsent candidates during dispatch revalidation. An unbound scope allows any otherwise valid explicit client. Binding edits never reroute durable requests; already-started submissions keep their original client identity for reconciliation, and exact request/selection replay still returns the retained receipt.
+
 Identity, requested target, media category, current quality/profile, size, cutoff, blocklist and client capability checks still apply. This accepted-result selection is not a forced override. Upstream release controllers additionally expose target/quality/language overrides and release push; those remain required future work. Episode/season/series/missing/cutoff command fanout, full ranking/custom-format breadth, packs and other clients also remain incomplete. These native routes do not claim V3 wire compatibility or upstream runtime equivalence.
 
 ## API

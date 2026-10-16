@@ -1,4 +1,4 @@
-import type {Provider,ProviderInput} from './api.generated';
+import type {MediaDomain,MovieIndexerScope,Provider,ProviderInput,TvIndexerScope} from './api.generated';
 export type PendingProvider = Omit<ProviderInput,'credentials'>;
 // Compare structured public settings regardless of JSON object key order; arrays retain order.
 function canonical(value:unknown):unknown {
@@ -8,4 +8,18 @@ function canonical(value:unknown):unknown {
 }
 export function matchesPendingProvider(provider:Provider,pending:PendingProvider):boolean {
   return provider.name===pending.name && provider.enabled===pending.enabled && provider.priority===pending.priority && JSON.stringify(canonical(provider.settings))===JSON.stringify(canonical(pending.settings));
+}
+
+export function indexerScope(provider:Provider|null,domain:MediaDomain) {
+  return provider && provider.settings.implementation!=='qbittorrent' ? provider.settings[domain] : null;
+}
+export function indexerOptions(scope:TvIndexerScope|MovieIndexerScope|null|undefined) {
+  return {enable_rss:scope?.enable_rss??true,enable_automatic_search:scope?.enable_automatic_search??true,enable_interactive_search:scope?.enable_interactive_search??true,download_client_id:scope?.download_client_id??null};
+}
+export function eligibleDownloadClient(provider:Provider|null,domain:MediaDomain):provider is Provider {
+  return !!provider && provider.enabled && provider.settings.implementation==='qbittorrent' && provider.settings[domain]!==null;
+}
+export function clientMatchesIndexer(indexer:Provider|null,client:Provider|null,domain:MediaDomain):boolean {
+  const scope=indexerScope(indexer,domain);
+  return !!indexer?.enabled && !!scope && eligibleDownloadClient(client,domain) && (!scope.download_client_id || scope.download_client_id===client.id);
 }
