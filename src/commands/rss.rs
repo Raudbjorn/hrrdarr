@@ -853,8 +853,7 @@ async fn process_candidate(
         .await
     {
         Ok(qbittorrent::AddOutcome::Observed { hash }) => {
-            c.execute("UPDATE rss_candidates SET status='observed',observed_hash=?,error_code=NULL,not_before=NULL,updated_at=? WHERE id=? AND status='submitting'",params![hash,now()?,p.id.to_string()]).await?;
-            Ok(())
+            accept_observed(&c, p.id, p.source, hash, client.backoff_grace_elapsed()).await
         }
         Ok(qbittorrent::AddOutcome::AlreadyPresent { .. }) => {
             candidate_state(
@@ -877,6 +876,35 @@ async fn process_candidate(
         }
     }
 }
+// Recovery belongs to this receipt's first fresh accepted observation, never reconciliation.
+pub(super) async fn accept_observed(
+    c: &Connection,
+    id: Uuid,
+    source: RssTarget,
+    hash: String,
+    grace_elapsed: bool,
+) -> Result<()> {
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let timestamp = now()?;
+        let accepted = tx.execute("UPDATE rss_candidates SET status='observed',observed_hash=?,error_code=NULL,not_before=NULL,updated_at=? WHERE id=? AND status='submitting'",params![hash,timestamp,id.to_string()]).await?;
+        if accepted == 1 && valid_provider(&tx, RefreshTarget {
+            provider_id: source.client_id,
+            media_type: source.media_type,
+        }, source.client_revision).await? {
+            crate::providers::backoff::apply(
+                &tx, &source.client_id.to_string(), source.client_revision,
+                source.media_type, crate::providers::backoff::Observation::Success,
+                timestamp, grace_elapsed,
+            ).await.map_err(|_|Error(StatusCode::INTERNAL_SERVER_ERROR,"client_backoff_storage_error"))?;
+        }
+        Ok(())
+    }.await;
+    finish(tx, outcome).await
+}
+
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct RssCandidateQuery {

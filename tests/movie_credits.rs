@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: migration 0050 adds durable indexer backoff; historical migration prefixes stay fixed.
+        51 // Reasoning: migration 0051 adds durable client backoff; historical migration prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -213,6 +213,16 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     assert!(c.execute("INSERT INTO movie_credits(metadata_id,credit_tmdb_id,person_tmdb_id,person_name,credit_order,credit_type) VALUES(2,'over',1,'N',0,'cast')", ()).await.is_err());
     c.execute("DELETE FROM movie_credits WHERE metadata_id=2", ())
         .await?;
+    // Reasoning: undo 0051's appended columns and replacement trigger before reconstructing the historical schema.
+    c.execute_batch("DROP TRIGGER commands_transition; DROP TRIGGER commands_backoff_identity; ALTER TABLE commands DROP COLUMN manual_bypass; ALTER TABLE commands DROP COLUMN origin; DROP TABLE download_client_status; DELETE FROM health_checks WHERE check_key='download_client_backoff'; DELETE FROM schema_migrations WHERE version=51;").await?;
+    let old_transition = include_str!("../migrations/0016_download_refresh.sql");
+    let old_transition = &old_transition[old_transition
+        .find("CREATE TRIGGER commands_transition")
+        .unwrap()
+        ..old_transition
+            .find("CREATE TRIGGER commands_delete_terminal")
+            .unwrap()];
+    c.execute_batch(old_transition).await?;
     // Reasoning: reconstruct 0046 by undoing all later objects, including 0050's backoff
     // table, provider trigger and health seeds; otherwise the real runner cannot reapply them.
     c.execute_batch("DROP TRIGGER indexer_status_configuration_reset; DROP TABLE indexer_status; DROP TABLE movie_credits; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures'); DELETE FROM schema_migrations WHERE version IN (47,48,49,50);")
@@ -231,7 +241,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: migration 0050 adds durable indexer backoff; historical migration prefixes stay fixed.
+        51 // Reasoning: migration 0051 adds durable client backoff; historical migration prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

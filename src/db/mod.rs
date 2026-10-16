@@ -216,6 +216,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "indexer_backoff",
         include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
+    (
+        "download_client_backoff",
+        include_str!("../../migrations/0051_download_client_backoff.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -779,3 +783,6 @@ mod indexer_client_tests;
 
 #[cfg(test)]
 mod indexer_backoff_tests;
+
+#[cfg(test)]
+mod download_client_backoff_tests;

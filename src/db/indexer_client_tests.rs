@@ -110,7 +110,7 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         let mut expected = before[1].clone();
         // Only the appended preference column differs: all old values remain exact and NULL.
@@ -120,11 +120,11 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
         assert_eq!(rows(&c, "provider_scopes").await?, expected);
         let registry = rows(&c, "health_checks").await?;
         assert_eq!(&registry[..12], before[2].as_slice());
-        assert_eq!(registry.len(), 18); // Reasoning: 0050 adds four backoff identities after 0049.
+        assert_eq!(registry.len(), 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
         assert_eq!(rows(&c, "health_lifecycle").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..48], before[4].as_slice());
-        assert_eq!(history.len(), 50); // Reasoning: the runner includes 0050.
+        assert_eq!(history.len(), 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
         assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='IndexerDownloadClientCheck'").await?,2);
         integrity(&c).await?;
     }

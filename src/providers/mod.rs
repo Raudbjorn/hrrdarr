@@ -1,5 +1,6 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
 pub mod administration;
+pub(crate) mod backoff;
 pub mod categories;
 mod credentials;
 pub mod draft;
@@ -29,7 +30,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug)]
-enum Error {
+pub(crate) enum Error {
     Plain(StatusCode, &'static str, &'static str),
     RateLimited(u32),
 }
@@ -64,7 +65,7 @@ impl From<libsql::Error> for Error {
         )
     }
 }
-type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 fn bad() -> Error {
     Error::Plain(
         StatusCode::BAD_REQUEST,
@@ -490,6 +491,7 @@ struct Context {
     db: Arc<Database>,
     key: Option<Arc<CredentialKey>>,
     transport: Arc<std::result::Result<http::HttpClient, http::HttpError>>,
+    backoff_started: std::time::Instant,
 }
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
     router_with_refresh(db, key).0
@@ -504,6 +506,7 @@ pub fn router_with_refresh(
         db,
         key,
         transport: Arc::new(http::HttpClient::new()),
+        backoff_started: std::time::Instant::now(),
     };
     let router = Router::new()
         .route("/api/v1/providers", get(list).post(create))
@@ -540,6 +543,7 @@ pub(crate) struct RefreshError {
     pub code: &'static str,
     pub retryable: bool,
     pub retry_after_seconds: Option<u32>,
+    pub client_failure: bool,
 }
 pub(crate) type AutomationError = RefreshError;
 impl RefreshError {
@@ -548,6 +552,7 @@ impl RefreshError {
             code,
             retryable,
             retry_after_seconds: None,
+            client_failure: false,
         }
     }
 }
@@ -557,6 +562,7 @@ fn refresh_error(error: Error) -> RefreshError {
             code: "refresh_failed",
             retryable: true,
             retry_after_seconds: Some(seconds.clamp(1, 86400)),
+            client_failure: false,
         },
         Error::Plain(_, "provider_revision_conflict", _) => {
             RefreshError::new("provider_changed", false)
@@ -576,6 +582,7 @@ fn refresh_error(error: Error) -> RefreshError {
             code: "refresh_failed",
             retryable: true,
             retry_after_seconds: Some(1),
+            client_failure: false,
         },
         _ => RefreshError::new("refresh_failed", true),
     }
@@ -634,6 +641,9 @@ pub(crate) struct OwnedDownloadDetails {
     pub host: String,
 }
 impl RefreshClient {
+    pub(crate) fn backoff_grace_elapsed(&self) -> bool {
+        self.0.backoff_started.elapsed() >= backoff::STARTUP_GRACE
+    }
     /// Read the actual scoped item list; connection/version success alone is insufficient.
     pub(crate) async fn probe_download_communication(
         &self,
@@ -1174,7 +1184,13 @@ impl RefreshClient {
                 domain,
             )
             .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
+            .map_err(|error| {
+                let client_failure =
+                    communication_error(error) == CommunicationProbeError::RemoteFailure;
+                let mut mapped = refresh_error(qbit_error(error).0);
+                mapped.client_failure = client_failure;
+                mapped
+            });
             // Changed configuration invalidates failed observations too.
             current_revision(&context.db, &provider)
                 .await
@@ -1405,6 +1421,9 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.imported_category.clone(),i64::from(s.recent_priority),i64::from(s.older_priority),match s.initial_state { DownloadInitialState::Started => "started", DownloadInitialState::Stopped => "stopped", DownloadInitialState::Forced => "forced" },match s.content_layout { DownloadContentLayout::Default => "default", DownloadContentLayout::Original => "original", DownloadContentLayout::Subfolder => "subfolder" },i64::from(s.sequential_order),i64::from(s.first_last_first),i64::from(s.add_tags)]).await?;
             }
         }
+    }
+    if matches!(settings, ProviderSettings::Qbittorrent { .. }) {
+        backoff::reconcile(conn, id).await?;
     }
     Ok(())
 }
@@ -2071,6 +2090,8 @@ async fn record_test(
     provider: &Provider,
     code: Option<&'static str>,
     indexer_observation: Option<(indexer_backoff::Observation, Option<MediaDomain>)>,
+    client_observation: Option<backoff::Observation>,
+    grace_elapsed: bool,
 ) -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2113,6 +2134,27 @@ async fn record_test(
                 && failed_domain.is_none_or(|domain| domain == media)
             {
                 indexer_backoff::apply(&tx, provider, media, Some(observation), tested_at).await?;
+            }
+        }
+    }
+    if let (Some(observation), ProviderSettings::Qbittorrent { tv, movies, .. }) =
+        (client_observation, &provider.settings)
+    {
+        for (selected, domain) in [
+            (tv.is_some(), MediaDomain::Tv),
+            (movies.is_some(), MediaDomain::Movies),
+        ] {
+            if selected {
+                backoff::apply(
+                    &tx,
+                    &provider.id.to_string(),
+                    provider.revision,
+                    domain,
+                    observation,
+                    tested_at,
+                    grace_elapsed,
+                )
+                .await?;
             }
         }
     }
@@ -2170,7 +2212,7 @@ async fn run_test(
     }
     .map_err(|e| http_error(e).0)?;
     let work = async {
-        let (result, observation) = if is_indexer {
+        let (result, observation, client_observation) = if is_indexer {
             let scoped = indexer::test_with_scope(
                 &operation,
                 &provider.settings,
@@ -2186,17 +2228,41 @@ async fn run_test(
                     .map(ProviderTestOutcome::Indexer)
                     .map_err(|error| indexer_error(error, &operation)),
                 observation,
+                None,
             )
         } else {
+            let result =
+                qbittorrent::test_connection(&operation, &provider.settings, credentials.as_ref())
+                    .await;
+            let observation = match result.as_ref() {
+                Ok(_) => Some(backoff::Observation::Success),
+                Err(error)
+                    if communication_error(*error) == CommunicationProbeError::RemoteFailure =>
+                {
+                    Some(backoff::Observation::Failure)
+                }
+                Err(_) => None,
+            };
             (
-                probe(&operation, &provider.settings, &credentials).await,
+                result
+                    .map(ProviderTestOutcome::DownloadClient)
+                    .map_err(qbit_error),
                 None,
+                observation,
             )
         };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
-                let tested_at = record_test(&context.db, &provider, None, observation).await?;
+                let tested_at = record_test(
+                    &context.db,
+                    &provider,
+                    None,
+                    observation,
+                    client_observation,
+                    context.backoff_started.elapsed() >= backoff::STARTUP_GRACE,
+                )
+                .await?;
                 bounded(ProviderTestResult {
                     provider_id: provider.id,
                     revision: provider.revision,
@@ -2206,7 +2272,15 @@ async fn run_test(
             }
             Err(error) => {
                 let (error, code) = error;
-                record_test(&context.db, &provider, Some(code), observation).await?;
+                record_test(
+                    &context.db,
+                    &provider,
+                    Some(code),
+                    observation,
+                    client_observation,
+                    context.backoff_started.elapsed() >= backoff::STARTUP_GRACE,
+                )
+                .await?;
                 Err(error)
             }
         }

@@ -199,6 +199,7 @@ mod tests {
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let context = Context {
+            backoff_started: std::time::Instant::now(),
             db: db.clone(),
             key: None,
             transport: Arc::new(http::HttpClient::new()),

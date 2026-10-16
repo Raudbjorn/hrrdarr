@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

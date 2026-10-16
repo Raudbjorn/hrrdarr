@@ -123,9 +123,18 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
+        if *table == "commands" {
+            // Reasoning: 0051 appends legacy origin and an inactive manual bypass.
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Text("legacy_unknown".into()),
+                    libsql::Value::Integer(0),
+                ]);
+            }
+        }
         if *table == "snapshot_imports" {
             // Migrations36 through41 and45 append seven inactive metadata markers; retain every prior field and assert the new AutoTagging marker is0.
             for row in &mut expected {

@@ -33,8 +33,24 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Reasoning: 0050 adds indexer_status and indexer_failures per domain; all eighteen checks must settle.
-            if v["summary"]["current"] == 18 {
+            // Reasoning: 0051 adds download_client_backoff per domain; all twenty checks must settle.
+            if v["summary"]["current"] == 20 {
+                // Reasoning: twenty checks span two pages; issue assertions cover both complete domains.
+                let (_, second) = request(
+                    client,
+                    base,
+                    reqwest::Method::GET,
+                    "/api/v1/health?offset=16",
+                    None,
+                )
+                .await;
+                let mut v = v;
+                for key in ["checks", "issues"] {
+                    v[key]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(second[key].as_array().unwrap().iter().cloned());
+                }
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -64,8 +80,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    // Reasoning: 0050 adds indexer_status and indexer_failures per domain to the fourteen existing identities.
-    assert_eq!(fresh["summary"]["never_run"], 18);
+    // Reasoning: 0051 adds download_client_backoff per domain to the eighteen existing identities.
+    assert_eq!(fresh["summary"]["never_run"], 20);
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -83,6 +99,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         .flat_map(|scope| {
             [
                 "completed_download_handling",
+                "download_client_backoff",
                 "download_client_communication",
                 "download_client_root_folder",
                 "indexer_download_client",
@@ -96,7 +113,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
             .map(move |key| (scope.to_owned(), key.to_owned()))
         })
         .collect::<std::collections::BTreeSet<_>>();
-    // Reasoning: eighteen identities now span two sixteen-row API pages; assert both pages exactly.
+    // Reasoning: twenty identities now span two sixteen-row API pages; assert both pages exactly.
     let (_, second_page) = request(
         &client,
         &base,
@@ -106,7 +123,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     assert_eq!(fresh["checks"].as_array().unwrap().len(), 16);
-    assert_eq!(second_page["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(second_page["checks"].as_array().unwrap().len(), 4);
     let mut actual = identities(&fresh["checks"]);
     actual.extend(identities(&second_page["checks"]));
     assert_eq!(actual, expected);
@@ -179,8 +196,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Reasoning: 0050 adds two identities per domain; compare all eighteen admitted identities as well as their count.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 18);
+    // Reasoning: 0051 adds one identity per domain; compare all twenty admitted identities as well as their count.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 20);
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -562,7 +579,7 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            if v["summary"]["current"] == 18 && issues(&v).is_empty() {
+            if v["summary"]["current"] == 20 && issues(&v).is_empty() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

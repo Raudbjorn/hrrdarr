@@ -145,6 +145,7 @@ pub(crate) async fn sweep(c: &Connection, timestamp: i64) -> Result<()> {
         return Ok(());
     }
     indexer_status_expiry(c, timestamp).await?;
+    client_backoff_expiry(c, timestamp).await?;
     let scheduled = if life.next_scheduled_at <= timestamp {
         selection(c, HealthScope::All, "scheduled=1").await?
     } else {
@@ -370,7 +371,7 @@ async fn publish(
 async fn publish_outcomes(
     c: &Connection,
     cmd: &HealthCommand,
-    results: Vec<CheckOutcome>,
+    mut results: Vec<CheckOutcome>,
     timestamp: i64,
 ) -> Result<()> {
     let tx = c
@@ -378,10 +379,17 @@ async fn publish_outcomes(
         .await?;
     let outcome = async {
         if !still_running(&tx, cmd).await? { return Ok(()); }
+        // A retry delay can expire while other members await network probes.
+        client_backoff_expiry(&tx, timestamp).await?;
         // A changed input invalidates this whole attempt, including completed observations.
         let stale = tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1", [cmd.id.to_string()]).await?.next().await?.is_some();
         if stale { return fail(&tx,cmd,timestamp,"stale_inputs").await; }
         if results.len() != cmd.members.len() { return Err(invariant()); }
+        for (member, result) in cmd.members.iter().zip(results.iter_mut()) {
+            if member.identity.check_key == "download_client_backoff" {
+                *result = client_backoff::evaluate(&tx, &member.identity, timestamp).await;
+            }
+        }
         let error = results.iter().find_map(|v| v.as_ref().err().copied());
         let retry = error.is_some() && cmd.attempts < 3;
         let life = lifecycle(&tx).await?;
@@ -490,6 +498,10 @@ async fn evaluate(
         _ => return Err("check_failed"),
     };
     match member.identity.check_key.as_str() {
+        "download_client_backoff" => {
+            let c = db.connect().await.map_err(|_| "storage_error")?;
+            client_backoff::evaluate(&c, &member.identity, now().map_err(|_| "check_failed")?).await
+        }
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
         "indexer_status" | "indexer_failures" => {

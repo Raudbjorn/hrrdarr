@@ -151,6 +151,22 @@ pub struct CommandInput {
     pub provider_revision: i64,
     pub priority: CommandPriority,
 }
+#[derive(Clone, Copy, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOrigin {
+    LegacyUnknown,
+    Automatic,
+    Manual,
+}
+impl CommandOrigin {
+    fn text(self) -> &'static str {
+        match self {
+            Self::LegacyUnknown => "legacy_unknown",
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct Command {
     pub id: Uuid,
@@ -166,6 +182,11 @@ pub struct Command {
     pub completed_at: Option<i64>,
     pub error_code: Option<String>,
     pub items_observed: u16,
+    pub origin: CommandOrigin,
+    pub manual_bypass: bool,
+    // Computed at read time; suppression never rewrites the command state or due time.
+    pub suppression_reason: Option<String>,
+    pub suppression_until: Option<i64>,
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -281,7 +302,7 @@ impl CommandStatus {
         }
     }
 }
-const COMMAND_COLUMNS: &str = "id,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,started_at,completed_at,error_code,items_observed";
+const COMMAND_COLUMNS: &str = "id,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,started_at,completed_at,error_code,items_observed,origin,manual_bypass,CASE WHEN status IN ('queued','retry_wait') AND origin='automatic' AND manual_bypass=0 THEN (SELECT b.disabled_until FROM download_client_status b JOIN providers p ON p.id=b.provider_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=b.media_type WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND p.revision=b.config_revision AND p.enabled=1 AND p.implementation='qbittorrent' AND b.disabled_until>unixepoch()) END";
 fn command_row(row: libsql::Row) -> Result<Command> {
     Ok(Command {
         id: Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| bad())?,
@@ -304,6 +325,17 @@ fn command_row(row: libsql::Row) -> Result<Command> {
         completed_at: row.get(10)?,
         error_code: row.get(11)?,
         items_observed: row.get::<i64>(12)? as u16,
+        origin: match row.get::<String>(13)?.as_str() {
+            "legacy_unknown" => CommandOrigin::LegacyUnknown,
+            "automatic" => CommandOrigin::Automatic,
+            "manual" => CommandOrigin::Manual,
+            _ => return Err(bad()),
+        },
+        manual_bypass: row.get::<i64>(14)? == 1,
+        suppression_reason: row
+            .get::<Option<i64>>(15)?
+            .map(|_| "download_client_backoff".to_owned()),
+        suppression_until: row.get(15)?,
     })
 }
 async fn read_command(c: &Connection, id: Uuid) -> Result<Command> {
@@ -346,12 +378,24 @@ async fn finish<T>(tx: libsql::Transaction, result: Result<T>) -> Result<T> {
     }
 }
 async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<Command> {
+    enqueue_origin(c, input, timestamp, CommandOrigin::Manual).await
+}
+async fn enqueue_origin(
+    c: &Connection,
+    input: CommandInput,
+    timestamp: i64,
+    origin: CommandOrigin,
+) -> Result<Command> {
     if !valid_provider(c, input.target, input.provider_revision).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     if let Some(row)=c.query(&format!("SELECT {COMMAND_COLUMNS} FROM commands WHERE provider_id=? AND media_type=? AND status IN ('queued','running','retry_wait')"),params![input.target.provider_id.to_string(),domain(input.target.media_type)]).await?.next().await?{
         let current=command_row(row)?;
         if current.provider_revision!=input.provider_revision{return Err(conflict())}
+        if matches!(origin, CommandOrigin::Manual) && matches!(current.origin, CommandOrigin::Automatic) && !current.manual_bypass {
+            c.execute("UPDATE commands SET manual_bypass=1 WHERE id=?",[current.id.to_string()]).await?;
+            return read_command(c,current.id).await
+        }
         return Ok(current)
     }
     let count = command_capacity(c).await?;
@@ -359,7 +403,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
     }
     let id = Uuid::new_v4();
-    c.execute("INSERT INTO commands(id,name,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,items_observed) VALUES(?,'refresh_downloads',?,?,?,?,'queued',0,?,?,0)",params![id.to_string(),input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,input.priority.number(),timestamp,timestamp]).await?;
+    c.execute("INSERT INTO commands(id,name,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,items_observed,origin,manual_bypass) VALUES(?,'refresh_downloads',?,?,?,?,'queued',0,?,?,0,?,?)",params![id.to_string(),input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,input.priority.number(),timestamp,timestamp,origin.text(),i64::from(matches!(origin,CommandOrigin::Manual))]).await?;
     read_command(c, id).await
 }
 

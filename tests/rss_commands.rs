@@ -345,12 +345,46 @@ async fn rss_grabs_both_domains_and_replay_does_not_duplicate_submissions() {
     let (indexer, download) = providers(&base, &remote_base).await;
     let indexer = bind_client(&base, &indexer, "tv", &download).await;
     let indexer = bind_client(&base, &indexer, "movies", &download).await;
+    let c = db.connect().await.unwrap();
+    let timestamp = chrono::Utc::now().timestamp();
+    // Seed persisted outage history; the new sends and their recovery below use real loopback HTTP.
+    for media in ["tv", "movies"] {
+        c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until,next_health_at) VALUES(?,?,?,3,?,?,?,?)",libsql::params![download["id"].as_str().unwrap(),media,download["revision"].as_i64().unwrap(),timestamp-600,timestamp-10,timestamp+900,timestamp+900]).await.unwrap();
+    }
+    // Keep unrelated successful polling from decrementing the same history during send assertions.
+    assert_eq!(
+        c.execute(
+            "UPDATE download_refresh_schedules SET next_run_at=? WHERE provider_id=?",
+            libsql::params![timestamp + 3600, download["id"].as_str().unwrap()]
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    async fn backoff(c: &libsql::Connection, media: &str) -> (i64, Option<i64>) {
+        let row = c.query("SELECT escalation_level,disabled_until FROM download_client_status WHERE media_type=?",[media]).await.unwrap().next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
     let runtime = commands::start(db.clone(), client).await.unwrap();
     for media in ["tv", "movies"] {
         let command = enqueue(&base, target(&indexer, &download, media)).await;
         let done = until(&base, &command["id"]).await;
         assert_eq!(done["status"], "succeeded", "{done}");
         assert_eq!(done["observed"], 1, "{done}");
+        assert_eq!(
+            backoff(&c, media).await,
+            (2, None),
+            "a fresh accepted send recovers only its scope"
+        );
+        if media == "tv" {
+            assert_eq!(
+                backoff(&c, "movies").await,
+                (3, Some(timestamp + 900)),
+                "TV submission must leave movie backoff intact"
+            );
+        } else {
+            assert_eq!(backoff(&c, "tv").await, (2, None));
+        }
         let (_, receipts) = request(
             &base,
             "GET",
@@ -373,6 +407,11 @@ async fn rss_grabs_both_domains_and_replay_does_not_duplicate_submissions() {
         );
         let replay = enqueue(&base, target(&indexer, &download, media)).await;
         assert_eq!(until(&base, &replay["id"]).await["status"], "succeeded");
+        assert_eq!(
+            backoff(&c, media).await,
+            (2, None),
+            "replay must not publish another fresh-send recovery"
+        );
     }
     assert_eq!(remote_state.adds.lock().unwrap().as_slice(), [TV, MOVIE]);
     runtime.shutdown().await;

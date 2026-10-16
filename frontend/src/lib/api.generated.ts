@@ -54,11 +54,13 @@ export type ClientTest = { api_version: string, application_version: string, dom
 
 export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
 
-export type Command = { id: string, name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, items_observed: number, };
+export type Command = { id: string, name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, items_observed: number, origin: CommandOrigin, manual_bypass: boolean, suppression_reason: string | null, suppression_until: number | null, };
 
 export type CommandInput = { name: CommandName, target: RefreshTarget, provider_revision: number, priority: CommandPriority, };
 
 export type CommandName = "refresh_downloads";
+
+export type CommandOrigin = "legacy_unknown" | "automatic" | "manual";
 
 export type CommandPriority = "normal" | "high";
 

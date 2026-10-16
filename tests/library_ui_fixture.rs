@@ -11,6 +11,7 @@ use hrrdarr::{
     blocklist, commands, db::Database, episodes, import, library, metadata::MetadataClient,
     providers, quality_profiles, search as releases, snapshots,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -192,6 +193,7 @@ async fn mode(
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        Some("4") => 4,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
@@ -283,6 +285,64 @@ async fn import_failure(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientBackoffFixtureInput {
+    provider_id: uuid::Uuid,
+}
+// Synthetic clock seed only: real failed Test observations must already exist in both domains.
+async fn age_client_failure(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<ClientBackoffFixtureInput>,
+) -> StatusCode {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let changed = tx.execute("UPDATE download_client_status SET initial_failure_at=initial_failure_at-301 WHERE provider_id=? AND initial_failure_at>301 AND last_failure_at=initial_failure_at AND escalation_level=1 AND disabled_until IS NULL", [input.provider_id.to_string()]).await.unwrap();
+    if changed != 2 {
+        tx.rollback().await.unwrap();
+        return StatusCode::CONFLICT;
+    }
+    tx.commit().await.unwrap();
+    StatusCode::NO_CONTENT
+}
+// Seed pending automatic work only after real failures have blocked both scopes; the browser exercises real manual coalescing.
+async fn pending_client_refreshes(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<ClientBackoffFixtureInput>,
+) -> Response {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let mut ids = serde_json::Map::new();
+    for media in ["tv", "movies"] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let changed = tx.execute("INSERT INTO commands(id,provider_id,media_type,provider_revision,next_attempt_at,created_at,origin) SELECT ?,p.id,s.media_type,p.revision,unixepoch(),unixepoch(),'automatic' FROM providers p JOIN download_client_status s ON s.provider_id=p.id AND s.config_revision=p.revision WHERE p.id=? AND s.media_type=? AND s.disabled_until>unixepoch()+30 AND NOT EXISTS(SELECT 1 FROM commands WHERE provider_id=p.id AND media_type=s.media_type AND status IN ('queued','running','retry_wait'))", libsql::params![id.clone(),input.provider_id.to_string(),media]).await.unwrap();
+        if changed != 1 {
+            tx.rollback().await.unwrap();
+            return StatusCode::CONFLICT.into_response();
+        }
+        ids.insert(media.into(), json!(id));
+    }
+    tx.commit().await.unwrap();
+    Json(ids).into_response()
+}
+async fn client_backoff_state(
+    State(db): State<Arc<Database>>,
+    Path(id): Path<uuid::Uuid>,
+) -> Json<Vec<serde_json::Value>> {
+    let c = db.connect().await.unwrap();
+    let mut rows = c.query("SELECT media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until,next_health_at FROM download_client_status WHERE provider_id=? ORDER BY media_type",[id.to_string()]).await.unwrap();
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        values.push(json!({"media_type":row.get::<String>(0).unwrap(),"config_revision":row.get::<i64>(1).unwrap(),"escalation_level":row.get::<i64>(2).unwrap(),"initial_failure_at":row.get::<Option<i64>>(3).unwrap(),"last_failure_at":row.get::<Option<i64>>(4).unwrap(),"disabled_until":row.get::<Option<i64>>(5).unwrap(),"next_health_at":row.get::<Option<i64>>(6).unwrap()}));
+    }
+    Json(values)
 }
 async fn observations(
     State(state): State<Arc<ProviderObservations>>,
@@ -400,6 +460,13 @@ async fn provider_mock(
             ""
         };
         return ([("content-type", "application/xml")],format!(r#"<rss xmlns:x="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel><x:response offset="0" total="1"/><item><title>{title}</title><guid>fixture-{category}{receipt_suffix}</guid><pubDate>Thu, 24 Sep 2026 12:00:00 +0000</pubDate><link>magnet:?xt=urn:btih:{hash}</link><x:attr name="magneturl" value="magnet:?xt=urn:btih:{hash}"/><x:attr name="category" value="{category}"/><x:attr name="{identity}" value="101"/><x:attr name="size" value="1073741824"/></item></channel></rss>"#)).into_response();
+    }
+    if uri.path().starts_with("/api/v2/") && state.1.load(Ordering::SeqCst) == 4 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PRIVATE_FIXTURE_CLIENT_FAILURE",
+        )
+            .into_response();
     }
     if uri.path() == "/api/v2/auth/login" {
         let fields: HashMap<String, String> =
@@ -782,6 +849,15 @@ async fn library_ui_fixture() {
             .merge(
                 Router::new()
                     .route("/api/fixture/fail-import-history", post(import_failure))
+                    .route("/api/fixture/client-backoff/age", post(age_client_failure))
+                    .route(
+                        "/api/fixture/client-backoff/pending",
+                        post(pending_client_refreshes),
+                    )
+                    .route(
+                        "/api/fixture/client-backoff/{id}",
+                        get(client_backoff_state),
+                    )
                     .with_state(db.clone()),
             )
             .merge(blocklist::router(db))

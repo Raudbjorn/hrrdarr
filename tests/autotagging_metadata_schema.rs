@@ -283,8 +283,10 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
         // Reasoning: migration 0049 likewise appends the nullable download_client_id column, so it joins the exclusion list.
         "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id') ORDER BY cid",
+        // Reasoning: 0051 appends command origin/bypass and replaces its transition trigger; preserve predecessor columns exactly.
+        "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
         // Reasoning: 0050 adds only indexer_status objects and its provider reset trigger; its dedicated migration tests cover them.
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','indexer_status') AND name!='indexer_status_configuration_reset' AND NOT (type='table' AND name='provider_scopes') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','indexer_status','download_client_status') AND name NOT IN ('indexer_status_configuration_reset','commands_transition','commands_backoff_identity') AND NOT (type='table' AND name IN ('provider_scopes','commands')) AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -499,7 +501,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        50 // Reasoning: migration 0050 adds durable indexer backoff; historical migration prefixes stay fixed.
+        51 // Reasoning: migration 0051 adds durable client backoff; historical migration prefixes stay fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -625,7 +627,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        50 // Reasoning: migration 0050 adds durable indexer backoff; historical migration prefixes stay fixed.
+        51 // Reasoning: migration 0051 adds durable client backoff; historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

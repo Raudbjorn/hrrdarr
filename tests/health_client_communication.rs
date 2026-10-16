@@ -408,14 +408,55 @@ async fn provider_test_markers_deduplicate_normalized_outcomes_and_rollback_atom
     assert_eq!(request(&api, "POST", &test_path, Value::Null).await.0, 502);
     let failed = generations(&db).await;
     for (old, new) in first.iter().zip(&failed) {
-        if old.1 == "download_client_communication" {
+        // Reasoning: 0051 persists the first failure and invalidates its scoped backoff check as well.
+        if matches!(
+            old.1.as_str(),
+            "download_client_communication" | "download_client_backoff"
+        ) {
             assert_eq!(new.2, old.2 + 1);
             assert!(new.3 <= old.3);
         }
     }
-    assert_eq!(request(&api, "POST", &test_path, Value::Null).await.0, 502);
-    assert_eq!(generations(&db).await, failed);
     let c = db.connect().await.unwrap();
+    let failure_times = || async {
+        let mut rows = c.query("SELECT media_type,last_failure_at FROM download_client_status WHERE provider_id=? ORDER BY media_type", [id]).await.unwrap();
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            values.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        values
+    };
+    let first_failures = failure_times().await;
+    assert_eq!(request(&api, "POST", &test_path, Value::Null).await.0, 502);
+    let repeated_failures = failure_times().await;
+    let repeated = generations(&db).await;
+    let mut expected = failed.clone();
+    // Reasoning: repeated Test failures keep communication deduplicated, while 0051 records a new failure timestamp per scope.
+    for (scope, previous) in first_failures {
+        let changed = repeated_failures
+            .iter()
+            .find(|row| row.0 == scope)
+            .unwrap()
+            .1
+            != previous;
+        let before = expected
+            .iter_mut()
+            .find(|row| row.0 == scope && row.1 == "download_client_backoff")
+            .unwrap();
+        before.2 += i64::from(changed);
+        if changed {
+            assert!(
+                repeated
+                    .iter()
+                    .find(|row| row.0 == scope && row.1 == "download_client_backoff")
+                    .unwrap()
+                    .3
+                    <= before.3
+            );
+        }
+    }
+    assert_eq!(repeated, expected);
+    let failed = repeated;
     c.execute_batch("CREATE TRIGGER reject_health_marker BEFORE UPDATE OF generation ON health_checks BEGIN SELECT RAISE(ABORT,'marker rejected'); END;").await.unwrap();
     p.mode.store(0, Ordering::SeqCst);
     assert!(!matches!(
@@ -614,7 +655,8 @@ async fn identical_tests_do_not_invalidate_blocked_probe_but_changed_outcomes_do
             assert_eq!(
                 new.2,
                 old.2
-                    + if old.1 == "download_client_communication" {
+                    // Reasoning: this first failed Test also creates scoped client backoff history.
+                    + if matches!(old.1.as_str(), "download_client_communication" | "download_client_backoff") {
                         1
                     } else {
                         0

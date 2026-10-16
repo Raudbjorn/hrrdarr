@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -136,6 +136,15 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
                 row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
                 // Reasoning: 0049 then appends the NULL download_client_id preference column.
                 row.push(libsql::Value::Null);
+            }
+        }
+        if *table == "commands" {
+            // Reasoning: 0051 appends explicit legacy provenance without inferring manual intent.
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Text("legacy_unknown".into()),
+                    libsql::Value::Integer(0),
+                ]);
             }
         }
         assert_eq!(&rows(&c, table).await?, &expected);
@@ -184,7 +193,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -228,10 +237,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Reasoning: 0050 adds two TV checks (seven -> nine); every admission retains generation1.
+    // Reasoning: 0051 gives ten TV identities; every admission retains generation1.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        9 // Reasoning: 0050 adds two checks per domain.
+        10 // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
     );
     assert_eq!(
         scalar(
@@ -239,7 +248,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        9, // Reasoning: 0050 adds two checks per domain; all retain admission generation1.
+        10, // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -402,7 +411,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        9 // Reasoning: 0050 adds two checks per domain; publication covers all nine.
+        10 // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
     );
     assert!(
         c.execute(
@@ -413,9 +422,9 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Reasoning: 0050 raises the registry to 18 identities, leaving 110 slots within the 128 ceiling.
-    for i in 0..110 {
-        // Reasoning: 0050 registers 18 identities, leaving 110 slots.
+    // Reasoning: 0051 gives 20 registry rows, leaving 108 slots within the 128 cap.
+    for i in 0..108 {
+        // Reasoning: 0051 gives 20 registry rows, leaving 108 slots within the 128 cap.
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -434,7 +443,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        1152 // Reasoning: 0050 gives nine TV identities: 128 retained commands * 9.
+        1280 // Reasoning: 0051 gives ten TV identities: 128 retained commands * 10.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -617,7 +626,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -702,10 +711,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 18); // Reasoning: 0050 adds four backoff identities (14 -> 18).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
     }
     Ok(())
 }

@@ -13,6 +13,7 @@ use libsql::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 mod api;
+mod client_backoff;
 mod download_roots;
 mod engine;
 mod indexers;
@@ -339,7 +340,7 @@ pub(crate) async fn provider_configuration_changed(
     let keys = selection(
         c,
         scope,
-        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder')",
+        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder','download_client_backoff')",
     )
     .await?;
     mark(c, &keys, CONFIG, now()?).await
@@ -373,16 +374,36 @@ pub(crate) async fn indexer_status_changed(c: &Connection, media: MediaDomain) -
     indexer_status_at(c, scope, now()?).await.map(|_| ())
 }
 async fn indexer_status_at(c: &Connection, scope: HealthScope, timestamp: i64) -> Result<bool> {
+    status_at(
+        c,
+        scope,
+        timestamp,
+        "check_key IN ('indexer_status','indexer_failures')",
+        2,
+    )
+    .await
+}
+pub(crate) async fn client_backoff_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    status_at(c, scope, now()?, "check_key='download_client_backoff'", 1)
+        .await
+        .map(|_| ())
+}
+async fn status_at(
+    c: &Connection,
+    scope: HealthScope,
+    timestamp: i64,
+    predicate: &str,
+    expected: usize,
+) -> Result<bool> {
     if c.is_autocommit() {
         return Err(invariant());
     }
-    let keys = selection(
-        c,
-        scope,
-        "check_key IN ('indexer_status','indexer_failures')",
-    )
-    .await?;
-    if keys.len() != 2 {
+    let keys = selection(c, scope, predicate).await?;
+    if keys.len() != expected {
         return Err(invariant());
     }
     if keys.iter().any(|key| key.generation >= MAX_INTEGER) {
@@ -397,6 +418,25 @@ async fn indexer_status_at(c: &Connection, scope: HealthScope, timestamp: i64) -
         if c.execute("UPDATE health_checks SET generation=generation+1,due_at=CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END,pending_reasons=pending_reasons|8 WHERE scope=? AND check_key=? AND generation=?",params![timestamp,timestamp,scope.text(),key.identity.check_key,key.generation]).await? != 1 { return Err(invariant()); }
     }
     Ok(true)
+}
+
+async fn client_backoff_expiry(c: &Connection, timestamp: i64) -> Result<()> {
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        let due = c.query("SELECT 1 FROM download_client_status WHERE media_type=? AND next_health_at<=? LIMIT 1",params![scope.text(),timestamp]).await?.next().await?.is_some();
+        if due
+            && status_at(
+                c,
+                scope,
+                timestamp,
+                "check_key='download_client_backoff'",
+                1,
+            )
+            .await?
+        {
+            c.execute("UPDATE download_client_status SET next_health_at=NULL WHERE media_type=? AND next_health_at<=?",params![scope.text(),timestamp]).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Consume each time boundary once, independently of health batch cancellation/publication.

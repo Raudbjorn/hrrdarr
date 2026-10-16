@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 50);
+        assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 4 } else { 1 }
+                    expected.len() + if *table == "health_checks" { 6 } else { 2 } // Reasoning: latest upgrade includes 0050 and 0051.
                 );
             } else {
                 assert_eq!(&actual, expected);

@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -365,7 +365,7 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     }
     // Reasoning: preserve predecessor (version<=45) health rows; exclude later registrations,
     // including the four 0050 backoff identities covered by their migration tests.
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures') ORDER BY scope,check_key").await?);
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -429,7 +429,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);

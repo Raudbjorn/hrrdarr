@@ -100,7 +100,7 @@ async fn blocklist_schema21_backfill_rollback_reopen_and_complete_target_constra
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

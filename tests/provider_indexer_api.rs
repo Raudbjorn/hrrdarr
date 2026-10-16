@@ -541,10 +541,11 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
     }
     values
 }
-// Reasoning: 0050 adds scoped transient/persistent backoff checks. Compare all nine identities
-// per domain so an unexpected sibling marker fails; indexer saves invalidate the two new checks.
-const IDENTITIES: [(&str, &str); 18] = [
+// Reasoning: 0051 adds scoped client backoff checks. Compare all ten identities
+// per domain so unexpected sibling markers fail; client saves also invalidate their backoff check.
+const IDENTITIES: [(&str, &str); 20] = [
     ("movies", "completed_download_handling"),
+    ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
     ("movies", "download_client_root_folder"),
     ("movies", "indexer_download_client"),
@@ -554,6 +555,7 @@ const IDENTITIES: [(&str, &str); 18] = [
     ("movies", "indexer_status"),
     ("movies", "removed_metadata"),
     ("tv", "completed_download_handling"),
+    ("tv", "download_client_backoff"),
     ("tv", "download_client_communication"),
     ("tv", "download_client_root_folder"),
     ("tv", "indexer_download_client"),
@@ -585,6 +587,7 @@ fn client_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
         .flat_map(|d| {
             [
                 (*d, "completed_download_handling"),
+                (*d, "download_client_backoff"),
                 (*d, "download_client_communication"),
                 (*d, "download_client_root_folder"),
             ]

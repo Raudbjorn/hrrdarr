@@ -411,6 +411,7 @@ pub(super) async fn update(
         let mut items=Vec::with_capacity(providers.len());
         for provider in providers {
             if tx.execute("UPDATE providers SET enabled=?,priority=?,revision=revision+1 WHERE id=? AND revision=?",params![i64::from(input.changes.enabled.unwrap_or(provider.enabled)),i64::from(input.changes.priority.unwrap_or(provider.priority)),provider.id.to_string(),provider.revision]).await?!=1 {return Err(conflict());}
+            backoff::reconcile(&tx,&provider.id.to_string()).await?;
             items.push(read(&tx,&provider.id.to_string()).await?.0);
         }
         changes.mark(&tx).await?;
@@ -660,6 +661,7 @@ mod tests {
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let context = Context {
+            backoff_started: std::time::Instant::now(),
             db: db.clone(),
             key: None,
             transport: Arc::new(http::HttpClient::new()),

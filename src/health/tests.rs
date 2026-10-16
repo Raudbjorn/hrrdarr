@@ -15,7 +15,7 @@ async fn fixture_all() -> (Scratch, Database, Connection) {
     (Scratch(path), db, c)
 }
 // These existing lifecycle cases deliberately use the original two-check registry.
-// Extension cases below use fixture_all and exercise the actual eighteen migration seeds (0050 adds four indexer backoff checks).
+// Extension cases below use fixture_all and exercise the actual twenty migration seeds (0051 adds two client backoff checks).
 async fn fixture() -> (Scratch, Database, Connection) {
     let fixture = fixture_all().await;
     fixture
@@ -814,7 +814,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
         // Reasoning: registry now contains nine checks per domain (0050 adds indexer_status/indexer_failures); retry must retain all eighteen.
-        assert_eq!(cmd.members.len(), 18); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+        assert_eq!(cmd.members.len(), 20); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
             .await
@@ -828,7 +828,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 18 } else { 0 } // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+            if attempt < 3 { 20 } else { 0 } // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -881,7 +881,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        18 // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+        20 // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -943,8 +943,8 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     init(&c, 100).await;
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
-    // Reasoning: the full registry now has eighteen members (0050 adds two backoff checks per domain), so every member needs an outcome.
-    publish(&c, &cmd, Ok(vec![None; 18]), 101).await.unwrap(); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+    // Reasoning: the full registry now has twenty members (0051 adds one client backoff check per domain), so every member needs an outcome.
+    publish(&c, &cmd, Ok(vec![None; 20]), 101).await.unwrap(); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
     for at in 200..212 {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -998,7 +998,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        18 // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+        20 // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
     );
 }
 
@@ -1189,7 +1189,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        9 // Reasoning: 0050 adds two backoff checks per domain; all nine scoped members remain covered.
+        10 // Reasoning: 0051 adds one client backoff check per domain; all ten scoped members remain covered.
     );
     assert_eq!(
         count(
@@ -1210,7 +1210,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 9); // Reasoning: 0050 adds two backoff checks per domain; all nine scoped members remain covered.
+    assert_eq!(next.members.len(), 10); // Reasoning: 0051 adds one client backoff check per domain; all ten scoped members remain covered.
     assert!(
         next.members
             .iter()
@@ -1507,7 +1507,7 @@ async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, 
 async fn indexer_configuration_marker_is_scoped_transactional_and_debounced() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 18); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+    assert_eq!(initial.len(), 20); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(indexer_configuration_changed(&c, media).await.is_err());
     }
@@ -1575,7 +1575,7 @@ async fn indexer_configuration_exhaustion_preflights_all_keys_and_rolls_back_aut
             .await
             .unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 18); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+        assert_eq!(before.len(), 20); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -1673,12 +1673,12 @@ async fn indexer_capability_gaps_are_reported_per_domain_from_eligible_scopes() 
 }
 
 // Binding marker tests retain all eighteen migration seeds (Reasoning: 0050 raises the
-// registry from fourteen to eighteen; every sibling check is still compared so a stray marker fails).
+// registry from eighteen to twenty; every sibling check is still compared so a stray marker fails).
 #[tokio::test]
 async fn indexer_client_marker_scoped_transaction_and_rollback() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 18); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+    assert_eq!(initial.len(), 20); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(
             indexer_client_configuration_changed(&c, media)
@@ -1790,7 +1790,7 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         .unwrap();
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES(?,'indexer_download_client',1,1,?,'IndexerDownloadClientCheck')",params![scope,MAX_INTEGER]).await.unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 18); // Reasoning: 0050 adds four scoped indexer backoff checks; all eighteen registry members remain covered.
+        assert_eq!(before.len(), 20); // Reasoning: 0051 adds two client backoff checks; all twenty registry members remain covered.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -2130,4 +2130,207 @@ async fn indexer_backoff_exhausted_health_generation_retains_authority_and_expir
         lifecycle(&c).await.unwrap().schedule_error.as_deref(),
         Some("health_invariant")
     );
+}
+
+fn client_backoff_identity(scope: HealthScope) -> HealthIdentity {
+    HealthIdentity {
+        scope,
+        check_key: "download_client_backoff".into(),
+    }
+}
+async fn client_backoff_facts(c: &Connection, until: i64) {
+    c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until,next_health_at) SELECT p.id,s.media_type,p.revision,1,100,150,?1,?1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation='qbittorrent'",[until]).await.unwrap();
+}
+#[tokio::test]
+async fn client_backoff_health_counts_domains_enabled_clients_and_exact_expiry() {
+    let (_scratch, _db, c) = fixture_all().await;
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        assert!(
+            client_backoff::evaluate(&c, &client_backoff_identity(scope), 200)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    communication_client(&c, "https://private.example.invalid").await;
+    client_backoff_facts(&c, 300).await;
+    communication_client(&c, "https://healthy.example.invalid").await;
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        let issue = client_backoff::evaluate(&c, &client_backoff_identity(scope), 299)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.severity, HealthSeverity::Warning);
+        assert!(!issue.message.contains("example.invalid"));
+        assert_eq!(issue.compatibility_type, "DownloadClientStatusCheck");
+        assert!(
+            client_backoff::evaluate(&c, &client_backoff_identity(scope), 300)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    c.execute(
+        "UPDATE providers SET enabled=0,revision=revision+1 WHERE endpoint='https://healthy.example.invalid'",
+        (),
+    )
+    .await
+    .unwrap();
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        assert_eq!(
+            client_backoff::evaluate(&c, &client_backoff_identity(scope), 299)
+                .await
+                .unwrap()
+                .unwrap()
+                .severity,
+            HealthSeverity::Error
+        );
+    }
+    c.execute("UPDATE download_client_status SET disabled_until=NULL,next_health_at=NULL WHERE media_type='tv'",()).await.unwrap();
+    assert!(
+        client_backoff::evaluate(&c, &client_backoff_identity(HealthScope::Tv), 200)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client_backoff::evaluate(&c, &client_backoff_identity(HealthScope::Movies), 200)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+#[tokio::test]
+async fn client_backoff_expiry_rejects_stale_publication_and_survives_rollback() {
+    let (_scratch, _db, c) = fixture_all().await;
+    c.execute(
+        "DELETE FROM health_checks WHERE check_key!='download_client_backoff'",
+        (),
+    )
+    .await
+    .unwrap();
+    communication_client(&c, "https://example.invalid").await;
+    client_backoff_facts(&c, 200).await;
+    init(&c, 100).await;
+    let id = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, id, 100).await;
+    let mut results = Vec::new();
+    for member in &cmd.members {
+        results.push(
+            client_backoff::evaluate(&c, &member.identity, 199)
+                .await
+                .unwrap(),
+        );
+    }
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    client_backoff_expiry(&tx, 200).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM download_client_status WHERE next_health_at=200"
+        )
+        .await,
+        2
+    );
+    publish(&c, &cmd, Ok(results), 200).await.unwrap();
+    assert_eq!(
+        read(&c, id).await.unwrap().error_code.as_deref(),
+        Some("stale_inputs")
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE severity IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&c,"SELECT count(*) FROM download_client_status WHERE next_health_at IS NULL AND escalation_level=1").await,2);
+    let before = count(&c, "SELECT sum(generation) FROM health_checks").await;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    client_backoff_expiry(&tx, 201).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        count(&c, "SELECT sum(generation) FROM health_checks").await,
+        before
+    );
+    let next = admit(&c, HealthScope::All, 201).await;
+    let cmd = take(&c, next, 201).await;
+    publish(&c, &cmd, Ok(vec![None, None]), 201).await.unwrap();
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE severity=0 AND checked_at=201"
+        )
+        .await,
+        2
+    );
+}
+#[tokio::test]
+async fn client_backoff_marker_exhaustion_preserves_authority_and_expiry() {
+    let (_scratch, _db, c) = fixture_all().await;
+    communication_client(&c, "https://example.invalid").await;
+    client_backoff_facts(&c, 200).await;
+    // Seed exhaustion before membership exists; normal updates must advance only one generation.
+    c.execute(
+        "DELETE FROM health_checks WHERE check_key='download_client_backoff'",
+        (),
+    )
+    .await
+    .unwrap();
+    for scope in ["tv", "movies"] {
+        c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES(?,'download_client_backoff',1,1,9007199254740991,'DownloadClientStatusCheck')",[scope]).await.unwrap();
+    }
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    client_backoff_changed(&tx, MediaDomain::Tv).await.unwrap();
+    client_backoff_expiry(&tx, 200).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM download_client_status WHERE next_health_at=200 AND escalation_level=1").await,2);
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_lifecycle WHERE schedule_error='health_invariant'"
+        )
+        .await,
+        1
+    );
+    assert!(client_backoff_changed(&c, MediaDomain::Tv).await.is_err());
+}
+
+#[tokio::test]
+async fn client_backoff_publication_settles_from_fresh_outcomes() {
+    let (_scratch, _db, c) = fixture_all().await;
+    c.execute(
+        "DELETE FROM health_checks WHERE check_key!='download_client_backoff'",
+        (),
+    )
+    .await
+    .unwrap();
+    init(&c, 100).await;
+    let id = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, id, 100).await;
+    // A previous failed read is superseded by the authoritative transaction-time local read.
+    publish_outcomes(
+        &c,
+        &cmd,
+        vec![Err("check_timeout"), Err("check_timeout")],
+        101,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read(&c, id).await.unwrap().status,
+        CommandStatus::Succeeded
+    ));
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE severity=0 AND last_error IS NULL AND due_at IS NULL").await,2);
 }
