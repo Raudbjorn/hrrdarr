@@ -451,12 +451,11 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             serde_json::to_value(&report.unsupported)?
         );
         // One marker for each affected class key, not once per imported indexer.
-        // Reasoning: per domain the commit marks the indexer class once (search, RSS and the 0049 binding
-        // check = 3 keys) and the download-client class once (CDH, communication and root folder = 3 keys),
-        // so 6 generations in total; the pre-0048/0049 expectation of 3 counted only CDH, communication and binding.
+        // Reasoning: 0050 adds two indexer health keys; one indexer class mark now advances five keys,
+        // and one client class mark advances three, for eight generations in the imported domain.
         assert_eq!(
             scalar(&c, "SELECT sum(generation) FROM health_checks").await,
-            before + 6
+            before + 8
         );
         let row=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='DownloadClients' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},report.fingerprint.clone()]).await?.next().await?.unwrap();
         let client: String = row.get(0)?;

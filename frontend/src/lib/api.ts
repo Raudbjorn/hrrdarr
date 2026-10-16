@@ -284,6 +284,30 @@ const healthScope = (scope:HealthScope) => ['all','tv','movies','system'].includ
 const healthOffset = (value:number,max:number) => Number.isSafeInteger(value)&&value>=0&&value<=max;
 const invalidHealth = <T>():Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid health scope, identifier or pagination.'});
 export const getHealth = (scope:HealthScope='all',offset=0) => healthScope(scope)&&healthOffset(offset,127)?request<HealthSnapshot>(`/api/v1/health?${new URLSearchParams({scope,limit:'16',offset:String(offset)})}`,undefined,undefined,true):invalidHealth<HealthSnapshot>();
+export type HealthRequestObservation = {epoch:string;checks:HealthSnapshot['checks']};
+const healthIdentity = (value:HealthSnapshot['coverage']['identities'][number]) => `${value.scope}:${value.check_key}`;
+export async function getHealthRequestObservation(first?:HealthSnapshot):Promise<Result<HealthRequestObservation>> {
+  const initial=first?{ok:true as const,data:first}:await getHealth();
+  if(!initial.ok)return initial;
+  const start=initial.data;
+  const incomplete=()=>({ok:false as const,error:'Requested check observations are incomplete or changed while reading; refresh again.'});
+  if(!Number.isInteger(start.total)||start.total<0||start.total>128||start.offset!==0||start.limit!==16||!Array.isArray(start.checks)||!Array.isArray(start.coverage?.identities)||typeof start.lifecycle?.epoch!=='string')return incomplete();
+  const registry=start.coverage.identities.map(healthIdentity);
+  if(registry.length!==start.total||new Set(registry).size!==registry.length)return incomplete();
+  const pages=await Promise.all(Array.from({length:Math.max(0,Math.ceil(start.total/16)-1)},(_,n)=>getHealth('all',(n+1)*16)));
+  const checks=[...start.checks];
+  for(const [index,page] of pages.entries()){
+    if(!page.ok)return page;
+    const value=page.data;
+    if(!Array.isArray(value.checks)||!Array.isArray(value.coverage?.identities)||value.lifecycle?.epoch!==start.lifecycle.epoch||value.total!==start.total||value.offset!==(index+1)*16||value.limit!==16||JSON.stringify(value.coverage.identities.map(healthIdentity))!==JSON.stringify(registry))return incomplete();
+    checks.push(...value.checks);
+  }
+  if(checks.length!==registry.length||checks.some((check,index)=>healthIdentity(check.identity)!==registry[index]))return incomplete();
+  return {ok:true,data:{epoch:start.lifecycle.epoch,checks}};
+}
+export function healthRequestObserved(admission:HealthAdmission,observation:HealthRequestObservation|null,epoch:string):boolean {
+  return !!observation&&observation.epoch===epoch&&admission.selection.every(token=>observation.checks.some(check=>healthIdentity(check.identity)===healthIdentity(token.identity)&&check.observed_generation!==null&&check.observed_generation>=token.generation&&check.observed_epoch===epoch&&check.evaluation==='current'&&!check.last_error));
+}
 export const createHealthCommand = (scope:HealthScope) => healthScope(scope)?request<HealthAdmission>('/api/v1/health/commands',{scope,priority:'normal'},'POST',true):invalidHealth<HealthAdmission>();
 export const listHealthCommands = (scope:HealthScope='all',offset=0,status:CommandStatus|''='') => {
   if(!healthScope(scope)||!healthOffset(offset,128)||!['','queued','running','retry_wait','succeeded','failed','cancelled'].includes(status))return invalidHealth<ApiPage<HealthCommand>>();

@@ -970,7 +970,12 @@ async fn failed_continuation_never_exposes_or_selects_partial_results() {
     let (base, server, client) = app(db.clone()).await;
     let (indexer, download) = providers(&base, &remote_base).await;
     let runtime = commands::start(db, client).await.unwrap();
+    let test_route = format!("/api/v1/providers/{}/test", indexer["id"].as_str().unwrap());
     for mode in ["automatic", "interactive"] {
+        // Durable backoff now gates retries; a successful real Test on page zero recovers
+        // the provider while continuation requests still fail, preserving this test's intent.
+        let (status, tested) = request(&base, "POST", &test_route, Value::Null).await;
+        assert_eq!(status, 200, "{tested}");
         let (code, command) = request(
             &base,
             "POST",
@@ -979,7 +984,57 @@ async fn failed_continuation_never_exposes_or_selects_partial_results() {
         )
         .await;
         assert_eq!(code, 202, "{command}");
-        let done = settled(&base, &command["id"]).await;
+        let mut recovered_attempt = 0;
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (status, row) = request(
+                    &base,
+                    "GET",
+                    &format!(
+                        "/api/v1/search/commands/{}",
+                        command["id"].as_str().unwrap()
+                    ),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(status, 200, "{row}");
+                if matches!(
+                    row["status"].as_str(),
+                    Some("succeeded" | "failed" | "cancelled")
+                ) {
+                    break row;
+                }
+                let attempt = row["attempts"].as_u64().unwrap();
+                if row["status"] == "retry_wait" && attempt > recovered_attempt {
+                    assert_eq!(
+                        attempt,
+                        recovered_attempt + 1,
+                        "every failed attempt is observed"
+                    );
+                    assert_eq!(row["error_code"], "provider_unavailable", "{row}");
+                    assert_eq!(row["fetch_complete"], false);
+                    assert!(row["selected_candidate_id"].is_null());
+                    assert!(
+                        offers(&base, &command["id"]).await.is_empty(),
+                        "partial results stay private during retries"
+                    );
+                    let (status, tested) = request(&base, "POST", &test_route, Value::Null).await;
+                    assert_eq!(status, 200, "{tested}");
+                    recovered_attempt = attempt;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("continuation failures settle after bounded Test recovery");
+        assert_eq!(
+            recovered_attempt, 2,
+            "both retries recovered through saved Test"
+        );
+        assert_eq!(
+            done["attempts"], 3,
+            "original bounded search retry policy is unchanged"
+        );
         assert_eq!(done["status"], "failed", "{done}");
         assert_eq!(
             done["error_code"], "provider_unavailable",

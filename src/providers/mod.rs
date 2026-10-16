@@ -5,6 +5,7 @@ mod credentials;
 pub mod draft;
 pub mod http;
 pub mod indexer;
+mod indexer_backoff;
 pub mod qbittorrent;
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
@@ -43,7 +44,7 @@ impl IntoResponse for Error {
                 [(axum::http::header::RETRY_AFTER, seconds.to_string())],
                 Json(ApiErrorEnvelope::new(
                     "rate_limited",
-                    "Provider is rate limited; retry after the indicated interval",
+                    "Provider is temporarily unavailable; retry after the indicated interval",
                 )),
             )
                 .into_response(),
@@ -1095,24 +1096,34 @@ impl RefreshClient {
             .as_ref()
             .map_err(|e| refresh_error(http_error(*e).0))?;
         let operation = transport
-            .operation(provider.id)
+            .indexer_operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
+            indexer_backoff::admit(&context.db, &provider, indexer_backoff::domain(request))
+                .await
+                .map_err(refresh_error)?;
             let result = indexer::raw_search(
                 &operation,
                 &provider.settings,
                 &IndexerAccess::from_credentials(&credentials),
                 request,
             )
-            .await
-            .map_err(|e| refresh_error(indexer_error(e, &operation).0));
+            .await;
             current_revision(&context.db, &provider)
                 .await
                 .map_err(refresh_error)?;
             operation
                 .ensure_active()
                 .map_err(|e| refresh_error(http_error(e).0))?;
-            result
+            indexer_backoff::record(
+                &context.db,
+                &provider,
+                indexer_backoff::domain(request),
+                indexer_backoff::observation(&result),
+            )
+            .await
+            .map_err(refresh_error)?;
+            result.map_err(|e| refresh_error(indexer_error(e, &operation).0))
         };
         tokio::time::timeout_at(operation.deadline(), work)
             .await
@@ -2059,6 +2070,7 @@ async fn record_test(
     db: &Database,
     provider: &Provider,
     code: Option<&'static str>,
+    indexer_observation: Option<(indexer_backoff::Observation, Option<MediaDomain>)>,
 ) -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2092,6 +2104,15 @@ async fn record_test(
                             Error::Plain(e.0, e.1, "Health observation could not be recorded")
                         })?;
                 }
+            }
+        }
+    }
+    if let Some((observation, failed_domain)) = indexer_observation {
+        for media in [MediaDomain::Tv, MediaDomain::Movies] {
+            if indexer_backoff::has_scope(&provider.settings, media)
+                && failed_domain.is_none_or(|domain| domain == media)
+            {
+                indexer_backoff::apply(&tx, provider, media, Some(observation), tested_at).await?;
             }
         }
     }
@@ -2141,15 +2162,41 @@ async fn run_test(
         .as_ref()
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
-    let operation = transport
-        .operation(provider.id)
-        .map_err(|e| http_error(e).0)?;
+    let is_indexer = !matches!(provider.settings, ProviderSettings::Qbittorrent { .. });
+    let operation = if is_indexer {
+        transport.indexer_operation(provider.id)
+    } else {
+        transport.operation(provider.id)
+    }
+    .map_err(|e| http_error(e).0)?;
     let work = async {
-        let result = probe(&operation, &provider.settings, &credentials).await;
+        let (result, observation) = if is_indexer {
+            let scoped = indexer::test_with_scope(
+                &operation,
+                &provider.settings,
+                &IndexerAccess::from_credentials(&credentials),
+            )
+            .await;
+            let failed_domain = scoped.as_ref().err().and_then(|(_, domain)| *domain);
+            let result = scoped.map_err(|(error, _)| error);
+            let observation =
+                indexer_backoff::observation(&result).map(|value| (value, failed_domain));
+            (
+                result
+                    .map(ProviderTestOutcome::Indexer)
+                    .map_err(|error| indexer_error(error, &operation)),
+                observation,
+            )
+        } else {
+            (
+                probe(&operation, &provider.settings, &credentials).await,
+                None,
+            )
+        };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
-                let tested_at = record_test(&context.db, &provider, None).await?;
+                let tested_at = record_test(&context.db, &provider, None, observation).await?;
                 bounded(ProviderTestResult {
                     provider_id: provider.id,
                     revision: provider.revision,
@@ -2159,7 +2206,7 @@ async fn run_test(
             }
             Err(error) => {
                 let (error, code) = error;
-                record_test(&context.db, &provider, Some(code)).await?;
+                record_test(&context.db, &provider, Some(code), observation).await?;
                 Err(error)
             }
         }
@@ -2196,9 +2243,10 @@ async fn search(
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
     let operation = transport
-        .operation(provider.id)
+        .indexer_operation(provider.id)
         .map_err(|e| http_error(e).0)?;
     let work = async {
+        indexer_backoff::admit(&context.db, &provider, indexer_backoff::domain(&input)).await?;
         let result = indexer::search(
             &operation,
             &provider.settings,
@@ -2208,6 +2256,13 @@ async fn search(
         .await;
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         current_revision(&context.db, &provider).await?;
+        indexer_backoff::record(
+            &context.db,
+            &provider,
+            indexer_backoff::domain(&input),
+            indexer_backoff::observation(&result),
+        )
+        .await?;
         bounded(ProviderSearchResult {
             provider_id: provider.id,
             revision: provider.revision,

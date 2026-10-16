@@ -181,6 +181,7 @@ struct ProviderObservations(
     AtomicU8,
     AtomicU8,
     Mutex<Vec<serde_json::Value>>,
+    AtomicU8,
 );
 async fn mode(
     State(state): State<Arc<ProviderObservations>>,
@@ -194,6 +195,19 @@ async fn mode(
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+// Independent indexer fault control keeps existing download-client fixture modes unchanged.
+async fn indexer_mode(
+    State(state): State<Arc<ProviderObservations>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let value = match query.get("mode").map(String::as_str) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    state.4.store(value, Ordering::SeqCst);
     StatusCode::NO_CONTENT
 }
 async fn processing_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCode {
@@ -293,6 +307,14 @@ async fn provider_mock(
         }
     }
     if matches!(uri.path(), "/torznab" | "/newznab") {
+        if state.4.load(Ordering::SeqCst) == 1 {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "600")],
+                "PRIVATE_FIXTURE_INDEXER_FAILURE",
+            )
+                .into_response();
+        }
         if query.get("t").is_some_and(|v| v == "caps") {
             return ([("content-type","application/xml")],r#"<caps><limits max="100" default="10"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,tvdbid,season,ep"/><movie-search available="yes" supportedParams="q,tmdbid,imdbid"/></searching><categories><category id="5030"/><category id="5070"/><category id="2000"/></categories></caps>"#).into_response();
         }
@@ -709,6 +731,7 @@ async fn library_ui_fixture() {
         Router::new()
             .route("/fixture-observations", get(observations))
             .route("/fixture-mode", post(mode))
+            .route("/fixture-indexer-mode", post(indexer_mode))
             .route("/fixture-processing", post(processing_mode))
             .route("/fixture-search", post(search_mode))
             .route("/fixture-completed", get(completed_observations))

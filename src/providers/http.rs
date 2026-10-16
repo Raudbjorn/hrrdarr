@@ -97,6 +97,17 @@ impl HttpClient {
         })
     }
     pub fn operation(&self, id: Uuid) -> Result<HttpOperation<'_>, HttpError> {
+        self.acquire_operation(id, false)
+    }
+    /// Saved indexers enforce scoped, revision-fenced cooldown in durable storage.
+    pub(super) fn indexer_operation(&self, id: Uuid) -> Result<HttpOperation<'_>, HttpError> {
+        self.acquire_operation(id, true)
+    }
+    fn acquire_operation(
+        &self,
+        id: Uuid,
+        persisted_backoff: bool,
+    ) -> Result<HttpOperation<'_>, HttpError> {
         let global = self
             .gate
             .clone()
@@ -142,7 +153,10 @@ impl HttpClient {
                 .lock()
                 .map_err(|_| HttpError::LocalUnavailable { timeout: false })?;
             state.used = now;
-            if let Some(until) = state.cooldown.filter(|until| *until > now) {
+            if let Some(until) = state
+                .cooldown
+                .filter(|until| !persisted_backoff && *until > now)
+            {
                 return Err(HttpError::RateLimited {
                     retry_after_seconds: Some(
                         until

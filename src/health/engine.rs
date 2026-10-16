@@ -144,6 +144,7 @@ pub(crate) async fn sweep(c: &Connection, timestamp: i64) -> Result<()> {
     if life.started_at == 0 {
         return Ok(());
     }
+    indexer_status_expiry(c, timestamp).await?;
     let scheduled = if life.next_scheduled_at <= timestamp {
         selection(c, HealthScope::All, "scheduled=1").await?
     } else {
@@ -491,6 +492,10 @@ async fn evaluate(
     match member.identity.check_key.as_str() {
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
+        "indexer_status" | "indexer_failures" => {
+            indexers::evaluate_status(db, &member.identity, now().map_err(|_| "check_failed")?)
+                .await
+        }
         "indexer_download_client" => {
             Ok(crate::health_detectors::evaluate_indexer_client(db, domain)
                 .await?

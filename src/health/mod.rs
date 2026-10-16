@@ -356,8 +356,66 @@ pub(crate) async fn indexer_configuration_changed(
         MediaDomain::Tv => HealthScope::Tv,
         MediaDomain::Movies => HealthScope::Movies,
     };
-    let keys = selection(c, scope, "check_key IN ('indexer_search','indexer_rss')").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('indexer_search','indexer_rss','indexer_status','indexer_failures')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
+}
+/// Backoff authority and its invalidation commit together; repeated failures cannot postpone work.
+pub(crate) async fn indexer_status_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    indexer_status_at(c, scope, now()?).await.map(|_| ())
+}
+async fn indexer_status_at(c: &Connection, scope: HealthScope, timestamp: i64) -> Result<bool> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('indexer_status','indexer_failures')",
+    )
+    .await?;
+    if keys.len() != 2 {
+        return Err(invariant());
+    }
+    if keys.iter().any(|key| key.generation >= MAX_INTEGER) {
+        c.execute(
+            "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1",
+            (),
+        )
+        .await?;
+        return Ok(false);
+    }
+    for key in keys {
+        if c.execute("UPDATE health_checks SET generation=generation+1,due_at=CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END,pending_reasons=pending_reasons|8 WHERE scope=? AND check_key=? AND generation=?",params![timestamp,timestamp,scope.text(),key.identity.check_key,key.generation]).await? != 1 { return Err(invariant()); }
+    }
+    Ok(true)
+}
+
+/// Consume each time boundary once, independently of health batch cancellation/publication.
+async fn indexer_status_expiry(c: &Connection, timestamp: i64) -> Result<()> {
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        let due = c
+            .query(
+                "SELECT 1 FROM indexer_status WHERE media_type=? AND next_health_at<=? LIMIT 1",
+                params![scope.text(), timestamp],
+            )
+            .await?
+            .next()
+            .await?
+            .is_some();
+        if due && indexer_status_at(c, scope, timestamp).await? {
+            c.execute("UPDATE indexer_status SET next_health_at=CASE WHEN disabled_until>? THEN disabled_until ELSE NULL END WHERE media_type=? AND next_health_at<=?",params![timestamp,scope.text(),timestamp]).await?;
+        }
+    }
+    Ok(())
 }
 /// Indexer download-client bindings are evaluated separately from search/RSS capability checks.
 /// The caller deduplicates affected referencing domains in the authoritative mutation transaction.

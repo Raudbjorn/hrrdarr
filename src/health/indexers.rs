@@ -3,6 +3,69 @@ use super::{HealthIdentity, HealthIssue, HealthScope, HealthSeverity};
 use crate::db::Database;
 use libsql::{TransactionBehavior, params};
 
+const PERSISTENT_FAILURE_SECONDS: i64 = 6 * 60 * 60;
+
+pub(super) async fn evaluate_status(
+    db: &Database,
+    identity: &HealthIdentity,
+    timestamp: i64,
+) -> Result<Option<HealthIssue>, &'static str> {
+    let (media, app) = match identity.scope {
+        HealthScope::Tv => ("tv", "sonarr"),
+        HealthScope::Movies => ("movies", "radarr"),
+        _ => return Err("check_failed"),
+    };
+    let persistent = match identity.check_key.as_str() {
+        "indexer_status" => false,
+        "indexer_failures" => true,
+        _ => return Err("check_failed"),
+    };
+    let c = db.connect().await.map_err(|_| "storage_error")?;
+    let row = c.query(
+        "SELECT count(*),COALESCE(sum(CASE WHEN b.disabled_until>?2 AND ((?2-b.initial_failure_at>=?3)=?4) THEN 1 ELSE 0 END),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id LEFT JOIN indexer_status b ON b.provider_id=p.id AND b.media_type=s.media_type AND b.config_revision=p.revision WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?1 AND (s.enable_rss=1 OR s.enable_automatic_search=1 OR s.enable_interactive_search=1)",
+        params![media,timestamp,PERSISTENT_FAILURE_SECONDS,persistent],
+    ).await.map_err(|_| "storage_error")?.next().await.map_err(|_| "storage_error")?.ok_or("check_failed")?;
+    let total: i64 = row.get(0).map_err(|_| "storage_error")?;
+    let unavailable: i64 = row.get(1).map_err(|_| "storage_error")?;
+    if total < 0 || unavailable < 0 || unavailable > total {
+        return Err("check_failed");
+    }
+    if unavailable == 0 {
+        return Ok(None);
+    }
+    let (reason, message, compatibility, anchor) = if persistent {
+        (
+            "indexers_persistent_failures",
+            format!(
+                "{unavailable} of {total} enabled indexers are unavailable after failures lasting at least six hours. Check the connection and credentials, then Test the provider."
+            ),
+            "IndexerLongTermStatusCheck",
+            "indexers-are-unavailable-due-to-failures",
+        )
+    } else {
+        (
+            "indexers_temporary_backoff",
+            format!(
+                "{unavailable} of {total} enabled indexers are temporarily unavailable after recent failures. They become available when the retry delay expires or a provider Test succeeds."
+            ),
+            "IndexerStatusCheck",
+            "indexers-are-unavailable-due-to-failures",
+        )
+    };
+    Ok(Some(HealthIssue {
+        identity: identity.clone(),
+        severity: if unavailable == total {
+            HealthSeverity::Error
+        } else {
+            HealthSeverity::Warning
+        },
+        reason: reason.into(),
+        message,
+        wiki_url: format!("https://wiki.servarr.com/{app}/system#{anchor}"),
+        compatibility_type: compatibility.into(),
+    }))
+}
+
 /// Counts use the same eligibility predicate as command admission: master enable,
 /// native implementation and the domain scope's per-operation flag.
 const COUNTS: &str = "SELECT count(*),COALESCE(sum(s.enable_rss),0),COALESCE(sum(s.enable_automatic_search),0),COALESCE(sum(s.enable_interactive_search),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?";

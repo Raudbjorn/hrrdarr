@@ -33,8 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Migration46 adds removed metadata per domain; wait for all fourteen current checks (0048 adds the indexer pair and 0049 the binding check per domain).
-            if v["summary"]["current"] == 14 {
+            // Reasoning: 0050 adds indexer_status and indexer_failures per domain; all eighteen checks must settle.
+            if v["summary"]["current"] == 18 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -64,9 +64,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    // Migration46 adds removed metadata to CDH, communication and roots in each domain.
-    // Reasoning: 0048 adds indexer_search and indexer_rss and 0049 indexer_download_client per domain, so the fresh registry has fourteen identities (was 12 at schema48, 8 before).
-    assert_eq!(fresh["summary"]["never_run"], 14);
+    // Reasoning: 0050 adds indexer_status and indexer_failures per domain to the fourteen existing identities.
+    assert_eq!(fresh["summary"]["never_run"], 18);
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -87,15 +86,30 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
                 "download_client_communication",
                 "download_client_root_folder",
                 "indexer_download_client",
+                "indexer_failures",
                 "indexer_rss",
                 "indexer_search",
+                "indexer_status",
                 "removed_metadata",
             ]
             .into_iter()
             .map(move |key| (scope.to_owned(), key.to_owned()))
         })
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(identities(&fresh["checks"]), expected);
+    // Reasoning: eighteen identities now span two sixteen-row API pages; assert both pages exactly.
+    let (_, second_page) = request(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/api/v1/health?offset=16",
+        None,
+    )
+    .await;
+    assert_eq!(fresh["checks"].as_array().unwrap().len(), 16);
+    assert_eq!(second_page["checks"].as_array().unwrap().len(), 2);
+    let mut actual = identities(&fresh["checks"]);
+    actual.extend(identities(&second_page["checks"]));
+    assert_eq!(actual, expected);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -165,9 +179,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Admission includes all four identities per domain, not only a larger count.
-    // Reasoning: seven identities per domain after 0049 (indexer_search/indexer_rss from 0048 and indexer_download_client); the union is fourteen.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 14);
+    // Reasoning: 0050 adds two identities per domain; compare all eighteen admitted identities as well as their count.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 18);
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -549,7 +562,7 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            if v["summary"]["current"] == 14 && issues(&v).is_empty() {
+            if v["summary"]["current"] == 18 && issues(&v).is_empty() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

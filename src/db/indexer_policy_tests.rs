@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 49); // Reasoning: the runner upgrades the schema47 predecessor through 0048 and on to latest 0049 (indexer client binding).
+    assert_eq!(version(&c).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -148,7 +148,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
             ]
         );
     }
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Reasoning: schema47 predecessor holds 8 health_checks rows; 0048 adds 4 indexer search/rss checks and 0049 adds 2 indexer_download_client checks.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 18); // Reasoning: 0050 adds four backoff identities (14 -> 18).
     // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
     assert_eq!(
         rows(&c, "SELECT * FROM health_checks ORDER BY rowid LIMIT 8").await?,
@@ -237,8 +237,8 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
     }
     let tx = c.transaction().await?;
-    for i in 0..114
-    /* Reasoning: 14 registry rows exist at schema49 (was 12 at schema48), so 114 fixtures fill the 128 cap */
+    for i in 0..110
+    /* Reasoning: 0050 gives 18 registry rows, so 110 fixtures fill the 128 cap */
     {
         tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'fixture')",[format!("fixture_{i}")]).await?;
     }
@@ -250,7 +250,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(rows(&c, policy_sql).await?, policies);
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Reasoning: 14 health rows at schema49 (was 12 at schema48).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 18); // Reasoning: 0050 adds four backoff identities (14 -> 18).
     c.execute("DELETE FROM providers WHERE id=?", [torznab.clone()])
         .await?;
     assert_eq!(
@@ -268,14 +268,14 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 49); // Reasoning: latest migration is 0049 indexer client binding (was 48).
+    assert_eq!(version(&fresh.connect().await?).await?, 50); // Reasoning: the runner now includes 0050; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
             "SELECT count(*) FROM health_checks"
         )
         .await?,
-        14 // Reasoning: fresh schema49 registry has 14 rows (12 at schema48).
+        18 // Reasoning: 0050 adds four backoff identities (14 -> 18).
     );
     Ok(())
 }

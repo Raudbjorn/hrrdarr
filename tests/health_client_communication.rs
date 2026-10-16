@@ -452,6 +452,13 @@ async fn unreadable_credentials_invalid_configuration_and_provider_bound_are_une
     let (status, indexer) = request(&api, "POST", "/api/v1/providers", indexer).await;
     assert_eq!(status, 201);
     let before = generations(&db).await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let started_at = now();
     assert_ne!(
         request(
             &api,
@@ -463,10 +470,32 @@ async fn unreadable_credentials_invalid_configuration_and_provider_bound_are_une
         .0,
         200
     );
+    let completed_at = now();
+    let after = generations(&db).await;
+    let mut expected = before;
+    // Reasoning: 0050 records this TV-only indexer's failed Test in exactly two backoff
+    // checks; every client, movie and unrelated indexer identity must remain unchanged.
+    for key in ["indexer_status", "indexer_failures"] {
+        let old = expected
+            .iter_mut()
+            .find(|row| row.0 == "tv" && row.1 == key)
+            .unwrap();
+        let actual = after
+            .iter()
+            .find(|row| row.0 == "tv" && row.1 == key)
+            .unwrap();
+        let due = actual
+            .3
+            .expect("failed Test must schedule immediate status health");
+        // Immediate means within this request, or an already-earlier due time; never debounce it later.
+        let prior_due = old.3.unwrap_or(i64::MAX);
+        assert!((started_at.min(prior_due)..=completed_at.min(prior_due)).contains(&due));
+        old.2 += 1;
+        old.3 = Some(due);
+    }
     assert_eq!(
-        generations(&db).await,
-        before,
-        "indexer test outcome cannot dirty download-client checks"
+        after, expected,
+        "only the two scoped backoff checks may change"
     );
     assert_eq!(
         evaluate_communication(&db, &client, MediaDomain::Tv)

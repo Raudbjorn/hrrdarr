@@ -1955,44 +1955,62 @@ pub async fn test(
     settings: &ProviderSettings,
     access: &IndexerAccess<'_>,
 ) -> Result<IndexerTest> {
+    test_with_scope(operation, settings, access)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// A shared caps failure applies to all configured scopes; a feed failure belongs to its domain.
+pub(crate) async fn test_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<IndexerTest, (IndexerError, Option<MediaDomain>)> {
     if !access.validate() {
-        return Err(IndexerError::InvalidRequest);
+        return Err((IndexerError::InvalidRequest, None));
     }
-    let (endpoint, torrent) = endpoint(settings)?;
-    let caps = capabilities(operation, endpoint, access.api_key).await?;
-    let (tv, movies) = scopes(settings)?;
+    let (endpoint, torrent) = endpoint(settings).map_err(|e| (e, None))?;
+    let caps = capabilities(operation, endpoint, access.api_key)
+        .await
+        .map_err(|e| (e, None))?;
+    let (tv, movies) = scopes(settings).map_err(|e| (e, None))?;
     let mut domains = vec![];
     for domain in tv
         .map(|_| MediaDomain::Tv)
         .into_iter()
         .chain(movies.map(|_| MediaDomain::Movies))
     {
-        let plan = plan_search(
-            settings,
-            &caps,
-            &IndexerSearch::Rss {
-                media_type: domain,
-                offset: 0,
-                query_index: 0,
-                limit: 1,
-            },
-        )?;
-        cooldown(
-            operation,
-            parse_page(
-                &fetch(
-                    operation,
-                    endpoint,
-                    access.api_key,
-                    private_parameters(access, domain, plan.parameters),
-                )
-                .await?,
-                0,
-                plan.limit,
-                torrent,
-                domain,
-            ),
-        )?;
+        let result: Result<()> = async {
+            let plan = plan_search(
+                settings,
+                &caps,
+                &IndexerSearch::Rss {
+                    media_type: domain,
+                    offset: 0,
+                    query_index: 0,
+                    limit: 1,
+                },
+            )?;
+            cooldown(
+                operation,
+                parse_page(
+                    &fetch(
+                        operation,
+                        endpoint,
+                        access.api_key,
+                        private_parameters(access, domain, plan.parameters),
+                    )
+                    .await?,
+                    0,
+                    plan.limit,
+                    torrent,
+                    domain,
+                ),
+            )?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error| (error, Some(domain)))?;
         domains.push(domain);
     }
     Ok(IndexerTest {
