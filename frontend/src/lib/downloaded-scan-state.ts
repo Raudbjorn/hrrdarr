@@ -3,7 +3,7 @@
 import type { Result } from './api';
 import type {
   CommandPriority, CommandStatus, DownloadedScanCommand, DownloadedScanInput, MediaDomain,
-  ScanChild, ScanChildResumeInput, ScanMode, ScanPhase,
+  ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupResumeInput, ScanCoverage, ScanMode, ScanPhase,
 } from './api.generated';
 
 export const SCAN_PENDING_KEY = 'hrrdarr.downloaded-scan.pending.v1';
@@ -24,7 +24,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MODES: readonly ScanMode[] = ['auto', 'move', 'copy'];
 const PRIORITIES: readonly CommandPriority[] = ['normal', 'high'];
 const STATUSES: readonly CommandStatus[] = ['queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled'];
-const PHASES: readonly ScanPhase[] = ['queued', 'inventory', 'awaiting_import', 'importing', 'recovery_required', 'settled'];
+const PHASES: readonly ScanPhase[] = ['queued', 'inventory', 'waiting_predecessor', 'awaiting_import', 'importing', 'recovery_required', 'cleanup', 'settled'];
 const TERMINAL: readonly CommandStatus[] = ['succeeded', 'failed', 'cancelled'];
 
 export type ScanForm = { path: string; mode: ScanMode; priority: CommandPriority };
@@ -208,6 +208,17 @@ export function resumeFailureMessage(result: Failure): string {
   }
 }
 
+export function cleanupResumeFailureMessage(result: Failure): string {
+  switch (result.code) {
+    case 'downloaded_scan_cleanup_resume_generation':
+      return 'The cleanup changed since it was read; another recovery may already have been accepted. Refresh before trying again.';
+    case 'downloaded_scan_cleanup_resume_not_required': return 'The source-folder cleanup no longer needs recovery. Refresh to read its state.';
+    case 'downloaded_scan_cleanup_resume_conflict': return 'The scan no longer matches this cleanup request. Refresh before trying again.';
+    case 'import_busy': return 'An import is running. Try the cleanup recovery again after it finishes.';
+    default: return result.error;
+  }
+}
+
 /** Library owners whose files changed; null means the bounded read could not prove the set. */
 export function completionOwners(domain: MediaDomain, imported: readonly ScanChild[], total: number): number[] | null {
   if (total > imported.length) return null;
@@ -221,9 +232,44 @@ export function completionOwners(domain: MediaDomain, imported: readonly ScanChi
 }
 
 const PHASE_TEXT: Record<ScanPhase, string> = {
-  queued: 'Queued', inventory: 'Discovering files', awaiting_import: 'Waiting to import', importing: 'Importing',
-  recovery_required: 'Needs explicit recovery', settled: 'Finished',
+  queued: 'Queued', inventory: 'Discovering files', waiting_predecessor: 'Waiting for the tracked download\'s own import',
+  awaiting_import: 'Waiting to import', importing: 'Importing', recovery_required: 'Needs explicit recovery',
+  cleanup: 'Cleaning up emptied source folders', settled: 'Finished',
 };
+
+const CLEANUP_REASON: Record<string, string> = {
+  unimported_media: 'media files that were not imported remain', unknown_leftovers: 'other files or folders remain',
+  archive_leftovers: 'archive files remain', identity_changed: 'the folder changed or was replaced',
+  path_denied: 'access was denied', path_invalid: 'the path is no longer a folder', cleanup_io: 'a file system error occurred',
+  cancelled: 'the scan was cancelled',
+};
+/** Plain-language source-folder cleanup state; static reason codes only. */
+export function describeCleanup(cleanup: ScanCleanup): string {
+  const removed = cleanup.removed === 1 ? '1 emptied folder' : `${cleanup.removed} emptied folders`;
+  switch (cleanup.state) {
+    case 'not_needed': return 'Not needed (nothing was moved out of a folder).';
+    case 'complete': return `Removed the emptied source folder (${removed}).`;
+    case 'retained': return `Kept the source folder: ${CLEANUP_REASON[cleanup.reason ?? ''] ?? 'leftovers remain'} (removed ${removed}).`;
+    case 'pending':
+      if (cleanup.recovery_required) return `Removal was interrupted${cleanup.error_code ? ` (${cleanup.error_code})` : ''}; it needs an explicit cleanup resume.`;
+      return cleanup.phase === 'remove_intent' ? 'Removing emptied folders.' : 'Checking the source folder before removing emptied folders.';
+  }
+}
+
+/** Plain-language typed coverage of a tracked receipt. */
+export function describeCoverage(coverage: ScanCoverage): string | null {
+  if (coverage.state === 'untracked') return null;
+  const tally = `${coverage.covered} of ${coverage.expected} covered`;
+  if (coverage.state === 'pending') return coverage.expected ? `In progress: ${tally}.` : 'Not yet published.';
+  return coverage.state === 'complete' ? `Complete: ${tally}.` : `Incomplete: ${tally}; the download stays blocked.`;
+}
+
+/** Builds the exact explicit cleanup-resume body, or null when cleanup is not awaiting recovery. */
+export function cleanupResumeRequest(parent: DownloadedScanCommand): ScanCleanupResumeInput | null {
+  if (parent.status !== 'running' || parent.inventory_revision !== 1 || !parent.cleanup.recovery_required) return null;
+  if (!Number.isSafeInteger(parent.cleanup.resume_generation) || parent.cleanup.resume_generation < 0) return null;
+  return { inventory_revision: 1, expected_cleanup_resume_generation: parent.cleanup.resume_generation };
+}
 export const scanPhaseText = (phase: ScanPhase) => PHASE_TEXT[phase] ?? phase;
 
 export function describeScan(parent: DownloadedScanCommand): string {
@@ -237,6 +283,7 @@ export function describeScan(parent: DownloadedScanCommand): string {
   if (parent.status === 'cancelled') return `Cancelled: ${tally}.`;
   if (parent.status === 'retry_wait') return `Waiting to retry${parent.error_code ? ` after ${parent.error_code}` : ''} (attempt ${parent.attempts} of 3).`;
   const stopping = parent.cancel_requested ? ' Stopping after the current file.' : '';
+  if (parent.phase === 'recovery_required' && parent.cleanup?.recovery_required) return `Source-folder cleanup was interrupted and needs an explicit cleanup resume.${stopping}`;
   if (parent.phase === 'recovery_required') return `${c.recovery_required} file${c.recovery_required === 1 ? '' : 's'} need explicit recovery.${stopping}`;
   return `${PHASE_TEXT[parent.phase] ?? parent.phase}: ${tally}.${stopping}`;
 }

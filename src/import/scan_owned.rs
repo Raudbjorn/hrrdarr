@@ -584,11 +584,13 @@ struct Child {
     proof: Option<String>,
     resume_generation: i64,
     resume_requested: bool,
+    /// The parent's captured tracked receipt authority, when the scan reserved one.
+    receipt: Option<ScanAuthority>,
 }
 async fn child(c: &Connection, claim: &ScanChildAdmission) -> Result<Child> {
     let r = c
         .query(
-            "SELECT p.status,p.inventory_revision,p.run_generation,p.cancel_requested,c.selected,c.disposition,c.operation_id,c.source_path,c.destination,c.resolved_mode,c.series_id,c.movie_id,c.expected_old_movie_file_id,c.quality_id,c.revision_json,c.edition,c.source_identity_json,CASE WHEN length(CAST(json_extract(c.decision_json,'$.proof') AS BLOB))<=? THEN json_extract(c.decision_json,'$.proof') END,c.resume_generation,c.resume_requested FROM downloaded_scan_children c JOIN downloaded_scan_commands p ON p.id=c.command_id WHERE c.id=? AND c.command_id=?",
+            "SELECT p.status,p.inventory_revision,p.run_generation,p.cancel_requested,c.selected,c.disposition,c.operation_id,c.source_path,c.destination,c.resolved_mode,c.series_id,c.movie_id,c.expected_old_movie_file_id,c.quality_id,c.revision_json,c.edition,c.source_identity_json,CASE WHEN length(CAST(json_extract(c.decision_json,'$.proof') AS BLOB))<=? THEN json_extract(c.decision_json,'$.proof') END,c.resume_generation,c.resume_requested,p.candidate_id,p.media_type,json_extract(p.tracked_json,'$.provider_id'),json_extract(p.tracked_json,'$.provider_revision'),json_extract(p.tracked_json,'$.remote_id') FROM downloaded_scan_children c JOIN downloaded_scan_commands p ON p.id=c.command_id WHERE c.id=? AND c.command_id=?",
             params![
                 MAX_PROOF_BYTES as i64,
                 claim.child_id.hyphenated().to_string(),
@@ -620,6 +622,20 @@ async fn child(c: &Connection, claim: &ScanChildAdmission) -> Result<Child> {
         proof: r.get(17)?,
         resume_generation: r.get(18)?,
         resume_requested: r.get::<i64>(19)? == 1,
+        receipt: match r.get::<Option<String>>(20)? {
+            None => None,
+            Some(candidate) => {
+                let uuid = |v: String| Uuid::parse_str(&v).map_err(|_| Error::internal());
+                Some(ScanAuthority::Receipt {
+                    candidate_id: uuid(candidate)?,
+                    media_type: MediaDomain::parse(&r.get::<String>(21)?)
+                        .map_err(|_| Error::internal())?,
+                    provider_id: uuid(r.get::<String>(22)?)?,
+                    provider_revision: r.get(23)?,
+                    remote_id: r.get(24)?,
+                })
+            }
+        },
     };
     // The parent claim is the only scheduling authority; a superseded generation does nothing.
     if child.status != "running"
@@ -797,9 +813,11 @@ pub(crate) async fn prepare_scan(
         ));
     }
     let s = selection(&c, &child_id, &current).await?;
-    let authority = ScanAuthority::Local {
+    // A tracked parent decided every child under its captured receipt; the same authority
+    // must reproduce the published proof (its fingerprint binds the receipt).
+    let authority = current.receipt.clone().unwrap_or(ScanAuthority::Local {
         owner: s.proof.owner,
-    };
+    });
     let warm = warm_scan_file(&c, &authority, input(&s.proof))
         .await
         .map_err(search)?;

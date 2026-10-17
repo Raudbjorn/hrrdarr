@@ -683,7 +683,7 @@ async fn completed_history_for_an_exact_source_path_is_historical_coverage_not_a
 }
 
 #[tokio::test]
-async fn a_known_tracked_receipt_fails_visibly_instead_of_degrading_to_an_untracked_scan() {
+async fn a_known_tracked_receipt_is_captured_exactly_once_and_never_degrades_to_a_fallback() {
     let (db, scratch) = seeded().await;
     let c = db.connect().await.unwrap();
     let (indexer, client) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
@@ -698,7 +698,7 @@ async fn a_known_tracked_receipt_fails_visibly_instead_of_degrading_to_an_untrac
         "a".repeat(40),
     );
     c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','tv',?,1,?,1,100,100)", params![command.clone(), indexer.clone(), client.clone()]).await.unwrap();
-    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,1,'pending','[]',100,100 FROM rss_commands WHERE id=?", params![candidate.clone(), "a".repeat(64), vec![1u8; 29], command]).await.unwrap();
+    c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Harbor.S01E01.1080p.WEB-DL',?,1,'pending','[]',100,100 FROM rss_commands WHERE id=?", params![candidate.clone(), "a".repeat(64), vec![1u8; 29], command]).await.unwrap();
     c.execute(
         "INSERT INTO rss_candidate_episodes VALUES(?,1,1)",
         [candidate.clone()],
@@ -726,7 +726,7 @@ async fn a_known_tracked_receipt_fails_visibly_instead_of_degrading_to_an_untrac
     .unwrap();
     c.execute(
         "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
-        params![hash.clone(), candidate],
+        params![hash.clone(), candidate.clone()],
     )
     .await
     .unwrap();
@@ -740,7 +740,8 @@ async fn a_known_tracked_receipt_fails_visibly_instead_of_degrading_to_an_untrac
         });
         request
     };
-    // Known receipt: failed, nothing published, no fallback to an ordinary scan.
+    // Known receipt: captured and reserved in the publication transaction (no processing row
+    // is fabricated), never degraded into an ordinary fallback scan.
     let request = tracked(&hash);
     let id = request.id;
     enqueue(&db, MediaDomain::Tv, request).await.unwrap();
@@ -748,16 +749,43 @@ async fn a_known_tracked_receipt_fails_visibly_instead_of_degrading_to_an_untrac
         .await
         .unwrap();
     let parent = snapshot(&db, id).await;
-    assert!(matches!(parent.status, CommandStatus::Failed));
+    assert!(matches!(parent.status, CommandStatus::Running));
     assert_eq!(
         (
-            parent.error_code.as_deref(),
             parent.revision,
-            parent.attempts
+            parent.attempts,
+            parent.candidate.as_deref()
         ),
-        (Some("scan_tracked_receipt_unsupported"), 0, 1)
+        (1, 1, Some(candidate.as_str()))
     );
-    assert_eq!(child_count(&db, id).await, 0);
+    assert_eq!(parent.coverage_state, "pending");
+    assert_eq!(child_count(&db, id).await, 2);
+    let c = db.connect().await.unwrap();
+    let absent: i64 = c
+        .query("SELECT count(*) FROM download_processing", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(absent, 0, "absent processing stays absent");
+    drop(c);
+    // A second tracked scan of the same receipt cannot take it over.
+    let request = tracked(&hash);
+    let second = request.id;
+    enqueue(&db, MediaDomain::Tv, request).await.unwrap();
+    run(&db, actual_claim(&db, second).await.unwrap())
+        .await
+        .unwrap();
+    let parent = snapshot(&db, second).await;
+    assert!(matches!(parent.status, CommandStatus::Failed));
+    assert_eq!(
+        parent.error_code.as_deref(),
+        Some("scan_tracked_receipt_reserved")
+    );
     // The same hash in the other domain is not this receipt (the provider has no movie scope).
     assert!(matches!(
         enqueue(&db, MediaDomain::Movies, tracked(&hash)).await,

@@ -2,6 +2,23 @@
 use super::*;
 use crate::search::ReleaseTarget;
 const PATH_MARKER: &str = "hc021_unresolved_attempt";
+/// A downloaded-folder scan that captured a receipt owns it until its settled handback (and
+/// a handed-back receipt stays scan-owned). Only an exact captured predecessor operation may
+/// continue through the singleton path. Mirrors the 0054 `scan_processing_legacy_guard`.
+pub(crate) const SCAN_RESERVED: &str = "(download_processing.scan_command_id IS NOT NULL OR EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=download_processing.candidate_id AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports i WHERE i.candidate_id=s.candidate_id AND i.operation_id=s.predecessor_operation_id)))";
+fn reserved_by_scan() -> Error {
+    Error(StatusCode::CONFLICT, "processing_reserved_by_scan")
+}
+async fn scan_reserved(c: &Connection, id: Uuid) -> Result<bool> {
+    Ok(c.query(
+        &format!("SELECT 1 FROM download_processing WHERE candidate_id=? AND {SCAN_RESERVED}"),
+        [id.to_string()],
+    )
+    .await?
+    .next()
+    .await?
+    .is_some())
+}
 
 pub(crate) enum PathReasonChange<'a> {
     Preserve,
@@ -164,6 +181,9 @@ pub struct DownloadProcessing {
     pub reasons: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    // Downloaded-folder scan that reserved (or settled) this receipt; singleton retry/cancel
+    // are refused while it owns the receipt.
+    pub scan_command_id: Option<Uuid>,
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -221,7 +241,7 @@ impl ProcessingStatus {
         }
     }
 }
-const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,CASE WHEN typeof(d.reasons_json)='text' AND length(CAST(d.reasons_json AS BLOB))<=8192 THEN CAST(d.reasons_json AS BLOB) ELSE x'00' END,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' AND length(CAST(j.path_failure_code AS BLOB))<=64 THEN CAST(j.path_failure_code AS BLOB) ELSE x'00' END,j.error_code IS NOT NULL";
+const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,CASE WHEN typeof(d.reasons_json)='text' AND length(CAST(d.reasons_json AS BLOB))<=8192 THEN CAST(d.reasons_json AS BLOB) ELSE x'00' END,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' AND length(CAST(j.path_failure_code AS BLOB))<=64 THEN CAST(j.path_failure_code AS BLOB) ELSE x'00' END,j.error_code IS NOT NULL,coalesce(d.scan_command_id,(SELECT s.id FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id ORDER BY s.created_at DESC,s.id DESC LIMIT 1))";
 const FROM: &str = "download_processing d JOIN rss_candidates r ON r.id=d.candidate_id LEFT JOIN rss_candidate_episodes e ON e.candidate_id=r.id LEFT JOIN rss_candidate_imports i ON i.candidate_id=r.id LEFT JOIN import_journal j ON j.operation_id=i.operation_id";
 fn positive(value: i64) -> Result<i64> {
     if (1..=MAX_REVISION).contains(&value) {
@@ -284,6 +304,10 @@ fn row(r: libsql::Row) -> Result<DownloadProcessing> {
         recovery_bytes_retained: r
             .get::<Option<String>>(20)?
             .is_some_and(|v| v == "quarantined" || v == "shared_retained"),
+        scan_command_id: r
+            .get::<Option<String>>(23)?
+            .map(|s| Uuid::parse_str(&s).map_err(|_| bad()))
+            .transpose()?,
     })
 }
 async fn read(c: &Connection, id: Uuid) -> Result<DownloadProcessing> {
@@ -499,6 +523,8 @@ async fn process(
         for id in input.receipt_ids {
             let valid=tx.query("SELECT 1 FROM rss_candidates WHERE id=? AND status='observed' AND client_id=? AND client_revision=? AND media_type=?",params![id.to_string(),input.provider_id.to_string(),input.provider_revision,domain(input.media_type)]).await?.next().await?.is_some();
             if !valid { return Err(Error(StatusCode::CONFLICT,"invalid_processing_receipt")); }
+            // A scan-reserved receipt is retried only through coverage-aware scan authority.
+            if scan_reserved(&tx,id).await? || tx.query("SELECT 1 FROM downloaded_scan_commands WHERE candidate_id=? AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=downloaded_scan_commands.candidate_id)",[id.to_string()]).await?.next().await?.is_some() { return Err(reserved_by_scan()); }
             let existing = match read(&tx,id).await {
                 Ok(row) => Some(row),
                 Err(Error(StatusCode::NOT_FOUND,"processing_not_found")) => None,
@@ -586,6 +612,7 @@ async fn cancel(
     let outcome = async {
         let item = read(&tx,id).await?;
         if item.operation_id.is_some() { return Err(conflict()); }
+        if scan_reserved(&tx,id).await? { return Err(reserved_by_scan()); }
         let reasons = path_reasons(&item.reasons,&[],PathReasonChange::Preserve)?;
         tx.execute("UPDATE download_processing SET status='cancelled',error_code=NULL,reasons_json=?,updated_at=? WHERE candidate_id=?",params![encoded_reasons(&reasons)?,now()?,id.to_string()]).await?;
         changed(&tx,&item,crate::health::PathDiagnosticChange::Progress).await?;
@@ -602,7 +629,7 @@ pub(super) async fn observe(
     timestamp: i64,
 ) -> Result<()> {
     for item in items.iter().filter(|item| item.completed) {
-        c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) SELECT r.id,p.revision,'queued',?,?,? FROM rss_candidates r JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type WHERE r.status='observed' AND r.client_id=? AND r.client_revision=? AND r.media_type=? AND r.observed_hash=? AND p.enabled=1 AND p.provider_revision=r.client_revision AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=r.id)",params![timestamp,timestamp,timestamp,scope.provider_id.to_string(),revision,domain(scope.media_type),item.hash.clone()]).await?;
+        c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) SELECT r.id,p.revision,'queued',?,?,? FROM rss_candidates r JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type WHERE r.status='observed' AND r.client_id=? AND r.client_revision=? AND r.media_type=? AND r.observed_hash=? AND p.enabled=1 AND p.provider_revision=r.client_revision AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=r.id) AND NOT EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=r.id)",params![timestamp,timestamp,timestamp,scope.provider_id.to_string(),revision,domain(scope.media_type),item.hash.clone()]).await?;
     }
     Ok(())
 }
@@ -611,7 +638,7 @@ pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Resul
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome = async {
-        let mut rows = tx.query("SELECT candidate_id FROM download_processing WHERE status IN ('checking','queued') ORDER BY candidate_id LIMIT 1025",()).await?;
+        let mut rows = tx.query(&format!("SELECT candidate_id FROM download_processing WHERE status IN ('checking','queued') AND NOT {SCAN_RESERVED} ORDER BY candidate_id LIMIT 1025"),()).await?;
         let mut ids = Vec::new();
         while let Some(row) = rows.next().await? {
             if ids.len() == 1024 { return Err(bad()); }
@@ -645,6 +672,9 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Do
         || item.total_preflight_attempts >= MAX_REVISION
     {
         return Err(conflict());
+    }
+    if scan_reserved(c, id).await? {
+        return Err(reserved_by_scan());
     }
     authorization(c, &item).await?;
     let reasons = path_reasons(&item.reasons, &[], PathReasonChange::Admission)?;

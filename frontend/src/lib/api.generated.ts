@@ -138,7 +138,7 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
-export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, };
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, };
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
@@ -148,7 +148,7 @@ export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" |
 
 export type DownloadedScanChildQuery = { disposition?: ScanDisposition, limit?: number, offset?: number, };
 
-export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, };
+export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, receipt_id: string | null, predecessor_operation_id: string | null, coverage: ScanCoverage, cleanup: ScanCleanup, };
 
 export type DownloadedScanInput = { id: string, path: string, mode: ScanMode, priority: CommandPriority, tracked?: ScanTracked, };
 
@@ -642,13 +642,29 @@ export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, inde
 
 export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, operation_phase: string | null, path_failure_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
 
+export type ScanChildMember = { episode_id: number, series_id: number, season_number: number, episode_number: number, expected_old_episode_file_id: number | null, };
+
 export type ScanChildResumeInput = { operation_id: string, inventory_revision: number, expected_resume_generation: number, };
 
+export type ScanCleanup = { state: ScanCleanupState, phase: ScanCleanupPhase | null, reason: string | null, removed: number, error_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
+
+export type ScanCleanupPhase = "observed" | "remove_intent" | "settled";
+
+export type ScanCleanupResumeInput = { inventory_revision: number, expected_cleanup_resume_generation: number, };
+
+export type ScanCleanupState = "not_needed" | "pending" | "complete" | "retained";
+
 export type ScanCounts = { entries: number, ready: number, importing: number, imported: number, already_imported: number, rejected: number, failed: number, cancelled: number, recovery_required: number, };
+
+export type ScanCoverage = { state: ScanCoverageState, expected: number, covered: number, missing: number, };
+
+export type ScanCoverageState = "untracked" | "pending" | "complete" | "incomplete";
 
 export type ScanDisposition = "ready" | "importing" | "imported" | "already_imported" | "rejected" | "failed" | "cancelled";
 
 export type ScanEntryKind = "file" | "directory" | "symlink" | "other";
+
+export type ScanMemberQuery = { limit?: number, offset?: number, };
 
 export type ScanMode = "auto" | "move" | "copy";
 
@@ -656,7 +672,7 @@ export type ScanObservationState = "measured" | "unavailable";
 
 export type ScanOutcome = "success" | "unsuccessful";
 
-export type ScanPhase = "queued" | "inventory" | "awaiting_import" | "importing" | "recovery_required" | "settled";
+export type ScanPhase = "queued" | "inventory" | "waiting_predecessor" | "awaiting_import" | "importing" | "recovery_required" | "cleanup" | "settled";
 
 export type ScanResolvedMode = "copy" | "move";
 
@@ -664,7 +680,7 @@ export type ScanSource = "found" | "missing";
 
 export type ScanTracked = { provider_id: string, remote_id: string, };
 
-export type ScanTracking = "untracked" | "pending" | "unknown_fallback";
+export type ScanTracking = "untracked" | "pending" | "unknown_fallback" | "receipt";
 
 export type Score = { format_ids: Array<number>, score: number, };
 

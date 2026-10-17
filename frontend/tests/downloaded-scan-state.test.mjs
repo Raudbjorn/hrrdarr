@@ -5,6 +5,7 @@ import {
   scanPathProblem, validateScanForm, createPendingScan, encodePendingScans, decodePendingScans, addPendingScan,
   removePendingScan, commandMatches, classifyAdmission, classifyReadback, validScanCommand, pollDelay, shouldPoll,
   canCancelScan, resumeRequest, resumeFailureMessage, completionOwners, describeScan,
+  describeCleanup, describeCoverage, cleanupResumeRequest, cleanupResumeFailureMessage,
 } from '../src/lib/downloaded-scan-state.ts';
 
 const id = (n = 1) => `c0000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -143,4 +144,33 @@ test('summaries distinguish success, zero-import, missing path, cancellation and
   assert.match(describeScan(parent({status: 'cancelled', phase: 'settled'})), /^Cancelled/);
   assert.match(describeScan(parent({status: 'running', phase: 'recovery_required', counts: {...counts, recovery_required: 1}})), /1 file need explicit recovery/);
   assert.match(describeScan(parent({status: 'running', phase: 'importing', cancel_requested: true})), /Stopping after the current file/);
+});
+
+const cleanup = (overrides = {}) => ({
+  state: 'not_needed', phase: null, reason: null, removed: 0, error_code: null, resume_generation: 0, resume_requested: false,
+  recovery_required: false, ...overrides,
+});
+
+test('cleanup and coverage summaries use static reasons and never imply recovery that is not required', () => {
+  assert.match(describeCleanup(cleanup()), /^Not needed/);
+  assert.match(describeCleanup(cleanup({state: 'complete', phase: 'settled', removed: 3})), /3 emptied folders/);
+  assert.match(describeCleanup(cleanup({state: 'retained', phase: 'settled', reason: 'unimported_media', removed: 1})), /not imported remain .*1 emptied folder\)/);
+  assert.match(describeCleanup(cleanup({state: 'retained', phase: 'settled', reason: 'something_new'})), /leftovers remain/);
+  assert.match(describeCleanup(cleanup({state: 'pending', phase: 'observed'})), /^Checking/);
+  assert.match(describeCleanup(cleanup({state: 'pending', phase: 'remove_intent', recovery_required: true, error_code: 'cleanup_io'})), /interrupted \(cleanup_io\)/);
+  assert.equal(describeCoverage({state: 'untracked', expected: 0, covered: 0, missing: 0}), null);
+  assert.match(describeCoverage({state: 'incomplete', expected: 1, covered: 0, missing: 1}), /stays blocked/);
+  assert.match(describeCoverage({state: 'complete', expected: 1, covered: 1, missing: 0}), /^Complete: 1 of 1/);
+  const stuck = parent({status: 'running', phase: 'recovery_required', inventory_revision: 1, cleanup: cleanup({state: 'pending', phase: 'remove_intent', recovery_required: true, resume_generation: 2})});
+  assert.match(describeScan(stuck), /cleanup was interrupted/);
+});
+
+test('cleanup recovery body names the exact generation and is offered only when required', () => {
+  const stuck = parent({status: 'running', phase: 'recovery_required', inventory_revision: 1, cleanup: cleanup({state: 'pending', phase: 'remove_intent', recovery_required: true, resume_generation: 2})});
+  assert.deepEqual(cleanupResumeRequest(stuck), {inventory_revision: 1, expected_cleanup_resume_generation: 2});
+  assert.equal(cleanupResumeRequest({...stuck, cleanup: cleanup({state: 'pending', phase: 'remove_intent', resume_requested: true})}), null);
+  assert.equal(cleanupResumeRequest({...stuck, status: 'succeeded', phase: 'settled'}), null);
+  assert.equal(cleanupResumeRequest({...stuck, cleanup: {...stuck.cleanup, resume_generation: -1}}), null);
+  assert.match(cleanupResumeFailureMessage({ok: false, status: 409, code: 'downloaded_scan_cleanup_resume_generation', error: 'x'}), /changed since it was read/);
+  assert.equal(cleanupResumeFailureMessage({ok: false, status: 500, code: 'other', error: 'raw'}), 'raw');
 });

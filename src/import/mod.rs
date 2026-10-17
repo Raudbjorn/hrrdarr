@@ -3,6 +3,7 @@ mod fs;
 mod owned;
 pub(crate) mod probe;
 pub(crate) mod scan;
+pub(crate) mod scan_cleanup;
 mod scan_owned;
 pub(crate) use fs::scan as scan_fs;
 pub(crate) use owned::{OwnedImport, prepare_owned};
@@ -762,6 +763,21 @@ pub(crate) fn acquire_resume_guard(db: &Arc<Database>) -> Result<ResumeGuard> {
             Error::conflict(
                 "import_busy",
                 "Another import is executing; retry this operation",
+            )
+        })
+}
+/// Downloaded-scan directory cleanup runs under the same single global effect permit as every
+/// import, with an owner key that can never equal an operation UUID.
+pub(crate) struct CleanupGuard {
+    _permit: Arc<Permit>,
+}
+pub(crate) fn acquire_cleanup_guard(db: &Arc<Database>, command_id: &str) -> Result<CleanupGuard> {
+    acquire(db, &format!("scan-cleanup-{command_id}"))
+        .map(|permit| CleanupGuard { _permit: permit })
+        .ok_or_else(|| {
+            Error::conflict(
+                "import_busy",
+                "Another import is executing; retry this cleanup",
             )
         })
 }

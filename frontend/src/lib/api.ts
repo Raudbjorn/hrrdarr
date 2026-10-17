@@ -1,6 +1,6 @@
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
-import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild, ScanChildResumeInput } from './api.generated';
+import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanChildMember, ScanMemberQuery } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTargetInput, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, MovieCredit, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -163,6 +163,18 @@ export const resumeDownloadedScanChild = (domain: MediaDomain, id: string, child
     && Number.isSafeInteger(input.expected_resume_generation) && input.expected_resume_generation >= 0
     ? request<ScanChild>(`${scanRoot(domain)}/${id}/children/${childId}/resume`, input, 'POST', true)
     : scanError<ScanChild>('Invalid scan child resume request.');
+// Complete paginated TV membership of one child's physical file (movie children have none).
+export const listDownloadedScanMembers = (domain: MediaDomain, id: string, childId: string, query?: ScanMemberQuery) =>
+  scanDomain(domain) && scanId(id) && scanId(childId) && validScanPage(query)
+    ? request<ApiPage<ScanChildMember>>(`${scanRoot(domain)}/${id}/children/${childId}/members${scanPage(query, {})}`, undefined, undefined, true)
+    : scanError<ApiPage<ScanChildMember>>('Invalid scan membership request.');
+// Explicit recovery of an uncertain source-folder cleanup; the body names the generation last
+// read. A lost response is reconciled by re-reading or repeating the identical body.
+export const resumeDownloadedScanCleanup = (domain: MediaDomain, id: string, input: ScanCleanupResumeInput) =>
+  scanDomain(domain) && scanId(id) && (input.inventory_revision === 0 || input.inventory_revision === 1)
+    && Number.isSafeInteger(input.expected_cleanup_resume_generation) && input.expected_cleanup_resume_generation >= 0
+    ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}/resume-cleanup`, input, 'POST', true)
+    : scanError<DownloadedScanCommand>('Invalid scan cleanup resume request.');
 
 const invalidProvider = <T>(): Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid provider ID or revision.'});
 export const getProvider = (id: string) => validOperation(id) ? request<Provider>(`/api/v1/providers/${id}`, undefined, undefined, true) : invalidProvider<Provider>();

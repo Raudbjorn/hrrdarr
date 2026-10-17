@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import type { ApiPage, CommandPriority, DownloadedScanCommand, MediaDomain, ScanChild, ScanChildResumeInput, ScanDisposition, ScanMode } from './api.generated';
+  import type { ApiPage, CommandPriority, DownloadedScanCommand, MediaDomain, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanDisposition, ScanMode } from './api.generated';
   import type { SettingsWriteState } from './api';
-  import { cancelDownloadedScanCommand, createDownloadedScanCommand, getDownloadedScanCommand, listDownloadedScanChildren, listDownloadedScanCommands, resumeDownloadedScanChild } from './api';
+  import { cancelDownloadedScanCommand, createDownloadedScanCommand, getDownloadedScanCommand, listDownloadedScanChildren, listDownloadedScanCommands, resumeDownloadedScanChild, resumeDownloadedScanCleanup } from './api';
   import {
     SCAN_CHILD_PAGE, SCAN_OWNER_READ_LIMIT, SCAN_PARENT_PAGE, SCAN_PENDING_KEY, SCAN_PENDING_LIMIT,
-    addPendingScan, canCancelScan, classifyAdmission, classifyReadback, completionOwners, createPendingScan,
+    addPendingScan, canCancelScan, classifyAdmission, cleanupResumeFailureMessage, cleanupResumeRequest, describeCleanup, describeCoverage, classifyReadback, completionOwners, createPendingScan,
     decodePendingScans, describeScan, encodePendingScans, isTerminalScan, pollDelay, removePendingScan,
     resumeFailureMessage, resumeRequest, scanPhaseText, shouldPoll, validScanChild, validScanCommand, validateScanForm,
   } from './downloaded-scan-state';
@@ -29,6 +29,8 @@
   let selectedId = $state<string | null>(null), selected = $state<DownloadedScanCommand | null>(null);
   let children = $state<ApiPage<ScanChild> | null>(null), childOffset = $state(0), childFilter = $state<ScanDisposition | ''>('');
   let lostResumes = $state<Record<string, ScanChildResumeInput>>({});
+  // A lost cleanup-recovery response, kept in memory only: repeating the identical body is safe.
+  let lostCleanup = $state<{ id: string; body: ScanCleanupResumeInput } | null>(null);
   let busy = $state(false), checking = $state(false), ready = $state(false), fresh = $state(false), unread = $state(true);
   let error = $state(''), notice = $state(''), readError = $state(''), storageError = $state(''), storageBlocked = $state(false);
   let mounted = false, generation = 0, failures = 0, rerun = false, lastStored: string | null = null;
@@ -55,7 +57,7 @@
 
   function switchDomain(next: MediaDomain) {
     scope = next; keptDomain = null; page = null; parentOffset = 0; selectedId = null; selected = null;
-    children = null; childOffset = 0; childFilter = ''; lostResumes = {}; unread = true; readError = ''; error = ''; notice = '';
+    children = null; childOffset = 0; childFilter = ''; lostResumes = {}; lostCleanup = null; unread = true; readError = ''; error = ''; notice = '';
     invalidate(); if (mounted) void refresh();
   }
   function discardAndSwitch() {
@@ -136,7 +138,7 @@
   }
   async function select(id: string) {
     if (selectedId === id) return;
-    selectedId = id; selected = page?.items.find(item => item.id === id) ?? null; children = null; childOffset = 0; childFilter = ''; lostResumes = {};
+    selectedId = id; selected = page?.items.find(item => item.id === id) ?? null; children = null; childOffset = 0; childFilter = ''; lostResumes = {}; lostCleanup = null;
     invalidate(); await refresh();
   }
   async function admit(entry: PendingScan, replay: boolean) {
@@ -234,6 +236,24 @@
     } else {
       lostResumes = { ...lostResumes, [child.id]: body };
       error = `${response.error} Recovery outcome unknown. Repeating the identical request is safe; refresh to read the file's state.`;
+    }
+    busy = false; await refresh();
+  }
+  async function resumeCleanup(parent: DownloadedScanCommand, repeat?: ScanCleanupResumeInput) {
+    const body = repeat ?? cleanupResumeRequest(parent);
+    if (blocked || !body || (!repeat && !fresh)) return;
+    busy = true; invalidate(); error = ''; notice = '';
+    const response = await resumeDownloadedScanCleanup(parent.media_type, parent.id, body);
+    if (!mounted) return;
+    if (response.ok) {
+      lostCleanup = null;
+      notice = 'Cleanup recovery requested. The worker re-checks the folder and removes only emptied folders.';
+    } else if (response.status === 409 || response.status === 404 || response.status === 400) {
+      lostCleanup = null;
+      error = cleanupResumeFailureMessage(response);
+    } else {
+      lostCleanup = { id: parent.id, body };
+      error = `${response.error} Cleanup recovery outcome unknown. Repeating the identical request is safe; refresh to read its state.`;
     }
     busy = false; await refresh();
   }
@@ -345,6 +365,8 @@
         <dt>Mode</dt><dd>{parent.mode} · {parent.priority} priority</dd>
         <dt>Entries</dt><dd>{parent.counts.entries} found · {parent.counts.ready} ready · {parent.counts.importing} importing · {parent.counts.imported} imported · {parent.counts.already_imported} already imported · {parent.counts.rejected} rejected · {parent.counts.failed} failed · {parent.counts.cancelled} cancelled</dd>
         {#if parent.source}<dt>Source</dt><dd>{parent.source === 'missing' ? 'Path not found' : 'Found'}</dd>{/if}
+        {#if describeCoverage(parent.coverage)}<dt>Tracked coverage</dt><dd>{describeCoverage(parent.coverage)}</dd>{/if}
+        <dt>Source cleanup</dt><dd>{describeCleanup(parent.cleanup)}</dd>
         {#if parent.error_code}<dt>Error</dt><dd><code>{parent.error_code}</code></dd>{/if}
         <dt>Attempts</dt><dd>{parent.attempts} of 3</dd>
         <dt>Created</dt><dd>{when(parent.created_at)}</dd>
@@ -352,7 +374,13 @@
         <dt>Command ID</dt><dd><code>{parent.id}</code></dd>
       </dl>
       {#if parent.cancel_requested && !isTerminalScan(parent.status)}<p role="status">Cancellation requested. {parent.counts.recovery_required ? 'A file that changed the library must be recovered explicitly before the scan can finish.' : 'The scan stops after the current file.'}</p>{/if}
-      {#if parent.phase === 'recovery_required'}<p role="alert">An import was interrupted after it started changing files. Review the failed entry and resume it explicitly; nothing retries automatically.</p>{/if}
+      {#if parent.phase === 'recovery_required' && parent.cleanup.recovery_required}<p role="alert">Removing emptied source folders was interrupted after it started. Nothing is retried automatically; check the folder, then resume the cleanup explicitly. Only folders that are empty are ever removed.</p>
+        {@const cleanupBody = cleanupResumeRequest(parent)}
+        <div class="actions">
+          {#if cleanupBody}<button type="button" class="primary" disabled={blocked || !fresh} onclick={() => resumeCleanup(parent)}>Resume source-folder cleanup</button>{/if}
+          {#if lostCleanup && lostCleanup.id === parent.id}<button type="button" disabled={blocked} onclick={() => lostCleanup && resumeCleanup(parent, lostCleanup.body)}>Repeat identical cleanup request</button>{/if}
+        </div>
+      {:else if parent.phase === 'recovery_required'}<p role="alert">An import was interrupted after it started changing files. Review the failed entry and resume it explicitly; nothing retries automatically.</p>{/if}
       {#if canCancelScan(parent)}
         <div class="actions"><button type="button" disabled={blocked || !fresh} onclick={cancel}>Stop scan after current file</button></div>
         <p class="muted">Stopping is safe to repeat. A file that is already importing finishes; files not yet started are skipped and imported files stay imported.</p>

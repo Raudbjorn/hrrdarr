@@ -8,12 +8,15 @@
 //!    `imported` once its journal is complete, relaunch a never-armed clean preview, or mark
 //!    it `failed` (measured error or abandoned marker; never retried automatically);
 //! 2. a `failed` child with an explicit resume request: start it under that generation;
-//! 3. after `cancel_requested`: cancel untouched children and settle `cancelled` once nothing
+//! 3. an explicitly resumed cleanup removal intent (see `cleanup.rs`);
+//! 4. after `cancel_requested`: cancel untouched children and settle `cancelled` once nothing
 //!    is in flight (stop-after-current);
-//! 4. the next `ready` child: prepare its operation and start it;
-//! 5. otherwise settle the parent: `succeeded` (`success` iff a child of this parent imported,
+//! 5. the next `ready` child: prepare its operation and start it;
+//! 6. one move-mode source cleanup checkpoint, when applicable;
+//! 7. otherwise settle the parent: `succeeded` (`success` iff a child of this parent imported,
 //!    else `unsuccessful`), unless a failed child holds an unresolved operation, in which case
-//!    the parent stays `running` (phase `recovery_required`) and is polled rarely.
+//!    the parent stays `running` (phase `recovery_required`) and is polled rarely. Settlement
+//!    records typed receipt coverage and hands a captured receipt back atomically.
 use super::*;
 use crate::import::{ScanChildAdmission, ScanChildStart, StartOwned};
 
@@ -123,6 +126,10 @@ pub(super) async fn step(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
     if let Some(child) = first(&c, &key, "disposition='failed' AND resume_requested=1").await? {
         return start(db, &c, &claim, child).await;
     }
+    if super::cleanup::resume_pending(&c, &key).await? {
+        super::cleanup::advance(db, &c, &claim).await?;
+        return Ok(());
+    }
     if p.cancel_requested {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -137,6 +144,9 @@ pub(super) async fn step(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
     }
     if let Some(child) = first(&c, &key, "disposition='ready'").await? {
         return ready(db, &c, &claim, child).await;
+    }
+    if super::cleanup::advance(db, &c, &claim).await? {
+        return Ok(());
     }
     settle(&c, &claim).await
 }
@@ -158,11 +168,24 @@ async fn importing(
     }
     let j = journal(c, &operation).await?;
     if j.phase == "complete" {
-        c.execute(
-            &format!("UPDATE downloaded_scan_children SET disposition='imported',error_code=NULL WHERE id=? AND disposition='importing' AND operation_id=? AND {FENCE}"),
-            params![child.id.clone(), operation, claim.run_generation],
-        )
-        .await?;
+        // The child settles and its typed history credits receipt coverage together.
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let outcome = async {
+            let rows = tx
+                .execute(
+                    &format!("UPDATE downloaded_scan_children SET disposition='imported',error_code=NULL WHERE id=? AND disposition='importing' AND operation_id=? AND {FENCE}"),
+                    params![child.id.clone(), operation, claim.run_generation],
+                )
+                .await?;
+            if rows == 1 {
+                super::receipt::credit(&tx, &claim.id.hyphenated().to_string()).await?;
+            }
+            Ok(())
+        }
+        .await;
+        finish(tx, outcome).await?;
         log(claim, &child.id, "child_imported", "complete");
         return Ok(());
     }
@@ -302,13 +325,15 @@ async fn settle(c: &Connection, claim: &ScanClaim) -> Result<()> {
         if unresolved {
             return Ok(None);
         }
-        let changed = tx
-            .execute(
-                "UPDATE downloaded_scan_commands SET status='succeeded',outcome=CASE WHEN EXISTS(SELECT 1 FROM downloaded_scan_children c WHERE c.command_id=downloaded_scan_commands.id AND c.disposition='imported') THEN 'success' ELSE 'unsuccessful' END,completed_at=?,error_code=NULL WHERE id=? AND status='running' AND inventory_revision=1 AND run_generation=? AND NOT EXISTS(SELECT 1 FROM downloaded_scan_children c WHERE c.command_id=downloaded_scan_commands.id AND c.disposition IN ('ready','importing'))",
-                params![now()?, key.clone(), claim.run_generation],
-            )
-            .await?;
-        Ok(Some(changed))
+        let settled = super::receipt::finalize(
+            &tx,
+            &key,
+            super::receipt::Terminal::Succeeded,
+            Some(claim.run_generation),
+            now()?,
+        )
+        .await?;
+        Ok(Some(u64::from(settled)))
     }
     .await;
     match finish(tx, outcome).await? {
@@ -379,9 +404,17 @@ pub(super) async fn settle_cancelled(
     if blocked {
         return Ok(false);
     }
-    tx.execute(
-        "UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status='running' AND cancel_requested=1 AND (?3 IS NULL OR run_generation=?3)",
-        params![timestamp, key, generation],
+    // A cleanup that never recorded removal intent is retained as cancelled; an armed
+    // removal intent keeps the parent running until it is explicitly resumed and settled.
+    if !super::cleanup::settle_for_cancel(tx, key).await? {
+        return Ok(false);
+    }
+    super::receipt::finalize(
+        tx,
+        key,
+        super::receipt::Terminal::Cancelled,
+        generation,
+        timestamp,
     )
     .await?;
     Ok(true)

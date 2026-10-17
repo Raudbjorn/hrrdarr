@@ -96,10 +96,16 @@ pub struct DownloadedScanInput {
 pub enum ScanPhase {
     Queued,
     Inventory,
+    // A captured tracked receipt's linked singleton import is still finishing under its own
+    // authority; discovery publishes only after that predecessor completes.
+    WaitingPredecessor,
     AwaitingImport,
     Importing,
-    // A failed child holds an unresolved operation; only an explicit child resume continues it.
+    // A failed child holds an unresolved operation, or directory cleanup failed after its
+    // removal intent; only an explicit child resume or cleanup resume continues it.
     RecoveryRequired,
+    // Move-mode source-directory cleanup is checkpointed (observed or remove_intent).
+    Cleanup,
     Settled,
 }
 #[derive(Clone, Copy, Serialize, ts_rs::TS)]
@@ -120,6 +126,54 @@ pub enum ScanTracking {
     Untracked,
     Pending,
     UnknownFallback,
+    // The exact provider/domain/remote receipt was captured and reserved by this parent.
+    Receipt,
+}
+#[derive(Clone, Copy, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanCoverageState {
+    Untracked,
+    Pending,
+    Complete,
+    Incomplete,
+}
+/// Typed expected coverage of a captured receipt: its episodes (TV) or its movie.
+#[derive(Serialize, ts_rs::TS)]
+pub struct ScanCoverage {
+    pub state: ScanCoverageState,
+    pub expected: i64,
+    pub covered: i64,
+    pub missing: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanCleanupState {
+    NotNeeded,
+    Pending,
+    Complete,
+    Retained,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanCleanupPhase {
+    Observed,
+    RemoveIntent,
+    Settled,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ScanCleanup {
+    pub state: ScanCleanupState,
+    pub phase: Option<ScanCleanupPhase>,
+    // Static retained reason (`unimported_media`, `unknown_leftovers`, ...); null otherwise.
+    pub reason: Option<String>,
+    // Directories removed by the cleanup checkpoints so far.
+    pub removed: i64,
+    // Static code of the last uncertain post-intent failure, if any.
+    pub error_code: Option<String>,
+    pub resume_generation: i64,
+    pub resume_requested: bool,
+    // Removal intent is recorded but its effect is unknown: needs an explicit cleanup resume.
+    pub recovery_required: bool,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct ScanCounts {
@@ -158,6 +212,12 @@ pub struct DownloadedScanCommand {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub counts: ScanCounts,
+    // Captured tracked receipt (download processing receipt id), once reserved.
+    pub receipt_id: Option<Uuid>,
+    // Linked singleton import of that receipt, captured at reservation; read, never re-owned.
+    pub predecessor_operation_id: Option<Uuid>,
+    pub coverage: ScanCoverage,
+    pub cleanup: ScanCleanup,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +332,26 @@ pub struct DownloadedScanChildQuery {
     #[ts(as = "Option<u32>", optional)]
     pub offset: u32,
 }
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct ScanMemberQuery {
+    #[serde(default = "page_default")]
+    #[ts(as = "Option<u16>", optional)]
+    pub limit: u16,
+    #[serde(default)]
+    #[ts(as = "Option<u32>", optional)]
+    pub offset: u32,
+}
+/// One episode served by a TV child's single physical file. Movie children have no members.
+#[derive(Serialize, ts_rs::TS)]
+pub struct ScanChildMember {
+    pub episode_id: i64,
+    pub series_id: i64,
+    pub season_number: i64,
+    pub episode_number: i64,
+    // The episode's file when the inventory was published; null when it had none.
+    pub expected_old_episode_file_id: Option<i64>,
+}
 fn page_default() -> u16 {
     PAGE_DEFAULT
 }
@@ -360,6 +440,14 @@ pub(super) fn router(db: Arc<Database>) -> Router {
             post(continuation::resume_tv),
         )
         .route(
+            "/api/v1/tv/downloaded-scan-commands/{id}/children/{child_id}/members",
+            get(members_tv),
+        )
+        .route(
+            "/api/v1/tv/downloaded-scan-commands/{id}/resume-cleanup",
+            post(cleanup::resume_tv),
+        )
+        .route(
             "/api/v1/movies/downloaded-scan-commands",
             get(list_movies).post(create_movies),
         )
@@ -378,6 +466,14 @@ pub(super) fn router(db: Arc<Database>) -> Router {
         .route(
             "/api/v1/movies/downloaded-scan-commands/{id}/children/{child_id}/resume",
             post(continuation::resume_movies),
+        )
+        .route(
+            "/api/v1/movies/downloaded-scan-commands/{id}/children/{child_id}/members",
+            get(members_movies),
+        )
+        .route(
+            "/api/v1/movies/downloaded-scan-commands/{id}/resume-cleanup",
+            post(cleanup::resume_movies),
         )
         .layer(DefaultBodyLimit::max(8192))
         .layer(axum::middleware::from_fn(deadline))
@@ -446,7 +542,7 @@ impl Request {
     }
 }
 
-const COLUMNS: &str = "id,media_type,source_path,requested_mode,priority,requested_provider_id,requested_remote_id,candidate_id,status,outcome,error_code,attempts,run_generation,cancel_requested,inventory_revision,CASE WHEN json_type(inventory_json,'$.missing')='true' THEN 1 ELSE 0 END,next_attempt_at,created_at,started_at,completed_at";
+const COLUMNS: &str = "id,media_type,source_path,requested_mode,priority,requested_provider_id,requested_remote_id,candidate_id,status,outcome,error_code,attempts,run_generation,cancel_requested,inventory_revision,CASE WHEN json_type(inventory_json,'$.missing')='true' THEN 1 ELSE 0 END,next_attempt_at,created_at,started_at,completed_at,predecessor_operation_id,coverage_state,cleanup_state,json_extract(cleanup_json,'$.phase'),CASE WHEN length(CAST(json_extract(cleanup_json,'$.reason') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.reason') END,coalesce(json_extract(cleanup_json,'$.removed'),0),CASE WHEN length(CAST(json_extract(cleanup_json,'$.error') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.error') END,cleanup_resume_generation,cleanup_resume_requested,predecessor_operation_id IS NULL OR EXISTS(SELECT 1 FROM import_journal j JOIN import_history h ON h.operation_id=j.operation_id WHERE j.operation_id=downloaded_scan_commands.predecessor_operation_id AND j.phase='complete')";
 struct Parent {
     id: Uuid,
     media: MediaDomain,
@@ -467,6 +563,17 @@ struct Parent {
     created_at: i64,
     started_at: Option<i64>,
     completed_at: Option<i64>,
+    candidate: Option<String>,
+    predecessor: Option<String>,
+    coverage_state: String,
+    cleanup_state: String,
+    cleanup_phase: Option<String>,
+    cleanup_reason: Option<String>,
+    cleanup_removed: i64,
+    cleanup_error: Option<String>,
+    cleanup_resume_generation: i64,
+    cleanup_resume_requested: bool,
+    predecessor_complete: bool,
 }
 fn parent(r: libsql::Row) -> Result<Parent> {
     Ok(Parent {
@@ -489,6 +596,17 @@ fn parent(r: libsql::Row) -> Result<Parent> {
         created_at: r.get(17)?,
         started_at: r.get(18)?,
         completed_at: r.get(19)?,
+        candidate: r.get(7)?,
+        predecessor: r.get(20)?,
+        coverage_state: r.get(21)?,
+        cleanup_state: r.get(22)?,
+        cleanup_phase: r.get(23)?,
+        cleanup_reason: r.get(24)?,
+        cleanup_removed: r.get(25)?,
+        cleanup_error: r.get(26)?,
+        cleanup_resume_generation: r.get(27)?,
+        cleanup_resume_requested: r.get::<i64>(28)? == 1,
+        predecessor_complete: r.get::<i64>(29)? == 1,
     })
 }
 async fn read_parent(c: &Connection, id: Uuid) -> Result<Option<Parent>> {
@@ -563,6 +681,42 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
         _ => return Err(bad()),
     };
     let published = p.revision == 1;
+    let (expected, covered): (i64, i64) = {
+        let row = c
+            .query(
+                "SELECT count(*),count(credited_operation_id) FROM downloaded_scan_coverage WHERE command_id=?",
+                [p.id.hyphenated().to_string()],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(bad)?;
+        (row.get(0)?, row.get(1)?)
+    };
+    let cleanup_phase = match p.cleanup_phase.as_deref() {
+        None => None,
+        Some("observed") => Some(ScanCleanupPhase::Observed),
+        Some("remove_intent") => Some(ScanCleanupPhase::RemoveIntent),
+        Some("settled") => Some(ScanCleanupPhase::Settled),
+        Some(_) => return Err(bad()),
+    };
+    let cleanup_state = match p.cleanup_state.as_str() {
+        "not_needed" => ScanCleanupState::NotNeeded,
+        "pending" => ScanCleanupState::Pending,
+        "complete" => ScanCleanupState::Complete,
+        "retained" => ScanCleanupState::Retained,
+        _ => return Err(bad()),
+    };
+    let cleanup_recovery = cleanup_state == ScanCleanupState::Pending
+        && cleanup_phase == Some(ScanCleanupPhase::RemoveIntent)
+        && !p.cleanup_resume_requested;
+    let uuid = |v: &Option<String>| {
+        v.as_deref()
+            .map(|v| Uuid::parse_str(v).map_err(|_| bad()))
+            .transpose()
+    };
+    let receipt_id = uuid(&p.candidate)?;
+    let predecessor_operation_id = uuid(&p.predecessor)?;
     Ok(DownloadedScanCommand {
         id: p.id,
         media_type: p.media,
@@ -573,18 +727,26 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
         } else {
             CommandPriority::Normal
         },
-        tracking: match (&tracked, published) {
-            (None, _) => ScanTracking::Untracked,
-            (Some(_), false) => ScanTracking::Pending,
-            (Some(_), true) => ScanTracking::UnknownFallback,
+        tracking: match (&tracked, receipt_id, published) {
+            (None, _, _) => ScanTracking::Untracked,
+            (Some(_), Some(_), _) => ScanTracking::Receipt,
+            (Some(_), None, false) => ScanTracking::Pending,
+            (Some(_), None, true) => ScanTracking::UnknownFallback,
         },
         tracked,
         phase: match (p.status, p.revision) {
             (CommandStatus::Queued | CommandStatus::RetryWait, _) => ScanPhase::Queued,
+            (CommandStatus::Running, 0) if receipt_id.is_some() && !p.predecessor_complete => {
+                ScanPhase::WaitingPredecessor
+            }
             (CommandStatus::Running, 0) => ScanPhase::Inventory,
             (CommandStatus::Running, _) if counts.importing > 0 => ScanPhase::Importing,
             (CommandStatus::Running, _) if counts.ready == 0 && counts.recovery_required > 0 => {
                 ScanPhase::RecoveryRequired
+            }
+            (CommandStatus::Running, _) if cleanup_recovery => ScanPhase::RecoveryRequired,
+            (CommandStatus::Running, _) if cleanup_state == ScanCleanupState::Pending => {
+                ScanPhase::Cleanup
             }
             (CommandStatus::Running, _) => ScanPhase::AwaitingImport,
             _ => ScanPhase::Settled,
@@ -611,6 +773,30 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
         started_at: p.started_at,
         completed_at: p.completed_at,
         counts,
+        receipt_id,
+        predecessor_operation_id,
+        coverage: ScanCoverage {
+            state: match p.coverage_state.as_str() {
+                "untracked" => ScanCoverageState::Untracked,
+                "pending" => ScanCoverageState::Pending,
+                "complete" => ScanCoverageState::Complete,
+                "incomplete" => ScanCoverageState::Incomplete,
+                _ => return Err(bad()),
+            },
+            expected,
+            covered,
+            missing: expected - covered,
+        },
+        cleanup: ScanCleanup {
+            state: cleanup_state,
+            phase: cleanup_phase,
+            reason: p.cleanup_reason,
+            removed: p.cleanup_removed,
+            error_code: p.cleanup_error,
+            resume_generation: p.cleanup_resume_generation,
+            resume_requested: p.cleanup_resume_requested,
+            recovery_required: cleanup_recovery,
+        },
     })
 }
 
@@ -882,6 +1068,88 @@ async fn children(
     .await;
     finish(tx, outcome).await
 }
+async fn members_tv(
+    state: State<Arc<Database>>,
+    path: Path<(String, String)>,
+    q: Q<ScanMemberQuery>,
+) -> Result<Json<ApiPage<ScanChildMember>>> {
+    members(state, MediaDomain::Tv, path, q).await
+}
+async fn members_movies(
+    state: State<Arc<Database>>,
+    path: Path<(String, String)>,
+    q: Q<ScanMemberQuery>,
+) -> Result<Json<ApiPage<ScanChildMember>>> {
+    members(state, MediaDomain::Movies, path, q).await
+}
+/// Complete paginated membership of one child, ordered by episode ID.
+async fn members(
+    State(db): State<Arc<Database>>,
+    media: MediaDomain,
+    Path((id, child_id)): Path<(String, String)>,
+    q: Q<ScanMemberQuery>,
+) -> Result<Json<ApiPage<ScanChildMember>>> {
+    let q = q.map_err(|_| bad())?.0;
+    if !(1..=PAGE_MAX).contains(&q.limit) || q.offset > OFFSET_MAX {
+        return Err(bad());
+    }
+    let id = parse_id(&id)?;
+    let child_id = parse_id(&child_id)?;
+    let c = connection(&db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::ReadOnly)
+        .await?;
+    let outcome = async {
+        scoped_parent(&tx, id, media).await?;
+        let (key, child) = (id.hyphenated().to_string(), child_id.hyphenated().to_string());
+        if tx
+            .query(
+                "SELECT 1 FROM downloaded_scan_children WHERE id=? AND command_id=?",
+                params![child.clone(), key.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            return Err(not_found());
+        }
+        let total = tx
+            .query(
+                "SELECT count(*) FROM downloaded_scan_child_episodes WHERE child_id=? AND command_id=?",
+                params![child.clone(), key.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(bad)?
+            .get(0)?;
+        let mut rows = tx
+            .query(
+                "SELECT m.episode_id,m.series_id,e.season,e.number,m.expected_old_episode_file_id FROM downloaded_scan_child_episodes m JOIN episodes e ON e.id=m.episode_id WHERE m.child_id=? AND m.command_id=? ORDER BY m.episode_id LIMIT ? OFFSET ?",
+                params![child, key, i64::from(q.limit), i64::from(q.offset)],
+            )
+            .await?;
+        let mut items = Vec::new();
+        while let Some(r) = rows.next().await? {
+            items.push(ScanChildMember {
+                episode_id: r.get(0)?,
+                series_id: r.get(1)?,
+                season_number: r.get(2)?,
+                episode_number: r.get(3)?,
+                expected_old_episode_file_id: r.get(4)?,
+            });
+        }
+        bounded(ApiPage {
+            items,
+            total,
+            limit: q.limit,
+            offset: q.offset,
+        })
+    }
+    .await;
+    finish(tx, outcome).await
+}
 /// Idempotent stop-after-current. `cancel_requested` is monotone, fences publication and
 /// prevents every later child preparation or start. Untouched ready children are cancelled at
 /// once; an importing or unresolved child keeps the parent running until it settles.
@@ -905,16 +1173,17 @@ async fn cancel(
             (CommandStatus::Succeeded | CommandStatus::Failed | CommandStatus::Cancelled, _) => {}
             (CommandStatus::Queued | CommandStatus::RetryWait, _) => {
                 tx.execute(
-                    "UPDATE downloaded_scan_commands SET cancel_requested=1,status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status IN ('queued','retry_wait')",
+                    &format!("UPDATE downloaded_scan_commands SET cancel_requested=1,status='cancelled',completed_at=?,error_code=NULL,{UNPUBLISHED_COVERAGE} WHERE id=? AND status IN ('queued','retry_wait')"),
                     params![timestamp, key],
                 )
                 .await?;
             }
             (CommandStatus::Running, 0) => {
-                // Discovery is in flight (or abandoned): the publication fence settles it.
+                // Discovery is in flight, abandoned or waiting for a captured predecessor: the
+                // publication fence settles it; a waiting parent is woken to observe the cancel.
                 tx.execute(
-                    "UPDATE downloaded_scan_commands SET cancel_requested=1 WHERE id=? AND status='running'",
-                    [key],
+                    "UPDATE downloaded_scan_commands SET cancel_requested=1,next_attempt_at=min(next_attempt_at,?) WHERE id=? AND status='running'",
+                    params![timestamp, key],
                 )
                 .await?;
             }
@@ -975,12 +1244,32 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
             requested: p.provider.zip(p.remote),
         }));
     }
+    if matches!(p.status, CommandStatus::Running) && p.revision == 0 && p.candidate.is_some() {
+        // A captured receipt waiting for its predecessor (or an abandoned discovery after the
+        // capture): a new scheduling generation, never another attempt and never a reset.
+        c.execute(
+            "UPDATE downloaded_scan_commands SET run_generation=run_generation+1,ready_order_at=max(ready_order_at,?1) WHERE id=?2 AND status='running' AND inventory_revision=0 AND candidate_id IS NOT NULL",
+            params![timestamp, key],
+        )
+        .await?;
+        let p = read_parent(c, id).await?.ok_or_else(not_found)?;
+        return Ok(Some(ScanClaim {
+            id,
+            continuation: false,
+            media: p.media,
+            path: p.path,
+            mode: p.mode,
+            attempts: p.attempts,
+            run_generation: p.run_generation,
+            requested: p.provider.zip(p.remote),
+        }));
+    }
     if !matches!(p.status, CommandStatus::Queued | CommandStatus::RetryWait) {
         return Ok(None);
     }
     if p.cancel_requested {
         c.execute(
-            "UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status IN ('queued','retry_wait')",
+            &format!("UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL,{UNPUBLISHED_COVERAGE} WHERE id=? AND status IN ('queued','retry_wait')"),
             params![timestamp, key],
         )
         .await?;
@@ -1003,17 +1292,21 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
         requested: p.provider.zip(p.remote),
     }))
 }
-/// Only unpublished running parents are reset. A published parent (revision 1) owns durable
-/// children and is never touched by startup or per-tick recovery.
+/// Only unpublished, uncaptured running parents are reset. A published parent (revision 1)
+/// owns durable children, and a parent that captured a tracked receipt waits for its
+/// predecessor; neither is touched by startup or per-tick recovery (the worker re-claims them).
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
     c.execute(
-        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0",
+        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0 AND candidate_id IS NULL",
         params![timestamp, code],
     )
     .await?;
     Ok(())
 }
 
+/// Unpublished parents settle with no credited coverage: a captured receipt is incomplete.
+const UNPUBLISHED_COVERAGE: &str =
+    "coverage_state=CASE WHEN candidate_id IS NULL THEN 'untracked' ELSE 'incomplete' END";
 enum Failure {
     /// Transient before publication; consumes the parent's three-attempt budget.
     Retry(&'static str),
@@ -1021,6 +1314,9 @@ enum Failure {
     Cancelled,
     /// Another claim superseded this generation; nothing may be written.
     Stale,
+    /// The captured receipt's predecessor is still finishing; poll again after this delay
+    /// without consuming an attempt.
+    Waiting(i64),
 }
 impl From<libsql::Error> for Failure {
     fn from(error: libsql::Error) -> Self {
@@ -1031,6 +1327,12 @@ impl From<libsql::Error> for Failure {
         );
         if message.contains("capacity reached") {
             Failure::Fail("scan_inventory_limit")
+        } else if message.contains("explicit scan lineage") {
+            Failure::Fail("scan_tracked_receipt_reserved")
+        } else if message.contains("busy scan receipt authority")
+            || message.contains("exact processing fence")
+        {
+            Failure::Retry("scan_tracked_receipt_busy")
         } else if message.contains("reserved")
             || message.contains("active rescan")
             || message.contains("existing transfer")
@@ -1136,6 +1438,8 @@ struct Chosen {
 struct Discovery {
     /// None when the valid source path does not exist.
     envelope: Option<String>,
+    /// The exact tracked receipt this parent captures at publication (or already captured).
+    receipt: Option<receipt::Receipt>,
     folder: Option<String>,
     items: Vec<Item>,
     chosen: Vec<Chosen>,
@@ -1180,41 +1484,6 @@ async fn live(c: &Connection, claim: &ScanClaim) -> std::result::Result<(), Fail
         Fence::Current => Ok(()),
         Fence::Cancel => Err(Failure::Cancelled),
         Fence::Stale => Err(Failure::Stale),
-    }
-}
-/// A tracked request resolves strictly by provider + domain + remote id. Phase A cannot
-/// reserve or hand back a known receipt, and a known receipt must never degrade into an
-/// ordinary untracked scan, so it fails visibly. Only an UNKNOWN remote falls back.
-async fn resolve_tracking(c: &Connection, claim: &ScanClaim) -> std::result::Result<(), Failure> {
-    let Some((provider, remote)) = &claim.requested else {
-        return Ok(());
-    };
-    let known = c
-        .query(
-            "SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=? WHERE p.id=?",
-            params![domain(claim.media), provider.clone()],
-        )
-        .await?
-        .next()
-        .await?
-        .is_some();
-    if !known {
-        return Err(Failure::Fail("scan_tracked_provider_unavailable"));
-    }
-    let receipt = c
-        .query(
-            "SELECT status FROM rss_candidates WHERE client_id=? AND observed_hash=? AND media_type=? LIMIT 1",
-            params![provider.clone(), remote.clone(), domain(claim.media)],
-        )
-        .await?
-        .next()
-        .await?;
-    match receipt {
-        None => Ok(()),
-        Some(r) if r.get::<String>(0)? == "observed" => {
-            Err(Failure::Fail("scan_tracked_receipt_unsupported"))
-        }
-        Some(_) => Err(Failure::Fail("scan_tracked_receipt_unavailable")),
     }
 }
 /// Already-imported sources are historical coverage; one scan of history per discovery.
@@ -1269,7 +1538,7 @@ async fn discover(
     let deadline = Instant::now() + DISCOVERY_BUDGET;
     let c = connection(db).await?;
     live(&c, claim).await?;
-    resolve_tracking(&c, claim).await?;
+    let tracking = receipt::resolve(&c, claim).await?;
     let path = claim.path.clone();
     let captured = tokio::task::spawn_blocking(move || Inventory::capture(&path))
         .await
@@ -1280,6 +1549,7 @@ async fn discover(
         Err(e) if e.path_class() == Some("missing") => {
             return Ok(Discovery {
                 envelope: None,
+                receipt: tracking,
                 folder: None,
                 items: Vec::new(),
                 chosen: Vec::new(),
@@ -1366,42 +1636,48 @@ async fn discover(
         } else {
             folder_root.clone()
         };
-        let identified = match parser::parse_downloaded(stem, tv) {
-            Ok(p) if !p.parsed.title.is_empty() => Ok(stem.to_owned()),
-            Ok(_) | Err(_) => folder_name.clone().ok_or("missing_owner_identification"),
+        // A captured receipt fixes the owner and expected members; the evaluator validates the
+        // filename/folder/receipt identities against it instead of resolving a local owner.
+        let authority = if let Some(r) = &tracking {
+            r.authority(claim.media)
+        } else {
+            let identified = match parser::parse_downloaded(stem, tv) {
+                Ok(p) if !p.parsed.title.is_empty() => Ok(stem.to_owned()),
+                Ok(_) | Err(_) => folder_name.clone().ok_or("missing_owner_identification"),
+            };
+            let raw = match identified {
+                Ok(raw) => raw,
+                Err(code) => {
+                    item.state = Verdict::Rejected(vec![reason(code)]);
+                    items.push(item);
+                    continue;
+                }
+            };
+            let key = owner_key(&raw, tv);
+            let owner = match owners.get(&key) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let resolved = match resolve_scan_owner(&c, claim.media, &raw).await {
+                        Ok(owner) => Ok(owner),
+                        Err(SearchError(code)) => match infrastructure(code) {
+                            Some(failure) => return Err(failure),
+                            None => Err(code),
+                        },
+                    };
+                    owners.insert(key, resolved.clone());
+                    resolved
+                }
+            };
+            let owner = match owner {
+                Ok(owner) => owner,
+                Err(code) => {
+                    item.state = Verdict::Rejected(vec![reason(code)]);
+                    items.push(item);
+                    continue;
+                }
+            };
+            ScanAuthority::Local { owner }
         };
-        let raw = match identified {
-            Ok(raw) => raw,
-            Err(code) => {
-                item.state = Verdict::Rejected(vec![reason(code)]);
-                items.push(item);
-                continue;
-            }
-        };
-        let key = owner_key(&raw, tv);
-        let owner = match owners.get(&key) {
-            Some(cached) => cached.clone(),
-            None => {
-                let resolved = match resolve_scan_owner(&c, claim.media, &raw).await {
-                    Ok(owner) => Ok(owner),
-                    Err(SearchError(code)) => match infrastructure(code) {
-                        Some(failure) => return Err(failure),
-                        None => Err(code),
-                    },
-                };
-                owners.insert(key, resolved.clone());
-                resolved
-            }
-        };
-        let owner = match owner {
-            Ok(owner) => owner,
-            Err(code) => {
-                item.state = Verdict::Rejected(vec![reason(code)]);
-                items.push(item);
-                continue;
-            }
-        };
-        let authority = ScanAuthority::Local { owner };
         let input = ScanFileInput {
             basename: &basename,
             relative_path: &item.relative_path,
@@ -1423,6 +1699,9 @@ async fn discover(
         .await;
         let (decision, warm) = match decided {
             Ok(v) => v,
+            Err(SearchError(code)) if tracking.is_some() && receipt::receipt_code(code) => {
+                return Err(Failure::Fail("scan_tracked_receipt_unavailable"));
+            }
             Err(SearchError(code)) => match infrastructure(code) {
                 Some(failure) => return Err(failure),
                 None => {
@@ -1538,6 +1817,7 @@ async fn discover(
     }
     Ok(Discovery {
         envelope: Some(envelope),
+        receipt: tracking,
         folder,
         items,
         chosen,
@@ -1597,9 +1877,11 @@ fn decision_json(
     }
     Ok(text)
 }
-fn resolved_mode(mode: ScanMode) -> &'static str {
-    // Untracked auto moves; tracked move capability is a phase B fact, so unknown never moves.
+fn resolved_mode(mode: ScanMode, tracked: bool) -> &'static str {
+    // Untracked auto moves. A tracked receipt's client move capability is not known here, and
+    // unknown capability never implies a move, so tracked auto copies. Explicit modes stay.
     match mode {
+        ScanMode::Auto if tracked => "copy",
         ScanMode::Auto | ScanMode::Move => "move",
         ScanMode::Copy => "copy",
     }
@@ -1636,6 +1918,12 @@ async fn publish_in(
     live(tx, claim).await?;
     let command = claim.id.hyphenated().to_string();
     let timestamp = now()?;
+    // Reserve the exact receipt before any child: the child/member triggers treat this
+    // parent's own captured receipt as related, every other receipt as a foreign owner.
+    if let Some(r) = discovery.receipt.as_ref().filter(|r| !r.captured) {
+        receipt::capture(tx, claim, r).await?;
+    }
+    let tracked = discovery.receipt.is_some();
     let mut destinations: HashSet<String> = HashSet::new();
     let mut selected = 0usize;
     let tv = claim.media == MediaDomain::Tv;
@@ -1803,7 +2091,7 @@ async fn publish_in(
                 movie_id,
                 old_movie,
                 destination,
-                chosen.map(|_| resolved_mode(claim.mode)),
+                chosen.map(|_| resolved_mode(claim.mode, tracked)),
                 quality,
                 revision,
                 edition,
@@ -1834,6 +2122,9 @@ async fn publish_in(
         }
     }
     let children = discovery.items.len();
+    if let Some(r) = &discovery.receipt {
+        receipt::expect_coverage(tx, &command, claim.media, r).await?;
+    }
     let inventory_json = match &discovery.envelope {
         Some(envelope) => envelope.clone(),
         None => serde_json::json!({"version":1,"missing":true}).to_string(),
@@ -1861,11 +2152,19 @@ async fn publish_in(
     if changed != 1 {
         return Err(Failure::Stale);
     }
+    if tracked {
+        // A completed predecessor's typed history counts before any child imports.
+        receipt::credit(tx, &command).await?;
+    }
     if selected == 0 {
-        // Completed evaluation with nothing to import is a successful, unsuccessful-outcome run.
-        tx.execute(
-            "UPDATE downloaded_scan_commands SET status='succeeded',outcome='unsuccessful',completed_at=? WHERE id=? AND status='running' AND run_generation=?",
-            params![timestamp, command, claim.run_generation],
+        // Completed evaluation with nothing to import is a successful, unsuccessful-outcome run;
+        // a captured receipt is handed back in this same transaction.
+        receipt::finalize(
+            tx,
+            &command,
+            receipt::Terminal::Succeeded,
+            Some(claim.run_generation),
+            timestamp,
         )
         .await?;
     }
@@ -1879,9 +2178,16 @@ async fn settle(db: &Arc<Database>, claim: &ScanClaim, failure: Failure) -> Resu
     let guard = "WHERE id=? AND status='running' AND run_generation=? AND inventory_revision=0";
     match failure {
         Failure::Stale => {}
+        Failure::Waiting(delay) => {
+            c.execute(
+                &format!("UPDATE downloaded_scan_commands SET next_attempt_at=? {guard}"),
+                params![timestamp + delay, key, claim.run_generation],
+            )
+            .await?;
+        }
         Failure::Cancelled => {
             c.execute(
-                &format!("UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL {guard} AND cancel_requested=1"),
+                &format!("UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL,{UNPUBLISHED_COVERAGE} {guard} AND cancel_requested=1"),
                 params![timestamp, key, claim.run_generation],
             )
             .await?;
@@ -1897,7 +2203,7 @@ async fn settle(db: &Arc<Database>, claim: &ScanClaim, failure: Failure) -> Resu
         }
         Failure::Retry(code) | Failure::Fail(code) => {
             c.execute(
-                &format!("UPDATE downloaded_scan_commands SET status='failed',completed_at=?,error_code=? {guard}"),
+                &format!("UPDATE downloaded_scan_commands SET status='failed',completed_at=?,error_code=?,{UNPUBLISHED_COVERAGE} {guard}"),
                 params![timestamp, code, key, claim.run_generation],
             )
             .await?;
@@ -1933,6 +2239,7 @@ pub(super) async fn run(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
                 Failure::Retry(c) | Failure::Fail(c) => c,
                 Failure::Cancelled => "cancelled",
                 Failure::Stale => "stale_generation",
+                Failure::Waiting(_) => "waiting_predecessor",
             };
             eprintln!(
                 "event=downloaded_scan_unpublished command_id={} media_type={} code={}",
@@ -1945,7 +2252,10 @@ pub(super) async fn run(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
     }
 }
 
+mod cleanup;
 mod continuation;
+mod receipt;
+pub use cleanup::ScanCleanupResumeInput;
 pub use continuation::ScanChildResumeInput;
 
 #[cfg(test)]
