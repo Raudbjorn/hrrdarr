@@ -41,6 +41,7 @@ pub mod tags;
 
 pub mod completed_download_handling;
 pub mod delay_profiles;
+pub mod import_policy;
 pub mod release_profiles;
 pub mod revision_policy;
 

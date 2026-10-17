@@ -1,5 +1,6 @@
 //! Native, domain-scoped file metadata. No endpoint here changes the filesystem.
 pub(crate) mod media_info;
+pub(crate) mod probe;
 use crate::db::Database;
 use axum::{
     Extension, Json, Router,
@@ -603,7 +604,7 @@ pub struct FileRevision {
 }
 impl FileRevision {
     pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
-        if !(1..=i64::from(i32::MAX)).contains(&self.version)
+        if !(0..=i64::from(i32::MAX)).contains(&self.version)
             || !(0..=i64::from(i32::MAX)).contains(&self.real)
         {
             return Err("Invalid quality revision");

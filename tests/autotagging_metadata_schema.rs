@@ -303,11 +303,16 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
 }
 
 // Only successful upgrades omit deliberate additions; rollback/backup/reopen witnesses stay exact.
-async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
+async fn upgrade_witness(
+    c: &Connection,
+    predecessor_names: &str,
+) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
     // 0053 appends one journal column and two indexes; preserve old columns separately below.
-    let mut result = witness_with_schema(c, &format!("SELECT * FROM ({PRESERVED_SCHEMA}) WHERE
-        NOT (type='table' AND name='import_journal') AND
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))','') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+        name IN ({predecessor_names}) AND
+        NOT (type='table' AND name IN ('import_journal','download_processing')) AND
+        name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND
         tbl_name NOT IN ('download_client_tags','rss_client_attempts') AND name NOT IN (
         'rss_commands','search_commands','rss_schedules','rss_candidates',
         'rss_commands_active','rss_candidate_selection_identity','rss_schedules_selection',
@@ -318,6 +323,11 @@ async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         'rss_candidate_selection_admit','rss_candidate_selection_transition',
         'rss_selected_episode_insert','rss_selected_episode_delete',
         'import_journal_path_unresolved','download_processing_path_unresolved') ORDER BY type,name")).await?;
+    // 0054 adds new producer objects (outside the actual44 object set), extends only
+    // the exact capacity term above, and rebuilds processing / ownership guards.
+    // Its dedicated migration tests exercise those changed guards; retain every
+    // predecessor processing column definition here rather than dropping its shape.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('download_processing') WHERE name!='scan_command_id' ORDER BY cid").await?);
     // Compare every predecessor journal column definition exactly despite the additive column.
     result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
     Ok(result)
@@ -518,7 +528,16 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = raw_connection(&old).await?;
     seed(&c).await?;
     let before = witness(&c).await?;
-    let upgrade_before = upgrade_witness(&c).await?;
+    let mut names = c
+        .query("SELECT name FROM sqlite_schema ORDER BY name", ())
+        .await?;
+    let mut predecessor_names = Vec::new();
+    while let Some(row) = names.next().await? {
+        predecessor_names.push(format!("'{}'", row.get::<String>(0)?.replace('\'', "''")));
+    }
+    let predecessor_names = predecessor_names.join(",");
+    drop(names);
+    let upgrade_before = upgrade_witness(&c, &predecessor_names).await?;
     drop(c);
     drop(old);
     let db = Database::open_local(scratch.database()).await?;
@@ -529,9 +548,25 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53 // Reasoning: 0053 adds path diagnostics; historical migration prefixes stay fixed.
+        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     );
-    assert_eq!(upgrade_witness(&c).await?, upgrade_before);
+    assert_eq!(
+        upgrade_witness(&c, &predecessor_names).await?,
+        upgrade_before
+    );
+    // 0055 only appends unknown runtime / pending exact-replay activation defaults.
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE runtime IS NOT NULL").await?,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT sum(series_runtime_version) FROM snapshot_imports"
+        )
+        .await?,
+        0
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
     assert_eq!(scalar(&c, "SELECT count(*) FROM movie_metadata WHERE studio IS NULL AND genres_json IS NULL AND keywords_json IS NULL").await?, 3);
     assert_eq!(
@@ -655,7 +690,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53 // Reasoning: 0053 adds path diagnostics; historical migration prefixes stay fixed.
+        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

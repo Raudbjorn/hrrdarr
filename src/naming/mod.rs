@@ -233,6 +233,15 @@ fn render_error(error: render::RenderError) -> Error {
             "invalid_naming_examples",
             "Example rendering hit a character that replace_illegal_characters=false does not allow",
         ),
+        E::InvalidEpisodeSet
+        | E::NeedsPolicy
+        | E::MissingAbsoluteNumber
+        | E::MissingAirDate
+        | E::MissingMembershipToken
+        | E::ComponentTooLong => Error::bad(
+            "invalid_naming_examples",
+            "Complete naming facts or an explicit multi-episode policy are required",
+        ),
         E::EmptyComponent => Error::bad(
             "invalid_naming_examples",
             "Example rendering produced an empty path component",
@@ -249,7 +258,18 @@ fn render_field(
         return Ok(None);
     };
     let parsed = render::parse(field, template).map_err(|e| template_error(field, e))?;
-    let rendered = render::render(&parsed, facts, config).map_err(render_error)?;
+    let rendered = match facts {
+        RenderFacts::Episode(f) if field == TemplateField::AnimeEpisode => {
+            render::render_episode_set(
+                &parsed,
+                &render::EpisodeSetNamingFacts::from_single(f, Some(47)),
+                None,
+                config,
+            )
+        }
+        _ => render::render(&parsed, facts, config),
+    }
+    .map_err(render_error)?;
     Ok(Some(rendered))
 }
 /// A representative single episode, used only to render `/examples` previews.
@@ -491,6 +511,9 @@ pub struct TvNamingExamplesQuery {
     pub series_folder_format: Option<String>,
     pub season_folder_format: Option<String>,
     pub specials_folder_format: Option<String>,
+    pub multi_episode_style: Option<i64>,
+    // Full draft semantics for the multi specimens only: omitted templates/style are NULL.
+    pub multi_episode_draft: Option<bool>,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct TvNamingExamples {
@@ -500,7 +523,27 @@ pub struct TvNamingExamples {
     pub series_folder_format: Option<String>,
     pub season_folder_format: Option<String>,
     pub specials_folder_format: Option<String>,
+    pub multi_episode_examples: Vec<MultiEpisodeNamingExample>,
 }
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiEpisodeExampleStatus {
+    Rendered,
+    Preserved,
+    NeedsPolicy,
+    Invalid,
+}
+#[derive(Debug, Serialize, ts_rs::TS)]
+pub struct MultiEpisodeNamingExample {
+    // Constructed from the three trusted filename field names only.
+    pub field: String,
+    pub contiguous: bool,
+    pub episodes: Vec<i64>,
+    pub status: MultiEpisodeExampleStatus,
+    pub filename: Option<String>,
+    pub reason: Option<String>,
+}
+
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 #[ts(optional_fields)]
@@ -594,6 +637,10 @@ async fn examples_tv(
     let query = query
         .map_err(|_| bad("Invalid TV naming examples query"))?
         .0;
+    validate_multi_episode_style(query.multi_episode_style)?;
+    if query.multi_episode_draft == Some(true) && query.rename_enabled.is_none() {
+        return Err(bad("rename_enabled is required for a multi-episode draft"));
+    }
     let conn = ctx.db.connect().await?;
     let row = fetch(&conn, "tv").await?;
     let replace_illegal_characters = query
@@ -619,9 +666,11 @@ async fn examples_tv(
         replace_illegal_characters,
         colon: colon_policy(colon, custom.as_deref()),
     };
+    let multi_episode_examples = multi_examples(&query, &row, &config);
     let facts = example_episode_facts();
     let facts = RenderFacts::Episode(&facts);
     Ok(Json(TvNamingExamples {
+        multi_episode_examples,
         standard_episode_format: render_field(
             TemplateField::StandardEpisode,
             query
@@ -677,6 +726,137 @@ async fn examples_tv(
             &config,
         )?,
     }))
+}
+
+fn multi_examples(
+    query: &TvNamingExamplesQuery,
+    row: &Row,
+    config: &RenderConfig<'_>,
+) -> Vec<MultiEpisodeNamingExample> {
+    use render::{EpisodeMemberNamingFacts, EpisodeSetNamingFacts, MultiEpisodeStyle};
+    let draft = query.multi_episode_draft == Some(true);
+    let style = if draft {
+        query.multi_episode_style
+    } else {
+        query.multi_episode_style.or(row.multi_episode_style)
+    }
+    .and_then(|v| MultiEpisodeStyle::try_from(v).ok());
+    let rename = query.rename_enabled.unwrap_or(row.rename_enabled);
+    let mut result = Vec::with_capacity(6);
+    for (field, provided, stored) in [
+        (
+            TemplateField::StandardEpisode,
+            &query.standard_episode_format,
+            &row.standard_episode_format,
+        ),
+        (
+            TemplateField::DailyEpisode,
+            &query.daily_episode_format,
+            &row.daily_episode_format,
+        ),
+        (
+            TemplateField::AnimeEpisode,
+            &query.anime_episode_format,
+            &row.anime_episode_format,
+        ),
+    ] {
+        let template = if draft {
+            provided.as_deref()
+        } else {
+            provided.as_deref().or(stored.as_deref())
+        };
+        for contiguous in [true, false] {
+            let episodes = if contiguous {
+                vec![7, 8, 9]
+            } else {
+                vec![7, 8, 10]
+            };
+            let facts = EpisodeSetNamingFacts {
+                series_title: "Halcyon Vale".into(),
+                anime: field == TemplateField::AnimeEpisode,
+                members: episodes
+                    .iter()
+                    .map(|n| EpisodeMemberNamingFacts {
+                        episode_id: *n,
+                        season: 3,
+                        episode: *n,
+                        title: Some(format!("Chapter {n}")),
+                        air_date: Some(format!("2024-05-{:02}", n + 7)),
+                        absolute_episode_number: Some(n + 40),
+                    })
+                    .collect(),
+                quality_title: "WEBDL-1080p".into(),
+                revision: None,
+                custom_formats: Vec::new(),
+            };
+            let original = if contiguous {
+                "Halcyon.Vale.S03E07E08E09.mkv"
+            } else {
+                "Halcyon.Vale.S03E07E08E10.mkv"
+            };
+            let (status, filename, reason) = if !rename || template.is_none() {
+                (
+                    MultiEpisodeExampleStatus::Preserved,
+                    Some(original.to_owned()),
+                    Some(
+                        if !rename {
+                            "rename_disabled"
+                        } else {
+                            "template_unset"
+                        }
+                        .to_owned(),
+                    ),
+                )
+            } else {
+                match render::parse(field, template.unwrap())
+                    .map_err(|_| "invalid_template")
+                    .and_then(|t| {
+                        render::render_episode_set(&t, &facts, style, config).map_err(|e| match e {
+                            render::RenderError::NeedsPolicy => "multi_episode_style_required",
+                            render::RenderError::MissingMembershipToken => {
+                                "membership_token_required"
+                            }
+                            render::RenderError::MissingAbsoluteNumber => {
+                                "absolute_number_required"
+                            }
+                            render::RenderError::MissingAirDate => "air_date_required",
+                            render::RenderError::ComponentTooLong => "filename_too_long",
+                            _ => "render_failed",
+                        })
+                    }) {
+                    Ok(stem) if stem.len() + 4 <= render::MAX_COMPONENT_BYTES => (
+                        MultiEpisodeExampleStatus::Rendered,
+                        Some(format!("{stem}.mkv")),
+                        None,
+                    ),
+                    Ok(_) => (
+                        MultiEpisodeExampleStatus::Invalid,
+                        None,
+                        Some("filename_too_long".into()),
+                    ),
+                    Err("multi_episode_style_required") => (
+                        MultiEpisodeExampleStatus::NeedsPolicy,
+                        None,
+                        Some("multi_episode_style_required".into()),
+                    ),
+                    Err(reason) => (
+                        MultiEpisodeExampleStatus::Invalid,
+                        None,
+                        Some(reason.into()),
+                    ),
+                }
+            };
+            result.push(MultiEpisodeNamingExample {
+                field: field.name().into(),
+                contiguous,
+                episodes,
+                status,
+                filename,
+                reason,
+            });
+        }
+    }
+    result
 }
 
 async fn get_movies(State(ctx): State<Context>) -> Result<Json<MovieNamingConfig>> {
@@ -869,6 +1049,8 @@ mod tests {
         // Overriding away from `custom` without supplying new custom text must not
         // inherit the stored custom text and fail validation against the override.
         let query = TvNamingExamplesQuery {
+            multi_episode_style: None,
+            multi_episode_draft: None,
             rename_enabled: None,
             replace_illegal_characters: None,
             colon_replacement: Some(ColonReplacement::Smart),
@@ -882,6 +1064,74 @@ mod tests {
         };
         let result = examples_tv(State(ctx), Ok(Query(query))).await;
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn multi_examples_distinguish_saved_policy_from_cleared_draft_without_writes() {
+        let (_sandbox, ctx) = open().await;
+        let mut settings = tv_update(1);
+        settings.rename_enabled = true;
+        settings.multi_episode_style = Some(5);
+        settings.standard_episode_format = Some("S{season:00}E{episode:00}".into());
+        settings.daily_episode_format = Some("{Air-Date}".into());
+        settings.anime_episode_format = Some("{absolute:000}".into());
+        put_tv(State(ctx.clone()), Ok(Json(settings)))
+            .await
+            .unwrap();
+        let read = |value| serde_json::from_value::<TvNamingExamplesQuery>(value).unwrap();
+        let saved = examples_tv(State(ctx.clone()), Ok(Query(read(serde_json::json!({})))))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(saved.multi_episode_examples.len(), 6);
+        assert!(
+            saved
+                .multi_episode_examples
+                .iter()
+                .all(|e| matches!(e.status, MultiEpisodeExampleStatus::Rendered))
+        );
+        for enabled in [true, false] {
+            let draft = read(
+                serde_json::json!({"multi_episode_draft":true,"rename_enabled":enabled,"standard_episode_format":"S{season:00}E{episode:00}","daily_episode_format":"{Air-Date}","anime_episode_format":"{absolute:000}"}),
+            );
+            let result = examples_tv(State(ctx.clone()), Ok(Query(draft)))
+                .await
+                .unwrap()
+                .0;
+            assert!(result.multi_episode_examples.iter().all(|e| if enabled {
+                matches!(e.status, MultiEpisodeExampleStatus::NeedsPolicy) && e.filename.is_none()
+            } else {
+                matches!(e.status, MultiEpisodeExampleStatus::Preserved) && e.filename.is_some()
+            }));
+        }
+        // Draft NULL templates deliberately do not reuse the configured saved templates.
+        let cleared = read(
+            serde_json::json!({"multi_episode_draft":true,"rename_enabled":true,"multi_episode_style":0}),
+        );
+        let cleared = examples_tv(State(ctx.clone()), Ok(Query(cleared)))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            cleared
+                .multi_episode_examples
+                .iter()
+                .all(|e| matches!(e.status, MultiEpisodeExampleStatus::Preserved))
+        );
+        assert_eq!(cleared.standard_episode_format.as_deref(), Some("S03E07"));
+        for invalid in [
+            serde_json::json!({"multi_episode_draft":true}),
+            serde_json::json!({"multi_episode_style":6}),
+        ] {
+            assert!(
+                examples_tv(State(ctx.clone()), Ok(Query(read(invalid))))
+                    .await
+                    .is_err()
+            );
+        }
+        let after = get_tv(State(ctx)).await.unwrap().0;
+        assert_eq!(after.revision, 2);
+        assert_eq!(after.multi_episode_style, Some(5));
     }
     #[test]
     fn examples_query_parses_enum_and_bool_and_rejects_wrong_domain_field() {

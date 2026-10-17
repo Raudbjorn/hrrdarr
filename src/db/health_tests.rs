@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -149,9 +149,11 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         }
         assert_eq!(&rows(&c, table).await?, &expected);
     }
-    // Remove only the later selection-default exception and the health count to recover every old predicate.
+    // Remove only the later selection-default exception and exact Health/scan
+    // capacity terms to recover every predecessor admission predicate.
     let added =
         "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
+    let scan_added = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))";
     for (name, sql) in &triggers {
         let actual = c
             .query("SELECT sql FROM sqlite_schema WHERE name=?", [name.clone()])
@@ -175,7 +177,9 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         } else {
             actual
         };
-        assert_eq!(actual.replace(added, ""), *sql);
+        // 0054 adds exactly one scan-parent capacity contribution to each old guard.
+        assert_eq!(actual.matches(scan_added).count(), 1);
+        assert_eq!(actual.replace(added, "").replace(scan_added, ""), *sql);
     }
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE severity IS NULL AND checked_at IS NULL AND observed_generation IS NULL AND pending_reasons=0 AND compatibility_type='ImportMechanismCheck'").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_lifecycle WHERE started_at=0 AND grace_due_at=0 AND next_scheduled_at=0 AND last_batch_completed_at IS NULL").await?,1);
@@ -208,7 +212,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -640,7 +644,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -725,7 +729,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 22); // Reasoning:0053 adds two path diagnostics identities (20 -> 22).

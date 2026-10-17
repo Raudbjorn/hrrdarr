@@ -164,7 +164,7 @@ export type EpisodeMonitorMany = { episode_ids: Array<number>, monitored: boolea
 
 export type EpisodeQuery = { series_id?: number, season?: number, episode_ids?: string, episode_file_id?: number, offset?: number, limit?: number, include_series?: boolean, include_episode_file?: boolean, include_images?: boolean, };
 
-export type EpisodeSeriesProjection = { id: number, tvdb_id: number | null, title: string, year: number | null, path: string, poster: string | null, monitored: boolean, };
+export type EpisodeSeriesProjection = { runtime: number | null, id: number, tvdb_id: number | null, title: string, year: number | null, path: string, poster: string | null, monitored: boolean, };
 
 export type EvaluatedRelease = { metadata: ReleaseMetadata, decision: ReleaseDecision, };
 
@@ -260,6 +260,10 @@ export type HostSettings = { authentication: HostAuthentication, configured_bind
 
 export type ImportInput = ManualImportRequest | ImportRequest;
 
+export type ImportPolicy = { media_type: MediaDomain, revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
+
+export type ImportPolicyUpdate = { revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
+
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };
 
 export type IndexerCategory = { id: number, parent_id: number | null, };
@@ -294,7 +298,7 @@ export type LibraryCreate = { title?: string | null, year?: number | null, tvdb_
 
 export type LibraryEditor = { ids: Array<number>, patch: LibraryPatch, };
 
-export type LibraryItem = { tag_ids: Array<number>, id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
+export type LibraryItem = { runtime: number | null, tag_ids: Array<number>, id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
 
 export type LibraryPage = { items: Array<LibraryItem>, total: number, limit: number, offset: number, };
 
@@ -401,6 +405,10 @@ export type MovieRenamePreviewItem = { movie_id: number, movie_file_id: number, 
 export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "invalid_file_facts" | "naming_render_failed";
 
 export type MovieRenamePreviewStatus = "change" | "unavailable";
+
+export type MultiEpisodeExampleStatus = "rendered" | "preserved" | "needs_policy" | "invalid";
+
+export type MultiEpisodeNamingExample = { field: string, contiguous: boolean, episodes: Array<number>, status: MultiEpisodeExampleStatus, filename: string | null, reason: string | null, };
 
 export type NamingErrorDetail = { code: string, message: string, };
 
@@ -642,7 +650,7 @@ export type SearchResult = { id: string, command_id: string, metadata: ReleaseMe
 
 export type SelectionKind = "legacy_fixed" | "default" | "explicit";
 
-export type SeriesDetails = { network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
+export type SeriesDetails = { runtime: number | null, network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
 export type SeriesLookupAdd = { tvdb_id: number, path: string, settings?: LibraryPatch, };
 
@@ -684,9 +692,9 @@ export type TvIndexerScope = { enable_rss?: boolean, enable_automatic_search?: b
 
 export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
-export type TvNamingExamples = { standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, };
+export type TvNamingExamples = { standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_examples: Array<MultiEpisodeNamingExample>, };
 
-export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_episode_format?: string, daily_episode_format?: string, anime_episode_format?: string, series_folder_format?: string, season_folder_format?: string, specials_folder_format?: string, };
+export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_episode_format?: string, daily_episode_format?: string, anime_episode_format?: string, series_folder_format?: string, season_folder_format?: string, specials_folder_format?: string, multi_episode_style?: number, multi_episode_draft?: boolean, };
 
 export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 

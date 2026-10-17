@@ -1,4 +1,5 @@
 //! Linux descriptor-relative transfers. No path component may be a symlink.
+pub(crate) mod scan;
 use super::{Error, Mode, PathKind, PathRole, Result};
 use ring::digest::{Context, SHA256};
 use rustix::fs::{self, AtFlags, Mode as Permissions, OFlags, RenameFlags};

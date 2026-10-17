@@ -199,7 +199,7 @@ export const getTvNaming = () => request<TvNamingConfig>('/api/v1/tv/config/nami
 export const updateTvNaming = (input: TvNamingUpdate) => validId(input.revision) ? request<TvNamingConfig>('/api/v1/tv/config/naming', input, 'PUT', true) : invalidProvider<TvNamingConfig>();
 export const getTvNamingExamples = (query: TvNamingExamplesQuery = {}) => {
   const params = new URLSearchParams();
-  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_episode_format','daily_episode_format','anime_episode_format','series_folder_format','season_folder_format','specials_folder_format'] as const) {
+  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_episode_format','daily_episode_format','anime_episode_format','series_folder_format','season_folder_format','specials_folder_format','multi_episode_style','multi_episode_draft'] as const) {
     if (query[field] != null) params.set(field, String(query[field]));
   }
   const qs = params.toString();
@@ -267,6 +267,9 @@ export const createDelayProfile = (domain: MediaDomain, input: import('./api.gen
 export const updateDelayProfile = (domain: MediaDomain, id: number, input: import('./api.generated').DelayProfileWrite) => validId(id) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').DelayProfileCatalog>();
 export const deleteDelayProfile = (domain: MediaDomain, id: number, revision: number) => validId(id)&&validId(revision) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}?revision=${revision}`, undefined, 'DELETE', true) : invalid<import('./api.generated').DelayProfileCatalog>();
 export const reorderDelayProfiles = (domain: MediaDomain, input: import('./api.generated').DelayProfileReorder) => request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/reorder`, input, 'PUT', true);
+export const getImportPolicy = (domain: MediaDomain) => request<import('./api.generated').ImportPolicy>(`/api/v1/${domain}/import-policy`, undefined, undefined, true);
+export const updateImportPolicy = (domain: MediaDomain, input: import('./api.generated').ImportPolicyUpdate) => request<import('./api.generated').ImportPolicy>(`/api/v1/${domain}/import-policy`, input, 'PUT', true);
+
 export const getRevisionPolicy = (domain: MediaDomain) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, undefined, undefined, true);
 export const updateRevisionPolicy = (domain: MediaDomain, input: import('./api.generated').RevisionPolicyUpdate) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, input, 'PUT', true);
 

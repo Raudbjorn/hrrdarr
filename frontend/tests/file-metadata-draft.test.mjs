@@ -27,7 +27,10 @@ test('quality uses catalog quality ID and explicitly replaces the entire nested 
  for(const domain of ['tv','movies']) {
   assert.deepEqual(build(domain,{quality:set({quality_id:7,revision})}),{ok:true,data:{quality:{quality_id:7,revision}}});
   assert.deepEqual(build(domain,{quality:set({quality_id:7,revision:null})}),{ok:true,data:{quality:{quality_id:7,revision:null}}});
-  for(const value of [{quality_id:999,revision:null},{quality_id:7},{quality_id:7,revision:{...revision,version:0}},{quality_id:7,revision:{...revision,real:2147483648}},{quality_id:7,revision:{...revision,is_repack:1}}]) assert.equal(build(domain,{quality:set(value)}).ok,false);
+  // Explicit quality v0 is valid; unknown remains null and negative/overflow values reject.
+  const zero={version:0,real:0,is_repack:false};
+  assert.deepEqual(build(domain,{quality:set({quality_id:7,revision:zero})}),{ok:true,data:{quality:{quality_id:7,revision:zero}}});
+  for(const value of [{quality_id:999,revision:null},{quality_id:7},...[ -1,0.5,true,'0',2147483648 ].map(version=>({quality_id:7,revision:{...revision,version}})),{quality_id:7,revision:{...revision,real:2147483648}},{quality_id:7,revision:{...revision,is_repack:1}}]) assert.equal(build(domain,{quality:set(value)}).ok,false);
  }
 });
 test('catalog membership, domains, language sentinels and masks fail closed',()=>{
@@ -52,7 +55,9 @@ test('readback requires every distinct requested file with exact domain and owne
  for(const domain of ['tv','movies']) {
   const a=resource(domain,1),b=resource(domain,2);
   assert.equal(validateFileReadback(domain,9,[1,2],[b,a]).ok,true);
-  for(const files of [[a],[a,a],[a,resource(domain,3)],[a,resource(domain,2,10)],[a,resource(domain==='tv'?'movies':'tv',2)],[a,{...b,languages:undefined}],[a,{...b,quality:{quality_id:7,revision:{version:0,real:0,is_repack:false}}}]]) assert.equal(validateFileReadback(domain,9,[1,2],files).ok,false);
+  // The backend can return explicit v0, distinct from an unknown revision.
+  assert.equal(validateFileReadback(domain,9,[1,2],[a,{...b,quality:{quality_id:7,revision:{version:0,real:0,is_repack:false}}}]).ok,true);
+  for(const files of [[a],[a,a],[a,resource(domain,3)],[a,resource(domain,2,10)],[a,resource(domain==='tv'?'movies':'tv',2)],[a,{...b,languages:undefined}],[a,{...b,quality:{quality_id:7,revision:{version:-1,real:0,is_repack:false}}}]]) assert.equal(validateFileReadback(domain,9,[1,2],files).ok,false);
   assert.equal(validateFileReadback(domain,9,[1,1],[a,a]).ok,false);
   assert.equal(validateFileReadback(domain,9,Array.from({length:26},(_,i)=>i+1),Array.from({length:26},(_,i)=>resource(domain,i+1))).ok,false);
   // An unfamiliar retained value is readable; editing it still requires a supported catalog choice.

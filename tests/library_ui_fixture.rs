@@ -1026,6 +1026,7 @@ async fn library_ui_fixture() {
             )
             .merge(hrrdarr::delay_profiles::router(db.clone()))
             .merge(hrrdarr::revision_policy::router(db.clone()))
+            .merge(hrrdarr::import_policy::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
             .merge(hrrdarr::naming::router(db.clone()))

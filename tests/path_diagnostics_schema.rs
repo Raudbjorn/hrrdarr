@@ -42,18 +42,23 @@ async fn dump(c: &Connection, sql: &str) -> Result<Vec<String>, Error> {
     out.sort();
     Ok(out)
 }
-// Snapshot every table, with only the explicitly additive53 fields/rows projected away.
-async fn data(c: &Connection) -> Result<Vec<(String, Vec<String>)>, Error> {
+// Capture actual predecessor columns so later additive fields/tables cannot distort
+// row preservation. Rollback witnesses still capture every table in their schema.
+async fn data_queries(c: &Connection) -> Result<Vec<(String, String)>, Error> {
     let mut tables = c.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", ()).await?;
     let mut out = Vec::new();
     while let Some(row) = tables.next().await? {
         let name: String = row.get(0)?;
         let table = format!("\"{}\"", name.replace('"', "\"\""));
-        let projection = if name == "import_journal" {
-            "operation_id,version,plan_json,stage_json,phase,error_code,updated_at"
-        } else {
-            "*"
-        };
+        let mut columns = c.query(&format!("PRAGMA table_info({table})"), ()).await?;
+        let mut projection = Vec::new();
+        while let Some(column) = columns.next().await? {
+            let column: String = column.get(1)?;
+            if name == "import_journal" && column == "path_failure_code" {
+                continue;
+            }
+            projection.push(format!("\"{}\"", column.replace('"', "\"\"")));
+        }
         let filter = match name.as_str() {
             "schema_migrations" => " WHERE version<=52",
             "health_checks" => " WHERE check_key!='remote_path_mapping'",
@@ -61,10 +66,23 @@ async fn data(c: &Connection) -> Result<Vec<(String, Vec<String>)>, Error> {
         };
         out.push((
             name,
-            dump(c, &format!("SELECT {projection} FROM {table}{filter}")).await?,
+            format!("SELECT {} FROM {table}{filter}", projection.join(",")),
         ));
     }
     Ok(out)
+}
+async fn data_with(
+    c: &Connection,
+    queries: &[(String, String)],
+) -> Result<Vec<(String, Vec<String>)>, Error> {
+    let mut out = Vec::new();
+    for (name, query) in queries {
+        out.push((name.clone(), dump(c, query).await?));
+    }
+    Ok(out)
+}
+async fn data(c: &Connection) -> Result<Vec<(String, Vec<String>)>, Error> {
+    data_with(c, &data_queries(c).await?).await
 }
 async fn schema(c: &Connection, additive_projection: bool) -> Result<Vec<String>, Error> {
     let filter = if additive_projection {
@@ -193,16 +211,25 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let c = fresh.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53
+        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks WHERE check_key='remote_path_mapping' AND startup=1 AND scheduled=1 AND compatibility_type='RemotePathMappingCheck' AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND severity IS NULL AND observed_generation IS NULL AND checked_at IS NULL").await?, 2);
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
     let before = old.connect()?;
     seed(&before).await?;
-    let rows = data(&before).await?;
+    let queries = data_queries(&before).await?;
+    let rows = data_with(&before, &queries).await?;
     let unchanged_schema = schema(&before, true).await?;
     let original_schema = schema(&before, false).await?;
+    // Keep the exact 0053-only SQL preservation assertion, before later producer
+    // migrations deliberately rebuild processing and extend admission predicates.
+    let tx = before.transaction().await?;
+    tx.execute_batch(MIGRATION).await?;
+    assert_eq!(data_with(&tx, &queries).await?, rows);
+    assert_eq!(schema(&tx, true).await?, unchanged_schema);
+    tx.rollback().await?;
+    assert_eq!(schema(&before, false).await?, original_schema);
     drop(before);
     drop(old);
     let upgraded = Database::open_local(&path).await?;
@@ -213,10 +240,33 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let after = upgraded.connect().await?;
     assert_eq!(
         scalar(&after, "SELECT max(version) FROM schema_migrations").await?,
-        53
+        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     );
-    assert_eq!(data(&after).await?, rows);
-    assert_eq!(schema(&after, true).await?, unchanged_schema);
+    assert_eq!(data_with(&after, &queries).await?, rows);
+    assert_eq!(
+        scalar(
+            &after,
+            "SELECT count(*) FROM series WHERE runtime IS NOT NULL"
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &after,
+            "SELECT count(*) FROM snapshot_imports WHERE series_runtime_version!=0"
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &after,
+            "SELECT count(*) FROM download_processing WHERE scan_command_id IS NOT NULL"
+        )
+        .await?,
+        0
+    );
     assert_eq!(
         scalar(
             &after,
@@ -241,7 +291,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     drop(upgraded);
     let reopened = Database::open_local(&path).await?;
     assert!(reopened.migration_backup().is_none());
-    assert_eq!(data(&reopened.connect().await?).await?, rows);
+    assert_eq!(data_with(&reopened.connect().await?, &queries).await?, rows);
     assert_eq!(
         schema(&reopened.connect().await?, false).await?,
         committed_schema

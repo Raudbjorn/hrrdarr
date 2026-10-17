@@ -228,6 +228,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "path_diagnostics",
         include_str!("../../migrations/0053_path_diagnostics.sql"),
     ),
+    (
+        "downloaded_scan",
+        include_str!("../../migrations/0054_downloaded_scan.sql"),
+    ),
+    (
+        "series_runtime",
+        include_str!("../../migrations/0055_series_runtime.sql"),
+    ),
+    (
+        "import_policy",
+        include_str!("../../migrations/0056_import_policy.sql"),
+    ),
+    (
+        "scan_media",
+        include_str!("../../migrations/0057_scan_media.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

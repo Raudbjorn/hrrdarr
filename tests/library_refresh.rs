@@ -49,6 +49,7 @@ fn episode(id: i64, season: i64, number: i64, title: &str) -> EpisodeDetails {
 }
 fn series() -> SeriesDetails {
     SeriesDetails {
+        runtime: None,
         network: None,
         original_country: None,
         status: None,

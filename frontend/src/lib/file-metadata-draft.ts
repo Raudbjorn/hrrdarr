@@ -22,7 +22,7 @@ const fail = <T>(error: string): Result<T> => ({ ok: false, error });
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const integer = (v: unknown, min: number, max = Number.MAX_SAFE_INTEGER): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= min && v <= max;
 const domainValid = (d: unknown): d is MediaDomain => d === 'tv' || d === 'movies';
-const revisionValid = (v: unknown): v is FileRevision => object(v) && integer(v.version, 1, 2147483647) && integer(v.real, 0, 2147483647) && typeof v.is_repack === 'boolean';
+const revisionValid = (v: unknown): v is FileRevision => object(v) && integer(v.version, 0, 2147483647) && integer(v.real, 0, 2147483647) && typeof v.is_repack === 'boolean';
 const textValid = (v: unknown): v is string => typeof v === 'string' && !v.includes('\0') && new TextEncoder().encode(v).length <= 1024;
 
 export function emptyFileMetadataDraft(): FileMetadataDraft {

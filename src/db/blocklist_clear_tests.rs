@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {
@@ -136,9 +136,12 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
             }
         }
         if *table == "snapshot_imports" {
-            // Migrations36 through41 and45 append seven inactive metadata markers; retain every prior field and assert the new AutoTagging marker is0.
+            // Migrations36 through41,45,55 and56 append nine inactive metadata markers.
+            // Preserve every predecessor field and assert both new activation markers start at0.
             for row in &mut expected {
                 row.extend([
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),

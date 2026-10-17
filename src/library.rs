@@ -294,6 +294,7 @@ pub struct Season {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
+    pub runtime: Option<i64>,
     pub tag_ids: Vec<i64>,
     pub id: i64,
     pub media_type: Domain,
@@ -565,8 +566,13 @@ async fn fetch(
     } else {
         "r.id,r.metadata_id,m.title,m.year,NULL,m.tmdb_id,m.imdb_id,r.path,NULL,r.monitored"
     };
+    let runtime = if d == Domain::Tv {
+        "r.runtime"
+    } else {
+        "m.runtime"
+    };
     let sql = format!(
-        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
+        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added,{runtime} FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
         d.table(),
         if d == Domain::Movies {
             "JOIN movie_metadata m ON m.id=r.metadata_id"
@@ -583,6 +589,7 @@ async fn fetch(
     let mut bytes = 1024;
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
+            runtime: r.get(18)?,
             tag_ids: crate::tags::assigned(c, d, r.get(0)?)
                 .await
                 .map_err(tag_error)?,

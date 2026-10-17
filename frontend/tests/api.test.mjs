@@ -503,7 +503,22 @@ test('naming examples query builders allowlist domain-scoped fields and drop the
     await getTvNamingExamples({ standard_movie_format: 'x', multi_episode_style: 1, revision: 2 });
     await getMovieNamingExamples({ standard_episode_format: 'x', multi_episode_style: 1, revision: 2 });
   });
-  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples', '/api/v1/movies/config/naming/examples']);
+  // TV multi-episode previews now consume this existing setting; movies still reject it.
+  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples?multi_episode_style=1', '/api/v1/movies/config/naming/examples']);
+});
+
+test('multi-episode draft preview distinguishes cleared style from saved settings and preserves zero', async () => {
+  const calls = [];
+  await withFetch(async (path) => { calls.push(path); return json({}); }, async () => {
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: true });
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: false, multi_episode_style: 0 });
+    await getTvNamingExamples({ multi_episode_draft: false });
+  });
+  assert.deepEqual(calls, [
+    '/api/v1/tv/config/naming/examples?rename_enabled=true&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?rename_enabled=false&multi_episode_style=0&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?multi_episode_draft=false',
+  ]);
 });
 
 const fileApi = await import('../src/lib/api.ts');

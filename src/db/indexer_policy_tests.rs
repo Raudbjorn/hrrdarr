@@ -118,12 +118,19 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
+            let mut expected = expected.clone();
+            if *table == "series" {
+                // 0055 adds a NULL runtime only; retain all preceding column values.
+                for row in &mut expected {
+                    row.push(libsql::Value::Null);
+                }
+            }
             assert_eq!(
-                &rows(&c, &format!("SELECT * FROM {table} ORDER BY rowid")).await?,
+                rows(&c, &format!("SELECT * FROM {table} ORDER BY rowid")).await?,
                 expected
             );
         }
@@ -267,7 +274,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,

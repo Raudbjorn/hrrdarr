@@ -49,6 +49,8 @@ pub fn render() -> String {
     registry.visit::<crate::commands::processing::ProcessingPolicyReset>();
     registry.visit::<crate::revision_policy::Policy>();
     registry.visit::<crate::revision_policy::Update>();
+    registry.visit::<crate::import_policy::Policy>();
+    registry.visit::<crate::import_policy::Update>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
@@ -216,6 +218,8 @@ pub fn render() -> String {
         crate::naming::TvNamingUpdate,
         crate::naming::TvNamingExamplesQuery,
         crate::naming::TvNamingExamples,
+        crate::naming::MultiEpisodeNamingExample,
+        crate::naming::MultiEpisodeExampleStatus,
         crate::naming::MovieNamingConfig,
         crate::naming::MovieNamingUpdate,
         crate::naming::MovieNamingExamplesQuery,

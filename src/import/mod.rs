@@ -1,6 +1,9 @@
 //! Initial manual imports and receipt-bound singleton replacements with durable recovery.
 mod fs;
 mod owned;
+pub(crate) mod probe;
+pub(crate) mod scan;
+pub(crate) use fs::scan as scan_fs;
 pub(crate) use owned::{OwnedImport, prepare_owned};
 
 // Share the existing descriptor-relative, no-symlink directory walk with root observations.

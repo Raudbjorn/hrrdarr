@@ -96,15 +96,22 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 8 } else { 4 } // Reasoning: latest upgrade adds 0050–0053;0053 adds two scoped path checks.
+                    expected.len() + if *table == "health_checks" { 8 } else { 8 } // Reasoning: eight migrations follow49 through57;54 through57 add no Health identities.
                 );
+            } else if *table == "series" {
+                // 0055 appends unknown runtime; every predecessor value remains exact.
+                let mut expected = expected.clone();
+                for row in &mut expected {
+                    row.push(libsql::Value::Null);
+                }
+                assert_eq!(actual, expected);
             } else {
                 assert_eq!(&actual, expected);
             }

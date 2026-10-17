@@ -12,6 +12,7 @@ const TV_ORIGIN: &str = "https://skyhook.sonarr.tv/v1/tvdb/";
 const MOVIE_ORIGIN: &str = "https://api.radarr.video/v1/";
 const MAX_RESULTS: usize = 100;
 const MAX_EPISODES: usize = 10000;
+pub(crate) const MAX_SERIES_RUNTIME_MINUTES: i64 = i32::MAX as i64;
 #[derive(Debug)]
 pub enum MetadataError {
     InvalidInput,
@@ -97,6 +98,7 @@ pub struct LookupResult {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct SeriesDetails {
+    pub runtime: Option<i64>,
     pub network: Option<String>,
     pub original_country: Option<String>,
     pub status: Option<String>,
@@ -530,6 +532,7 @@ fn validate_results(results: Vec<LookupResult>) -> Result<Vec<LookupResult>> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Show {
+    runtime: Option<i64>,
     network: Option<String>,
     original_country: Option<String>,
     status: Option<String>,
@@ -563,6 +566,12 @@ struct Episode {
 }
 impl Show {
     fn summary(self) -> Result<LookupResult> {
+        if self
+            .runtime
+            .is_some_and(|value| !(0..=MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        {
+            return Err(MetadataError::InvalidResponse);
+        }
         identity(self.tvdb_id)?;
         text(&self.title, 1024, false)?;
         canonical_scalar(self.network.clone())?;
@@ -623,8 +632,10 @@ impl Show {
             }
         });
         let genres = canonical_set(self.genres.take())?;
+        let runtime = self.runtime;
         let summary = self.summary()?;
         SeriesDetails {
+            runtime,
             network,
             original_country,
             status,
@@ -831,6 +842,12 @@ fn validate_year(value: Option<i64>) -> Result<()> {
 }
 impl SeriesDetails {
     pub(crate) fn validated(mut self) -> Result<Self> {
+        if self
+            .runtime
+            .is_some_and(|value| !(0..=MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        {
+            return Err(MetadataError::InvalidResponse);
+        }
         identity(self.tvdb_id)?;
         text(&self.title, 1024, false)?;
         validate_year(self.year)?;
@@ -1071,6 +1088,26 @@ mod tests {
             );
         }
         assert_eq!(show(json!({"genres":[]})).unwrap().genres, Some(vec![]));
+        for runtime in [0, 45, 10081, MAX_SERIES_RUNTIME_MINUTES] {
+            assert_eq!(
+                show(json!({"runtime":runtime})).unwrap().runtime,
+                Some(runtime)
+            );
+        }
+        assert_eq!(show(json!({})).unwrap().runtime, None);
+        assert_eq!(show(json!({"runtime":null})).unwrap().runtime, None);
+        for runtime in [
+            json!(-1),
+            json!(MAX_SERIES_RUNTIME_MINUTES + 1),
+            json!(0.5),
+            json!("45"),
+            json!([]),
+        ] {
+            assert!(show(json!({"runtime":runtime})).is_err());
+        }
+        let mut direct = show(json!({"runtime":45})).unwrap();
+        direct.runtime = Some(MAX_SERIES_RUNTIME_MINUTES + 1);
+        assert!(direct.validated().is_err());
         let film = movie(json!({"studio":" Studio ","genres":["b","A","a"],"keywords":["Ý","ý"],"runtime":0,"status":{"ignored":"wire"}})).unwrap();
         assert_eq!(film.studio.as_deref(), Some(" Studio "));
         assert_eq!(film.genres.unwrap(), ["A", "b"]);
