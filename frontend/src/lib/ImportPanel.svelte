@@ -2,11 +2,15 @@
   import { onMount } from 'svelte';
   import type { ManualImportRequest, MediaTarget, Operation, Mode } from './api.generated';
   import { previewManualImport, executeImport, getImport } from './api';
+  import { hasRecoveryState, manualImportAction, pathDiagnostic } from './pathDiagnostics';
   let { target, label, oncomplete }: { target: MediaTarget | null; label: string; oncomplete: () => void } = $props();
   type Receipt = { request: ManualImportRequest; label: string; operation: Operation; authorized: boolean };
   const key = 'hrrdarr.import.receipt.v1';
   let source = $state(''), destination = $state(''), mode: Mode = $state('copy');
   let receipt: Receipt | null = $state(null), busy = $state(false), error = $state(''), storageError = $state('');
+  let statusFresh = $state(false);
+  const action = $derived.by(() => receipt ? manualImportAction(receipt.operation, statusFresh) : null);
+  const diagnostic = $derived.by(() => receipt ? pathDiagnostic(receipt.operation.path_failure_code, receipt.operation.recovery_required === true, receipt.operation.status === 'complete') : null);
   let active = true, timer: ReturnType<typeof setTimeout> | undefined;
   function persist() {
     try { if (receipt) localStorage.setItem(key, JSON.stringify(receipt)); else localStorage.removeItem(key); storageError = ''; }
@@ -15,12 +19,13 @@
   function accept(operation: Operation) {
     if (!receipt || operation.id !== receipt.operation.id || operation.target.media_type !== receipt.request.target.media_type || operation.target.id !== receipt.request.target.id) { error = 'Operation target does not match the saved confirmation.'; return; }
     const wasComplete = receipt.operation.status === 'complete';
-    receipt = { ...receipt, operation }; persist();
+    receipt = { ...receipt, operation }; statusFresh = hasRecoveryState(operation); persist();
+    if (!statusFresh) error = 'Import status is missing recovery details. Check status before authorizing another action.';
     if (operation.status === 'complete' && !wasComplete) oncomplete();
   }
   async function check() {
     if (!receipt || busy) return;
-    const id = receipt.operation.id; busy = true; error = '';
+    const id = receipt.operation.id; busy = true; statusFresh = false; error = '';
     const result = await getImport(id);
     if (!active) return;
     busy = false;
@@ -29,7 +34,7 @@
   }
   function schedule() {
     clearTimeout(timer);
-    if (active && !document.hidden && receipt && !['preview', 'complete'].includes(receipt.operation.status) && !receipt.operation.error_code && !error) timer = setTimeout(check, 5000);
+    if (active && !document.hidden && receipt && !['preview', 'complete'].includes(receipt.operation.status) && !receipt.operation.error_code && !receipt.operation.recovery_required && !error) timer = setTimeout(check, 5000);
   }
   async function preview() {
     if (!target || receipt || busy) return;
@@ -38,12 +43,13 @@
     const result = await previewManualImport(request);
     if (!active) return;
     busy = false;
-    if (result.ok) { receipt = { request, label: name, operation: result.data, authorized: false }; persist(); }
+    if (result.ok) { receipt = { request, label: name, operation: result.data, authorized: false }; statusFresh = hasRecoveryState(result.data); persist(); }
     else error = `${result.error} No transfer was authorized. If the response was lost, the server may retain an unexecuted preview.`;
   }
   async function execute() {
-    if (!receipt || busy) return;
+    if (!receipt || busy || !manualImportAction(receipt.operation, statusFresh)) return;
     const id = receipt.operation.id;
+    statusFresh = false;
     receipt = { ...receipt, authorized: true }; persist();
     busy = true; error = ''; clearTimeout(timer);
     const result = await executeImport(id);
@@ -66,7 +72,7 @@
     busy = false;
     if (!result.ok) { error = result.error; return; }
     accept(result.data);
-    if (receipt?.operation.id === id && receipt.operation.status === "preview" && !receipt.authorized) {
+    if (statusFresh && receipt?.operation.id === id && receipt.operation.status === "preview" && !receipt.authorized) {
       source = receipt.request.source; destination = receipt.request.destination; mode = receipt.request.mode; receipt = null; persist();
     }
   }
@@ -78,7 +84,7 @@
         if (text.length > 16384) throw new Error();
         const saved = JSON.parse(text) as Receipt;
         if (!saved || !saved.request || !saved.operation || typeof saved.label !== 'string' || typeof saved.operation.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(saved.operation.id) || !['preview','staging','staged','published','committed','complete'].includes(saved.operation.status) || typeof saved.operation.message !== 'string' || (saved.operation.error_code !== null && typeof saved.operation.error_code !== 'string') || !['episode','movie'].includes(saved.request.target?.media_type) || !Number.isSafeInteger(saved.request.target.id) || saved.request.target.id <= 0 || typeof saved.request.source !== 'string' || typeof saved.request.destination !== 'string' || !['copy','move','hardlink'].includes(saved.request.mode) || saved.operation.target?.id !== saved.request.target.id || saved.operation.target?.media_type !== saved.request.target.media_type) throw new Error();
-        receipt = { ...saved, authorized: saved.authorized !== false }; void check();
+        receipt = { ...saved, authorized: saved.authorized !== false }; statusFresh = false; void check();
       }
     } catch { storageError = 'Saved import receipt could not be read. Do not start a duplicate transfer; recover its operation ID before continuing.'; }
     const visibility = () => { if (document.hidden) clearTimeout(timer); else schedule(); };
@@ -92,7 +98,9 @@
   {#if receipt}
     <h3>Confirmed import: {receipt.label}</h3>
     <dl><dt>Target</dt><dd>{receipt.request.target.media_type} {receipt.request.target.id}</dd><dt>Source</dt><dd>{receipt.request.source}</dd><dt>Destination</dt><dd>{receipt.request.destination}</dd><dt>Transfer mode</dt><dd>{receipt.request.mode}</dd><dt>Operation ID</dt><dd>{receipt.operation.id}</dd><dt>Status</dt><dd aria-live="polite">{receipt.operation.status}{receipt.operation.error_code ? ` (${receipt.operation.error_code})` : ''}</dd></dl>
-    <div class="actions">{#if receipt.operation.status === 'preview' && !receipt.authorized}<button disabled={busy} onclick={editPreview}>Edit unexecuted preview</button>{/if}<button disabled={busy} onclick={check}>Check status</button>{#if receipt.operation.status !== 'complete'}<button class="primary" disabled={busy} onclick={execute}>{receipt.operation.status === 'preview' && !receipt.authorized ? 'Execute import' : 'Resume import'}</button>{:else}<button disabled={busy} onclick={() => {receipt = null; persist(); source = ''; destination = ''; error = '';}}>Prepare another import</button>{/if}</div>
+    <div class="actions">{#if receipt.operation.status === 'preview' && !receipt.authorized}<button disabled={busy} onclick={editPreview}>Edit unexecuted preview</button>{/if}<button disabled={busy} onclick={check}>Check status</button>{#if action}<button class="primary" disabled={busy} onclick={execute}>{action === 'execute' && !receipt.authorized ? 'Execute import' : 'Resume import'}</button>{:else if receipt.operation.status === 'complete'}<button disabled={busy || !statusFresh} onclick={() => {receipt = null; persist(); source = ''; destination = ''; error = '';}}>Prepare another import</button>{/if}</div>
+    {#if diagnostic}<p role={receipt.operation.recovery_required ? 'alert' : 'status'}>{diagnostic}</p>{/if}
+    {#if !statusFresh}<p role="status">Refresh the saved operation status before authorizing or resuming an import.</p>{:else if !action && receipt.operation.status !== 'complete'}<p role="status">No recovery action is currently available. Check status to follow this operation.</p>{/if}
     {#if receipt.operation.status === 'preview' && !receipt.authorized}<p>No transfer has been authorized from this confirmation. Execute import authorizes the confirmed {receipt.request.mode} operation.</p>{/if}
   {:else}
     <p>{target ? `Selected target: ${label}` : 'Select a movie or an episode without a file.'}</p>

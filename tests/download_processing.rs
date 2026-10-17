@@ -1898,9 +1898,13 @@ async fn naming_render_failure_blocks_and_touches_nothing_http() {
     // previously-discovered bug where the raw sentence violated the reasons_json trigger and
     // masked the real outcome as `storage_error` after 3 failed retries.
     assert_eq!(blocked["error_code"], "unsupported_download", "{blocked}");
+    // 0053 retains Admission evidence first until completion, alongside the naming rejection.
     assert_eq!(
         blocked["reasons"].as_array().unwrap(),
-        &vec![serde_json::json!("naming_render_failed")]
+        &vec![
+            serde_json::json!("hc021_unresolved_attempt"),
+            serde_json::json!("naming_render_failed")
+        ]
     );
     assert_eq!(blocked["total_preflight_attempts"], 1, "{blocked}");
     assert!(blocked["operation_id"].is_null());
@@ -2294,9 +2298,14 @@ async fn cross_type_numbering_completed_downloads_preserve_sources_http() {
     // unsupported_download belongs to other admission failures. The fixture also advertises
     // a sample (remote(), above), so preserve its independent rejection in the exact reason list.
     assert_eq!(done["error_code"], "quality_rejected");
+    // 0053 retains Admission evidence first; both ordinary rejection reasons stay exact.
     assert_eq!(
         done["reasons"],
-        json!(["filename_target_mismatch", "sample_file"])
+        json!([
+            "hc021_unresolved_attempt",
+            "filename_target_mismatch",
+            "sample_file"
+        ])
     );
     assert!(
         c.query("SELECT episode_file_id FROM episodes WHERE id=1", ())
@@ -2570,9 +2579,14 @@ async fn legacy_receipt_requires_observed_revision_http() {
         assert_eq!(blocked["error_code"], "quality_rejected", "{blocked}");
         // Processing aggregates every rejected file when none is importable. The
         // real fixture also advertises a sample, which must retain its independent rejection.
+        // 0053 retains Admission evidence first until completion; quality rejection does not clear it.
         assert_eq!(
             blocked["reasons"],
-            json!(["revision_unknown", "sample_file"]),
+            json!([
+                "hc021_unresolved_attempt",
+                "revision_unknown",
+                "sample_file"
+            ]),
             "{blocked}"
         );
         assert_eq!(std::fs::read(&original).unwrap(), vec![1u8; 1048576]);

@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -208,7 +208,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -252,10 +252,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Reasoning: 0051 gives ten TV identities; every admission retains generation1.
+    // Reasoning: 0053 gives eleven TV identities; every admission retains generation1.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        10 // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
+        11 // Reasoning: 0053 adds one path diagnostics identity per domain (10 -> 11).
     );
     assert_eq!(
         scalar(
@@ -263,7 +263,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        10, // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
+        11, // Reasoning: 0053 adds one path diagnostics identity per domain (10 -> 11).
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -426,7 +426,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        10 // Reasoning: 0051 adds one client backoff identity per domain (9 -> 10).
+        11 // Reasoning: 0053 adds one path diagnostics identity per domain (10 -> 11).
     );
     assert!(
         c.execute(
@@ -437,9 +437,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Reasoning: 0051 gives 20 registry rows, leaving 108 slots within the 128 cap.
-    for i in 0..108 {
-        // Reasoning: 0051 gives 20 registry rows, leaving 108 slots within the 128 cap.
+    // Reasoning: 0053 gives 22 registry rows, leaving 106 slots within the 128 cap.
+    for i in 0..106 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -458,7 +457,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        1280 // Reasoning: 0051 gives ten TV identities: 128 retained commands * 10.
+        1408 // Reasoning: 0053 gives eleven TV identities: 128 retained commands * 11.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -641,7 +640,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -726,10 +725,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 22); // Reasoning:0053 adds two path diagnostics identities (20 -> 22).
     }
     Ok(())
 }

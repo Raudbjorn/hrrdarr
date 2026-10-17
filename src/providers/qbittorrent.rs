@@ -1517,6 +1517,19 @@ pub struct ClientStatus {
     pub locality: EndpointLocality,
     pub removes_completed_downloads: bool,
 }
+pub(crate) enum ClientStatusSnapshot {
+    Status(ClientStatus),
+    OutputMissing(EndpointLocality),
+    OutputInvalid(EndpointLocality),
+}
+impl ClientStatusSnapshot {
+    fn into_status(self) -> Result<ClientStatus> {
+        match self {
+            Self::Status(status) => Ok(status),
+            Self::OutputMissing(_) | Self::OutputInvalid(_) => Err(QbitError::InvalidResponse),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootSource {
     Default,
@@ -1607,29 +1620,66 @@ pub async fn client_status(
     credentials: Option<&Credentials>,
     domain: MediaDomain,
 ) -> Result<ClientStatus> {
+    client_status_snapshot(operation, settings, credentials, domain)
+        .await?
+        .into_status()
+}
+pub(crate) async fn client_status_snapshot(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    domain: MediaDomain,
+) -> Result<ClientStatusSnapshot> {
     let configured = scope(settings, domain)?;
     let mut session = Session::connect(operation, settings, credentials).await?;
     let preferences = session
         .get("api/v2/app/preferences", "query/preferences", &[])
         .await?;
-    let removes_completed_downloads = removes_completed_downloads(session.version, &preferences)?;
-    let default = text(&preferences, "save_path", 4096)?;
     let categories = if session.legacy {
         BTreeMap::new()
     } else {
         session.categories().await?
     };
-    let (remote_root, root_source) = remote_root(
-        &default,
+    status_from_preferences(
+        session.version,
+        &preferences,
         categories.get(&configured.category).map(String::as_str),
-    )?;
-    Ok(ClientStatus {
+        domain,
+        endpoint_locality(settings.endpoint())?,
+    )
+}
+fn status_from_preferences(
+    version: Version,
+    preferences: &Value,
+    category: Option<&str>,
+    domain: MediaDomain,
+    locality: EndpointLocality,
+) -> Result<ClientStatusSnapshot> {
+    if !preferences.is_object() {
+        return Err(QbitError::InvalidResponse);
+    }
+    // Unrelated malformed protocol fields must not become a path diagnosis.
+    let removes_completed_downloads = removes_completed_downloads(version, preferences)?;
+    match preferences.get("save_path") {
+        None | Some(Value::Null) => return Ok(ClientStatusSnapshot::OutputMissing(locality)),
+        Some(Value::String(value)) if value.is_empty() => {
+            return Ok(ClientStatusSnapshot::OutputMissing(locality));
+        }
+        _ => {}
+    }
+    let Ok(default) = text(preferences, "save_path", 4096) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    let Ok((remote_root, root_source)) = remote_root(&default, category) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    Ok(ClientStatusSnapshot::Status(ClientStatus {
         domain,
         remote_root,
         root_source,
-        locality: endpoint_locality(settings.endpoint())?,
+        locality,
         removes_completed_downloads,
-    })
+    }))
 }
 fn verify_tags(torrent: &Value, requested: &[String]) -> Result<()> {
     let raw = text(torrent, "tags", 16_384)?;
@@ -3458,6 +3508,94 @@ mod tests {
                 endpoint_locality(endpoint).unwrap(),
                 EndpointLocality::Unknown
             );
+        }
+    }
+
+    #[test]
+    fn output_diagnosis_requires_exact_path_evidence() {
+        let valid = serde_json::json!({"save_path":"/downloads", "max_ratio_enabled":false,
+            "max_seeding_time_enabled":false, "max_seeding_time":-1, "max_ratio_act":0});
+        for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+            let decode = |prefs: &Value, category: Option<&str>| {
+                status_from_preferences(
+                    Version(2, 11, 0),
+                    prefs,
+                    category,
+                    domain,
+                    EndpointLocality::Unknown,
+                )
+            };
+            for value in [Value::Null, Value::String(String::new())] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputMissing(EndpointLocality::Unknown)
+                ));
+                assert!(matches!(
+                    decode(&prefs, None).unwrap().into_status(),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut absent = valid.clone();
+            absent.as_object_mut().unwrap().remove("save_path");
+            assert!(matches!(
+                decode(&absent, None).unwrap(),
+                ClientStatusSnapshot::OutputMissing(_)
+            ));
+            for value in [
+                serde_json::json!(42),
+                serde_json::json!("relative"),
+                serde_json::json!("/private\u{0}path"),
+                serde_json::json!("/../escape"),
+                serde_json::json!(format!("/{}", "x".repeat(4096))),
+            ] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputInvalid(_)
+                ));
+            }
+            assert!(matches!(
+                decode(&valid, Some("../escape")).unwrap(),
+                ClientStatusSnapshot::OutputInvalid(_)
+            ));
+            for category in [
+                None,
+                Some("movies/new"),
+                Some(r"C:\downloads"),
+                Some(r"\\server\share"),
+            ] {
+                let status = decode(&valid, category).unwrap().into_status().unwrap();
+                assert_eq!(status.domain, domain);
+                assert_eq!(status.locality, EndpointLocality::Unknown);
+            }
+            for key in [
+                "max_ratio_enabled",
+                "max_seeding_time_enabled",
+                "max_seeding_time",
+                "max_ratio_act",
+            ] {
+                let mut prefs = valid.clone();
+                // The time value is required only when its policy is enabled.
+                prefs["max_seeding_time_enabled"] = serde_json::json!(true);
+                prefs.as_object_mut().unwrap().remove(key);
+                assert!(matches!(
+                    decode(&prefs, None),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut disabled_time = valid.clone();
+            disabled_time
+                .as_object_mut()
+                .unwrap()
+                .remove("max_seeding_time");
+            assert!(decode(&disabled_time, None).unwrap().into_status().is_ok());
+            assert!(matches!(
+                decode(&Value::Null, None),
+                Err(QbitError::InvalidResponse)
+            ));
         }
     }
 

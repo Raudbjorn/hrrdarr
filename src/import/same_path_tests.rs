@@ -38,6 +38,8 @@ async fn fixture(
         c.execute("UPDATE download_processing SET status='queued',policy_revision=2,preflight_attempts=0,error_code=NULL,reasons_json='[]'", ()).await.unwrap();
         c.execute("UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=total_preflight_attempts+1", ()).await.unwrap();
         input.policy_revision = 2;
+        // This fixture starts a second receipt attempt; stale first-attempt inputs must not link.
+        input.total_preflight_attempts += 1;
     }
     input.mode = mode;
     input

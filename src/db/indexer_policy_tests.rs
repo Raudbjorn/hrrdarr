@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -148,7 +148,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
             ]
         );
     }
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 22); // Reasoning:0053 adds two path diagnostics identities (20 -> 22).
     // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
     assert_eq!(
         rows(&c, "SELECT * FROM health_checks ORDER BY rowid LIMIT 8").await?,
@@ -237,9 +237,8 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
     }
     let tx = c.transaction().await?;
-    for i in 0..108
-    // Reasoning: 0051 gives 20 registry rows, leaving 108 slots within the 128 cap.
-    {
+    // Reasoning: 0053 gives 22 registry rows, leaving 106 slots within the 128 cap.
+    for i in 0..106 {
         tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'fixture')",[format!("fixture_{i}")]).await?;
     }
     assert!(tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'fixture')",()).await.is_err());
@@ -250,7 +249,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(rows(&c, policy_sql).await?, policies);
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 22); // Reasoning:0053 adds two path diagnostics identities (20 -> 22).
     c.execute("DELETE FROM providers WHERE id=?", [torznab.clone()])
         .await?;
     assert_eq!(
@@ -268,14 +267,14 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 53); // Reasoning: 0053 adds retained path diagnostics; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
             "SELECT count(*) FROM health_checks"
         )
         .await?,
-        20 // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+        22 // Reasoning: 0053 adds two path diagnostics identities (20 -> 22).
     );
     Ok(())
 }

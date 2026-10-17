@@ -89,6 +89,7 @@ async fn count(db: &Database, table: &str) -> i64 {
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
+    durable_path_diagnostics().await;
     // All execute() cases share the process-wide import permit. Keep this regression in the
     // serial recovery test so unrelated scratch databases cannot race for that permit.
     manual_hidden_extension_filename_preserves_explicit_mapping().await;
@@ -428,4 +429,263 @@ async fn manual_hidden_extension_filename_preserves_explicit_mapping() {
             .unwrap();
         assert_eq!(title, ".mkv");
     }
+}
+
+async fn durable_path_diagnostics() {
+    for movie in [false, true] {
+        for (failure, expected) in [
+            ("missing", "source_missing_precommit"),
+            ("changed", "source_changed_precommit"),
+            ("denied", "source_denied_precommit"),
+            ("root", "root_missing_precommit"),
+        ] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            dir.setup(&db).await;
+            let op = dir.preview(db.clone(), movie, Mode::Copy).await;
+            match failure {
+                "missing" => std::fs::remove_file(dir.path("downloads/media")).unwrap(),
+                "changed" => {
+                    std::fs::rename(dir.path("downloads/media"), dir.path("downloads/original"))
+                        .unwrap();
+                    std::fs::write(dir.path("downloads/media"), b"unrelated-source").unwrap();
+                }
+                "denied" => std::fs::set_permissions(
+                    dir.path("downloads/media"),
+                    std::fs::Permissions::from_mode(0),
+                )
+                .unwrap(),
+                "root" => std::fs::rename(
+                    dir.path(if movie { "movies" } else { "tv" }),
+                    dir.path("saved-root"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let outcome = execute(db.clone(), &op).await;
+            if failure == "denied" {
+                std::fs::set_permissions(
+                    dir.path("downloads/media"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let error = outcome.expect_err(
+                "fixture must observe the requested filesystem failure, including real EACCES",
+            );
+            assert!(error.started_attempt());
+            assert_eq!(error.path_failure_code(), Some(expected));
+            let state = status(db.clone(), &op).await.unwrap();
+            assert_eq!(state.path_failure_code.as_deref(), Some(expected));
+            assert!(state.recovery_required);
+            assert_eq!(count(&db, "import_history").await, 0);
+        }
+        // The durable sentinel survives failure of the precise/generic error write and restart.
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        dir.setup(&db).await;
+        let op = dir.preview(db.clone(), movie, Mode::Copy).await;
+        let c = db.connect().await.unwrap();
+        c.execute_batch("CREATE TRIGGER path_commit_failure BEFORE INSERT ON import_history BEGIN SELECT RAISE(ABORT,'fixture commit denied');END; CREATE TRIGGER path_error_failure BEFORE UPDATE OF error_code ON import_journal WHEN NEW.error_code IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture diagnostic denied');END;").await.unwrap();
+        assert!(
+            execute(db.clone(), &op)
+                .await
+                .unwrap_err()
+                .started_attempt()
+        );
+        let state = status(db.clone(), &op).await.unwrap();
+        assert_eq!(state.status, "published");
+        assert!(state.error_code.is_none());
+        assert_eq!(
+            state.path_failure_code.as_deref(),
+            Some("unresolved_attempt")
+        );
+        assert!(state.recovery_required);
+        c.execute_batch("DROP TRIGGER path_commit_failure; DROP TRIGGER path_error_failure;")
+            .await
+            .unwrap();
+        drop(c);
+        drop(db);
+        let db = dir.database().await;
+        assert!(status(db.clone(), &op).await.unwrap().recovery_required);
+        let completed = execute(db.clone(), &op).await.unwrap();
+        assert_eq!(completed.status, "complete");
+        assert!(completed.path_failure_code.is_none());
+        assert!(!completed.recovery_required);
+        assert_eq!(count(&db, "import_history").await, 1);
+    }
+    // Distinguish a destination parent from its root, and an owned staging file from source.
+    for movie in [false, true] {
+        for failure in ["destination", "stage", "source_cleanup"] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            dir.setup(&db).await;
+            let target = if movie {
+                MediaTarget::Movie(1)
+            } else {
+                MediaTarget::Episode(1)
+            };
+            let root = if movie { "movies" } else { "tv" };
+            std::fs::create_dir(dir.path(&format!("{root}/nested"))).unwrap();
+            std::fs::write(dir.path("downloads/media"), b"verified-media-content").unwrap();
+            let op = preview(
+                db.clone(),
+                ImportInput::Typed(ManualImportRequest {
+                    target: if movie {
+                        MediaTarget::Movie(1)
+                    } else {
+                        MediaTarget::Episode(1)
+                    },
+                    source: dir.path("downloads/media"),
+                    destination: dir.path(&format!("{root}/nested/media.mkv")),
+                    mode: if failure == "source_cleanup" {
+                        Mode::Move
+                    } else {
+                        Mode::Copy
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+            .id
+            .to_string();
+            let c = db.connect().await.unwrap();
+            let expected = match failure {
+                "destination" => {
+                    std::fs::rename(
+                        dir.path(&format!("{root}/nested")),
+                        dir.path(&format!("{root}/saved")),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(dir.path(&format!("{root}/nested"))).unwrap();
+                    "destination_changed_precommit"
+                }
+                "stage" => {
+                    let plan = load(&c, &op).await.unwrap().plan.unwrap();
+                    checkpoint(&c, &op, "staging", None).await.unwrap();
+                    let stage = plan.create_stage().unwrap();
+                    checkpoint(&c, &op, "staging", Some(&stage)).await.unwrap();
+                    std::fs::remove_file(
+                        dir.path(&format!("{root}/nested/.hrrdarr-import-{op}/media")),
+                    )
+                    .unwrap();
+                    "stage_missing_precommit"
+                }
+                "source_cleanup" => {
+                    let (plan, stage) = stage_and_publish(&db, &op, true).await;
+                    commit(&c, &op, &target, &plan, &stage).await.unwrap();
+                    std::fs::remove_file(dir.path("downloads/media")).unwrap();
+                    "source_missing_cleanup"
+                }
+                _ => unreachable!(),
+            };
+            let error = execute(db.clone(), &op).await.unwrap_err();
+            assert_eq!(error.path_failure_code(), Some(expected));
+            assert_eq!(
+                status(db.clone(), &op)
+                    .await
+                    .unwrap()
+                    .path_failure_code
+                    .as_deref(),
+                Some(expected)
+            );
+            if failure == "source_cleanup" {
+                assert_eq!(count(&db, "import_history").await, 1);
+                assert_eq!(
+                    std::fs::read(dir.path(&format!("{root}/nested/media.mkv"))).unwrap(),
+                    b"verified-media-content"
+                );
+            }
+        }
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        dir.setup(&db).await;
+        let op = dir.preview(db.clone(), movie, Mode::Copy).await;
+        let c = db.connect().await.unwrap();
+        c.execute_batch("CREATE TRIGGER path_precise_failure BEFORE UPDATE OF error_code ON import_journal WHEN NEW.error_code IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture precise diagnostic denied');END;").await.unwrap();
+        std::fs::remove_file(dir.path("downloads/media")).unwrap();
+        assert_eq!(
+            execute(db.clone(), &op)
+                .await
+                .unwrap_err()
+                .path_failure_code(),
+            Some("source_missing_precommit")
+        );
+        let state = status(db.clone(), &op).await.unwrap();
+        assert!(state.error_code.is_none());
+        assert_eq!(
+            state.path_failure_code.as_deref(),
+            Some("unresolved_attempt")
+        );
+        assert!(state.recovery_required);
+    }
+    // Every resumable phase must arm before any filesystem work, even cleanup/restoration.
+    for phase in ["preview", "staging", "staged", "published", "committed"] {
+        let dir = Scratch::new();
+        let db = dir.database().await;
+        dir.setup(&db).await;
+        let op = dir.preview(db.clone(), false, Mode::Copy).await;
+        let c = db.connect().await.unwrap();
+        if phase != "preview" {
+            if phase == "staging" {
+                checkpoint(&c, &op, "staging", None).await.unwrap();
+            } else {
+                let (plan, stage) = stage_and_publish(&db, &op, phase != "staged").await;
+                if phase == "committed" {
+                    commit(&c, &op, &MediaTarget::Episode(1), &plan, &stage)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let before = load(&c, &op).await.unwrap();
+        c.execute_batch("CREATE TRIGGER path_admission_failure BEFORE UPDATE OF generation ON health_checks WHEN NEW.check_key='remote_path_mapping' BEGIN SELECT RAISE(ABORT,'fixture generation denied');END;").await.unwrap();
+        let error = execute(db.clone(), &op).await.unwrap_err();
+        assert!(!error.started_attempt());
+        let after = load(&c, &op).await.unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.path_failure, before.path_failure);
+        assert_eq!(json(&after.stage).unwrap(), json(&before.stage).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path("downloads/media")).unwrap(),
+            b"verified-media-content"
+        );
+        c.execute_batch("DROP TRIGGER path_admission_failure")
+            .await
+            .unwrap();
+        assert_eq!(execute(db.clone(), &op).await.unwrap().status, "complete");
+    }
+    // Cleanup completed physically, but a failed final transaction must retain uncertainty.
+    let dir = Scratch::new();
+    let db = dir.database().await;
+    dir.setup(&db).await;
+    let op = dir.preview(db.clone(), true, Mode::Move).await;
+    let c = db.connect().await.unwrap();
+    c.execute_batch("CREATE TRIGGER path_complete_failure BEFORE UPDATE OF phase ON import_journal WHEN NEW.phase='complete' BEGIN SELECT RAISE(ABORT,'fixture completion denied');END;").await.unwrap();
+    assert!(execute(db.clone(), &op).await.is_err());
+    let state = status(db.clone(), &op).await.unwrap();
+    assert_eq!(state.status, "committed");
+    assert_eq!(
+        state.path_failure_code.as_deref(),
+        Some("unresolved_attempt")
+    );
+    assert!(state.recovery_required);
+    assert!(!std::path::Path::new(&dir.path("downloads/media")).exists());
+    c.execute_batch("DROP TRIGGER path_complete_failure")
+        .await
+        .unwrap();
+    assert_eq!(execute(db.clone(), &op).await.unwrap().status, "complete");
+    // The reservation shares the actual executor permit, without pretending to be a transfer.
+    let reservation = acquire_resume_guard(&db).unwrap();
+    assert!(!operation_active(&op).unwrap());
+    assert!(acquire(&db, &op).is_none());
+    assert_eq!(
+        execute(db.clone(), &op).await.unwrap_err().code(),
+        "import_busy"
+    );
+    drop(reservation);
+    let active = acquire(&db, &op).unwrap();
+    assert!(operation_active(&op).unwrap());
+    assert!(acquire_resume_guard(&db).is_err());
+    drop(active);
 }

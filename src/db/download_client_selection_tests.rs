@@ -173,11 +173,14 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 52);
+        assert_eq!(version(&c).await?, 53); // Reasoning: current open applies0053 after the unchanged0052 prefix.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {
                 " WHERE version<=51"
+            } else if *table == "health_checks" {
+                // 0053 adds two identities; all schema51 observations remain exact.
+                " WHERE check_key!='remote_path_mapping'"
             } else {
                 ""
             };

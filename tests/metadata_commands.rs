@@ -30,12 +30,17 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+struct Held404 {
+    started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
 struct Remote {
     mode: AtomicU8,
     version: AtomicU8,
     calls: Mutex<Vec<String>>,
     started: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
+    held404: Mutex<Option<Held404>>,
 }
 impl Default for Remote {
     fn default() -> Self {
@@ -45,7 +50,27 @@ impl Default for Remote {
             calls: Mutex::new(vec![]),
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
+            held404: Mutex::new(None),
         }
+    }
+}
+impl Remote {
+    // Each held404 owns its gate: cancellation cannot bank a release for the next request.
+    fn hold404(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started, arrival) = tokio::sync::oneshot::channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let mut slot = self.held404.lock().unwrap();
+        assert!(slot.is_none(), "previous held404 has not arrived");
+        *slot = Some(Held404 {
+            started,
+            release: waiting,
+        });
+        (arrival, release)
     }
 }
 async fn remote(
@@ -66,7 +91,17 @@ async fn remote(
         return axum::Json(json!([])).into_response();
     }
     let mode = s.mode.load(Ordering::SeqCst);
-    if mode == 2 || mode == 6 {
+    if mode == 6 {
+        let gate = s
+            .held404
+            .lock()
+            .unwrap()
+            .take()
+            .expect("held404 request must be armed");
+        let _ = gate.started.send(());
+        let _ = gate.release.await;
+    }
+    if mode == 2 {
         s.started.notify_one();
         let permit = s.release.acquire().await.unwrap();
         permit.forget();
@@ -735,32 +770,35 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
     );
     for (index, target) in targets.iter().enumerate() {
         let generations = removed_generations(&db).await;
+        let (arrival, release) = state.hold404();
         state.mode.store(6, Ordering::SeqCst); // actual HTTP404 held until cancellation/identity edit
         let cancelled = enqueue(&base, target, "normal").await;
-        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+        tokio::time::timeout(Duration::from_secs(5), arrival)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(
-            request(
-                &base,
-                "POST",
-                &format!(
-                    "/api/v1/metadata-refresh/commands/{}/cancel",
-                    cancelled["id"].as_str().unwrap()
-                ),
-                Value::Null
-            )
-            .await
-            .0,
-            200
-        );
-        state.release.add_permits(1);
+        let (code, cancellation) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/metadata-refresh/commands/{}/cancel",
+                cancelled["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, 200, "{cancellation}");
+        // A terminal failed command also returns200; prove cancellation won before releasing404.
+        assert_eq!(cancellation["status"], "cancelled", "{cancellation}");
+        let _ = release.send(()); // A cancelled upstream handler may already have been dropped.
         until(&base, &cancelled["id"], "cancelled").await;
 
+        let (arrival, release) = state.hold404();
         let stale = enqueue(&base, target, "normal").await;
-        // Reaching the next remote read also proves the worker left the cancelled command.
-        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+        // This request-specific arrival proves the worker left the cancelled command.
+        tokio::time::timeout(Duration::from_secs(5), arrival)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(lifecycle(&db).await, statuses);
         assert_eq!(removed_generations(&db).await, generations);
@@ -781,7 +819,9 @@ async fn actual_404_publication_is_captured_atomic_and_preserves_library_rows() 
         c.execute_batch(change).await.unwrap();
         let changed = preserved_metadata(&db).await;
         let changed_statuses = lifecycle(&db).await;
-        state.release.add_permits(1);
+        release
+            .send(())
+            .expect("stale request must remain held until identity changes");
         assert_eq!(
             until(&base, &stale["id"], "failed").await["error_code"],
             "target_changed"

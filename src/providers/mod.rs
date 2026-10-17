@@ -742,6 +742,15 @@ pub(crate) struct OwnedDownloadDetails {
     pub details: qbittorrent::TorrentDetails,
     pub host: String,
 }
+pub(crate) enum PathOutput {
+    Local(String),
+    Missing,
+    Invalid,
+}
+pub(crate) struct PathOutputFacts {
+    pub locality: qbittorrent::EndpointLocality,
+    pub output: PathOutput,
+}
 impl RefreshClient {
     pub(crate) fn backoff_grace_elapsed(&self) -> bool {
         self.0.backoff_started.elapsed() >= backoff::STARTUP_GRACE
@@ -822,7 +831,12 @@ impl RefreshClient {
     ) -> std::result::Result<qbittorrent::EndpointLocality, AutomationError> {
         self.inspect_client_status_snapshot(provider_id, revision, domain)
             .await
-            .map(|(_, status, _)| status.locality)
+            .and_then(|(_, status, _)| match status {
+                qbittorrent::ClientStatusSnapshot::Status(status) => Ok(status.locality),
+                _ => Err(refresh_error(
+                    qbit_error(qbittorrent::QbitError::InvalidResponse).0,
+                )),
+            })
     }
 
     /// Fresh active-scope output directories in the configured local path namespace.
@@ -836,6 +850,49 @@ impl RefreshClient {
         let (provider, status, deadline) = self
             .inspect_client_status_snapshot(provider_id, revision, domain)
             .await?;
+        let qbittorrent::ClientStatusSnapshot::Status(status) = status else {
+            return Err(refresh_error(
+                qbit_error(qbittorrent::QbitError::InvalidResponse).0,
+            ));
+        };
+        let output = self
+            .resolve_download_root(&provider, status.remote_root, domain, deadline)
+            .await?;
+        match output {
+            PathOutput::Local(path) => Ok(vec![path]),
+            _ => Err(RefreshError::new("download_root_unresolved", false)),
+        }
+    }
+
+    pub(crate) async fn inspect_path_output(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<PathOutputFacts, AutomationError> {
+        use qbittorrent::ClientStatusSnapshot;
+        let (provider, status, deadline) = self
+            .inspect_client_status_snapshot(provider_id, revision, domain)
+            .await?;
+        let (locality, output) = match status {
+            ClientStatusSnapshot::OutputMissing(locality) => (locality, PathOutput::Missing),
+            ClientStatusSnapshot::OutputInvalid(locality) => (locality, PathOutput::Invalid),
+            ClientStatusSnapshot::Status(status) => (
+                status.locality,
+                self.resolve_download_root(&provider, status.remote_root, domain, deadline)
+                    .await?,
+            ),
+        };
+        Ok(PathOutputFacts { locality, output })
+    }
+
+    async fn resolve_download_root(
+        &self,
+        provider: &Provider,
+        remote_root: String,
+        domain: MediaDomain,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<PathOutput, AutomationError> {
         let endpoint = url::Url::parse(provider.settings.endpoint())
             .map_err(|_| RefreshError::new("provider_unavailable", false))?;
         let host = crate::remote_paths::host(
@@ -857,18 +914,18 @@ impl RefreshClient {
                 domain,
                 crate::remote_paths::ResolveInput {
                     host,
-                    path: status.remote_root,
+                    path: remote_root,
                     direction: crate::remote_paths::Direction::RemoteToLocal,
                 },
             )
             .await
             .map_err(|_| RefreshError::new("download_root_mapping_failed", false))?;
-            let path = local_download_root(&resolution.output)
-                .ok_or_else(|| RefreshError::new("download_root_unresolved", false))?;
-            current_revision(&self.0.db, &provider)
+            let output = local_download_root(&resolution.output)
+                .map_or(PathOutput::Invalid, PathOutput::Local);
+            current_revision(&self.0.db, provider)
                 .await
                 .map_err(refresh_error)?;
-            Ok::<_, AutomationError>(vec![path])
+            Ok::<_, AutomationError>(output)
         };
         tokio::time::timeout_at(deadline, work)
             .await
@@ -881,7 +938,11 @@ impl RefreshClient {
         revision: i64,
         domain: MediaDomain,
     ) -> std::result::Result<
-        (Provider, qbittorrent::ClientStatus, tokio::time::Instant),
+        (
+            Provider,
+            qbittorrent::ClientStatusSnapshot,
+            tokio::time::Instant,
+        ),
         AutomationError,
     > {
         let context = &self.0;
@@ -907,7 +968,7 @@ impl RefreshClient {
             .operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
-            let status = qbittorrent::client_status(
+            let status = qbittorrent::client_status_snapshot(
                 &operation,
                 &provider.settings,
                 credentials.as_ref(),

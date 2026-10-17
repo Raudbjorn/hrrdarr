@@ -13,6 +13,7 @@ pub(crate) struct OwnedImport {
     pub revision_json: String,
     pub edition: Option<String>,
     pub policy_revision: i64,
+    pub total_preflight_attempts: i64,
     pub mapping_id: i64,
     pub mapping_revision: i64,
     pub host: String,
@@ -254,10 +255,9 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             if same_path { old.as_ref() } else { None },
         )?;
         if plan.source_size() != expected {
-            return Err(Error::conflict(
-                "source_changed",
-                "Downloaded file size changed",
-            ));
+            let mut error = Error::conflict("source_changed", "Downloaded file size changed");
+            error.path_kind = Some(PathKind::Changed);
+            return Err(error.at(PathRole::Source));
         }
         if let Some(old) = &old {
             old.recovery_path()?;
@@ -400,7 +400,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         MediaTarget::Episode(_) => "tv",
         MediaTarget::Movie(_) => "movies",
     };
-    let guard=tx.query("SELECT 1 FROM rss_candidates r JOIN download_processing d ON d.candidate_id=r.id JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type JOIN providers v ON v.id=r.client_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=r.media_type JOIN remote_path_mappings m ON m.id=? AND m.media_type=r.media_type WHERE r.id=? AND r.status='observed' AND r.media_type=? AND d.status='checking' AND d.policy_revision=? AND p.revision=d.policy_revision AND p.provider_revision=r.client_revision AND p.enabled=1 AND p.mode=? AND v.revision=r.client_revision AND v.enabled=1 AND m.revision=? AND m.host=?",params![input.mapping_id,input.candidate_id.clone(),domain,input.policy_revision,input.mode.name(),input.mapping_revision,input.host.clone()]).await?.next().await?;
+    let guard=tx.query("SELECT 1 FROM rss_candidates r JOIN download_processing d ON d.candidate_id=r.id JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type JOIN providers v ON v.id=r.client_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=r.media_type JOIN remote_path_mappings m ON m.id=? AND m.media_type=r.media_type WHERE r.id=? AND r.status='observed' AND r.media_type=? AND d.status='checking' AND d.policy_revision=? AND d.total_preflight_attempts=? AND p.revision=d.policy_revision AND p.provider_revision=r.client_revision AND p.enabled=1 AND p.mode=? AND v.revision=r.client_revision AND v.enabled=1 AND m.revision=? AND m.host=?",params![input.mapping_id,input.candidate_id.clone(),domain,input.policy_revision,input.total_preflight_attempts,input.mode.name(),input.mapping_revision,input.host.clone()]).await?.next().await?;
     if guard.is_none() {
         return Err(Error::conflict(
             "preflight_changed",
@@ -421,6 +421,13 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     let old_id = old.as_ref().map(|v| v.file_id);
     tx.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,edition,provenance_json,old_file_json,old_episode_file_id,old_movie_file_id)VALUES(?,?,?,?,?,?,?,?,?)",params![input.candidate_id.clone(),operation.clone(),input.quality_id,input.revision_json,input.edition,json(&provenance)?,old.as_ref().map(json).transpose()?,if episode.is_some(){old_id}else{None},if movie.is_some(){old_id}else{None}]).await?;
     tx.execute("UPDATE download_processing SET status='importing',error_code=NULL,updated_at=unixepoch() WHERE candidate_id=? AND status='checking'",[input.candidate_id]).await?;
+    crate::health::path_diagnostics_changed(
+        &tx,
+        super::media(&input.target),
+        crate::health::PathDiagnosticChange::Progress,
+    )
+    .await
+    .map_err(|_| Error::internal())?;
     tx.commit().await?;
     status(db, &operation).await
 }

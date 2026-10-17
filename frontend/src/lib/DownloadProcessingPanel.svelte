@@ -2,6 +2,7 @@
   import { onMount, untrack, tick } from 'svelte';
   import type { ApiPage, DownloadProcessing, MediaDomain, ProcessingMode, ProcessingPolicy, Provider } from './api.generated';
   import type {SettingsWriteState} from './api';
+  import { canResumeProcessing, processingDiagnostic } from './pathDiagnostics';
   import { cancelDownloadProcessing, inheritProcessingPolicy, listDownloadProcessing, processDownloads, saveProcessingPolicy } from './api';
   let { provider, media, currentPolicy, active=true, relatedWrite='idle', onreload, onwrite=()=>{}, ondirty=()=>{} }: {provider:Provider; media:MediaDomain;currentPolicy:ProcessingPolicy|null;active?:boolean;relatedWrite?:SettingsWriteState;onreload:()=>Promise<boolean>;onwrite?:(state:SettingsWriteState)=>void;ondirty?:(dirty:boolean)=>void} = $props();
   let policy:ProcessingPolicy|null = $state(null), rows:ApiPage<DownloadProcessing>|null = $state(null);
@@ -35,6 +36,7 @@
   }
   async function mutate(action:'policy'|'retry'|'cancel',row?:DownloadProcessing) {
     if(reading || locked || !policy || action==='policy'&&(stale||!currentPolicy)) return;
+    if (action === 'retry' && row?.operation_id && !canResumeProcessing(row)) return;
     saving=true; clearTimeout(timer); error=''; notice='';
     const input={provider_revision:policy.provider_revision,revision:policy.revision,mode};
     const result=action==='policy'
@@ -82,6 +84,7 @@
   {#if rows}
     <p>{rows.total} processing records for {media}.</p>
     <ul>{#each rows.items as row (row.receipt_id)}
+      {@const diagnostic = processingDiagnostic(row)}
       <li><strong>{row.target.media_type==='tv'?`Episode ${row.target.episode_ids.join(', ')}`:`Movie ${row.target.movie_id}`}: {row.status}</strong>
         <p>Preflight attempts: {row.preflight_attempts} this round, {row.total_preflight_attempts} total. Provider revision {row.provider_revision}.</p>
         {#if row.operation_id}<p>Import {row.operation_id}: {row.import_phase??'Awaiting status'}</p>{/if}
@@ -89,9 +92,10 @@
         {#if row.retirement_state==='quarantined'}<p>Previous file retained in a private recovery location. Recovery bytes are not automatically deleted.</p>
         {:else if row.retirement_state==='shared_retained'}<p>Previous file retained because other episodes still use it.</p>
         {:else if row.retirement_state==='pending'}<p>Previous file retirement is pending. Original or recovery bytes are retained.</p>{/if}
-        {#if row.error_code}<p role="alert">{row.error_code}{row.reasons.length?`: ${row.reasons.join(', ')}`:''}</p>{/if}
+        {#if row.error_code && row.status !== 'imported' && row.import_phase !== 'complete'}<p role="alert">{row.error_code}{row.reasons.filter(reason=>!reason.startsWith('hc021_')).length?`: ${row.reasons.filter(reason=>!reason.startsWith('hc021_')).join(', ')}`:''}</p>{/if}
+        {#if diagnostic}<p role={row.recovery_required ? 'alert' : 'status'}>{diagnostic}</p>{/if}
         {#if row.status==='blocked'||row.status==='cancelled'}<button disabled={reading||locked||!currentPolicy?.enabled} onclick={()=>mutate('retry',row)}>Retry processing {row.receipt_id}</button>{/if}
-        {#if row.status==='importing' && row.error_code && !row.resume_requested}<button disabled={reading||locked} onclick={()=>mutate('retry',row)}>Resume import {row.operation_id}</button><p>Resume continues the same recorded import operation.</p>{/if}
+        {#if canResumeProcessing(row)}<button disabled={reading||locked} onclick={()=>mutate('retry',row)}>Resume import {row.operation_id}</button><p>Resume continues the same recorded import operation.</p>{/if}
         {#if !row.operation_id && (row.status==='queued'||row.status==='checking')}<button disabled={reading||locked} onclick={()=>mutate('cancel',row)}>Cancel processing {row.receipt_id}</button>{/if}
       </li>
     {:else}<li>No processing records. Eligible confirmed completed submissions appear here after observation; inherited defaults need no per-client opt-in.</li>{/each}</ul>

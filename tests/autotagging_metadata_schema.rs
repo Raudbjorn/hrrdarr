@@ -302,10 +302,12 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
     Ok(out)
 }
 
-// Only successful upgrades omit 0052's deliberate changes; rollback/backup/reopen witnesses stay exact.
+// Only successful upgrades omit deliberate additions; rollback/backup/reopen witnesses stay exact.
 async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
-    witness_with_schema(c, &format!("SELECT * FROM ({PRESERVED_SCHEMA}) WHERE
+    // 0053 appends one journal column and two indexes; preserve old columns separately below.
+    let mut result = witness_with_schema(c, &format!("SELECT * FROM ({PRESERVED_SCHEMA}) WHERE
+        NOT (type='table' AND name='import_journal') AND
         tbl_name NOT IN ('download_client_tags','rss_client_attempts') AND name NOT IN (
         'rss_commands','search_commands','rss_schedules','rss_candidates',
         'rss_commands_active','rss_candidate_selection_identity','rss_schedules_selection',
@@ -314,7 +316,11 @@ async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         'rss_schedules_admit','rss_schedules_update','rss_candidate_admit','rss_candidate_transition',
         'rss_comparison_facts_update','rss_hash_retained','rss_candidate_local_storage_retry',
         'rss_candidate_selection_admit','rss_candidate_selection_transition',
-        'rss_selected_episode_insert','rss_selected_episode_delete') ORDER BY type,name")).await
+        'rss_selected_episode_insert','rss_selected_episode_delete',
+        'import_journal_path_unresolved','download_processing_path_unresolved') ORDER BY type,name")).await?;
+    // Compare every predecessor journal column definition exactly despite the additive column.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
+    Ok(result)
 }
 
 async fn seed(c: &Connection) -> Result<(), Error> {
@@ -523,7 +529,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: 0052 adds client selection; historical migration prefixes stay fixed.
+        53 // Reasoning: 0053 adds path diagnostics; historical migration prefixes stay fixed.
     );
     assert_eq!(upgrade_witness(&c).await?, upgrade_before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -649,7 +655,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: 0052 adds client selection; historical migration prefixes stay fixed.
+        53 // Reasoning: 0053 adds path diagnostics; historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

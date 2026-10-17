@@ -138,7 +138,7 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
-export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, reasons: Array<string>, created_at: number, updated_at: number, };
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, };
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
@@ -406,7 +406,7 @@ export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, tar
 
 export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
 
-export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
+export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, };
 
 export type ParseQuery = { title: string, };
 

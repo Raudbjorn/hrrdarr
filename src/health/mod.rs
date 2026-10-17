@@ -17,6 +17,9 @@ mod client_backoff;
 mod download_roots;
 mod engine;
 mod indexers;
+mod path_diagnostics;
+#[cfg(test)]
+pub(crate) use path_diagnostics::retained_path_diagnostic;
 mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
@@ -324,7 +327,12 @@ pub(crate) async fn configuration_changed(c: &Connection, media: MediaDomain) ->
         MediaDomain::Tv => HealthScope::Tv,
         MediaDomain::Movies => HealthScope::Movies,
     };
-    let keys = selection(c, scope, "check_key='completed_download_handling'").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('completed_download_handling','remote_path_mapping')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 
@@ -340,7 +348,7 @@ pub(crate) async fn provider_configuration_changed(
     let keys = selection(
         c,
         scope,
-        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder','download_client_backoff')",
+        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder','download_client_backoff','remote_path_mapping')",
     )
     .await?;
     mark(c, &keys, CONFIG, now()?).await
@@ -517,6 +525,44 @@ pub(crate) async fn download_roots_changed(
         Some(MediaDomain::Movies) => HealthScope::Movies,
         None => HealthScope::All,
     };
-    let keys = selection(c, scope, "check_key='download_client_root_folder'").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('download_client_root_folder','remote_path_mapping')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Durable path evidence and its observation fence share the caller's write transaction.
+#[derive(Clone, Copy)]
+pub(crate) enum PathDiagnosticChange {
+    Admission,
+    Failure,
+    Progress,
+    Completion,
+}
+pub(crate) async fn path_diagnostics_changed(
+    c: &Connection,
+    media: MediaDomain,
+    change: PathDiagnosticChange,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let row = c.query("SELECT generation,checked_at IS NOT NULL AND observed_generation IS NOT NULL AND severity=0 FROM health_checks WHERE scope=? AND check_key='remote_path_mapping'", [scope.text()]).await?.next().await?.ok_or_else(invariant)?;
+    let generation: i64 = row.get(0)?;
+    if generation >= MAX_INTEGER {
+        return Err(Error(StatusCode::CONFLICT, "health_generation_exhausted"));
+    }
+    // Admission may already have made the last successful observation stale.
+    let schedule = matches!(change, PathDiagnosticChange::Completion)
+        || (matches!(change, PathDiagnosticChange::Failure) && row.get::<i64>(1)? == 1);
+    let timestamp = now()?;
+    if c.execute("UPDATE health_checks SET generation=generation+1,pending_reasons=CASE WHEN ? THEN pending_reasons|8 ELSE pending_reasons END,due_at=CASE WHEN ? THEN CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END ELSE due_at END WHERE scope=? AND check_key='remote_path_mapping' AND generation=?", params![schedule,schedule,timestamp,timestamp,scope.text(),generation]).await? != 1 { return Err(invariant()); }
+    Ok(())
 }
