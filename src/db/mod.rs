@@ -378,6 +378,7 @@ impl Database {
         })
         .await??;
         let inner = libsql::Builder::new_local(&path).build().await?;
+        write_ahead_log(&inner.connect()?).await?;
         let engine = storage_engine(&inner.connect()?).await?;
         let mut db = Self {
             inner,
@@ -445,6 +446,25 @@ impl Database {
     pub fn migration_backup(&self) -> Option<&Path> {
         self.backup.as_deref()
     }
+}
+
+/// Readers must never hold off a writer's commit. In rollback-journal mode an open read
+/// cursor keeps a SHARED lock, and SQLite's busy handler then sleeps synchronously on the
+/// async executor until it times out. WAL lets reads and the single writer proceed
+/// concurrently; the mode is persistent in the file. Filesystems without shared-memory
+/// support keep the previous mode, which is reported rather than treated as fatal.
+async fn write_ahead_log(conn: &Connection) -> Result<(), libsql::Error> {
+    let mode: String = conn
+        .query("PRAGMA journal_mode=WAL", ())
+        .await?
+        .next()
+        .await?
+        .ok_or(libsql::Error::QueryReturnedNoRows)?
+        .get(0)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        eprintln!("event=database_journal_mode_fallback mode={mode}");
+    }
+    Ok(())
 }
 
 async fn scalar(conn: &Connection, sql: &str) -> Result<i64, libsql::Error> {
@@ -759,6 +779,45 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn local_databases_use_write_ahead_logging() {
+        let directory = std::env::temp_dir().join(format!("hrrdarr-wal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("db");
+        {
+            let db = Database::open_local(&path).await.unwrap();
+            let conn = db.connect().await.unwrap();
+            let mode: String = conn
+                .query("PRAGMA journal_mode", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(mode, "wal");
+            // A live read cursor must not block a concurrent writer's commit.
+            let reader = db.connect().await.unwrap();
+            let mut rows = reader
+                .query("SELECT 1 FROM sqlite_schema", ())
+                .await
+                .unwrap();
+            assert!(rows.next().await.unwrap().is_some());
+            let writer = db.connect().await.unwrap();
+            writer
+                .busy_timeout(std::time::Duration::from_millis(50))
+                .unwrap();
+            writer
+                .execute("CREATE TABLE wal_probe(id INTEGER)", ())
+                .await
+                .unwrap();
+            drop(rows);
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }
 
