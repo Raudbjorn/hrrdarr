@@ -638,6 +638,17 @@ impl Plan {
     pub(super) fn source_size(&self) -> u64 {
         self.source_identity.size
     }
+    /// True when the previewed source is the same inode with the same content facts
+    /// (size and modification time) as a previously captured scan inventory identity.
+    pub(super) fn source_matches(&self, captured: &serde_json::Value) -> bool {
+        let field = |name: &str| captured.get(name).and_then(serde_json::Value::as_i64);
+        let unsigned = |name: &str| captured.get(name).and_then(serde_json::Value::as_u64);
+        unsigned("dev") == Some(self.source_identity.dev)
+            && unsigned("ino") == Some(self.source_identity.ino)
+            && unsigned("size") == Some(self.source_identity.size)
+            && field("mtime") == Some(self.source_identity.mtime)
+            && field("mtime_ns") == Some(self.source_identity.mtime_ns)
+    }
 }
 impl OldFile {
     pub(super) fn capture(
@@ -646,6 +657,38 @@ impl OldFile {
         metadata: serde_json::Value,
         root: &str,
         operation: &str,
+    ) -> Result<Self> {
+        Self::capture_named(
+            file_id,
+            path,
+            metadata,
+            root,
+            format!(".hrrdarr-replaced-{operation}"),
+        )
+    }
+    /// A scan operation can replace several originals in one directory, so its recovery
+    /// artifact name carries the typed old-file identity as well as the operation.
+    pub(super) fn capture_scan(
+        file_id: i64,
+        path: String,
+        metadata: serde_json::Value,
+        root: &str,
+        operation: &str,
+    ) -> Result<Self> {
+        Self::capture_named(
+            file_id,
+            path,
+            metadata,
+            root,
+            format!(".hrrdarr-replaced-{operation}-{file_id}"),
+        )
+    }
+    fn capture_named(
+        file_id: i64,
+        path: String,
+        metadata: serde_json::Value,
+        root: &str,
+        quarantine_name: String,
     ) -> Result<Self> {
         (|| {
             validate_path(&path)?;
@@ -662,7 +705,7 @@ impl OldFile {
                 metadata,
                 parent: Identity::read(&directory)?,
                 file: identity,
-                quarantine_name: format!(".hrrdarr-replaced-{operation}"),
+                quarantine_name,
             })
         })()
         .map_err(|e: Error| e.at(PathRole::Destination))

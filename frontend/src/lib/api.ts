@@ -1,6 +1,6 @@
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
-import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild } from './api.generated';
+import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild, ScanChildResumeInput } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTargetInput, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, MovieCredit, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -155,6 +155,14 @@ export const listDownloadedScanChildren = (domain: MediaDomain, id: string, quer
 export const cancelDownloadedScanCommand = (domain: MediaDomain, id: string) => scanDomain(domain) && scanId(id)
   ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}/cancel`, undefined, 'POST', true)
   : scanError<DownloadedScanCommand>('Invalid command ID.');
+// Explicit recovery of one failed child; the body names the exact operation and the generation
+// last read. A lost response is reconciled by re-reading or repeating the identical body.
+export const resumeDownloadedScanChild = (domain: MediaDomain, id: string, childId: string, input: ScanChildResumeInput) =>
+  scanDomain(domain) && scanId(id) && scanId(childId) && scanId(input.operation_id)
+    && (input.inventory_revision === 0 || input.inventory_revision === 1)
+    && Number.isSafeInteger(input.expected_resume_generation) && input.expected_resume_generation >= 0
+    ? request<ScanChild>(`${scanRoot(domain)}/${id}/children/${childId}/resume`, input, 'POST', true)
+    : scanError<ScanChild>('Invalid scan child resume request.');
 
 const invalidProvider = <T>(): Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid provider ID or revision.'});
 export const getProvider = (id: string) => validOperation(id) ? request<Provider>(`/api/v1/providers/${id}`, undefined, undefined, true) : invalidProvider<Provider>();

@@ -104,7 +104,7 @@ pub(super) async fn ownership(
         .ok_or_else(Error::missing)?;
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
 }
-async fn old_record(
+pub(super) async fn old_record(
     c: &Connection,
     t: &MediaTarget,
     fid: i64,
@@ -132,6 +132,9 @@ pub(super) async fn before(
     operation: &str,
     t: &MediaTarget,
 ) -> Result<(i64, String, Option<i64>)> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::before(c, operation, t).await;
+    }
     let Some(f) = facts(c, operation).await? else {
         return owner(c, t).await;
     };
@@ -440,6 +443,9 @@ pub(super) async fn retire(
     stage: &Stage,
     lease: &Arc<Permit>,
 ) -> Result<()> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::retire(c, operation, target, plan, stage, lease).await;
+    }
     let Some(mut facts) = facts(c, operation).await? else {
         return Ok(());
     };
@@ -575,6 +581,9 @@ pub(super) async fn placement_old(
     operation: &str,
     plan: &Plan,
 ) -> Result<Option<OldFile>> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::placement_old(c, operation, plan).await;
+    }
     Ok(facts(c, operation)
         .await?
         .and_then(|v| v.old)
@@ -586,6 +595,9 @@ pub(super) async fn available(
     target: &MediaTarget,
     plan: &Plan,
 ) -> Result<()> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::available(c, operation, target, plan).await;
+    }
     let old = placement_old(c, operation, plan).await?;
     destination_available(
         c,

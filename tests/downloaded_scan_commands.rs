@@ -1,6 +1,8 @@
-//! Real HTTP + real worker coverage of downloaded-folder scan discovery (phase A). Everything
-//! runs against temporary directories and databases and 127.0.0.1:0 listeners; no live service
-//! is contacted and no scan performs a transfer. Each test owns its database and worker.
+//! Real HTTP + real worker coverage of downloaded-folder scan commands: phase A discovery and
+//! the phase B sequential import continuation. Everything runs against temporary directories
+//! and databases and 127.0.0.1:0 listeners; no live service is contacted. Each test owns its
+//! database and worker. Library roots under `/fictional` do not exist, so tests that keep them
+//! observe a measured prepare refusal instead of a transfer.
 use hrrdarr::{commands, db::Database, metadata::MetadataClient, providers};
 use serde_json::{Value, json};
 use std::{
@@ -43,7 +45,7 @@ impl Harness {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = commands::router(db.clone());
+        let app = commands::router(db.clone()).merge(hrrdarr::import::router(db.clone()));
         let server = Server(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
@@ -70,6 +72,79 @@ impl Harness {
         if let Some(worker) = self.worker.take() {
             worker.shutdown().await;
         }
+    }
+    /// Real library roots: series 1, movie 1 and movie 2 move under the scratch directory.
+    async fn library(&self) -> (PathBuf, PathBuf) {
+        let tv = self.dir("lib/tv");
+        let movie = self.dir("lib/movie");
+        let orbit = self.dir("lib/orbit");
+        let c = self.db.connect().await.unwrap();
+        c.execute(
+            "UPDATE series SET path=? WHERE id=1",
+            [tv.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE movies SET path=? WHERE id=1",
+            [movie.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE movies SET path=? WHERE id=2",
+            [orbit.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        (tv, movie)
+    }
+    async fn scalar(&self, sql: &str, args: Vec<libsql::Value>) -> Option<libsql::Value> {
+        let c = self.db.connect().await.unwrap();
+        let mut rows = c.query(sql, args).await.unwrap();
+        rows.next().await.unwrap().map(|r| r.get_value(0).unwrap())
+    }
+    async fn count(&self, sql: &str, args: Vec<libsql::Value>) -> i64 {
+        match self.scalar(sql, args).await {
+            Some(libsql::Value::Integer(n)) => n,
+            other => panic!("{sql} -> {other:?}"),
+        }
+    }
+    async fn settled(&self, domain: &str, id: Uuid) -> Value {
+        self.wait(domain, id, |v| v["phase"] == "settled").await
+    }
+    /// Polls the children page until the predicate holds for the named child.
+    async fn wait_child(
+        &self,
+        domain: &str,
+        id: Uuid,
+        relative: &str,
+        done: impl Fn(&Value) -> bool,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let page = self.children(domain, id, "?limit=100").await;
+                if let Some(child) = by_path(&page).get(relative) {
+                    if done(child) {
+                        return child.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("scan child did not reach the expected state")
+    }
+    async fn resume(&self, domain: &str, id: Uuid, child: &Value, body: Value) -> (u16, Value) {
+        self.call(
+            "POST",
+            &format!(
+                "/api/v1/{domain}/downloaded-scan-commands/{id}/children/{}/resume",
+                child["id"].as_str().unwrap()
+            ),
+            body,
+        )
+        .await
     }
     fn dir(&self, name: &str) -> PathBuf {
         let path = self.scratch.0.join(name);
@@ -170,9 +245,6 @@ fn by_path(page: &Value) -> std::collections::BTreeMap<String, Value> {
         .map(|c| (c["relative_path"].as_str().unwrap().to_owned(), c.clone()))
         .collect()
 }
-fn awaiting(v: &Value) -> bool {
-    v["phase"] == "awaiting_import" || v["phase"] == "settled"
-}
 
 #[tokio::test]
 async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventory_each() {
@@ -205,27 +277,36 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
     assert_eq!(h.admit("movies", file_id, &single, "move").await.0, 202);
     h.start_worker().await;
 
-    let tv_done = h.wait("tv", tv_id, awaiting).await;
-    let movie_done = h.wait("movies", movie_id, awaiting).await;
-    let file_done = h.wait("movies", file_id, awaiting).await;
+    // The import continuation runs right after publication. The /fictional library roots do
+    // not exist, so every selected child is refused at prepare (a measured pre-journal
+    // failure with no operation) and the parent settles succeeded/unsuccessful. Changed from
+    // the phase A expectation (running/awaiting_import) because phase B now consumes parked
+    // parents; the published inventory facts asserted below are unchanged.
+    let tv_done = h.settled("tv", tv_id).await;
+    let movie_done = h.settled("movies", movie_id).await;
+    let file_done = h.settled("movies", file_id).await;
     for done in [&tv_done, &movie_done, &file_done] {
-        assert_eq!(done["status"], "running", "{done}");
-        assert_eq!(done["phase"], "awaiting_import");
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["outcome"], "unsuccessful");
         assert_eq!(done["attempts"], 1);
         assert_eq!(done["inventory_revision"], 1);
         assert_eq!(done["source"], "found");
-        assert_eq!(done["outcome"], Value::Null);
         assert_eq!(done["counts"]["imported"], 0);
+        assert_eq!(done["counts"]["ready"], 0);
+        assert_eq!(done["counts"]["recovery_required"], 0);
     }
     // TV: file entries plus directories are all children; exactly the two best files are ready.
     let page = h.children("tv", tv_id, "?limit=100").await;
     let children = by_path(&page);
     assert_eq!(page["total"], 8, "{page}");
     assert_eq!(tv_done["counts"]["entries"], 8);
-    assert_eq!(tv_done["counts"]["ready"], 2);
+    assert_eq!(tv_done["counts"]["failed"], 2);
     assert_eq!(tv_done["counts"]["rejected"], 6);
     let deep = &children["nested/deep/Harbor.S01E02.1080p.WEB-DL.flv"];
-    assert_eq!(deep["disposition"], "ready");
+    assert_eq!(deep["disposition"], "failed");
+    assert_eq!(deep["error_code"], "hc021_root_missing_prepare");
+    assert_eq!(deep["operation_id"], Value::Null);
+    assert_eq!(deep["recovery_required"], false);
     assert_eq!(deep["selected"], true);
     assert_eq!(deep["series_id"], 1);
     assert_eq!(deep["movie_id"], Value::Null);
@@ -241,8 +322,8 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
     ));
     // The tied duplicate resolves deterministically before any effect, not by directory order.
     assert_eq!(
-        children["dupe/Harbor.S01E01.1080p.WEB-DL.flv"]["disposition"],
-        "ready"
+        children["dupe/Harbor.S01E01.1080p.WEB-DL.flv"]["selected"],
+        true
     );
     assert_eq!(
         children["Harbor.S01E01.1080p.WEB-DL.flv"]["reasons"],
@@ -263,7 +344,8 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
     let page = h.children("movies", movie_id, "?limit=100").await;
     let children = by_path(&page);
     let accepted = &children["Harbor.2020.1080p.WEB-DL.flv"];
-    assert_eq!(accepted["disposition"], "ready");
+    assert_eq!(accepted["disposition"], "failed");
+    assert_eq!(accepted["selected"], true);
     assert_eq!(accepted["movie_id"], 1);
     assert_eq!(accepted["series_id"], Value::Null);
     assert_eq!(accepted["resolved_mode"], "copy");
@@ -280,7 +362,7 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
         children["notes.txt"]["reasons"],
         json!(["unsupported_file_type"])
     );
-    assert_eq!(movie_done["counts"]["ready"], 1);
+    assert_eq!(movie_done["counts"]["failed"], 1);
     // Single file source: one child whose relative path is its own name.
     let page = h.children("movies", file_id, "").await;
     assert_eq!(page["total"], 1);
@@ -344,14 +426,12 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
     assert_eq!(after["total"], 8);
     assert!(!by_path(&after).contains_key("Harbor.S01E02.1080p.WEB-DL.flv"));
     let (_, same) = h.get("tv", tv_id).await;
+    // Continuations add scheduling generations, never attempts; terminal proof is immutable.
     assert_eq!(
-        (
-            same["status"].as_str(),
-            same["attempts"].as_i64(),
-            same["run_generation"].as_i64()
-        ),
-        (Some("running"), Some(1), Some(1))
+        (same["status"].as_str(), same["attempts"].as_i64()),
+        (Some("succeeded"), Some(1))
     );
+    assert!(same["run_generation"].as_i64().unwrap() > 1);
     // No transfer: every source byte and path is untouched.
     assert_eq!(
         std::fs::read(tv.join("nested/deep/Harbor.S01E02.1080p.WEB-DL.flv")).unwrap(),
@@ -360,29 +440,23 @@ async fn both_domains_with_colliding_ids_publish_one_complete_immutable_inventor
     assert!(single.exists() && movie.join("Harbor.2020.1080p.WEB-DL.flv").exists());
     assert!(!Path::new("/fictional").exists());
 
-    // Cancel after publication settles every ready child and is idempotent.
-    for _ in 0..2 {
-        let (code, cancelled) = h
-            .call(
-                "POST",
-                &format!("/api/v1/tv/downloaded-scan-commands/{tv_id}/cancel"),
-                Value::Null,
-            )
-            .await;
-        assert_eq!(code, 200, "{cancelled}");
-        assert_eq!(
-            (
-                cancelled["status"].as_str(),
-                cancelled["phase"].as_str(),
-                cancelled["cancel_requested"].as_bool()
-            ),
-            (Some("cancelled"), Some("settled"), Some(true))
-        );
-        assert_eq!(cancelled["counts"]["ready"], 0);
-        assert_eq!(cancelled["counts"]["cancelled"], 2);
-    }
-    // The other domain's parents are unaffected.
-    assert_eq!(h.get("movies", movie_id).await.1["status"], "running");
+    // Cancel on a settled parent is an idempotent no-op that cannot rewrite terminal proof.
+    // (The parked-parent cancel path is covered deterministically by a unit test.)
+    let (code, unchanged) = h
+        .call(
+            "POST",
+            &format!("/api/v1/tv/downloaded-scan-commands/{tv_id}/cancel"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(code, 200, "{unchanged}");
+    assert_eq!(
+        (
+            unchanged["status"].as_str(),
+            unchanged["cancel_requested"].as_bool()
+        ),
+        (Some("succeeded"), Some(false))
+    );
     h.stop_worker().await;
 }
 
@@ -736,9 +810,11 @@ async fn tracked_requests_with_unknown_remote_fall_back_visibly_and_known_provid
         409
     );
     h.start_worker().await;
-    let done = h.wait("movies", id, awaiting).await;
+    let done = h.settled("movies", id).await;
     assert_eq!(done["tracking"], "unknown_fallback");
-    assert_eq!(done["counts"]["ready"], 1, "{done}");
+    // Selected by fallback identification, then refused at prepare: /fictional is absent.
+    assert_eq!(done["counts"]["failed"], 1, "{done}");
+    assert_eq!(done["outcome"], "unsuccessful");
     h.stop_worker().await;
 }
 
@@ -814,4 +890,529 @@ async fn scan_commands_share_the_1024_command_pool_with_every_other_producer() {
         )
         .await;
     assert_eq!(code, 202, "{body}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase B: sequential import continuation
+// ---------------------------------------------------------------------------------------
+
+fn text(v: &str) -> libsql::Value {
+    libsql::Value::Text(v.into())
+}
+/// Distinct payloads so byte-for-byte assertions cannot be satisfied by another file.
+fn payload(tag: u8) -> Vec<u8> {
+    let mut bytes = wav();
+    bytes.extend(std::iter::repeat_n(tag, 4096));
+    bytes
+}
+fn operation_of(child: &Value) -> String {
+    child["operation_id"]
+        .as_str()
+        .expect("linked operation")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn both_domains_import_one_physical_file_each_with_colliding_ids_and_visible_rejections() {
+    let mut h = Harness::new().await;
+    let (tv_root, movie_root) = h.library().await;
+    let tv = h.dir("tv-source").join("Harbor.S01.1080p.WEB-DL");
+    let multi = tv.join("Harbor.S01E01-E02.1080p.WEB-DL.flv");
+    write(&multi, &payload(1));
+    write(&tv.join("Other.Show.S01E01.1080p.WEB-DL.flv"), &payload(2));
+    write(&tv.join("readme.nfo"), b"text");
+    let movie = h.dir("movie-source").join("Harbor.2020.1080p.WEB-DL");
+    let film = movie.join("Harbor.2020.1080p.WEB-DL.flv");
+    write(&film, &payload(3));
+    let (tv_id, movie_id) = (Uuid::new_v4(), Uuid::new_v4());
+    // Untracked auto resolves move; the movie is an explicit copy.
+    assert_eq!(h.admit("tv", tv_id, &tv, "auto").await.0, 202);
+    assert_eq!(h.admit("movies", movie_id, &movie, "copy").await.0, 202);
+    h.start_worker().await;
+    let tv_done = h.settled("tv", tv_id).await;
+    let movie_done = h.settled("movies", movie_id).await;
+    for done in [&tv_done, &movie_done] {
+        assert_eq!(
+            (
+                done["status"].as_str(),
+                done["outcome"].as_str(),
+                done["attempts"].as_i64(),
+                done["error_code"].as_str()
+            ),
+            (Some("succeeded"), Some("success"), Some(1), None),
+            "{done}"
+        );
+        assert_eq!(done["counts"]["imported"], 1);
+        assert_eq!(done["counts"]["ready"], 0);
+    }
+    // Mixed outcome: success with every rejection still visible on its child.
+    assert_eq!(tv_done["counts"]["rejected"], 2);
+    let children = by_path(&h.children("tv", tv_id, "?limit=100").await);
+    assert_eq!(
+        children["Other.Show.S01E01.1080p.WEB-DL.flv"]["reasons"],
+        json!(["no_library_match"])
+    );
+    assert_eq!(children["readme.nfo"]["disposition"], "rejected");
+    let imported = &children["Harbor.S01E01-E02.1080p.WEB-DL.flv"];
+    assert_eq!(imported["disposition"], "imported");
+    assert_eq!(imported["member_count"], 2);
+    assert_eq!(imported["operation_phase"], "complete");
+    assert_eq!(imported["recovery_required"], false);
+    let tv_op = operation_of(imported);
+
+    // TV: one physical transfer (moved), one episode file serving both members, one physical
+    // history event with relational membership for every member.
+    let destination = tv_root.join("Harbor.S01E01-E02.1080p.WEB-DL.flv");
+    assert_eq!(std::fs::read(&destination).unwrap(), payload(1));
+    assert!(!multi.exists(), "move retires the source file");
+    assert_eq!(
+        h.count("SELECT count(*) FROM episode_files", vec![]).await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(DISTINCT e.episode_file_id) FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id IN (1,2) AND f.series_id=1 AND f.path=?",
+            vec![text(destination.to_str().unwrap())]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM episodes WHERE id IN (1,2) AND episode_file_id IS NOT NULL",
+            vec![]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM import_history WHERE operation_id=? AND media_type='episode' AND episode_id=1",
+            vec![text(&tv_op)]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM import_history_episodes WHERE operation_id=? AND episode_id IN (1,2)",
+            vec![text(&tv_op)]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM import_journal WHERE operation_id=? AND phase='complete' AND path_failure_code IS NULL",
+            vec![text(&tv_op)]
+        )
+        .await,
+        1
+    );
+
+    // Movie 1 shares the numeric ID with series 1 yet owns a separate movie file; copy keeps
+    // the source bytes in place.
+    let movie_child = h.children("movies", movie_id, "").await["items"][0].clone();
+    assert_eq!(movie_child["disposition"], "imported");
+    let movie_op = operation_of(&movie_child);
+    let movie_destination = movie_root.join("Harbor.2020.1080p.WEB-DL.flv");
+    assert_eq!(std::fs::read(&movie_destination).unwrap(), payload(3));
+    assert_eq!(
+        std::fs::read(&film).unwrap(),
+        payload(3),
+        "copy keeps source"
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM movie_files WHERE movie_id=1 AND path=?",
+            vec![text(movie_destination.to_str().unwrap())]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM import_history WHERE operation_id=? AND media_type='movie' AND movie_id=1 AND episode_id IS NULL",
+            vec![text(&movie_op)]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM import_history_episodes WHERE operation_id=?",
+            vec![text(&movie_op)]
+        )
+        .await,
+        0
+    );
+
+    // Scan-owned operations are a distinct producer: generic execute and manual command
+    // admission are refused even after completion; status remains readable.
+    for op in [&tv_op, &movie_op] {
+        let (code, body) = h
+            .call(
+                "POST",
+                &format!("/api/v1/imports/{op}/execute"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(
+            (code, body["error"]["code"].as_str()),
+            (409, Some("scan_recovery_required")),
+            "{body}"
+        );
+        let (code, body) = h
+            .call(
+                "POST",
+                "/api/v1/manual-import/commands",
+                json!({"operation_ids":[op],"priority":"normal"}),
+            )
+            .await;
+        assert_eq!(code, 409, "{body}");
+        let (code, status) = h
+            .call("GET", &format!("/api/v1/imports/{op}"), Value::Null)
+            .await;
+        assert_eq!((code, status["status"].as_str()), (200, Some("complete")));
+    }
+    // Exactly one transfer per physical file: no second operation was ever created.
+    assert_eq!(
+        h.count("SELECT count(*) FROM scan_import_facts", vec![])
+            .await,
+        2
+    );
+    h.stop_worker().await;
+}
+
+#[tokio::test]
+async fn failed_replacement_keeps_every_original_and_explicit_resume_is_generation_fenced() {
+    let mut h = Harness::new().await;
+    let (tv_root, _) = h.library().await;
+    // Two distinct lower-quality originals, one per member episode.
+    let old_one = tv_root.join("Harbor.S01E01.720p.HDTV.mkv");
+    let old_two = tv_root.join("Harbor.S01E02.720p.HDTV.mkv");
+    write(&old_one, &payload(10));
+    write(&old_two, &payload(20));
+    let c = h.db.connect().await.unwrap();
+    for (id, path) in [(1, &old_one), (2, &old_two)] {
+        c.execute(
+            "INSERT INTO episode_files(id,series_id,path)VALUES(?,1,?)",
+            libsql::params![id, path.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        c.execute("INSERT INTO file_metadata(media_type,episode_file_id,quality_id,revision_json)VALUES('tv',?,3,'{\"version\":1,\"real\":0,\"is_repack\":false}')", [id]).await.unwrap();
+        c.execute("UPDATE episodes SET episode_file_id=? WHERE id=?", [id, id])
+            .await
+            .unwrap();
+    }
+    drop(c);
+    let source = h.dir("upgrade").join("Harbor.S01E01-E02.1080p.WEB-DL");
+    let multi = source.join("Harbor.S01E01-E02.1080p.WEB-DL.flv");
+    write(&multi, &payload(30));
+    // Forced failure: the library directory refuses the private staging directory, so the
+    // first execution fails after arming but before any library byte changes.
+    std::fs::set_permissions(&tv_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let denied = std::fs::create_dir(tv_root.join("probe")).is_err();
+    let id = Uuid::new_v4();
+    assert_eq!(h.admit("tv", id, &source, "copy").await.0, 202);
+    h.start_worker().await;
+    let name = "Harbor.S01E01-E02.1080p.WEB-DL.flv";
+    let mut operation = None;
+    if denied {
+        let failed = h
+            .wait_child("tv", id, name, |c| c["recovery_required"] == true)
+            .await;
+        assert_eq!(failed["disposition"], "failed");
+        assert_eq!(failed["path_failure_code"], "stage_denied_precommit");
+        assert_eq!(failed["resume_generation"], 0);
+        let parent = h.get("tv", id).await.1;
+        assert_eq!(
+            (parent["status"].as_str(), parent["phase"].as_str()),
+            (Some("running"), Some("recovery_required")),
+            "{parent}"
+        );
+        assert_eq!(parent["counts"]["recovery_required"], 1);
+        // The originals are untouched in bytes, paths and associations; nothing was published.
+        assert_eq!(std::fs::read(&old_one).unwrap(), payload(10));
+        assert_eq!(std::fs::read(&old_two).unwrap(), payload(20));
+        assert!(!tv_root.join(name).exists());
+        assert_eq!(
+            h.count(
+                "SELECT count(*) FROM episodes WHERE (id=1 AND episode_file_id=1) OR (id=2 AND episode_file_id=2)",
+                vec![]
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            h.count("SELECT count(*) FROM episode_files", vec![]).await,
+            2
+        );
+        // No automatic retry: the parent waits for an explicit resume.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let still = h
+            .wait_child("tv", id, name, |c| c["disposition"] == "failed")
+            .await;
+        assert_eq!(still["resume_generation"], 0);
+        std::fs::set_permissions(&tv_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let op = operation_of(&failed);
+        // Stop the worker so the replay below deterministically precedes consumption; once
+        // the worker consumes a generation it can no longer be replayed (asserted after).
+        h.stop_worker().await;
+        let body = |op: &str, generation: i64| json!({"operation_id":op,"inventory_revision":1,"expected_resume_generation":generation});
+        // Wrong operation, revision or generation never authorizes anything.
+        let (code, wrong) = h
+            .resume("tv", id, &failed, body(&Uuid::new_v4().to_string(), 0))
+            .await;
+        assert_eq!(
+            (code, wrong["error"]["code"].as_str()),
+            (409, Some("downloaded_scan_resume_conflict"))
+        );
+        let (code, wrong) = h.resume("tv", id, &failed, body(&op, 3)).await;
+        assert_eq!(
+            (code, wrong["error"]["code"].as_str()),
+            (409, Some("downloaded_scan_resume_generation"))
+        );
+        assert_eq!(
+            h.resume("movies", id, &failed, body(&op, 0)).await.0,
+            404,
+            "domain scoped"
+        );
+        let (code, resumed) = h.resume("tv", id, &failed, body(&op, 0)).await;
+        assert_eq!(code, 200, "{resumed}");
+        // A lost response is reconciled by replaying the identical body: no second grant.
+        let (code, replay) = h.resume("tv", id, &failed, body(&op, 0)).await;
+        assert_eq!(code, 200, "{replay}");
+        assert_eq!(
+            (
+                replay["resume_generation"].as_i64(),
+                replay["resume_requested"].as_bool()
+            ),
+            (Some(1), Some(true))
+        );
+        h.start_worker().await;
+        h.wait_child("tv", id, name, |c| c["resume_requested"] == false)
+            .await;
+        // Consumed: the same body can no longer authorize or replay anything.
+        let (code, consumed) = h.resume("tv", id, &failed, body(&op, 0)).await;
+        assert_eq!(code, 409, "{consumed}");
+        operation = Some(op);
+    } else {
+        std::fs::set_permissions(&tv_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!(
+            "privileged runner can write mode 0555; forced replacement failure not established"
+        );
+    }
+    let done = h.settled("tv", id).await;
+    assert_eq!(
+        (done["status"].as_str(), done["outcome"].as_str()),
+        (Some("succeeded"), Some("success")),
+        "{done}"
+    );
+    let child = h.children("tv", id, "").await["items"][0].clone();
+    let op = operation_of(&child);
+    if let Some(expected) = operation {
+        assert_eq!(op, expected, "resume reuses the same operation");
+        assert_eq!(child["resume_generation"], 1);
+    }
+    // One new physical file for both members; each distinct original is quarantined in its
+    // own recovery directory with its bytes intact, and its row now names that artifact.
+    assert_eq!(std::fs::read(tv_root.join(name)).unwrap(), payload(30));
+    for (file, bytes) in [(1, payload(10)), (2, payload(20))] {
+        let recovery = tv_root
+            .join(format!(".hrrdarr-replaced-{op}-{file}"))
+            .join("original");
+        assert_eq!(std::fs::read(&recovery).unwrap(), bytes);
+        assert_eq!(
+            h.count(
+                "SELECT count(*) FROM episode_files WHERE id=? AND path=?",
+                vec![
+                    libsql::Value::Integer(file),
+                    text(recovery.to_str().unwrap())
+                ]
+            )
+            .await,
+            1
+        );
+    }
+    assert!(!old_one.exists() && !old_two.exists());
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM scan_import_replacements WHERE operation_id=? AND retirement_state='quarantined'",
+            vec![text(&op)]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id IN (1,2) AND f.path=?",
+            vec![text(tv_root.join(name).to_str().unwrap())]
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        std::fs::read(&multi).unwrap(),
+        payload(30),
+        "copy keeps source"
+    );
+    // A settled parent cannot be resumed again.
+    let (code, _) = h
+        .resume(
+            "tv",
+            id,
+            &child,
+            json!({"operation_id":op,"inventory_revision":1,"expected_resume_generation":1}),
+        )
+        .await;
+    assert_eq!(code, 409);
+    h.stop_worker().await;
+}
+
+#[tokio::test]
+async fn cancel_between_children_stops_after_current_and_never_transfers_the_next() {
+    let mut h = Harness::new().await;
+    let (tv_root, _) = h.library().await;
+    let source = h.dir("cancel").join("Harbor.S01.1080p.WEB-DL");
+    let first = source.join("Harbor.S01E01.1080p.WEB-DL.flv");
+    let second = source.join("Harbor.S01E02.1080p.WEB-DL.flv");
+    write(&first, &payload(1));
+    write(&second, &payload(2));
+    let id = Uuid::new_v4();
+    assert_eq!(h.admit("tv", id, &source, "move").await.0, 202);
+    h.start_worker().await;
+    // Children run in ordinal order, one at a time; cancel once the first has started.
+    h.wait_child("tv", id, "Harbor.S01E01.1080p.WEB-DL.flv", |c| {
+        matches!(c["disposition"].as_str(), Some("importing" | "imported"))
+    })
+    .await;
+    let (code, cancelling) = h
+        .call(
+            "POST",
+            &format!("/api/v1/tv/downloaded-scan-commands/{id}/cancel"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(code, 200, "{cancelling}");
+    assert_eq!(cancelling["cancel_requested"], true);
+    let done = h.settled("tv", id).await;
+    assert_eq!(
+        (done["status"].as_str(), done["outcome"].as_str()),
+        (Some("cancelled"), None),
+        "{done}"
+    );
+    assert_eq!(done["counts"]["imported"], 1);
+    assert_eq!(done["counts"]["cancelled"], 1);
+    let children = by_path(&h.children("tv", id, "").await);
+    assert_eq!(
+        children["Harbor.S01E01.1080p.WEB-DL.flv"]["disposition"],
+        "imported"
+    );
+    let skipped = &children["Harbor.S01E02.1080p.WEB-DL.flv"];
+    assert_eq!(skipped["disposition"], "cancelled");
+    assert_eq!(skipped["operation_id"], Value::Null, "never prepared");
+    // The in-flight child completed; the next child never transferred.
+    assert_eq!(
+        std::fs::read(tv_root.join("Harbor.S01E01.1080p.WEB-DL.flv")).unwrap(),
+        payload(1)
+    );
+    assert!(!first.exists());
+    assert!(!tv_root.join("Harbor.S01E02.1080p.WEB-DL.flv").exists());
+    assert_eq!(std::fs::read(&second).unwrap(), payload(2));
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM episodes WHERE id=2 AND episode_file_id IS NULL",
+            vec![]
+        )
+        .await,
+        1
+    );
+    h.stop_worker().await;
+}
+
+#[tokio::test]
+async fn worker_restart_during_an_import_settles_the_same_operation_once_without_reimporting() {
+    let mut h = Harness::new().await;
+    let (_, movie_root) = h.library().await;
+    let source = h.dir("restart").join("Harbor.2020.1080p.WEB-DL");
+    let film = source.join("Harbor.2020.1080p.WEB-DL.flv");
+    // Large enough that the detached transfer usually outlives the worker stop.
+    let mut big = wav();
+    big.resize(24 * 1024 * 1024, 7);
+    write(&film, &big);
+    let id = Uuid::new_v4();
+    assert_eq!(h.admit("movies", id, &source, "move").await.0, 202);
+    h.start_worker().await;
+    let started = h
+        .wait_child("movies", id, "Harbor.2020.1080p.WEB-DL.flv", |c| {
+            matches!(c["disposition"].as_str(), Some("importing" | "imported"))
+        })
+        .await;
+    let op = operation_of(&started);
+    // Stop the worker: the detached engine task keeps its permit and finishes on its own.
+    h.stop_worker().await;
+    let journal_done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let child = h
+                .wait_child("movies", id, "Harbor.2020.1080p.WEB-DL.flv", |_| true)
+                .await;
+            if child["operation_phase"] == "complete" {
+                return child;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if let Ok(child) = &journal_done {
+        // The journal completed with no worker: settlement is still pending, not fabricated.
+        if started["disposition"] == "importing" {
+            assert_eq!(child["disposition"], "importing", "{child}");
+        }
+    }
+    // Record which interleaving this run exercised; both must reach the same single result.
+    eprintln!(
+        "restart_observation started_as={} journal_complete_while_stopped={}",
+        started["disposition"],
+        journal_done.is_ok()
+    );
+    let before = h.get("movies", id).await.1;
+    h.start_worker().await;
+    let done = h.settled("movies", id).await;
+    assert_eq!(
+        (
+            done["status"].as_str(),
+            done["outcome"].as_str(),
+            done["attempts"].as_i64()
+        ),
+        (Some("succeeded"), Some("success"), Some(1)),
+        "{done}"
+    );
+    assert!(done["run_generation"].as_i64() > before["run_generation"].as_i64());
+    let child = h.children("movies", id, "").await["items"][0].clone();
+    assert_eq!(
+        operation_of(&child),
+        op,
+        "same operation before and after restart"
+    );
+    // Exactly one transfer, one operation and one history row.
+    assert_eq!(
+        h.count("SELECT count(*) FROM scan_import_facts", vec![])
+            .await,
+        1
+    );
+    assert_eq!(h.count("SELECT count(*) FROM operations", vec![]).await, 1);
+    assert_eq!(
+        h.count("SELECT count(*) FROM import_history", vec![]).await,
+        1
+    );
+    assert_eq!(
+        std::fs::read(movie_root.join("Harbor.2020.1080p.WEB-DL.flv"))
+            .unwrap()
+            .len(),
+        big.len()
+    );
+    assert!(!film.exists());
+    h.stop_worker().await;
 }

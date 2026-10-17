@@ -3,8 +3,10 @@ mod fs;
 mod owned;
 pub(crate) mod probe;
 pub(crate) mod scan;
+mod scan_owned;
 pub(crate) use fs::scan as scan_fs;
 pub(crate) use owned::{OwnedImport, prepare_owned};
+pub(crate) use scan_owned::{ScanChildAdmission, ScanChildStart, prepare_scan, start_scan};
 
 // Share the existing descriptor-relative, no-symlink directory walk with root observations.
 pub(crate) fn root_directory(path: &std::path::Path) -> Option<std::fs::File> {
@@ -90,6 +92,11 @@ impl Error {
 
     pub(crate) fn started_attempt(&self) -> bool {
         self.started_attempt
+    }
+    /// Storage/internal failures may succeed on a later attempt; every other error is a
+    /// measured, deterministic refusal of the current facts.
+    pub(crate) fn transient(&self) -> bool {
+        self.status.is_server_error()
     }
     fn at(mut self, role: PathRole) -> Self {
         if self.path_role.is_none() && self.path_kind.is_some() {
@@ -547,6 +554,7 @@ async fn committed_owner(c: &Connection, opid: &str, t: &MediaTarget, p: &Plan) 
             "Committed library ownership changed; source cleanup is paused",
         ));
     }
+    scan_owned::committed_members(c, opid).await?;
     source_unmanaged(c, &p.source).await
 }
 fn json<T: Serialize>(v: &T) -> Result<String> {
@@ -668,6 +676,11 @@ pub async fn status(db: Arc<Database>, opid: &str) -> Result<Operation> {
 // Reuse the canonical projection inside a caller-owned read snapshot.
 pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
     let mut response = load(c, opid).await?.response()?;
+    if scan_owned::is_scan(c, opid).await? {
+        response.message =
+            "Downloaded scan import; execution and recovery belong to its scan command".into();
+        return Ok(response);
+    }
     if let Some(row)=c.query("SELECT old_file_json IS NOT NULL,retirement_state FROM rss_candidate_imports WHERE operation_id=?",[opid]).await?.next().await? {
         response.message=if row.get::<i64>(0)?==0 {"Owned download import; source bytes retained"} else {match row.get::<String>(1)?.as_str(){"quarantined"=>"Replacement imported; original bytes retained in private recovery artifact","shared_retained"=>"Replacement imported; original still serves other episodes",_=>"Owned replacement; original retirement pending and bytes retained"}}.into();
     }
@@ -867,6 +880,14 @@ async fn execute_with_authority(
 ) -> Result<Operation> {
     local(&db)?;
     Uuid::parse_str(opid).map_err(|_| Error::bad("Operation ID must be a UUID"))?;
+    // Scan ownership is immutable once the operation exists: its child link, parent
+    // cancellation and resume generations are the only authority that may start it.
+    if scan_owned::is_scan(&db.connect().await?, opid).await? {
+        return Err(Error::conflict(
+            "scan_recovery_required",
+            "This import belongs to a downloaded-folder scan; resume it through the scan command",
+        ));
+    }
     let permit = acquire(&db, opid).ok_or_else(|| {
         Error::conflict(
             "import_busy",
@@ -1096,6 +1117,9 @@ async fn commit(
     plan: &Plan,
     stage: &Stage,
 ) -> Result<()> {
+    if scan_owned::is_scan(c, opid).await? {
+        return scan_owned::commit(c, opid, t, plan, stage).await;
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;

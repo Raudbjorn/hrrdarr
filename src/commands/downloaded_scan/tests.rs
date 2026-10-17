@@ -159,6 +159,61 @@ async fn claim_counts_attempts_and_generations_and_recovery_spares_published_par
     assert!(matches!(parent.status, CommandStatus::Running));
     assert_eq!(parent.revision, 1);
     assert_eq!((parent.attempts, parent.run_generation), (2, 2));
+    // The published parent is now claimed as an import continuation: a new scheduling
+    // generation that never consumes an attempt.
+    let continuation = actual_claim(&db, id).await.unwrap();
+    assert!(continuation.continuation);
+    assert_eq!((continuation.attempts, continuation.run_generation), (2, 3));
+    let parent = snapshot(&db, id).await;
+    assert_eq!((parent.attempts, parent.run_generation), (2, 3));
+}
+
+#[tokio::test]
+async fn cancel_of_a_parked_parent_settles_every_ready_child_without_any_operation() {
+    let (db, scratch) = seeded().await;
+    let folder = release(&scratch);
+    let id = Uuid::new_v4();
+    enqueue(&db, MediaDomain::Tv, input(id, &folder, ScanMode::Auto))
+        .await
+        .unwrap();
+    // Publication only: no continuation step runs, so the parent stays parked.
+    run(&db, actual_claim(&db, id).await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        snapshot(&db, id).await.status,
+        CommandStatus::Running
+    ));
+    for _ in 0..2 {
+        let Json(cancelled) = cancel(
+            State(db.clone()),
+            MediaDomain::Tv,
+            Path(id.to_string()),
+            Ok(Query(Empty {})),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(cancelled.status, CommandStatus::Cancelled));
+        assert!(matches!(cancelled.phase, ScanPhase::Settled));
+        assert!(cancelled.cancel_requested);
+        assert_eq!((cancelled.counts.ready, cancelled.counts.cancelled), (0, 1));
+    }
+    // A cancelled parent is never claimed again, and nothing was prepared or transferred.
+    assert!(actual_claim(&db, id).await.is_none());
+    let operations: i64 = connection(&db)
+        .await
+        .unwrap()
+        .query("SELECT count(*) FROM scan_import_facts", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(operations, 0);
+    assert!(folder.join("Harbor.S01E01.1080p.WEB-DL.flv").exists());
 }
 
 #[tokio::test]

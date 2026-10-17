@@ -1,14 +1,15 @@
-//! Durable downloaded-folder scan commands, phase A: bounded read-only discovery.
+//! Durable downloaded-folder scan commands: phase A bounded read-only discovery, then the
+//! phase B import continuation in `continuation.rs`.
 //!
 //! One `POST` names exactly one absolute file or folder. The worker captures an anchored,
 //! bounded inventory on a blocking thread, evaluates and observes every candidate, then
 //! publishes the COMPLETE inventory (children, episode membership, media observations and the
 //! revision 0 -> 1 transition) in one immediate transaction fenced by `run_generation` and
 //! `cancel_requested`. Nothing is truncated: any cap, permission, identity or storage failure
-//! leaves revision 0 and no child rows. Phase A performs no transfer; a parent that published
-//! selected children stays `running` (phase `awaiting_import`) for the import phase, and a
-//! parent with nothing to import settles `succeeded` with outcome `unsuccessful`.
-//! See docs/downloaded-scan.md.
+//! leaves revision 0 and no child rows. Discovery performs no transfer; a parent that published
+//! selected children stays `running` and the worker imports its ready children one at a time
+//! (see `continuation.rs`). A parent with nothing to import settles `succeeded` with outcome
+//! `unsuccessful`. See docs/downloaded-scan.md.
 use super::*;
 use crate::{
     import::{
@@ -96,6 +97,9 @@ pub enum ScanPhase {
     Queued,
     Inventory,
     AwaitingImport,
+    Importing,
+    // A failed child holds an unresolved operation; only an explicit child resume continues it.
+    RecoveryRequired,
     Settled,
 }
 #[derive(Clone, Copy, Serialize, ts_rs::TS)]
@@ -127,6 +131,8 @@ pub struct ScanCounts {
     pub rejected: i64,
     pub failed: i64,
     pub cancelled: i64,
+    // Failed children whose operation is not complete; they keep the parent running.
+    pub recovery_required: i64,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct DownloadedScanCommand {
@@ -234,6 +240,13 @@ pub struct ScanChild {
     pub observation: Option<ScanObservationState>,
     pub error_code: Option<String>,
     pub operation_id: Option<Uuid>,
+    // Journal phase of the linked operation; never grants execution permission.
+    pub operation_phase: Option<String>,
+    pub path_failure_code: Option<String>,
+    pub resume_generation: i64,
+    pub resume_requested: bool,
+    // Failed with an unresolved operation and no active execution: needs an explicit resume.
+    pub recovery_required: bool,
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -343,6 +356,10 @@ pub(super) fn router(db: Arc<Database>) -> Router {
             post(cancel_tv),
         )
         .route(
+            "/api/v1/tv/downloaded-scan-commands/{id}/children/{child_id}/resume",
+            post(continuation::resume_tv),
+        )
+        .route(
             "/api/v1/movies/downloaded-scan-commands",
             get(list_movies).post(create_movies),
         )
@@ -357,6 +374,10 @@ pub(super) fn router(db: Arc<Database>) -> Router {
         .route(
             "/api/v1/movies/downloaded-scan-commands/{id}/cancel",
             post(cancel_movies),
+        )
+        .route(
+            "/api/v1/movies/downloaded-scan-commands/{id}/children/{child_id}/resume",
+            post(continuation::resume_movies),
         )
         .layer(DefaultBodyLimit::max(8192))
         .layer(axum::middleware::from_fn(deadline))
@@ -503,6 +524,7 @@ async fn counts(c: &Connection, id: Uuid) -> Result<ScanCounts> {
         rejected: 0,
         failed: 0,
         cancelled: 0,
+        recovery_required: 0,
     };
     while let Some(r) = rows.next().await? {
         let n: i64 = r.get(1)?;
@@ -517,6 +539,17 @@ async fn counts(c: &Connection, id: Uuid) -> Result<ScanCounts> {
             ScanDisposition::Cancelled => counts.cancelled = n,
         }
     }
+    drop(rows);
+    counts.recovery_required = c
+        .query(
+            "SELECT count(*) FROM downloaded_scan_children c JOIN import_journal j ON j.operation_id=c.operation_id WHERE c.command_id=? AND c.disposition='failed' AND j.phase!='complete'",
+            [id.hyphenated().to_string()],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(bad)?
+        .get(0)?;
     Ok(counts)
 }
 async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
@@ -549,6 +582,10 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
         phase: match (p.status, p.revision) {
             (CommandStatus::Queued | CommandStatus::RetryWait, _) => ScanPhase::Queued,
             (CommandStatus::Running, 0) => ScanPhase::Inventory,
+            (CommandStatus::Running, _) if counts.importing > 0 => ScanPhase::Importing,
+            (CommandStatus::Running, _) if counts.ready == 0 && counts.recovery_required > 0 => {
+                ScanPhase::RecoveryRequired
+            }
             (CommandStatus::Running, _) => ScanPhase::AwaitingImport,
             _ => ScanPhase::Settled,
         },
@@ -726,8 +763,25 @@ async fn detail(
     .await;
     finish(tx, outcome).await
 }
-const CHILD_COLUMNS: &str = "c.id,c.ordinal,c.relative_path,c.source_path,json_extract(c.decision_json,'$.entry_kind'),c.disposition,c.selected,c.reasons_json,c.series_id,c.movie_id,(SELECT min(m.episode_id) FROM downloaded_scan_child_episodes m WHERE m.child_id=c.id),(SELECT count(*) FROM downloaded_scan_child_episodes m WHERE m.child_id=c.id),c.expected_old_movie_file_id,c.destination,c.resolved_mode,c.quality_id,c.revision_json,c.edition,json_extract(c.source_identity_json,'$.size'),json_extract(c.decision_json,'$.observation.state'),c.error_code,c.operation_id";
+const CHILD_COLUMNS: &str = "c.id,c.ordinal,c.relative_path,c.source_path,json_extract(c.decision_json,'$.entry_kind'),c.disposition,c.selected,c.reasons_json,c.series_id,c.movie_id,(SELECT min(m.episode_id) FROM downloaded_scan_child_episodes m WHERE m.child_id=c.id),(SELECT count(*) FROM downloaded_scan_child_episodes m WHERE m.child_id=c.id),c.expected_old_movie_file_id,c.destination,c.resolved_mode,c.quality_id,c.revision_json,c.edition,json_extract(c.source_identity_json,'$.size'),json_extract(c.decision_json,'$.observation.state'),c.error_code,c.operation_id,c.resume_generation,c.resume_requested,j.phase,CASE WHEN length(CAST(j.path_failure_code AS BLOB))<=64 THEN j.path_failure_code END,j.error_code IS NOT NULL";
+/// Child rows always join their (optional) linked journal for the operation projection.
+const CHILD_FROM: &str =
+    "downloaded_scan_children c LEFT JOIN import_journal j ON j.operation_id=c.operation_id";
 fn child(r: libsql::Row) -> Result<ScanChild> {
+    let operation_id: Option<String> = r.get(21)?;
+    let operation_phase: Option<String> = r.get(24)?;
+    let path_failure_code: Option<String> = r.get(25)?;
+    let disposition = ScanDisposition::parse(&r.get::<String>(5)?)?;
+    let unresolved = r.get::<Option<i64>>(26)? == Some(1) || path_failure_code.is_some();
+    let recovery_required = disposition == ScanDisposition::Failed
+        && operation_phase
+            .as_deref()
+            .is_some_and(|phase| phase != "complete")
+        && unresolved
+        && match operation_id.as_deref() {
+            Some(op) => !crate::import::operation_active(op).map_err(|_| bad())?,
+            None => false,
+        };
     Ok(ScanChild {
         id: Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?,
         ordinal: r.get(1)?,
@@ -740,7 +794,7 @@ fn child(r: libsql::Row) -> Result<ScanChild> {
             Some("other") => ScanEntryKind::Other,
             _ => return Err(bad()),
         },
-        disposition: ScanDisposition::parse(&r.get::<String>(5)?)?,
+        disposition,
         selected: r.get::<i64>(6)? == 1,
         reasons: serde_json::from_str(&r.get::<String>(7)?).map_err(|_| bad())?,
         series_id: r.get(8)?,
@@ -769,10 +823,14 @@ fn child(r: libsql::Row) -> Result<ScanChild> {
             Some(_) => return Err(bad()),
         },
         error_code: r.get(20)?,
-        operation_id: r
-            .get::<Option<String>>(21)?
+        operation_id: operation_id
             .map(|v| Uuid::parse_str(&v).map_err(|_| bad()))
             .transpose()?,
+        operation_phase,
+        path_failure_code,
+        resume_generation: r.get(22)?,
+        resume_requested: r.get::<i64>(23)? == 1,
+        recovery_required,
     })
 }
 async fn children(
@@ -806,7 +864,7 @@ async fn children(
             .get(0)?;
         let mut rows = tx
             .query(
-                &format!("SELECT {CHILD_COLUMNS} FROM downloaded_scan_children c WHERE c.command_id=? AND (? IS NULL OR c.disposition=?) ORDER BY c.ordinal LIMIT ? OFFSET ?"),
+                &format!("SELECT {CHILD_COLUMNS} FROM {CHILD_FROM} WHERE c.command_id=? AND (? IS NULL OR c.disposition=?) ORDER BY c.ordinal LIMIT ? OFFSET ?"),
                 params![key, disposition, disposition, i64::from(q.limit), i64::from(q.offset)],
             )
             .await?;
@@ -824,8 +882,9 @@ async fn children(
     .await;
     finish(tx, outcome).await
 }
-/// Idempotent stop. `cancel_requested` is monotone and fences publication. Phase A has no
-/// effectful child, so every state can settle without an uncertain external effect.
+/// Idempotent stop-after-current. `cancel_requested` is monotone, fences publication and
+/// prevents every later child preparation or start. Untouched ready children are cancelled at
+/// once; an importing or unresolved child keeps the parent running until it settles.
 async fn cancel(
     State(db): State<Arc<Database>>,
     media: MediaDomain,
@@ -860,34 +919,13 @@ async fn cancel(
                 .await?;
             }
             (CommandStatus::Running, _) => {
-                let effectful = tx
-                    .query(
-                        "SELECT 1 FROM downloaded_scan_children WHERE command_id=? AND (operation_id IS NOT NULL OR disposition='importing') LIMIT 1",
-                        [key.clone()],
-                    )
-                    .await?
-                    .next()
-                    .await?
-                    .is_some();
-                if effectful {
-                    // Never relabel an armed or uncertain child; only the fence is recorded.
-                    tx.execute(
-                        "UPDATE downloaded_scan_commands SET cancel_requested=1 WHERE id=? AND status='running'",
-                        [key],
-                    )
-                    .await?;
-                } else {
-                    tx.execute(
-                        "UPDATE downloaded_scan_children SET disposition='cancelled' WHERE command_id=? AND disposition='ready'",
-                        [key.clone()],
-                    )
-                    .await?;
-                    tx.execute(
-                        "UPDATE downloaded_scan_commands SET cancel_requested=1,status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status='running'",
-                        params![timestamp, key],
-                    )
-                    .await?;
-                }
+                // Record the fence and wake the worker so an in-flight child settles promptly.
+                tx.execute(
+                    "UPDATE downloaded_scan_commands SET cancel_requested=1,next_attempt_at=? WHERE id=? AND status='running'",
+                    params![timestamp, key.clone()],
+                )
+                .await?;
+                continuation::settle_cancelled(&tx, &key, timestamp, None).await?;
             }
         }
         let p = scoped_parent(&tx, id, media).await?;
@@ -904,6 +942,8 @@ async fn cancel(
 /// A claim is a scheduling generation. Every callback compares id AND run_generation.
 pub(super) struct ScanClaim {
     pub(super) id: Uuid,
+    /// A published (`inventory_revision` 1) parent: the import continuation, not discovery.
+    continuation: bool,
     media: MediaDomain,
     path: String,
     mode: ScanMode,
@@ -915,10 +955,29 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
     let Some(p) = read_parent(c, id).await? else {
         return Ok(None);
     };
+    let key = id.hyphenated().to_string();
+    if matches!(p.status, CommandStatus::Running) && p.revision == 1 {
+        // A continuation is a new scheduling generation, never another attempt.
+        c.execute(
+            "UPDATE downloaded_scan_commands SET run_generation=run_generation+1,ready_order_at=max(ready_order_at,?1) WHERE id=?2 AND status='running' AND inventory_revision=1",
+            params![timestamp, key],
+        )
+        .await?;
+        let p = read_parent(c, id).await?.ok_or_else(not_found)?;
+        return Ok(Some(ScanClaim {
+            id,
+            continuation: true,
+            media: p.media,
+            path: p.path,
+            mode: p.mode,
+            attempts: p.attempts,
+            run_generation: p.run_generation,
+            requested: p.provider.zip(p.remote),
+        }));
+    }
     if !matches!(p.status, CommandStatus::Queued | CommandStatus::RetryWait) {
         return Ok(None);
     }
-    let key = id.hyphenated().to_string();
     if p.cancel_requested {
         c.execute(
             "UPDATE downloaded_scan_commands SET status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status IN ('queued','retry_wait')",
@@ -935,6 +994,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
     let p = read_parent(c, id).await?.ok_or_else(not_found)?;
     Ok(Some(ScanClaim {
         id,
+        continuation: false,
         media: p.media,
         path: p.path,
         mode: p.mode,
@@ -1846,6 +1906,9 @@ async fn settle(db: &Arc<Database>, claim: &ScanClaim, failure: Failure) -> Resu
     Ok(())
 }
 pub(super) async fn run(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
+    if claim.continuation {
+        return continuation::step(db, claim).await;
+    }
     let found = match tokio::time::timeout(DISCOVERY_DEADLINE, discover(db, &claim)).await {
         Ok(found) => found,
         Err(_) => Err(Failure::Retry("scan_discovery_timeout")),
@@ -1881,6 +1944,9 @@ pub(super) async fn run(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
         }
     }
 }
+
+mod continuation;
+pub use continuation::ScanChildResumeInput;
 
 #[cfg(test)]
 mod tests;

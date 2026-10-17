@@ -102,6 +102,7 @@ pub fn render() -> String {
         crate::commands::downloaded_scan::DownloadedScanChildQuery,
         crate::api::ApiPage<crate::commands::downloaded_scan::DownloadedScanCommand>,
         crate::api::ApiPage<crate::commands::downloaded_scan::ScanChild>,
+        crate::commands::downloaded_scan::ScanChildResumeInput,
         crate::commands::rescan::RescanInput,
         crate::commands::rescan::RescanQuery,
         crate::commands::rescan::RescanBatch,

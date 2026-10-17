@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createDownloadedScanCommand, listDownloadedScanCommands, getDownloadedScanCommand,
-  listDownloadedScanChildren, cancelDownloadedScanCommand,
+  listDownloadedScanChildren, cancelDownloadedScanCommand, resumeDownloadedScanChild,
 } from '../src/lib/api.ts';
 
 const id = 'c0000000-0000-4000-8000-000000000001';
@@ -80,4 +80,32 @@ test('native conflicts keep their static code and HTTP status for explicit readb
       ok: false, status: 409, code: 'downloaded_scan_conflict', error: 'downloaded_scan_conflict',
     });
   });
+});
+
+test('child resume names the exact operation and generation and is never retried', async () => {
+  const child = 'e0000000-0000-4000-8000-000000000001';
+  const operation = 'f0000000-0000-4000-8000-000000000001';
+  const body = {operation_id: operation, inventory_revision: 1, expected_resume_generation: 0};
+  const calls = [];
+  await withFetch(async (path, options) => {
+    calls.push({path, method: options.method, body: JSON.parse(options.body)});
+    return response({id: child, resume_generation: 1, resume_requested: true});
+  }, async () => {
+    assert.equal((await resumeDownloadedScanChild('movies', id, child, body)).ok, true);
+  });
+  assert.deepEqual(calls, [{path: `/api/v1/movies/downloaded-scan-commands/${id}/children/${child}/resume`, method: 'POST', body}]);
+  await withFetch(() => assert.fail('Invalid resume reached fetch'), async () => {
+    for (const [domain, command, target, patch] of [
+      ['shows', id, child, {}], ['tv', 'bad', child, {}], ['tv', id, child.toUpperCase(), {}],
+      ['tv', id, child, {operation_id: 'nope'}], ['tv', id, child, {inventory_revision: 2}],
+      ['tv', id, child, {expected_resume_generation: -1}], ['tv', id, child, {expected_resume_generation: 1.5}],
+    ]) {
+      assert.equal((await resumeDownloadedScanChild(domain, command, target, {...body, ...patch})).ok, false, JSON.stringify(patch));
+    }
+  });
+  let attempts = 0;
+  await withFetch(async () => { attempts++; throw new Error('Response lost'); }, async () => {
+    assert.deepEqual(await resumeDownloadedScanChild('tv', id, child, body), {ok: false, error: 'Response lost'});
+  });
+  assert.equal(attempts, 1);
 });

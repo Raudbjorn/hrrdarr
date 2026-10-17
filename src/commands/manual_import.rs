@@ -241,6 +241,20 @@ async fn validate_admission(tx: &Connection, operation_id: Uuid) -> Result<()> {
             "manual_import_owned_by_download",
         ));
     }
+    // A downloaded-folder scan is a distinct producer: its child link, cancellation and
+    // resume generations are the only start authority, so it is never a manual command.
+    if tx
+        .query(
+            "SELECT 1 FROM scan_import_facts WHERE operation_id=?",
+            [opstr.clone()],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some()
+    {
+        return Err(Error(StatusCode::CONFLICT, "manual_import_owned_by_scan"));
+    }
     let Some(j) = journal(tx, operation_id).await? else {
         return Err(Error(StatusCode::CONFLICT, "manual_import_not_previewed"));
     };

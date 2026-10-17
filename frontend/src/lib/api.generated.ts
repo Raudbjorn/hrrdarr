@@ -640,9 +640,11 @@ export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_r
 
 export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, };
 
-export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, };
+export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, operation_phase: string | null, path_failure_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
 
-export type ScanCounts = { entries: number, ready: number, importing: number, imported: number, already_imported: number, rejected: number, failed: number, cancelled: number, };
+export type ScanChildResumeInput = { operation_id: string, inventory_revision: number, expected_resume_generation: number, };
+
+export type ScanCounts = { entries: number, ready: number, importing: number, imported: number, already_imported: number, rejected: number, failed: number, cancelled: number, recovery_required: number, };
 
 export type ScanDisposition = "ready" | "importing" | "imported" | "already_imported" | "rejected" | "failed" | "cancelled";
 
@@ -654,7 +656,7 @@ export type ScanObservationState = "measured" | "unavailable";
 
 export type ScanOutcome = "success" | "unsuccessful";
 
-export type ScanPhase = "queued" | "inventory" | "awaiting_import" | "settled";
+export type ScanPhase = "queued" | "inventory" | "awaiting_import" | "importing" | "recovery_required" | "settled";
 
 export type ScanResolvedMode = "copy" | "move";
 
