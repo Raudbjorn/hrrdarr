@@ -7,7 +7,7 @@ const origin = process.env.UI_URL;
 const scratch = process.env.UI_SCRATCH;
 assert.ok(origin && scratch, 'Set UI_URL and UI_SCRATCH from your owned fixture');
 assert.equal(new URL(origin).hostname, '127.0.0.1');
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_EXECUTABLE ? {executablePath: process.env.PLAYWRIGHT_EXECUTABLE} : {}) });
 const page = await browser.newPage();
 page.setDefaultTimeout(10000);
 page.on('dialog', dialog=>dialog.accept());
@@ -72,8 +72,18 @@ async function verifyProviders() {
     if(type==='qbittorrent'){update.settings.tv.initial_state='forced';update.settings.movies.content_layout='subfolder';}
     else{update.settings.tv.anime_standard_format_search=true;update.settings.movies.remove_year=true;update.credentials={kind:'indexer',api_key:'fixture-good',tv_parameters:[{name:'private_tv',value:'fixture-tv'}],movie_parameters:[{name:'private_movie',value:'fixture-movie'}]};}
     let response=await page.request.put(`${origin}/api/v1/providers/${before.id}`,{data:update});assert.equal(response.status(),200,await response.text());
+    const independentlyUpdated = await response.json();
+    assert.equal(independentlyUpdated.revision, before.revision + 1);
+    await editor.getByText(new RegExp(`^Saved revision ${before.revision}\\.`)).waitFor();
     await page.getByLabel('Priority',{exact:true}).fill('2');
-    await page.getByRole('button',{name:'Save provider',exact:true}).click();
+    // Blurring Priority must not remove test results mid-click and move Save away from the pointer.
+    const [staleReply] = await Promise.all([
+      page.waitForResponse(reply => reply.request().method() === 'PUT' && new URL(reply.url()).pathname === `/api/v1/providers/${before.id}`),
+      page.getByRole('button',{name:'Save provider',exact:true}).click(),
+    ]);
+    assert.equal(staleReply.request().postDataJSON().revision, before.revision);
+    assert.equal(staleReply.status(), 409, 'The stale editor must receive a revision conflict');
+    assert.equal((await staleReply.json()).error.code, 'provider_revision_conflict');
     await page.getByRole('alert').filter({hasText:/changed|revision|conflict/i}).waitFor();
     assert.equal(await page.getByRole('button',{name:'Save provider',exact:true}).isDisabled(),true);
     await page.getByRole('button',{name:'Reload saved provider',exact:true}).click();

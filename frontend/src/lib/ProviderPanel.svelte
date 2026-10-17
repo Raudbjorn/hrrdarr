@@ -163,7 +163,8 @@
       {#if editing}
         <h2>{selected ? selected.name : 'New provider'}</h2>
         {#if selected}<p>Saved revision {selected.revision}. Credentials: {selected.has_credentials ? 'stored (write-only)' : 'none stored'}.</p><p>Saved test: {selected.test_status.replaceAll('_',' ')}{selected.last_test ? ` at ${new Date(selected.last_test.tested_at * 1000).toLocaleString()} (revision ${selected.last_test.revision})` : ''}{selected.last_test?.error_code ? `: ${selected.last_test.error_code}` : ''}.</p><button disabled={busy || relatedWrite!=='idle'} onclick={() => select(selected!.id)}>Reload saved provider</button>{/if}
-        <form onsubmit={(event) => {event.preventDefault(); void save();}} oninput={() => dirty = true} onchange={() => {dirty = true; confirmingDelete = false; testResult = null;}}>
+        <!-- Clear stale panels while editing, before blur can move Save between pointerdown and click. -->
+        <form onsubmit={(event) => {event.preventDefault(); void save();}} oninput={() => {dirty = true; confirmingDelete = false; testResult = null;}} onchange={() => {dirty = true; confirmingDelete = false; testResult = null;}}>
           <fieldset disabled={locked || conflict}><legend>Connection</legend>
             <label>Provider type<select bind:value={implementation} disabled={!!selected} onchange={changeImplementation}><option value="torznab">Torznab</option><option value="newznab">Newznab</option><option value="qbittorrent">qBittorrent</option></select></label>
             <label>Name<input bind:value={name} required maxlength="128" /></label><label>Endpoint<input type="url" bind:value={endpoint} required maxlength="2048" placeholder="https://indexer.example/api" /></label>
