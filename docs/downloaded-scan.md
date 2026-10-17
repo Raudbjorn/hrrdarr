@@ -314,7 +314,11 @@ longer publish: publication and settlement are fenced by generation.
 - Discovery is read-only but non-atomic with the filesystem: a file added between
   `verify_before_publish` and commit is not in the inventory; prepare revalidates each source's
   inode, size and mtime before creating its operation.
-- No UI panel consumes these routes yet; only the typed `api.ts` wrappers exist.
+- `frontend/src/lib/DownloadedScanPanel.svelte` (library view, below manual import) is the UI consumer: explicit
+  admission with the request identity saved to `localStorage` before the POST and reconciled by `GET` of the same ID,
+  5-second visible-only polling with backoff, child pages, cancel and explicit child resume. Covered by
+  `frontend/tests/downloaded-scan-state.test.mjs` and `frontend/tests/downloaded-scan-browser.mjs` (real fixture
+  backend). Tracked requests are not offered in the form, and a lost resume response is retained only in memory.
 - Per-request owner resolution scans the title catalog once per distinct normalized title; very
   large libraries combined with very many distinct files can exhaust the 30-second budget, which
   fails visibly (`scan_discovery_timeout`) rather than truncating.

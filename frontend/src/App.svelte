@@ -20,6 +20,7 @@
   import RssPanel from './lib/RssPanel.svelte';
   import ReleaseSearchPanel from './lib/ReleaseSearchPanel.svelte';
   import ImportPanel from './lib/ImportPanel.svelte';
+  import DownloadedScanPanel from './lib/DownloadedScanPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
   import HealthPanel from './lib/HealthPanel.svelte';
   import GeneralSettingsPanel from './lib/GeneralSettingsPanel.svelte';
@@ -84,16 +85,18 @@
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
   let fileTarget = $state<{domain:MediaDomain;id:number;title:string}|null>(null);
   let fileWrite = $state<SettingsWriteState>('idle'), fileDirty = $state(false), fileDiscardVersion = $state(0);
-  let manualWrite = $state<SettingsWriteState>('idle');
+  let manualWrite = $state<SettingsWriteState>('idle'), scanWrite = $state<SettingsWriteState>('idle');
   let importVersions = $state({tv:0,movies:0}), importSeen = $state({tv:0,movies:0});
   let importDetailOwner = $state<{domain:MediaDomain;id:number}|null>(null);
   let importReadEpoch = 0, selectionOwner: {domain:MediaDomain;id:number}|null = null;
   let importRefreshing = $state(false), importRefreshError = $state('');
   let fileRefresh = $state<{domain:MediaDomain;id:number;version:number}>({domain:'tv',id:0,version:0});
   let movieFileVersion = $state({id:0,version:0});
-  const fileRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
-  const manualRelatedWrite=$derived<SettingsWriteState>(fileWrite!=='idle'?fileWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites.tv!=='idle'?assignmentWrites.tv:assignmentWrites.movies);
-  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle' || fileWrite!=='idle' || manualWrite!=='idle');
+  const fileRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:scanWrite!=='idle'?scanWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
+  const manualRelatedWrite=$derived<SettingsWriteState>(fileWrite!=='idle'?fileWrite:scanWrite!=='idle'?scanWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites.tv!=='idle'?assignmentWrites.tv:assignmentWrites.movies);
+  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle' || fileWrite!=='idle' || manualWrite!=='idle' || scanWrite!=='idle');
+  // Scan admission/control waits for other library writes; background scan effects rely on backend guards.
+  const scanRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:fileWrite!=='idle'?fileWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
   function admitFileOwner(scope:MediaDomain,id:number|null):boolean {
     if(fileWrite!=='idle')return false;
     if(!fileTarget || (fileTarget.domain===scope && fileTarget.id===id))return true;
@@ -192,6 +195,17 @@
       if(scope==='movies')filesSaved(refreshOwner);
     }
     if(fileTarget?.domain===scope && (!owner || fileTarget.id===owner.id))
+      fileRefresh={domain:scope,id:fileTarget.id,version:fileRefresh.version+1};
+  }
+  // Same owner-scoped invalidation as manual import completion; null owners refresh conservatively.
+  function refreshAfterScan(event:{domain:MediaDomain;commandId:string;owners:number[]|null}) {
+    const scope=event.domain, owns=(id:number)=>event.owners===null || event.owners.includes(id);
+    importVersions={...importVersions,[scope]:importVersions[scope]+1};
+    if(selectionOwner?.domain===scope && owns(selectionOwner.id)) {
+      importDetailOwner={...selectionOwner};
+      if(scope==='movies')filesSaved(selectionOwner);
+    }
+    if(fileTarget?.domain===scope && owns(fileTarget.id))
       fileRefresh={domain:scope,id:fileTarget.id,version:fileRefresh.version+1};
   }
   $effect(() => {
@@ -306,6 +320,7 @@
   <div hidden={view!=='library'}>
     {#if importRefreshError}<p role="alert">Import completed, but library refresh failed: {importRefreshError}</p><button disabled={libraryLocked || importRefreshing} onclick={()=>importRefreshError=''}>Retry library refresh</button>{/if}
     <ImportPanel {target} label={targetLabel} owner={selected?{domain,id:selected.id}:null} active={view==='library'} relatedWrite={manualRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;manualWrite=state;}} oncomplete={refreshAfterImport} />
+    <DownloadedScanPanel {domain} active={view==='library'} relatedWrite={scanRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;scanWrite=state;}} oncomplete={refreshAfterScan} />
   </div>
 </main>
 

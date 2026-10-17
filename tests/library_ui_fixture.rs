@@ -51,6 +51,66 @@ async fn start_command_worker(State(state): State<Arc<CommandWorkerFixture>>) ->
     }
 }
 
+// Barrier counterpart: the downloaded-scan browser parks admitted scans before any claim so it
+// can cancel genuinely queued work, then restarts the worker through the route above.
+async fn stop_command_worker(State(state): State<Arc<CommandWorkerFixture>>) -> StatusCode {
+    match state.runtime.lock().await.take() {
+        Some(runtime) => {
+            runtime.shutdown().await;
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::CONFLICT,
+    }
+}
+/// Minimal PCM WAV bytes (one audio stream). Downloaded-scan sources use the sample-exempt
+/// `.flv` extension, so the probe result never decides acceptance.
+fn scan_payload(tag: u8) -> Vec<u8> {
+    const DATA_BYTES: u32 = 16000;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(DATA_BYTES + 36).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&DATA_BYTES.to_le_bytes());
+    wav.resize(44 + DATA_BYTES as usize, 0);
+    wav.extend(std::iter::repeat_n(tag, 4096));
+    wav
+}
+/// Isolated downloaded-scan sources under `scratch/downloaded-scan`; nothing else reads them.
+fn downloaded_scan_sources(root: &std::path::Path) {
+    let files: [(&str, Option<u8>); 7] = [
+        (
+            "tv/Fixture.series.S01E01.1080p.WEB-DL/Fixture.series.S01E01.1080p.WEB-DL.flv",
+            Some(1),
+        ),
+        ("tv/Fixture.series.S01E01.1080p.WEB-DL/readme.nfo", None),
+        (
+            "movies/Fixture.movie.2021.1080p.WEB-DL.English/Fixture.movie.2021.1080p.WEB-DL.English.flv",
+            Some(2),
+        ),
+        (
+            "tv-recovery/Fixture.series.S01E02.1080p.WEB-DL/Fixture.series.S01E02.1080p.WEB-DL.flv",
+            Some(3),
+        ),
+        ("cancel/Fixture.series.S01E02.1080p.WEB-DL.flv", Some(4)),
+        ("unmatched/Unknown.Show.S01E01.1080p.WEB-DL.flv", Some(5)),
+        ("unmatched/notes.txt", None),
+    ];
+    for (relative, tag) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, tag.map_or_else(|| b"text".to_vec(), scan_payload)).unwrap();
+    }
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+}
+
 struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -948,6 +1008,7 @@ async fn library_ui_fixture() {
         )
         .unwrap();
     }
+    downloaded_scan_sources(&scratch.0.join("downloaded-scan"));
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
@@ -1000,6 +1061,10 @@ async fn library_ui_fixture() {
                     .route(
                         "/api/fixture/start-command-worker",
                         post(start_command_worker),
+                    )
+                    .route(
+                        "/api/fixture/stop-command-worker",
+                        post(stop_command_worker),
                     )
                     .with_state(worker.clone()),
             )
@@ -1071,7 +1136,7 @@ async fn library_ui_fixture() {
     let shutdown = scratch.0.join("shutdown");
     println!(
         "UI_FIXTURE {}",
-        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
+        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"downloaded_scan":scratch.0.join("downloaded-scan"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
     while !shutdown.exists() && tokio::time::Instant::now() < deadline {
