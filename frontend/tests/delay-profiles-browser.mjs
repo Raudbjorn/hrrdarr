@@ -1,7 +1,7 @@
 // Real native endpoints; injected response holds/loss exercise races without sleeps.
 import assert from 'node:assert/strict';import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-const origin=process.env.UI_URL;assert.ok(origin);assert.equal(new URL(origin).hostname,'127.0.0.1');const browser=await chromium.launch({headless:true});const page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',dialog=>dialog.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
+const origin=process.env.UI_URL;assert.ok(origin);assert.equal(new URL(origin).hostname,'127.0.0.1');const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});const page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',dialog=>dialog.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
 const nav=page.getByRole('navigation',{name:'Workspace'}),panel=page.getByRole('region',{name:'Delay profiles',exact:true}),tags=page.getByRole('region',{name:'Tags settings',exact:true});
 const path=domain=>`/api/v1/${domain}/delay-profiles`;
 async function read(domain){const r=await page.request.get(origin+path(domain));assert.equal(r.status(),200);return r.json();}
