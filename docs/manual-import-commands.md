@@ -9,12 +9,42 @@ See [path diagnostics](path-diagnostics.md) for retained evidence, Health findin
 
 ## Routes
 
+- `POST /api/v1/manual-import/commands/reconcile` — read-only body `{"operation_ids":[...]}`, 1–100 distinct operation UUIDs. Returns 200 with exactly one result per requested UUID, in request order: `{"operation_id":"...","operation":Operation|null,"active_command":ManualImportCommand|null}`. Unknown fields and query parameters are rejected. This uses the same 8 KiB request limit, five-second deadline and 1 MiB response bound as the command router.
 - `POST /api/v1/manual-import/commands` — body `{"operation_ids":[...],"priority":"normal"|"high"}`, up to 100 unique operation UUIDs. Validates the whole batch in one transaction before inserting anything: every ID must exist, have an `import_journal` row still at phase `preview` with no `error_code` or retained `path_failure_code`, not already have a non-terminal `manual_import_commands` row, and not be claimed by the automated-download path (`rss_candidate_imports`). Returns 202 and the created rows, all sharing one fresh `batch_id` (`rows[0].batch_id`); poll that with the list endpoint.
 - `GET /api/v1/manual-import/commands` — list, filterable by `batch_id` and `status`, paginated (`limit` 1-100, `offset` up to 1024).
 - `GET /api/v1/manual-import/commands/{id}` — single row detail.
 - `POST /api/v1/manual-import/commands/{id}/cancel` — only while `queued`/`retry_wait` **and** the linked `import_journal` is still at `preview`, without retained path evidence or a matching active transfer. Once execution has begun, through this command or a direct `execute` call racing ahead of it, cancellation returns 409: a copy/move/hardlink in progress or completed cannot be undone by cancelling the wrapper.
 
 An operation admitted here can still be executed directly through `POST /api/v1/imports/{id}/execute`; the two paths are not mutually exclusive at the database level (only the automated-download path has that trigger-enforced exclusivity). `cancel` re-checks the journal phase, not just the command's own status column, specifically to catch that race.
+
+## Reconciliation after an uncertain response
+
+Reconciliation reads operation status and the current queued, retry-wait or running command in one
+read-only database snapshot. It uses the canonical operation projection, including any recovery
+fields exposed by the operation API. Missing operations return both values as null. An existing
+operation with no active command returns its status and `active_command:null`; a terminal command
+is not substituted for an active one. Known command IDs remain readable through the detail route
+while retained. Projection or storage errors fail the entire response rather than omitting entries.
+
+The active-command lookup uses the partial unique index on operation ID. It does not scan global
+history, enumerate terminal commands, or depend on the list endpoint's offset limit. Terminal
+history may have been pruned, and multiple historical batches for one operation are legal.
+
+This snapshot does **not** settle an earlier HTTP request, reserve admission, recover the exact
+original batch identity, or grant recovery authority. An original request may still be pending
+after a read reports no active command. An explicit new admission must use the same captured
+operation UUIDs and remains subject to transactional validation; a conflict requires fresh reads,
+not automatic repeated POSTs or replacement previews. Cancelling one observed command does not
+revoke every pending admission request. A complete operation can coexist with an unsettled queued
+wrapper after direct execution; reconciliation reports both facts without settling that wrapper.
+
+[Reconciliation integration coverage](../tests/manual_import_reconcile.rs) exercises real TV/movie
+previews with colliding numeric target IDs, missing operations, strict request bounds, active and
+terminal command states, complete operations with queued wrappers, more than 1024 unrelated terminal
+rows, terminal-history pruning, and the active lookup's query plan. It checks database data-version
+stability around reconciliation requests, unchanged source bytes/identity, and absence of unrequested
+imports. This source coverage does not establish a passing run, request-settlement semantics,
+distributed ownership, or filesystem effects beyond the explicitly executed test operation.
 
 ## Why `execute()` settles in one tick, and what happens when it doesn't
 

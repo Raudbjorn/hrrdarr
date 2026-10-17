@@ -84,6 +84,8 @@ pub fn render() -> String {
         crate::commands::blocklist::BlocklistClearInput,
         crate::api::ApiPage<crate::commands::blocklist::BlocklistClearCommand>,
         crate::commands::manual_import::ManualImportBatchInput,
+        crate::commands::manual_import::ManualImportReconcileInput,
+        crate::commands::manual_import::ManualImportReconciliation,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
         crate::health::HealthCommandInput,

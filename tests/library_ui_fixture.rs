@@ -1,4 +1,5 @@
-//! Opt-in local browser fixture. No catalog/library rows are inserted directly.
+//! Opt-in local browser fixture. Library creation uses public APIs; an explicit file-metadata
+//! seed hook adds owned pagination/shared-file records after a real import.
 use axum::{
     Json, Router,
     body::Bytes,
@@ -22,6 +23,33 @@ use std::{
     },
     time::Duration,
 };
+
+// Opt-in start barrier lets the browser cancel genuinely queued commands before any claim.
+struct CommandWorkerFixture {
+    runtime: tokio::sync::Mutex<Option<commands::Runtime>>,
+    db: Arc<Database>,
+    refresh: hrrdarr::providers::RefreshClient,
+    metadata: Arc<MetadataClient>,
+}
+async fn start_command_worker(State(state): State<Arc<CommandWorkerFixture>>) -> StatusCode {
+    let mut runtime = state.runtime.lock().await;
+    if runtime.is_some() {
+        return StatusCode::CONFLICT;
+    }
+    match commands::start_with_metadata(
+        state.db.clone(),
+        state.refresh.clone(),
+        state.metadata.clone(),
+    )
+    .await
+    {
+        Ok(worker) => {
+            *runtime = Some(worker);
+            StatusCode::NO_CONTENT
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -317,6 +345,104 @@ async fn import_failure(
     match db.connect().await.unwrap().execute_batch(sql).await {
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+// This one-use hook has no production route and is inert in existing browser flows.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileMetadataSeedInput {
+    series_id: i64,
+}
+struct SeedDirectory {
+    path: Option<PathBuf>,
+    retain: bool,
+}
+impl Drop for SeedDirectory {
+    fn drop(&mut self) {
+        if !self.retain {
+            if let Some(path) = &self.path {
+                if std::fs::remove_dir_all(path).is_err() {
+                    eprintln!("event=fixture_seed_cleanup_failed");
+                }
+            }
+        }
+    }
+}
+async fn seed_file_metadata(
+    State((db, root)): State<(Arc<Database>, PathBuf)>,
+    Json(input): Json<FileMetadataSeedInput>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use std::io::Write;
+    const FILE_COUNT: i64 = 25;
+    const MEDIA_BYTES: &[u8] = b"owned file metadata pagination fixture\n";
+    let storage = |_| StatusCode::INTERNAL_SERVER_ERROR;
+    if input.series_id <= 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Declare before the transaction so cancellation releases database work before file cleanup.
+    let mut directory = SeedDirectory {
+        path: None,
+        retain: false,
+    };
+    let c = db.connect().await.map_err(storage)?;
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .map_err(storage)?;
+    let result = async {
+        let row = tx.query("SELECT path FROM series WHERE id=? AND tvdb_id=101 AND EXISTS(SELECT 1 FROM seasons WHERE series_id=series.id AND number=1)", [input.series_id]).await.map_err(storage)?.next().await.map_err(storage)?.ok_or(StatusCode::CONFLICT)?;
+        let stored_root = PathBuf::from(row.get::<String>(0).map_err(storage)?);
+        // Only the original fixture root is eligible; never follow a substituted root symlink.
+        if stored_root != root || !std::fs::symlink_metadata(&root).map_err(|_| StatusCode::CONFLICT)?.is_dir() || std::fs::canonicalize(&root).map_err(|_| StatusCode::CONFLICT)? != root {
+            return Err(StatusCode::CONFLICT);
+        }
+        let mut files = tx.query("SELECT id,path FROM episode_files WHERE series_id=? ORDER BY id LIMIT 2", [input.series_id]).await.map_err(storage)?;
+        let original = files.next().await.map_err(storage)?.ok_or(StatusCode::CONFLICT)?;
+        // libSQL rows borrow the statement's current values; capture them before advancing it.
+        let original_id = original.get::<i64>(0).map_err(storage)?;
+        let original_path = PathBuf::from(original.get::<String>(1).map_err(storage)?);
+        drop(original);
+        if files.next().await.map_err(storage)?.is_some() { return Err(StatusCode::CONFLICT); }
+        if original_path.parent() != Some(root.as_path()) || !std::fs::symlink_metadata(&original_path).map_err(|_| StatusCode::CONFLICT)?.is_file() {
+            return Err(StatusCode::CONFLICT);
+        }
+        drop(files);
+        let valid = tx.query("SELECT 1 WHERE EXISTS(SELECT 1 FROM import_history h JOIN import_journal j ON j.operation_id=h.operation_id WHERE h.episode_file_id=?1 AND j.phase='complete') AND (SELECT count(*) FROM episodes WHERE series_id=?2 AND episode_file_id=?1)=1 AND NOT EXISTS(SELECT 1 FROM episodes WHERE series_id=?2 AND season=1 AND number BETWEEN 100 AND 199) AND NOT EXISTS(SELECT 1 FROM operations o JOIN episodes e ON e.id=o.episode_id JOIN import_journal j ON j.operation_id=o.id WHERE e.series_id=?2 AND j.phase!='complete')", libsql::params![original_id,input.series_id]).await.map_err(storage)?.next().await.map_err(storage)?.is_some();
+        if !valid { return Err(StatusCode::CONFLICT); }
+        let seed_root = root.join("file-metadata-seed");
+        std::fs::create_dir(&seed_root).map_err(|_| StatusCode::CONFLICT)?;
+        directory.path = Some(seed_root.clone());
+        let mut file_ids = vec![original_id];
+        for index in 0..FILE_COUNT {
+            let path = seed_root.join(format!("Fixture.series.S01E{:03}.mkv",100+index));
+            let mut media = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            media.write_all(MEDIA_BYTES).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            drop(media);
+            let file = tx.query("INSERT INTO episode_files(series_id,path)VALUES(?,?) RETURNING id", libsql::params![input.series_id,path.to_string_lossy().into_owned()]).await.map_err(storage)?.next().await.map_err(storage)?.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?.get::<i64>(0).map_err(storage)?;
+            tx.execute("INSERT INTO episodes(series_id,season,number,title,episode_file_id)VALUES(?,1,?,?,?)", libsql::params![input.series_id,100+index,format!("File metadata fixture {}",index+1),file]).await.map_err(storage)?;
+            tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,size,season_number)VALUES('tv',?,?,1)", libsql::params![file,MEDIA_BYTES.len() as i64]).await.map_err(storage)?;
+            file_ids.push(file);
+        }
+        tx.execute("INSERT INTO episodes(series_id,season,number,title,episode_file_id)VALUES(?,1,199,'Shared file metadata fixture',?)", libsql::params![input.series_id,original_id]).await.map_err(storage)?;
+        let mut shared = tx.query("SELECT id FROM episodes WHERE series_id=? AND episode_file_id=? ORDER BY id LIMIT 3",libsql::params![input.series_id,original_id]).await.map_err(storage)?;
+        let mut episode_ids = Vec::new();
+        while let Some(row) = shared.next().await.map_err(storage)? { episode_ids.push(row.get::<i64>(0).map_err(storage)?); }
+        if episode_ids.len()!=2 { return Err(StatusCode::CONFLICT); }
+        file_ids.sort_unstable();
+        Ok(json!({"series_id":input.series_id,"file_ids":file_ids,"shared_file_id":original_id,"shared_episode_ids":episode_ids}))
+    }.await;
+    match result {
+        Ok(value) => {
+            // Retain created bytes if commit reports an ambiguous error; Scratch owns final cleanup.
+            // Successful commit never leaves a row referring to a file removed by the guard.
+            directory.retain = true;
+            tx.commit().await.map_err(storage)?;
+            Ok(Json(value))
+        }
+        Err(error) => {
+            tx.rollback().await.map_err(storage)?;
+            Err(error)
+        }
     }
 }
 #[derive(Deserialize)]
@@ -855,11 +981,28 @@ async fn library_ui_fixture() {
     let clear_root = scratch.0.join("clear-source");
     std::fs::create_dir(&clear_root).unwrap();
     let clear_fixture = blocklist_fixture(db.clone(), &clear_root, 902).await;
-    let worker = commands::start_with_metadata(db.clone(), refresh.clone(), client.clone())
-        .await
-        .unwrap();
+    let worker = Arc::new(CommandWorkerFixture {
+        runtime: tokio::sync::Mutex::new(None),
+        db: db.clone(),
+        refresh: refresh.clone(),
+        metadata: client.clone(),
+    });
+    if std::env::var("HRRDARR_UI_PAUSE_COMMANDS").as_deref() != Ok("1") {
+        assert_eq!(
+            start_command_worker(State(worker.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+    }
     let (api, _api) = serve(
         library::router(db.clone())
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/fixture/start-command-worker",
+                        post(start_command_worker),
+                    )
+                    .with_state(worker.clone()),
+            )
             .merge(library::metadata_router(db.clone(), client))
             .merge(episodes::router(db.clone()))
             .merge(hrrdarr::credits::router(db.clone()))
@@ -902,6 +1045,12 @@ async fn library_ui_fixture() {
                     )
                     .with_state(db.clone()),
             )
+            .merge(
+                Router::new()
+                    .route("/api/fixture/file-metadata-seed", post(seed_file_metadata))
+                    .layer(axum::extract::DefaultBodyLimit::max(1024))
+                    .with_state((db.clone(), tv.clone())),
+            )
             .merge(blocklist::router(db))
             .merge(
                 Router::new()
@@ -929,7 +1078,9 @@ async fn library_ui_fixture() {
     }
     // Join aborted servers before removing their database and scratch files.
     _api.stop().await;
-    worker.shutdown().await;
+    if let Some(runtime) = worker.runtime.lock().await.take() {
+        runtime.shutdown().await;
+    }
     _metadata.stop().await;
     _providers.stop().await;
     alternate_providers.stop().await;

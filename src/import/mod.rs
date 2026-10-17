@@ -648,7 +648,11 @@ async fn load(c: &Connection, opid: &str) -> Result<Record> {
 }
 pub async fn status(db: Arc<Database>, opid: &str) -> Result<Operation> {
     let c = db.connect().await?;
-    let mut response = load(&c, opid).await?.response()?;
+    status_in(&c, opid).await
+}
+// Reuse the canonical projection inside a caller-owned read snapshot.
+pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
+    let mut response = load(c, opid).await?.response()?;
     if let Some(row)=c.query("SELECT old_file_json IS NOT NULL,retirement_state FROM rss_candidate_imports WHERE operation_id=?",[opid]).await?.next().await? {
         response.message=if row.get::<i64>(0)?==0 {"Owned download import; source bytes retained"} else {match row.get::<String>(1)?.as_str(){"quarantined"=>"Replacement imported; original bytes retained in private recovery artifact","shared_retained"=>"Replacement imported; original still serves other episodes",_=>"Owned replacement; original retirement pending and bytes retained"}}.into();
     }

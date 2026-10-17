@@ -1,4 +1,5 @@
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
+import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTargetInput, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, MovieCredit, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -91,6 +92,23 @@ export const previewManualImport = (body: ManualImportRequest) => validId(body.t
 const validOperation = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 export const getImport = (id: string) => validOperation(id) ? request<Operation>(`/api/v1/imports/${id}`, undefined, undefined, true) : Promise.resolve<Result<Operation>>({ok:false,error:'Invalid operation ID.'});
 export const executeImport = (id: string) => validOperation(id) ? request<Operation>(`/api/v1/imports/${id}/execute`, undefined, 'POST', true) : Promise.resolve<Result<Operation>>({ok:false,error:'Invalid operation ID.'});
+
+const validManualImportIds = (ids: string[]) => Array.isArray(ids) && ids.length >= 1 && ids.length <= 100
+  && ids.every(id => typeof id === 'string' && validOperation(id))
+  && new Set(ids.map(id => id.toLowerCase())).size === ids.length;
+export const createManualImportCommands = (input: ManualImportBatchInput) =>
+  validManualImportIds(input.operation_ids) && ['normal', 'high'].includes(input.priority)
+    ? request<ManualImportCommand[]>('/api/v1/manual-import/commands', input, 'POST', true)
+    : Promise.resolve<Result<ManualImportCommand[]>>({ok: false, error: 'Choose 1–100 distinct operation IDs and a valid priority.'});
+export const getManualImportCommand = (id: string) => validOperation(id)
+  ? request<ManualImportCommand>(`/api/v1/manual-import/commands/${id}`, undefined, undefined, true)
+  : Promise.resolve<Result<ManualImportCommand>>({ok: false, error: 'Invalid command ID.'});
+export const cancelManualImportCommand = (id: string) => validOperation(id)
+  ? request<ManualImportCommand>(`/api/v1/manual-import/commands/${id}/cancel`, undefined, 'POST', true)
+  : Promise.resolve<Result<ManualImportCommand>>({ok: false, error: 'Invalid command ID.'});
+export const reconcileManualImports = (operationIds: string[]) => validManualImportIds(operationIds)
+  ? request<ManualImportReconciliation[]>('/api/v1/manual-import/commands/reconcile', {operation_ids: operationIds}, 'POST', true)
+  : Promise.resolve<Result<ManualImportReconciliation[]>>({ok: false, error: 'Choose 1–100 distinct operation IDs.'});
 
 export const listProviders = (offset = 0) => request<ApiPage<Provider>>(`/api/v1/providers?limit=25&offset=${offset}`, undefined, undefined, true);
 export const getProviderSchema = (media: MediaDomain, kind: ProviderKind) => request<ProviderSchema>(`/api/v1/providers/schema?${new URLSearchParams({media_type: media, kind})}`, undefined, undefined, true);
@@ -341,3 +359,54 @@ export const getHistory = (query: import('./api.generated').HistoryQuery = {}): 
 };
 export const getHostSettings =(): Promise<Result<import('./api.generated').HostSettings>> =>
   request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);
+
+// File IDs are scoped by domain; owner-qualified readback is required after uncertain writes.
+import type { FilePatch, FileResource } from './api.generated';
+import { FILE_PAGE_SIZE, validFileIds, validFileResource, validateFileReadback } from './file-metadata-draft.ts';
+const fileDomain = (domain: MediaDomain) => domain === 'tv' || domain === 'movies';
+const invalidFiles = <T>(error = 'Invalid file request.'): Result<T> => ({ ok: false, error });
+const filePageValid = (value: unknown): value is ApiPage<FileResource> => {
+  if (!value || typeof value !== 'object') return false;
+  const page = value as ApiPage<FileResource>;
+  return Array.isArray(page.items) && page.items.length <= FILE_PAGE_SIZE && Number.isSafeInteger(page.total) && page.total >= 0 && page.limit === FILE_PAGE_SIZE && Number.isSafeInteger(page.offset) && page.offset >= 0 && page.offset <= 4294967295 && page.items.length === Math.min(FILE_PAGE_SIZE, Math.max(0, page.total - page.offset));
+};
+export async function listMediaFiles(domain: MediaDomain, ownerId: number, offset = 0): Promise<Result<ApiPage<FileResource>>> {
+  if (!fileDomain(domain) || !validId(ownerId) || !Number.isInteger(offset) || offset < 0 || offset > 4294967295) return invalidFiles();
+  const query = new URLSearchParams({ [domain === 'tv' ? 'series_id' : 'movie_ids']: String(ownerId), limit: String(FILE_PAGE_SIZE), offset: String(offset) });
+  const result = await request<ApiPage<FileResource>>(`/api/v1/${domain}/files?${query}`, undefined, undefined, true);
+  if (!result.ok) return result;
+  if (!filePageValid(result.data) || result.data.offset !== offset) return invalidFiles('Invalid file page response.');
+  if (result.data.items.length) {
+    const checked = validateFileReadback(domain, ownerId, result.data.items.map(file => file?.id), result.data.items);
+    if (!checked.ok) return checked;
+  }
+  return result;
+}
+export async function getMediaFile(domain: MediaDomain, fileId: number): Promise<Result<FileResource>> {
+  if (!fileDomain(domain) || !validId(fileId)) return invalidFiles();
+  const result = await request<FileResource>(`/api/v1/${domain}/files/${fileId}`, undefined, undefined, true);
+  return !result.ok || (validFileResource(domain, result.data) && result.data.id === fileId) ? result : invalidFiles('Invalid file detail response.');
+}
+export async function updateMediaFile(domain: MediaDomain, fileId: number, patch: FilePatch): Promise<Result<FileResource>> {
+  if (!fileDomain(domain) || !validId(fileId) || !patch || !Object.keys(patch).length) return invalidFiles();
+  const result = await request<FileResource>(`/api/v1/${domain}/files/${fileId}`, patch, 'PUT', true);
+  return !result.ok || (validFileResource(domain, result.data) && result.data.id === fileId) ? result : invalidFiles('Invalid file update response; read back before another write.');
+}
+export async function editMediaFiles(domain: MediaDomain, fileIds: number[], patch: FilePatch): Promise<Result<FileResource[]>> {
+  if (!fileDomain(domain) || !validFileIds(fileIds) || !patch || !Object.keys(patch).length) return invalidFiles();
+  const ids = [...fileIds];
+  const result = await request<FileResource[]>(`/api/v1/${domain}/files/editor`, { ...patch, file_ids: ids }, 'PUT', true);
+  if (!result.ok) return result;
+  if (!Array.isArray(result.data) || result.data.length !== ids.length || new Set(result.data.map(file => file?.id)).size !== ids.length || result.data.some(file => !validFileResource(domain, file) || !ids.includes(file.id))) return invalidFiles('Invalid file editor response; read back every attempted file before another write.');
+  return result;
+}
+export async function readMediaFiles(domain: MediaDomain, ownerId: number, fileIds: number[]): Promise<Result<FileResource[]>> {
+  if (!fileDomain(domain) || !validId(ownerId) || !validFileIds(fileIds)) return invalidFiles();
+  // Snapshot the selection before awaiting; callers may change their local selection.
+  const ids = [...fileIds];
+  const query = new URLSearchParams({ file_ids: ids.join(','), limit: String(FILE_PAGE_SIZE), offset: '0' });
+  const result = await request<ApiPage<FileResource>>(`/api/v1/${domain}/files?${query}`, undefined, undefined, true);
+  if (!result.ok) return result;
+  if (!filePageValid(result.data) || result.data.offset !== 0 || result.data.total !== ids.length) return invalidFiles('Readback did not return the complete attempted selection.');
+  return validateFileReadback(domain, ownerId, ids, result.data.items);
+}

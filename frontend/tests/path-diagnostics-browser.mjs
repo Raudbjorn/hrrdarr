@@ -1,9 +1,9 @@
 // Owned browser regression: real source-parent loss/recovery and Health in both domains.
-// Explicit GET-only overlays separately exercise lease projections and completed suppression.
+// Explicit read-only reconciliation/GET overlays exercise lease projections and malformed completion rejection.
 // Run against a fresh owned library_ui_fixture, separate from library-browser.mjs.
 import assert from 'node:assert/strict';
 import {copyFile,mkdir,readFile,realpath,rename,stat} from 'node:fs/promises';
-import {basename,isAbsolute,join} from 'node:path';
+import {basename,isAbsolute,join,resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
 const origin=process.env.UI_URL,providerOrigin=process.env.UI_PROVIDER_ORIGIN;
@@ -11,14 +11,33 @@ for(const value of [origin,providerOrigin])assert.equal(new URL(value).hostname,
 assert.ok(process.env.UI_SCRATCH&&isAbsolute(process.env.UI_SCRATCH));
 const scratch=await realpath(process.env.UI_SCRATCH);
 assert.ok(basename(scratch).startsWith('hrrdarr-library-ui-'),'Only the owned library fixture may be modified');
+// Evidence must stay in an explicitly selected ignored 103 directory, independent of cwd.
+assert.ok(process.env.UI_SCREENSHOT_DIR&&isAbsolute(process.env.UI_SCREENSHOT_DIR),'Set an absolute UI_SCREENSHOT_DIR');
+const screenshotRequested=resolve(process.env.UI_SCREENSHOT_DIR);
+assert.match(screenshotRequested,/\/\.do-not-commit\/loop\/iteration103(?:[-/]|$)/,'Screenshots must stay under ignored iteration103 artifacts');
+await mkdir(screenshotRequested,{recursive:true});
+const screenshotDirectory=await realpath(screenshotRequested);
+assert.match(screenshotDirectory,/\/\.do-not-commit\/loop\/iteration103(?:[-/]|$)/,'Screenshot directory must resolve to ignored iteration103 artifacts');
+const screenshotRun=`${Date.now()}-${process.pid}`,screenshots=[];
+async function screenshot(name){const path=join(screenshotDirectory,`iteration103-${name}-${screenshotRun}.png`);await page.screenshot({path});screenshots.push(path);}
 const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});
 const page=await browser.newPage({viewport:{width:1280,height:900}});
 page.setDefaultTimeout(20000);
-const errors=[],external=[],writes=[],overlays=[];
+const errors=[],external=[],writes=[],reconciliations=[],overlays=[];
+const reconcilePath='/api/v1/manual-import/commands/reconcile';
 const retainedParents=new Map();
 page.on('pageerror',error=>errors.push(error.message));
-page.on('dialog',dialog=>{errors.push(`Unexpected dialog: ${dialog.message()}`);void dialog.dismiss();});
-page.on('request',request=>{if(!['GET','HEAD'].includes(request.method()))writes.push([request.method(),new URL(request.url()).pathname]);});
+let expectedLegacyBeforeUnload=false;
+page.on('dialog',dialog=>{
+ if(expectedLegacyBeforeUnload&&dialog.type()==='beforeunload'){expectedLegacyBeforeUnload=false;void dialog.accept();return;}
+ errors.push(`Unexpected ${dialog.type()} dialog: ${dialog.message()}`);void dialog.dismiss();
+});
+page.on('request',request=>{
+ const path=new URL(request.url()).pathname;
+ // This POST is a read-only snapshot, never an execution/admission authorization.
+ if(path===reconcilePath && request.method()==='POST'){reconciliations.push(request.postDataJSON());return;}
+ if(!['GET','HEAD'].includes(request.method()))writes.push([request.method(),path]);
+});
 await page.route('**/*',route=>{
  const url=new URL(route.request().url());
  if(['http:','https:'].includes(url.protocol)&&url.hostname!=='127.0.0.1'){external.push(url.href);return route.abort();}
@@ -29,7 +48,20 @@ const manual=page.getByRole('region',{name:'Manual import',exact:true});
 const health=page.getByRole('region',{name:'Health',exact:true});
 const activity=page.getByRole('region',{name:'Activity',exact:true});
 const processing=page.getByRole('region',{name:'Completed downloads',exact:true});
-const receipt=()=>page.evaluate(()=>JSON.parse(localStorage.getItem('hrrdarr.import.receipt.v1')));
+const manualRow=id=>manual.getByRole('article').filter({has:page.getByText(id,{exact:true})});
+async function receipt(id){
+ await page.waitForFunction(id=>{const saved=JSON.parse(localStorage.getItem('hrrdarr.import.collection.v2')||'null');return saved?.version===2&&saved.entries.some(e=>!id||e.operationId===id);},id);
+ const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('hrrdarr.import.collection.v2')));
+ assert.equal(saved.version,2);if(!id)assert.equal(saved.entries.length,1);
+ const entry=id?saved.entries.find(e=>e.operationId===id):saved.entries[0];assert.ok(entry);
+ assert.equal(Object.hasOwn(entry,'operation'),false,'Stored entries must never substitute for real operation observations');return entry;
+}
+async function reconciliationResponse(route,id,projection){
+ assert.equal(route.request().method(),'POST');assert.deepEqual(route.request().postDataJSON(),{operation_ids:[id]});
+ const response=await route.fetch();assert.equal(response.status(),200);const rows=await response.json();
+ assert.equal(rows.length,1);assert.equal(rows[0].operation_id,id);assert.equal(rows[0].operation.id,id);assert.equal(rows[0].active_command,null);
+ return route.fulfill({response,body:JSON.stringify([{...rows[0],operation:projection}])});
+}
 async function get(path){const response=await page.request.get(origin+path,{timeout:10000});assert.equal(response.status(),200,await response.text());return response.json();}
 async function until(read,accept,label){const deadline=Date.now()+30000;let last;while(Date.now()<deadline){last=await read();if(accept(last))return last;await page.waitForTimeout(75);}assert.fail(`${label}: ${JSON.stringify(last)}`);}
 async function ready(button){await button.waitFor();await until(()=>button.isEnabled(),Boolean,'Control did not become enabled');}
@@ -74,48 +106,74 @@ async function healthRun(domain,expectedReason){
  return snapshot;
 }
 async function manualProjectionOverlays(operation){
- const match=url=>url.pathname===`/api/v1/imports/${operation.id}`;
+ const match=url=>url.pathname===reconcilePath,row=manualRow(operation.id);
  let projection={...operation,status:'staging',error_code:null,path_failure_code:'unresolved_attempt',recovery_required:false};
- const count=writes.length;
- await page.route(match,route=>{assert.equal(route.request().method(),'GET');return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(projection)});});
+ const count=writes.length,reads=reconciliations.length;
+ await page.route(match,route=>reconciliationResponse(route,operation.id,projection));
  await manualRead();
- await manual.getByText('This import attempt has unresolved evidence. Check status before another action; this does not establish a specific filesystem failure.',{exact:true}).waitFor();
- assert.equal(await manual.getByRole('button',{name:'Resume import',exact:true}).count(),0,'Active projection must not offer a future resume');
- assert.equal(await manual.getByRole('button',{name:'Execute import',exact:true}).count(),0);
+ await row.getByText('This import attempt has unresolved evidence. Check status before another action; this does not establish a specific filesystem failure.',{exact:true}).waitFor();
+ assert.equal(await row.getByRole('button',{name:'Resume import',exact:true}).count(),0,'Active projection must not offer a future resume');
+ assert.equal(await row.getByRole('button',{name:'Execute import',exact:true}).count(),0);
  projection={...projection,recovery_required:true};await manualRead();
- await manual.getByText('The previous import attempt has no confirmed outcome. Check retained files and explicitly resume the same operation when ready.',{exact:true}).waitFor();
- await ready(manual.getByRole('button',{name:'Resume import',exact:true}));
- assert.equal(writes.length,count,'Rendering recovery projections must not send mutations');
+ await row.getByText('The previous import attempt has no confirmed outcome. Check retained files and explicitly resume the same operation when ready.',{exact:true}).waitFor();
+ await ready(row.getByRole('button',{name:'Resume import',exact:true}));
+ assert.ok(reconciliations.length>reads,'Projection was observed through read-only reconciliation');
+ assert.equal(writes.length,count,'Rendering recovery projections must not send any mutation or authorization');
  await page.unroute(match);await manualRead();
- assert.equal((await receipt()).operation.path_failure_code,operation.path_failure_code,'Actual persisted cause must return after overlay removal');
- overlays.push('Manual GET: active and abandoned sentinel with NULL control error; no execute sent');
+ assert.equal((await get(`/api/v1/imports/${operation.id}`)).path_failure_code,operation.path_failure_code,'Actual persisted cause must return after overlay removal');
+ assert.equal((await receipt(operation.id)).operationId,operation.id);
+ overlays.push('Manual read-only reconciliation POST: active and abandoned sentinel with NULL control error; no authorization sent');
 }
 async function oldReceiptRefresh(operation){
- const match=url=>url.pathname===`/api/v1/imports/${operation.id}`;
+ const match=url=>url.pathname===reconcilePath,row=manualRow(operation.id),entry=await receipt(operation.id);
  let entered;const held=new Promise(resolve=>entered=resolve);let release;const gate=new Promise(resolve=>release=resolve);
- await page.evaluate(()=>{const saved=JSON.parse(localStorage.getItem('hrrdarr.import.receipt.v1'));delete saved.operation.path_failure_code;delete saved.operation.recovery_required;localStorage.setItem('hrrdarr.import.receipt.v1',JSON.stringify(saved));});
- await page.route(match,async route=>{const response=await route.fetch();entered();await gate;await route.fulfill({response});});
+ // Explicitly exercise legacy migration: observations are present only in this v1 specimen.
+ // Removing v2 is required; otherwise the panel correctly prefers its existing collection.
+ await page.evaluate(({entry,operation})=>{
+  const oldOperation={...operation};delete oldOperation.path_failure_code;delete oldOperation.recovery_required;
+  localStorage.removeItem('hrrdarr.import.collection.v2');
+  localStorage.setItem('hrrdarr.import.receipt.v1',JSON.stringify({request:entry.request,label:entry.label,operation:oldOperation,authorized:entry.authorized}));
+ },{entry,operation});
+ const count=writes.length;
+ await page.route(match,async route=>{
+  assert.equal(route.request().method(),'POST');assert.deepEqual(route.request().postDataJSON(),{operation_ids:[operation.id]});
+  const response=await route.fetch();assert.equal(response.status(),200);entered();await gate;await route.fulfill({response});
+ });
  let timeout;
  try{
-  await page.reload();await Promise.race([held,new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Saved receipt read did not enter gate')),10000);})]);
-  await manual.getByText('Refresh the saved operation status before authorizing or resuming an import.',{exact:true}).waitFor();
-  assert.equal(await manual.getByRole('button',{name:'Resume import',exact:true}).count(),0);
-  assert.equal(await manual.getByRole('button',{name:'Execute import',exact:true}).count(),0);
+  // The retained authorized entry deliberately warns before this explicit migration reload.
+  expectedLegacyBeforeUnload=true;
+  try{await page.reload();}finally{expectedLegacyBeforeUnload=false;}
+  await Promise.race([held,new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Saved receipt reconciliation did not enter gate')),10000);})]);
+  await row.getByText('Check status before authorizing this operation. Saved receipts never restore action freshness.',{exact:true}).waitFor();
+  assert.equal(await row.getByRole('button',{name:'Resume import',exact:true}).count(),0);
+  assert.equal(await row.getByRole('button',{name:'Execute import',exact:true}).count(),0);
  }finally{clearTimeout(timeout);release();}
- await ready(manual.getByRole('button',{name:'Resume import',exact:true}));await page.unroute(match);
- assert.equal((await receipt()).operation.id,operation.id);assert.equal((await receipt()).operation.recovery_required,true);
- overlays.push('Delayed actual GET: legacy saved receipt remains unauthorized until fresh fields arrive');
+ await ready(row.getByRole('button',{name:'Resume import',exact:true}));await page.unroute(match);
+ const migrated=await receipt(operation.id);assert.deepEqual(migrated.request,entry.request);assert.equal(migrated.authorized,true);assert.equal(migrated.executionUncertain,true);assert.equal(migrated.owner,null);
+ assert.equal(await page.evaluate(()=>localStorage.getItem('hrrdarr.import.receipt.v1')),null,'Migration removes v1 only after retaining v2');
+ assert.equal((await get(`/api/v1/imports/${operation.id}`)).recovery_required,true);
+ assert.equal(writes.length,count,'Migrating and reconciling an old receipt must not authorize effects');
+ overlays.push('Delayed actual read-only reconciliation: explicitly seeded legacy receipt requires fresh recovery fields; no execution/admission');
 }
 async function completedOverlay(operation){
- const match=url=>url.pathname===`/api/v1/imports/${operation.id}`;
+ const match=url=>url.pathname===reconcilePath,row=manualRow(operation.id);
  const count=writes.length;
- await page.route(match,route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...operation,status:'complete',error_code:null,path_failure_code:'source_denied_precommit',recovery_required:true})}));
- await manualRead();await ready(manual.getByRole('button',{name:'Prepare another import',exact:true}));
- assert.equal(await manual.getByRole('button',{name:'Resume import',exact:true}).count(),0);
- assert.equal(await manual.getByText(/denied access|unresolved evidence|previous import attempt/).count(),0);
- assert.equal(writes.length,count);
- await page.unroute(match);await manualRead();
- overlays.push('Manual GET: inconsistent stale diagnostic on completed status is suppressed');
+ await page.route(match,route=>reconciliationResponse(route,operation.id,{...operation,status:'complete',error_code:null,path_failure_code:'source_denied_precommit',recovery_required:true}));
+ await manualRead();
+ // 103 validates the full operation contract: complete with a retained failure/recovery flag
+ // is malformed. Preserve the identity, invalidate actions and reject the observation.
+ await manual.getByRole('alert').filter({hasText:'Reconciliation operation target or status is invalid.'}).waitFor();
+ await row.getByText('Check status before authorizing this operation. Saved receipts never restore action freshness.',{exact:true}).waitFor();
+ assert.equal(await row.getByRole('button',{name:'Prepare another import',exact:true}).count(),0,'An invalid projection cannot authorize forgetting recovery identity');
+ assert.equal(await row.getByRole('button',{name:'Resume import',exact:true}).count(),0);
+ assert.equal(await row.getByRole('button',{name:'Execute import',exact:true}).count(),0);
+ assert.equal(await row.getByText(/denied access|unresolved evidence|previous import attempt/).count(),0);
+ assert.equal(writes.length,count,'Malformed completion must not authorize any mutation');
+ assert.equal((await receipt(operation.id)).operationId,operation.id);
+ const actual=await get(`/api/v1/imports/${operation.id}`);assert.equal(actual.status,'complete');assert.equal(actual.path_failure_code,null);assert.equal(actual.recovery_required,false);
+ await page.unroute(match);await manualRead();await ready(row.getByRole('button',{name:'Prepare another import',exact:true}));
+ overlays.push('Manual read-only reconciliation: contradictory completed recovery projection rejected; identity retained and every action fenced, no effects');
 }
 async function processingProjectionOverlays(owners,operations){
  const scope=category=>({category,imported_category:null,recent_priority:0,older_priority:0});
@@ -153,7 +211,7 @@ try{
  const owners={},operations={};
  for(const domain of ['tv','movies']){
   await nav.getByRole('button',{name:'Library',exact:true}).click();
-  if(domain==='movies')await manual.getByRole('button',{name:'Prepare another import',exact:true}).click();
+  if(domain==='movies'){await manualRow(operations.tv.id).getByRole('button',{name:'Prepare another import',exact:true}).click();assert.equal(await manualRow(operations.tv.id).count(),0);}
   owners[domain]=await add(domain);await enableCdh(domain);
   if(domain==='tv')await page.getByRole('button',{name:'Import Pilot',exact:true}).click();
   const parent=join(scratch,`path-diagnostic-${domain}`),hidden=join(scratch,`path-diagnostic-${domain}-retained`);
@@ -162,45 +220,52 @@ try{
   await copyFile(join(scratch,'incoming',domain==='tv'?'episode.mkv':'movie.mkv'),source);
   const original=await readFile(source),identity=await stat(source,{bigint:true});
   await manual.getByLabel('Source file',{exact:true}).fill(source);await manual.getByLabel('Destination file',{exact:true}).fill(destination);
-  await manual.getByRole('button',{name:'Preview import',exact:true}).click();await ready(manual.getByRole('button',{name:'Execute import',exact:true}));
-  const saved=await receipt();assert.equal(saved.operation.target.media_type,domain==='tv'?'episode':'movie');
-  if(domain==='movies')assert.equal(saved.operation.target.id,operations.tv.target.id,'Both domains exercise colliding numeric target IDs');
-  const id=saved.operation.id,executePath=`/api/v1/imports/${id}/execute`;
+  await manual.getByRole('button',{name:'Preview import',exact:true}).click();
+  const saved=await receipt(),id=saved.operationId,row=manualRow(id);await ready(row.getByRole('button',{name:'Execute import',exact:true}));
+  const preview=await get(`/api/v1/imports/${id}`);assert.deepEqual(preview.target,saved.request.target);assert.equal(preview.target.media_type,domain==='tv'?'episode':'movie');
+  if(domain==='movies')assert.equal(preview.target.id,operations.tv.target.id,'Both domains exercise colliding numeric target IDs');
+  const executePath=`/api/v1/imports/${id}/execute`;
   const before=writes.filter(([,path])=>path===executePath).length;
   // Rename only the source parent; source inode/content/ctime remain identical for recovery.
   await rename(parent,hidden);retainedParents.set(hidden,parent);
   const failedReply=page.waitForResponse(response=>new URL(response.url()).pathname===executePath&&response.request().method()==='POST');
-  await manual.getByRole('button',{name:'Execute import',exact:true}).click();assert.equal((await failedReply).status(),409);
+  await row.getByRole('button',{name:'Execute import',exact:true}).click();assert.equal((await failedReply).status(),409);
   const failed=await until(()=>get(`/api/v1/imports/${id}`),value=>value.path_failure_code==='source_missing_precommit'&&value.recovery_required,'Failure did not retain a recoverable source-loss diagnostic');
-  await manualRead();await ready(manual.getByRole('button',{name:'Resume import',exact:true}));
-  await manual.getByText('An approved source was recorded missing before import completed. Restore or review the source before explicitly resuming the same operation.',{exact:true}).waitFor();
+  await manualRead();await ready(row.getByRole('button',{name:'Resume import',exact:true}));
+  await row.getByText('An approved source was recorded missing before import completed. Restore or review the source before explicitly resuming the same operation.',{exact:true}).waitFor();
   assert.equal(await stat(destination).then(()=>true,error=>{assert.equal(error.code,'ENOENT');return false;}),false);
   await manualProjectionOverlays(failed);
   if(domain==='tv')await oldReceiptRefresh(failed);
   await healthRun(domain,'path_source_removed');
-  if(domain==='tv'){await mkdir('.do-not-commit/loop',{recursive:true});await page.screenshot({path:'.do-not-commit/loop/iteration101-path-health-desktop.png'});}
+  if(domain==='tv')await screenshot('path-health-desktop');
   await rename(hidden,parent);retainedParents.delete(hidden);
   const restored=await stat(source,{bigint:true});for(const field of ['dev','ino','size','mtimeNs','ctimeNs'])assert.equal(restored[field],identity[field],`Source ${field} changed during parent restoration`);
   assert.deepEqual(await readFile(source),original);
   await healthRun(domain,'path_source_removed'); // Restored accessibility is not operation completion.
-  await nav.getByRole('button',{name:'Library',exact:true}).click();await ready(manual.getByRole('button',{name:'Resume import',exact:true}));
+  await nav.getByRole('button',{name:'Library',exact:true}).click();await ready(row.getByRole('button',{name:'Resume import',exact:true}));
   if(domain==='tv'){
    await page.setViewportSize({width:390,height:844});await manual.scrollIntoViewIfNeeded();
    assert.equal(await manual.evaluate(node=>node.scrollWidth<=node.clientWidth+1),true,'Manual recovery panel overflows mobile width');
-   await page.screenshot({path:'.do-not-commit/loop/iteration101-path-import-mobile.png'});await page.setViewportSize({width:1280,height:900});
+   await screenshot('path-import-mobile');await page.setViewportSize({width:1280,height:900});
   }
   const completedReply=page.waitForResponse(response=>new URL(response.url()).pathname===executePath&&response.request().method()==='POST');
-  await manual.getByRole('button',{name:'Resume import',exact:true}).click();assert.equal((await completedReply).status(),200);
-  await ready(manual.getByRole('button',{name:'Prepare another import',exact:true}));
+  await row.getByRole('button',{name:'Resume import',exact:true}).click();assert.equal((await completedReply).status(),200);
+  await ready(row.getByRole('button',{name:'Prepare another import',exact:true}));
   const complete=await get(`/api/v1/imports/${id}`);assert.equal(complete.id,id);assert.equal(complete.status,'complete');assert.equal(complete.path_failure_code,null);assert.equal(complete.recovery_required,false);
-  assert.equal((await receipt()).operation.id,id);assert.deepEqual(await readFile(destination),original);assert.deepEqual(await readFile(source),original);
+  assert.equal((await receipt(id)).operationId,id);assert.deepEqual(await readFile(destination),original);assert.deepEqual(await readFile(source),original);
   assert.equal(writes.filter(([,path])=>path===executePath).length-before,2,'Only explicit failure and explicit recovery may execute this operation');
   await completedOverlay(complete);operations[domain]=complete;
   await healthRun(domain,null);
  }
+ // Retire the final completed browser identity before unrelated processing projections.
+ await nav.getByRole('button',{name:'Library',exact:true}).click();
+ await ready(manualRow(operations.movies.id).getByRole('button',{name:'Prepare another import',exact:true}));
+ await manualRow(operations.movies.id).getByRole('button',{name:'Prepare another import',exact:true}).click();
+ assert.equal(await manualRow(operations.movies.id).count(),0);
  await processingProjectionOverlays(owners,operations);
  assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
- console.log('PASS actual TV/movie source-parent loss, retained manual and Health diagnosis, unchanged source identity/bytes, explicit same-operation recovery, completed suppression, scoped Health recovery, mobile layout.');
+ console.log('PASS actual TV/movie source-parent loss, retained manual and Health diagnosis, unchanged source identity/bytes, explicit same-operation recovery, malformed completed projection rejection, scoped Health recovery, mobile layout.');
+ console.log('Screenshots: '+JSON.stringify(screenshots));
  console.log('Disclosed presentation overlays (not backend lease/recovery evidence): '+JSON.stringify(overlays));
 }finally{
  try{for(const [hidden,parent] of retainedParents)await rename(hidden,parent);}

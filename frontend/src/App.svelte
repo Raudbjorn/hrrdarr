@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MediaFilesPanel from './lib/MediaFilesPanel.svelte';
   import MovieRenamePreviewPanel from './lib/MovieRenamePreviewPanel.svelte';
   import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
@@ -8,7 +9,7 @@
   import CreateTags from './lib/CreateTags.svelte';
   import { findLibraryByExternalId } from './lib/api';
   import { unknownTagWrite } from './lib/tag-draft';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import SettingsIndex from './lib/SettingsIndex.svelte';
   import NotFound from './lib/NotFound.svelte';
   import { parseHash, hashFor, SETTINGS_INDEX_HASH, type ViewId } from './lib/routes';
@@ -74,13 +75,33 @@
   let tagWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), assignmentWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let creationIds=$state<number[]>([]), creationReady=$state(true), creationUncertain=$state(false);
   function tagsSaved(items:LibraryItem[]){if(page)page={...page,items:page.items.map(item=>items.find(saved=>saved.id===item.id)??item)};if(selected){const updated=items.find(item=>item.id===selected!.id);if(updated)selected={...selected,tag_ids:updated.tag_ids};}}
-  async function reconcileCreation(){if(!choice||saving)return;saving=true;const result=await findLibraryByExternalId(domain,choice.external_id);saving=false;if(!result.ok){error=result.error;return;}creationUncertain=false;if(result.data.items.length){adding=false;choice=null;await load();await select(result.data.items[0].id);notice='Existing library item loaded. Review its tags before changing them.';}else notice='No matching library item found. Review the retained creation draft before retrying.';}
+  async function reconcileCreation(){if(!choice||saving)return;++importReadEpoch;saving=true;const result=await findLibraryByExternalId(domain,choice.external_id);saving=false;if(!result.ok){error=result.error;return;}creationUncertain=false;if(result.data.items.length){adding=false;choice=null;await load();await select(result.data.items[0].id);notice='Existing library item loaded. Review its tags before changing them.';}else notice='No matching library item found. Review the retained creation draft before retrying.';}
   let qualityCatalogVersions = $state({tv:0,movies:0});
   let profileWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), qualityWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
   let episodes: Episode[] = $state([]), episodeTotal = $state(0), episodeOffset = $state(0), episodeId: number | null = $state(null);
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
-  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle');
+  let fileTarget = $state<{domain:MediaDomain;id:number;title:string}|null>(null);
+  let fileWrite = $state<SettingsWriteState>('idle'), fileDirty = $state(false), fileDiscardVersion = $state(0);
+  let manualWrite = $state<SettingsWriteState>('idle');
+  let importVersions = $state({tv:0,movies:0}), importSeen = $state({tv:0,movies:0});
+  let importDetailOwner = $state<{domain:MediaDomain;id:number}|null>(null);
+  let importReadEpoch = 0, selectionOwner: {domain:MediaDomain;id:number}|null = null;
+  let importRefreshing = $state(false), importRefreshError = $state('');
+  let fileRefresh = $state<{domain:MediaDomain;id:number;version:number}>({domain:'tv',id:0,version:0});
+  let movieFileVersion = $state({id:0,version:0});
+  const fileRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
+  const manualRelatedWrite=$derived<SettingsWriteState>(fileWrite!=='idle'?fileWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites.tv!=='idle'?assignmentWrites.tv:assignmentWrites.movies);
+  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle' || fileWrite!=='idle' || manualWrite!=='idle');
+  function admitFileOwner(scope:MediaDomain,id:number|null):boolean {
+    if(fileWrite!=='idle')return false;
+    if(!fileTarget || (fileTarget.domain===scope && fileTarget.id===id))return true;
+    if(fileDirty && !window.confirm('Discard unsaved file metadata changes?'))return false;
+    ++fileDiscardVersion;fileDirty=false;return true;
+  }
+  function filesSaved(owner:{domain:MediaDomain;id:number}) {
+    if(owner.domain==='movies')movieFileVersion={id:owner.id,version:movieFileVersion.version+1};
+  }
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
   const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
   const tagRelatedWithProfiles=$derived<Record<MediaDomain,SettingsWriteState>>({tv:releaseWrites.tv!=='idle'?releaseWrites.tv:tagRelatedWithDelay.tv,movies:releaseWrites.movies!=='idle'?releaseWrites.movies:tagRelatedWithDelay.movies});
@@ -109,14 +130,14 @@
     if (result.ok) profiles = result.data; else profilesError = result.error;
   }
   function changeDomain(next: MediaDomain) {
-    if(libraryLocked)return;creationIds=[];creationReady=true;searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
+    if(next===domain || libraryLocked || !admitFileOwner(next,null))return;selectionOwner=null;creationIds=[];creationReady=true;searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
   }
   async function select(id: number, offset = 0) {
-    if(libraryLocked)return;searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
+    if(libraryLocked || !admitFileOwner(domain,id))return;selectionOwner={domain,id};searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
     const result = await getLibrary(scope, id);
     if (!alive || version !== detailVersion) return;
     if (!result.ok) { detailLoading = false; selected = null; error = result.error; return; }
-    selected = result.data; fields(selected); if (!profiles && !profilesLoading) void loadProfiles(); episodes = []; episodeOffset = offset;
+    selected = result.data; fileTarget={domain:scope,id:selected.id,title:selected.title}; fields(selected); if (!profiles && !profilesLoading) void loadProfiles(); episodes = []; episodeOffset = offset;
     if (scope === 'tv') {
       const rows = await listEpisodes(id, offset);
       if (!alive || version !== detailVersion) return;
@@ -133,7 +154,7 @@
   }
   async function add() {
     if (!choice || libraryLocked || !creationReady || tagWrites[domain]!=='idle') return;
-    const scope = domain, externalId = choice.external_id, version = searchVersion; saving = true; error = '';
+    const scope = domain, externalId = choice.external_id, version = searchVersion; ++importReadEpoch; saving = true; error = '';
     const result = await addLibrary(scope, externalId, path,{tags:{mode:'replace',ids:creationIds}});
     saving = false;
     if (!alive || scope !== domain || version !== searchVersion) return;
@@ -142,15 +163,15 @@
   }
   async function patch(patch: LibraryPatch) {
     if (!selected || libraryLocked) return;
-    const item = selected, version = detailVersion; saving = true; error = ''; notice = '';
+    const item = selected, version = detailVersion; ++importReadEpoch; saving = true; error = ''; notice = '';
     const result = await updateLibrary(item.media_type, item.id, patch); saving = false;
     if (!alive || version !== detailVersion) return;
     if (!result.ok) {error = result.error; return;}
     notice = 'Changes saved.'; await select(item.id, episodeOffset); void load(page?.offset ?? 0);
   }
   async function monitor(episode: Episode) {
-    if (saving) return;
-    const version = detailVersion; saving = true; error = '';
+    if (libraryLocked) return;
+    const version = detailVersion; ++importReadEpoch; saving = true; error = '';
     const result = await monitorEpisode(episode.id, !episode.monitored); saving = false;
     if (!alive || version !== detailVersion) return;
     if (result.ok) { episodes = episodes.map(item => item.id === episode.id ? result.data : item); notice = 'Episode monitoring saved.'; }
@@ -159,7 +180,45 @@
   function saveSettings() {
     void patch(domain === 'tv' ? {quality_profile_id: profileId, series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {quality_profile_id: profileId, minimum_availability: (availability || null) as MinimumAvailability | null});
   }
-  function refreshAfterImport() { void load(page?.offset ?? 0); if (selected) void select(selected.id, episodeOffset); }
+  function refreshAfterImport(event:{operationId:string;target:MediaTarget;owner:{domain:MediaDomain;id:number}|null}) {
+    const scope=event.target.media_type==='movie'?'movies':'tv';
+    const owner=event.owner ?? (scope==='movies'?{domain:scope,id:event.target.id}:domain==='tv' && selected && episodes.some(e=>e.id===event.target.id)?{domain:scope,id:selected.id}:null);
+    // Legacy receipts lack a series owner; conservatively reread visible TV facts without inventing ownership.
+    const refreshOwner=owner ?? (selectionOwner?.domain===scope?selectionOwner:null);
+    importVersions={...importVersions,[scope]:importVersions[scope]+1};
+    if(refreshOwner && selectionOwner?.domain===refreshOwner.domain && selectionOwner.id===refreshOwner.id) {
+      importDetailOwner=refreshOwner;
+      if(scope==='movies')filesSaved(refreshOwner);
+    }
+    if(fileTarget?.domain===scope && (!owner || fileTarget.id===owner.id))
+      fileRefresh={domain:scope,id:fileTarget.id,version:fileRefresh.version+1};
+  }
+  $effect(() => {
+    if(view==='library' && !libraryLocked && !loading && !detailLoading && !importRefreshing && !importRefreshError && importSeen[domain]!==importVersions[domain])
+      untrack(()=>{void refreshImportObservations();});
+  });
+  async function refreshImportObservations() {
+    const scope=domain, revision=importVersions[scope], list=listVersion, detail=detailVersion, writes=importReadEpoch;
+    const owner=importDetailOwner?.domain===scope && selected?.id===importDetailOwner.id?selected.id:null;
+    const offset=episodeOffset; importRefreshing=true; importRefreshError='';
+    const [collection,item,rows]=await Promise.all([
+      listLibrary(scope,page?.offset??0), owner===null?null:getLibrary(scope,owner),
+      owner===null || scope!=='tv'?null:listEpisodes(owner,offset),
+    ]);
+    if(!alive)return;
+    importRefreshing=false;
+    if(scope!==domain || libraryLocked || detailLoading || list!==listVersion || detail!==detailVersion || writes!==importReadEpoch)return;
+    if(!collection.ok || (item && !item.ok) || (rows && !rows.ok)) {
+      importRefreshError=[collection,item,rows].flatMap(result=>result && !result.ok?[result.error]:[]).join(' '); return;
+    }
+    page=collection.data; importSeen={...importSeen,[scope]:revision};
+    if(owner!==null && selected?.id===owner && item?.ok) {
+      // Refresh import observations without replacing local library settings or file drafts.
+      selected={...selected,statistics:item.data.statistics};
+      if(rows?.ok){episodes=rows.data.items;episodeTotal=rows.data.total;if(episodeId!==null && !episodes.some(e=>e.id===episodeId && !e.has_file))episodeId=null;}
+      if(importVersions[scope]===revision)importDetailOwner=null;
+    }
+  }
   onMount(() => { alive = true; applyHash(); window.addEventListener('hashchange', applyHash); void load(); return () => {window.removeEventListener('hashchange', applyHash); alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
 </script>
 
@@ -183,7 +242,7 @@
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
-  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
+  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);if(scope!==domain)return;view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
   {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}{#if saving}<p role="status">Saving library changes…</p>{/if}
@@ -193,10 +252,10 @@
       {#if searching}<p role="status">Searching catalogue…</p>{:else if searched && !results.length}<p>No matches. Try a different title or catalogue ID.</p>{/if}
       <ul class="lookup-results">{#each results as result (`${result.media_type}:${result.external_id}`)}<li><button disabled={libraryLocked} aria-pressed={choice?.external_id === result.external_id} onclick={() => {choice = result; path = '';creationIds=[];creationReady=true;}}>{result.title} {result.year ?? ''}<small>{domain === 'tv' ? 'TVDB' : 'TMDB'} {result.external_id}</small></button></li>{/each}</ul>
       {#if choice}<form onsubmit={(event) => {event.preventDefault(); void add();}}><h2>{choice.title}</h2><label>Existing library directory<input bind:value={path} required placeholder="/library/title" /></label><p>Choose a directory that already exists. Adding does not create folders, search for downloads or import files. Monitoring starts enabled; edit it below after adding.</p>{#key `${domain}:${choice.external_id}`}<CreateTags {domain} catalogVersion={tagVersions[domain]} disabled={libraryLocked||tagWrites[domain]!=='idle'} onchange={(ids,ready)=>{creationIds=ids;creationReady=ready;}} />{/key}<button class="primary" disabled={libraryLocked||!creationReady||tagWrites[domain]!=='idle'}>Add to library</button></form>{/if}
-    {#if creationUncertain}<p role="alert">Add outcome unknown. Check for the created item before retrying.</p><button disabled={saving} onclick={reconcileCreation}>Check creation outcome</button>{/if}
+    {#if creationUncertain}<p role="alert">Add outcome unknown. Check for the created item before retrying.</p><button disabled={saving || manualWrite!=='idle' || fileWrite!=='idle' || assignmentWrites[domain]!=='idle'} onclick={reconcileCreation}>Check creation outcome</button>{/if}
     </section>
   {/if}
-  <LibraryTagsPanel {domain} items={page?.items??[]} {selected} catalogVersion={tagVersions[domain]} relatedWrite={tagWrites[domain]!=='idle'?tagWrites[domain]:saving?'busy':creationUncertain?'uncertain':'idle'} onwrite={(scope,state)=>assignmentWrites={...assignmentWrites,[scope]:state}} onsaved={tagsSaved} />
+  <LibraryTagsPanel {domain} items={page?.items??[]} {selected} catalogVersion={tagVersions[domain]} relatedWrite={manualWrite!=='idle'?manualWrite:fileWrite!=='idle'?fileWrite:tagWrites[domain]!=='idle'?tagWrites[domain]:saving?'busy':creationUncertain?'uncertain':'idle'} onwrite={(scope,state)=>{if(state!=='idle')++importReadEpoch;assignmentWrites={...assignmentWrites,[scope]:state};}} onsaved={tagsSaved} />
   <div class="workspace">
     <aside aria-label="Library collection"><div class="section-heading"><h1>{domain === 'tv' ? 'Series' : 'Movies'}</h1><button disabled={loading} onclick={() => load(page?.offset ?? 0)}>Refresh library</button></div>
       {#if loading}<p role="status">Loading library…</p>{/if}
@@ -208,7 +267,7 @@
       {#if detailLoading}<p role="status">Loading details…</p>{/if}
       {#if selected && !detailLoading}
         <h1>{selected.title}</h1><p class="path">{selected.path}</p><p>{selected.statistics.file_count} associated files · {selected.monitored ? 'Monitored' : 'Unmonitored'}</p>
-        <button disabled={saving} onclick={() => patch({monitored: !selected!.monitored})}>{selected.monitored ? 'Unmonitor' : 'Monitor'} {domain === 'tv' ? 'series' : 'movie'}</button>
+        <button disabled={libraryLocked} onclick={() => patch({monitored: !selected!.monitored})}>{selected.monitored ? 'Unmonitor' : 'Monitor'} {domain === 'tv' ? 'series' : 'movie'}</button>
         {#if view === 'library'}{#key `${selected.media_type}:${selected.id}`}<MetadataRefreshPanel target={selected.media_type === 'tv' ? {media_type:'tv',series_id:selected.id} : {media_type:'movies',movie_id:selected.id}} onreload={() => {if(selected) {void load(page?.offset ?? 0); void select(selected.id,episodeOffset);}}} />{/key}{/if}
         {#if view === 'library' && selected.media_type === 'movies'}{#key `movies:${selected.id}`}<MovieCreditsPanel movieId={selected.id} />{/key}{/if}
         <details><summary>Library settings</summary><form onsubmit={(event) => {event.preventDefault(); saveSettings();}}>
@@ -222,22 +281,31 @@
           {#if profilesLoading}<p role="status">Loading quality profiles…</p>{/if}
           {#if profilesError}<p role="alert" class="error">{profilesError}</p><button type="button" onclick={() => loadProfiles()}>Retry quality profiles</button>{/if}
           {#if profiles}<div class="actions"><button type="button" disabled={profilesLoading || profiles.offset === 0} onclick={() => loadProfiles(Math.max(0, profiles!.offset - 50))}>Previous profiles</button><button type="button" disabled={profilesLoading || profiles.offset + profiles.limit >= profiles.total} onclick={() => loadProfiles(profiles!.offset + profiles!.limit)}>Next profiles</button></div>{/if}
-          <button disabled={saving || profilesLoading}>Save settings</button></form></details>
+          <button disabled={libraryLocked || profilesLoading}>Save settings</button></form></details>
         {#if domain === 'movies'}
-          {#key selected.id}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+          {#if fileWrite==='idle'}
+            {#key `${selected.id}:${movieFileVersion.id===selected.id?movieFileVersion.version:0}`}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+          {:else}<p role="status">Filename previews are available after the file metadata write is reconciled.</p>{/if}
         {/if}
         {#if domain === 'tv'}
-          <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={saving} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
-          <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={saving} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
-          <div class="pagination"><button disabled={episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
+          <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={libraryLocked} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
+          <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={libraryLocked} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
+          <div class="pagination"><button disabled={libraryLocked || episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={libraryLocked || episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
         {:else if selected.statistics.file_count > 0}<p>This movie already has a file association. Initial import will not replace it.</p>{/if}
         {#if domain === 'movies'}<button onclick={() => searchTarget = {media_type:'movie',id:selected!.id}}>Search movie releases</button>{/if}
         {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} onsettings={openDelay} />{/key}{/if}
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
+      {#if fileTarget}<div hidden={view!=='library' || detailLoading || !selected || selected.id!==fileTarget.id || domain!==fileTarget.domain}>
+        <MediaFilesPanel target={fileTarget} active={view==='library' && !detailLoading && !!selected && selected.id===fileTarget.id && domain===fileTarget.domain}
+          relatedWrite={fileRelatedWrite} discardVersion={fileDiscardVersion} refreshVersion={fileRefresh.domain===fileTarget.domain && fileRefresh.id===fileTarget.id?fileRefresh.version:0} onwrite={state=>{if(state!=='idle')++importReadEpoch;fileWrite=state;}} ondirty={dirty=>fileDirty=dirty} onsaved={filesSaved} />
+      </div>{/if}
     </article>
   </div>
   </div>
-  {#if view === 'library'}<ImportPanel {target} label={targetLabel} oncomplete={refreshAfterImport} />{/if}
+  <div hidden={view!=='library'}>
+    {#if importRefreshError}<p role="alert">Import completed, but library refresh failed: {importRefreshError}</p><button disabled={libraryLocked || importRefreshing} onclick={()=>importRefreshError=''}>Retry library refresh</button>{/if}
+    <ImportPanel {target} label={targetLabel} owner={selected?{domain,id:selected.id}:null} active={view==='library'} relatedWrite={manualRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;manualWrite=state;}} oncomplete={refreshAfterImport} />
+  </div>
 </main>
 
 <style>

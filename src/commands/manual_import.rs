@@ -17,6 +17,17 @@ pub struct ManualImportBatchInput {
     pub operation_ids: Vec<Uuid>,
     pub priority: CommandPriority,
 }
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct ManualImportReconcileInput {
+    pub operation_ids: Vec<Uuid>,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ManualImportReconciliation {
+    pub operation_id: Uuid,
+    pub operation: Option<crate::api::Operation>,
+    pub active_command: Option<ManualImportCommand>,
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct ManualImportCommand {
     pub id: Uuid,
@@ -134,11 +145,55 @@ fn normalize(code: &str) -> &str {
 pub(super) fn router(db: Arc<Database>) -> Router {
     Router::new()
         .route("/api/v1/manual-import/commands", get(list).post(create))
+        .route("/api/v1/manual-import/commands/reconcile", post(reconcile))
         .route("/api/v1/manual-import/commands/{id}", get(detail))
         .route("/api/v1/manual-import/commands/{id}/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(8192))
         .layer(axum::middleware::from_fn(deadline))
         .with_state(db)
+}
+async fn reconcile(
+    State(db): State<Arc<Database>>,
+    q: std::result::Result<Query<Empty>, QueryRejection>,
+    input: std::result::Result<Json<ManualImportReconcileInput>, JsonRejection>,
+) -> Result<Json<Vec<ManualImportReconciliation>>> {
+    q.map_err(|_| bad())?;
+    let ids = input.map_err(|_| bad())?.0.operation_ids;
+    if ids.is_empty()
+        || ids.len() > BATCH_CAP
+        || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+    {
+        return Err(bad());
+    }
+    let c = connection(&db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::ReadOnly)
+        .await?;
+    let outcome = async {
+        let mut result = Vec::with_capacity(ids.len());
+        for operation_id in ids {
+            let key = operation_id.to_string();
+            // Missing operations are explicit; other canonical projection failures fail the
+            // whole snapshot rather than silently presenting partial reconciliation as complete.
+            let operation = match crate::import::status_in(&tx, &key).await {
+                Ok(operation) => Some(operation),
+                Err(error) if error.code() == "not_found" => None,
+                Err(_) => return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable")),
+            };
+            let active_command = if operation.is_some() {
+                // The partial unique index bounds this lookup independently of retained history.
+                // Read a second row defensively; corrupted uniqueness must not select an arbitrary owner.
+                let mut rows = tx.query(&format!("SELECT {COLUMNS} FROM manual_import_commands WHERE operation_id=? AND status IN ('queued','retry_wait','running') LIMIT 2"), [key]).await?;
+                let command = rows.next().await?.map(row).transpose()?;
+                if rows.next().await?.is_some() { return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable")); }
+                command
+            } else { None };
+            result.push(ManualImportReconciliation { operation_id, operation, active_command });
+        }
+        bounded(result)
+    }.await;
+    // This snapshot neither settles an earlier HTTP request nor reserves future admission.
+    finish(tx, outcome).await
 }
 async fn deadline(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     match tokio::time::timeout(std::time::Duration::from_secs(5), next.run(request)).await {
@@ -304,7 +359,7 @@ async fn cancel(
         if j.phase != "preview" || j.path_failure_code.is_some() || crate::import::operation_active(&current.operation_id.to_string()).map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable"))? {
             return Err(conflict());
         }
-        tx.execute("UPDATE manual_import_commands SET status='cancelled',completed_at=? WHERE id=? AND status IN ('queued','retry_wait')",params![now()?,id.to_string()]).await?;
+        tx.execute("UPDATE manual_import_commands SET status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status IN ('queued','retry_wait')",params![now()?,id.to_string()]).await?;
         bounded(read(&tx, id).await?)
     }
     .await;

@@ -320,6 +320,10 @@ export type ManualImportCommand = { id: string, batch_id: string, operation_id: 
 
 export type ManualImportCommandQuery = { batch_id?: string, status?: CommandStatus, limit?: number, offset?: number, };
 
+export type ManualImportReconcileInput = { operation_ids: Array<string>, };
+
+export type ManualImportReconciliation = { operation_id: string, operation: Operation | null, active_command: ManualImportCommand | null, };
+
 export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
 
 export type Mapping = { id: number, media_type: MediaDomain, host: string, remote_path: string, local_path: string, revision: number, };
