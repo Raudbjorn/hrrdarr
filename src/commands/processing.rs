@@ -337,7 +337,7 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
+    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
     let stored=c.query("SELECT provider_revision,revision,enabled,mode,enabled_override FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
     let master = crate::completed_download_handling::read(c, media)
@@ -823,7 +823,7 @@ async fn preflight(
     let c = connection(db).await?;
     let mode = authorization(&c, item).await?;
     let target = target(&item.target)?;
-    let observed = client
+    let observed = match client
         .inspect_download(
             &item.provider_id.to_string(),
             item.provider_revision,
@@ -831,16 +831,31 @@ async fn preflight(
             &item.remote_id,
         )
         .await
-        .map_err(|e| {
-            Error(
+    {
+        Ok(observed) => observed,
+        // Usenet output folders are listed locally, so an unmapped output blocks like an unmapped file.
+        Err(e) if e.code == "path_mapping_missing" => {
+            blocked(
+                &c,
+                item,
+                "path_mapping_missing",
+                vec!["path_mapping_missing".into()],
+                Some("hc021_mapping_missing"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Error(
                 StatusCode::CONFLICT,
                 match e.code {
                     "provider_changed" => "provider_changed",
                     "refresh_timeout" => "download_timeout",
                     _ => "download_unavailable",
                 },
-            )
-        })?;
+            ));
+        }
+    };
     let details = observed.details;
     if matches!(
         details.item.status,

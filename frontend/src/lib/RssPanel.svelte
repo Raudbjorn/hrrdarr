@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import {clientAttemptLabel,eligibleDownloadClient,indexerScope} from './provider-draft';
+  import {clientAttemptLabel,eligibleDownloadClient,indexerScope,isDownloadClient,isIndexer} from './provider-draft';
   import type { ApiPage, Provider, MediaDomain, RssTargetInput, RssCommand, RssCandidate, RssSchedule } from './api.generated';
   import { getProvider, listProviders, listRssCommands, createRssCommand, cancelRssCommand, listRssCandidates, listRssSchedules, saveRssSchedule } from './api';
   let domain:MediaDomain=$state('tv'), providers:ApiPage<Provider>|null=$state(null), indexer:Provider|null=$state(null), client:Provider|null=$state(null);
@@ -8,8 +8,8 @@
   let commands:ApiPage<RssCommand>|null=$state(null),candidates:ApiPage<RssCandidate>|null=$state(null),schedules:RssSchedule[]=$state([]),commandOffset=$state(0),candidateOffset=$state(0);
   let alive=true,version=0,timer:ReturnType<typeof setTimeout>|undefined;
   const boundClientId=$derived(indexerScope(indexer,domain)?.download_client_id);
-  const target:RssTargetInput|null=$derived.by(()=>indexer&&indexer.enabled&&indexerScope(indexer,domain)&&indexerScope(indexer,domain)?.enable_rss!==false&&(!clientId||eligibleDownloadClient(client,domain))?{media_type:domain,indexer_id:indexer.id,indexer_revision:indexer.revision,client_selection:clientId?{kind:'explicit',provider_id:client!.id,provider_revision:client!.revision}:{kind:'default'}}:null);
-  const eligible=(p:Provider,kind:'indexer'|'client')=>p.enabled&&p.settings[domain]!==null&&(kind==='client'?p.settings.implementation==='qbittorrent':p.settings.implementation!=='qbittorrent');
+  const target:RssTargetInput|null=$derived.by(()=>indexer&&indexer.enabled&&indexerScope(indexer,domain)&&indexerScope(indexer,domain)?.enable_rss!==false&&(!clientId||eligibleDownloadClient(client,domain,indexer))?{media_type:domain,indexer_id:indexer.id,indexer_revision:indexer.revision,client_selection:clientId?{kind:'explicit',provider_id:client!.id,provider_revision:client!.revision}:{kind:'default'}}:null);
+  const eligible=(p:Provider,kind:'indexer'|'client')=>p.enabled&&p.settings[domain]!==null&&(kind==='client'?isDownloadClient(p):isIndexer(p));
   const active=(c:RssCommand)=>['queued','running','retry_wait'].includes(c.status);
   function later(){clearTimeout(timer);if(alive&&!document.hidden)timer=setTimeout(()=>void read(),5000);}
   async function loadProviders(offset=0){
@@ -51,7 +51,7 @@
   <label>RSS media<select bind:value={domain} disabled={busy} onchange={scope}><option value="tv">TV</option><option value="movies">Movies</option></select></label>
   <form onsubmit={e=>{e.preventDefault();void mutate('run');}}>
     <label>RSS indexer<select bind:value={indexerId} disabled={busy||loadingProviders} onchange={chooseIndexer}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'indexer'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
-    <label>RSS download client<select bind:value={clientId} disabled={busy||loadingProviders} onchange={()=>client=providers?.items.find(p=>p.id===clientId)??null}><option value="">Default — choose for each matching release</option>{#if clientId&&!client}<option value={clientId}>Unavailable selected client {clientId}</option>{/if}{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'client'))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
+    <label>RSS download client<select bind:value={clientId} disabled={busy||loadingProviders} onchange={()=>client=providers?.items.find(p=>p.id===clientId)??null}><option value="">Default — choose for each matching release</option>{#if clientId&&!client}<option value={clientId}>Unavailable selected client {clientId}</option>{/if}{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain,indexer))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p,'client')&&eligibleDownloadClient(p,domain,indexer))??[] as p(p.id)}<option value={p.id}>{p.name} · revision {p.revision}</option>{/each}</select></label>
     {#if providers}<div class="actions"><button type="button" disabled={busy||loadingProviders||providers.offset===0} onclick={()=>loadProviders(Math.max(0,providers!.offset-25))}>Previous RSS providers</button><button type="button" disabled={busy||loadingProviders||providers.offset+providers.limit>=providers.total} onclick={()=>loadProviders(providers!.offset+providers!.limit)}>Next RSS providers</button><button type="button" disabled={busy||loadingProviders} onclick={()=>loadProviders(providers!.offset)}>Reload RSS providers</button></div>{/if}
     {#if boundClientId}<p>Default selection uses this indexer’s {domain} client preference: {boundClientId}. Selecting a client above overrides that preference.</p>{/if}
     {#if clientId&&!client}<p role="alert">The explicitly selected client is unavailable for {domain}. Reload providers or choose another client.</p>{/if}

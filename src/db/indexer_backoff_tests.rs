@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 8 } else { 8 } // Reasoning: eight migrations follow49 through57;54 through57 add no Health identities.
+                    expected.len() + if *table == "health_checks" { 8 } else { 9 } // Reasoning: nine migrations follow49 through58 (schema_migrations rows); 54 through58 add no Health identities, so Health keeps the eight it had at 57.
                 );
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.

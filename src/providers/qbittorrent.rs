@@ -105,6 +105,14 @@ pub enum DownloadDiagnostic {
     Metadata,
     DhtDisabled,
     UnknownState,
+    /// Usenet post-processing stages; the download itself has finished transferring.
+    Verifying,
+    Repairing,
+    Extracting,
+    Moving,
+    PostProcessing,
+    /// Unpacking stopped because the client reported a write error or full disk.
+    DiskFull,
 }
 #[derive(Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -468,7 +476,7 @@ fn scope(settings: &ProviderSettings, domain: MediaDomain) -> Result<&DownloadSc
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
+pub(crate) fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
     match target {
         MediaTarget::Episode(id) if *id > 0 => Ok(MediaDomain::Tv),
         MediaTarget::Movie(id) if *id > 0 => Ok(MediaDomain::Movies),
@@ -1540,7 +1548,7 @@ pub enum EndpointLocality {
     Loopback,
     Unknown,
 }
-fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
+pub(crate) fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
     let url = url::Url::parse(endpoint).map_err(|_| QbitError::InvalidRequest)?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -1556,7 +1564,7 @@ fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
         EndpointLocality::Unknown
     })
 }
-fn validate_remote_path(path: &str) -> Result<()> {
+pub(crate) fn validate_remote_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.len() > 4096
         || path.chars().any(char::is_control)
@@ -1589,7 +1597,7 @@ fn validate_remote_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
-fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
+pub(crate) fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
     validate_remote_path(default)?;
     let rooted = |p: &str| {
         p.starts_with('/') || p.starts_with("\\\\") || (p.len() >= 3 && p.as_bytes()[1] == b':')
@@ -2040,7 +2048,7 @@ pub enum AddOutcome {
         hashes: Vec<String>,
     },
 }
-fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
+pub(crate) fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
     ring::digest::digest(algorithm, data)
         .as_ref()
         .iter()
@@ -2429,6 +2437,27 @@ impl SubmissionIdentity {
     }
     pub fn payload_sha256(&self) -> &str {
         &self.payload_sha256
+    }
+    pub(crate) fn settings_fingerprint(&self) -> &str {
+        &self.settings_fingerprint
+    }
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+    /// Shared journal shape for client protocols whose identity is a caller-derived token.
+    pub(crate) fn tokenized(
+        target: MediaTarget,
+        token: String,
+        settings_fingerprint: String,
+        payload_sha256: String,
+    ) -> Self {
+        Self {
+            version: 1,
+            target,
+            hashes: vec![token],
+            settings_fingerprint,
+            payload_sha256,
+        }
     }
     fn validate(&self, settings: &ProviderSettings) -> Result<MediaDomain> {
         let domain = target_domain(&self.target)?;

@@ -156,7 +156,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        57
+        58 // Reasoning: latest adds 0058 download-client registry; the actual56 predecessor stays fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

@@ -244,6 +244,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "scan_media",
         include_str!("../../migrations/0057_scan_media.sql"),
     ),
+    (
+        "download_client_registry",
+        include_str!("../../migrations/0058_download_client_registry.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -893,5 +897,7 @@ mod indexer_backoff_tests;
 
 #[cfg(test)]
 mod download_client_backoff_tests;
+#[cfg(test)]
+mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;

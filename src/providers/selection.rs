@@ -1,4 +1,5 @@
-//! Default client selection uses scoped owner tags and volatile per-domain torrent cursors.
+//! Default client selection uses scoped owner tags and volatile per-domain cursors. Only clients
+//! sharing the indexer's release protocol are eligible; an explicit mismatch is rejected visibly.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -67,6 +68,13 @@ fn unavailable() -> Error {
         "No eligible download client is available",
     )
 }
+fn protocol_mismatch() -> Error {
+    Error::Plain(
+        StatusCode::CONFLICT,
+        "protocol_mismatch",
+        "The selected download client does not accept this release protocol",
+    )
+}
 fn domain(target: &crate::db::MediaTarget) -> (&'static str, usize, i64) {
     match target {
         crate::db::MediaTarget::Episode(id) => ("tv", 0, *id),
@@ -131,8 +139,9 @@ async fn eligible(
         return Err(corrupt());
     }
     let (media, _, target_id) = domain(target);
-    let source=c.query("SELECT p.implementation,s.download_client_id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.enabled=1 AND s.media_type=?",params![indexer.to_string(),media]).await?.next().await?.ok_or_else(unavailable)?;
-    if source.get::<String>(0)? != "torznab" {
+    let source=c.query("SELECT r.protocol,s.download_client_id FROM providers p JOIN provider_implementations r ON r.implementation=p.implementation JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.enabled=1 AND r.kind='indexer' AND s.media_type=?",params![indexer.to_string(),media]).await?.next().await?.ok_or_else(unavailable)?;
+    let protocol: String = source.get(0)?;
+    if !matches!(protocol.as_str(), "torrent" | "usenet") {
         return Err(Error::Plain(
             StatusCode::CONFLICT,
             "unsupported_target",
@@ -140,6 +149,14 @@ async fn eligible(
         ));
     }
     let binding: Option<String> = source.get(1)?;
+    // A stored binding predating protocol validation cannot silently select nothing.
+    if let Some(bound) = &binding {
+        if let Some(row) = c.query("SELECT r.protocol FROM providers p JOIN provider_implementations r ON r.implementation=p.implementation WHERE p.id=? AND r.kind='download_client'",[bound.clone()]).await?.next().await? {
+            if row.get::<String>(0)? != protocol {
+                return Err(protocol_mismatch());
+            }
+        }
+    }
     let owner = match target {
         crate::db::MediaTarget::Episode(_) => c
             .query("SELECT series_id FROM episodes WHERE id=?", [target_id])
@@ -161,7 +178,10 @@ async fn eligible(
         provider_revision,
     } = intent
     {
-        let row = c.query("SELECT p.id,p.revision,p.priority FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?",params![provider_id.to_string(),provider_revision,media]).await?.next().await?.ok_or_else(unavailable)?;
+        let row = c.query("SELECT p.id,p.revision,p.priority,r.protocol FROM providers p JOIN provider_implementations r ON r.implementation=p.implementation JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND r.kind='download_client' AND s.media_type=?",params![provider_id.to_string(),provider_revision,media]).await?.next().await?.ok_or_else(unavailable)?;
+        if row.get::<String>(3)? != protocol {
+            return Err(protocol_mismatch());
+        }
         return Ok(vec![Eligible {
             client: ClientRef {
                 client_id: row.get(0)?,
@@ -178,7 +198,7 @@ async fn eligible(
     } else {
         ("movie_tags", "movie_id")
     };
-    let mut rows=c.query(&format!("SELECT p.id,p.revision,p.priority,EXISTS(SELECT 1 FROM download_client_tags t WHERE t.provider_id=p.id AND t.media_type=s.media_type),EXISTS(SELECT 1 FROM download_client_tags t JOIN {table} o ON o.tag_id=t.tag_id WHERE t.provider_id=p.id AND t.media_type=s.media_type AND o.{column}=?),COALESCE(b.disabled_until>?,0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id LEFT JOIN download_client_status b ON b.provider_id=p.id AND b.media_type=s.media_type AND b.config_revision=p.revision WHERE p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=? ORDER BY p.id LIMIT 129"),params![owner,now,media]).await?;
+    let mut rows=c.query(&format!("SELECT p.id,p.revision,p.priority,EXISTS(SELECT 1 FROM download_client_tags t WHERE t.provider_id=p.id AND t.media_type=s.media_type),EXISTS(SELECT 1 FROM download_client_tags t JOIN {table} o ON o.tag_id=t.tag_id WHERE t.provider_id=p.id AND t.media_type=s.media_type AND o.{column}=?),COALESCE(b.disabled_until>?,0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id LEFT JOIN download_client_status b ON b.provider_id=p.id AND b.media_type=s.media_type AND b.config_revision=p.revision WHERE p.enabled=1 AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client' AND protocol=?) AND s.media_type=? ORDER BY p.id LIMIT 129"),params![owner,now,protocol.clone(),media]).await?;
     let mut clients = Vec::new();
     while let Some(row) = rows.next().await? {
         clients.push(Eligible {

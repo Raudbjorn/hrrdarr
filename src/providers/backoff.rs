@@ -85,7 +85,7 @@ pub(crate) async fn apply(
         MediaDomain::Tv => "tv",
         MediaDomain::Movies => "movies",
     };
-    if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id,revision,media]).await?.next().await?.is_none() { return Err(conflict()); }
+    if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?",params![id,revision,media]).await?.next().await?.is_none() { return Err(conflict()); }
     let previous = c.query("SELECT escalation_level,initial_failure_at,last_failure_at,disabled_until FROM download_client_status WHERE provider_id=? AND media_type=? AND config_revision=?",params![id,media,revision]).await?.next().await?
         .map(|row| -> Result<Status> { Ok(Status {level:row.get(0)?,initial:row.get(1)?,last:row.get(2)?,until:row.get(3)?}) }).transpose()?.unwrap_or_default();
     let Ok(updated) = transition(previous, observation, timestamp, grace_elapsed) else {
@@ -115,7 +115,7 @@ pub(super) async fn reconcile(c: &Connection, id: &str) -> Result<()> {
     if c.is_autocommit() {
         return Err(corrupt());
     }
-    c.execute("DELETE FROM download_client_status WHERE provider_id=? AND NOT EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=download_client_status.provider_id AND s.media_type=download_client_status.media_type AND s.implementation='qbittorrent')",[id]).await?;
+    c.execute("DELETE FROM download_client_status WHERE provider_id=? AND NOT EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=download_client_status.provider_id AND s.media_type=download_client_status.media_type AND s.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client'))",[id]).await?;
     c.execute("UPDATE download_client_status SET config_revision=(SELECT revision FROM providers WHERE id=?) WHERE provider_id=?",params![id,id]).await?;
     Ok(())
 }

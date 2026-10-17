@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -177,6 +177,11 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         } else {
             actual
         };
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // map only that predicate back to the 41-era qBittorrent literal.
+        let actual = actual
+            .replace("p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)", "p.implementation='qbittorrent'")
+            .replace("p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')", "p.implementation='qbittorrent'");
         // 0054 adds exactly one scan-parent capacity contribution to each old guard.
         assert_eq!(actual.matches(scan_added).count(), 1);
         assert_eq!(actual.replace(added, "").replace(scan_added, ""), *sql);
@@ -212,7 +217,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -644,7 +649,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -729,7 +734,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 22); // Reasoning:0053 adds two path diagnostics identities (20 -> 22).

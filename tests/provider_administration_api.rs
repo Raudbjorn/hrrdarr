@@ -195,7 +195,8 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             .await;
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
-            assert_eq!(templates.len(), if kind == "indexer" { 2 } else { 1 });
+            // Reasoning: dlc.014 adds the SABnzbd usenet client template beside qBittorrent.
+            assert_eq!(templates.len(), 2);
             assert_eq!(
                 templates
                     .iter()
@@ -204,7 +205,7 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                 if kind == "indexer" {
                     vec!["newznab", "torznab"]
                 } else {
-                    vec!["qbittorrent"]
+                    vec!["qbittorrent", "sabnzbd"]
                 }
             );
             for t in templates {
@@ -214,6 +215,13 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                     assert_eq!(t["defaults"]["tv"]["categories"], json!([]));
                     assert_eq!(t["defaults"]["tv"]["anime_standard_format_search"], false);
                     assert_eq!(t["defaults"]["movies"]["remove_year"], false);
+                } else if t["implementation"] == "sabnzbd" {
+                    // Usenet defaults: category default priority for both windows, no tags.
+                    assert_eq!(t["defaults"]["kind"], "usenet_client");
+                    assert_eq!(t["defaults"]["recent_priority"], "default");
+                    assert_eq!(t["defaults"]["older_priority"], "default");
+                    assert_eq!(t["defaults"]["tags"], json!([]));
+                    assert!(t["defaults"].get("category").is_none());
                 } else {
                     assert_eq!(t["defaults"]["initial_state"], "started");
                     assert_eq!(t["defaults"]["content_layout"], "default");

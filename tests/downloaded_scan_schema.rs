@@ -200,7 +200,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        57 // Latest includes 0057; the predecessor prefix remains fixed.
+        58 // Latest includes 0058; the predecessor prefix remains fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -296,6 +296,22 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .into_iter()
             .filter(|(name, _)| !matches!(name.as_str(), "series" | "snapshot_imports")),
     ) {
+        // Reasoning: 0058 rebuilds the provider tables and their shape/options/test-owner
+        // guards (covered by db::download_client_registry_tests); skip only those objects.
+        if matches!(
+            name.as_str(),
+            "providers"
+                | "provider_scopes"
+                | "cdh_scope_authority"
+                | "provider_client_options_insert"
+                | "provider_client_options_update"
+                | "provider_scope_options_insert"
+                | "provider_scope_options_update"
+                | "provider_test_insert_owner"
+                | "provider_test_update_owner"
+        ) {
+            continue;
+        }
         let actual: String = after
             .query("SELECT sql FROM sqlite_schema WHERE name=?", [name.clone()])
             .await?
@@ -303,6 +319,17 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .await?
             .ok_or("missing preserved object")?
             .get(0)?;
+        // Reasoning: 0058 otherwise changes only the client predicate, now resolved through the
+        // provider_implementations registry (protocol-matched for RSS/search); map it back.
+        let actual = actual
+            .replace(
+                "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)",
+                "p.implementation='qbittorrent'",
+            )
+            .replace(
+                " IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')",
+                "='qbittorrent'",
+            );
         assert_eq!(
             actual, expected,
             "SQL changed outside allocated predicate: {name}"

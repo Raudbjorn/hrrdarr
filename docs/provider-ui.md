@@ -1,7 +1,7 @@
 # Provider setup UI
 
 The Providers workspace uses native `/api/v1/providers` contracts and generated
-Rust-to-TypeScript DTOs for Torznab, Newznab and qBittorrent. It provides a paged
+Rust-to-TypeScript DTOs for Torznab, Newznab, qBittorrent and SABnzbd. It provides a paged
 list, create/edit, explicit configuration deletion and saved connection tests.
 Each provider may serve TV, movies or both; tests cover all saved scopes.
 Implementation cannot change during an edit. Saving alone does not contact a
@@ -13,7 +13,7 @@ object, including indexer search flags and qBittorrent imported categories,
 priorities, initial state, content layout, sequential/first-last options and tags.
 The form edits categories, per-domain RSS/automatic/interactive search switches,
 each indexer scope’s download-client preference, and qBittorrent eligibility tags for each domain. Eligibility tags come from the local tag catalog and are separate from tags added to remote torrents. Other options are preserved.
-Client choices include enabled qBittorrent clients supporting that domain; use the
+Client choices include enabled download clients supporting that domain and the indexer's protocol (Torznab with qBittorrent, Newznab with SABnzbd); SABnzbd scopes add a category plus recent/older priority, and its test result shows version and warnings; use the
 provider-list pages to browse choices. An existing binding outside the current page
 or no longer available remains visible by ID and is preserved until explicitly
 changed or cleared. Disabling a scope removes its settings when saved. Backend validation

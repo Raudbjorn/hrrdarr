@@ -1,6 +1,6 @@
 # Durable download refresh
 
-`refresh_downloads` is the first executable durable command. Its target is an explicit provider UUID and `tv` or `movies`, plus the expected provider revision. It reads the configured active qBittorrent category. It does not submit, remove, import or associate downloads. Identical hashes or titles in different categories remain separate, explicitly unassociated observations.
+`refresh_downloads` is the first executable durable command. Its target is an explicit provider UUID and `tv` or `movies`, plus the expected provider revision. It reads the configured active qBittorrent category, or the SABnzbd category's queue and recent history ([sabnzbd-protocol.md](sabnzbd-protocol.md)). It does not submit, remove, import or associate downloads. Identical hashes or titles in different categories remain separate, explicitly unassociated observations.
 
 ## API
 

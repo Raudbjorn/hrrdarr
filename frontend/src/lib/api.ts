@@ -359,7 +359,7 @@ export async function readDownloadHandling(providerId?: string): Promise<Result<
     if(!saved.ok && saved.status!==404)return saved;
     if(saved.ok){
       provider=saved.data;
-      if(provider.settings.implementation==='qbittorrent')for(const media of ['tv','movies'] as const){
+      if(provider.settings.implementation==='qbittorrent'||provider.settings.implementation==='sabnzbd')for(const media of ['tv','movies'] as const){
         if(!provider.settings[media])continue;
         const policy=await getProcessingPolicy(providerId,media);
         if(!policy.ok)return policy;
