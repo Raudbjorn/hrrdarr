@@ -1756,7 +1756,7 @@ fn scan_runtime(members: &[ScanMember], series_runtime: Option<i64>) -> super::R
     // This is expected-runtime policy, not an observed metadata value; fallback is once per file.
     Ok(Some(if total == 0 { 45 } else { total }))
 }
-fn scan_extension_supported(extension: &str, tv: bool) -> bool {
+pub(crate) fn scan_extension_supported(extension: &str, tv: bool) -> bool {
     match extension.to_ascii_lowercase().as_str() {
         "webm" | "m4v" | "3gp" | "nsv" | "ty" | "strm" | "rm" | "rmvb" | "m3u" | "ifo" | "mov"
         | "qt" | "divx" | "xvid" | "bivx" | "nrg" | "pva" | "wmv" | "asf" | "asx" | "ogm"

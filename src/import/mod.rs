@@ -76,6 +76,18 @@ impl Error {
         self.code
     }
 
+    /// Closed, path-free classification of a measured filesystem failure for callers outside
+    /// this module (the downloaded-scan producer). `None` means no filesystem cause was measured.
+    pub(crate) fn path_class(&self) -> Option<&'static str> {
+        self.path_kind.map(|kind| match kind {
+            PathKind::Missing => "missing",
+            PathKind::Denied => "denied",
+            PathKind::Changed => "changed",
+            PathKind::Invalid => "invalid",
+            PathKind::Io => "io",
+        })
+    }
+
     pub(crate) fn started_attempt(&self) -> bool {
         self.started_attempt
     }

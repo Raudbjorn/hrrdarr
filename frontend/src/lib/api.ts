@@ -1,5 +1,6 @@
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
+import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTargetInput, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, MovieCredit, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -112,6 +113,49 @@ export const reconcileManualImports = (operationIds: string[]) => validManualImp
 
 export const listProviders = (offset = 0) => request<ApiPage<Provider>>(`/api/v1/providers?limit=25&offset=${offset}`, undefined, undefined, true);
 export const getProviderSchema = (media: MediaDomain, kind: ProviderKind) => request<ProviderSchema>(`/api/v1/providers/schema?${new URLSearchParams({media_type: media, kind})}`, undefined, undefined, true);
+// Downloaded-folder scan (phase A discovery): one POST authorizes bounded discovery of exactly one
+// named file or folder. Nothing here retries; a lost response is reconciled by GET with the SAME id.
+const scanId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
+const scanPath = (path: unknown): path is string => typeof path === 'string'
+  && path.startsWith('/') && path !== '/' && !path.endsWith('/') && !path.includes('\0')
+  && new TextEncoder().encode(path).length <= 4096
+  && path.slice(1).split('/').every(part => part !== '' && part !== '.' && part !== '..');
+const scanRemote = (remote: unknown): remote is string => typeof remote === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(remote);
+const scanDomain = (domain: unknown): domain is MediaDomain => domain === 'tv' || domain === 'movies';
+const scanRoot = (domain: MediaDomain) => `/api/v1/${domain}/downloaded-scan-commands`;
+const scanError = <T>(error: string) => Promise.resolve<Result<T>>({ ok: false, error });
+const scanPage = (query: { limit?: number; offset?: number } | undefined, extra: Record<string, string | undefined>) => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(extra)) if (value !== undefined) params.set(key, value);
+  if (query?.limit !== undefined) params.set('limit', String(query.limit));
+  if (query?.offset !== undefined) params.set('offset', String(query.offset));
+  const text = params.toString();
+  return text ? `?${text}` : '';
+};
+const validScanPage = (query: { limit?: number; offset?: number } | undefined) => !query
+  || ((query.limit === undefined || (Number.isInteger(query.limit) && query.limit >= 1 && query.limit <= 100))
+    && (query.offset === undefined || (Number.isInteger(query.offset) && query.offset >= 0 && query.offset <= 100_000)));
+export const createDownloadedScanCommand = (domain: MediaDomain, input: DownloadedScanInput) => {
+  if (!scanDomain(domain)) return scanError<DownloadedScanCommand>('Choose TV or movies.');
+  if (!scanId(input.id)) return scanError<DownloadedScanCommand>('Invalid command ID.');
+  if (!scanPath(input.path)) return scanError<DownloadedScanCommand>('Enter an absolute, normalized file or folder path of at most 4096 bytes.');
+  if (!['auto', 'move', 'copy'].includes(input.mode) || !['normal', 'high'].includes(input.priority)) return scanError<DownloadedScanCommand>('Choose a valid mode and priority.');
+  if (input.tracked !== undefined && (!scanId(input.tracked.provider_id) || !scanRemote(input.tracked.remote_id))) return scanError<DownloadedScanCommand>('Tracked downloads need a provider ID and a lowercase 40- or 64-character hash.');
+  return request<DownloadedScanCommand>(scanRoot(domain), input, 'POST', true);
+};
+export const listDownloadedScanCommands = (domain: MediaDomain, query?: DownloadedScanQuery) => scanDomain(domain) && validScanPage(query)
+  ? request<ApiPage<DownloadedScanCommand>>(`${scanRoot(domain)}${scanPage(query, { status: query?.status })}`, undefined, undefined, true)
+  : scanError<ApiPage<DownloadedScanCommand>>('Invalid scan list request.');
+export const getDownloadedScanCommand = (domain: MediaDomain, id: string) => scanDomain(domain) && scanId(id)
+  ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}`, undefined, undefined, true)
+  : scanError<DownloadedScanCommand>('Invalid command ID.');
+export const listDownloadedScanChildren = (domain: MediaDomain, id: string, query?: DownloadedScanChildQuery) => scanDomain(domain) && scanId(id) && validScanPage(query)
+  ? request<ApiPage<ScanChild>>(`${scanRoot(domain)}/${id}/children${scanPage(query, { disposition: query?.disposition })}`, undefined, undefined, true)
+  : scanError<ApiPage<ScanChild>>('Invalid scan children request.');
+export const cancelDownloadedScanCommand = (domain: MediaDomain, id: string) => scanDomain(domain) && scanId(id)
+  ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}/cancel`, undefined, 'POST', true)
+  : scanError<DownloadedScanCommand>('Invalid command ID.');
+
 const invalidProvider = <T>(): Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid provider ID or revision.'});
 export const getProvider = (id: string) => validOperation(id) ? request<Provider>(`/api/v1/providers/${id}`, undefined, undefined, true) : invalidProvider<Provider>();
 export const createProvider = (input: ProviderInput) => request<Provider>('/api/v1/providers', input, 'POST', true);

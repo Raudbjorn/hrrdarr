@@ -146,6 +146,14 @@ export type DownloadScope = { category: string, imported_category: string | null
 
 export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "warning" | "stalled" | "unknown";
 
+export type DownloadedScanChildQuery = { disposition?: ScanDisposition, limit?: number, offset?: number, };
+
+export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, };
+
+export type DownloadedScanInput = { id: string, path: string, mode: ScanMode, priority: CommandPriority, tracked?: ScanTracked, };
+
+export type DownloadedScanQuery = { status?: CommandStatus, limit?: number, offset?: number, };
+
 export type Episode = { id: number, series_id: number, season: number, number: number, title: string, monitored: boolean, episode_file_id: number | null, has_file: boolean, file_path: string | null, tvdb_id: number | null, air_date: string | null, air_date_utc: string | null, last_search_time: string | null, runtime: number | null, finale_type: string | null, overview: string | null, absolute_episode_number: number | null, scene_absolute_episode_number: number | null, scene_episode_number: number | null, scene_season_number: number | null, unverified_scene_numbering: boolean | null, series?: EpisodeSeriesProjection, episode_file?: EpisodeFileProjection, images?: Array<EpisodeCover> | null, };
 
 export type EpisodeCover = { coverType: EpisodeCoverType, url?: string | null, remoteUrl?: string | null, };
@@ -631,6 +639,30 @@ export type RssScheduleInput = { revision?: number, target: RssTargetInput, inte
 export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, selection_kind: SelectionKind, client_id: string | null, client_revision: number | null, };
 
 export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, };
+
+export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, };
+
+export type ScanCounts = { entries: number, ready: number, importing: number, imported: number, already_imported: number, rejected: number, failed: number, cancelled: number, };
+
+export type ScanDisposition = "ready" | "importing" | "imported" | "already_imported" | "rejected" | "failed" | "cancelled";
+
+export type ScanEntryKind = "file" | "directory" | "symlink" | "other";
+
+export type ScanMode = "auto" | "move" | "copy";
+
+export type ScanObservationState = "measured" | "unavailable";
+
+export type ScanOutcome = "success" | "unsuccessful";
+
+export type ScanPhase = "queued" | "inventory" | "awaiting_import" | "settled";
+
+export type ScanResolvedMode = "copy" | "move";
+
+export type ScanSource = "found" | "missing";
+
+export type ScanTracked = { provider_id: string, remote_id: string, };
+
+export type ScanTracking = "untracked" | "pending" | "unknown_fallback";
 
 export type Score = { format_ids: Array<number>, score: number, };
 
