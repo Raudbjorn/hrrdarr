@@ -657,20 +657,24 @@ struct Movie {
     premier: Option<String>,
     original_language: Option<String>,
     alternative_titles: Option<Vec<AlternativeTitle>>,
-    credits: Option<Vec<WireCredit>>,
+    credits: Option<WireCredits>,
 }
-// Fixture-defined contract: the live service shape is not verified by this crate's tests.
+// A supplied set must contain both groups so partial payloads cannot silently erase credits.
+#[derive(Deserialize)]
+struct WireCredits {
+    cast: Vec<WireCredit>,
+    crew: Vec<WireCredit>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireCredit {
     name: String,
-    person_tmdb_id: i64,
+    tmdb_id: i64,
     credit_id: String,
     department: Option<String>,
     job: Option<String>,
     character: Option<String>,
     order: Option<i64>,
-    r#type: String,
     images: Option<Vec<WireCreditImage>>,
 }
 #[derive(Deserialize)]
@@ -742,38 +746,51 @@ impl Movie {
         let credits = self
             .credits
             .map(|credits| {
-                if credits.len() > MAX_CREDITS {
+                if credits.cast.len().saturating_add(credits.crew.len()) > MAX_CREDITS {
                     return Err(MetadataError::InvalidResponse);
                 }
-                credits
+                Ok(credits
+                    .cast
                     .into_iter()
-                    .map(|credit| {
-                        let kind = match credit.r#type.as_str() {
-                            "cast" => CreditKind::Cast,
-                            "crew" => CreditKind::Crew,
-                            _ => return Err(MetadataError::InvalidResponse),
-                        };
-                        Ok(CreditDetails {
-                            credit_tmdb_id: credit.credit_id,
-                            person_tmdb_id: credit.person_tmdb_id,
-                            person_name: credit.name,
-                            department: credit.department,
-                            job: credit.job,
-                            character: credit.character,
-                            order: credit.order.unwrap_or(0),
-                            kind,
-                            images: credit
-                                .images
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|image| CreditImage {
-                                    cover_type: image.cover_type,
-                                    url: image.url,
-                                })
-                                .collect(),
-                        })
+                    .map(|credit| (CreditKind::Cast, credit))
+                    .chain(
+                        credits
+                            .crew
+                            .into_iter()
+                            .map(|credit| (CreditKind::Crew, credit)),
+                    )
+                    .map(|(kind, credit)| CreditDetails {
+                        credit_tmdb_id: credit.credit_id,
+                        person_tmdb_id: credit.tmdb_id,
+                        person_name: credit.name,
+                        department: if kind == CreditKind::Crew {
+                            credit.department
+                        } else {
+                            None
+                        },
+                        job: if kind == CreditKind::Crew {
+                            credit.job
+                        } else {
+                            None
+                        },
+                        character: if kind == CreditKind::Cast {
+                            credit.character
+                        } else {
+                            None
+                        },
+                        order: credit.order.unwrap_or(0),
+                        kind,
+                        images: credit
+                            .images
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|image| CreditImage {
+                                cover_type: image.cover_type,
+                                url: image.url,
+                            })
+                            .collect(),
                     })
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<Vec<_>>())
             })
             .transpose()?;
         let in_cinemas = timestamp(self.in_cinema)?;

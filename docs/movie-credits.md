@@ -1,6 +1,6 @@
 # Movie credits (ledger api.037, slice 5, movie-only)
 
-Native, read-only credits for movie catalog metadata. This is a minimal vertical slice; it does not claim Radarr V3 wire compatibility, and the ledger row stays below Verified.
+Native, read-only credits for movie catalog metadata with a movie-detail cast and crew panel. This does not claim Radarr V3 wire compatibility, and the ledger row stays below Verified.
 
 ## Storage
 
@@ -21,7 +21,9 @@ Credits are written only inside the existing metadata add/refresh transaction (`
 - A failed or invalid provider response is rejected before any transaction opens, so existing credits stay. A storage failure rolls back with the rest of the transaction.
 - Adding a movie onto catalog metadata that already holds different credits is a conflict, as for the other catalog facts.
 
-Provider wire shape (fixture-defined, not verified against a live service): `credits: [{creditId, personTmdbId, name, type: "cast"|"crew", order, department, job, character, images: [{coverType, url}]}]`.
+Provider wire shape follows the pinned Radarr SkyHook resource contract: `credits: {cast: [{creditId, tmdbId, name, order, character, images: [{coverType, url}]}], crew: [{creditId, tmdbId, name, order, department, job, images: [{coverType, url}]}]}`. Source inspection establishes the payload contract; it does not verify a live service. Both groups normalize into the existing `CreditDetails` records before validation and the atomic refresh transaction.
+
+An omitted or null `credits` object preserves stored credits. A supplied object must contain both arrays; `{cast: [], crew: []}` explicitly clears the set. Missing or malformed groups reject the whole metadata response rather than erasing the omitted group.
 
 ## API
 
@@ -40,6 +42,18 @@ Ordering is `metadata_id, type (cast first), order, id`. Errors use the shared e
 
 Image URLs pass through only if they are https, have a DNS host name containing a dot (no IP literals, `localhost` or single-label hosts), and carry no credentials, port or fragment. They are remote provider references that the server never fetches. Cover type is one of `poster, banner, fanart, screenshot, headshot, clearlogo`.
 
-**No local cover mapping is implemented.** api.019 MediaCovers is Blocked, so there is no cached local URL.
+**No local cover mapping is implemented.** Local artwork caching remains unfinished; the UI uses remote references.
 
-Not covered: a live TMDB or Radarr service, the real provider payload shape, importing a Radarr `Credits` table from a snapshot, a scheduled credits refresh (credits update only when a metadata refresh runs), and any frontend.
+## Library UI
+
+Open a movie in Library to view its stored cast and crew. Each provider credit remains a separate card: namesakes, multiple characters, and multiple crew jobs are not combined by name or person ID. Cast cards show characters; crew cards show jobs and departments. Names link to numeric TMDb person pages. Missing or failed headshots retain readable names and roles.
+
+The panel reads `GET /api/v1/movies/credits?movie_id=ID&limit=500`, using generated `MovieCredit` and `ApiPage` types. The metadata contract permits at most 500 credits per movie. The panel requests the complete bounded collection, including records beyond the API's default 100, and reports an error rather than presenting an incomplete page as complete. Loading, empty, error, and retry states are visible. Movie changes and navigation unmount the panel; late responses cannot replace another movie's credits or appear in TV details.
+
+**Reload movie credits** only reads stored data. To fetch new catalogue facts, use the existing **Refresh metadata** workflow, wait for its successful command outcome, then choose **Reload library details**. That reload also refreshes the credits panel. Viewing, retrying, and reloading credits do not enqueue commands or change library settings, tags, monitoring, or files.
+
+Headshots use remote HTTPS provider references with no referrer sent; they are not downloaded into local cover storage. Metadata ingestion validates those references. Browser image failures show a fallback, and all credit names and roles render as text.
+
+`frontend/tests/movie-credits.test.mjs` checks the bounded read request, preservation of distinct records, safe movie IDs, native API failures, and malformed transport data. `frontend/tests/movie-credits-browser.mjs` exercises component lifecycle, layout, image fallback, and metadata-refresh integration against the isolated API fixture. Explicit response interception covers read failures, incomplete pages and late responses; retry uses the real endpoint.
+
+This native workflow does not establish Radarr V3 wire compatibility or live-provider equivalence. Person-based import-list controls, local artwork caching, and snapshot credit import remain separate parity work. No dependency, migration, or additional refresh command is introduced by the UI.

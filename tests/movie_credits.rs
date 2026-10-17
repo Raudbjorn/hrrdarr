@@ -58,7 +58,7 @@ async fn dump(c: &libsql::Connection, sql: &str) -> String {
     out
 }
 fn credit(id: &str, person: i64, name: &str, kind: &str, order: i64) -> Value {
-    json!({"creditId":id,"personTmdbId":person,"name":name,"type":kind,"order":order,
+    json!({"creditId":id,"tmdbId":person,"name":name,"order":order,
         "character": if kind=="cast" {json!("Role")} else {Value::Null},
         "department": if kind=="crew" {json!("Directing")} else {Value::Null},
         "job": if kind=="crew" {json!("Director")} else {Value::Null},
@@ -285,11 +285,10 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
 
 #[tokio::test]
 async fn add_persists_credits_and_native_read_routes_filter_page_and_404() -> Result<(), Error> {
-    let credits = json!([
-        credit("crew1", 11, "Dir", "crew", 0),
-        credit("cast2", 12, "Second", "cast", 1),
-        credit("cast1", 13, "First", "cast", 0),
-    ]);
+    let credits = json!({
+        "cast": [credit("cast2", 12, "Second", "cast", 1), credit("cast1", 13, "First", "cast", 0)],
+        "crew": [credit("crew1", 11, "Dir", "crew", 0)],
+    });
     let h = harness(movie(credits)).await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
@@ -396,12 +395,57 @@ async fn add_persists_credits_and_native_read_routes_filter_page_and_404() -> Re
 }
 
 #[tokio::test]
+async fn grouped_credits_preserve_namesakes_roles_defaults_and_combined_limit() -> Result<(), Error>
+{
+    let mut cast: Vec<Value> = (0..498)
+        .map(|i| credit(&format!("cast{i}"), i + 1, "Same Name", "cast", i))
+        .collect();
+    // Identity is the credit ID: one person can have multiple roles, and names are not unique.
+    cast[1]["tmdbId"] = json!(1);
+    cast[1]["character"] = json!("Other Role");
+    cast[0] = json!({"creditId":"cast0","tmdbId":1,"name":"Same Name"});
+    let h = harness(movie(json!({
+        "cast": cast,
+        "crew": [credit("crew0", 1, "Same Name", "crew", 0), credit("crew1", 499, "Same Name", "crew", 1)]
+    }))).await?;
+    assert_eq!(h.add().await, 201);
+    let (status, page) = h.get("/api/v1/movies/credits?movie_id=1&limit=500").await;
+    assert_eq!(status, 200);
+    assert_eq!(page["total"], 500);
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 500);
+    assert_eq!(
+        items.iter().filter(|item| item["type"] == "cast").count(),
+        498
+    );
+    assert_eq!(
+        items.iter().filter(|item| item["type"] == "crew").count(),
+        2
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["person_tmdb_id"] == 1)
+            .count(),
+        3
+    );
+    assert!(items.iter().all(|item| item["person_name"] == "Same Name"));
+    assert_eq!(items[0]["credit_tmdb_id"], "cast0");
+    assert_eq!(items[0]["order"], 0);
+    assert_eq!(items[0]["images"], json!([]));
+    assert!(items[0]["character"].is_null());
+    assert_eq!(items[1]["character"], "Other Role");
+    assert_eq!(items[498]["job"], "Director");
+    Ok(())
+}
+
+#[tokio::test]
 async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_ids()
 -> Result<(), Error> {
-    let h = harness(movie(json!([
-        credit("keep", 1, "Keep", "cast", 0),
-        credit("drop", 2, "Drop", "crew", 0)
-    ])))
+    let h = harness(movie(json!({
+        "cast": [credit("keep", 1, "Keep", "cast", 0)],
+        "crew": [credit("drop", 2, "Drop", "crew", 0)]
+    })))
     .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
@@ -426,10 +470,10 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
     // Changed set: update one, drop one, add one.
     h.set(
         200,
-        movie(json!([
+        movie(json!({"cast": [
             credit("keep", 1, "Keep Renamed", "cast", 3),
             credit("new", 3, "New", "cast", 1)
-        ])),
+        ], "crew": []})),
     );
     assert_eq!(h.refresh().await, Ok(1));
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
@@ -447,14 +491,17 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
         before_state,
         "refresh must not touch user settings, files or tags"
     );
-    // Absent credits preserve; an explicit empty array clears.
+    // Absent/null credits preserve; two explicitly empty groups clear.
     h.set(
         200,
         json!({"tmdbId":101,"title":"Film","year":2020,"imdbId":"tt1234567","runtime":120}),
     );
     h.refresh().await.unwrap();
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
-    h.set(200, movie(json!([])));
+    h.set(200, movie(Value::Null));
+    h.refresh().await.unwrap();
+    assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
+    h.set(200, movie(json!({"cast": [], "crew": []})));
     assert_eq!(h.refresh().await, Ok(1));
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(user_state().await, before_state);
@@ -464,48 +511,66 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
 #[tokio::test]
 async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits_intact()
 -> Result<(), Error> {
-    let h = harness(movie(json!([
-        credit("a", 1, "A", "cast", 0),
-        credit("b", 2, "B", "crew", 0)
-    ])))
+    let h = harness(movie(json!({
+        "cast": [credit("a", 1, "A", "cast", 0)],
+        "crew": [credit("b", 2, "B", "crew", 0)]
+    })))
     .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
     let before = dump(&c, "SELECT * FROM movie_credits ORDER BY id").await;
+    let metadata_before = dump(&c, "SELECT * FROM movie_metadata ORDER BY id").await;
     // Upstream failure.
     h.set(500, json!({}));
     assert!(h.refresh().await.is_err());
     h.set(404, json!({}));
     assert!(h.refresh().await.is_err());
     // Invalid payloads are rejected as a whole before any transaction opens.
-    let many: Vec<Value> = (0..501)
+    let many: Vec<Value> = (0..500)
         .map(|i| credit(&format!("m{i}"), 1, "N", "cast", i))
         .collect();
+    let cast = |credit: Value| json!({"cast": [credit], "crew": []});
     let mut bad_cases: Vec<(&str, Value)> = vec![
-        ("type", json!([credit("z", 1, "N", "guest", 0)])),
+        ("obsolete array shape", json!([])),
+        ("missing groups", json!({})),
+        ("missing cast", json!({"crew": []})),
+        ("missing crew", json!({"cast": []})),
+        ("null group", json!({"cast": null, "crew": []})),
+        ("wrong group type", json!({"cast": [], "crew": {}})),
         (
-            "duplicate",
-            json!([
-                credit("z", 1, "N", "cast", 0),
-                credit("z", 2, "N", "cast", 1)
-            ]),
+            "obsolete person field",
+            cast(json!({"creditId":"z","personTmdbId":1,"name":"N"})),
         ),
-        ("count", json!(many)),
-        ("person", json!([credit("z", 0, "N", "cast", 0)])),
-        ("order", json!([credit("z", 1, "N", "cast", -1)])),
-        ("name", json!([credit("z", 1, "  ", "cast", 0)])),
-        ("id charset", json!([credit("z/../", 1, "N", "cast", 0)])),
+        (
+            "duplicate across groups",
+            json!({
+                "cast": [credit("z", 1, "N", "cast", 0)],
+                "crew": [credit("z", 2, "N", "crew", 1)]
+            }),
+        ),
+        (
+            "combined count",
+            json!({"cast": many, "crew": [credit("overflow", 1, "N", "crew", 0)]}),
+        ),
+        ("person", cast(credit("z", 0, "N", "cast", 0))),
+        ("order", cast(credit("z", 1, "N", "cast", -1))),
+        ("name", cast(credit("z", 1, "  ", "cast", 0))),
+        ("id charset", cast(credit("z/../", 1, "N", "cast", 0))),
         (
             "long job",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"crew","job":"j".repeat(257)}]),
+            json!({"cast": [], "crew": [{"creditId":"z","tmdbId":1,"name":"N","job":"j".repeat(257)}]}),
         ),
         (
             "cover type",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":[{"coverType":"nope","url":"https://image.tmdb.org/a.jpg"}]}]),
+            cast(
+                json!({"creditId":"z","tmdbId":1,"name":"N","images":[{"coverType":"nope","url":"https://image.tmdb.org/a.jpg"}]}),
+            ),
         ),
         (
             "too many images",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":(0..9).map(|i| json!({"coverType":"poster","url":format!("https://image.tmdb.org/{i}.jpg")})).collect::<Vec<_>>()}]),
+            cast(
+                json!({"creditId":"z","tmdbId":1,"name":"N","images":(0..9).map(|i| json!({"coverType":"poster","url":format!("https://image.tmdb.org/{i}.jpg")})).collect::<Vec<_>>()}),
+            ),
         ),
     ];
     for url in [
@@ -523,12 +588,24 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
         "/local/cover.jpg",
         "https://image.tmdb.org/a b.jpg",
     ] {
-        bad_cases.push((url, json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":[{"coverType":"headshot","url":url}]}])));
+        bad_cases.push((url, cast(json!({"creditId":"z","tmdbId":1,"name":"N","images":[{"coverType":"headshot","url":url}]}))));
     }
     for (label, credits) in bad_cases {
-        h.set(200, movie(credits));
+        let mut payload = movie(credits);
+        payload["title"] = json!("Must not partially refresh");
+        h.set(200, payload);
         assert!(h.client.movie(101).await.is_err(), "accepted {label}");
         assert!(h.refresh().await.is_err(), "refreshed {label}");
+        assert_eq!(
+            dump(&c, "SELECT * FROM movie_credits ORDER BY id").await,
+            before,
+            "{label}"
+        );
+        assert_eq!(
+            dump(&c, "SELECT * FROM movie_metadata ORDER BY id").await,
+            metadata_before,
+            "{label}"
+        );
     }
     assert_eq!(
         dump(&c, "SELECT * FROM movie_credits ORDER BY id").await,
@@ -537,10 +614,10 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
     // Storage failure inside the replacement transaction rolls back every credit change.
     h.set(
         200,
-        movie(json!([
+        movie(json!({"cast": [
             credit("a", 1, "A changed", "cast", 0),
             credit("n", 9, "N", "cast", 5)
-        ])),
+        ], "crew": []})),
     );
     c.execute_batch("CREATE TRIGGER reject_credit BEFORE INSERT ON movie_credits BEGIN SELECT RAISE(ABORT,'fixture'); END;").await?;
     assert_eq!(h.refresh().await, Err("metadata storage failed".into()));
@@ -553,7 +630,10 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
 
 #[tokio::test]
 async fn credits_are_movie_domain_scoped_and_tv_ids_never_match() -> Result<(), Error> {
-    let h = harness(movie(json!([credit("a", 1, "A", "cast", 0)]))).await?;
+    let h = harness(movie(
+        json!({"cast": [credit("a", 1, "A", "cast", 0)], "crew": []}),
+    ))
+    .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
     // Series 5 / episode id equal to the credit id and to the movie id; none of them may resolve credits.

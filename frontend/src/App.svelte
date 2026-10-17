@@ -25,6 +25,7 @@
   import ActivityPanel from './lib/ActivityPanel.svelte';
   import BlocklistPanel from './lib/BlocklistPanel.svelte';
   import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
+  import MovieCreditsPanel from './lib/MovieCreditsPanel.svelte';
   import QualityDefinitionsPanel from './lib/QualityDefinitionsPanel.svelte';
   import QualityProfilesPanel from './lib/QualityProfilesPanel.svelte';
   import NamingPanel from './lib/NamingPanel.svelte';
@@ -209,6 +210,7 @@
         <h1>{selected.title}</h1><p class="path">{selected.path}</p><p>{selected.statistics.file_count} associated files · {selected.monitored ? 'Monitored' : 'Unmonitored'}</p>
         <button disabled={saving} onclick={() => patch({monitored: !selected!.monitored})}>{selected.monitored ? 'Unmonitor' : 'Monitor'} {domain === 'tv' ? 'series' : 'movie'}</button>
         {#if view === 'library'}{#key `${selected.media_type}:${selected.id}`}<MetadataRefreshPanel target={selected.media_type === 'tv' ? {media_type:'tv',series_id:selected.id} : {media_type:'movies',movie_id:selected.id}} onreload={() => {if(selected) {void load(page?.offset ?? 0); void select(selected.id,episodeOffset);}}} />{/key}{/if}
+        {#if view === 'library' && selected.media_type === 'movies'}{#key `movies:${selected.id}`}<MovieCreditsPanel movieId={selected.id} />{/key}{/if}
         <details><summary>Library settings</summary><form onsubmit={(event) => {event.preventDefault(); saveSettings();}}>
           {#if domain === 'tv'}<label>Series type<select aria-label="Series type" bind:value={seriesType}><option value="">Unknown</option><option value="standard">Standard</option><option value="daily">Daily</option><option value="anime">Anime</option></select></label><label>Season folders<select aria-label="Season folders" bind:value={seasonFolder}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Scene numbering<select aria-label="Scene numbering" bind:value={sceneNumbering}><option value="">Unknown</option><option value="true">Enabled</option><option value="false">Disabled</option></select></label><label>Monitor new seasons<select aria-label="Monitor new seasons" bind:value={newItems}><option value="">Unknown</option><option value="all">All</option><option value="none">None</option></select></label>
           {:else}<label>Minimum availability<select aria-label="Minimum availability" bind:value={availability}><option value="">Unknown</option><option value="tba">To be announced</option><option value="announced">Announced</option><option value="in_cinemas">In cinemas</option><option value="released">Released</option></select></label><p>Background release decisions use this policy and the known release dates.</p>{/if}

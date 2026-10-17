@@ -81,6 +81,12 @@ async fn metadata_mode(
         // Owned removed-health browser: actual404 and explicit valid restoration.
         Some("4") => 4,
         Some("5") => 5,
+        // Credits modes leave the original provider and removed-health scenarios unchanged.
+        Some("6") => 6,
+        Some("7") => 7,
+        Some("8") => 8,
+        Some("9") => 9,
+        Some("10") => 10,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.store(value, Ordering::SeqCst);
@@ -139,6 +145,31 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
         }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed movie");
+        }
+        match mode {
+            6 => {
+                let cast: Vec<_> = (0..102).map(|index| json!({
+                    "creditId":format!("cast-{index}"),"tmdbId":1000+index,
+                    "name":if index < 2 { "Same Name".to_owned() } else if index == 2 { "<img src=x onerror=alert(1)>".to_owned() } else { format!("Cast person {index}") },
+                    "order":index,"character":format!("Character {index}"),
+                    "images":if index == 0 { vec![json!({"coverType":"headshot","url":"https://image.tmdb.org/t/p/original/owned-credits-missing.jpg"})] } else { vec![] }
+                })).collect();
+                value["credits"] = json!({"cast":cast,"crew":[
+                    {"creditId":"crew-director","tmdbId":1000,"name":"Same Name","order":0,"department":"Directing","job":"Director"},
+                    {"creditId":"crew-writer","tmdbId":1000,"name":"Same Name","order":1,"department":"Writing","job":"Writer"},
+                    {"creditId":"crew-last","tmdbId":2000,"name":"Crew final","order":2,"department":"Sound","job":"Sound editor"}
+                ]});
+            }
+            7 => {
+                value["credits"] = json!({"cast":[{"creditId":"cast-0","tmdbId":1000,"name":"Replacement name","order":0,"character":"Replacement role"}],"crew":[]})
+            }
+            8 => value["credits"] = json!({"cast":[],"crew":[]}),
+            9 => {}
+            10 => {
+                value["title"] = json!("Invalid refresh must not persist");
+                value["credits"] = json!({"cast":[{"creditId":"unsafe","tmdbId":1000,"name":"Unsafe image","images":[{"coverType":"headshot","url":"javascript:alert(1)"}]}],"crew":[]});
+            }
+            _ => {}
         }
         Json(value).into_response()
     } else {
@@ -831,6 +862,7 @@ async fn library_ui_fixture() {
         library::router(db.clone())
             .merge(library::metadata_router(db.clone(), client))
             .merge(episodes::router(db.clone()))
+            .merge(hrrdarr::credits::router(db.clone()))
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
