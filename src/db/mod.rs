@@ -244,6 +244,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "scan_media",
         include_str!("../../migrations/0057_scan_media.sql"),
     ),
+    (
+        "scan_successor",
+        include_str!("../../migrations/0058_scan_successor.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

@@ -28,6 +28,7 @@ fn input(id: Uuid, path: &std::path::Path, mode: ScanMode) -> DownloadedScanInpu
         mode,
         priority: CommandPriority::Normal,
         tracked: None,
+        supersedes_command_id: None,
     }
 }
 async fn enqueue(

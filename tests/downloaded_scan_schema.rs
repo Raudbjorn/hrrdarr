@@ -200,7 +200,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        57 // Latest includes 0057; the predecessor prefix remains fixed.
+        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -900,6 +900,12 @@ async fn schema54_tracked_partial_lineage_handback_atomicity_and_full_coverage()
         "third successor can retain all earlier ancestors"
     );
     let last = successor(&c, &parent).await?;
+    // 0058: the active successor holds the lineage; storage refuses a competing successor.
+    let competing = uuid::Uuid::new_v4().to_string();
+    assert!(
+        c.execute("INSERT INTO downloaded_scan_commands(id,media_type,source_path,requested_mode,ready_order_at,next_attempt_at,created_at,supersedes_command_id)VALUES(?,'tv','/download','copy',100,100,100,?)",params![competing.clone(),parent.clone()]).await.is_err(),
+        "a second successor of one predecessor was admitted"
+    );
     capture(&c, &last).await?;
     let child = selected_tv(&c, &last, None).await?;
     publish(&c, &last).await?;

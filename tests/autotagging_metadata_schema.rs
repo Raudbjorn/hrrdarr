@@ -548,7 +548,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -690,7 +690,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        57 // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

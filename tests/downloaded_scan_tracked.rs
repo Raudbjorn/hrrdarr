@@ -2,7 +2,10 @@
 //! reservation, typed coverage and the processing handback, and move-mode source-directory
 //! cleanup with its explicit resume. Temporary directories and databases, 127.0.0.1:0
 //! listeners; no live service is contacted (the client endpoint 127.0.0.1:1 is never needed).
-use hrrdarr::{commands, db::Database, metadata::MetadataClient, providers};
+use hrrdarr::{
+    commands, completed_download_handling, db::Database, health, metadata::MetadataClient,
+    providers,
+};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
@@ -44,7 +47,10 @@ impl Harness {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = commands::router(db.clone()).merge(hrrdarr::import::router(db.clone()));
+        let app = commands::router(db.clone())
+            .merge(hrrdarr::import::router(db.clone()))
+            .merge(health::router(db.clone()))
+            .merge(completed_download_handling::router(db.clone()));
         let server = Server(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
@@ -385,6 +391,95 @@ async fn admit_tracked(
         json!({"id":id,"path":path,"mode":mode,"priority":"normal","tracked":{"provider_id":p.client,"remote_id":hash}}),
     )
     .await
+}
+
+async fn admit_successor(
+    h: &Harness,
+    domain: &str,
+    id: Uuid,
+    path: &Path,
+    tracked: Option<(&str, &str)>,
+    previous: Uuid,
+) -> (u16, Value) {
+    let mut body = json!({"id":id,"path":path,"mode":"copy","priority":"normal","supersedes_command_id":previous});
+    if let Some((provider, remote)) = tracked {
+        body["tracked"] = json!({"provider_id":provider,"remote_id":remote});
+    }
+    h.call(
+        "POST",
+        &format!("/api/v1/{domain}/downloaded-scan-commands"),
+        body,
+    )
+    .await
+}
+fn code(response: &(u16, Value)) -> (u16, Option<&str>) {
+    (response.0, response.1["error"]["code"].as_str())
+}
+/// Health's remote-path check is scoped to completed-download handling; enable it explicitly.
+async fn enable_cdh(h: &Harness, domain: &str) {
+    let route = format!("/api/v1/{domain}/completed-download-handling");
+    let (status, settings) = h.call("GET", &route, Value::Null).await;
+    assert_eq!(status, 200, "{settings}");
+    let (status, saved) = h
+        .call(
+            "PUT",
+            &route,
+            json!({"enabled":true,"revision":settings["revision"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{saved}");
+}
+/// The remote_path_mapping check and its published issue, via the real Health API.
+async fn path_check(h: &Harness, domain: &str) -> Value {
+    let (status, value) = h
+        .call(
+            "GET",
+            &format!("/api/v1/health?scope={domain}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let mut check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["identity"]["check_key"] == "remote_path_mapping")
+        .unwrap()
+        .clone();
+    check["issue"] = value["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["identity"]["check_key"] == "remote_path_mapping")
+        .cloned()
+        .unwrap_or(Value::Null);
+    check
+}
+/// Requests a fresh Health evaluation through the owned worker and waits for its publication.
+async fn recheck(h: &Harness, domain: &str) -> Value {
+    let previous = path_check(h, domain).await;
+    let (status, body) = h
+        .call(
+            "POST",
+            "/api/v1/health/commands",
+            json!({"scope":domain,"priority":"high"}),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let value = path_check(h, domain).await;
+            if value["evaluation"] == "current"
+                && value["observed_generation"].as_i64().unwrap()
+                    > previous["observed_generation"].as_i64().unwrap_or(-1)
+            {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("owned Health worker must publish a fresh path observation")
 }
 
 #[tokio::test]
@@ -877,12 +972,20 @@ async fn an_uncertain_cleanup_after_intent_stays_pending_until_a_generation_fenc
     let c = h.db.connect().await.unwrap();
     c.execute_batch("CREATE TRIGGER injected_cleanup_settle BEFORE UPDATE OF cleanup_state ON downloaded_scan_commands WHEN NEW.cleanup_state IN ('complete','retained') BEGIN SELECT RAISE(ABORT,'injected cleanup settlement failure'); END;").await.unwrap();
     drop(c);
+    enable_cdh(&h, "movies").await;
     let id = Uuid::new_v4();
     assert_eq!(h.admit("movies", id, &source, "move").await.0, 202);
     h.start_worker().await;
     let stuck = h
         .wait("movies", id, |v| v["cleanup"]["recovery_required"] == true)
         .await;
+    // The uncertain removal intent is surfaced through the existing path-diagnostics check.
+    let issue = recheck(&h, "movies").await;
+    assert_eq!(
+        issue["issue"]["reason"], "path_scan_cleanup_uncertain",
+        "{issue}"
+    );
+    assert!(!issue.to_string().contains(source.to_str().unwrap()));
     assert_eq!(
         (
             stuck["status"].as_str(),
@@ -1005,6 +1108,8 @@ async fn an_uncertain_cleanup_after_intent_stays_pending_until_a_generation_fenc
         "{done}"
     );
     assert_eq!(done["counts"]["imported"], 1);
+    // The settled cleanup is no longer evidence.
+    assert!(recheck(&h, "movies").await["issue"].is_null());
     let (code, body) = h
         .call(
             "POST",
@@ -1017,5 +1122,297 @@ async fn an_uncertain_cleanup_after_intent_stays_pending_until_a_generation_fenc
         (409, Some("downloaded_scan_cleanup_resume_conflict")),
         "{body}"
     );
+    h.stop_worker().await;
+}
+
+#[tokio::test]
+async fn an_incomplete_tracked_receipt_completes_only_through_one_explicit_successor() {
+    let mut h = Harness::new().await;
+    let (tv_root, movie_root) = h.library().await;
+    let p = providers(&h).await;
+    // Receipts are singletons (0025), so an incomplete predecessor carries no credit; the
+    // successor must prove the member itself and no credit may be counted twice.
+    let cases = [
+        (
+            "tv",
+            "Harbor.S01E01.1080p.WEB-DL",
+            vec![1i64],
+            'e',
+            "Harbor.S01E01.1080p.WEB-DL.flv",
+            tv_root.clone(),
+            "SELECT count(*) FROM import_history WHERE media_type='episode' AND episode_id=1",
+        ),
+        (
+            "movies",
+            "Harbor.2020.1080p.WEB-DL",
+            vec![],
+            'f',
+            "Harbor.2020.1080p.WEB-DL.flv",
+            movie_root.clone(),
+            "SELECT count(*) FROM import_history WHERE media_type='movie' AND movie_id=1",
+        ),
+    ];
+    let mut prepared = Vec::new();
+    for (domain, title, episodes, tag, _, _, _) in &cases {
+        let (candidate, hash) = receipt(&h, &p, domain, title, episodes, *tag).await;
+        blocked_processing(&h, &candidate).await;
+        let folder = h.dir(&format!("dl-successor-{domain}")).join(title);
+        // Nothing acceptable for the receipt's member yet: the first scan proves nothing.
+        write(&folder.join("readme.nfo"), b"text");
+        if *domain == "tv" {
+            write(&folder.join("Harbor.S01E02.1080p.WEB-DL.flv"), &payload(21));
+        }
+        let first = Uuid::new_v4();
+        assert_eq!(
+            admit_tracked(&h, domain, first, &folder, "copy", &p, &hash)
+                .await
+                .0,
+            202
+        );
+        prepared.push((candidate, hash, folder, first));
+    }
+    h.start_worker().await;
+    for ((domain, _, _, _, file, root, history), (candidate, hash, folder, first)) in
+        cases.iter().zip(&prepared)
+    {
+        let done = h.settled(domain, *first).await;
+        assert_eq!(
+            done["coverage"],
+            json!({"state":"incomplete","expected":1,"covered":0,"missing":1}),
+            "{done}"
+        );
+        assert_eq!(done["successor_allowed"], true, "{done}");
+        assert_eq!(done["successor_command_id"], Value::Null);
+        let before = processing(&h, candidate).await;
+        assert_eq!(before["status"], "blocked");
+        assert_eq!(before["scan_reserved"], true, "{before}");
+        // Invalid lineage: every request below is rejected and creates nothing.
+        let other_domain = if *domain == "tv" { "movies" } else { "tv" };
+        for (route_domain, path, tracked, previous, expected) in [
+            (
+                *domain,
+                folder.join("other"),
+                Some((p.client.as_str(), hash.as_str())),
+                *first,
+                "downloaded_scan_successor_invalid",
+            ),
+            (
+                *domain,
+                folder.clone(),
+                None,
+                *first,
+                "downloaded_scan_successor_invalid",
+            ),
+            (
+                *domain,
+                folder.clone(),
+                Some((p.client.as_str(), "9".repeat(40).as_str())),
+                *first,
+                "downloaded_scan_successor_invalid",
+            ),
+            (
+                other_domain,
+                folder.clone(),
+                Some((p.client.as_str(), hash.as_str())),
+                *first,
+                "downloaded_scan_successor_invalid",
+            ),
+            (
+                *domain,
+                folder.clone(),
+                Some((p.client.as_str(), hash.as_str())),
+                Uuid::new_v4(),
+                "downloaded_scan_successor_invalid",
+            ),
+        ] {
+            let response =
+                admit_successor(&h, route_domain, Uuid::new_v4(), &path, tracked, previous).await;
+            assert_eq!(code(&response), (409, Some(expected)), "{}", response.1);
+        }
+        // The remaining file arrives; the successor is reviewed and admitted with a NEW id.
+        write(&folder.join(file), &payload(22));
+        h.stop_worker().await;
+        let tracked = Some((p.client.as_str(), hash.as_str()));
+        let successor = Uuid::new_v4();
+        let admitted = admit_successor(&h, domain, successor, folder, tracked, *first).await;
+        assert_eq!(admitted.0, 202, "{}", admitted.1);
+        assert_eq!(admitted.1["supersedes_command_id"], first.to_string());
+        assert_eq!(admitted.1["successor_allowed"], false);
+        // Exact replay is the same command; the same id with other lineage is a conflict.
+        let replay = admit_successor(&h, domain, successor, folder, tracked, *first).await;
+        assert_eq!(replay.0, 200, "{}", replay.1);
+        let different = admit_tracked(&h, domain, successor, folder, "copy", &p, hash).await;
+        assert_eq!(code(&different), (409, Some("downloaded_scan_conflict")));
+        // The lineage is reserved atomically: a competing successor is refused.
+        let competing = admit_successor(&h, domain, Uuid::new_v4(), folder, tracked, *first).await;
+        assert_eq!(
+            code(&competing),
+            (409, Some("downloaded_scan_successor_conflict")),
+            "{}",
+            competing.1
+        );
+        // A queued (unsettled) successor cannot itself be superseded.
+        let unsettled =
+            admit_successor(&h, domain, Uuid::new_v4(), folder, tracked, successor).await;
+        assert_eq!(
+            code(&unsettled),
+            (409, Some("downloaded_scan_successor_not_settled")),
+            "{}",
+            unsettled.1
+        );
+        let (_, previous) = h.get(domain, *first).await;
+        assert_eq!(
+            (
+                previous["successor_command_id"].as_str(),
+                previous["successor_allowed"].as_bool()
+            ),
+            (Some(successor.to_string().as_str()), Some(false))
+        );
+        // The singleton path still cannot bypass the scan-owned proof.
+        let (status, body) = h
+            .call(
+                "POST",
+                "/api/v1/download-processing",
+                json!({"provider_id":p.client,"provider_revision":1,"media_type":domain,"receipt_ids":[candidate]}),
+            )
+            .await;
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (409, Some("processing_reserved_by_scan"))
+        );
+        h.start_worker().await;
+        let done = h.settled(domain, successor).await;
+        assert_eq!(
+            (
+                done["status"].as_str(),
+                done["outcome"].as_str(),
+                done["tracking"].as_str(),
+                done["receipt_id"].as_str()
+            ),
+            (
+                Some("succeeded"),
+                Some("success"),
+                Some("receipt"),
+                Some(candidate.as_str())
+            ),
+            "{done}"
+        );
+        assert_eq!(
+            done["coverage"],
+            json!({"state":"complete","expected":1,"covered":1,"missing":0})
+        );
+        let children = by_path(&h.children(domain, successor, "?limit=100").await);
+        assert_eq!(children[*file]["disposition"], "imported", "{children:?}");
+        assert_eq!(children["readme.nfo"]["disposition"], "rejected");
+        assert_eq!(
+            std::fs::read(root.join(file)).unwrap(),
+            payload(22),
+            "the remaining file reached the library"
+        );
+        // Full typed coverage hands the receipt back as imported through the successor;
+        // the hc021 marker is cleared only by that proof and lifetime counters are preserved.
+        let after = processing(&h, candidate).await;
+        assert_eq!(
+            (
+                after["status"].as_str(),
+                after["error_code"].as_str(),
+                after["scan_command_id"].as_str(),
+                after["scan_reserved"].as_bool()
+            ),
+            (
+                Some("imported"),
+                None,
+                Some(successor.to_string().as_str()),
+                Some(true)
+            ),
+            "{after}"
+        );
+        assert_eq!(after["reasons"], json!([]));
+        for field in [
+            "policy_revision",
+            "preflight_attempts",
+            "total_preflight_attempts",
+            "next_attempt_at",
+            "created_at",
+        ] {
+            assert_eq!(after[field], before[field], "{field}");
+        }
+        // The predecessor's proof is immutable and the member is credited exactly once.
+        let (_, previous) = h.get(domain, *first).await;
+        assert_eq!(
+            previous["coverage"],
+            json!({"state":"incomplete","expected":1,"covered":0,"missing":1})
+        );
+        assert_eq!(h.count(history, vec![]).await, 1);
+        assert_eq!(
+            h.count(
+                "SELECT count(*) FROM downloaded_scan_coverage WHERE command_id IN (?,?) AND credited_operation_id IS NOT NULL",
+                vec![text(&first.to_string()), text(&successor.to_string())]
+            )
+            .await,
+            1
+        );
+        // Lineage is consumed: neither a complete successor nor its predecessor can be
+        // superseded again.
+        let again = admit_successor(&h, domain, Uuid::new_v4(), folder, tracked, successor).await;
+        assert_eq!(
+            code(&again),
+            (409, Some("downloaded_scan_successor_not_incomplete")),
+            "{}",
+            again.1
+        );
+        let stale = admit_successor(&h, domain, Uuid::new_v4(), folder, tracked, *first).await;
+        assert_eq!(
+            code(&stale),
+            (409, Some("downloaded_scan_successor_conflict")),
+            "{}",
+            stale.1
+        );
+    }
+    h.stop_worker().await;
+}
+
+#[tokio::test]
+async fn a_measured_prepare_refusal_is_health_evidence_until_the_source_is_rescanned() {
+    let mut h = Harness::new().await;
+    enable_cdh(&h, "tv").await;
+    // The series root (/fictional/tv) does not exist: the selected child is refused at prepare
+    // with a measured path cause and no operation.
+    let folder = h.dir("dl-prepare").join("Harbor.S01E01.1080p.WEB-DL");
+    write(&folder.join("Harbor.S01E01.1080p.WEB-DL.flv"), &payload(31));
+    h.start_worker().await;
+    assert!(recheck(&h, "tv").await["issue"].is_null());
+    let health = generation(&h, "tv").await;
+    let first = Uuid::new_v4();
+    assert_eq!(h.admit("tv", first, &folder, "copy").await.0, 202);
+    let done = h.settled("tv", first).await;
+    assert_eq!(done["outcome"], "unsuccessful", "{done}");
+    let child = &h.children("tv", first, "?disposition=failed").await["items"][0];
+    assert_eq!(
+        (child["error_code"].as_str(), child["operation_id"].as_str()),
+        (Some("hc021_root_missing_prepare"), None)
+    );
+    assert!(
+        generation(&h, "tv").await > health,
+        "refusal invalidates Health"
+    );
+    let issue = recheck(&h, "tv").await;
+    assert_eq!(
+        issue["issue"]["reason"], "path_import_unavailable",
+        "{issue}"
+    );
+    assert!(!issue.to_string().contains(folder.to_str().unwrap()));
+    // Repairing the root alone does not clear recorded evidence.
+    h.library().await;
+    assert_eq!(
+        recheck(&h, "tv").await["issue"]["reason"],
+        "path_import_unavailable"
+    );
+    // A new scan of the same source re-observes it (and imports): the evidence is superseded.
+    let second = Uuid::new_v4();
+    assert_eq!(h.admit("tv", second, &folder, "copy").await.0, 202);
+    let done = h.settled("tv", second).await;
+    assert_eq!(done["outcome"], "success", "{done}");
+    assert!(recheck(&h, "tv").await["issue"].is_null());
     h.stop_worker().await;
 }

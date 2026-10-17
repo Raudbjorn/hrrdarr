@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        57 // Latest adds scan media storage; actual55 predecessor remains fixed.
+        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);

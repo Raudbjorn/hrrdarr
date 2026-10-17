@@ -94,7 +94,17 @@ fn log(claim: &ScanClaim, event: &str, code: &str) {
     );
 }
 async fn changed(c: &Connection, media: MediaDomain) -> Result<()> {
-    crate::health::path_diagnostics_changed(c, media, crate::health::PathDiagnosticChange::Progress)
+    signal(c, media, crate::health::PathDiagnosticChange::Progress).await
+}
+/// Cleanup evidence (an armed or uncertain removal intent) is read by Health; every
+/// transition invalidates its generation in the caller's transaction. An uncertain failure
+/// schedules a re-check like any failure; a settlement schedules one like a completion.
+async fn signal(
+    c: &Connection,
+    media: MediaDomain,
+    change: crate::health::PathDiagnosticChange,
+) -> Result<()> {
+    crate::health::path_diagnostics_changed(c, media, change)
         .await
         .map_err(|e| Error(e.0, e.1))
 }
@@ -336,7 +346,16 @@ async fn execute(
             .await?
         };
         if rows == 1 {
-            changed(&tx, s.media).await?;
+            signal(
+                &tx,
+                s.media,
+                if sql == "settle" {
+                    crate::health::PathDiagnosticChange::Completion
+                } else {
+                    crate::health::PathDiagnosticChange::Failure
+                },
+            )
+            .await?;
         }
         Ok(rows)
     }

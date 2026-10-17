@@ -4,7 +4,7 @@
   import type {SettingsWriteState} from './api';
   import { canResumeProcessing, processingDiagnostic } from './pathDiagnostics';
   import { cancelDownloadProcessing, inheritProcessingPolicy, listDownloadProcessing, processDownloads, saveProcessingPolicy } from './api';
-  let { provider, media, currentPolicy, active=true, relatedWrite='idle', onreload, onwrite=()=>{}, ondirty=()=>{} }: {provider:Provider; media:MediaDomain;currentPolicy:ProcessingPolicy|null;active?:boolean;relatedWrite?:SettingsWriteState;onreload:()=>Promise<boolean>;onwrite?:(state:SettingsWriteState)=>void;ondirty?:(dirty:boolean)=>void} = $props();
+  let { provider, media, currentPolicy, active=true, relatedWrite='idle', onreload, onwrite=()=>{}, ondirty=()=>{}, onscan }: {provider:Provider; media:MediaDomain;currentPolicy:ProcessingPolicy|null;active?:boolean;relatedWrite?:SettingsWriteState;onreload:()=>Promise<boolean>;onwrite?:(state:SettingsWriteState)=>void;ondirty?:(dirty:boolean)=>void;onscan?:(domain:MediaDomain,id:string)=>void} = $props();
   let policy:ProcessingPolicy|null = $state(null), rows:ApiPage<DownloadProcessing>|null = $state(null);
   let override=$state<'inherit'|'on'|'off'>('inherit'), mode:ProcessingMode = $state('copy'), offset = $state(0), dirty = $state(false), stale=$state(false);
   let writeReadback=$state(false);
@@ -37,6 +37,8 @@
   async function mutate(action:'policy'|'retry'|'cancel',row?:DownloadProcessing) {
     if(reading || locked || !policy || action==='policy'&&(stale||!currentPolicy)) return;
     if (action === 'retry' && row?.operation_id && !canResumeProcessing(row)) return;
+    // A scan-owned receipt is continued only by a coverage-aware scan, never by singleton retry.
+    if (action !== 'policy' && row?.scan_reserved) return;
     saving=true; clearTimeout(timer); error=''; notice='';
     const input={provider_revision:policy.provider_revision,revision:policy.revision,mode};
     const result=action==='policy'
@@ -94,9 +96,14 @@
         {:else if row.retirement_state==='pending'}<p>Previous file retirement is pending. Original or recovery bytes are retained.</p>{/if}
         {#if row.error_code && row.status !== 'imported' && row.import_phase !== 'complete'}<p role="alert">{row.error_code}{row.reasons.filter(reason=>!reason.startsWith('hc021_')).length?`: ${row.reasons.filter(reason=>!reason.startsWith('hc021_')).join(', ')}`:''}</p>{/if}
         {#if diagnostic}<p role={row.recovery_required ? 'alert' : 'status'}>{diagnostic}</p>{/if}
-        {#if row.status==='blocked'||row.status==='cancelled'}<button disabled={reading||locked||!currentPolicy?.enabled} onclick={()=>mutate('retry',row)}>Retry processing {row.receipt_id}</button>{/if}
-        {#if canResumeProcessing(row)}<button disabled={reading||locked} onclick={()=>mutate('retry',row)}>Resume import {row.operation_id}</button><p>Resume continues the same recorded import operation.</p>{/if}
-        {#if !row.operation_id && (row.status==='queued'||row.status==='checking')}<button disabled={reading||locked} onclick={()=>mutate('cancel',row)}>Cancel processing {row.receipt_id}</button>{/if}
+        {#if row.scan_command_id}<p>{row.scan_reserved ? 'Owned by downloaded-folder scan' : 'Last read by downloaded-folder scan'} <button type="button" class="link" onclick={()=>row.scan_command_id && onscan?.(media,row.scan_command_id)}>Open scan {row.scan_command_id}</button></p>{/if}
+        {#if row.scan_reserved}
+          {#if row.status==='blocked'||row.status==='cancelled'}<p role="status">A downloaded-folder scan holds this download's coverage. Retry is not offered here; open the scan and use “Scan remaining files” after the missing files are in place.</p>{/if}
+        {:else}
+          {#if row.status==='blocked'||row.status==='cancelled'}<button disabled={reading||locked||!currentPolicy?.enabled} onclick={()=>mutate('retry',row)}>Retry processing {row.receipt_id}</button>{/if}
+          {#if canResumeProcessing(row)}<button disabled={reading||locked} onclick={()=>mutate('retry',row)}>Resume import {row.operation_id}</button><p>Resume continues the same recorded import operation.</p>{/if}
+          {#if !row.operation_id && (row.status==='queued'||row.status==='checking')}<button disabled={reading||locked} onclick={()=>mutate('cancel',row)}>Cancel processing {row.receipt_id}</button>{/if}
+        {/if}
       </li>
     {:else}<li>No processing records. Eligible confirmed completed submissions appear here after observation; inherited defaults need no per-client opt-in.</li>{/each}</ul>
     <div class="actions"><button disabled={reading||saving||offset===0} onclick={()=>{offset=Math.max(0,offset-25);void read();}}>Previous imports</button><button disabled={reading||saving||offset+25>=rows.total} onclick={()=>{offset+=25;void read();}}>Next imports</button></div>
@@ -104,5 +111,5 @@
 </section>
 
 <style>
-  .surface{background:white;border:1px solid #cbd5de;padding:1.25rem;margin:1rem 0}.surface h2{margin-top:0}fieldset{display:grid;gap:.8rem;border:1px solid #cbd5de;padding:1rem;min-width:0;margin-top:1rem}li{margin:1rem 0;overflow-wrap:anywhere}li p{margin:.4rem 0}[role=alert]{color:#a12637}.actions{display:flex;gap:.5rem;flex-wrap:wrap}@media(max-width:700px){.surface{padding:1rem}}
+  .surface{background:white;border:1px solid #cbd5de;padding:1.25rem;margin:1rem 0}.surface h2{margin-top:0}fieldset{display:grid;gap:.8rem;border:1px solid #cbd5de;padding:1rem;min-width:0;margin-top:1rem}li{margin:1rem 0;overflow-wrap:anywhere}li p{margin:.4rem 0}[role=alert]{color:#a12637}.link{background:none;border:none;padding:0;color:#245ba8;text-decoration:underline;cursor:pointer;overflow-wrap:anywhere;text-align:left}.actions{display:flex;gap:.5rem;flex-wrap:wrap}@media(max-width:700px){.surface{padding:1rem}}
 </style>

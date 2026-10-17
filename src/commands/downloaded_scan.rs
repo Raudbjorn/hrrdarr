@@ -89,6 +89,11 @@ pub struct DownloadedScanInput {
     #[serde(default)]
     #[ts(optional)]
     pub tracked: Option<ScanTracked>,
+    // Explicit coverage-aware successor of a settled scan whose tracked receipt kept incomplete
+    // coverage. Requires the same domain, path and tracked identity; never reopens that scan.
+    #[serde(default)]
+    #[ts(optional)]
+    pub supersedes_command_id: Option<Uuid>,
 }
 // Derived from status and inventory revision; never grants execution permission.
 #[derive(Clone, Copy, Serialize, ts_rs::TS)]
@@ -218,6 +223,14 @@ pub struct DownloadedScanCommand {
     pub predecessor_operation_id: Option<Uuid>,
     pub coverage: ScanCoverage,
     pub cleanup: ScanCleanup,
+    // The settled scan this request explicitly succeeds (`supersedes_command_id` input).
+    pub supersedes_command_id: Option<Uuid>,
+    // Newest explicit successor naming this scan, whatever its state.
+    pub successor_command_id: Option<Uuid>,
+    // A "scan remaining files" successor may currently be admitted for this scan: it settled
+    // with incomplete tracked coverage, has no unresolved effect and no successor holds its
+    // lineage. Receipt/provider validity is re-checked at admission; this grants nothing.
+    pub successor_allowed: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -516,6 +529,7 @@ struct Request {
     priority: i64,
     provider: Option<String>,
     remote: Option<String>,
+    supersedes: Option<String>,
 }
 impl Request {
     fn new(media: MediaDomain, input: DownloadedScanInput) -> Result<Self> {
@@ -538,11 +552,17 @@ impl Request {
             priority: input.priority.number(),
             provider,
             remote,
+            supersedes: input
+                .supersedes_command_id
+                .map(|id| id.hyphenated().to_string()),
         })
     }
 }
 
-const COLUMNS: &str = "id,media_type,source_path,requested_mode,priority,requested_provider_id,requested_remote_id,candidate_id,status,outcome,error_code,attempts,run_generation,cancel_requested,inventory_revision,CASE WHEN json_type(inventory_json,'$.missing')='true' THEN 1 ELSE 0 END,next_attempt_at,created_at,started_at,completed_at,predecessor_operation_id,coverage_state,cleanup_state,json_extract(cleanup_json,'$.phase'),CASE WHEN length(CAST(json_extract(cleanup_json,'$.reason') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.reason') END,coalesce(json_extract(cleanup_json,'$.removed'),0),CASE WHEN length(CAST(json_extract(cleanup_json,'$.error') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.error') END,cleanup_resume_generation,cleanup_resume_requested,predecessor_operation_id IS NULL OR EXISTS(SELECT 1 FROM import_journal j JOIN import_history h ON h.operation_id=j.operation_id WHERE j.operation_id=downloaded_scan_commands.predecessor_operation_id AND j.phase='complete')";
+/// The last column mirrors the successor admission's own-state checks (0054
+/// `downloaded_scan_admit`, 0058 `scan_successor_unique`); receipt and provider validity are
+/// re-checked only at admission, so `successor_allowed` never grants authority.
+const COLUMNS: &str = "id,media_type,source_path,requested_mode,priority,requested_provider_id,requested_remote_id,candidate_id,status,outcome,error_code,attempts,run_generation,cancel_requested,inventory_revision,CASE WHEN json_type(inventory_json,'$.missing')='true' THEN 1 ELSE 0 END,next_attempt_at,created_at,started_at,completed_at,predecessor_operation_id,coverage_state,cleanup_state,json_extract(cleanup_json,'$.phase'),CASE WHEN length(CAST(json_extract(cleanup_json,'$.reason') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.reason') END,coalesce(json_extract(cleanup_json,'$.removed'),0),CASE WHEN length(CAST(json_extract(cleanup_json,'$.error') AS BLOB))<=64 THEN json_extract(cleanup_json,'$.error') END,cleanup_resume_generation,cleanup_resume_requested,predecessor_operation_id IS NULL OR EXISTS(SELECT 1 FROM import_journal j JOIN import_history h ON h.operation_id=j.operation_id WHERE j.operation_id=downloaded_scan_commands.predecessor_operation_id AND j.phase='complete'),supersedes_command_id,(SELECT s.id FROM downloaded_scan_commands s WHERE s.supersedes_command_id=downloaded_scan_commands.id ORDER BY s.created_at DESC,s.id DESC LIMIT 1),(status IN ('succeeded','failed','cancelled') AND coverage_state='incomplete' AND candidate_id IS NOT NULL AND requested_provider_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM downloaded_scan_reserved_children c WHERE c.command_id=downloaded_scan_commands.id) AND (predecessor_operation_id IS NULL OR EXISTS(SELECT 1 FROM import_journal j JOIN import_history h ON h.operation_id=j.operation_id WHERE j.operation_id=downloaded_scan_commands.predecessor_operation_id AND j.phase='complete')) AND NOT EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.supersedes_command_id=downloaded_scan_commands.id AND (s.status IN ('queued','running','retry_wait') OR s.candidate_id IS NOT NULL)))";
 struct Parent {
     id: Uuid,
     media: MediaDomain,
@@ -574,6 +594,9 @@ struct Parent {
     cleanup_resume_generation: i64,
     cleanup_resume_requested: bool,
     predecessor_complete: bool,
+    supersedes: Option<String>,
+    successor: Option<String>,
+    successor_allowed: bool,
 }
 fn parent(r: libsql::Row) -> Result<Parent> {
     Ok(Parent {
@@ -607,6 +630,9 @@ fn parent(r: libsql::Row) -> Result<Parent> {
         cleanup_resume_generation: r.get(27)?,
         cleanup_resume_requested: r.get::<i64>(28)? == 1,
         predecessor_complete: r.get::<i64>(29)? == 1,
+        supersedes: r.get(30)?,
+        successor: r.get(31)?,
+        successor_allowed: r.get::<i64>(32)? == 1,
     })
 }
 async fn read_parent(c: &Connection, id: Uuid) -> Result<Option<Parent>> {
@@ -717,6 +743,8 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
     };
     let receipt_id = uuid(&p.candidate)?;
     let predecessor_operation_id = uuid(&p.predecessor)?;
+    let supersedes_command_id = uuid(&p.supersedes)?;
+    let successor_command_id = uuid(&p.successor)?;
     Ok(DownloadedScanCommand {
         id: p.id,
         media_type: p.media,
@@ -797,6 +825,9 @@ async fn render(c: &Connection, p: Parent) -> Result<DownloadedScanCommand> {
             resume_requested: p.cleanup_resume_requested,
             recovery_required: cleanup_recovery,
         },
+        supersedes_command_id,
+        successor_command_id,
+        successor_allowed: p.successor_allowed,
     })
 }
 
@@ -821,7 +852,8 @@ async fn create(
                 && existing.mode == request.mode
                 && existing.priority == request.priority
                 && existing.provider == request.provider
-                && existing.remote == request.remote;
+                && existing.remote == request.remote
+                && existing.supersedes == request.supersedes;
             if !same {
                 return Err(scan_conflict());
             }
@@ -846,12 +878,16 @@ async fn create(
                 ));
             }
         }
+        if let Some(previous) = &request.supersedes {
+            // Explicit lineage is validated and reserved under this same writer lock.
+            successor_admission(&tx, &request, previous).await?;
+        }
         if command_capacity(&tx).await? >= MAX_COMMANDS {
             return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
         }
         let timestamp = now()?;
         tx.execute(
-            "INSERT INTO downloaded_scan_commands(id,media_type,source_path,requested_mode,requested_provider_id,requested_remote_id,priority,ready_order_at,next_attempt_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO downloaded_scan_commands(id,media_type,source_path,requested_mode,requested_provider_id,requested_remote_id,priority,ready_order_at,next_attempt_at,created_at,supersedes_command_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 request.id.clone(),
                 domain(media),
@@ -862,15 +898,108 @@ async fn create(
                 request.priority,
                 timestamp,
                 timestamp,
-                timestamp
+                timestamp,
+                request.supersedes.clone()
             ],
         )
         .await?;
+        if let Some(previous) = &request.supersedes {
+            eprintln!(
+                "event=downloaded_scan_successor_admitted command_id={} media_type={} supersedes={previous}",
+                request.id,
+                domain(media)
+            );
+        }
         let row = read_parent(&tx, id).await?.ok_or_else(not_found)?;
         Ok((StatusCode::ACCEPTED, bounded(render(&tx, row).await?)?))
     }
     .await;
     finish(tx, outcome).await
+}
+fn successor_error(code: &'static str) -> Error {
+    Error(StatusCode::CONFLICT, code)
+}
+/// Validates an explicit `supersedes_command_id` inside the admission transaction. The
+/// predecessor must be a settled scan of this domain and source with retained incomplete
+/// tracked coverage and no unresolved effect; the request must name the same tracked receipt;
+/// that receipt must still be the current observed authority of an enabled, scoped client; and
+/// no other successor may hold the lineage. The 0054/0058 admission triggers repeat the
+/// own-state checks, and the receipt capture triggers repeat the authority checks later.
+async fn successor_admission(tx: &Connection, request: &Request, previous: &str) -> Result<()> {
+    let invalid = || successor_error("downloaded_scan_successor_invalid");
+    let row = tx
+        .query(
+            "SELECT p.media_type,p.source_path,p.requested_provider_id,p.requested_remote_id,p.status,p.coverage_state,p.candidate_id,
+             EXISTS(SELECT 1 FROM downloaded_scan_reserved_children c WHERE c.command_id=p.id) OR p.cleanup_state='pending' OR NOT (p.predecessor_operation_id IS NULL OR EXISTS(SELECT 1 FROM import_journal j JOIN import_history h ON h.operation_id=j.operation_id WHERE j.operation_id=p.predecessor_operation_id AND j.phase='complete')),
+             EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.supersedes_command_id=p.id AND (s.status IN ('queued','running','retry_wait') OR s.candidate_id IS NOT NULL))
+             FROM downloaded_scan_commands p WHERE p.id=?",
+            [previous],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(invalid)?;
+    let media: String = row.get(0)?;
+    let path: String = row.get(1)?;
+    let provider: Option<String> = row.get(2)?;
+    let remote: Option<String> = row.get(3)?;
+    let status = CommandStatus::parse(&row.get::<String>(4)?)?;
+    let coverage: String = row.get(5)?;
+    let candidate: Option<String> = row.get(6)?;
+    let unresolved = row.get::<i64>(7)? == 1;
+    let held = row.get::<i64>(8)? == 1;
+    drop(row);
+    // The same typed authority: domain, source path and the exact tracked receipt request.
+    if media != domain(request.media)
+        || path != request.path
+        || request.provider.is_none()
+        || provider != request.provider
+        || remote != request.remote
+    {
+        return Err(invalid());
+    }
+    if !matches!(
+        status,
+        CommandStatus::Succeeded | CommandStatus::Failed | CommandStatus::Cancelled
+    ) || unresolved
+    {
+        return Err(successor_error("downloaded_scan_successor_not_settled"));
+    }
+    let Some(candidate) = candidate.filter(|_| coverage == "incomplete") else {
+        return Err(successor_error("downloaded_scan_successor_not_incomplete"));
+    };
+    if held {
+        return Err(successor_error("downloaded_scan_successor_conflict"));
+    }
+    // The receipt must still be the observed authority of an enabled, scoped, unchanged client,
+    // and its processing row (if any) must carry no handback or one from this lineage.
+    let current = tx
+        .query(
+            "WITH RECURSIVE ancestry(id,previous,depth) AS (SELECT id,supersedes_command_id,1 FROM downloaded_scan_commands WHERE id=?5 UNION ALL SELECT a.id,a.supersedes_command_id,x.depth+1 FROM downloaded_scan_commands a JOIN ancestry x ON a.id=x.previous WHERE x.depth<1024)
+             SELECT EXISTS(SELECT 1 FROM rss_candidates r JOIN providers v ON v.id=r.client_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=r.media_type WHERE r.id=?1 AND r.status='observed' AND r.media_type=?2 AND r.client_id=?3 AND r.observed_hash=?4 AND v.enabled=1 AND v.revision=r.client_revision),
+             coalesce((SELECT d.status='checking' OR (d.scan_command_id IS NOT NULL AND d.scan_command_id NOT IN (SELECT id FROM ancestry)) FROM download_processing d WHERE d.candidate_id=?1),0),
+             EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=?1 AND s.status IN ('queued','running','retry_wait'))",
+            params![
+                candidate,
+                domain(request.media),
+                request.provider.clone(),
+                request.remote.clone(),
+                previous
+            ],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or_else(invalid)?;
+    if current.get::<i64>(0)? != 1 {
+        return Err(successor_error(
+            "downloaded_scan_successor_receipt_unavailable",
+        ));
+    }
+    if current.get::<i64>(1)? == 1 || current.get::<i64>(2)? == 1 {
+        return Err(successor_error("downloaded_scan_successor_conflict"));
+    }
+    Ok(())
 }
 async fn list(
     State(db): State<Arc<Database>>,
@@ -1219,6 +1348,8 @@ pub(super) struct ScanClaim {
     attempts: i64,
     run_generation: i64,
     requested: Option<(String, String)>,
+    /// Explicit predecessor whose retained incomplete coverage this scan continues.
+    supersedes: Option<String>,
 }
 pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Option<ScanClaim>> {
     let Some(p) = read_parent(c, id).await? else {
@@ -1242,6 +1373,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
             attempts: p.attempts,
             run_generation: p.run_generation,
             requested: p.provider.zip(p.remote),
+            supersedes: p.supersedes,
         }));
     }
     if matches!(p.status, CommandStatus::Running) && p.revision == 0 && p.candidate.is_some() {
@@ -1262,6 +1394,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
             attempts: p.attempts,
             run_generation: p.run_generation,
             requested: p.provider.zip(p.remote),
+            supersedes: p.supersedes,
         }));
     }
     if !matches!(p.status, CommandStatus::Queued | CommandStatus::RetryWait) {
@@ -1290,6 +1423,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
         attempts: p.attempts,
         run_generation: p.run_generation,
         requested: p.provider.zip(p.remote),
+        supersedes: p.supersedes,
     }))
 }
 /// Only unpublished, uncaptured running parents are reset. A published parent (revision 1)
@@ -1539,6 +1673,7 @@ async fn discover(
     let c = connection(db).await?;
     live(&c, claim).await?;
     let tracking = receipt::resolve(&c, claim).await?;
+    let carried = receipt::carried_members(&c, claim).await?;
     let path = claim.path.clone();
     let captured = tokio::task::spawn_blocking(move || Inventory::capture(&path))
         .await
@@ -1724,6 +1859,13 @@ async fn discover(
             }
             ScanFileDecision::PolicyEligible(eligible) => eligible,
         };
+        if fully_carried(&eligible, &carried) {
+            // An explicit predecessor already proved every member of this file against the
+            // current association: it is not remaining work for this successor.
+            item.state = Verdict::Rejected(vec!["coverage_already_credited".into()]);
+            items.push(item);
+            continue;
+        }
         let observer = inventory.clone();
         let flag = cancel.clone();
         let (eligible, observed) = tokio::task::spawn_blocking(move || {
@@ -1822,6 +1964,51 @@ async fn discover(
         items,
         chosen,
     })
+}
+
+/// Whether every typed member of an eligible file is already a carried predecessor credit.
+fn fully_carried(eligible: &ScanPolicyEligible, carried: &HashSet<i64>) -> bool {
+    if carried.is_empty() {
+        return false;
+    }
+    match eligible.target {
+        ReleaseTarget::Movies { movie_id } => carried.contains(&movie_id),
+        ReleaseTarget::Tv { .. } => {
+            !eligible.members.is_empty()
+                && eligible
+                    .members
+                    .iter()
+                    .all(|m| carried.contains(&m.episode_id))
+        }
+    }
+}
+/// A publication re-observes its source: measured prepare refusals recorded by EARLIER scans of
+/// the same domain and source stop being current Health evidence, so the Health generation is
+/// invalidated in this publication transaction when any such evidence exists.
+async fn supersede_prepare_evidence(
+    tx: &Connection,
+    claim: &ScanClaim,
+    command: &str,
+) -> std::result::Result<(), Failure> {
+    let superseded = tx
+        .query(
+            "SELECT 1 FROM downloaded_scan_children c JOIN downloaded_scan_commands p ON p.id=c.command_id WHERE c.disposition='failed' AND c.operation_id IS NULL AND substr(c.error_code,1,6)='hc021_' AND p.media_type=? AND p.source_path=? AND p.id!=? LIMIT 1",
+            params![domain(claim.media), claim.path.clone(), command],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    if superseded {
+        crate::health::path_diagnostics_changed(
+            tx,
+            claim.media,
+            crate::health::PathDiagnosticChange::Completion,
+        )
+        .await
+        .map_err(|_| Failure::Retry("scan_storage_error"))?;
+    }
+    Ok(())
 }
 
 struct Published {
@@ -2152,8 +2339,10 @@ async fn publish_in(
     if changed != 1 {
         return Err(Failure::Stale);
     }
+    supersede_prepare_evidence(tx, claim, &command).await?;
     if tracked {
-        // A completed predecessor's typed history counts before any child imports.
+        // A completed predecessor's typed history (and any still-valid credit carried from an
+        // explicit predecessor scan) counts before any child imports.
         receipt::credit(tx, &command).await?;
     }
     if selected == 0 {

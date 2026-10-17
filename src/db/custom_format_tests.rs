@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

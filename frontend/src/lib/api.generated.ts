@@ -138,7 +138,7 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
-export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, };
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, scan_reserved: boolean, };
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
@@ -148,9 +148,9 @@ export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" |
 
 export type DownloadedScanChildQuery = { disposition?: ScanDisposition, limit?: number, offset?: number, };
 
-export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, receipt_id: string | null, predecessor_operation_id: string | null, coverage: ScanCoverage, cleanup: ScanCleanup, };
+export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, receipt_id: string | null, predecessor_operation_id: string | null, coverage: ScanCoverage, cleanup: ScanCleanup, supersedes_command_id: string | null, successor_command_id: string | null, successor_allowed: boolean, };
 
-export type DownloadedScanInput = { id: string, path: string, mode: ScanMode, priority: CommandPriority, tracked?: ScanTracked, };
+export type DownloadedScanInput = { id: string, path: string, mode: ScanMode, priority: CommandPriority, tracked?: ScanTracked, supersedes_command_id?: string, };
 
 export type DownloadedScanQuery = { status?: CommandStatus, limit?: number, offset?: number, };
 

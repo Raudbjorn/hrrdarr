@@ -2,8 +2,8 @@
 // Persisted state is identity + immutable request only: a saved receipt never grants an action.
 import type { Result } from './api';
 import type {
-  CommandPriority, CommandStatus, DownloadedScanCommand, DownloadedScanInput, MediaDomain,
-  ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupResumeInput, ScanCoverage, ScanMode, ScanPhase,
+  CommandPriority, CommandStatus, DownloadedScanCommand, DownloadedScanInput, MediaDomain, Provider,
+  ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupResumeInput, ScanCoverage, ScanMode, ScanPhase, ScanTracked,
 } from './api.generated';
 
 export const SCAN_PENDING_KEY = 'hrrdarr.downloaded-scan.pending.v1';
@@ -21,13 +21,17 @@ const MAX_BACKOFF_STEPS = 4;
 
 const encoder = new TextEncoder();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Same grammar as the server: a lowercase 40- or 64-character hexadecimal download ID. */
+const REMOTE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MODES: readonly ScanMode[] = ['auto', 'move', 'copy'];
 const PRIORITIES: readonly CommandPriority[] = ['normal', 'high'];
 const STATUSES: readonly CommandStatus[] = ['queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled'];
 const PHASES: readonly ScanPhase[] = ['queued', 'inventory', 'waiting_predecessor', 'awaiting_import', 'importing', 'recovery_required', 'cleanup', 'settled'];
 const TERMINAL: readonly CommandStatus[] = ['succeeded', 'failed', 'cancelled'];
 
-export type ScanForm = { path: string; mode: ScanMode; priority: CommandPriority };
+/** `providerId`/`remoteId` are both empty for an untracked scan, or both set for a tracked one. */
+export type ScanForm = { path: string; mode: ScanMode; priority: CommandPriority; providerId?: string; remoteId?: string };
+type ValidForm = { path: string; mode: ScanMode; priority: CommandPriority; tracked: ScanTracked | null };
 export type PendingScan = Readonly<{ domain: MediaDomain; input: Readonly<DownloadedScanInput> }>;
 export type AdmissionOutcome = 'admitted' | 'rejected' | 'uncertain' | 'mismatch';
 export type ReadbackOutcome = 'admitted' | 'absent' | 'mismatch' | 'unknown';
@@ -60,30 +64,60 @@ export function scanPathProblem(path: unknown): string | null {
   return null;
 }
 
-export function validateScanForm(form: ScanForm): Result<ScanForm> {
+/** A tracked identity is optional; when present it is exact: a provider ID and a download ID. */
+export function trackedProblem(providerId: unknown, remoteId: unknown): string | null {
+  const provider = typeof providerId === 'string' ? providerId : '', remote = typeof remoteId === 'string' ? remoteId : '';
+  if (provider === '' && remote === '') return null;
+  if (provider === '') return 'Choose the download client that tracks this download, or clear the download ID.';
+  if (!scanUuid(provider)) return 'Choose a listed download client.';
+  if (remote === '') return 'Enter the download ID (torrent hash) reported by the download client, or choose Not tracked.';
+  if (!REMOTE.test(remote)) return 'The download ID must be a lowercase 40- or 64-character hexadecimal hash.';
+  return null;
+}
+
+export function validateScanForm(form: ScanForm): Result<ValidForm> {
   if (!object(form)) return fail('Invalid scan form.');
   const problem = scanPathProblem(form.path);
   if (problem) return fail(problem);
   if (!member(form.mode, MODES)) return fail('Choose Auto, Move or Copy.');
   if (!member(form.priority, PRIORITIES)) return fail('Choose Normal or High priority.');
-  return good({ path: form.path, mode: form.mode, priority: form.priority });
+  const trackedIssue = trackedProblem(form.providerId ?? '', form.remoteId ?? '');
+  if (trackedIssue) return fail(trackedIssue);
+  const tracked = form.providerId ? { provider_id: form.providerId, remote_id: form.remoteId as string } : null;
+  return good({ path: form.path, mode: form.mode, priority: form.priority, tracked });
 }
 
-/** Captures the immutable request under a client-generated identity before any POST. */
-export function createPendingScan(domain: MediaDomain, id: string, form: ScanForm): Result<PendingScan> {
+/**
+ * Captures the immutable request under a client-generated identity before any POST. An explicit
+ * successor names the settled scan it continues; it always needs a tracked identity.
+ */
+export function createPendingScan(domain: MediaDomain, id: string, form: ScanForm, supersedes: string | null = null): Result<PendingScan> {
   if (!isScanDomain(domain)) return fail('Choose TV or movies.');
   if (!scanUuid(id)) return fail('Invalid scan request ID.');
   const valid = validateScanForm(form);
   if (!valid.ok) return valid;
-  return good(Object.freeze({ domain, input: Object.freeze({ id, ...valid.data }) }));
+  if (supersedes !== null && (!scanUuid(supersedes) || supersedes === id || !valid.data.tracked))
+    return fail('A scan of remaining files needs the finished tracked scan it continues.');
+  const { tracked, ...plain } = valid.data;
+  const input: DownloadedScanInput = { id, ...plain, ...(tracked ? { tracked: Object.freeze({ ...tracked }) } : {}), ...(supersedes ? { supersedes_command_id: supersedes } : {}) };
+  return good(Object.freeze({ domain, input: Object.freeze(input) }));
 }
 
+const INPUT_KEYS = ['id', 'path', 'mode', 'priority'] as const;
 function pendingEntry(v: unknown): Result<PendingScan> {
-  if (!object(v) || !exactKeys(v, ['domain', 'input']) || !object(v.input) || !exactKeys(v.input, ['id', 'path', 'mode', 'priority']))
-    return fail('Invalid saved scan request.');
+  if (!object(v) || !exactKeys(v, ['domain', 'input']) || !object(v.input)) return fail('Invalid saved scan request.');
   const input = v.input as Record<string, unknown>;
-  return createPendingScan(v.domain as MediaDomain, input.id as string,
-    { path: input.path as string, mode: input.mode as ScanMode, priority: input.priority as CommandPriority });
+  const keys = [...INPUT_KEYS, ...(Object.hasOwn(input, 'tracked') ? ['tracked'] : []), ...(Object.hasOwn(input, 'supersedes_command_id') ? ['supersedes_command_id'] : [])];
+  if (!exactKeys(input, keys)) return fail('Invalid saved scan request.');
+  const tracked = input.tracked;
+  if (tracked !== undefined && (!object(tracked) || !exactKeys(tracked, ['provider_id', 'remote_id']))) return fail('Invalid saved scan request.');
+  const supersedes = input.supersedes_command_id;
+  if (supersedes !== undefined && typeof supersedes !== 'string') return fail('Invalid saved scan request.');
+  return createPendingScan(v.domain as MediaDomain, input.id as string, {
+    path: input.path as string, mode: input.mode as ScanMode, priority: input.priority as CommandPriority,
+    providerId: tracked ? (tracked as Record<string, unknown>).provider_id as string : '',
+    remoteId: tracked ? (tracked as Record<string, unknown>).remote_id as string : '',
+  }, (supersedes as string | undefined) ?? null);
 }
 
 function pendingList(v: unknown): Result<PendingScan[]> {
@@ -122,19 +156,28 @@ export function addPendingScan(entries: readonly PendingScan[], entry: PendingSc
 
 export const removePendingScan = (entries: readonly PendingScan[], id: string) => entries.filter(e => e.input.id !== id);
 
+const sameTracked = (a: unknown, b: ScanTracked | undefined) => b === undefined
+  ? a === null
+  : object(a) && a.provider_id === b.provider_id && a.remote_id === b.remote_id;
 /** A server row satisfies a retained request only when every immutable input field matches. */
 export function commandMatches(entry: PendingScan, command: unknown): boolean {
   return object(command) && command.id === entry.input.id && command.media_type === entry.domain
     && command.path === entry.input.path && command.mode === entry.input.mode
-    && command.priority === entry.input.priority && command.tracked === null;
+    && command.priority === entry.input.priority && sameTracked(command.tracked, entry.input.tracked)
+    && (command.supersedes_command_id ?? null) === (entry.input.supersedes_command_id ?? null);
 }
 
+/** 409 codes that reject the request inside the admission transaction: nothing was created. */
+const REJECTING_CONFLICTS = new Set([
+  'downloaded_scan_provider_unknown', 'downloaded_scan_successor_invalid', 'downloaded_scan_successor_not_settled',
+  'downloaded_scan_successor_not_incomplete', 'downloaded_scan_successor_conflict', 'downloaded_scan_successor_receipt_unavailable',
+]);
 /** Only explicit request rejections settle an admission; anything else may have committed. */
 export function classifyAdmission(entry: PendingScan, result: Result<DownloadedScanCommand>): AdmissionOutcome {
   if (result.ok) return commandMatches(entry, result.data) && validScanCommand(result.data, entry.domain) ? 'admitted' : 'mismatch';
   const failure = result as Failure;
   if (failure.status === 400 || failure.status === 413 || failure.status === 429) return 'rejected';
-  if (failure.status === 409 && failure.code === 'downloaded_scan_provider_unknown') return 'rejected';
+  if (failure.status === 409 && REJECTING_CONFLICTS.has(failure.code ?? '')) return 'rejected';
   // 409 downloaded_scan_conflict: this ID already names a different request. Keep the identity.
   if (failure.status === 409) return 'mismatch';
   return 'uncertain';
@@ -157,7 +200,10 @@ export function validScanCommand(v: unknown, domain: MediaDomain): v is Download
     && member(v.mode, MODES) && member(v.priority, PRIORITIES) && member(v.status, STATUSES) && member(v.phase, PHASES)
     && (v.outcome === null || v.outcome === 'success' || v.outcome === 'unsuccessful')
     && typeof v.cancel_requested === 'boolean' && count(v.inventory_revision) && count(v.attempts) && validCounts(v.counts)
-    && (v.phase === 'settled') === isTerminalScan(v.status as CommandStatus);
+    && (v.phase === 'settled') === isTerminalScan(v.status as CommandStatus)
+    && typeof v.successor_allowed === 'boolean' && (v.supersedes_command_id === null || scanUuid(v.supersedes_command_id))
+    && (v.successor_command_id === null || scanUuid(v.successor_command_id))
+    && (v.tracked === null || (object(v.tracked) && scanUuid(v.tracked.provider_id) && typeof v.tracked.remote_id === 'string'));
 }
 
 export function validScanChild(v: unknown): v is ScanChild {
@@ -286,4 +332,41 @@ export function describeScan(parent: DownloadedScanCommand): string {
   if (parent.phase === 'recovery_required' && parent.cleanup?.recovery_required) return `Source-folder cleanup was interrupted and needs an explicit cleanup resume.${stopping}`;
   if (parent.phase === 'recovery_required') return `${c.recovery_required} file${c.recovery_required === 1 ? '' : 's'} need explicit recovery.${stopping}`;
   return `${PHASE_TEXT[parent.phase] ?? parent.phase}: ${tally}.${stopping}`;
+}
+
+/**
+ * The reviewed "Scan remaining files" request for a settled tracked scan with incomplete
+ * coverage: a NEW identity with the same path, mode, priority and tracked receipt, explicitly
+ * naming the settled scan. Never reopens the original inventory. Null when not offered.
+ */
+export function successorRequest(parent: DownloadedScanCommand, id: string): Result<PendingScan> | null {
+  if (!parent.successor_allowed || !isTerminalScan(parent.status) || parent.coverage.state !== 'incomplete' || !parent.tracked) return null;
+  return createPendingScan(parent.media_type, id, {
+    path: parent.path, mode: parent.mode, priority: parent.priority,
+    providerId: parent.tracked.provider_id, remoteId: parent.tracked.remote_id,
+  }, parent.id);
+}
+
+/** Plain-language confirmation shown before a successor is sent. */
+export function successorConfirmation(parent: DownloadedScanCommand): string {
+  return `Start a new scan of ${parent.path} for the files this tracked download is still missing (${parent.coverage.missing} of ${parent.coverage.expected})? `
+    + 'The finished scan stays unchanged. Files it already imported are not imported again, and the download stays blocked unless the new scan covers everything.';
+}
+
+export function admissionFailureMessage(result: Failure): string {
+  switch (result.code) {
+    case 'downloaded_scan_successor_invalid': return 'The finished scan does not match this request (library type, path or tracked download). Refresh before trying again.';
+    case 'downloaded_scan_successor_not_settled': return 'The previous scan has not finished, or still has an unresolved import or cleanup. Recover it first.';
+    case 'downloaded_scan_successor_not_incomplete': return 'The previous scan is not missing any tracked files, so there is nothing remaining to scan.';
+    case 'downloaded_scan_successor_conflict': return 'Another scan already continues this tracked download. Open the newest scan instead.';
+    case 'downloaded_scan_successor_receipt_unavailable': return 'The tracked download is no longer available from an enabled download client for this library type.';
+    case 'downloaded_scan_provider_unknown': return 'The chosen download client is not configured for this library type.';
+    default: return result.error;
+  }
+}
+
+/** Download clients (not indexers) that are configured for the given library type. */
+export function trackingProviders(providers: readonly Provider[], domain: MediaDomain): Provider[] {
+  return providers.filter(p => p.settings.implementation !== 'torznab' && p.settings.implementation !== 'newznab'
+    && p.settings[domain] !== null && scanUuid(p.id));
 }

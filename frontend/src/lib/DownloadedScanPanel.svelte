@@ -1,21 +1,25 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import type { ApiPage, CommandPriority, DownloadedScanCommand, MediaDomain, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanDisposition, ScanMode } from './api.generated';
+  import type { ApiPage, CommandPriority, DownloadedScanCommand, MediaDomain, Provider, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanDisposition, ScanMode } from './api.generated';
   import type { SettingsWriteState } from './api';
-  import { cancelDownloadedScanCommand, createDownloadedScanCommand, getDownloadedScanCommand, listDownloadedScanChildren, listDownloadedScanCommands, resumeDownloadedScanChild, resumeDownloadedScanCleanup } from './api';
+  import { cancelDownloadedScanCommand, createDownloadedScanCommand, getDownloadedScanCommand, listDownloadedScanChildren, listDownloadedScanCommands, listProviders, resumeDownloadedScanChild, resumeDownloadedScanCleanup } from './api';
   import {
     SCAN_CHILD_PAGE, SCAN_OWNER_READ_LIMIT, SCAN_PARENT_PAGE, SCAN_PENDING_KEY, SCAN_PENDING_LIMIT,
-    addPendingScan, canCancelScan, classifyAdmission, cleanupResumeFailureMessage, cleanupResumeRequest, describeCleanup, describeCoverage, classifyReadback, completionOwners, createPendingScan,
+    addPendingScan, admissionFailureMessage, canCancelScan, classifyAdmission, cleanupResumeFailureMessage, cleanupResumeRequest, describeCleanup, describeCoverage, classifyReadback, completionOwners, createPendingScan,
     decodePendingScans, describeScan, encodePendingScans, isTerminalScan, pollDelay, removePendingScan,
-    resumeFailureMessage, resumeRequest, scanPhaseText, shouldPoll, validScanChild, validScanCommand, validateScanForm,
+    resumeFailureMessage, resumeRequest, scanPhaseText, shouldPoll, successorConfirmation, successorRequest, trackingProviders, validScanChild, validScanCommand, validateScanForm,
   } from './downloaded-scan-state';
   import type { PendingScan } from './downloaded-scan-state';
 
-  let { domain, active = true, relatedWrite = 'idle', onwrite, oncomplete }: {
+  let { domain, active = true, relatedWrite = 'idle', request = null, onwrite, oncomplete }: {
     domain: MediaDomain; active?: boolean; relatedWrite?: SettingsWriteState;
+    /** Explicit navigation to one scan (for example from a download receipt); never authorizes anything. */
+    request?: { domain: MediaDomain; id: string; nonce: number } | null;
     onwrite?: (state: SettingsWriteState) => void;
     oncomplete?: (event: { domain: MediaDomain; commandId: string; owners: number[] | null }) => void;
   } = $props();
+  /** Bounded provider read for the tracked-download selector (10 pages of 25). */
+  const PROVIDER_PAGES = 10;
 
   type PendingView = { state: 'checking' | 'absent' | 'unknown' | 'mismatch'; message: string };
   const DISPOSITIONS: ScanDisposition[] = ['ready', 'importing', 'imported', 'already_imported', 'rejected', 'failed', 'cancelled'];
@@ -24,6 +28,9 @@
   // The form keeps its own captured domain; a library type change never silently retargets it.
   let scope = $state<MediaDomain>(untrack(() => domain)), keptDomain = $state<MediaDomain | null>(null);
   let path = $state(''), mode = $state<ScanMode>('copy'), priority = $state<CommandPriority>('normal');
+  let providerId = $state(''), remoteId = $state('');
+  let providers = $state<Provider[]>([]), providersError = $state(''), providersPartial = $state(false);
+  let seenRequest = 0;
   let pending = $state<PendingScan[]>([]), pendingViews = $state<Record<string, PendingView>>({});
   let page = $state<ApiPage<DownloadedScanCommand> | null>(null), parentOffset = $state(0);
   let selectedId = $state<string | null>(null), selected = $state<DownloadedScanCommand | null>(null);
@@ -38,7 +45,9 @@
   // Parents seen non-terminal (or admitted here) notify completion once per page session.
   const watched = new Set<string>(), completed = new Set<string>();
 
-  const formDirty = $derived(path !== '' || mode !== 'copy' || priority !== 'normal');
+  const formDirty = $derived(path !== '' || mode !== 'copy' || priority !== 'normal' || providerId !== '' || remoteId !== '');
+  const clients = $derived(trackingProviders(providers, scope));
+  const providerName = (id: string) => providers.find(p => p.id === id)?.name ?? 'Unlisted download client';
   const domainChanged = $derived(domain !== scope && keptDomain !== domain);
   const blocked = $derived(busy || !ready || relatedWrite !== 'idle' || storageBlocked || !!storageError);
   const liveStatus = $derived(selected ? `${selected.path}: ${describeScan(selected)}` : '');
@@ -54,6 +63,18 @@
     const visible = active;
     untrack(() => { invalidate(); if (visible) void refresh(); else clearTimeout(timer); });
   });
+  // An explicit link opens that scan when it names the current scan library type.
+  $effect(() => {
+    const next = request;
+    if (!ready || !next || next.nonce === seenRequest) return;
+    untrack(() => {
+      if (next.domain !== scope) {
+        if (formDirty || busy) { notice = `Linked ${label(next.domain)} scan not opened: this scan form still targets ${label(scope)}.`; seenRequest = next.nonce; return; }
+        switchDomain(next.domain);
+      }
+      seenRequest = next.nonce; void select(next.id);
+    });
+  });
 
   function switchDomain(next: MediaDomain) {
     scope = next; keptDomain = null; page = null; parentOffset = 0; selectedId = null; selected = null;
@@ -63,7 +84,19 @@
   function discardAndSwitch() {
     if (busy) return;
     if (formDirty && !window.confirm('Discard this scan form and use the selected library type?')) return;
-    path = ''; mode = 'copy'; priority = 'normal'; switchDomain(domain);
+    path = ''; mode = 'copy'; priority = 'normal'; providerId = ''; remoteId = ''; switchDomain(domain);
+  }
+  /** Bounded read of configured providers; a failure only disables the tracked selector. */
+  async function loadProviders() {
+    const found: Provider[] = []; let offset = 0, total = 0;
+    for (let page = 0; page < PROVIDER_PAGES; page++) {
+      const result = await listProviders(offset);
+      if (!mounted) return;
+      if (!result.ok) { providersError = `${result.error} Tracked downloads cannot be chosen right now.`; return; }
+      found.push(...result.data.items); total = result.data.total; offset += result.data.items.length;
+      if (!result.data.items.length || offset >= total) break;
+    }
+    providers = found; providersError = ''; providersPartial = offset < total;
   }
   function invalidate() { ++generation; fresh = false; }
   function save(next: PendingScan[], keepOnFailure = true): boolean {
@@ -153,11 +186,11 @@
       watched.add(response.data.id); track(response.data);
       if (entry.domain === scope) { selectedId = response.data.id; selected = response.data; children = null; childOffset = 0; childFilter = ''; parentOffset = 0; }
       notice = replay ? 'The same scan request was confirmed by the server.' : 'Scan admitted. Discovery and import run in the background; progress updates below.';
-      if (!replay && entry.domain === scope && path === entry.input.path) path = '';
+      if (!replay && entry.domain === scope && path === entry.input.path && !entry.input.supersedes_command_id) { path = ''; providerId = ''; remoteId = ''; }
     } else if (outcome === 'rejected') {
       save(removePendingScan(pending, entry.input.id));
       const { [entry.input.id]: _, ...rest } = pendingViews; pendingViews = rest;
-      error = `${response.ok ? 'Unexpected response.' : response.error} The scan was rejected; nothing was scanned or imported.`;
+      error = `${response.ok ? 'Unexpected response.' : admissionFailureMessage(response)} The scan was rejected; nothing was scanned or imported.`;
     } else {
       const message = outcome === 'mismatch'
         ? 'The server returned a different scan for this request ID. Keep this identity and review the scan list before starting another scan.'
@@ -169,13 +202,26 @@
   }
   async function submit() {
     if (blocked) return;
-    const form = validateScanForm({ path, mode, priority });
-    if (!form.ok) { error = form.error; return; }
-    const entry = createPendingScan(scope, crypto.randomUUID(), form.data);
+    const form = { path, mode, priority, providerId, remoteId };
+    const valid = validateScanForm(form);
+    if (!valid.ok) { error = valid.error; return; }
+    const entry = createPendingScan(scope, crypto.randomUUID(), form);
     if (!entry.ok) { error = entry.error; return; }
     const next = addPendingScan(pending, entry.data);
     if (!next.ok) { error = next.error; return; }
     // Persist the identity BEFORE the POST so a lost response is reconciled by the same ID.
+    if (!save(next.data, false)) { error = storageError || 'The scan request could not be saved. Nothing was sent.'; return; }
+    await admit(entry.data, false);
+  }
+  /** Reviewed "Scan remaining files": a NEW request naming the settled scan; the old inventory is never reopened. */
+  async function scanRemaining(parent: DownloadedScanCommand) {
+    if (blocked || !fresh) return;
+    const entry = successorRequest(parent, crypto.randomUUID());
+    if (!entry) return;
+    if (!entry.ok) { error = entry.error; return; }
+    if (!window.confirm(successorConfirmation(parent))) return;
+    const next = addPendingScan(pending, entry.data);
+    if (!next.ok) { error = next.error; return; }
     if (!save(next.data, false)) { error = storageError || 'The scan request could not be saved. Nothing was sent.'; return; }
     await admit(entry.data, false);
   }
@@ -271,6 +317,7 @@
       else { storageBlocked = true; storageError = `${decoded.error} New scans are blocked until the saved requests are recovered.`; }
     } catch { storageBlocked = true; storageError = 'Saved scan requests could not be read. New scans are blocked.'; }
     ready = true;
+    void loadProviders();
     // Reads only: restored identities are checked by GET of the same ID, never re-sent.
     void (async () => { for (const entry of [...pending]) { if (!mounted) return; await checkPending(entry); } })();
     const visibility = () => { if (document.hidden) { clearTimeout(timer); invalidate(); } else void refresh(); };
@@ -303,8 +350,18 @@
       <option value="move">Move (remove the downloaded file after import)</option>
       <option value="auto">Auto (may move files)</option>
     </select></label>
-    <p id="scan-mode-help" class={mode === 'copy' ? 'muted' : 'warning'}>{mode === 'auto' ? 'Auto moves files for downloads that are not tracked by a download client, so the downloaded files are removed from this folder after import.' : mode === 'move' ? 'Move removes each imported file from the download folder. Folders and unimported files are left in place.' : 'Copy leaves every downloaded file in place.'}</p>
+    <p id="scan-mode-help" class={mode === 'copy' || (mode === 'auto' && providerId) ? 'muted' : 'warning'}>{mode === 'auto' ? providerId ? 'Auto copies tracked downloads: the download client may still need its files.' : 'Auto moves files for downloads that are not tracked by a download client, so the downloaded files are removed from this folder after import.' : mode === 'move' ? 'Move removes each imported file from the download folder. Folders and unimported files are left in place.' : 'Copy leaves every downloaded file in place.'}</p>
     <label>Scan priority<select aria-label="Scan priority" bind:value={priority} disabled={busy}><option value="normal">Normal</option><option value="high">High</option></select></label>
+    <fieldset class="tracked" disabled={busy}>
+      <legend>Tracked download (optional)</legend>
+      <p class="muted" id="scan-tracked-help">Name the download client and download ID when this folder is a client's completed download. Its files are then matched to that download and its processing record is updated when the scan finishes.</p>
+      <label>Scan tracked client<select aria-label="Scan tracked client" bind:value={providerId} aria-describedby="scan-tracked-help" onchange={() => { if (!providerId) remoteId = ''; }}>
+        <option value="">Not tracked</option>
+        {#each clients as client (client.id)}<option value={client.id}>{client.name}{client.enabled ? '' : ' (disabled)'}</option>{/each}
+      </select></label>
+      <label>Download ID<input aria-label="Download ID" bind:value={remoteId} disabled={!providerId} maxlength="64" autocomplete="off" spellcheck="false" placeholder="40 or 64 lowercase hexadecimal characters" /></label>
+      {#if providersError}<p role="alert" class="error">{providersError}</p>{:else if providersPartial}<p class="muted">Only the first {providers.length} configured providers are listed.</p>{:else if !clients.length}<p class="muted">No download client is configured for {label(scope)}.</p>{/if}
+    </fieldset>
     <button class="primary" disabled={blocked || pending.length >= SCAN_PENDING_LIMIT}>Scan and import</button>
     {#if relatedWrite !== 'idle'}<p role="status">Another library write must finish before a new scan can start. Status checks continue.</p>{/if}
   </form>
@@ -320,7 +377,7 @@
         {#each pending as entry (entry.input.id)}
           {@const view = pendingViews[entry.input.id]}
           <li><article aria-label={`Unconfirmed scan ${entry.input.path}`}>
-            <dl><dt>Path</dt><dd>{entry.input.path}</dd><dt>Library type</dt><dd>{label(entry.domain)}</dd><dt>Mode</dt><dd>{entry.input.mode} · {entry.input.priority} priority</dd><dt>Request ID</dt><dd><code>{entry.input.id}</code></dd></dl>
+            <dl><dt>Path</dt><dd>{entry.input.path}</dd><dt>Library type</dt><dd>{label(entry.domain)}</dd><dt>Mode</dt><dd>{entry.input.mode} · {entry.input.priority} priority</dd>{#if entry.input.tracked}<dt>Tracked download</dt><dd>{providerName(entry.input.tracked.provider_id)} · <code>{entry.input.tracked.remote_id}</code></dd>{/if}{#if entry.input.supersedes_command_id}<dt>Continues scan</dt><dd><code>{entry.input.supersedes_command_id}</code></dd>{/if}<dt>Request ID</dt><dd><code>{entry.input.id}</code></dd></dl>
             {#if view?.state === 'checking'}<p role="status">Checking this request…</p>{:else if view?.message}<p role="status">{view.message}</p>{/if}
             <div class="actions">
               <button type="button" disabled={busy || view?.state === 'checking'} onclick={() => checkPending(entry)}>Check outcome</button>
@@ -365,7 +422,10 @@
         <dt>Mode</dt><dd>{parent.mode} · {parent.priority} priority</dd>
         <dt>Entries</dt><dd>{parent.counts.entries} found · {parent.counts.ready} ready · {parent.counts.importing} importing · {parent.counts.imported} imported · {parent.counts.already_imported} already imported · {parent.counts.rejected} rejected · {parent.counts.failed} failed · {parent.counts.cancelled} cancelled</dd>
         {#if parent.source}<dt>Source</dt><dd>{parent.source === 'missing' ? 'Path not found' : 'Found'}</dd>{/if}
+        {#if parent.tracked}<dt>Tracked download</dt><dd>{providerName(parent.tracked.provider_id)} · <code>{parent.tracked.remote_id}</code>{parent.tracking === 'unknown_fallback' ? ' (not known to that client; files were identified normally)' : ''}</dd>{/if}
         {#if describeCoverage(parent.coverage)}<dt>Tracked coverage</dt><dd>{describeCoverage(parent.coverage)}</dd>{/if}
+        {#if parent.supersedes_command_id}<dt>Continues scan</dt><dd><button type="button" class="link" onclick={() => parent.supersedes_command_id && select(parent.supersedes_command_id)}>Open earlier scan <code>{parent.supersedes_command_id}</code></button></dd>{/if}
+        {#if parent.successor_command_id}<dt>Continued by</dt><dd><button type="button" class="link" onclick={() => parent.successor_command_id && select(parent.successor_command_id)}>Open later scan <code>{parent.successor_command_id}</code></button></dd>{/if}
         <dt>Source cleanup</dt><dd>{describeCleanup(parent.cleanup)}</dd>
         {#if parent.error_code}<dt>Error</dt><dd><code>{parent.error_code}</code></dd>{/if}
         <dt>Attempts</dt><dd>{parent.attempts} of 3</dd>
@@ -381,6 +441,10 @@
           {#if lostCleanup && lostCleanup.id === parent.id}<button type="button" disabled={blocked} onclick={() => lostCleanup && resumeCleanup(parent, lostCleanup.body)}>Repeat identical cleanup request</button>{/if}
         </div>
       {:else if parent.phase === 'recovery_required'}<p role="alert">An import was interrupted after it started changing files. Review the failed entry and resume it explicitly; nothing retries automatically.</p>{/if}
+      {#if parent.successor_allowed && parent.tracked && isTerminalScan(parent.status)}
+        <div class="notice" role="status"><p>This tracked download is still missing {parent.coverage.missing} of {parent.coverage.expected} files and stays blocked. After the missing files are in place, a new scan can import only what remains. This scan stays unchanged.</p>
+          <div class="actions"><button type="button" class="primary" disabled={blocked || !fresh} onclick={() => scanRemaining(parent)}>Scan remaining files</button></div></div>
+      {/if}
       {#if canCancelScan(parent)}
         <div class="actions"><button type="button" disabled={blocked || !fresh} onclick={cancel}>Stop scan after current file</button></div>
         <p class="muted">Stopping is safe to repeat. A file that is already importing finishes; files not yet started are skipped and imported files stay imported.</p>
@@ -441,5 +505,7 @@
   .filter select { width:auto; }
   .pagination { display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem;margin-top:1rem; }
   .empty { color:#596b7b; }
+  .tracked { display:grid;gap:.6rem;border:1px solid #cbd5de;padding:.75rem;min-width:0; }
+  .link { background:none;border:none;padding:0;color:#245ba8;text-decoration:underline;cursor:pointer;text-align:left; }
   @media(max-width:600px) { .scan-panel{padding:1rem;} dl{grid-template-columns:1fr;} dd{margin-bottom:.4rem;} article{padding:.75rem;} }
 </style>

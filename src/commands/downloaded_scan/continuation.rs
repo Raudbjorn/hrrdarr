@@ -273,12 +273,34 @@ async fn ready(
             Err(e) if e.transient() => return poll(c, claim, ACTIVE_POLL_SECONDS).await,
             Err(e) => {
                 // A measured pre-journal refusal: no operation exists, so nothing is uncertain.
-                let code = e.prepare_failure_code().unwrap_or(e.code());
-                c.execute(
-                    &format!("UPDATE downloaded_scan_children SET disposition='failed',error_code=? WHERE id=? AND disposition='ready' AND operation_id IS NULL AND {FENCE}"),
-                    params![code, child.id.clone(), claim.run_generation],
-                )
-                .await?;
+                // A measured path cause (`hc021_*_prepare`) is durable Health evidence: it is
+                // recorded and the Health generation invalidated in one transaction. Ordinary
+                // decision/naming refusals are not path evidence and leave Health untouched.
+                let measured = e.prepare_failure_code();
+                let code = measured.unwrap_or(e.code());
+                let tx = c
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .await?;
+                let outcome = async {
+                    let rows = tx
+                        .execute(
+                            &format!("UPDATE downloaded_scan_children SET disposition='failed',error_code=? WHERE id=? AND disposition='ready' AND operation_id IS NULL AND {FENCE}"),
+                            params![code, child.id.clone(), claim.run_generation],
+                        )
+                        .await?;
+                    if rows == 1 && measured.is_some() {
+                        crate::health::path_diagnostics_changed(
+                            &tx,
+                            claim.media,
+                            crate::health::PathDiagnosticChange::Failure,
+                        )
+                        .await
+                        .map_err(|e| Error(e.0, e.1))?;
+                    }
+                    Ok(())
+                }
+                .await;
+                finish(tx, outcome).await?;
                 log(claim, &child.id, "child_prepare_refused", code);
                 return Ok(());
             }

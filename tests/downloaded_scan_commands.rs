@@ -646,7 +646,7 @@ async fn admission_is_idempotent_strict_and_bounded() {
         base(json!({"priority":"urgent"})),
         base(json!({"id":"not-a-uuid"})),
         base(json!({"unexpected":true})),
-        base(json!({"supersedes_command_id":Uuid::new_v4()})),
+        base(json!({"supersedes_command_id":"not-a-uuid"})),
         base(json!({"tracked":tracked(&Uuid::new_v4().to_string(), "short")})),
         base(json!({"tracked":tracked(&Uuid::new_v4().to_string(), &"A".repeat(40))})),
         base(
@@ -697,6 +697,21 @@ async fn admission_is_idempotent_strict_and_bounded() {
     assert_eq!(
         (code, body["error"]["code"].as_str()),
         (409, Some("downloaded_scan_provider_unknown"))
+    );
+    // Reasoning: `supersedes_command_id` is now an accepted field (explicit successor lineage),
+    // so a well-formed value naming no settled tracked predecessor is a lineage conflict, not
+    // an unknown-field 400. It still creates nothing.
+    let (code, body) = h
+        .call(
+            "POST",
+            "/api/v1/tv/downloaded-scan-commands",
+            base(json!({"supersedes_command_id":Uuid::new_v4()})),
+        )
+        .await;
+    assert_eq!(
+        (code, body["error"]["code"].as_str()),
+        (409, Some("downloaded_scan_successor_invalid")),
+        "{body}"
     );
     assert_eq!(count(&h).await, 2);
     // Query strictness, pagination bounds and malformed identities.

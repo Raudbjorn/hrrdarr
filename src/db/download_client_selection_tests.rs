@@ -173,7 +173,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 57); // Reasoning: latest adds 0057 scan media retention; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {

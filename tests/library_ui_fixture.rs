@@ -85,7 +85,7 @@ fn scan_payload(tag: u8) -> Vec<u8> {
 }
 /// Isolated downloaded-scan sources under `scratch/downloaded-scan`; nothing else reads them.
 fn downloaded_scan_sources(root: &std::path::Path) {
-    let files: [(&str, Option<u8>); 7] = [
+    let files: [(&str, Option<u8>); 8] = [
         (
             "tv/Fixture.series.S01E01.1080p.WEB-DL/Fixture.series.S01E01.1080p.WEB-DL.flv",
             Some(1),
@@ -102,6 +102,11 @@ fn downloaded_scan_sources(root: &std::path::Path) {
         ("cancel/Fixture.series.S01E02.1080p.WEB-DL.flv", Some(4)),
         ("unmatched/Unknown.Show.S01E01.1080p.WEB-DL.flv", Some(5)),
         ("unmatched/notes.txt", None),
+        // Tracked receipt folder: initially nothing for the receipt's episode (see the hook below).
+        (
+            "tracked/Fixture.series.S01E03.1080p.WEB-DL/readme.nfo",
+            None,
+        ),
     ];
     for (relative, tag) in files {
         let path = root.join(relative);
@@ -406,6 +411,90 @@ async fn import_failure(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+// One-use downloaded-scan browser hook (no production route, inert elsewhere): adds S01E03 to
+// the given series and an OBSERVED tracked qBittorrent receipt for it with a blocked processing
+// row, mirroring tests/downloaded_scan_tracked.rs. Both providers point at 127.0.0.1:1, which
+// is never needed: tracked scans read the receipt from storage only.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackedReceiptInput {
+    series_id: i64,
+}
+async fn seed_tracked_receipt(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<TrackedReceiptInput>,
+) -> Response {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let (indexer, client, command, candidate) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    let hash = "e".repeat(40);
+    for (id, implementation, name) in [
+        (&indexer, "torznab", "Tracked indexer"),
+        (&client, "qbittorrent", "Tracked client"),
+    ] {
+        tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,?,?,1,1,1,1,'http://127.0.0.1:1/')", libsql::params![id.clone(), implementation, name]).await.unwrap();
+    }
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)", [indexer.clone()]).await.unwrap();
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','tv','tv',0,0,'started','default',0,0,0)", [client.clone()]).await.unwrap();
+    tx.execute("INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode,enabled_override) VALUES(?,'tv',1,1,1,'copy',1)", [client.clone()]).await.unwrap();
+    let episode: i64 = tx
+        .query("INSERT INTO episodes(series_id,season,number,title,runtime,air_date) VALUES(?,1,3,'Tracked episode',45,'2020-01-03') RETURNING id", [input.series_id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    tx.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','tv',?,1,?,1,100,100)", libsql::params![command.clone(), indexer.clone(), client.clone()]).await.unwrap();
+    tx.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Fixture.series.S01E03.1080p.WEB-DL',?,?,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?", libsql::params![candidate.clone(), "f".repeat(64), vec![1u8; 29], input.series_id, command]).await.unwrap();
+    tx.execute(
+        "INSERT INTO rss_candidate_episodes VALUES(?,1,?)",
+        libsql::params![candidate.clone(), episode],
+    )
+    .await
+    .unwrap();
+    let identity = json!({"version":1,"target":{"media_type":"episode","id":episode},"hashes":[hash],"settings_fingerprint":"c".repeat(64),"payload_sha256":"d".repeat(64)}).to_string();
+    tx.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        libsql::params![identity, candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        libsql::params![client.clone(), hash.clone(), candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        libsql::params![hash.clone(), candidate.clone()],
+    )
+    .await
+    .unwrap();
+    // Blocked in the same transaction so the processing worker never claims it first.
+    tx.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at)VALUES(?,1,'queued',100,100,100)", [candidate.clone()]).await.unwrap();
+    tx.execute("UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1,updated_at=101 WHERE candidate_id=?", [candidate.clone()]).await.unwrap();
+    tx.execute("UPDATE download_processing SET status='blocked',error_code='path_mapping_missing',reasons_json='[\"hc021_mapping_missing\",\"path_mapping_missing\"]',updated_at=102 WHERE candidate_id=?", [candidate.clone()]).await.unwrap();
+    tx.commit().await.unwrap();
+    Json(json!({"provider_id":client,"remote_id":hash,"candidate_id":candidate,"episode_id":episode})).into_response()
 }
 // This one-use hook has no production route and is inert in existing browser flows.
 #[derive(Deserialize)]
@@ -1100,6 +1189,10 @@ async fn library_ui_fixture() {
             .merge(
                 Router::new()
                     .route("/api/fixture/fail-import-history", post(import_failure))
+                    .route(
+                        "/api/fixture/tracked-scan-receipt",
+                        post(seed_tracked_receipt),
+                    )
                     .route("/api/fixture/client-backoff/age", post(age_client_failure))
                     .route(
                         "/api/fixture/client-backoff/pending",
