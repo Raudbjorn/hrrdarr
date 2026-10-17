@@ -50,6 +50,12 @@ export type CategoryOption = { id: number, parent_id: number | null, label: stri
 
 export type CategoryOrigin = "advertised" | "standard_fallback";
 
+export type ClientAttempt = { ordinal: number, selection_round: number, client_id: string, client_revision: number, state: ClientAttemptState, error_code: string | null, created_at: number, updated_at: number, };
+
+export type ClientAttemptState = "selected" | "prepared" | "dispatching" | "definitely_not_submitted" | "observed" | "unknown";
+
+export type ClientSelection = { "kind": "default", } | { "kind": "explicit", provider_id: string, provider_revision: number, };
+
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
 
 export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
@@ -136,7 +142,7 @@ export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, pr
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
-export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, initial_state?: DownloadInitialState, content_layout?: DownloadContentLayout, sequential_order?: boolean, first_last_first?: boolean, add_tags?: boolean, };
+export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, initial_state?: DownloadInitialState, content_layout?: DownloadContentLayout, sequential_order?: boolean, first_last_first?: boolean, add_tags?: boolean, tags?: Array<number>, };
 
 export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "warning" | "stalled" | "unknown";
 
@@ -438,7 +444,7 @@ export type ProviderChanges = { enabled?: boolean | null, priority?: number | nu
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -596,29 +602,31 @@ export type RootObservationStatus = "available" | "inaccessible" | "timeout" | "
 
 export type RootQuery = { limit?: number, offset?: number, };
 
-export type RssCandidate = { origin: CandidateOrigin, id: string, command_id: string | null, source: RssTarget, title: string, target: ReleaseTarget | null, status: string, reasons: Array<string>, not_before: number | null, attempts: number, created_at: number, updated_at: number, error_code: string | null, };
+export type RssCandidate = { client_attempts: Array<ClientAttempt>, origin: CandidateOrigin, id: string, command_id: string | null, source: RssTarget, title: string, target: ReleaseTarget | null, status: string, reasons: Array<string>, not_before: number | null, attempts: number, created_at: number, updated_at: number, error_code: string | null, };
 
 export type RssCandidateQuery = { media_type?: MediaDomain, command_id?: string, status?: string, limit?: number, offset?: number, };
 
 export type RssCommand = { id: string, target: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, evaluated: number, rejected: number, pending: number, observed: number, uncertain: number, fetch_complete: boolean, };
 
-export type RssInput = { target: RssTarget, priority: CommandPriority, };
+export type RssInput = { target: RssTargetInput, priority: CommandPriority, };
 
 export type RssSchedule = { id: string, target: RssTarget, revision: number, interval_seconds: number, enabled: boolean, next_run_at: number, last_run_at: number | null, error_code: string | null, created_at: number, };
 
 export type RssScheduleDelete = { revision: number, };
 
-export type RssScheduleInput = { revision?: number, target: RssTarget, interval_seconds: number, enabled: boolean, };
+export type RssScheduleInput = { revision?: number, target: RssTargetInput, interval_seconds: number, enabled: boolean, };
 
-export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_id: string, client_revision: number, };
+export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, selection_kind: SelectionKind, client_id: string | null, client_revision: number | null, };
+
+export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, };
 
 export type Score = { format_ids: Array<number>, score: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
-export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, };
+export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_client_id: string | null, selected_client_attempts: Array<ClientAttempt>, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, };
 
-export type SearchCommandInput = { request_id: string, mode: SearchMode, target: MediaTarget, indexer_id: string, indexer_revision: number, client_id: string, client_revision: number, priority: CommandPriority, };
+export type SearchCommandInput = { request_id: string, mode: SearchMode, target: MediaTarget, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, priority: CommandPriority, };
 
 export type SearchCommandQuery = { target_type?: string, target_id?: number, status?: CommandStatus, limit?: number, offset?: number, };
 
@@ -627,6 +635,8 @@ export type SearchEngine = "raw" | "sphinx";
 export type SearchMode = "automatic" | "interactive";
 
 export type SearchResult = { id: string, command_id: string, metadata: ReleaseMetadata, decision: ReleaseDecision, expires_at: number, selected_candidate_id: string | null, };
+
+export type SelectionKind = "legacy_fixed" | "default" | "explicit";
 
 export type SeriesDetails = { network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
@@ -654,7 +664,7 @@ export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
 
 export type TagAssignmentMode = "add" | "remove" | "replace";
 
-export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, };
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, download_client_ids: Array<string>, };
 
 export type TagInput = { label: string, };
 

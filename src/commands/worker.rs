@@ -267,6 +267,9 @@ async fn step(
             retryable: false,
             retry_after_seconds: None,
             client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: crate::providers::ClientRetryKind::Other,
+            client_retry_eligible: false,
         })
     } else {
         let probe = client.refresh(
@@ -312,13 +315,13 @@ async fn publish(
         let Some(current)=retained_command(&tx,command.id).await? else {return Ok(None)};
         if !matches!(current.status,CommandStatus::Running) || current.attempts != command.attempts {return Ok(None)}
         let provider_current=valid_provider(&tx,command.target,command.provider_revision).await?;
-        let result=if provider_current{result}else{Err(RefreshError{code:"provider_changed",retryable:false,retry_after_seconds:None,client_failure:false})};
+        let result=if provider_current{result}else{Err(RefreshError{code:"provider_changed",retryable:false,retry_after_seconds:None,client_failure:false,definitely_not_submitted:false,client_retry_kind:crate::providers::ClientRetryKind::Other,client_retry_eligible:false})};
         let timestamp=now()?;
         match result {
             Ok(items)=>{
                 let json=serde_json::to_string(&items).map_err(|_|bad())?;
                 if json.len()>MAX_BYTES||items.len()>1000||!snapshot_capacity(&tx,command.target).await?{
-                    fail(&tx,&command,timestamp,RefreshError{code:"refresh_limit",retryable:false,retry_after_seconds:None,client_failure:false}).await?;
+                    fail(&tx,&command,timestamp,RefreshError{code:"refresh_limit",retryable:false,retry_after_seconds:None,client_failure:false,definitely_not_submitted:false,client_retry_kind:crate::providers::ClientRetryKind::Other,client_retry_eligible:false}).await?;
                 }else{
                     tx.execute("UPDATE commands SET status='succeeded',completed_at=?,items_observed=? WHERE id=?",params![timestamp,items.len() as i64,command.id.to_string()]).await?;
                     tx.execute("INSERT INTO download_refresh_snapshots(provider_id,media_type,provider_revision,observed_at,command_id,items_json) VALUES(?,?,?,?,?,?) ON CONFLICT(provider_id,media_type) DO UPDATE SET provider_revision=excluded.provider_revision,observed_at=excluded.observed_at,command_id=excluded.command_id,items_json=excluded.items_json",params![command.target.provider_id.to_string(),domain(command.target.media_type),command.provider_revision,timestamp,command.id.to_string(),json]).await?;
@@ -474,6 +477,9 @@ mod tests {
                 retryable: false,
                 retry_after_seconds: None,
                 client_failure: false,
+                definitely_not_submitted: false,
+                client_retry_kind: crate::providers::ClientRetryKind::Other,
+                client_retry_eligible: false,
             }),
             true,
         )
@@ -1044,6 +1050,9 @@ mod tests {
                 retryable: false,
                 retry_after_seconds: None,
                 client_failure: false,
+                definitely_not_submitted: false,
+                client_retry_kind: crate::providers::ClientRetryKind::Other,
+                client_retry_eligible: false,
             }),
             true,
         )
@@ -1068,6 +1077,9 @@ mod tests {
                 retryable: true,
                 retry_after_seconds: None,
                 client_failure: true,
+                definitely_not_submitted: false,
+                client_retry_kind: crate::providers::ClientRetryKind::Other,
+                client_retry_eligible: false,
             }),
             true,
         )
@@ -1104,18 +1116,19 @@ mod tests {
                 media_type: media,
                 indexer_id: Uuid::parse_str(&row.get::<String>(0).unwrap()).unwrap(),
                 indexer_revision: 1,
-                client_id: Uuid::parse_str(&row.get::<String>(1).unwrap()).unwrap(),
-                client_revision: 1,
+                selection_kind: rss::SelectionKind::LegacyFixed,
+                client_id: Some(Uuid::parse_str(&row.get::<String>(1).unwrap()).unwrap()),
+                client_revision: Some(1),
             };
             drop(row);
-            blocked_client(&c, source.client_id, media, now().unwrap()).await;
+            blocked_client(&c, source.client_id.unwrap(), media, now().unwrap()).await;
             let other = if matches!(media, MediaDomain::Tv) {
                 MediaDomain::Movies
             } else {
                 MediaDomain::Tv
             };
-            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,1,'started','default',0,0,0)",params![source.client_id.to_string(),domain(other),domain(other)]).await.unwrap();
-            blocked_client(&c, source.client_id, other, now().unwrap()).await;
+            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,1,'started','default',0,0,0)",params![source.client_id.unwrap().to_string(),domain(other),domain(other)]).await.unwrap();
+            blocked_client(&c, source.client_id.unwrap(), other, now().unwrap()).await;
             c.execute("CREATE TRIGGER reject_backoff BEFORE UPDATE ON download_client_status BEGIN SELECT RAISE(ABORT,'fixture'); END",()).await.unwrap();
             assert!(
                 rss::accept_observed(&c, id, source, "b".repeat(40), true)
@@ -1196,6 +1209,9 @@ mod tests {
                 retryable: true,
                 retry_after_seconds: None,
                 client_failure: true,
+                definitely_not_submitted: false,
+                client_retry_kind: crate::providers::ClientRetryKind::Other,
+                client_retry_eligible: false,
             }),
             true,
         )

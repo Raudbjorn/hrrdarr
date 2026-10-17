@@ -490,3 +490,86 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     let _ = server.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn download_client_tags_are_scoped_retained_and_revision_guarded() {
+    let scratch = Sandbox::new();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    c.execute_batch(
+        "INSERT INTO tags(id,media_type,label) VALUES(1,'tv','tv-tag'),(2,'movies','movie-tag')",
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = providers::router(db.clone(), None).merge(hrrdarr::tags::router(db.clone()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = json!({"name":"tagged","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("http://{address}/unused"),"tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0,"tags":[1]},"movies":{"category":"movies","imported_category":null,"recent_priority":0,"older_priority":0,"tags":[2]}}});
+    let (status, created) =
+        request(address, "POST", "/api/v1/providers", &config.to_string()).await;
+    assert_eq!(status, 201, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let route = format!("/api/v1/providers/{id}");
+    for (media, tag) in [("tv", 1), ("movies", 2)] {
+        assert_eq!(created["settings"][media]["tags"], json!([tag]));
+        // Reverse references belong to the detail endpoint, not the tag record.
+        let (status, detail) = request(
+            address,
+            "GET",
+            &format!("/api/v1/{media}/tags/detail/{tag}"),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(detail["download_client_ids"], json!([id]));
+        assert_eq!(
+            request(
+                address,
+                "DELETE",
+                &format!("/api/v1/{media}/tags/{tag}"),
+                ""
+            )
+            .await
+            .0,
+            409
+        );
+    }
+    config["revision"] = json!(1);
+    config["settings"]["tv"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tags");
+    config["settings"]["movies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tags");
+    let (status, retained) = request(address, "PUT", &route, &config.to_string()).await;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained["settings"]["tv"]["tags"], json!([1]));
+    assert_eq!(retained["settings"]["movies"]["tags"], json!([2]));
+    assert_eq!(
+        request(address, "PUT", &route, &config.to_string()).await.0,
+        409
+    );
+    config["revision"] = json!(2);
+    for invalid in [json!([2]), json!([1, 1]), json!(null), json!([999])] {
+        config["settings"]["tv"]["tags"] = invalid;
+        assert_eq!(
+            request(address, "PUT", &route, &config.to_string()).await.0,
+            400
+        );
+    }
+    config["settings"]["tv"]["tags"] = json!([]);
+    let (status, cleared) = request(address, "PUT", &route, &config.to_string()).await;
+    assert_eq!(status, 200, "{cleared}");
+    assert_eq!(cleared["settings"]["tv"]["tags"], json!([]));
+    assert_eq!(cleared["settings"]["movies"]["tags"], json!([2]));
+    assert_eq!(
+        request(address, "DELETE", "/api/v1/tv/tags/1", "").await.0,
+        204
+    );
+    server.abort();
+}

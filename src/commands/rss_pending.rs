@@ -200,6 +200,13 @@ pub(super) async fn best(
     let mut best: Option<(crate::search::revision::ReleasePreference, Uuid)> = None;
     for item in items {
         let p = &item.work.public;
+        if matches!(
+            p.error_code.as_deref(),
+            Some("download_client_unavailable" | "local_storage_retry")
+        ) && p.not_before.is_some_and(|due| due > timestamp)
+        {
+            continue;
+        }
         if !singleton(&p.target) || !valid_target(c, p.source, p.origin.operation()).await? {
             continue;
         }

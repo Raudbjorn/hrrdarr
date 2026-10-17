@@ -115,6 +115,21 @@ fn validate_encoding(raw: &str) -> Result<()> {
     std::str::from_utf8(&decoded).map_err(|_| INVALID)?;
     Ok(())
 }
+fn client_tags(row: &Record) -> Result<Vec<i64>> {
+    let Some(value) = row.get("Tags") else {
+        return Ok(vec![]);
+    };
+    let Value::Text(raw) = value else {
+        return Err(INVALID);
+    };
+    let ids: Vec<i64> = serde_json::from_str(raw).map_err(|_| INVALID)?;
+    crate::tags::validate(&crate::tags::Assignment {
+        mode: crate::tags::Mode::Replace,
+        ids: ids.clone(),
+    })
+    .map_err(|_| INVALID)?;
+    Ok(ids)
+}
 pub(super) fn read(
     source: &Source,
     app: Application,
@@ -385,6 +400,7 @@ pub(super) fn read(
                     sequential_order: flag(settings, "sequentialOrder")?,
                     first_last_first: flag(settings, "firstAndLast")?,
                     add_tags: tv && flag(settings, "addSeriesTags")?,
+                    tags: Some(client_tags(row)?),
                 };
                 let config = ProviderSettings::Qbittorrent {
                     endpoint: url,
@@ -409,14 +425,15 @@ pub(super) fn read(
                 .columns
                 .iter()
                 .filter(|c| {
-                    !(table_name == "Indexers"
-                        && matches!(
-                            c.as_str(),
-                            "EnableRss"
-                                | "EnableAutomaticSearch"
-                                | "EnableInteractiveSearch"
-                                | "DownloadClientId"
-                        ))
+                    !(table_name == "DownloadClients" && c.as_str() == "Tags")
+                        && !(table_name == "Indexers"
+                            && matches!(
+                                c.as_str(),
+                                "EnableRss"
+                                    | "EnableAutomaticSearch"
+                                    | "EnableInteractiveSearch"
+                                    | "DownloadClientId"
+                            ))
                         && !matches!(
                             c.as_str(),
                             "Id" | "Name"
@@ -490,12 +507,44 @@ pub(super) async fn write(
         } else {
             None
         };
+        let download_client_tags = if let ProviderSettings::Qbittorrent { tv, movies, .. } =
+            &record.input.settings
+        {
+            let media = if matches!(report.application, Application::Sonarr) {
+                "tv"
+            } else {
+                "movies"
+            };
+            let scope = tv.as_ref().or(movies.as_ref()).ok_or(INVALID)?;
+            let mut ids = Vec::new();
+            let source_tags = scope.tags.as_ref().ok_or(INVALID)?;
+            for source_id in source_tags {
+                let mapped=conn.query("SELECT t.id FROM snapshot_mappings m JOIN tags t ON t.id=m.destination_id AND t.media_type=? WHERE m.application=? AND m.fingerprint=? AND m.destination_table='tags' AND m.source_id=?",params![media,report.application.name(),report.fingerprint.clone(),*source_id]).await?.next().await?;
+                if let Some(mapped) = mapped {
+                    ids.push(mapped.get::<i64>(0)?);
+                }
+            }
+            if ids.len() != source_tags.len() {
+                report.unsupported.push(Unsupported {
+                    table: "DownloadClients".into(),
+                    rows: 1,
+                    columns: vec!["Tags (unmapped; client not reconstructed)".into()],
+                });
+                continue;
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids)
+        } else {
+            None
+        };
         let mapped=conn.query("SELECT provider_id,provider_revision FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table=? AND source_id=?",params![report.application.name(),report.fingerprint.clone(),record.table,record.id]).await?.next().await?.map(|r|->Result<(String,i64)>{Ok((r.get(0)?,r.get(1)?))}).transpose()?;
         let outcome = crate::providers::import_configuration(
             conn,
             key,
             &record.input,
             download_client_id,
+            download_client_tags,
             &mut changes,
             mapped
                 .as_ref()

@@ -33,8 +33,15 @@ pub struct SearchCommandInput {
     pub target: MediaTarget,
     pub indexer_id: Uuid,
     pub indexer_revision: i64,
-    pub client_id: Uuid,
-    pub client_revision: i64,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_selection: Option<crate::providers::ClientSelection>,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_revision: Option<i64>,
     pub priority: CommandPriority,
 }
 #[derive(Serialize, ts_rs::TS)]
@@ -53,6 +60,8 @@ pub struct SearchCommand {
     pub error_code: Option<String>,
     pub fetched: u32,
     pub fetch_complete: bool,
+    pub selected_client_id: Option<Uuid>,
+    pub selected_client_attempts: Vec<rss::ClientAttempt>,
     pub selected_candidate_id: Option<Uuid>,
     pub selected_candidate_status: Option<String>,
     pub selected_candidate_error_code: Option<String>,
@@ -108,7 +117,7 @@ struct Context {
     db: Arc<Database>,
     client: RefreshClient,
 }
-const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id)";
+const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),c.selection_kind,(SELECT r.client_id FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),coalesce((SELECT json_group_array(json_object('ordinal',a.ordinal,'selection_round',a.selection_round,'client_id',a.client_id,'client_revision',a.client_revision,'state',a.state,'error_code',a.error_code,'created_at',a.created_at,'updated_at',a.updated_at)) FROM (SELECT a.* FROM rss_client_attempts a JOIN search_results s ON s.selected_candidate_id=a.candidate_id WHERE s.command_id=c.id ORDER BY a.ordinal) a),'[]')";
 fn parse_mode(s: &str) -> Result<SearchMode> {
     match s {
         "automatic" => Ok(SearchMode::Automatic),
@@ -138,7 +147,8 @@ fn command_row(r: libsql::Row) -> Result<SearchCommand> {
             media_type: media,
             indexer_id: uuid(r.get(5)?)?,
             indexer_revision: r.get(6)?,
-            client_id: uuid(r.get(7)?)?,
+            selection_kind: rss::SelectionKind::parse(&r.get::<String>(23)?)?,
+            client_id: r.get::<Option<String>>(7)?.map(uuid).transpose()?,
             client_revision: r.get(8)?,
         },
         priority: if r.get::<i64>(9)? == 1 {
@@ -155,6 +165,8 @@ fn command_row(r: libsql::Row) -> Result<SearchCommand> {
         error_code: r.get(16)?,
         fetched: r.get::<i64>(17)? as u32,
         fetch_complete: r.get::<i64>(18)? == 1,
+        selected_client_id: r.get::<Option<String>>(24)?.map(uuid).transpose()?,
+        selected_client_attempts: serde_json::from_str(&r.get::<String>(25)?).map_err(|_| bad())?,
         selected_candidate_id: r.get::<Option<String>>(19)?.map(uuid).transpose()?,
         selected_candidate_status: r.get(20)?,
         selected_candidate_error_code: r.get(21)?,
@@ -297,16 +309,35 @@ async fn evaluate(
     Ok(decision)
 }
 fn envelope(id: Uuid, command: &SearchCommand) -> String {
-    format!(
-        "search-result/{}/{}/{}/{}/{}/{}/{}",
-        id,
-        command.id,
-        command.source.indexer_id,
-        command.source.indexer_revision,
-        command.source.client_id,
-        command.source.client_revision,
-        domain(command.source.media_type)
-    )
+    if matches!(
+        command.source.selection_kind,
+        rss::SelectionKind::LegacyFixed
+    ) {
+        format!(
+            "search-result/{}/{}/{}/{}/{}/{}/{}",
+            id,
+            command.id,
+            command.source.indexer_id,
+            command.source.indexer_revision,
+            command
+                .source
+                .client_id
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            command.source.client_revision.unwrap_or_default(),
+            domain(command.source.media_type)
+        )
+    } else {
+        format!(
+            "search-result-v2/{}/{}/{}/{}/{}/{}",
+            id,
+            command.id,
+            command.source.indexer_id,
+            command.source.indexer_revision,
+            domain(command.source.media_type),
+            command.source.selection_kind.text()
+        )
+    }
 }
 pub(crate) fn router(db: Arc<Database>, client: RefreshClient) -> Router {
     Router::new()
@@ -334,28 +365,33 @@ async fn create(
     let input = input.map_err(|_| bad())?.0;
     let (media, episode, movie) = target_parts(&input.target);
     let id = episode.or(movie).ok_or_else(bad)?;
-    if !(1..=MAX_REVISION).contains(&id)
-        || !(1..=MAX_REVISION).contains(&input.indexer_revision)
-        || !(1..=MAX_REVISION).contains(&input.client_revision)
-    {
+    if !(1..=MAX_REVISION).contains(&id) || !(1..=MAX_REVISION).contains(&input.indexer_revision) {
         return Err(bad());
     }
+    let source = rss::RssTargetInput {
+        media_type: media,
+        indexer_id: input.indexer_id,
+        indexer_revision: input.indexer_revision,
+        client_selection: input.client_selection,
+        client_id: input.client_id,
+        client_revision: input.client_revision,
+    }
+    .normalize()?;
     let c = connection(&s.db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async{
  match read(&tx,input.request_id).await { Ok(existing)=>{
- if existing.mode!=input.mode||existing.target!=input.target||existing.source.indexer_id!=input.indexer_id||existing.source.indexer_revision!=input.indexer_revision||existing.source.client_id!=input.client_id||existing.source.client_revision!=input.client_revision||existing.priority.number()!=input.priority.number(){return Err(conflict())}
+ if existing.mode!=input.mode||existing.target!=input.target||existing.source.indexer_id!=input.indexer_id||existing.source.indexer_revision!=input.indexer_revision||existing.source.selection_kind!=source.selection_kind||existing.source.client_id!=source.client_id||existing.source.client_revision!=source.client_revision||existing.priority.number()!=input.priority.number(){return Err(conflict())}
  return bounded(existing)
  },Err(Error(StatusCode::NOT_FOUND,"search_command_not_found"))=>(),Err(e)=>return Err(e)}
- let source=rss::RssTarget{media_type:media,indexer_id:input.indexer_id,indexer_revision:input.indexer_revision,client_id:input.client_id,client_revision:input.client_revision};
  if !rss::valid_target(&tx,source,input.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
  // A selected offer must never depend on an unencrypted locator fallback.
  s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;
  let captured=identity(&tx,&input.target).await?;let timestamp=now()?;
  if command_capacity(&tx).await?>=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
- tx.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0)",params![input.request_id.to_string(),input.mode.text(),domain(media),episode,movie,captured,input.indexer_id.to_string(),input.indexer_revision,input.client_id.to_string(),input.client_revision,input.priority.number(),timestamp,timestamp]).await?;
+ tx.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete,selection_kind)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0,?)",params![input.request_id.to_string(),input.mode.text(),domain(media),episode,movie,captured,input.indexer_id.to_string(),input.indexer_revision,source.client_id.map(|v|v.to_string()),source.client_revision,input.priority.number(),timestamp,timestamp,source.selection_kind.text()]).await?;
  bounded(read(&tx,input.request_id).await?)
  }.await;
     Ok((StatusCode::ACCEPTED, finish(tx, outcome).await?))
@@ -589,7 +625,7 @@ async fn select(
     {
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "candidate_limit"));
     }
-    c.execute("INSERT INTO rss_candidates(id,command_id,search_result_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at)VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?,?,'pending','[]',?,?)",params![candidate_id.to_string(),id.to_string(),domain(command.source.media_type),command.source.indexer_id.to_string(),command.source.indexer_revision,command.source.client_id.to_string(),command.source.client_revision,fingerprint,title,sealed,series,movie,timestamp,timestamp]).await?;
+    c.execute("INSERT INTO rss_candidates(id,command_id,search_result_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at,selection_kind)VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?,?,'pending','[]',?,?,?)",params![candidate_id.to_string(),id.to_string(),domain(command.source.media_type),command.source.indexer_id.to_string(),command.source.indexer_revision,command.source.client_id.map(|v|v.to_string()),command.source.client_revision,fingerprint,title,sealed,series,movie,timestamp,timestamp,command.source.selection_kind.text()]).await?;
     if let Some(episode) = episode {
         c.execute(
             "INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id)VALUES(?,?,?)",

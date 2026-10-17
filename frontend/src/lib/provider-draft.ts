@@ -19,7 +19,5 @@ export function indexerOptions(scope:TvIndexerScope|MovieIndexerScope|null|undef
 export function eligibleDownloadClient(provider:Provider|null,domain:MediaDomain):provider is Provider {
   return !!provider && provider.enabled && provider.settings.implementation==='qbittorrent' && provider.settings[domain]!==null;
 }
-export function clientMatchesIndexer(indexer:Provider|null,client:Provider|null,domain:MediaDomain):boolean {
-  const scope=indexerScope(indexer,domain);
-  return !!indexer?.enabled && !!scope && eligibleDownloadClient(client,domain) && (!scope.download_client_id || scope.download_client_id===client.id);
-}
+const clientAttemptLabels:Record<string,string>={selected:'Client selected',prepared:'Ready to send',dispatching:'Sending',definitely_not_submitted:'Not submitted',observed:'Confirmed in client',unknown:'Outcome uncertain'};
+export const clientAttemptLabel=(state:string)=>clientAttemptLabels[state]??state;

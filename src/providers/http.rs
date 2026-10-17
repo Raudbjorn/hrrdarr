@@ -1,7 +1,10 @@
 //! Bounded transport for provider operations. URLs, headers and bodies never enter errors.
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -221,6 +224,38 @@ impl HttpOperation<'_> {
         headers: &[(String, String)],
         body: HttpRequestBody,
     ) -> Result<HttpResponse, HttpError> {
+        self.request_inner(endpoint, query, headers, body, None)
+            .await
+    }
+
+    /// qBittorrent distinguishes initial probe 401 from 403 before authentication.
+    /// Other consumers retain the existing sanitized authentication error contract.
+    pub(super) async fn request_with_auth_status(
+        &self,
+        endpoint: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        certificate_trust_failure: &AtomicBool,
+    ) -> Result<HttpResponse, HttpError> {
+        self.request_inner(
+            endpoint,
+            query,
+            headers,
+            body,
+            Some(certificate_trust_failure),
+        )
+        .await
+    }
+
+    async fn request_inner(
+        &self,
+        endpoint: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        certificate_trust_failure: Option<&AtomicBool>,
+    ) -> Result<HttpResponse, HttpError> {
         if endpoint.trim() != endpoint
             || endpoint.contains('\\')
             || endpoint.chars().any(char::is_control)
@@ -349,14 +384,21 @@ impl HttpOperation<'_> {
             };
             tokio::time::sleep_until(start).await;
             dispatched = true;
-            let mut response = self
-                .client
-                .client
-                .execute(request)
-                .await
-                .map_err(classify)?;
+            let mut response = self.client.client.execute(request).await.map_err(|error| {
+                if let Some(evidence) = certificate_trust_failure {
+                    evidence.store(is_certificate_trust_failure(&error), Ordering::Relaxed);
+                }
+                classify(error)
+            })?;
             let status = response.status();
             if status.as_u16() == 401 || status.as_u16() == 403 {
+                if certificate_trust_failure.is_some() {
+                    return Ok(HttpResponse {
+                        status: status.as_u16(),
+                        body: Vec::new(),
+                        set_cookies: Vec::new(),
+                    });
+                }
                 return Err(HttpError::Authentication);
             }
             if status.as_u16() == 429 {
@@ -441,6 +483,31 @@ fn validate_fields(fields: &[(String, String)]) -> Result<(), HttpError> {
     }
     Ok(())
 }
+fn is_certificate_trust_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    const MAX_ERROR_SOURCE_DEPTH: usize = 16;
+    let mut source = Some(error);
+    for _ in 0..MAX_ERROR_SOURCE_DEPTH {
+        let Some(error) = source else {
+            return false;
+        };
+        if matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        ) {
+            return true;
+        }
+        source = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(|error| {
+                error
+                    .get_ref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static))
+            })
+            .or_else(|| error.source());
+    }
+    false
+}
+
 fn classify(error: reqwest::Error) -> HttpError {
     if error.is_timeout() {
         HttpError::Timeout
@@ -468,6 +535,29 @@ fn retry_after(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn certificate_trust_detection_is_structured_and_bounded() {
+        let certificate =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        assert!(super::is_certificate_trust_failure(&certificate));
+        let wrapped = std::io::Error::other(certificate);
+        assert!(super::is_certificate_trust_failure(&wrapped));
+        assert!(!super::is_certificate_trust_failure(
+            &std::io::Error::other("invalid peer certificate: UnknownIssuer")
+        ));
+        assert!(!super::is_certificate_trust_failure(
+            &rustls::Error::General("certificate text".into())
+        ));
+        let mut deep: Box<dyn std::error::Error + Send + Sync> = Box::new(wrapped);
+        for _ in 0..20 {
+            deep = Box::new(std::io::Error::other(deep));
+        }
+        assert!(
+            !super::is_certificate_trust_failure(deep.as_ref()),
+            "bounded traversal must stop"
+        );
+    }
+
     use super::*;
     use axum::{Router, response::IntoResponse, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

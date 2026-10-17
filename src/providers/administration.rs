@@ -84,6 +84,7 @@ pub enum ProviderDefaults {
         sequential_order: bool,
         first_last_first: bool,
         add_tags: bool,
+        tags: Vec<i64>,
     },
 }
 #[derive(Serialize, ts_rs::TS)]
@@ -290,6 +291,7 @@ pub(super) async fn schema(
                 sequential_order: false,
                 first_last_first: false,
                 add_tags: false,
+                tags: vec![],
             },
         }],
     };
@@ -662,6 +664,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let context = Context {
             backoff_started: std::time::Instant::now(),
+            selection_cursor: Arc::new(std::sync::Mutex::new([None, None])),
             db: db.clone(),
             key: None,
             transport: Arc::new(http::HttpClient::new()),

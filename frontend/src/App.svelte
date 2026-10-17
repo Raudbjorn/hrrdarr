@@ -83,7 +83,9 @@
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
   const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
   const tagRelatedWithProfiles=$derived<Record<MediaDomain,SettingsWriteState>>({tv:releaseWrites.tv!=='idle'?releaseWrites.tv:tagRelatedWithDelay.tv,movies:releaseWrites.movies!=='idle'?releaseWrites.movies:tagRelatedWithDelay.movies});
-  const profileUsageVersion=$derived({tv:delayUsageVersion.tv+releaseUsageVersion.tv,movies:delayUsageVersion.movies+releaseUsageVersion.movies});
+  const profileUsageVersion=$derived({tv:delayUsageVersion.tv+releaseUsageVersion.tv+providerVersion,movies:delayUsageVersion.movies+releaseUsageVersion.movies+providerVersion});
+  const tagRelatedWithProviders=$derived<Record<MediaDomain,SettingsWriteState>>({tv:providerWrite!=='idle'?providerWrite:tagRelatedWithProfiles.tv,movies:providerWrite!=='idle'?providerWrite:tagRelatedWithProfiles.movies});
+  const providerRelatedWrite=$derived(activityWrite!=='idle'?activityWrite:tagWrites.tv!=='idle'?tagWrites.tv:tagWrites.movies);
   let adding = $state(false), term = $state(''), results: LookupResult[] = $state([]), choice: LookupResult | null = $state(null), path = $state(''), searching = $state(false), searched = $state(false);
   let seriesType = $state(''), seasonFolder = $state(''), sceneNumbering = $state(''), newItems = $state(''), availability = $state('');
   let profiles: QualityProfilePage | null = $state(null), profileId: number | null = $state(null), profilesLoading = $state(false), profilesError = $state('');
@@ -167,7 +169,7 @@
   {#if view === 'settings-index'}<SettingsIndex />{/if}
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
-  {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={activityWrite} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
+  {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={providerRelatedWrite} {tagVersions} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
   {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
   {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
   {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
@@ -180,7 +182,7 @@
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
-  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProfiles} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
+  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
   {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}{#if saving}<p role="status">Saving library changes…</p>{/if}

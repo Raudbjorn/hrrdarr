@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { ApiPage, DownloadScope, Provider, ProviderImplementation, ProviderInput, ProviderSettings, ProviderTemplate, ProviderTestResult } from './api.generated';
+  import type { ApiPage, MediaDomain, Tag, DownloadScope, Provider, ProviderImplementation, ProviderInput, ProviderSettings, ProviderTemplate, ProviderTestResult } from './api.generated';
   import {eligibleDownloadClient,indexerOptions,matchesPendingProvider,type PendingProvider} from './provider-draft';
   import type {SettingsWriteState} from './api';
-  import {readDownloadHandling, listProviders, getProvider, getProviderSchema, createProvider, updateProvider, deleteProvider, testProvider } from './api';
-  let {relatedWrite='idle',onwrite=()=>{},onchange=()=>{}}:{relatedWrite?:SettingsWriteState;onwrite?:(state:SettingsWriteState)=>void;onchange?:()=>void}=$props();
+  import {listTags, readDownloadHandling, listProviders, getProvider, getProviderSchema, createProvider, updateProvider, deleteProvider, testProvider } from './api';
+  let {relatedWrite='idle',tagVersions={tv:0,movies:0},onwrite=()=>{},onchange=()=>{}}:{relatedWrite?:SettingsWriteState;tagVersions?:Record<MediaDomain,number>;onwrite?:(state:SettingsWriteState)=>void;onchange?:()=>void}=$props();
   $effect(()=>onwrite(busy?'busy':uncertain?'uncertain':'idle'));
   function discard(){return !busy&&relatedWrite==='idle'&&(!dirty||window.confirm('Discard unsaved provider changes?'));}
   let pendingCreation=$state<PendingProvider|null>(null);
@@ -12,6 +12,15 @@
   let editing = $state(false), implementation: ProviderImplementation = $state('torznab'), name = $state(''), endpoint = $state(''), enabled = $state(true), priority = $state(1);
   let tv = $state(true), movies = $state(false), tvCategories = $state(''), animeCategories = $state(''), movieCategories = $state(''), tvCategory = $state(''), movieCategory = $state('');
   let tvOptions=$state(indexerOptions(null)), movieOptions=$state(indexerOptions(null));
+  let clientTags=$state<Record<MediaDomain,Tag[]>>({tv:[],movies:[]}),tvTags=$state<number[]>([]),movieTags=$state<number[]>([]);
+  let tagLoading=$state(false),tagLoaded=$state(false),tagError=$state(''),loadedTagVersions=$state({tv:-1,movies:-1}),tagEpoch=0;
+  const tagsStale=$derived(loadedTagVersions.tv!==tagVersions.tv||loadedTagVersions.movies!==tagVersions.movies);
+  async function loadClientTags(){
+    if(locked)return;const token=++tagEpoch,versions={...tagVersions};tagLoading=true;tagError='';
+    const results=await Promise.all([listTags('tv'),listTags('movies')]);if(!alive||token!==tagEpoch)return;tagLoading=false;
+    if(results[0].ok&&results[1].ok){clientTags={tv:results[0].data,movies:results[1].data};loadedTagVersions=versions;tagLoaded=true;}
+    else{const failed=results.find(r=>!r.ok);tagError=failed&&!failed.ok?failed.error:'Tag catalog could not be read';}
+  }
   let credentialAction = $state('preserve'), credentialKind = $state<'api_key' | 'username_password'>('api_key'), apiKey = $state(''), username = $state(''), password = $state('');
   let loading = $state(false), busy = $state(false), dirty = $state(false), confirmingDelete = $state(false), conflict = $state(false), uncertain = $state(false);
   let error = $state(''), notice = $state(''), testResult: ProviderTestResult | null = $state(null);
@@ -23,7 +32,7 @@
     pendingCreation=null;selected = item; editing = true; confirmingDelete = false; conflict = false; uncertain = false; error = ''; notice = ''; testResult = null; clearSecrets(); credentialAction = 'preserve';
     if (item) {
       implementation = item.settings.implementation; name = item.name; endpoint = item.settings.endpoint; enabled = item.enabled; priority = item.priority; tv = !!item.settings.tv; movies = !!item.settings.movies;
-      if (item.settings.implementation === 'qbittorrent') {tvCategory = item.settings.tv?.category ?? ''; movieCategory = item.settings.movies?.category ?? ''; tvCategories = ''; animeCategories = ''; movieCategories = '';}
+      if (item.settings.implementation === 'qbittorrent') {tvTags=[...(item.settings.tv?.tags??[])];movieTags=[...(item.settings.movies?.tags??[])];tvCategory = item.settings.tv?.category ?? ''; movieCategory = item.settings.movies?.category ?? ''; tvCategories = ''; animeCategories = ''; movieCategories = '';}
       else {tvOptions=indexerOptions(item.settings.tv);movieOptions=indexerOptions(item.settings.movies);tvCategories = item.settings.tv?.categories.join(', ') ?? ''; animeCategories = item.settings.tv?.anime_categories.join(', ') ?? ''; movieCategories = item.settings.movies?.categories.join(', ') ?? ''; tvCategory = ''; movieCategory = '';}
     } else {name = ''; endpoint = ''; tv = true; movies = false; tvCategory = ''; movieCategory = ''; defaults();}
     credentialKind = implementation === 'qbittorrent' ? 'username_password' : 'api_key';
@@ -31,6 +40,7 @@
   }
   function defaults() {
     const current = templates.find(item => item.implementation === implementation);
+    tvTags=[];movieTags=[];
     tvOptions=indexerOptions(current?.defaults.kind==='indexer'?current.defaults.tv:null);
     movieOptions=indexerOptions(current?.defaults.kind==='indexer'?current.defaults.movies:null);
     enabled = current?.enabled ?? true; priority = current?.priority ?? 1;
@@ -62,18 +72,19 @@
     const numbers = parts.map(Number);
     return numbers.some(id => !Number.isSafeInteger(id) || id > 2147483647) || new Set(numbers).size !== numbers.length ? null : numbers;
   }
-  function downloadScope(category: string, existing: DownloadScope | null | undefined): DownloadScope | null {
-    if (existing) return {...existing, category};
+  function downloadScope(category: string, tags:number[], existing: DownloadScope | null | undefined): DownloadScope | null {
+    if (existing) return {...existing, category, tags};
     if (template?.defaults.kind !== 'download_client') return null;
     const {kind: _, ...defaults} = template.defaults;
-    return {...defaults, category};
+    return {...defaults, category, tags};
   }
   function input(): ProviderInput | null {
     if (!tv && !movies) {error = 'Enable at least one media scope.'; return null;}
     let settings: ProviderSettings;
     if (implementation === 'qbittorrent') {
+      if(!tagLoaded||tagLoading||tagsStale||tagError){error='Reload the client tag choices before saving.';return null;}
       const saved = selected?.settings.implementation === 'qbittorrent' ? selected.settings : null;
-      const tvScope = tv ? downloadScope(tvCategory, saved?.tv) : null, movieScope = movies ? downloadScope(movieCategory, saved?.movies) : null;
+      const tvScope = tv ? downloadScope(tvCategory, tvTags, saved?.tv) : null, movieScope = movies ? downloadScope(movieCategory, movieTags, saved?.movies) : null;
       if ((tv && !tvScope) || (movies && !movieScope)) {error = 'Provider defaults are unavailable. Reload provider settings.'; return null;}
       settings = {implementation, endpoint, tv:tvScope, movies:movieScope};
     } else {
@@ -127,20 +138,20 @@
     else {error = result.error; conflict = result.status === 409; uncertain = result.status===undefined||result.status>=500; if (uncertain) error += ' Deletion may have completed. Refresh the list before retrying.';}
   }
   onMount(() => {
-    alive = true; void load();
+    alive = true; void load(); void loadClientTags();
     void Promise.all([getProviderSchema('tv','indexer'),getProviderSchema('tv','download_client')]).then(results => {
       if (!alive) return;
       templates = results.flatMap(result => result.ok ? result.data.templates : []);
       const failed = results.find(result => !result.ok); if (failed && !failed.ok) error = failed.error;
     });
-    return () => {alive = false; ++selectionVersion; ++listVersion; clearSecrets();};
+    return () => {alive = false; ++selectionVersion; ++listVersion; ++tagEpoch; clearSecrets();};
   });
 </script>
 <svelte:window onbeforeunload={event=>{if(dirty||busy||uncertain){event.preventDefault();event.returnValue='';}}} />
 
 <section aria-labelledby="providers-heading">
   {#if uncertain&&pendingCreation}<p role="alert">Creation outcome unknown. Browse saved providers and explicitly adopt a matching configuration. Matching records are shown separately by ID; none is assumed to be this request’s result. A new creation will not be sent while unresolved.</p>{/if}
-  {#if relatedWrite!=='idle'}<p role="alert">Completed-download settings have a pending or unknown write. Resolve it in Activity before changing providers.</p>{/if}
+  {#if relatedWrite!=='idle'}<p role="alert">Related download settings or tags have a pending or unknown write. Resolve it before changing providers.</p>{/if}
   <div class="heading"><div><h1 id="providers-heading">Providers</h1><p>Configure indexers and download clients for TV, movies or both.</p></div><button class="primary" disabled={locked || !templates.length} onclick={() => {if(!discard())return;++selectionVersion; implementation = 'torznab'; fill(null);}}>New provider</button></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
   <div class="providers-workspace">
@@ -161,19 +172,20 @@
           </fieldset>
           <fieldset disabled={locked || conflict}><legend>Media scopes</legend>
             <label class="check"><input type="checkbox" bind:checked={tv} />TV scope</label>
-            {#if tv}{#if implementation === 'qbittorrent'}<label>TV download category<input bind:value={tvCategory} required maxlength="64" /></label>{:else}<label>TV categories<input bind:value={tvCategories} placeholder="5000" /></label><label>Anime categories<input bind:value={animeCategories} placeholder="5070" /></label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_rss} />TV RSS</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_automatic_search} />TV automatic search</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_interactive_search} />TV interactive search</label>
+            {#if tv}{#if implementation === 'qbittorrent'}<label>TV download category<input bind:value={tvCategory} required maxlength="64" /></label><label>TV client eligibility tags<select multiple bind:value={tvTags} disabled={tagLoading||tagsStale||!tagLoaded}>{#each clientTags.tv as tag(tag.id)}<option value={tag.id}>{tag.label}</option>{/each}{#each tvTags.filter(id=>!clientTags.tv.some(tag=>tag.id===id)) as id(id)}<option value={id}>Unavailable tag {id}</option>{/each}</select></label>{:else}<label>TV categories<input bind:value={tvCategories} placeholder="5000" /></label><label>Anime categories<input bind:value={animeCategories} placeholder="5070" /></label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_rss} />TV RSS</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_automatic_search} />TV automatic search</label><label class="check"><input type="checkbox" bind:checked={tvOptions.enable_interactive_search} />TV interactive search</label>
               <label>TV bound download client<select bind:value={tvOptions.download_client_id}><option value={null}>Any enabled TV client</option>{#if tvOptions.download_client_id&&!page?.items.some(p=>p.id===tvOptions.download_client_id&&eligibleDownloadClient(p,'tv'))}<option value={tvOptions.download_client_id}>Saved client {tvOptions.download_client_id} (unavailable on this page)</option>{/if}{#each page?.items.filter(p=>eligibleDownloadClient(p,'tv'))??[] as client(client.id)}<option value={client.id}>{client.name}</option>{/each}</select></label>{/if}{/if}
             <label class="check"><input type="checkbox" bind:checked={movies} />Movie scope</label>
-            {#if movies}{#if implementation === 'qbittorrent'}<label>Movie download category<input bind:value={movieCategory} required maxlength="64" /></label>{:else}<label>Movie categories<input bind:value={movieCategories} required placeholder="2000" /></label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_rss} />Movie RSS</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_automatic_search} />Movie automatic search</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_interactive_search} />Movie interactive search</label>
+            {#if movies}{#if implementation === 'qbittorrent'}<label>Movie download category<input bind:value={movieCategory} required maxlength="64" /></label><label>Movie client eligibility tags<select multiple bind:value={movieTags} disabled={tagLoading||tagsStale||!tagLoaded}>{#each clientTags.movies as tag(tag.id)}<option value={tag.id}>{tag.label}</option>{/each}{#each movieTags.filter(id=>!clientTags.movies.some(tag=>tag.id===id)) as id(id)}<option value={id}>Unavailable tag {id}</option>{/each}</select></label>{:else}<label>Movie categories<input bind:value={movieCategories} required placeholder="2000" /></label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_rss} />Movie RSS</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_automatic_search} />Movie automatic search</label><label class="check"><input type="checkbox" bind:checked={movieOptions.enable_interactive_search} />Movie interactive search</label>
               <label>Movie bound download client<select bind:value={movieOptions.download_client_id}><option value={null}>Any enabled Movie client</option>{#if movieOptions.download_client_id&&!page?.items.some(p=>p.id===movieOptions.download_client_id&&eligibleDownloadClient(p,'movies'))}<option value={movieOptions.download_client_id}>Saved client {movieOptions.download_client_id} (unavailable on this page)</option>{/if}{#each page?.items.filter(p=>eligibleDownloadClient(p,'movies'))??[] as client(client.id)}<option value={client.id}>{client.name}</option>{/each}</select></label>{/if}{/if}
-            <p>{implementation === 'qbittorrent' ? 'Use distinct, non-overlapping categories for TV and movies. Existing imported categories, priorities and download options are preserved.' : 'Enter the numeric category IDs advertised by your indexer, separated by commas. Use provider-list pages to browse client choices. A saved client binding is preserved even when unavailable; new requests require that client to be enabled for this scope. Other search options are preserved.'} Disabling a scope removes its saved settings.</p>
+            {#if implementation==='qbittorrent'}<button type="button" disabled={locked||tagLoading} onclick={loadClientTags}>Reload client tag choices</button>{#if tagLoading}<p role="status">Loading client tags…</p>{/if}{#if tagError}<p role="alert">{tagError}</p>{/if}{#if tagsStale&&tagLoaded}<p role="alert">Tag choices changed. Reload and review client tags.</p>{/if}<p>Default selection prefers clients whose eligibility tags match the series or movie. Untagged clients are used when no tagged client matches. These tags do not add labels to remote downloads.</p>{/if}
+            <p>{implementation === 'qbittorrent'  ? 'Use distinct, non-overlapping categories for TV and movies. Existing imported categories, priorities and download options are preserved.' : 'Enter the numeric category IDs advertised by your indexer, separated by commas. Use provider-list pages to browse client choices. A saved client binding is preserved even when unavailable; default selection requires that client to be eligible for this scope; an explicit client choice overrides the preference. Other search options are preserved.'} Disabling a scope removes its saved settings.</p>
           </fieldset>
           <fieldset disabled={locked || conflict}><legend>Credentials</legend>
             <label>Credential action<select bind:value={credentialAction} onchange={clearSecrets}><option value="preserve">{selected ? 'Preserve stored credentials' : 'No credentials'}</option><option value="replace">Replace entire credential bundle</option><option value="clear">Clear entire credential bundle</option></select></label>
             {#if credentialAction !== 'preserve'}<p class="credential-warning">{credentialAction === 'clear' ? 'Clearing removes' : 'Replacing discards'} the entire saved credential bundle, including any private TV/movie parameters not shown here.</p>{/if}
             {#if credentialAction === 'replace'}{#if implementation === 'qbittorrent'}<label>Credential type<select bind:value={credentialKind} onchange={clearSecrets}><option value="username_password">Username and password</option><option value="api_key">API key</option></select></label>{/if}{#if implementation === 'qbittorrent' && credentialKind === 'username_password'}<label>Username<input bind:value={username} autocomplete="off" required maxlength="4096" /></label><label>Password<input type="password" bind:value={password} autocomplete="new-password" required maxlength="4096" /></label>{:else}<label>API key<input type="password" bind:value={apiKey} autocomplete="new-password" required maxlength="4096" /></label>{/if}{/if}
           </fieldset>
-          <button class="primary" disabled={locked || conflict || !dirty || (!selected && !template)}>Save provider</button>
+          <button class="primary" disabled={locked || conflict || !dirty || (!selected && !template) || (implementation==='qbittorrent'&&(!tagLoaded||tagLoading||tagsStale||!!tagError))}>Save provider</button>
         </form>
         {#if selected}<div class="actions"><button disabled={locked || dirty || conflict || !selected.test_supported} onclick={test}>Test saved provider</button><button disabled={locked || conflict} onclick={() => confirmingDelete = !confirmingDelete}>Delete provider</button></div>{#if dirty}<p>Save or reload changes before testing. Tests always use the saved configuration.</p>{/if}{/if}
         {#if confirmingDelete}<div class="delete-confirm"><p>Delete configuration for {selected?.name}? This removes both saved scopes and credentials. It does not delete media or remote downloads.</p><button disabled={busy} onclick={remove}>Confirm delete configuration</button><button disabled={busy} onclick={() => confirmingDelete = false}>Cancel delete</button></div>{/if}

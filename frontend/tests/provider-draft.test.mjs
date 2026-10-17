@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {clientMatchesIndexer,eligibleDownloadClient,indexerOptions,matchesPendingProvider} from '../src/lib/provider-draft.ts';
+import {clientAttemptLabel,eligibleDownloadClient,indexerOptions,matchesPendingProvider} from '../src/lib/provider-draft.ts';
 test('unknown creation adoption compares all submitted public settings without equating unrelated records',()=>{
  const pending={name:'shared',enabled:true,priority:3,settings:{implementation:'qbittorrent',endpoint:'http://127.0.0.1:1234',tv:{category:'tv'},movies:{category:'movies'}}};
  const stored={id:'new',revision:1,has_credentials:true,...pending,settings:{movies:{category:'movies'},tv:{category:'tv'},endpoint:pending.settings.endpoint,implementation:'qbittorrent'}};
@@ -19,19 +19,15 @@ test('indexer draft retains false policies and bindings independently for each m
  }
  assert.deepEqual(indexerOptions(null),{enable_rss:true,enable_automatic_search:true,enable_interactive_search:true,download_client_id:null});
 });
-test('download selection enforces enabled same-domain binding and fails closed without a matching client',()=>{
+// Explicit choices override default indexer bindings; scoped eligibility still applies.
+test('explicit download choices require an enabled client in the requested scope',()=>{
  const client=(id,tv=true,movies=true,enabled=true)=>({id,enabled,settings:{implementation:'qbittorrent',tv:tv?{category:'tv'}:null,movies:movies?{category:'movies'}:null}});
- const indexer={enabled:true,settings:{implementation:'torznab',tv:{download_client_id:'tv-client'},movies:{download_client_id:'movie-client'}}};
- for(const [domain,id] of [['tv','tv-client'],['movies','movie-client']]){
-  assert.equal(clientMatchesIndexer(indexer,client(id),domain),true);
-  for(const invalid of [null,client('other'),client(id,true,true,false),client(id,domain!=='tv',domain!=='movies'),{...indexer,id}]){
-   assert.equal(clientMatchesIndexer(indexer,invalid,domain),false);
-  }
-  const unbound={...indexer,settings:{...indexer.settings,[domain]:{download_client_id:null}}};
-  assert.equal(clientMatchesIndexer(unbound,client('chosen'),domain),true);
-  assert.equal(clientMatchesIndexer({...indexer,enabled:false},client(id),domain),false);
-  assert.equal(clientMatchesIndexer({...indexer,settings:{...indexer.settings,[domain]:null}},client(id),domain),false);
+ for(const domain of ['tv','movies']){
+  assert.equal(eligibleDownloadClient(client('chosen'),domain),true);
+  for(const invalid of [null,client('disabled',true,true,false),client('other-scope',domain!=='tv',domain!=='movies'),{enabled:true,settings:{implementation:'torznab',tv:{},movies:{}}}])assert.equal(eligibleDownloadClient(invalid,domain),false);
  }
- assert.equal(eligibleDownloadClient(indexer,'tv'),false);
- assert.equal(clientMatchesIndexer(null,client('chosen'),'tv'),false);
+ // Unknown persists after reconciliation stops, so its label must not promise an active check.
+ assert.equal(clientAttemptLabel('unknown'),'Outcome uncertain');
+ assert.equal(clientAttemptLabel('definitely_not_submitted'),'Not submitted');
+ assert.equal(clientAttemptLabel('future-state'),'future-state');
 });

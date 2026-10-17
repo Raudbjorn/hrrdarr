@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51);
+    assert_eq!(version(&c).await?, 52); // 0052 adds selection without changing backoff records.
     for i in [0, 1, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

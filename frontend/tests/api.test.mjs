@@ -374,6 +374,29 @@ test('release and RSS clients preserve explicit scopes, revisions, targets and u
   assert.equal(calls,1,'The client must not automatically repeat an uncertain RSS mutation');
 });
 
+test('RSS and search accept default or explicit intent and reject mixed or incomplete client authority',async()=>{
+ const indexer_id='00000000-0000-0000-0000-000000000001',client_id='00000000-0000-0000-0000-000000000002';
+ const seen=[];
+ await withFetch(async(path,options)=>{seen.push([path,JSON.parse(options.body)]);return json({});},async()=>{
+  for(const media_type of ['tv','movies'])for(const client_selection of [{kind:'default'},{kind:'explicit',provider_id:client_id,provider_revision:2}]){
+   const source={media_type,indexer_id,indexer_revision:1,client_selection};
+   assert.equal((await createRssCommand({target:source,priority:'normal'})).ok,true);
+   assert.equal((await saveRssSchedule({target:source,interval_seconds:900,enabled:false})).ok,true);
+   assert.equal((await createSearchCommand({...source,request_id:client_id,target:{media_type:media_type==='tv'?'episode':'movie',id:1},mode:'automatic',priority:'normal'})).ok,true);
+  }
+  const accepted=seen.length;
+  for(const invalid of [{},{client_id},{client_revision:2},{client_selection:null},{client_selection:{kind:'other'}},{client_selection:{kind:'explicit',provider_id:client_id,provider_revision:0}},{client_selection:{kind:'default'},client_id},{client_selection:{kind:'default'},client_revision:2}]){
+   const source={media_type:'tv',indexer_id,indexer_revision:1,...invalid};
+   assert.equal((await createRssCommand({target:source,priority:'normal'})).ok,false);
+   assert.equal((await saveRssSchedule({target:source,interval_seconds:900,enabled:false})).ok,false);
+   assert.equal((await createSearchCommand({...source,request_id:client_id,target:{media_type:'episode',id:1},mode:'automatic',priority:'normal'})).ok,false);
+  }
+  assert.equal(seen.length,accepted,'Invalid authority never reaches the network');
+ });
+ assert.equal(seen.length,12);
+ for(const [path,body] of seen){const source=path.startsWith('/api/v1/rss/')?body.target:body;assert.equal('client_id' in source,false);assert.ok(['default','explicit'].includes(source.client_selection.kind));}
+});
+
 test('processing policy and receipt requests retain domains, revisions and uncertain outcomes',async()=>{
   const provider='00000000-0000-0000-0000-000000000001',receipt='00000000-0000-0000-0000-000000000002';
   const seen=[];

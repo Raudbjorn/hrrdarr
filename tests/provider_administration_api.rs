@@ -129,7 +129,8 @@ async fn remote(
         permit.forget();
         s.active.fetch_sub(1, Ordering::SeqCst);
     }
-    if uri.path().contains("failure") {
+    // Reject the authenticated API request; a support-probe 401 is a generic transport failure.
+    if uri.path().contains("failure") && !uri.path().ends_with("webapiVersion") {
         return (StatusCode::UNAUTHORIZED, PRIVATE).into_response();
     }
     if uri.path().ends_with("webapiVersion") {

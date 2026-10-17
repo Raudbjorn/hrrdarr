@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,

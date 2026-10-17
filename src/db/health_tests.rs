@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -149,7 +149,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         }
         assert_eq!(&rows(&c, table).await?, &expected);
     }
-    // Exact removal of the one new count must recover every original predicate.
+    // Remove only the later selection-default exception and the health count to recover every old predicate.
     let added =
         "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
     for (name, sql) in &triggers {
@@ -160,6 +160,21 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             .await?
             .unwrap()
             .get::<String>(0)?;
+        // 0052 adds a default-only bypass of concrete client admission, retaining the complete legacy predicate.
+        let actual = if matches!(
+            name.as_str(),
+            "rss_commands_admit" | "search_commands_admit"
+        ) {
+            actual.replace(
+                "AND (NEW.selection_kind='default' OR EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+                "AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+            ).replace(
+                "p.enabled=1))) THEN RAISE(ABORT,'invalid RSS provider",
+                "p.enabled=1)) THEN RAISE(ABORT,'invalid RSS provider",
+            )
+        } else {
+            actual
+        };
         assert_eq!(actual.replace(added, ""), *sql);
     }
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE severity IS NULL AND checked_at IS NULL AND observed_generation IS NULL AND pending_reasons=0 AND compatibility_type='ImportMechanismCheck'").await?,2);
@@ -193,7 +208,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -626,7 +641,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -711,7 +726,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).

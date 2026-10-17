@@ -341,7 +341,14 @@ async fn offers(base: &str, id: &Value) -> Vec<Value> {
 // are seeded; neither a candidate nor an observed submission is fabricated in SQL.
 #[tokio::test]
 async fn automatic_and_interactive_search_preserve_context_targets_and_replay() {
-    for interactive in [false, true] {
+    for (interactive, selection) in [
+        (false, "legacy_fixed"),
+        (true, "legacy_fixed"),
+        (false, "default"),
+        (true, "default"),
+        (false, "explicit"),
+        (true, "explicit"),
+    ] {
         let scratch =
             Scratch(std::env::temp_dir().join(format!("hrrdarr-search-{}", uuid::Uuid::new_v4())));
         std::fs::create_dir(&scratch.0).unwrap();
@@ -416,7 +423,7 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                 remote_state.adds.lock().unwrap().len(),
                 if tv { 0 } else { 1 }
             );
-            let intent = input(
+            let mut intent = input(
                 &indexer,
                 &download,
                 tv,
@@ -426,6 +433,12 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                     "automatic"
                 },
             );
+            if selection != "legacy_fixed" {
+                let object = intent.as_object_mut().unwrap();
+                object.remove("client_id");
+                object.remove("client_revision");
+                object.insert("client_selection".into(), if selection == "default" { json!({"kind":"default"}) } else { json!({"kind":"explicit","provider_id":download["id"],"provider_revision":download["revision"]}) });
+            }
             let (code, command) =
                 request(&base, "POST", "/api/v1/search/commands", intent.clone()).await;
             assert_eq!(code, 202, "{command}");
@@ -482,6 +495,29 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                 done["selected_candidate_id"].as_str().unwrap().to_owned()
             };
             let receipt = observed(&base, &candidate_id).await;
+            assert_eq!(receipt["source"]["selection_kind"], selection);
+            assert_eq!(receipt["source"]["client_id"], download["id"]);
+            let (_, selected) = request(
+                &base,
+                "GET",
+                &format!(
+                    "/api/v1/search/commands/{}",
+                    command["id"].as_str().unwrap()
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(selected["selected_client_id"], download["id"]);
+            assert_eq!(
+                selected["selected_client_attempts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                usize::from(selection != "legacy_fixed")
+            );
+            if selection != "legacy_fixed" {
+                assert_eq!(selected["selected_client_attempts"][0]["state"], "observed");
+            }
             assert_eq!(
                 receipt["target"]["media_type"],
                 if tv { "tv" } else { "movies" }
@@ -1843,4 +1879,65 @@ async fn client_binding_change_during_search_preparation_never_reroutes_or_posts
             remote_server.stop().await;
         }
     }
+}
+
+#[tokio::test]
+async fn client_selection_input_is_closed_and_mixed_or_null_fields_are_rejected() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-selection-input-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    seed(&db).await;
+    let state = Arc::new(Remote::default());
+    let (remote_base, _remote) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(state.clone()),
+    )
+    .await;
+    let (base, _server, _client) = app(db.clone()).await;
+    let (indexer, download) = providers(&base, &remote_base).await;
+    for selection in [
+        json!(null),
+        json!({"kind":"default","provider_id":download["id"]}),
+        json!({"kind":"default","extra":true}),
+        json!({"kind":"other"}),
+        json!({"kind":"explicit","provider_id":download["id"]}),
+        json!({"kind":"explicit","provider_id":download["id"],"provider_revision":1,"extra":true}),
+    ] {
+        let mut search = input(&indexer, &download, true, "automatic");
+        search.as_object_mut().unwrap().remove("client_id");
+        search.as_object_mut().unwrap().remove("client_revision");
+        search["client_selection"] = selection.clone();
+        assert_eq!(
+            request(&base, "POST", "/api/v1/search/commands", search)
+                .await
+                .0,
+            400
+        );
+        let rss = json!({"target":{"media_type":"tv","indexer_id":indexer["id"],"indexer_revision":1,"client_selection":selection},"priority":"normal"});
+        assert_eq!(
+            request(&base, "POST", "/api/v1/rss/commands", rss).await.0,
+            400
+        );
+    }
+    for mixed in [json!(null), download["id"].clone()] {
+        let mut search = input(&indexer, &download, true, "automatic");
+        search["client_selection"] = json!({"kind":"default"});
+        search["client_id"] = mixed.clone();
+        assert_eq!(
+            request(&base, "POST", "/api/v1/search/commands", search)
+                .await
+                .0,
+            400
+        );
+        let rss = json!({"target":{"media_type":"tv","indexer_id":indexer["id"],"indexer_revision":1,"client_selection":{"kind":"default"},"client_id":mixed,"client_revision":1},"priority":"normal"});
+        assert_eq!(
+            request(&base, "POST", "/api/v1/rss/commands", rss).await.0,
+            400
+        );
+    }
+    assert!(state.indexer_requests.lock().unwrap().is_empty());
+    assert!(state.adds.lock().unwrap().is_empty());
 }

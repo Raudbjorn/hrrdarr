@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        51 // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+        52 // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     );
     Ok(())
 }

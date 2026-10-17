@@ -94,7 +94,8 @@ async fn upstream(
     headers: HeaderMap,
 ) -> Response {
     assert_eq!(headers["authorization"], format!("Bearer {SECRET}"));
-    if state.mode.load(Ordering::SeqCst) == 1 {
+    // Reject the authenticated API request; a support-probe 401 is a generic transport failure.
+    if state.mode.load(Ordering::SeqCst) == 1 && uri.path() != "/api/v2/app/webapiVersion" {
         return (StatusCode::UNAUTHORIZED, SECRET).into_response();
     }
     let args: std::collections::HashMap<String, String> =

@@ -6,7 +6,7 @@ impl Drop for Scratch {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
 }
-async fn search(
+pub(super) async fn search(
     c: &Connection,
     indexer: &str,
     client: &str,
@@ -22,7 +22,7 @@ async fn search(
     c.execute("INSERT INTO search_commands(id,mode,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,?,?,?,?,?,?,1,?,1,100,100)",params![id.clone(),mode,media,(media=="tv").then_some(1),(media=="movies").then_some(1),captured.to_string(),indexer,client]).await?;
     Ok(id)
 }
-async fn start(c: &Connection, id: &str) -> Result<(), Error> {
+pub(super) async fn start(c: &Connection, id: &str) -> Result<(), Error> {
     c.execute(
         "UPDATE search_commands SET status='running',attempts=1,started_at=100 WHERE id=?",
         [id],
@@ -30,7 +30,7 @@ async fn start(c: &Connection, id: &str) -> Result<(), Error> {
     .await?;
     Ok(())
 }
-async fn offer(
+pub(super) async fn offer(
     c: &Connection,
     cmd: &str,
     ordinal: i64,
@@ -42,7 +42,7 @@ async fn offer(
     c.execute("INSERT INTO search_results(id,command_id,ordinal,fingerprint,title,metadata_json,decision_json,private_payload,created_at,expires_at) VALUES(?,?,?,?,'Release','{}','{}',?,unixepoch()-?,unixepoch()-?+1800)",params![id.clone(),cmd,ordinal,fp,vec![1u8;bytes],age,age]).await?;
     Ok(id)
 }
-async fn select(c: &Connection, result: &str) -> Result<String, Error> {
+pub(super) async fn select(c: &Connection, result: &str) -> Result<String, Error> {
     select_target(c, result, None).await
 }
 async fn select_target(
@@ -113,7 +113,7 @@ async fn search_schema26_upgrade_rollback_transfer_origin_and_retention() -> Res
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: 0051 adds client backoff; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

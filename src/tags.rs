@@ -52,6 +52,7 @@ pub struct Detail {
     pub delay_profile_ids: Vec<i64>,
     pub release_profile_ids: Vec<i64>,
     pub excluded_release_profile_ids: Vec<i64>,
+    pub download_client_ids: Vec<uuid::Uuid>,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "TagOwners")]
@@ -403,13 +404,33 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
             "Tag reference graph exceeds its bound",
         ));
     }
+    let mut download_client_ids = Vec::new();
+    let mut rows = c.query("SELECT provider_id FROM download_client_tags WHERE tag_id=? AND media_type=? ORDER BY provider_id LIMIT 129",params![t.id,names(t.media_type).0]).await?;
+    while let Some(row) = rows.next().await? {
+        download_client_ids.push(uuid::Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tag_reference_invariant",
+                "Invalid client identity",
+            )
+        })?);
+    }
+    if download_client_ids.len() > 128 {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tag_reference_invariant",
+            "Tag reference graph exceeds its bound",
+        ));
+    }
     Ok(Detail {
-        in_use: count > 0
+        in_use: !download_client_ids.is_empty()
+            || count > 0
             || !delay_profile_ids.is_empty()
             || !release_profile_ids.is_empty()
             || !excluded_release_profile_ids.is_empty(),
         release_profile_ids,
         excluded_release_profile_ids,
+        download_client_ids,
         delay_profile_ids,
         tag: t,
         owner_count: count,

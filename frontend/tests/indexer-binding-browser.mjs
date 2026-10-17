@@ -58,20 +58,19 @@ async function openRss(domain){
 }
 async function checkSelection(panel,indexerLabel,clientLabel,bound,unbound,client,available){
  const indexer=panel.getByLabel(new RegExp(`^${indexerLabel}`)),select=panel.getByLabel(new RegExp(`^${clientLabel}`));
- await indexer.selectOption(bound.id);
- if(available){await page.waitForFunction(({label,id})=>Array.from(document.querySelectorAll('label')).find(el=>el.textContent.startsWith(label))?.querySelector('select')?.value===id,{label:clientLabel,id:client.id});assert.equal(await select.inputValue(),client.id);}
- else await panel.getByRole('alert').filter({hasText:/bound|configured|client/i}).first().waitFor();
- assert.equal(await select.isDisabled(),true);
+ await indexer.selectOption(bound.id);await ready(select);await select.selectOption('');
+ // Binding constrains server-side default resolution; explicit user intent can override it.
+ assert.equal(await select.inputValue(),'');
+ await panel.getByText(/Default selection uses this indexer/).waitFor();
  const actions=panel===rss?['Run RSS now','Save RSS schedule']:['Search to choose a download','Search and download best match'];
- for(const name of actions){const button=panel.getByRole('button',{name,exact:true});if(available)await ready(button);else assert.equal(await button.isDisabled(),true,`${name} must fail closed`);}
- await indexer.selectOption(unbound.id);await ready(select);await select.selectOption(client.alternativeId);
- assert.equal(await select.inputValue(),client.alternativeId);
- await indexer.selectOption(bound.id);
- if(available)await page.waitForFunction(({label,id})=>Array.from(document.querySelectorAll('label')).find(el=>el.textContent.startsWith(label))?.querySelector('select')?.value===id,{label:clientLabel,id:client.id});
- else await panel.getByRole('alert').filter({hasText:/bound|configured|client/i}).first().waitFor();
- assert.equal(await select.isDisabled(),true);
- for(const name of actions){const button=panel.getByRole('button',{name,exact:true});if(available)await ready(button);else assert.equal(await button.isDisabled(),true);}
+ for(const name of actions)await ready(panel.getByRole('button',{name,exact:true}));
+ await select.selectOption(client.alternativeId);assert.equal(await select.inputValue(),client.alternativeId);
+ for(const name of actions)await ready(panel.getByRole('button',{name,exact:true}));
+ await indexer.selectOption(unbound.id);assert.equal(await select.inputValue(),client.alternativeId);
+ await indexer.selectOption(bound.id);assert.equal(await select.inputValue(),client.alternativeId);
+ await select.selectOption('');
 }
+
 try{
  const download=category=>({category,imported_category:null,recent_priority:0,older_priority:0});
  const clientSettings={implementation:'qbittorrent',endpoint:providerOrigin,tv:download('tv'),movies:download('movies')};
@@ -103,11 +102,11 @@ try{
   await openRss(domain);await checkSelection(rss,'RSS indexer','RSS download client',bound,unbound,client,true);
   const saved=page.waitForResponse(r=>r.request().method()==='POST'&&new URL(r.url()).pathname==='/api/v1/rss/schedules');
   await rss.getByRole('button',{name:'Save RSS schedule',exact:true}).click();const response=await saved;assert.equal(response.status(),200);
-  const schedule=await response.json();assert.equal(schedule.target.client_id,client.id);assert.equal(schedule.target.media_type,domain);assert.equal(schedule.enabled,false);
+  const schedule=await response.json();assert.equal(schedule.target.client_id,null);assert.equal(schedule.target.selection_kind,'default');assert.equal(schedule.target.media_type,domain);assert.equal(schedule.enabled,false);
   await openSearch(domain);await checkSelection(search,'Download search indexer','Search download client',bound,unbound,client,true);
   const accepted=page.waitForResponse(r=>r.request().method()==='POST'&&new URL(r.url()).pathname==='/api/v1/search/commands');
   await search.getByRole('button',{name:'Search to choose a download',exact:true}).click();const responseSearch=await accepted;assert.equal(responseSearch.status(),202);
-  const command=await responseSearch.json();assert.equal(command.source.client_id,client.id);assert.equal(command.source.media_type,domain);
+  const command=await responseSearch.json();assert.equal(command.source.client_id,null);assert.equal(command.source.selection_kind,'default');assert.equal(command.source.media_type,domain);
  }
  await updateProvider(client.id,{enabled:false});await edit(bound);
  for(const prefix of ['TV','Movie'])assert.equal(await editor.getByLabel(new RegExp(`^${prefix} bound download client`)).inputValue(),client.id);
@@ -132,5 +131,5 @@ try{
   assert.equal(await editor.getByLabel(new RegExp(`^${prefix} bound download client`)).inputValue(),'');
  }
  assert.deepEqual(errors,[]);
- console.log('PASS real TV/movie indexer binding and policy editor roundtrip; RSS schedule/search admission use bound client; disabled/removed client blocks actions and retains saved binding; unbound indexer restores explicit choice; user can explicitly clear both removed-client bindings.');
+ console.log('PASS real TV/movie indexer binding and policy editor roundtrip; RSS schedule/search admission persist default intent; disabled/removed client retains saved binding while explicit alternatives remain selectable; user can explicitly clear both removed-client bindings.');
 }finally{await browser.close();}

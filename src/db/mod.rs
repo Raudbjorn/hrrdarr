@@ -220,6 +220,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "download_client_backoff",
         include_str!("../../migrations/0051_download_client_backoff.sql"),
     ),
+    (
+        "download_client_selection",
+        include_str!("../../migrations/0052_download_client_selection.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -362,7 +366,7 @@ impl Database {
             backup: None,
         };
         let conn = db.connect().await?;
-        db.backup = migrate(&conn, Some(&path)).await?;
+        db.backup = migrate(conn, Some(&path)).await?;
         Ok(db)
     }
 
@@ -375,7 +379,7 @@ impl Database {
             _owner: None,
             backup: None,
         };
-        migrate(&db.connect().await?, None).await?;
+        migrate(db.connect().await?, None).await?;
         Ok(db)
     }
 
@@ -566,24 +570,30 @@ async fn integrity(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
-    integrity(conn).await?;
-    let current = version(conn).await?;
+async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
+    integrity(&conn).await?;
+    let current = version(&conn).await?;
     if current == MIGRATIONS.len() {
         return Ok(None);
     }
     let path = local_path.ok_or("pending remote schema migrations require a verified remote backup/recovery strategy; database unchanged")?;
     let has_data = scalar(
-        conn,
+        &conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )
     .await?
         > 0;
     let backup = if has_data {
-        Some(backup(conn, path).await?)
+        Some(backup(&conn, path).await?)
     } else {
         None
     };
+    // This connection is owned here: cancellation drops it instead of exposing disabled enforcement.
+    conn.execute("PRAGMA foreign_keys = OFF", ()).await?;
+    let result: Result<Option<PathBuf>, Error> = async {
+        if scalar(&conn, "PRAGMA foreign_keys").await? != 0 {
+            return Err("migration table rebuild requires isolated foreign key suspension".into());
+        }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -597,6 +607,7 @@ async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
                 params![(index + 1) as i64, name, checksum(sql), sql]).await?;
         }
+        integrity(&tx).await?;
         Ok(())
     }.await;
     match result {
@@ -611,6 +622,22 @@ async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<
         }
     }
     Ok(backup)
+    }.await;
+    let restored: Result<(), Error> = async {
+        conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        if scalar(&conn, "PRAGMA foreign_keys").await? != 1 {
+            return Err("foreign key enforcement unavailable after migration".into());
+        }
+        Ok(())
+    }
+    .await;
+    match (result, restored) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(restore)) => {
+            Err(format!("{error}; restoring foreign key enforcement failed: {restore}").into())
+        }
+    }
 }
 
 async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
@@ -699,7 +726,8 @@ mod tests {
             .await
             .unwrap();
         let conn = db.connect().unwrap();
-        let error = migrate(&conn, None).await.unwrap_err();
+        let error = migrate(conn, None).await.unwrap_err();
+        let conn = db.connect().unwrap();
         assert!(
             error
                 .to_string()
@@ -786,3 +814,5 @@ mod indexer_backoff_tests;
 
 #[cfg(test)]
 mod download_client_backoff_tests;
+#[cfg(test)]
+mod download_client_selection_tests;

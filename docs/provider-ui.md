@@ -12,7 +12,7 @@ category IDs or download category names. Editing preserves the complete saved sc
 object, including indexer search flags and qBittorrent imported categories,
 priorities, initial state, content layout, sequential/first-last options and tags.
 The form edits categories, per-domain RSS/automatic/interactive search switches,
-and each indexer scope’s download-client binding. Other options are preserved.
+each indexer scope’s download-client preference, and qBittorrent eligibility tags for each domain. Eligibility tags come from the local tag catalog and are separate from tags added to remote torrents. Other options are preserved.
 Client choices include enabled qBittorrent clients supporting that domain; use the
 provider-list pages to browse choices. An existing binding outside the current page
 or no longer available remains visible by ID and is preserved until explicitly
@@ -45,16 +45,9 @@ Development uses the explicit server-side `HRRDARR_API_ORIGIN` Vite proxy descri
 in [library-ui.md](library-ui.md); no production static serving, CORS bypass or live
 service default is introduced.
 
-RSS and download-search forms honor the selected indexer’s domain-specific binding.
-They fetch the bound client by ID even when it is outside the current provider page,
-lock that selection, and block new requests with a visible explanation when the
-client is missing, disabled, or does not support the domain. Unbound indexers retain
-manual client selection. RSS and search actions also respect their corresponding
-scope switches. Switching RSS domains resets provider selection; the library keys
-search components by media target so their selections and pending reads are disposed
-when the target changes. Backend revision and binding checks remain authoritative
-if a provider changes after the form loads. Reconciliation of previously submitted
-work is independent of this selection UI.
+RSS and download-search forms start with default client selection and allow an explicit override, including when the indexer has a preferred client. The preference remains visible even when unavailable; actual default resolution happens against the matched library owner's tags on the server. Requests persist their selection intent. RSS schedules retain default intent, and release/search details display the current client and ordered attempts with their selection rounds, including safe failure and uncertainty. Scope switches, provider revisions and backend validation still apply. Switching RSS domains resets selection; the library keys search components by target so pending reads are disposed when that target changes.
+
+Provider tag editing requires a current scoped tag catalog. Provider/library/profile writes invalidate related tag usage, and a missing tag remains visible until the draft is reconciled. Tags used by clients appear in tag usage and cannot be deleted while referenced.
 
 ## Verification limits
 
@@ -62,8 +55,9 @@ Run `node frontend/tests/indexer-binding-browser.mjs` against a fresh
 [owned browser fixture](library-ui.md#runnable-isolated-browser-verification),
 with its `UI_URL`, `UI_PROVIDER_ORIGIN` and `UI_SCRATCH`. The scenario checks
 both-domain binding and policy save/reload, actual RSS schedule/search admission,
-disabled/deleted client handling, restoration of unbound client selection, and
+disabled/deleted preference retention, explicit override availability, and
 explicit clearing of deleted-client bindings.
+`client-selection-browser.mjs` additionally requires `UI_ALTERNATE_PROVIDER_ORIGIN` from the same owned fixture. It exercises two independent mock clients, scoped tag editing, TV fallback, movie single-client failure, an explicit override, safe exhaustion and same-client round recovery on actual retry deadlines, and uncertain submission reconciliation. These scripts require recorded successful runs before being treated as verification evidence.
 Backend binding and interrupted-submission regressions live in
 `tests/rss_commands.rs` and `tests/search_commands.rs`.
 
@@ -74,5 +68,4 @@ endpoints and owned mock providers, including authentication failure/success,
 scoped setting preservation and stale revisions. Such checks do not establish live
 provider equivalence or complete settings parity. Draft testing, presets, discovered
 category selection, advanced scope editors, bulk operations, every remaining
-provider and full routes `ui.010`/`ui.013` remain required work. No dependency,
-backend route or schema change is introduced by this UI.
+provider and full routes `ui.010`/`ui.013` remain required work. No new backend route is introduced. Migration 0052 supplies scoped eligibility tags and durable selection attempts and rounds. The provider transport directly references the already-locked Rust TLS dependency to distinguish certificate-trust failures without exposing private error text.

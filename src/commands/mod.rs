@@ -218,6 +218,11 @@ pub struct RefreshScheduleInput {
     pub enabled: bool,
     pub interval_seconds: u32,
 }
+pub(super) fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
 fn required_nullable<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<i64>, D::Error> {

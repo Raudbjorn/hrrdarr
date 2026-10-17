@@ -194,6 +194,8 @@ async fn mode(
         Some("2") => 2,
         Some("3") => 3,
         Some("4") => 4,
+        // Record an add while withholding its successful response and observation.
+        Some("5") => 5,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
@@ -350,6 +352,19 @@ async fn observations(
     Json(state.0.lock().unwrap().clone())
 }
 // Synthetic credentials are accepted only by this owned loopback server.
+fn provider_router() -> Router {
+    Router::new()
+        .route("/fixture-observations", get(observations))
+        .route("/fixture-mode", post(mode))
+        .route("/fixture-indexer-mode", post(indexer_mode))
+        .route("/fixture-processing", post(processing_mode))
+        .route("/fixture-search", post(search_mode))
+        .route("/fixture-completed", get(completed_observations))
+        .route("/fixture-complete-search", post(complete_search))
+        .fallback(provider_mock)
+        .with_state(Arc::new(ProviderObservations::default()))
+}
+
 async fn provider_mock(
     State(state): State<Arc<ProviderObservations>>,
     OriginalUri(uri): OriginalUri,
@@ -493,7 +508,8 @@ async fn provider_mock(
             .and_then(|h| h.to_str().ok())
             .is_some_and(|v| v.contains("SID=fixture-session"));
     if !authorized {
-        return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
+        // qBittorrent's support probe uses 403 for login; 401 is a generic probe failure.
+        return (StatusCode::FORBIDDEN, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
     }
     // Bounded owned health probe delay for pending-generation/cancel browser checks.
     if uri.path() == "/api/v2/app/preferences" && state.1.load(Ordering::SeqCst) == 3 {
@@ -501,6 +517,8 @@ async fn provider_mock(
     }
     if uri.path() == "/api/v2/torrents/info" {
         match state.1.load(Ordering::SeqCst) {
+            // The add is recorded below, but its response and later observation remain uncertain.
+            5 => return Json(json!([])).into_response(),
             1 => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -555,6 +573,9 @@ async fn provider_mock(
                 name(tv).to_owned()
             };
             state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":download_name,"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{download_name}")}));
+            if state.1.load(Ordering::SeqCst) == 5 {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             return "Ok.".into_response();
         }
         if uri.path() == "/api/v2/torrents/setForceStart" {
@@ -794,19 +815,8 @@ async fn library_ui_fixture() {
             .await
             .unwrap(),
     );
-    let (provider_origin, _providers) = serve(
-        Router::new()
-            .route("/fixture-observations", get(observations))
-            .route("/fixture-mode", post(mode))
-            .route("/fixture-indexer-mode", post(indexer_mode))
-            .route("/fixture-processing", post(processing_mode))
-            .route("/fixture-search", post(search_mode))
-            .route("/fixture-completed", get(completed_observations))
-            .route("/fixture-complete-search", post(complete_search))
-            .fallback(provider_mock)
-            .with_state(Arc::new(ProviderObservations::default())),
-    )
-    .await;
+    let (provider_origin, _providers) = serve(provider_router()).await;
+    let (alternate_provider_origin, alternate_providers) = serve(provider_router()).await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
     let release_fixture = release_profile_fixture(db.clone(), &scratch.0).await;
@@ -879,7 +889,7 @@ async fn library_ui_fixture() {
     let shutdown = scratch.0.join("shutdown");
     println!(
         "UI_FIXTURE {}",
-        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
+        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
     while !shutdown.exists() && tokio::time::Instant::now() < deadline {
@@ -890,4 +900,5 @@ async fn library_ui_fixture() {
     worker.shutdown().await;
     _metadata.stop().await;
     _providers.stop().await;
+    alternate_providers.stop().await;
 }

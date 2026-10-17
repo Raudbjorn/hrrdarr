@@ -8,6 +8,7 @@ pub mod http;
 pub mod indexer;
 mod indexer_backoff;
 pub mod qbittorrent;
+pub(crate) mod selection;
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -25,6 +26,7 @@ use axum::{
 };
 pub use credentials::{CredentialKey, Credentials, IndexerAccess, IndexerParameter};
 use libsql::{Connection, params};
+pub use selection::ClientSelection;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
@@ -254,6 +256,13 @@ pub struct DownloadScope {
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub add_tags: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
 }
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(tag = "implementation", rename_all = "lowercase", deny_unknown_fields)]
@@ -340,6 +349,13 @@ impl ProviderSettings {
                         && !c.ends_with('/')
                 };
                 for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
                     if !category(&s.category)
                         || s.imported_category
                             .as_ref()
@@ -492,6 +508,7 @@ struct Context {
     key: Option<Arc<CredentialKey>>,
     transport: Arc<std::result::Result<http::HttpClient, http::HttpError>>,
     backoff_started: std::time::Instant,
+    selection_cursor: Arc<std::sync::Mutex<[Option<String>; 2]>>,
 }
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
     router_with_refresh(db, key).0
@@ -507,6 +524,7 @@ pub fn router_with_refresh(
         key,
         transport: Arc::new(http::HttpClient::new()),
         backoff_started: std::time::Instant::now(),
+        selection_cursor: Arc::new(std::sync::Mutex::new([None, None])),
     };
     let router = Router::new()
         .route("/api/v1/providers", get(list).post(create))
@@ -544,8 +562,78 @@ pub(crate) struct RefreshError {
     pub retryable: bool,
     pub retry_after_seconds: Option<u32>,
     pub client_failure: bool,
+    pub definitely_not_submitted: bool,
+    pub client_retry_kind: ClientRetryKind,
+    pub client_retry_eligible: bool,
+}
+/// Pending-release policy, independent of add safety and health attribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ClientRetryKind {
+    #[default]
+    Other = 0,
+    Unavailable = 1,
+    Authentication = 2,
 }
 pub(crate) type AutomationError = RefreshError;
+#[derive(Debug)]
+pub(crate) struct PreparationError {
+    pub error: AutomationError,
+    pub identity: Option<qbittorrent::SubmissionIdentity>,
+    pub client_changed: bool,
+    pub local_storage_failure: bool,
+}
+impl PreparationError {
+    fn release(error: AutomationError) -> Self {
+        Self {
+            error,
+            identity: None,
+            client_changed: false,
+            local_storage_failure: false,
+        }
+    }
+    fn lookup(error: Error) -> Self {
+        let local_storage_failure = matches!(&error, Error::Plain(_, "provider_database_error", _));
+        let mut failure = Self::configuration(refresh_error(error));
+        failure.local_storage_failure = local_storage_failure;
+        failure
+    }
+    fn configuration(error: AutomationError) -> Self {
+        let client_changed = matches!(error.code, "provider_changed" | "provider_unavailable");
+        Self {
+            error,
+            identity: None,
+            client_changed,
+            local_storage_failure: false,
+        }
+    }
+}
+
+// Keep local storage provenance at the lookup boundary; release/client HTTP
+// failures can share refresh_failed and must never acquire this classification.
+fn automation_lookup_error(error: Error) -> AutomationError {
+    if matches!(&error, Error::Plain(_, "provider_database_error", _)) {
+        RefreshError::new("provider_database_error", true)
+    } else {
+        refresh_error(error)
+    }
+}
+fn preparation_error(error: qbittorrent::QbitError) -> PreparationError {
+    let mapped = match error {
+        qbittorrent::QbitError::InvalidRequest => RefreshError::new("invalid_release", false),
+        // These requests fetch release bytes, never communicate with the download client.
+        qbittorrent::QbitError::Http(error) => {
+            let mut mapped = refresh_error(http_error(error).0);
+            if mapped.code == "provider_unavailable" {
+                mapped.code = "refresh_failed";
+            }
+            mapped
+        }
+        other => refresh_error(qbit_error(other).0),
+    };
+    PreparationError::release(mapped)
+}
+
 impl RefreshError {
     fn new(code: &'static str, retryable: bool) -> Self {
         Self {
@@ -553,6 +641,9 @@ impl RefreshError {
             retryable,
             retry_after_seconds: None,
             client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         }
     }
 }
@@ -563,10 +654,18 @@ fn refresh_error(error: Error) -> RefreshError {
             retryable: true,
             retry_after_seconds: Some(seconds.clamp(1, 86400)),
             client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         },
         Error::Plain(_, "provider_revision_conflict", _) => {
             RefreshError::new("provider_changed", false)
         }
+        Error::Plain(
+            _,
+            code @ ("download_client_unavailable" | "unsupported_target" | "refresh_limit"),
+            _,
+        ) => RefreshError::new(code, false),
         Error::Plain(_, "timeout", _) => RefreshError::new("refresh_timeout", true),
         Error::Plain(_, "response_too_large", _) => RefreshError::new("refresh_limit", false),
         Error::Plain(status, code, _)
@@ -583,6 +682,9 @@ fn refresh_error(error: Error) -> RefreshError {
             retryable: true,
             retry_after_seconds: Some(1),
             client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         },
         _ => RefreshError::new("refresh_failed", true),
     }
@@ -925,20 +1027,26 @@ impl RefreshClient {
         source: qbittorrent::AddSource,
         recent: bool,
         options: qbittorrent::QbitOptions,
-    ) -> std::result::Result<qbittorrent::PreparedDownload, AutomationError> {
+    ) -> std::result::Result<qbittorrent::PreparedDownload, PreparationError> {
         let context = &self.0;
         let (provider, _credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             network_snapshot(context, provider_id),
         )
         .await
-        .map_err(|_| RefreshError::new("refresh_timeout", true))?
-        .map_err(refresh_error)?;
+        .map_err(|_| PreparationError::release(RefreshError::new("refresh_timeout", true)))?
+        .map_err(PreparationError::lookup)?;
         if provider.revision != revision {
-            return Err(RefreshError::new("provider_changed", false));
+            return Err(PreparationError::configuration(RefreshError::new(
+                "provider_changed",
+                false,
+            )));
         }
         if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-            return Err(RefreshError::new("provider_unavailable", false));
+            return Err(PreparationError::configuration(RefreshError::new(
+                "provider_unavailable",
+                false,
+            )));
         }
         if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
             let scope = match &target {
@@ -946,19 +1054,22 @@ impl RefreshClient {
                 crate::db::MediaTarget::Movie(_) => movies.as_ref(),
             };
             if scope.is_some_and(|s| s.recent_priority != s.older_priority) {
-                return Err(RefreshError::new("unsupported_target", false));
+                return Err(PreparationError::release(RefreshError::new(
+                    "unsupported_target",
+                    false,
+                )));
             }
         }
         let transport = context
             .transport
             .as_ref()
             .as_ref()
-            .map_err(|e| refresh_error(http_error(*e).0))?;
+            .map_err(|e| PreparationError::release(refresh_error(http_error(*e).0)))?;
         let operation = transport
             .operation(provider.id)
-            .map_err(|e| refresh_error(http_error(e).0))?;
+            .map_err(|e| PreparationError::release(refresh_error(http_error(e).0)))?;
         let work = async {
-            let result = qbittorrent::prepare(
+            let prepared = qbittorrent::prepare(
                 &operation,
                 &provider.settings,
                 target,
@@ -967,18 +1078,25 @@ impl RefreshClient {
                 options,
             )
             .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
-            current_revision(&context.db, &provider)
-                .await
-                .map_err(refresh_error)?;
-            operation
-                .ensure_active()
-                .map_err(|e| refresh_error(http_error(e).0))?;
-            result
+            .map_err(preparation_error)?;
+            if let Err(error) = current_revision(&context.db, &provider).await {
+                let mut failure = PreparationError::lookup(error);
+                failure.identity = Some(prepared.into_identity());
+                return Err(failure);
+            }
+            if let Err(error) = operation.ensure_active() {
+                return Err(PreparationError {
+                    error: refresh_error(http_error(error).0),
+                    identity: Some(prepared.into_identity()),
+                    client_changed: false,
+                    local_storage_failure: false,
+                });
+            }
+            Ok(prepared)
         };
         tokio::time::timeout_at(operation.deadline(), work)
             .await
-            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+            .map_err(|_| PreparationError::release(RefreshError::new("refresh_timeout", true)))?
     }
     pub(crate) async fn submit_download(
         &self,
@@ -986,43 +1104,67 @@ impl RefreshClient {
         revision: i64,
         prepared: qbittorrent::PreparedDownload,
     ) -> std::result::Result<qbittorrent::AddOutcome, AutomationError> {
+        fn before_add(mut error: AutomationError) -> AutomationError {
+            error.definitely_not_submitted = true;
+            if matches!(error.code, "provider_changed" | "provider_unavailable") {
+                error.client_retry_eligible = true;
+                error.client_retry_kind = ClientRetryKind::Unavailable;
+            }
+            error
+        }
         let context = &self.0;
         let (provider, credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             network_snapshot(context, provider_id),
         )
         .await
-        .map_err(|_| RefreshError::new("refresh_timeout", true))?
-        .map_err(refresh_error)?;
+        .map_err(|_| before_add(RefreshError::new("refresh_timeout", true)))?
+        .map_err(|e| before_add(automation_lookup_error(e)))?;
         if provider.revision != revision {
-            return Err(RefreshError::new("provider_changed", false));
+            return Err(before_add(RefreshError::new("provider_changed", false)));
         }
         if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-            return Err(RefreshError::new("provider_unavailable", false));
+            return Err(before_add(RefreshError::new("provider_unavailable", false)));
         }
         let transport = context
             .transport
             .as_ref()
             .as_ref()
-            .map_err(|e| refresh_error(http_error(*e).0))?;
+            .map_err(|e| before_add(refresh_error(http_error(*e).0)))?;
         let operation = transport
             .operation(provider.id)
-            .map_err(|e| refresh_error(http_error(e).0))?;
+            .map_err(|e| before_add(refresh_error(http_error(e).0)))?;
         let work = async {
-            let result = qbittorrent::submit(
+            let result = qbittorrent::submit_classified(
                 &operation,
                 &provider.settings,
                 credentials.as_ref(),
                 prepared,
             )
             .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
+            .map_err(|e| {
+                let attributable = matches!(
+                    communication_error(e.error),
+                    CommunicationProbeError::RemoteFailure
+                );
+                let mut mapped = refresh_error(qbit_error(e.error).0);
+                mapped.definitely_not_submitted = e.definitely_not_submitted;
+                mapped.client_retry_kind = e.client_retry_kind;
+                mapped.client_retry_eligible = e.client_retry_eligible;
+                mapped.client_failure = attributable;
+                mapped
+            });
+            let safe = result.as_ref().is_err_and(|e| e.definitely_not_submitted);
+            let preserve_phase = |mut error: AutomationError| {
+                error.definitely_not_submitted = safe;
+                if safe { before_add(error) } else { error }
+            };
             current_revision(&context.db, &provider)
                 .await
-                .map_err(refresh_error)?;
+                .map_err(|e| preserve_phase(automation_lookup_error(e)))?;
             operation
                 .ensure_active()
-                .map_err(|e| refresh_error(http_error(e).0))?;
+                .map_err(|e| preserve_phase(refresh_error(http_error(e).0)))?;
             result
         };
         tokio::time::timeout_at(operation.deadline(), work)
@@ -1265,6 +1407,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 sequential_order: stored_bool(scope.get(11)?)?,
                 first_last_first: stored_bool(scope.get(12)?)?,
                 add_tags: stored_bool(scope.get(13)?)?,
+                tags: Some(selection::read_tags(conn, id, &media).await?),
             };
             if media == "tv" {
                 tv_client = Some(item)
@@ -1363,6 +1506,19 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             }
         }
     }
+    let mut retained_tags = std::collections::BTreeMap::new();
+    if let ProviderSettings::Qbittorrent { tv, movies, .. } = settings {
+        for (media, scope) in [("tv", tv), ("movies", movies)] {
+            if let Some(scope) = scope {
+                let tags = match &scope.tags {
+                    Some(tags) => tags.clone(),
+                    None => selection::read_tags(conn, id, media).await?,
+                };
+                selection::validate_tags(conn, media, &tags).await?;
+                retained_tags.insert(media, tags);
+            }
+        }
+    }
     conn.execute("DELETE FROM provider_scopes WHERE provider_id=?", [id])
         .await?;
     match settings {
@@ -1423,6 +1579,15 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         }
     }
     if matches!(settings, ProviderSettings::Qbittorrent { .. }) {
+        for (media, tags) in retained_tags {
+            for tag in tags {
+                conn.execute(
+                    "INSERT INTO download_client_tags(provider_id,media_type,tag_id) VALUES(?,?,?)",
+                    params![id, media, tag],
+                )
+                .await?;
+            }
+        }
         backoff::reconcile(conn, id).await?;
     }
     Ok(())
@@ -2459,6 +2624,7 @@ pub(crate) async fn import_configuration(
     key: Option<&CredentialKey>,
     input: &ProviderInput,
     download_client_id: Option<Uuid>,
+    download_client_tags: Option<Vec<i64>>,
     changes: &mut HealthConfigurationChanges,
     mapped: Option<(&str, i64)>,
 ) -> std::result::Result<Option<(String, i64, bool)>, &'static str> {
@@ -2478,6 +2644,10 @@ pub(crate) async fn import_configuration(
         }
     } else if download_client_id.is_some() {
         return Err(INVALID);
+    }
+    if let ProviderSettings::Qbittorrent { tv, movies, .. } = &mut settings {
+        let scope = tv.as_mut().or(movies.as_mut()).ok_or(INVALID)?;
+        scope.tags = download_client_tags;
     }
     if input.enabled {
         return Err(INVALID);
