@@ -196,8 +196,8 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
             // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
-            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013) uTorrent (dlc.017) Aria2 (dlc.002) and Flood (dlc.006).
-            assert_eq!(templates.len(), if kind == "indexer" { 2 } else { 9 });
+            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013) uTorrent (dlc.017) Aria2 (dlc.002) Flood (dlc.006) and DownloadStation (dlc.005).
+            assert_eq!(templates.len(), if kind == "indexer" { 2 } else { 10 });
             assert_eq!(
                 templates
                     .iter()
@@ -216,6 +216,7 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                         "utorrent",
                         "aria2",
                         "flood",
+                        "downloadstation",
                     ]
                 }
             );
@@ -240,7 +241,7 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                     assert_eq!(t["defaults"]["add_paused"], false);
                     assert_eq!(t["defaults"]["tags"], json!([]));
                     assert!(t["defaults"].get("category").is_none());
-                } else if ["deluge", "rtorrent", "utorrent", "aria2", "flood"]
+                } else if ["deluge", "rtorrent", "utorrent", "aria2", "flood", "downloadstation"]
                     .contains(&t["implementation"].as_str().unwrap())
                 {
                     assert_eq!(t["defaults"]["kind"], "label_torrent_client");

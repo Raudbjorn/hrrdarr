@@ -33,6 +33,7 @@ impl ProviderKind {
                     | ProviderSettings::Transmission { .. }
                     | ProviderSettings::Deluge { .. }
                     | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Downloadstation { .. }
                     | ProviderSettings::Flood { .. }
                     | ProviderSettings::Aria2 { .. }
                     | ProviderSettings::Utorrent { .. }
@@ -73,6 +74,7 @@ impl ProviderFilter {
                 | ProviderSettings::Transmission { .. }
                 | ProviderSettings::Deluge { .. }
                 | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Downloadstation { .. }
                 | ProviderSettings::Flood { .. }
                 | ProviderSettings::Aria2 { .. }
                 | ProviderSettings::Utorrent { .. }),
@@ -150,6 +152,7 @@ pub enum ProviderImplementation {
     Utorrent,
     Aria2,
     Flood,
+    Downloadstation,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -209,6 +212,7 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Transmission
         | ProviderImplementation::Deluge
         | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Downloadstation
         | ProviderImplementation::Flood
         | ProviderImplementation::Aria2
         | ProviderImplementation::Utorrent => vec![],
@@ -473,6 +477,20 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://flood.example:3000".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Downloadstation,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "https://nas.example:5001".into(),
                 },
             },
         ],

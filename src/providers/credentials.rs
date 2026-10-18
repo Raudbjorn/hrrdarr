@@ -306,7 +306,12 @@ impl Credentials {
             Self::ApiKey { api_key } => {
                 !matches!(
                     implementation,
-                    "transmission" | "nzbget" | "rtorrent" | "utorrent" | "flood"
+                    "transmission"
+                        | "nzbget"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
                 ) && valid(api_key)
             }
             Self::Indexer {
@@ -325,7 +330,13 @@ impl Credentials {
             Self::UsernamePassword { username, password } => {
                 matches!(
                     implementation,
-                    "qbittorrent" | "transmission" | "nzbget" | "rtorrent" | "utorrent" | "flood"
+                    "qbittorrent"
+                        | "transmission"
+                        | "nzbget"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
                 ) && valid(username)
                     && valid(password)
             }
