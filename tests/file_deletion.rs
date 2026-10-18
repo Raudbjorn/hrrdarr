@@ -792,3 +792,146 @@ async fn recycle_bin_health_reports_missing_bin_and_restores_per_domain() {
     assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 0);
     app.stop().await;
 }
+
+#[tokio::test]
+async fn movie_cleanup_runs_manually_and_on_schedule_without_touching_the_tv_bin() {
+    let (scratch, db, _lib) = sandbox("movie-cleanup").await;
+    let movie_bin = scratch.0.join("movie-bin");
+    let tv_bin = scratch.0.join("tv-bin");
+    std::fs::create_dir_all(movie_bin.join("Film (2001)")).unwrap();
+    std::fs::create_dir_all(&tv_bin).unwrap();
+    let expired = movie_bin.join("Film (2001)/old.mkv");
+    let fresh = movie_bin.join("fresh.mkv");
+    let tv_expired = tv_bin.join("old-episode.mkv");
+    for path in [&expired, &fresh, &tv_expired] {
+        std::fs::write(path, b"bytes").unwrap();
+    }
+    age(&expired, 8);
+    age(&tv_expired, 30);
+    let app = App::start(db).await;
+    assert_eq!(app.settings("movies", Some(&movie_bin), 7).await.0, 200);
+    assert_eq!(app.settings("tv", Some(&tv_bin), 0).await.0, 200);
+    // Manual movie cleanup removes only the expired movie file and its emptied folder.
+    let (status, queued) = app
+        .call(
+            reqwest::Method::POST,
+            "/api/v1/recycle-bin/cleanup-commands",
+            Some(json!({"target":{"media_type":"movies"},"priority":"normal"})),
+        )
+        .await;
+    assert_eq!(status, 202, "{queued}");
+    let done = wait_command(&app, queued["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(done["outcome"], "cleaned");
+    assert_eq!(done["origin"], "manual");
+    assert_eq!(done["files_removed"], 1, "{done}");
+    assert_eq!(done["folders_removed"], 1, "{done}");
+    assert_eq!(done["bin_path"], s(&movie_bin));
+    assert!(!expired.exists());
+    assert!(fresh.exists());
+    // Reasoning: TV cleanup days are 0 (never), so a 30-day-old TV file must survive movie cleanup.
+    assert!(
+        tv_expired.exists(),
+        "movie cleanup never reaches the TV bin"
+    );
+    let tv = app
+        .get("/api/v1/recycle-bin/cleanup-commands?media_type=tv")
+        .await;
+    assert_eq!(tv["total"], 0, "movie cleanup creates no TV command: {tv}");
+    // Scheduled movie cleanup runs once when due and moves the next run a day ahead.
+    let aged = movie_bin.join("aged.mkv");
+    std::fs::write(&aged, b"bytes").unwrap();
+    age(&aged, 9);
+    let c = app.db.connect().await.unwrap();
+    c.execute_batch("UPDATE recycle_bin_settings SET next_cleanup_at=0 WHERE media_type='movies';")
+        .await
+        .unwrap();
+    drop(c);
+    let automatic = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let page = app
+                .get("/api/v1/recycle-bin/cleanup-commands?media_type=movies&status=succeeded")
+                .await;
+            if let Some(found) = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["origin"] == "automatic")
+            {
+                return found.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("scheduled movie cleanup must run");
+    assert_eq!(automatic["files_removed"], 1, "{automatic}");
+    assert!(!aged.exists());
+    assert!(fresh.exists());
+    assert!(tv_expired.exists());
+    assert!(
+        app.scalar(
+            "SELECT next_cleanup_at-unixepoch() FROM recycle_bin_settings WHERE media_type='movies'"
+        )
+        .await
+            > 86_000
+    );
+    assert_eq!(
+        app.scalar(
+            "SELECT count(*) FROM recycle_bin_cleanup_commands WHERE origin='automatic' AND media_type='movies'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        app.scalar("SELECT count(*) FROM recycle_bin_cleanup_commands WHERE media_type='tv'")
+            .await,
+        0
+    );
+    app.stop().await;
+}
+
+#[tokio::test]
+async fn recycle_bin_health_reports_unwritable_bin_per_domain_and_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (scratch, db, _lib) = sandbox("health-unwritable").await;
+    let bin = scratch.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Privileged runners ignore directory permissions; the unwritable case cannot be observed there.
+    if std::fs::write(bin.join(".probe-privilege"), b"x").is_ok() {
+        std::fs::remove_file(bin.join(".probe-privilege")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: directory permissions are not enforced for this user");
+        return;
+    }
+    let app = App::start(db).await;
+    assert_eq!(app.settings("movies", Some(&bin), 7).await.0, 200);
+    let generation = app
+        .scalar(
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='recycle_bin'",
+        )
+        .await;
+    run_health(&app, "movies").await;
+    let (_, issues) = recycle_check(&app, "movies", generation).await;
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0]["severity"], "error");
+    assert_eq!(issues[0]["reason"], "recycle_bin_unwritable");
+    assert_eq!(issues[0]["compatibility_type"], "RecyclingBinCheck");
+    // The TV scope has no bin configured and stays healthy.
+    run_health(&app, "tv").await;
+    let (_, tv_issues) = recycle_check(&app, "tv", 0).await;
+    assert!(tv_issues.is_empty(), "{tv_issues:?}");
+    // Restoring write permission clears the issue and the probe leaves nothing behind.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let generation = app
+        .scalar(
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='recycle_bin'",
+        )
+        .await;
+    run_health(&app, "movies").await;
+    let (_, issues) = recycle_check(&app, "movies", generation).await;
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 0);
+    app.stop().await;
+}
