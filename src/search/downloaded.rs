@@ -482,6 +482,17 @@ mod tests {
         assert_eq!(sparse.languages, Some(vec![4]));
         assert_eq!(sparse.release_group.as_deref(), Some("RENAMED"));
         assert_eq!(sparse.title, "Harbor.2020.1080p");
+        // A measured empty list must not be refilled from a renamed path's language token.
+        let mut measured = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(
+            &mut measured,
+            evidence("Harbor.2020.1080p", Some(vec![]), None),
+        );
+        assert_eq!(measured.languages, Some(vec![]));
     }
     struct Scratch(std::path::PathBuf);
     impl Drop for Scratch {
@@ -1059,14 +1070,15 @@ pub(crate) async fn original_language(
 }
 
 /// Facts frozen at submission outrank tokens in a (possibly renamed) downloaded path;
-/// the filename only fills what the receipt did not record.
+/// the filename only fills what the receipt did not record. A recorded empty language
+/// list is a measurement, not an absence, so it is kept as-is.
 fn merge_receipt(
     evidence: &mut crate::custom_formats::Evidence,
     receipt: crate::custom_formats::Evidence,
 ) {
     evidence.title = receipt.title;
     evidence.indexer_flags = receipt.indexer_flags;
-    if receipt.languages.as_ref().is_some_and(|l| !l.is_empty()) {
+    if receipt.languages.is_some() {
         evidence.languages = receipt.languages;
     }
     if receipt.release_group.is_some() {
