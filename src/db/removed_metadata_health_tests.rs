@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 51); // Reasoning: provider authority 0051 is latest (collections 0050 follows main's 0049); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,
@@ -369,7 +369,7 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         "health_command_checks",
         "health_transitions",
     ] {
-        // Collections47/provider48 add inactive markers; compare every pre47 field exactly.
+        // Collections50/provider51 add inactive markers; compare every pre50 field exactly.
         // Its initial zero is asserted independently after the real upgrade below.
         let projection = if table == "snapshot_imports" {
             "application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version,autotag_metadata_version"
@@ -378,7 +378,10 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         };
         out.push(rows(c, &format!("SELECT {projection} FROM {table} ORDER BY 1")).await?);
     }
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key!='removed_metadata' ORDER BY scope,check_key").await?);
+    // Reasoning: the witness covers predecessor (version<=45) health rows only; 0048 later appends four
+    // indexer_search/indexer_rss identities and 0049 two indexer_download_client identities, which are not
+    // predecessor state and are asserted separately.
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -442,7 +445,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 51); // Reasoning: provider authority 0051 is latest (collections 0050 follows main's 0049); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,
@@ -453,6 +456,8 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     integrity(&c).await?;
     let complete = health(&c).await?;
     drop(c);

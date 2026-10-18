@@ -46,7 +46,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0048_provider_authority.sql");
+const MIGRATION: &str = include_str!("../migrations/0051_provider_authority.sql");
 const PREDECESSORS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -230,17 +230,23 @@ const PREDECESSORS: &[(&str, &str)] = &[
         include_str!("../migrations/0046_removed_metadata_health.sql"),
     ),
     (
+        "movie_credits",
+        include_str!("../migrations/0047_movie_credits.sql"),
+    ),
+    (
+        "indexer_operation_policy",
+        include_str!("../migrations/0048_indexer_operation_policy.sql"),
+    ),
+    (
+        "indexer_client_binding",
+        include_str!("../migrations/0049_indexer_client_binding.sql"),
+    ),
+    (
         "collections",
-        include_str!("../migrations/0047_collections.sql"),
+        include_str!("../migrations/0050_collections.sql"),
     ),
 ];
 const OBJECTS: &[&str] = &[
-    "provider_indexer_modes",
-    "provider_modes_owner_insert",
-    "provider_modes_owner_update",
-    "provider_modes_required",
-    "provider_scope_initialize_modes",
-    "provider_modes_invalidate_test",
     "provider_scope_authority_identity",
     "provider_scope_tags",
     "provider_scope_tags_tag",
@@ -248,12 +254,6 @@ const OBJECTS: &[&str] = &[
     "provider_tags_identity",
     "provider_tags_insert_invalidates_test",
     "provider_tags_delete_invalidates_test",
-    "provider_scope_client_overrides",
-    "provider_client_override_usage",
-    "provider_override_owner",
-    "provider_override_identity",
-    "provider_override_insert_invalidates_test",
-    "provider_override_delete_invalidates_test",
     "provider_status",
     "provider_status_insert",
     "provider_status_update",
@@ -351,7 +351,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='provider_authority_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade47_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
+async fn upgrade50_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -365,8 +365,12 @@ async fn upgrade47_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(witness(&c).await, before);
     objects(&c).await;
-    assert_eq!(number(&c,"SELECT count(*) FROM provider_indexer_modes WHERE enable_rss=1 AND enable_automatic_search=1 AND enable_interactive_search=1").await,3);
-    assert_eq!(number(&c,"SELECT count(*) FROM provider_indexer_modes m JOIN providers p ON p.id=m.provider_id WHERE p.implementation='qbittorrent'").await,0);
+    // Reasoning: operation modes are main's 0048 provider_scopes columns, not 0051 rows;
+    // 0051 backfills no tag authority.
+    assert_eq!(
+        number(&c, "SELECT count(*) FROM provider_scope_tags").await,
+        0
+    );
     assert_eq!(number(&c, "SELECT count(*) FROM provider_status").await, 0);
     assert_eq!(
         number(
@@ -378,7 +382,7 @@ async fn upgrade47_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        48
+        51 // Reasoning: provider authority is 0051 after collections 0050.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -390,7 +394,7 @@ async fn upgrade47_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     Ok(())
 }
 #[tokio::test]
-async fn migration_late_failure_restores47_schema_and_evidence() -> Result<(), Error> {
+async fn migration_late_failure_restores50_schema_and_evidence() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -409,7 +413,7 @@ async fn migration_late_failure_restores47_schema_and_evidence() -> Result<(), E
     assert_eq!(number(&tx, "SELECT count(*) FROM provider_tests").await, 3);
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=47",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=50",
             ()
         )
         .await
@@ -431,71 +435,26 @@ async fn migration_late_failure_restores47_schema_and_evidence() -> Result<(), E
     let c = raw.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        47
+        50 // Reasoning: predecessor chain now ends at collections 0050.
     );
     assert_eq!(witness(&c).await, before);
     Ok(())
 }
 #[tokio::test]
-async fn modes_and_tag_authority_are_domain_scoped_and_bounded() -> Result<(), Error> {
+async fn tag_authority_and_scope_identity_are_domain_scoped_and_bounded() -> Result<(), Error> {
     let s = Scratch::new();
     let db = Database::open_local(s.database()).await?;
     let c = db.connect().await?;
     seed(&c).await?;
     objects(&c).await;
-    assert!(
-        c.execute(
-            "INSERT INTO provider_indexer_modes(provider_id,media_type) VALUES(?,'movies')",
-            [CLIENT]
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        c.execute(
-            "DELETE FROM provider_indexer_modes WHERE provider_id=? AND media_type='tv'",
-            [INDEXER]
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        c.execute(
-            "UPDATE provider_indexer_modes SET enable_rss=2 WHERE provider_id=?",
-            [INDEXER]
-        )
-        .await
-        .is_err()
-    );
-    c.execute("UPDATE provider_indexer_modes SET enable_automatic_search=0 WHERE provider_id=? AND media_type='movies'",[INDEXER]).await?;
-    assert_eq!(number(&c, "SELECT count(*) FROM provider_tests").await, 2);
-    let chosen=number(&c,&format!("SELECT enable_automatic_search FROM provider_indexer_modes WHERE provider_id='{INDEXER}' AND media_type='movies'")).await;
-    let tx = c
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    tx.execute(
-        "UPDATE providers SET revision=revision+1,name='Renamed' WHERE id=?",
-        [INDEXER],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM provider_scopes WHERE provider_id=? AND media_type='movies'",
-        [INDEXER],
-    )
-    .await?;
-    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,remove_year) VALUES(?,'torznab','movies','[5000]','[]',0)",[INDEXER]).await?;
-    // Producer contract: capture old false before scope reconstruction and restore it.
-    tx.execute("UPDATE provider_indexer_modes SET enable_automatic_search=? WHERE provider_id=? AND media_type='movies'",params![chosen,INDEXER]).await?;
-    tx.commit().await?;
-    assert_eq!(number(&c,"SELECT enable_automatic_search FROM provider_indexer_modes WHERE media_type='movies' AND provider_id='00000000-0000-0000-0000-000000000001'").await,0);
-    assert_eq!(
-        number(
-            &c,
-            "SELECT enable_automatic_search FROM provider_indexer_modes WHERE media_type='tv'"
-        )
-        .await,
-        1
-    );
+    // Reasoning: indexer modes moved to main's 0048 columns, so this test now covers
+    // only what 0051 owns: scope identity is immutable and tags are bounded per domain.
+    for sql in [
+        "UPDATE provider_scopes SET media_type='tv' WHERE provider_id=? AND media_type='movies'",
+        "UPDATE provider_scopes SET implementation='newznab' WHERE provider_id=?",
+    ] {
+        assert!(c.execute(sql, [INDEXER]).await.is_err());
+    }
     assert!(
         c.execute(
             "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES(?,'movies',1)",
@@ -517,40 +476,19 @@ async fn modes_and_tag_authority_are_domain_scoped_and_bounded() -> Result<(), E
     assert_eq!(number(&c,"SELECT count(*) FROM provider_scope_tags WHERE provider_id='00000000-0000-0000-0000-000000000001'").await,64);
     c.execute("DELETE FROM providers WHERE id=?", [INDEXER])
         .await?;
+    // Reasoning: owner deletion cascades its tags; the client's tag survives.
     assert_eq!(
-        number(&c, "SELECT count(*) FROM provider_indexer_modes").await,
+        number(&c, "SELECT count(*) FROM provider_scope_tags").await,
         1
     );
     Ok(())
 }
 #[tokio::test]
-async fn override_deferred_scope_replacement_and_cursor_lifetime() -> Result<(), Error> {
+async fn cursor_lifetime_outlives_client_without_authority() -> Result<(), Error> {
     let s = Scratch::new();
     let db = Database::open_local(s.database()).await?;
     let c = db.connect().await?;
     seed(&c).await?;
-    for (owner, target) in [(CLIENT, INDEXER), (NEWS, CLIENT), (INDEXER, NEWS)] {
-        assert!(c.execute("INSERT INTO provider_scope_client_overrides(provider_id,media_type,client_id) VALUES(?,'movies',?)",params![owner,target]).await.is_err());
-    }
-    c.execute("INSERT INTO provider_scope_client_overrides(provider_id,media_type,client_id) VALUES(?,'movies',?)",params![INDEXER,CLIENT]).await?;
-    let tx = c
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    tx.execute(
-        "DELETE FROM provider_scopes WHERE provider_id=? AND media_type='movies'",
-        [CLIENT],
-    )
-    .await?;
-    client_scope(&tx, "movies").await?;
-    tx.commit().await?;
-    assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
-    // Failed deferred commit remains an open transaction; explicitly roll it back.
-    c.execute("BEGIN IMMEDIATE", ()).await?;
-    c.execute("DELETE FROM providers WHERE id=?", [CLIENT])
-        .await?;
-    assert!(c.execute("COMMIT", ()).await.is_err());
-    c.execute("ROLLBACK", ()).await?;
-    assert_eq!(number(&c, "SELECT count(*) FROM providers").await, 3);
     for domain in ["tv", "movies"] {
         c.execute("INSERT INTO provider_selection_cursors(media_type,protocol,last_client_id,revision) VALUES(?,'torrent',?,1)",params![domain,CLIENT]).await?;
     }
@@ -569,8 +507,6 @@ async fn override_deferred_scope_replacement_and_cursor_lifetime() -> Result<(),
         (),
     )
     .await?;
-    c.execute("DELETE FROM provider_scope_client_overrides", ())
-        .await?;
     c.execute("DELETE FROM providers WHERE id=?", [CLIENT])
         .await?;
     // Historical cursor survives client removal; it cannot authorize a new selection.

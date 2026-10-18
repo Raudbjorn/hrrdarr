@@ -96,8 +96,15 @@ pub async fn start_with_metadata(
         // ponytail: one worker per locally owned DB; add weighted concurrency only with real jobs needing it.
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Terminal-history pruning is a worker-owned recurring job: bounded, idempotent and
+        // serialized with this loop's claims. Errors are logged inside and never propagate.
+        let mut housekeeping = now().ok().map(housekeeping::Schedule::new);
+        let housekeeping_policy = housekeeping::Policy::default();
         loop {
             tick.tick().await;
+            if let (Some(schedule), Ok(timestamp)) = (housekeeping.as_mut(), now()) {
+                housekeeping::tick(&db, schedule, &housekeeping_policy, timestamp).await;
+            }
             let result =
                 tokio::time::timeout(Duration::from_secs(45), step(&db, &client, &metadata)).await;
             if !matches!(result, Ok(Ok(()))) {

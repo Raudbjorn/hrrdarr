@@ -273,15 +273,23 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         "SELECT * FROM metadata_refresh_commands ORDER BY id",
         "SELECT * FROM schema_migrations WHERE version<=44 ORDER BY version",
         "SELECT * FROM sqlite_sequence ORDER BY name",
+        // Reasoning: migration 0047 adds the new movie_credits table, index and limit trigger; this predecessor
+        // witness excludes that whole table by name and tests/movie_credits.rs covers its schema.
         // The latest runner adds46's three movie-membership invalidation triggers;
         // compare every predecessor object exactly, with those explicit additions
-        // covered by removed_metadata_health_tests. Collections47 appends facts to two
-        // existing tables and adds precisely the named objects below; collection_schema
-        // independently asserts every new object and legacy row/FK preservation.
-        // Provider authority48 adds only the explicitly named tables/triggers below;
-        // provider_authority_schema independently checks their presence and old facts.
-        // Existing45 exclusions and all predecessor data projections stay fixed.
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_indexer_modes','provider_scope_tags','provider_scope_client_overrides','provider_status','provider_selection_cursors') AND name NOT IN ('provider_indexer_modes','provider_modes_owner_insert','provider_modes_owner_update','provider_modes_required','provider_scope_initialize_modes','provider_modes_invalidate_test','provider_scope_authority_identity','provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_scope_client_overrides','provider_client_override_usage','provider_override_owner','provider_override_identity','provider_override_insert_invalidates_test','provider_override_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // covered by removed_metadata_health_tests. Existing45 exclusions stay fixed.
+        // Reasoning: migration 0048 ALTERs provider_scopes (three appended enable_* columns), which rewrites that
+        // one CREATE TABLE text. Its predecessor columns are still compared exactly via the table_info row below;
+        // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
+        // Reasoning: migration 0049 likewise appends the nullable download_client_id column, so it joins the exclusion list.
+        "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id') ORDER BY cid",
+        // Collections50 appends facts to two existing tables and adds precisely the named
+        // objects below; collection_schema independently asserts every new object and
+        // legacy row/FK preservation. Provider authority51 adds only the explicitly named
+        // tables/triggers below; provider_authority_schema checks them and old facts.
+        // Reasoning: 0051's indexer modes and client overrides were dropped because
+        // 0048/0049 already store them as provider_scopes columns.
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_scope_tags','provider_status','provider_selection_cursors') AND name NOT IN ('provider_scope_authority_identity','provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain') AND NOT (type='table' AND name='provider_scopes') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -496,7 +504,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        48 // Provider authority48 is latest; predecessor44 and injected45 failure remain fixed.
+        51 // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -622,7 +630,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        48 // Provider authority48 is latest; predecessor44 and injected45 failure remain fixed.
+        51 // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

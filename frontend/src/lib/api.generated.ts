@@ -74,6 +74,12 @@ export type CompletedDownloadHandlingReconciliationReason = "pending" | "schedul
 
 export type CompletedDownloadHandlingUpdate = { enabled: boolean, revision: number, };
 
+export type CreditDetails = { credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, kind: CreditKind, images: Array<CreditImage>, };
+
+export type CreditImage = { cover_type: string, url: string, };
+
+export type CreditKind = "cast" | "crew";
+
 export type CustomFormat = { id: number, media_type: MediaDomain, name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
 
 export type CustomFormatBulkInput = { ids: Array<number>, include_when_renaming?: boolean | null, };
@@ -354,11 +360,15 @@ export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
-export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, };
+export type MovieCredit = { id: number, metadata_id: number, credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, type: CreditKind, images: Array<CreditImage>, };
+
+export type MovieCreditQuery = { limit?: number, offset?: number, movie_id?: number, metadata_id?: number, };
+
+export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, };
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
+export type MovieIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, remove_year?: boolean, };
 
 export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, monitor?: CollectionMonitoring, collection_expected_revision?: number | null, };
 
@@ -656,7 +666,7 @@ export type TestStatus = "never_tested" | "success" | "failure";
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
+export type TvIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
 
 export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 

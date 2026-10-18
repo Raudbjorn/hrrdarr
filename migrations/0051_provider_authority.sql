@@ -1,35 +1,7 @@
--- Actual scope authority, not nullable enabled fallbacks. Existing constructors retain
--- their prior all-enabled operation modes; download clients never receive indexer modes.
-CREATE TABLE provider_indexer_modes (
- provider_id TEXT NOT NULL,
- media_type TEXT NOT NULL CHECK(media_type IN('tv','movies')),
- enable_rss INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_rss)='integer' AND enable_rss IN(0,1)),
- enable_automatic_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_automatic_search)='integer' AND enable_automatic_search IN(0,1)),
- enable_interactive_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_interactive_search)='integer' AND enable_interactive_search IN(0,1)),
- PRIMARY KEY(provider_id,media_type),
- FOREIGN KEY(provider_id,media_type) REFERENCES provider_scopes(provider_id,media_type) ON DELETE CASCADE
-);
--- Insert before observation-invalidation guards: backfill does not change config
--- or destroy accepted revision-bound Test evidence.
-INSERT INTO provider_indexer_modes(provider_id,media_type)
- SELECT provider_id,media_type FROM provider_scopes WHERE implementation IN('torznab','newznab');
-CREATE TRIGGER provider_modes_owner_insert BEFORE INSERT ON provider_indexer_modes BEGIN
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=NEW.provider_id AND media_type=NEW.media_type AND implementation IN('torznab','newznab')) THEN RAISE(ABORT,'indexer_modes_owner') END;
-END;
-CREATE TRIGGER provider_modes_owner_update BEFORE UPDATE ON provider_indexer_modes BEGIN
- SELECT CASE WHEN NEW.provider_id IS NOT OLD.provider_id OR NEW.media_type IS NOT OLD.media_type THEN RAISE(ABORT,'indexer_modes_identity') END;
-END;
-CREATE TRIGGER provider_modes_required BEFORE DELETE ON provider_indexer_modes
- WHEN EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=OLD.provider_id AND media_type=OLD.media_type)
- BEGIN SELECT RAISE(ABORT,'indexer_modes_required'); END;
-CREATE TRIGGER provider_scope_initialize_modes AFTER INSERT ON provider_scopes
- WHEN NEW.implementation IN('torznab','newznab') BEGIN
- INSERT INTO provider_indexer_modes(provider_id,media_type) VALUES(NEW.provider_id,NEW.media_type);
-END;
-CREATE TRIGGER provider_modes_invalidate_test AFTER UPDATE ON provider_indexer_modes
- WHEN NEW.enable_rss IS NOT OLD.enable_rss OR NEW.enable_automatic_search IS NOT OLD.enable_automatic_search OR NEW.enable_interactive_search IS NOT OLD.enable_interactive_search
- BEGIN DELETE FROM provider_tests WHERE provider_id=NEW.provider_id; END;
--- Modes cannot be orphaned by direct maintenance changing a scope identity.
+-- Indexer operation modes and the download-client preference are not duplicated
+-- here: 0048/0049 store them as provider_scopes columns that round-trip through
+-- every provider update. This migration adds only authority 0048/0049 lack.
+-- Scope tags cannot be orphaned by direct maintenance changing a scope identity.
 CREATE TRIGGER provider_scope_authority_identity BEFORE UPDATE OF provider_id,media_type,implementation ON provider_scopes
  WHEN NEW.provider_id IS NOT OLD.provider_id OR NEW.media_type IS NOT OLD.media_type OR NEW.implementation IS NOT OLD.implementation
  BEGIN SELECT RAISE(ABORT,'provider_scope_authority_identity'); END;
@@ -53,30 +25,6 @@ CREATE TRIGGER provider_tags_insert_invalidates_test AFTER INSERT ON provider_sc
  DELETE FROM provider_tests WHERE provider_id=NEW.provider_id;
 END;
 CREATE TRIGGER provider_tags_delete_invalidates_test AFTER DELETE ON provider_scope_tags BEGIN
- DELETE FROM provider_tests WHERE provider_id=OLD.provider_id;
-END;
-
-CREATE TABLE provider_scope_client_overrides (
- provider_id TEXT NOT NULL,
- media_type TEXT NOT NULL CHECK(media_type IN('tv','movies')),
- client_id TEXT NOT NULL,
- PRIMARY KEY(provider_id,media_type),
- FOREIGN KEY(provider_id,media_type) REFERENCES provider_scopes(provider_id,media_type) ON DELETE CASCADE,
- -- Accepted provider updates delete/recreate scopes in one transaction. Deferral
- -- permits that replacement, but a missing final target still rejects commit.
- FOREIGN KEY(client_id,media_type) REFERENCES provider_scopes(provider_id,media_type) DEFERRABLE INITIALLY DEFERRED
-);
-CREATE INDEX provider_client_override_usage ON provider_scope_client_overrides(client_id,media_type,provider_id);
-CREATE TRIGGER provider_override_owner BEFORE INSERT ON provider_scope_client_overrides BEGIN
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=NEW.provider_id AND media_type=NEW.media_type AND implementation='torznab') OR NOT EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=NEW.client_id AND media_type=NEW.media_type AND implementation='qbittorrent') THEN RAISE(ABORT,'provider_override_protocol_domain') END;
-END;
-CREATE TRIGGER provider_override_identity BEFORE UPDATE ON provider_scope_client_overrides BEGIN
- SELECT RAISE(ABORT,'provider_override_replace');
-END;
-CREATE TRIGGER provider_override_insert_invalidates_test AFTER INSERT ON provider_scope_client_overrides BEGIN
- DELETE FROM provider_tests WHERE provider_id=NEW.provider_id;
-END;
-CREATE TRIGGER provider_override_delete_invalidates_test AFTER DELETE ON provider_scope_client_overrides BEGIN
  DELETE FROM provider_tests WHERE provider_id=OLD.provider_id;
 END;
 

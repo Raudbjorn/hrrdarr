@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "snapshot_imports" {

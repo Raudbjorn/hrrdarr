@@ -201,12 +201,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0046_removed_metadata_health.sql"),
     ),
     (
+        "movie_credits",
+        include_str!("../../migrations/0047_movie_credits.sql"),
+    ),
+    (
+        "indexer_operation_policy",
+        include_str!("../../migrations/0048_indexer_operation_policy.sql"),
+    ),
+    (
+        "indexer_client_binding",
+        include_str!("../../migrations/0049_indexer_client_binding.sql"),
+    ),
+    (
         "collections",
-        include_str!("../../migrations/0047_collections.sql"),
+        include_str!("../../migrations/0050_collections.sql"),
     ),
     (
         "provider_authority",
-        include_str!("../../migrations/0048_provider_authority.sql"),
+        include_str!("../../migrations/0051_provider_authority.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -762,3 +774,9 @@ mod download_root_health_tests;
 
 #[cfg(test)]
 mod removed_metadata_health_tests;
+
+#[cfg(test)]
+mod indexer_policy_tests;
+
+#[cfg(test)]
+mod indexer_client_tests;

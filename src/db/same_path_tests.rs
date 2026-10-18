@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 48); // Provider authority48 is latest; historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

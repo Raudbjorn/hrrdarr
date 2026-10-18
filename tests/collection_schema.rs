@@ -43,7 +43,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0047_collections.sql");
+const MIGRATION: &str = include_str!("../migrations/0050_collections.sql");
 const PREDECESSORS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -226,6 +226,18 @@ const PREDECESSORS: &[(&str, &str)] = &[
         "removed_metadata_health",
         include_str!("../migrations/0046_removed_metadata_health.sql"),
     ),
+    (
+        "movie_credits",
+        include_str!("../migrations/0047_movie_credits.sql"),
+    ),
+    (
+        "indexer_operation_policy",
+        include_str!("../migrations/0048_indexer_operation_policy.sql"),
+    ),
+    (
+        "indexer_client_binding",
+        include_str!("../migrations/0049_indexer_client_binding.sql"),
+    ),
 ];
 const OBJECTS: &[&str] = &[
     "movie_collection_settings",
@@ -325,7 +337,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='collection_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade46_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
+async fn upgrade49_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -347,7 +359,7 @@ async fn upgrade46_preserves_both_domains_unknowns_and_multiple_memberships() ->
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        48 // Latest runner adds provider authority48; fixed46/47 migration fixtures remain unchanged.
+        51 // Reasoning: latest runner adds provider authority 0051 after collections 0050 (renumbered behind main's 0047-0049).
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -359,7 +371,7 @@ async fn upgrade46_preserves_both_domains_unknowns_and_multiple_memberships() ->
     Ok(())
 }
 #[tokio::test]
-async fn late_failure_rolls_back_all47_ddl_and_facts() -> Result<(), Error> {
+async fn late_failure_rolls_back_all50_ddl_and_facts() -> Result<(), Error> {
     let s = Scratch::new();
     let db = predecessor(&s).await?;
     let c = db.connect()?;
@@ -382,7 +394,7 @@ async fn late_failure_rolls_back_all47_ddl_and_facts() -> Result<(), Error> {
     .await?;
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=46",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=49",
             ()
         )
         .await
@@ -404,7 +416,7 @@ async fn late_failure_rolls_back_all47_ddl_and_facts() -> Result<(), Error> {
     let c = db.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        46
+        49 // Reasoning: predecessor chain now ends at main's 0049 indexer client binding.
     );
     assert_eq!(preserved(&c).await, before);
     Ok(())
