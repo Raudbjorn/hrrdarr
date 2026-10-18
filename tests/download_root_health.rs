@@ -111,8 +111,12 @@ async fn peer(State(p): State<Peer>, method: Method, OriginalUri(uri): OriginalU
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
+/// Bounds explicit worker iterations; idle waits cover only due times the engine schedules
+/// (CONFIG rechecks are due 5 s after a mutation), never worker cadence or load.
+const MAX_STEPS: usize = 64;
+const MAX_IDLE: Duration = Duration::from_secs(10);
 struct Fixture {
-    runtime: Option<commands::Runtime>,
+    worker: Option<Arc<commands::Driver>>,
     app: Option<Server>,
     upstream: Option<Server>,
     db: Arc<Database>,
@@ -157,7 +161,7 @@ impl Fixture {
             .merge(remote_paths::router(db.clone()));
         let (base, app) = serve(app).await;
         let mut f = Self {
-            runtime: None,
+            worker: None,
             app: Some(app),
             upstream: Some(upstream),
             db,
@@ -176,13 +180,46 @@ impl Fixture {
         let mut config = f.config();
         config["credentials"] = json!({"kind":"api_key","api_key":SECRET});
         f.provider = f.call("POST", "/api/v1/providers", Some(config), 201).await;
-        f.runtime = Some(
-            commands::start(f.db.clone(), f.refresh.clone())
-                .await
-                .unwrap(),
-        );
+        f.start().await;
         f.settle().await;
         f
+    }
+    /// The worker runs only when a test steps it, so no command is claimed between a
+    /// completed attempt and the assertions about it.
+    async fn start(&mut self) {
+        assert!(self.worker.is_none());
+        self.worker = Some(Arc::new(
+            commands::start_driven(self.db.clone(), self.refresh.clone())
+                .await
+                .unwrap(),
+        ));
+    }
+    async fn restart(&mut self) {
+        drop(self.worker.take().unwrap());
+        self.start().await;
+    }
+    /// Steps until `done`; idles only while no command is claimable (a future due time).
+    async fn drive<T>(&self, what: &str, mut done: impl AsyncFnMut() -> Option<T>) -> T {
+        let worker = self.worker.as_ref().unwrap();
+        let (mut steps, idle_until) = (0, tokio::time::Instant::now() + MAX_IDLE);
+        loop {
+            if let Some(value) = done().await {
+                return value;
+            }
+            if worker.step().await {
+                steps += 1;
+                assert!(
+                    steps <= MAX_STEPS,
+                    "{what}: no fixed point after {MAX_STEPS} steps"
+                );
+            } else {
+                assert!(
+                    tokio::time::Instant::now() < idle_until,
+                    "{what}: nothing became due"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
     fn path(&self, name: &str) -> String {
         self.scratch
@@ -222,21 +259,15 @@ impl Fixture {
         self.call("GET", "/api/v1/health", None, 200).await
     }
     async fn settle(&self) -> Value {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let health = self.health().await;
-                if ["tv", "movies"]
-                    .iter()
-                    .all(|scope| check(&health, scope)["evaluation"] == "current")
-                    && health["active_command"].is_null()
-                {
-                    return health;
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
+        self.drive("root health must settle through owned worker", async || {
+            let health = self.health().await;
+            (["tv", "movies"]
+                .iter()
+                .all(|scope| check(&health, scope)["evaluation"] == "current")
+                && health["active_command"].is_null())
+            .then_some(health)
         })
         .await
-        .expect("root health must settle through owned worker")
     }
     async fn enqueue(&self) -> Value {
         self.call(
@@ -247,7 +278,9 @@ impl Fixture {
         )
         .await
     }
-    async fn blocked_movie_root(&self) -> Value {
+    /// Returns the command and its in-flight worker step, parked inside the root probe until
+    /// `peer.release`. The probe is still bounded by the client's 5 s read timeout.
+    async fn blocked_movie_root(&self) -> (Value, tokio::task::JoinHandle<()>) {
         // Source-confirmed native order: Movies CDH does not probe status; communication
         // only requests torrents/info. Thus this categories request is the root evaluator,
         // after it captured all configured roots, not the TV CDH status request.
@@ -260,6 +293,31 @@ impl Fixture {
                 202,
             )
             .await;
+        let (worker, client) = (self.worker.clone().unwrap(), self.client.clone());
+        let url = format!(
+            "{}/api/v1/health/commands/{}",
+            self.base,
+            command["command_id"].as_str().unwrap()
+        );
+        // Higher-priority health work is claimed first; loop only past unrelated due work.
+        let step = tokio::spawn(async move {
+            for _ in 0..MAX_STEPS {
+                worker.step().await;
+                let bytes = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                let detail: Value = serde_json::from_slice(&bytes).unwrap();
+                if detail["status"] != "queued" {
+                    return;
+                }
+            }
+            panic!("blocked health command was never claimed");
+        });
         tokio::time::timeout(Duration::from_secs(5), self.peer.entered.notified())
             .await
             .unwrap();
@@ -287,7 +345,7 @@ impl Fixture {
             check(&self.health().await, "movies")["generation"]
         );
         assert!(!root["captured_generation"].is_null());
-        command
+        (command, step)
     }
     async fn evaluate(&self, tv: bool, movies: bool) -> Value {
         self.enqueue().await;
@@ -337,25 +395,28 @@ impl Fixture {
         )
         .await
     }
+    async fn command(&self, id: &str) -> Value {
+        self.call("GET", &format!("/api/v1/health/commands/{id}"), None, 200)
+            .await
+    }
     async fn wait_retry(&self, id: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(12), async {
-            loop {
-                let command = self
-                    .call("GET", &format!("/api/v1/health/commands/{id}"), None, 200)
-                    .await;
-                if command["status"] == "retry_wait" || command["status"] == "failed" {
-                    return command;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        self.drive("attempt must report its failed/stale outcome", async || {
+            let command = self.command(id).await;
+            (command["status"] == "retry_wait" || command["status"] == "failed").then_some(command)
         })
         .await
-        .expect("attempt must report its failed/stale outcome")
+    }
+    /// Lets a parked attempt publish; no later command can run before the caller asserts.
+    async fn release(&self, step: tokio::task::JoinHandle<()>, id: &str) -> Value {
+        self.peer.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), step)
+            .await
+            .expect("released attempt must finish within the health deadline")
+            .unwrap();
+        self.command(id).await
     }
     async fn stop(mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown().await;
-        }
+        drop(self.worker.take());
         self.app.take().unwrap().stop().await;
         self.upstream.take().unwrap().stop().await;
         assert_eq!(
@@ -529,12 +590,7 @@ async fn scoped_mappings_failures_mutation_rollback_and_recovery() {
     )
     .await;
     f.evaluate(false, false).await;
-    f.runtime.take().unwrap().shutdown().await;
-    f.runtime = Some(
-        commands::start(f.db.clone(), f.refresh.clone())
-            .await
-            .unwrap(),
-    );
+    f.restart().await;
     f.settle().await;
     assert_eq!(std::fs::read(owned).unwrap(), b"original-media");
     f.stop().await;
@@ -555,7 +611,7 @@ async fn root_mapping_and_provider_mutations_fence_inflight_health_publication()
                 .outputs("/safe", Some("/safe"), Some(&format!("{root}/downloads")));
         }
         f.evaluate(false, false).await;
-        let command = f.blocked_movie_root().await;
+        let (command, step) = f.blocked_movie_root().await;
         let before = generations(&f.health().await);
         match mutation {
             "root" => {
@@ -585,9 +641,9 @@ async fn root_mapping_and_provider_mutations_fence_inflight_health_publication()
         } else {
             assert_eq!(after, [before[0] + 1, before[1] + 1]);
         }
-        f.peer.release.notify_one();
         let id = command["command_id"].as_str().unwrap();
-        let stale = f.wait_retry(id).await;
+        let stale = f.release(step, id).await;
+        assert_eq!(stale["status"], "failed", "{mutation}: {stale}");
         assert_eq!(stale["error_code"], "stale_inputs", "{mutation}: {stale}");
         let pending = f.health().await;
         assert_ne!(
@@ -674,7 +730,7 @@ async fn both_snapshot_roots_invalidate_atomically_and_restart_preserves_media()
             0
         );
         // Block a captured old attempt while snapshot adds a previously unused root.
-        let command = f.blocked_movie_root().await;
+        let (command, step) = f.blocked_movie_root().await;
         let before = generations(&f.health().await);
         let imported = snapshots::import(&f.db, app, bytes.clone(), false)
             .await
@@ -684,9 +740,8 @@ async fn both_snapshot_roots_invalidate_atomically_and_restart_preserves_media()
             generations(&f.health().await),
             [before[0] + 1, before[1] + 1]
         );
-        f.peer.release.notify_one();
         let id = command["command_id"].as_str().unwrap();
-        assert_eq!(f.wait_retry(id).await["error_code"], "stale_inputs");
+        assert_eq!(f.release(step, id).await["error_code"], "stale_inputs");
         f.call(
             "POST",
             &format!("/api/v1/health/commands/{id}/cancel"),
@@ -708,14 +763,11 @@ async fn both_snapshot_roots_invalidate_atomically_and_restart_preserves_media()
         drop(c);
     }
     // Restart interrupts a real running read; original media and durable roots remain.
-    f.blocked_movie_root().await;
-    f.runtime.take().unwrap().shutdown().await;
+    let (_, step) = f.blocked_movie_root().await;
+    step.abort();
+    assert!(step.await.unwrap_err().is_cancelled());
     f.peer.release.notify_one();
-    f.runtime = Some(
-        commands::start(f.db.clone(), f.refresh.clone())
-            .await
-            .unwrap(),
-    );
+    f.restart().await;
     f.settle().await;
     f.evaluate(false, true).await;
     assert_eq!(std::fs::read(owned).unwrap(), b"preserved");
