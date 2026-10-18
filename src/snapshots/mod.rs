@@ -2,11 +2,16 @@
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
 mod blocklist;
+mod completed_download_handling;
 mod custom_formats;
+mod delay_profiles;
 mod history;
 mod profiles;
 mod providers;
 mod readers;
+mod release_profiles;
+mod revision_policy;
+mod tags;
 
 use crate::db::Database;
 use libsql::{Connection, Value, params};
@@ -67,6 +72,19 @@ pub struct Unsupported {
 // Deliberately static: SQL/parser errors may include source values or credentials.
 #[derive(Debug)]
 pub struct ImportError(pub &'static str);
+impl ImportError {
+    /// Temporary matcher admission/execution failures must not become invalid uploads.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self.0,
+            "release_term_busy"
+                | "release_term_timeout"
+                | "release_term_worker_failed"
+                | "release_term_state_changed"
+        )
+    }
+}
+
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)
@@ -188,6 +206,11 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let cdh_plan = completed_download_handling::read(&source, &mut plan.unsupported)?;
+    let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
+    let release_profile_plan = release_profiles::read(&source, app, &mut plan.unsupported).await?;
+    let delay_plan = delay_profiles::read(&source, app, &mut plan.unsupported)?;
+    let tag_plan = tags::read(&source, app, &mut plan.unsupported)?;
     let profile_plan = profiles::read(&source, app, &mut plan.unsupported).await?;
     let blocklist_plan = blocklist::read(&source, app, &mut plan.unsupported)?;
     let history_plan = history::read(&source, app, &mut plan.unsupported)?;
@@ -208,10 +231,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library, supported custom formats, whole profiles and assignments, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No clients, jobs or sessions are resumed. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported custom formats and whole profiles/assignments, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No clients, jobs or sessions are resumed. No network or media access occurs.";
+        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -222,9 +245,14 @@ async fn import_inner(
             profiles::prepare(&tx, &profile_plan, &mut plan.entities, &mut report).await?;
         write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
         profiles::finish(&tx, prepared, &mut report).await?;
+        tags::write(&tx, &tag_plan, &mut report).await?;
+        revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
+        delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
-        providers::write(&tx, &provider_plan, key, &mut report).await
+        providers::write(&tx, &provider_plan, key, &mut report).await?;
+        release_profiles::write(&tx, release_profile_plan.as_ref(), &mut report).await?;
+        completed_download_handling::write(&tx, cdh_plan, &mut report).await
     }
     .await;
     match result {
@@ -466,6 +494,8 @@ async fn write(
     let old_metadata=conn.query("SELECT episode_metadata_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let mut ids = BTreeMap::new();
     let mut seasons_done = false;
+    let mut roots_changed = false;
+    let mut mappings_changed = false;
     // Predecessor-schema fixture writers also use this core before retirement exists.
     let has_retirement = conn
         .query(
@@ -602,6 +632,8 @@ async fn write(
                     values,
                 )
                 .await?;
+                roots_changed |= entity.table == "root_folders";
+                mappings_changed |= entity.table == "remote_path_mappings";
                 report.mapped += 1;
                 conn.last_insert_rowid()
             }
@@ -617,6 +649,26 @@ async fn write(
         write_seasons(conn, seasons, &ids, report).await?;
     }
     readers::verify_remote_order(conn, entities, &ids, report).await?;
+    // Historical-schema fixture imports predate health; live imports always have this registry.
+    if (roots_changed || mappings_changed)
+        && conn
+            .query(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='health_checks'",
+                (),
+            )
+            .await?
+            .next()
+            .await?
+            .is_some()
+    {
+        let media = match report.application {
+            Application::Sonarr => crate::api::MediaDomain::Tv,
+            Application::Radarr => crate::api::MediaDomain::Movies,
+        };
+        crate::health::download_roots_changed(conn, if roots_changed { None } else { Some(media) })
+            .await
+            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
+    }
     for (table, data) in &source.tables {
         for (i, row) in data.rows.iter().enumerate() {
             conn.execute("INSERT INTO snapshot_records (application,fingerprint,source_table,ordinal,record_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),table.clone(),i as i64,archive(row)?]).await?;

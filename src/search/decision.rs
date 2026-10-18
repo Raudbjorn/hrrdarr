@@ -5,6 +5,16 @@ use crate::{
 };
 use libsql::{Connection, params};
 
+// Settings readers distinguish SQL availability from invalid persisted policy.
+// Only the former can retry without permanently discarding a pending receipt.
+fn settings_error(error: crate::qualities::Error, invalid: &'static str) -> SearchError {
+    SearchError(if error.1 == "database_error" {
+        "release_storage_error"
+    } else {
+        invalid
+    })
+}
+
 struct Candidate {
     target: ReleaseTarget,
     profile: Option<i64>,
@@ -17,7 +27,7 @@ struct Candidate {
     language: Option<i64>,
     monitored: bool,
     files: Vec<Option<i64>>,
-    aired: bool,
+    air_dates: Vec<Option<chrono::DateTime<chrono::Utc>>>,
 }
 fn id_agrees(actual: Option<i64>, supplied: Option<u32>) -> bool {
     supplied.is_none_or(|id| actual == Some(i64::from(id)))
@@ -27,9 +37,34 @@ fn id_agrees(actual: Option<i64>, supplied: Option<u32>) -> bool {
 pub async fn evaluate(
     c: &Connection,
     media: MediaDomain,
+    indexer: uuid::Uuid,
     release: &Release,
     context: SearchContext,
     now: i64,
+) -> Result<ReleaseDecision> {
+    let mut operation = super::operation_evidence()?;
+    evaluate_with_evidence(c, media, indexer, release, context, now, &mut operation).await
+}
+pub(crate) async fn evaluate_with_evidence(
+    c: &Connection,
+    media: MediaDomain,
+    indexer: uuid::Uuid,
+    release: &Release,
+    context: SearchContext,
+    now: i64,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
+) -> Result<ReleaseDecision> {
+    evaluate_with_pending(c, media, indexer, release, context, now, None, operation).await
+}
+pub(crate) async fn evaluate_with_pending(
+    c: &Connection,
+    media: MediaDomain,
+    indexer: uuid::Uuid,
+    release: &Release,
+    context: SearchContext,
+    now: i64,
+    oldest_pending_publication: Option<i64>,
+    operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<ReleaseDecision> {
     let tv = matches!(media, MediaDomain::Tv);
     let title = release.metadata.title.as_deref().unwrap_or("");
@@ -97,43 +132,32 @@ pub async fn evaluate(
             let Some(series_type) = r.get::<Option<String>>(5)? else {
                 return Ok(ReleaseDecision::reject("series_type_unconfigured"));
             };
-            // Mirrors downloaded::match_absolute (and upstream ParsingService.GetAnimeEpisodes):
-            // a scene_absolute_episode_number match is only used when it resolves to exactly one
-            // episode in the series. An empty or ambiguous scene-column result is discarded (not
-            // treated as a mismatch) and matching falls back to the plain absolute_episode_number
-            // column below, instead of rejecting a real anime release at search/decision time.
-            // COUNT(*) is a single bounded aggregate row regardless of series size, so this needs
-            // no row-scan cap unlike the per-episode query just below.
-            let use_scene_for_absolute = if scene && series_type == "anime" {
-                if let parser::Numbering::Absolute { episode } = parsed.numbering.as_ref().unwrap()
-                {
-                    let hits = c
-                        .query(
-                            "SELECT COUNT(*) FROM episodes WHERE series_id=? AND scene_absolute_episode_number=?",
-                            params![id, *episode],
-                        )
-                        .await?
-                        .next()
-                        .await?
-                        .map(|r| r.get::<i64>(0))
-                        .transpose()?
-                        .unwrap_or(0);
-                    hits == 1
-                } else {
-                    false
+            // A release and its eventual downloaded file must select the same unique episode.
+            // Daily-on-anime and ordinary absolute numbering are admitted by source policy;
+            // query-family construction remains independently driven by the configured type.
+            let resolved = match parsed.numbering.as_ref().unwrap() {
+                parser::Numbering::Daily { date } if series_type != "standard" => {
+                    Some(downloaded::daily_candidates(c, id, date).await?)
                 }
-            } else {
-                false
+                parser::Numbering::Daily { .. } => continue,
+                parser::Numbering::Absolute { episode } => {
+                    Some(downloaded::absolute_candidates(c, id, scene, *episode).await?)
+                }
+                _ => None,
             };
+            if resolved.as_ref().is_some_and(|ids| ids.len() != 1) {
+                continue;
+            }
             let mut eps=c.query("SELECT e.id,e.season,e.number,e.absolute_episode_number,e.air_date,e.monitored,e.runtime,e.episode_file_id,e.scene_season_number,e.scene_episode_number,e.scene_absolute_episode_number,s.monitored,e.air_date_utc FROM episodes e JOIN seasons s ON s.series_id=e.series_id AND s.number=e.season WHERE e.series_id=? ORDER BY e.id LIMIT 10001",[id]).await?;
             let mut ids = Vec::new();
             let mut matched_numbers = std::collections::BTreeSet::new();
-            let mut aired = true;
+            let mut air_dates = Vec::new();
             let mut files = Vec::new();
             let mut runtime = Some(0i64);
             let mut monitored = r.get::<i64>(3)? == 1;
             let mut scanned_episodes = 0;
             while let Some(e) = eps.next().await? {
+                let episode_id = e.get::<i64>(0)?;
                 scanned_episodes += 1;
                 if scanned_episodes > 10000 {
                     return Err(SearchError("episode_match_limit"));
@@ -154,17 +178,10 @@ pub async fn evaluate(
                         episodes,
                     } => season == Some(*s) && number.is_some_and(|n| episodes.contains(&n)),
                     parser::Numbering::Season { season: s } => season == Some(*s),
-                    parser::Numbering::Daily { date } => {
-                        series_type == "daily"
-                            && e.get::<Option<String>>(4)?.as_deref() == Some(date)
-                    }
-                    parser::Numbering::Absolute { episode } => {
-                        series_type == "anime"
-                            && (if use_scene_for_absolute {
-                                e.get::<Option<i64>>(10)?
-                            } else {
-                                e.get(3)?
-                            }) == Some(*episode)
+                    parser::Numbering::Daily { .. } | parser::Numbering::Absolute { .. } => {
+                        resolved
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(&episode_id))
                     }
                 };
                 if matches {
@@ -172,11 +189,11 @@ pub async fn evaluate(
                     if let Some(n) = number {
                         matched_numbers.insert(n);
                     }
-                    aired &= e
-                        .get::<Option<String>>(12)?
-                        .as_deref()
-                        .and_then(timestamp)
-                        .is_some_and(|t| t <= now);
+                    air_dates.push(
+                        e.get::<Option<String>>(12)?
+                            .as_deref()
+                            .and_then(super::restrictions::stored_instant),
+                    );
                     files.push(e.get(7)?);
                     monitored &= e.get::<i64>(5)? == 1 && e.get::<i64>(11)? == 1;
                     runtime = runtime
@@ -215,7 +232,7 @@ pub async fn evaluate(
                 language: r.get(7)?,
                 monitored,
                 files,
-                aired,
+                air_dates,
             });
         }
     } else {
@@ -275,7 +292,7 @@ pub async fn evaluate(
                 language: r.get(15)?,
                 monitored: r.get::<i64>(7)? == 1,
                 files: vec![r.get(16)?],
-                aired: true,
+                air_dates: Vec::new(),
             });
         }
     }
@@ -309,22 +326,32 @@ pub async fn evaluate(
     if candidate.status.as_deref() == Some("deleted") {
         result.deny("movie_deleted")
     }
-    if context == SearchContext::Rss && !candidate.aired {
-        result.deny("episode_not_aired")
-    }
+    // Publication/grace and full-season rules replace the former blanket now-based
+    // veto: negative grace and the explicit 24-hour pack window must remain usable.
+    super::restrictions::apply(
+        c,
+        media,
+        indexer,
+        release,
+        &candidate.target,
+        &candidate.air_dates,
+        matches!(parsed.numbering, Some(parser::Numbering::Season { .. })),
+        now,
+        &mut result,
+        operation,
+    )
+    .await?;
     if context == SearchContext::Rss && !candidate.monitored {
         result.deny("not_monitored")
     }
     if release.facts.nuked == Some(true) {
         result.deny("nuked_release")
     }
-    if parsed.revision > 1 {
-        result.deny("proper_upgrade_unsupported")
-    }
+
     let mut evidence = crate::custom_formats::release(release, &parsed, tv);
     crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
         .await?;
-    apply_quality(
+    let quality = apply_quality(
         c,
         media,
         candidate.profile,
@@ -334,34 +361,36 @@ pub async fn evaluate(
         &parsed,
         &evidence,
         candidate.language,
+        context,
+        now,
         &mut result,
     )
     .await?;
-    let policy=c.query("SELECT torrent_delay_minutes,usenet_delay_minutes,availability_delay_days FROM release_delay_policies WHERE media_type=?",[domain(media)]).await?.next().await?;
-    if context == SearchContext::Rss {
-        if let Some(p) = policy {
-            if !tv && !available(&candidate, now, p.get::<i64>(2)?) {
-                result.deny("movie_unavailable")
+    let delay = super::delay::select(c, media, &candidate.target).await?;
+    if context == SearchContext::Rss && !tv {
+        let availability = c
+            .query(
+                "SELECT availability_delay_days FROM release_delay_policies WHERE media_type=?",
+                [domain(media)],
+            )
+            .await?
+            .next()
+            .await?;
+        if let Some(policy) = availability {
+            if !available(&candidate, now, policy.get(0)?) {
+                result.deny("movie_unavailable");
             }
-            let delay = p.get::<i64>(if release.facts.torrent.is_some() {
-                0
-            } else {
-                1
-            })? * 60;
-            if let Some(published) = timestamp(&release.metadata.published_at) {
-                let until = published.saturating_add(delay);
-                if until > now && result.disposition == Disposition::Accept {
-                    result.disposition = Disposition::Delay;
-                    result.not_before = Some(until);
-                    result.reasons.push("configured_delay".into());
-                }
-            } else {
-                result.deny("release_date_unknown")
-            }
-        } else {
-            result.deny("release_policy_unconfigured")
         }
     }
+    super::delay::apply(
+        &delay,
+        release,
+        context,
+        now,
+        oldest_pending_publication,
+        quality,
+        &mut result,
+    );
     let (column, id) = match &candidate.target {
         ReleaseTarget::Tv { series_id, .. } => ("series_id", *series_id),
         ReleaseTarget::Movies { movie_id } => ("movie_id", *movie_id),
@@ -412,6 +441,11 @@ fn available(c: &Candidate, now: i64, delay_days: i64) -> bool {
 }
 
 /// Shared profile/rank/size/cutoff checks for releases and already downloaded files.
+#[derive(Default, Clone, Copy)]
+pub(super) struct QualityAssessment {
+    pub highest_allowed: bool,
+    pub revision_bypass: bool,
+}
 pub(super) async fn apply_quality(
     c: &Connection,
     media: MediaDomain,
@@ -422,8 +456,11 @@ pub(super) async fn apply_quality(
     parsed: &crate::search::parser::ParsedRelease,
     evidence: &crate::custom_formats::Evidence,
     original_language: Option<i64>,
+    search_context: SearchContext,
+    now: i64,
     result: &mut ReleaseDecision,
-) -> Result<()> {
+) -> Result<QualityAssessment> {
+    let mut assessment = QualityAssessment::default();
     let tv = matches!(media, MediaDomain::Tv);
     let quality = if let Some(name) = &parsed.quality_name {
         c.query("SELECT quality_id,min_size,max_size FROM quality_definitions WHERE media_type=? AND name=?",params![domain(media),name.as_str()]).await?.next().await?
@@ -436,11 +473,18 @@ pub(super) async fn apply_quality(
         if let Some(profile_id) = profile_id {
             let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
                 .await
-                .map_err(|_| SearchError("release_profile_error"))?;
+                .map_err(|error| settings_error(error, "release_profile_error"))?;
             let ranked = profile_ranks(&profile.items);
             if let Some((_, rank, allowed, min, max)) =
                 ranked.iter().find(|(id, ..)| *id == quality_id)
             {
+                assessment.highest_allowed = *allowed
+                    && ranked
+                        .iter()
+                        .filter(|(_, _, allowed, _, _)| *allowed)
+                        .map(|(_, rank, ..)| *rank)
+                        .max()
+                        == Some(*rank);
                 if !allowed {
                     result.deny("quality_not_allowed")
                 }
@@ -461,7 +505,7 @@ pub(super) async fn apply_quality(
                 if let Some(policy) = profile.policy {
                     let formats = crate::custom_formats::catalog(c, media)
                         .await
-                        .map_err(|_| SearchError("custom_format_catalog_invalid"))?;
+                        .map_err(|error| settings_error(error, "custom_format_catalog_invalid"))?;
                     let score = crate::custom_formats::score(
                         &formats,
                         media,
@@ -499,50 +543,104 @@ pub(super) async fn apply_quality(
                             .map(|(_, r, ..)| *r),
                         Cutoff::Group { position } => Some(position),
                     };
-                    for file in files.iter().flatten() {
+                    let mode = crate::revision_policy::read(c, media)
+                        .await
+                        .map_err(|error| SearchError(error.code()))?
+                        .mode;
+                    let anime = if let Some(ReleaseTarget::Tv { series_id, .. }) = &result.target {
+                        c.query(
+                            "SELECT series_type='anime' FROM library_settings WHERE series_id=?",
+                            [*series_id],
+                        )
+                        .await?
+                        .next()
+                        .await?
+                        .map(|r| r.get::<Option<i64>>(0))
+                        .transpose()?
+                        .flatten()
+                            == Some(1)
+                    } else {
+                        false
+                    };
+                    let clock = revision::EvaluationClock::local(now).map_err(SearchError)?;
+                    let context = revision::Context {
+                        mode,
+                        search: search_context,
+                        anime,
+                        queued: false,
+                        clock,
+                    };
+                    let comparison_policy = revision::Profile {
+                        upgrade_allowed: policy.upgrade_allowed,
+                        cutoff_rank: cutoff,
+                        cutoff_score: i64::from(policy.cutoff_format_score),
+                        minimum_increment: i64::from(policy.min_upgrade_format_score),
+                    };
+                    let unique_files: std::collections::BTreeSet<_> =
+                        files.iter().flatten().copied().collect();
+                    for file in unique_files {
                         let column = if tv {
                             "episode_file_id"
                         } else {
                             "movie_file_id"
                         };
-                        let existing=c.query(&format!("SELECT quality_id FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),*file]).await?.next().await?;
-                        let existing = existing
-                            .map(|r| r.get::<Option<i64>>(0))
-                            .transpose()?
-                            .flatten()
-                            .and_then(|id| ranked.iter().find(|(q, ..)| *q == id));
-                        if !policy.upgrade_allowed {
-                            result.deny("upgrades_disabled")
-                        } else if let Some((_, old, ..)) = existing {
-                            let old_facts =
-                                crate::custom_formats::existing(c, media, *file).await?;
-                            let old_score = crate::custom_formats::score(
-                                &formats,
-                                media,
-                                old_facts,
-                                original_language,
-                                policy.format_items.clone(),
-                                !c.is_autocommit(),
-                            )
-                            .await?
-                            .score;
-                            if rank < old {
-                                result.deny("not_quality_upgrade");
-                            } else if rank > old {
-                                if cutoff.is_some_and(|cutoff| *old >= cutoff) {
-                                    result.deny("cutoff_met");
-                                }
-                            } else if old_score >= i64::from(policy.cutoff_format_score) {
-                                result.deny("cutoff_met");
-                            } else if score.score <= old_score {
-                                result.deny("custom_format_not_upgrade");
-                            } else if score.score - old_score
-                                < i64::from(policy.min_upgrade_format_score)
-                            {
-                                result.deny("custom_format_upgrade_increment");
-                            }
-                        } else {
-                            result.deny("existing_quality_unknown")
+                        let existing = c.query(&format!("SELECT quality_id,revision_json,release_group,date_added FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),file]).await?.next().await?;
+                        let Some(row) = existing else {
+                            result.deny("existing_quality_unknown");
+                            continue;
+                        };
+                        let old_quality = row.get::<Option<i64>>(0)?;
+                        let Some((old_id, old_rank, ..)) =
+                            old_quality.and_then(|id| ranked.iter().find(|(q, ..)| *q == id))
+                        else {
+                            result.deny("existing_quality_unknown");
+                            continue;
+                        };
+                        let old_revision = row
+                            .get::<Option<String>>(1)?
+                            .map(|s| {
+                                serde_json::from_str::<crate::media_files::FileRevision>(&s)
+                                    .map_err(|_| SearchError("existing_revision_invalid"))
+                            })
+                            .transpose()?;
+                        if let Some(old) = &old_revision {
+                            old.validate()
+                                .map_err(|_| SearchError("existing_revision_invalid"))?;
+                        }
+                        let old_group: Option<String> = row.get(2)?;
+                        let old_date = row.get::<Option<String>>(3)?.as_deref().and_then(timestamp);
+                        let old_facts = crate::custom_formats::existing(c, media, file).await?;
+                        let old_score = crate::custom_formats::score(
+                            &formats,
+                            media,
+                            old_facts,
+                            original_language,
+                            policy.format_items.clone(),
+                            !c.is_autocommit(),
+                        )
+                        .await?
+                        .score;
+                        let incoming = revision::Facts {
+                            quality_id,
+                            rank: *rank,
+                            revision: parsed.revision.as_ref(),
+                            score: score.score,
+                            group: evidence.release_group.as_deref(),
+                            date_added: None,
+                        };
+                        let current = revision::Facts {
+                            quality_id: *old_id,
+                            rank: *old_rank,
+                            revision: old_revision.as_ref(),
+                            score: old_score,
+                            group: old_group.as_deref(),
+                            date_added: old_date,
+                        };
+                        let comparison =
+                            revision::compare(&incoming, &current, &comparison_policy, &context);
+                        assessment.revision_bypass |= comparison.delay_bypass(tv, true, mode);
+                        for reason in comparison.reasons {
+                            result.deny(reason);
                         }
                     }
                 } else {
@@ -557,7 +655,7 @@ pub(super) async fn apply_quality(
     } else {
         result.deny("quality_unknown")
     }
-    Ok(())
+    Ok(assessment)
 }
 
 fn profile_ranks(items: &[ProfileItem]) -> Vec<(i64, usize, bool, Option<f64>, Option<f64>)> {
@@ -612,7 +710,7 @@ pub(crate) async fn target_ranks(
         .ok_or(SearchError("release_profile_error"))?;
     let profile = crate::quality_profiles::fetch(c, domain(media), profile)
         .await
-        .map_err(|_| SearchError("release_profile_error"))?;
+        .map_err(|error| settings_error(error, "release_profile_error"))?;
     Ok(profile_ranks(&profile.items)
         .into_iter()
         .filter(|(_, _, allowed, ..)| *allowed)

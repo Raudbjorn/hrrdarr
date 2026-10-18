@@ -95,6 +95,59 @@ fn finish_render(
         .ok_or_else(|| internal("non_utf8_destination"))
 }
 
+// The same exact-input score cache guards the transaction without compiling regexes
+// under its writer lock. Empty score weights deliberately make naming profile-independent.
+async fn matching_names(
+    c: &Connection,
+    target: &MediaTarget,
+    field: TemplateField,
+    template: &str,
+    evidence: &crate::custom_formats::Evidence,
+) -> Result<Vec<String>, DestinationError> {
+    let fail = || {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "custom_format_evaluation_failed",
+        })
+    };
+    let parsed = render::parse(field, template).map_err(|_| {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "invalid_template",
+        })
+    })?;
+    if !parsed.uses_custom_formats() {
+        return Ok(Vec::new());
+    }
+    let media = match target {
+        MediaTarget::Episode(_) => crate::api::MediaDomain::Tv,
+        MediaTarget::Movie(_) => crate::api::MediaDomain::Movies,
+    };
+    let formats = crate::custom_formats::catalog(c, media)
+        .await
+        .map_err(|_| fail())?;
+    let original = crate::search::downloaded::original_language(c, target)
+        .await
+        .map_err(|_| fail())?;
+    let score = crate::custom_formats::score(
+        &formats,
+        media,
+        evidence.clone(),
+        original,
+        Vec::new(),
+        !c.is_autocommit(),
+    )
+    .await
+    .map_err(|_| fail())?;
+    let mut names = formats
+        .into_iter()
+        .filter(|f| f.definition.include_when_renaming && score.format_ids.contains(&f.id))
+        .map(|f| f.definition.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
 /// `rename_enabled=0`, or a `NULL` format for the target's domain/series-type, both fall
 /// back to `root.join(basename)` -- today's exact behavior. Never invents a default template.
 pub(crate) async fn resolve_owned_destination(
@@ -103,7 +156,9 @@ pub(crate) async fn resolve_owned_destination(
     root: &str,
     basename: &str,
     quality_id: i64,
+    revision: &crate::media_files::FileRevision,
     edition: Option<&str>,
+    evidence: &crate::custom_formats::Evidence,
 ) -> Result<String, DestinationError> {
     let domain = match target {
         MediaTarget::Episode(_) => "tv",
@@ -159,12 +214,16 @@ pub(crate) async fn resolve_owned_destination(
             let Some(template) = template else {
                 return preserved(root, basename);
             };
+            let custom_formats = matching_names(c, target, field, &template, evidence).await?;
             let facts = EpisodeNamingFacts {
+                custom_formats,
                 series_title: row.get(0)?,
+                anime: series_type.as_deref() == Some("anime"),
                 season: row.get(1)?,
                 episode: row.get(2)?,
                 episode_title: Some(row.get(3)?),
                 quality_title: quality_title(c, "tv", quality_id).await?,
+                revision: Some(revision.clone()),
                 air_date: row.get(4)?,
             };
             finish_render(
@@ -189,11 +248,16 @@ pub(crate) async fn resolve_owned_destination(
                 .next()
                 .await?
                 .ok_or_else(|| internal("target_missing"))?;
+            let custom_formats =
+                matching_names(c, target, TemplateField::StandardMovie, &template, evidence)
+                    .await?;
             let facts = MovieNamingFacts {
+                custom_formats,
                 movie_title: row.get(0)?,
                 release_year: row.get(1)?,
                 edition: edition.map(str::to_owned),
                 quality_title: quality_title(c, "movies", quality_id).await?,
+                revision: Some(revision.clone()),
             };
             finish_render(
                 TemplateField::StandardMovie,
@@ -223,10 +287,13 @@ mod tests {
     fn short_stem_is_untouched_and_joined_with_the_downloaded_files_own_extension() {
         let facts = EpisodeNamingFacts {
             series_title: "Halcyon Vale".into(),
+            anime: false,
             season: 3,
             episode: 7,
             episode_title: Some("The Long Dark".into()),
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
+            custom_formats: vec![],
             air_date: None,
         };
         let destination = finish_render(
@@ -245,10 +312,13 @@ mod tests {
     fn a_very_long_rendered_stem_is_capped_to_leave_room_for_the_extension() {
         let facts = EpisodeNamingFacts {
             series_title: "x".repeat(500),
+            anime: false,
             season: 1,
             episode: 1,
             episode_title: None,
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
+            custom_formats: vec![],
             air_date: None,
         };
         let destination = finish_render(
@@ -267,16 +337,37 @@ mod tests {
         // 255 (NAME_MAX) total, minus ".mkv" (4 bytes), minus the joining dot (1 byte).
         assert_eq!(filename.len(), 255);
         assert!(filename.ends_with(".mkv"));
+        let mut facts = facts;
+        facts.custom_formats = vec!["é".repeat(100), "ü".repeat(100)];
+        let destination = finish_render(
+            TemplateField::StandardEpisode,
+            "{Custom Formats}",
+            RenderFacts::Episode(&facts),
+            &config(),
+            "/library/Show",
+            "source.mkv",
+        )
+        .unwrap();
+        let filename = std::path::Path::new(&destination)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(filename.len() <= render::MAX_COMPONENT_BYTES);
+        assert!(filename.ends_with(".mkv"));
     }
 
     #[test]
     fn a_template_that_renders_empty_is_a_render_error_not_a_silent_fallback() {
         let facts = EpisodeNamingFacts {
             series_title: "Halcyon Vale".into(),
+            anime: false,
             season: 1,
             episode: 1,
             episode_title: None,
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
+            custom_formats: vec![],
             air_date: None,
         };
         let err = finish_render(

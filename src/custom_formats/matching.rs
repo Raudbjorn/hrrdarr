@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Evidence {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::search::revision::Observation>,
     pub title: String,
     pub filename: Option<String>,
     pub languages: Option<Vec<i32>>,
@@ -187,6 +189,9 @@ pub(crate) fn validate_evidence(
     media: MediaDomain,
     evidence: &Evidence,
 ) -> std::result::Result<(), &'static str> {
+    if let Some(revision) = &evidence.revision {
+        revision.validate()?;
+    }
     if evidence.version != 1
         || evidence.title.is_empty()
         || evidence.title.chars().any(char::is_control)
@@ -466,6 +471,7 @@ pub(crate) fn parsed(
     }
     Evidence {
         version: 1,
+        revision: crate::search::revision::Observation::from_parsed(parsed),
         title: title.into(),
         filename: None,
         languages: (!languages.is_empty()).then_some(languages),
@@ -511,14 +517,18 @@ pub(crate) fn release(
         tv,
         release.metadata.size_bytes,
     );
-    if !release.metadata.languages.is_empty() {
-        let values: Option<Vec<_>> = release
-            .metadata
-            .languages
-            .iter()
-            .map(|s| language(s, tv))
-            .collect();
-        e.languages = values;
+    // Torznab keeps combined values such as "English,French"; unknown tokens are skipped
+    // so they cannot erase recognised indexer or title languages. Duplicates are kept so an
+    // oversized indexer list still fails the MAX_LANGUAGE_FACTS bound.
+    let values: Vec<_> = release
+        .metadata
+        .languages
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|s| language(s.trim(), tv))
+        .collect();
+    if !values.is_empty() {
+        e.languages = Some(values);
     }
     let f = &release.facts;
     let mut flags = 0i64;
@@ -586,7 +596,12 @@ pub(crate) async fn existing(
     let original_path: Option<String> = row.get(2)?;
     let title = row
         .get::<Option<String>>(1)?
-        .or_else(|| original_path.map(|s| basename(&s)))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            original_path
+                .map(|s| basename(&s))
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| basename(&path));
     let parsed = crate::search::parser::parse(&title, tv).ok();
     let (source, resolution, modifier) = structured_quality(
@@ -599,6 +614,7 @@ pub(crate) async fn existing(
     )?;
     Ok(Evidence {
         version: 1,
+        revision: None,
         title,
         filename: Some(basename(&path)),
         languages: row
@@ -627,6 +643,7 @@ mod tests {
     fn evidence() -> Evidence {
         Evidence {
             version: 1,
+            revision: None,
             title: "Harbor.2020.English.1080p.WEB-DL-GROUP".into(),
             filename: None,
             languages: Some(vec![1, 2]),
@@ -640,6 +657,35 @@ mod tests {
             resolution: 1080,
             modifier: 5,
         }
+    }
+    #[test]
+    fn revision_observation_is_optional_but_validated() {
+        let old = evidence();
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("revision").is_none());
+        let decoded: Evidence = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.revision.is_none());
+        let mut new = old.clone();
+        new.revision = Some(crate::search::revision::Observation {
+            parser_version: 1,
+            value: crate::media_files::FileRevision {
+                version: 2,
+                real: 0,
+                is_repack: true,
+            },
+            explicit_marker: true,
+        });
+        assert!(validate_evidence(MediaDomain::Tv, &new).is_ok());
+        assert_eq!(serde_json::to_value(&new).unwrap()["version"], 1);
+        new.revision.as_mut().unwrap().parser_version = 2;
+        assert_eq!(
+            validate_evidence(MediaDomain::Tv, &new).unwrap_err(),
+            "revision_evidence_version"
+        );
+        let mut malformed = encoded;
+        malformed["revision"] =
+            serde_json::json!({"parser_version":1,"value":{"version":2},"explicit_marker":true});
+        assert!(serde_json::from_value::<Evidence>(malformed).is_err());
     }
     fn spec(condition: Condition, required: bool, negate: bool) -> Specification {
         Specification {
@@ -886,6 +932,35 @@ mod tests {
         }
         assert!(count > 50);
         drop(rows);
+        c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Series','/tv'); INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/tv/Current.mkv'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,'/movies/Current.mkv'); INSERT INTO file_metadata(media_type,episode_file_id)VALUES('tv',1); INSERT INTO file_metadata(media_type,movie_file_id)VALUES('movies',1);").await.unwrap();
+        for (title, original_path, expected) in [
+            (Some("   "), "/original/Original.mkv", "Original.mkv"),
+            (Some("\t"), "/original/   ", "Current.mkv"),
+            (None, "   ", "Current.mkv"),
+            (
+                Some("  Actual release  "),
+                "/original/Original.mkv",
+                "  Actual release  ",
+            ),
+        ] {
+            c.execute(
+                "UPDATE file_metadata SET original_release_title=?,original_file_path=CASE WHEN media_type='movies' THEN ? ELSE NULL END",
+                params![title, original_path],
+            )
+            .await
+            .unwrap();
+            for media in [MediaDomain::Tv, MediaDomain::Movies] {
+                // TV original paths are currently absent by schema contract; its blank
+                // scene title falls directly through to the current basename.
+                let expected =
+                    if media == MediaDomain::Tv && title.is_none_or(|s| s.trim().is_empty()) {
+                        "Current.mkv"
+                    } else {
+                        expected
+                    };
+                assert_eq!(existing(&c, media, 1).await.unwrap().title, expected);
+            }
+        }
         drop(c);
         drop(db);
         std::fs::remove_dir_all(path).unwrap();
@@ -933,7 +1008,7 @@ mod tests {
                 let xml = format!(
                     r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>{title}</title><guid>owned-test</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://example.invalid/owned</link><torznab:attr name="downloadvolumefactor" value="{factor}"/></item></channel></rss>"#
                 );
-                let r = crate::providers::indexer::parse_page(
+                let mut r = crate::providers::indexer::parse_page(
                     &xml,
                     0,
                     100,
@@ -949,6 +1024,23 @@ mod tests {
                 .remove(0);
                 let parsed = crate::search::parser::parse(title, tv).unwrap();
                 assert_eq!(release(&r, &parsed, tv).indexer_flags, Some(flag));
+                let english = language("English", tv).unwrap();
+                let french = language("French", tv).unwrap();
+                r.metadata.languages = vec!["English,French".into(), "Klingon".into()];
+                assert_eq!(
+                    release(&r, &parsed, tv).languages,
+                    Some(vec![english, french])
+                );
+                r.metadata.languages = vec!["Klingon".into()];
+                let titled = if tv {
+                    "Harbor.S01E01.French.1080p.WEB-DL"
+                } else {
+                    "Harbor.2020.French.1080p.WEB-DL"
+                };
+                r.metadata.title = Some(titled.into());
+                let titled_parse = crate::search::parser::parse(titled, tv).unwrap();
+                // An unrecognised indexer token must not erase title-parsed languages.
+                assert_eq!(release(&r, &titled_parse, tv).languages, Some(vec![french]));
             }
         }
     }

@@ -954,3 +954,419 @@ async fn pending_replacement_file_survives_cleanup_and_is_never_readopted() {
         "the quarantined file must not be adopted as a new one"
     );
 }
+
+async fn execute_rescan(db: &Arc<Database>, series: i64) -> RescanCommand {
+    let batch = create(
+        State(db.clone()),
+        MediaDomain::Tv,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(series)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    let command = actual_claim(db, batch.commands[0].id).await;
+    run(db, command).await.unwrap();
+    read(&connection(db).await.unwrap(), batch.commands[0].id)
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn local_daily_and_absolute_files_follow_catalog_rules_and_recover_after_reopen() {
+    let scratch = Scratch::new();
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    // Each fixture has ordinary episode1, optional ordinary episode2 and optional special.
+    // Scene settings never reinterpret an existing local filename's ordinary number.
+    let cases = [
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            0,
+            Some(1),
+        ),
+        (
+            "anime",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            0,
+            Some(1),
+        ),
+        (
+            "standard",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            0,
+            None,
+        ),
+        (
+            "missing",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            0,
+            None,
+        ),
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-03",
+            1,
+            0,
+            None,
+        ),
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            2,
+            0,
+            None,
+        ),
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            1,
+            Some(1),
+        ),
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            0,
+            1,
+            Some(0),
+        ),
+        (
+            "daily",
+            "Show.2020.01.02.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            0,
+            2,
+            None,
+        ),
+        (
+            "anime",
+            "Show - 023 - Title.mkv",
+            "2020-01-02",
+            1,
+            0,
+            Some(1),
+        ),
+        (
+            "standard",
+            "Show - 023 - Title.mkv",
+            "2020-01-02",
+            1,
+            0,
+            Some(1),
+        ),
+        ("anime", "Show - 023 - Title.mkv", "2020-01-02", 2, 0, None),
+        ("anime", "Show - 099 - Title.mkv", "2020-01-02", 1, 0, None),
+        (
+            "anime",
+            "Show.S01E01.1080p.WEB-DL.mkv",
+            "2020-01-02",
+            1,
+            0,
+            Some(1),
+        ),
+    ];
+    let mut sources = vec![];
+    for (index, (kind, name, date, regular, special, expected)) in cases.iter().enumerate() {
+        let sid = index as i64 + 1;
+        let path = scratch.dir(&format!("tv/{sid}"));
+        c.execute(
+            "INSERT INTO series(id,title,path)VALUES(?,'Show',?)",
+            params![sid, path.clone()],
+        )
+        .await
+        .unwrap();
+        if *kind != "missing" {
+            c.execute("INSERT INTO library_settings(media_type,series_id,series_type,use_scene_numbering)VALUES('tv',?,?,1)",params![sid,*kind]).await.unwrap();
+        }
+        for (season, count) in [(1, *regular), (0, *special)] {
+            if count == 0 {
+                continue;
+            }
+            c.execute(
+                "INSERT INTO seasons(series_id,number)VALUES(?,?)",
+                params![sid, season],
+            )
+            .await
+            .unwrap();
+            for number in 1..=count {
+                c.execute("INSERT INTO episodes(series_id,season,number,title,air_date,absolute_episode_number,scene_absolute_episode_number)VALUES(?,?,?,'Episode',?,23,99)",params![sid,season,number,*date]).await.unwrap();
+            }
+        }
+        let filename = format!("{path}/{name}");
+        write_file(&filename, b"preserved local media");
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&filename).unwrap().ino();
+        let done = execute_rescan(&db, sid).await;
+        assert!(
+            matches!(done.status, RescanStatus::Succeeded),
+            "case {index}"
+        );
+        assert_eq!(
+            done.files_adopted,
+            Some(i64::from(expected.is_some())),
+            "case {index}"
+        );
+        let mut rows = c
+            .query(
+                "SELECT season FROM episodes WHERE series_id=? AND episode_file_id IS NOT NULL",
+                [sid],
+            )
+            .await
+            .unwrap();
+        let actual = rows.next().await.unwrap().map(|r| r.get::<i64>(0).unwrap());
+        assert_eq!(actual, *expected, "case {index}");
+        assert!(rows.next().await.unwrap().is_none());
+        assert_eq!(std::fs::read(&filename).unwrap(), b"preserved local media");
+        assert_eq!(std::fs::metadata(&filename).unwrap().ino(), inode);
+        sources.push((sid, filename, inode));
+    }
+    // A real ordinary multi-episode file retains the established one-file/many-episodes path.
+    let multi_path = scratch.dir("tv/multi");
+    c.execute(
+        "INSERT INTO series(id,title,path)VALUES(99,'Show',?)",
+        [multi_path.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute_batch("INSERT INTO seasons VALUES(99,1,1);INSERT INTO episodes(series_id,season,number,title)VALUES(99,1,1,'One'),(99,1,2,'Two');").await.unwrap();
+    let multi_file = format!("{multi_path}/Show.S01E01E02.mkv");
+    write_file(&multi_file, b"multi-preserved");
+    assert_eq!(execute_rescan(&db, 99).await.files_adopted, Some(1));
+    let row=c.query("SELECT count(*),count(DISTINCT episode_file_id) FROM episodes WHERE series_id=99 AND episode_file_id IS NOT NULL",()).await.unwrap().next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+    assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    drop(row); // Release the read cursor before command admission opens another writer.
+    assert_eq!(std::fs::read(&multi_file).unwrap(), b"multi-preserved");
+    // Persist a running command, reopen and use normal recovery/claim: adopted rows must
+    // converge without replacing identities or writing/moving the physical media again.
+    let first_id = c
+        .query("SELECT id FROM episode_files WHERE series_id=1", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap();
+    let batch = create(
+        State(db.clone()),
+        MediaDomain::Tv,
+        Ok(Query(Empty {})),
+        Ok(Json(input(Some(1)))),
+    )
+    .await
+    .unwrap()
+    .1
+    .0;
+    actual_claim(&db, batch.commands[0].id).await;
+    drop(c);
+    drop(db);
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    recover(&c, now().unwrap(), "interrupted").await.unwrap();
+    let claimed = actual_claim(&db, batch.commands[0].id).await;
+    run(&db, claimed).await.unwrap();
+    assert_eq!(
+        read(&c, batch.commands[0].id).await.unwrap().files_adopted,
+        Some(0)
+    );
+    assert_eq!(
+        c.query("SELECT id FROM episode_files WHERE series_id=1", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap(),
+        first_id
+    );
+    for (_, filename, inode) in sources {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::read(&filename).unwrap(), b"preserved local media");
+        assert_eq!(std::fs::metadata(&filename).unwrap().ino(), inode);
+    }
+}
+
+#[tokio::test]
+async fn local_reconciliation_revalidates_metadata_and_rolls_back_rebinding_as_one_write() {
+    let scratch = Scratch::new();
+    let path = scratch.dir("tv/Show");
+    let db = scratch.database().await;
+    let c = connection(&db).await.unwrap();
+    c.execute(
+        "INSERT INTO series(id,title,path)VALUES(1,'Show',?)",
+        [path.clone()],
+    )
+    .await
+    .unwrap();
+    c.execute_batch("INSERT INTO seasons VALUES(1,1,1);INSERT INTO library_settings(media_type,series_id,series_type,use_scene_numbering)VALUES('tv',1,'daily',0);INSERT INTO episodes(id,series_id,season,number,title,air_date,absolute_episode_number)VALUES(1,1,1,1,'One','2020-01-02',23),(2,1,1,2,'Two','2020-01-03',24);").await.unwrap();
+    let filename = format!("{path}/Show.2020.01.02.mkv");
+    write_file(&filename, b"same-file");
+    let walk = WalkFile {
+        relative: "Show.2020.01.02.mkv".into(),
+        absolute: filename.clone(),
+        size: 9,
+    };
+    let parsed = parser::parse("Show.2020.01.02", true).unwrap();
+    let present = HashSet::from([filename.clone()]);
+    let empty = HashSet::new();
+    // Parsing/walking precedes mutable metadata. The writer must use the current catalog.
+    c.execute(
+        "UPDATE library_settings SET series_type='standard' WHERE series_id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &parsed, &present, &empty)
+            .await
+            .unwrap(),
+        (false, vec![])
+    );
+    c.execute_batch("UPDATE library_settings SET series_type='daily' WHERE series_id=1;UPDATE episodes SET air_date='2020-01-04' WHERE id=1;UPDATE episodes SET air_date='2020-01-02' WHERE id=2;").await.unwrap();
+    assert_eq!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &parsed, &present, &empty)
+            .await
+            .unwrap(),
+        (true, vec![2])
+    );
+    c.execute(
+        "UPDATE series SET path=? WHERE id=1",
+        [scratch.dir("tv/Moved")],
+    )
+    .await
+    .unwrap();
+    assert!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &parsed, &present, &empty)
+            .await
+            .is_err()
+    );
+    assert!(
+        delete_stale_episode_file(&c, 1, &path, 1, &filename)
+            .await
+            .is_err()
+    );
+    c.execute("UPDATE series SET path=? WHERE id=1", [path.clone()])
+        .await
+        .unwrap();
+    // Inject a failure after delete-at-path. Both the old file and episode2 binding must
+    // survive; the former split delete/adopt transactions would lose that association.
+    c.execute_batch("UPDATE episodes SET air_date='2020-01-03' WHERE id=2;UPDATE episodes SET air_date='2020-01-02' WHERE id=1;CREATE TRIGGER reject_rebind BEFORE INSERT ON episode_files BEGIN SELECT RAISE(ABORT,'injected adoption failure'); END;").await.unwrap();
+    assert!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &parsed, &present, &empty)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        c.query(
+            "SELECT id FROM episodes WHERE episode_file_id IS NOT NULL",
+            ()
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        c.query("SELECT path FROM episode_files", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        filename
+    );
+    c.execute_batch("DROP TRIGGER reject_rebind").await.unwrap();
+    assert_eq!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &parsed, &present, &empty)
+            .await
+            .unwrap(),
+        (true, vec![1])
+    );
+    // Ordinary multi-episode local names remain all-or-nothing even with scene policy set.
+    c.execute_batch("UPDATE library_settings SET use_scene_numbering=1 WHERE series_id=1")
+        .await
+        .unwrap();
+    let multi = parser::parse("Show.S01E01E02", true).unwrap();
+    assert_eq!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &multi, &present, &empty)
+            .await
+            .unwrap(),
+        (true, vec![1, 2])
+    );
+    let missing = parser::parse("Show.S01E01E03", true).unwrap();
+    assert_eq!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &missing, &present, &empty)
+            .await
+            .unwrap(),
+        (false, vec![])
+    );
+    // The same atomic rollback contract applies to the pre-existing SxxExx sibling path.
+    let single = parser::parse("Show.S01E01", true).unwrap();
+    c.execute_batch("CREATE TRIGGER reject_standard_rebind BEFORE INSERT ON episode_files BEGIN SELECT RAISE(ABORT,'injected standard rebind failure'); END;").await.unwrap();
+    assert!(
+        reconcile_episode_candidate(&c, 1, &path, &walk, &single, &present, &empty)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        c.query(
+            "SELECT count(*) FROM episodes WHERE episode_file_id IS NOT NULL",
+            ()
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap(),
+        2
+    );
+    c.execute_batch("DROP TRIGGER reject_standard_rebind;UPDATE episodes SET absolute_episode_number=NULL,air_date=NULL;").await.unwrap();
+    assert!(
+        local_episode_ids(&c, 1, &Numbering::Absolute { episode: 23 })
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        local_episode_ids(
+            &c,
+            1,
+            &Numbering::Daily {
+                date: "2020-01-02".into()
+            }
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(std::fs::read(&filename).unwrap(), b"same-file");
+}

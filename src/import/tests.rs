@@ -89,6 +89,9 @@ async fn count(db: &Database, table: &str) -> i64 {
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
+    // All execute() cases share the process-wide import permit. Keep this regression in the
+    // serial recovery test so unrelated scratch databases cannot race for that permit.
+    manual_hidden_extension_filename_preserves_explicit_mapping().await;
     owned_cases::replacements().await;
     same_path_cases::replacements().await;
     // These use the real phase helpers and reopen the owned database between interruption and
@@ -386,7 +389,6 @@ async fn filesystem_identity_checks_reject_swaps_and_retain_unrecorded_staging()
     drop(db);
 }
 
-#[tokio::test]
 async fn manual_hidden_extension_filename_preserves_explicit_mapping() {
     for movie in [false, true] {
         let dir = Scratch::new();

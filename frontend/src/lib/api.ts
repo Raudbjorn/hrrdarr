@@ -1,5 +1,8 @@
+import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
+import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTarget, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
+export type SettingsWriteState = 'idle' | 'busy' | 'uncertain';
 export type Result<T> = { ok: true; data: T } | { ok: false; error: string; code?: string; status?: number };
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -204,3 +207,106 @@ export const getRootFolder = (domain: MediaDomain, id: number) => validId(id) ? 
 export const createRootFolder = (domain: MediaDomain, path: string) => path.trim().length > 0 && path.length <= 4096 ? request<RootFolder>(`/api/v1/${domain}/root-folders`, { path }, 'POST', true) : Promise.resolve<Result<RootFolder>>({ ok: false, error: 'Root folder path is required.' });
 export const createRescanCommand = (domain: MediaDomain, targetId: number, priority: CommandPriority = 'normal') => validId(targetId) ? request<RescanBatch>(`/api/v1/${domain}/rescan-commands`, { target_id: targetId, priority }, 'POST', true) : invalid<RescanBatch>();
 export const getRescanCommand = (domain: MediaDomain, id: string) => validOperation(id) ? request<RescanCommand>(`/api/v1/${domain}/rescan-commands/${id}`, undefined, undefined, true) : invalidProvider<RescanCommand>();
+
+// Custom formats remain scoped to the selected library domain.
+export const listCustomFormats = (domain: MediaDomain) => request<import('./api.generated').CustomFormat[]>(`/api/v1/${domain}/custom-formats`, undefined, undefined, true);
+export const getCustomFormatSchema = (domain: MediaDomain) => request<import('./api.generated').CustomFormatSchema>(`/api/v1/${domain}/custom-formats/schema`, undefined, undefined, true);
+export const createCustomFormat = (domain: MediaDomain, input: import('./api.generated').CustomFormatInput) => request<import('./api.generated').CustomFormat>(`/api/v1/${domain}/custom-formats`, input, 'POST', true);
+export const updateCustomFormat = (domain: MediaDomain, id: number, input: import('./api.generated').CustomFormatInput) => validId(id) ? request<import('./api.generated').CustomFormat>(`/api/v1/${domain}/custom-formats/${id}`, input, 'PUT', true) : invalid<import('./api.generated').CustomFormat>();
+export const deleteCustomFormat = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`/api/v1/${domain}/custom-formats/${id}`, undefined, 'DELETE', true) : invalid<void>();
+export const getQualityProfile = (domain: MediaDomain, id: number) => validId(id) ? request<QualityProfile>(`/api/v1/${domain}/quality-profiles/${id}`, undefined, undefined, true) : invalid<QualityProfile>();
+export const getQualityProfileSchema = (domain: MediaDomain) => request<QualityProfileInput>(`/api/v1/${domain}/quality-profiles/schema`, undefined, undefined, true);
+export const listQualityDefinitions = (domain: MediaDomain) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions`, undefined, undefined, true);
+export const createQualityProfile = (domain: MediaDomain, input: QualityProfileInput) => request<QualityProfile>(`/api/v1/${domain}/quality-profiles`, input, 'POST', true);
+export const updateQualityProfile = (domain: MediaDomain, id: number, input: QualityProfileInput) => validId(id) ? request<QualityProfile>(`/api/v1/${domain}/quality-profiles/${id}`, input, 'PUT', true) : invalid<QualityProfile>();
+export const deleteQualityProfile = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`/api/v1/${domain}/quality-profiles/${id}`, undefined, 'DELETE', true) : invalid<void>();
+
+export const getQualityDefinitionLimits = (domain: MediaDomain) => request<import('./api.generated').QualityDefinitionLimits>(`/api/v1/${domain}/quality-definitions/limits`, undefined, undefined, true);
+export const getQualityDefinitionDefaults = (domain: MediaDomain) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/defaults`, undefined, undefined, true);
+export const updateQualityDefinitions = (domain: MediaDomain, input: import('./api.generated').QualityDefinitionUpdate[]) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/bulk`, input, 'PUT', true);
+export const resetQualityDefinitions = (domain: MediaDomain, resetTitles: boolean) => request<QualityDefinition[]>(`/api/v1/${domain}/quality-definitions/reset`, { reset_titles: resetTitles }, 'POST', true);
+
+const tagPath = (domain: MediaDomain) => `/api/v1/${domain}/tags`;
+export const listTags = (domain: MediaDomain) => request<Tag[]>(tagPath(domain), undefined, undefined, true);
+export const listTagDetails = (domain: MediaDomain) => request<TagDetail[]>(`${tagPath(domain)}/detail`, undefined, undefined, true);
+export const createTag = (domain: MediaDomain, label: string) => request<Tag>(tagPath(domain), {label}, 'POST', true);
+export const renameTag = (domain: MediaDomain, id: number, label: string) => validId(id) ? request<Tag>(`${tagPath(domain)}/${id}`, {label}, 'PUT', true) : invalid<Tag>();
+export const deleteTag = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`${tagPath(domain)}/${id}`, undefined, 'DELETE', true) : invalid<void>();
+export const getTagOwners = (domain: MediaDomain, id: number, offset = 0) => validId(id) && Number.isSafeInteger(offset) && offset >= 0 ? request<TagOwners>(`${tagPath(domain)}/${id}/owners?limit=25&offset=${offset}`, undefined, undefined, true) : invalid<TagOwners>();
+export const assignLibraryTags = (domain: MediaDomain, ids: number[], tags: TagAssignment) => ids.length > 0 && ids.length <= 100 && ids.every(validId) && tags.ids.length <= 200 && tags.ids.every(validId) ? request<LibraryItem[]>(`${collection(domain)}/editor`, {ids,patch:{tags}}, 'PUT', true) : invalid<LibraryItem[]>();
+
+const delayPath = (domain: MediaDomain) => `/api/v1/${domain}/delay-profiles`;
+export const listDelayProfiles = (domain: MediaDomain) => request<import('./api.generated').DelayProfileCatalog>(delayPath(domain), undefined, undefined, true);
+export const getDelayProfileSchema = (domain: MediaDomain) => request<import('./api.generated').DelayProfileInput>(`${delayPath(domain)}/schema`, undefined, undefined, true);
+export const createDelayProfile = (domain: MediaDomain, input: import('./api.generated').DelayProfileWrite) => request<import('./api.generated').DelayProfileCatalog>(delayPath(domain), input, 'POST', true);
+export const updateDelayProfile = (domain: MediaDomain, id: number, input: import('./api.generated').DelayProfileWrite) => validId(id) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').DelayProfileCatalog>();
+export const deleteDelayProfile = (domain: MediaDomain, id: number, revision: number) => validId(id)&&validId(revision) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}?revision=${revision}`, undefined, 'DELETE', true) : invalid<import('./api.generated').DelayProfileCatalog>();
+export const reorderDelayProfiles = (domain: MediaDomain, input: import('./api.generated').DelayProfileReorder) => request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/reorder`, input, 'PUT', true);
+export const getRevisionPolicy = (domain: MediaDomain) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, undefined, undefined, true);
+export const updateRevisionPolicy = (domain: MediaDomain, input: import('./api.generated').RevisionPolicyUpdate) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, input, 'PUT', true);
+
+const releaseProfilePath=(domain:MediaDomain)=>`/api/v1/${domain}/release-profiles`;
+export const listReleaseProfiles=(domain:MediaDomain)=>request<import('./api.generated').ReleaseProfileCatalog>(releaseProfilePath(domain),undefined,undefined,true);
+export const getReleaseProfileSchema=(domain:MediaDomain)=>request<import('./release-profile-draft').Input>(`${releaseProfilePath(domain)}/schema`,undefined,undefined,true);
+export const createReleaseProfile=(domain:MediaDomain,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(input.revision)&&input.profile.indexers.every(r=>r.kind==='provider')?request<import('./api.generated').ReleaseProfileCatalog>(releaseProfilePath(domain),input,'POST',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
+export const updateReleaseProfile=(domain:MediaDomain,id:number,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(id)&&validId(input.revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}`,input,'PUT',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
+export const deleteReleaseProfile=(domain:MediaDomain,id:number,revision:number)=>validId(id)&&validId(revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}?revision=${revision}`,undefined,'DELETE',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
+
+// One readback boundary for settings which reconcile policies and schedules together.
+export const getCompletedDownloadHandling = (media: MediaDomain) => request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,undefined,undefined,true);
+export const saveCompletedDownloadHandling = (media: MediaDomain, input: import('./api.generated').CompletedDownloadHandlingUpdate) => validId(input.revision) ? request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,input,'PUT',true) : invalidProvider<import('./api.generated').CompletedDownloadHandling>();
+export const inheritProcessingPolicy = (provider: string, media: MediaDomain, input: import('./api.generated').ProcessingPolicyReset) => validOperation(provider)&&validId(input.provider_revision)&&(input.revision===null||validId(input.revision)) ? request<ProcessingPolicy>(`/api/v1/download-processing/policies/${provider}/${media}/inherit`,input,'PUT',true) : invalidProvider<ProcessingPolicy>();
+export const inheritRefreshSchedule = (input: import('./api.generated').RefreshScheduleReset) => validOperation(input.target.provider_id)&&validId(input.provider_revision)&&(input.revision===null||validId(input.revision)) ? request<RefreshSchedule>('/api/v1/download-refresh/schedules/inherit',input,'PUT',true) : invalidProvider<RefreshSchedule>();
+export async function readDownloadHandling(providerId?: string): Promise<Result<{settings:Record<MediaDomain,import('./api.generated').CompletedDownloadHandling>;schedules:RefreshSchedule[];provider:Provider|null;policies:Partial<Record<MediaDomain,ProcessingPolicy>>}>> {
+  const [tv,movies,schedules] = await Promise.all([getCompletedDownloadHandling('tv'),getCompletedDownloadHandling('movies'),listRefreshSchedules()]);
+  if(!tv.ok)return tv;if(!movies.ok)return movies;if(!schedules.ok)return schedules;
+  let provider:Provider|null=null;
+  const policies:Partial<Record<MediaDomain,ProcessingPolicy>>={};
+  if(providerId){
+    const saved=await getProvider(providerId);
+    if(!saved.ok && saved.status!==404)return saved;
+    if(saved.ok){
+      provider=saved.data;
+      if(provider.settings.implementation==='qbittorrent')for(const media of ['tv','movies'] as const){
+        if(!provider.settings[media])continue;
+        const policy=await getProcessingPolicy(providerId,media);
+        if(!policy.ok)return policy;
+        policies[media]=policy.data;
+      }
+    }
+  }
+  return {ok:true,data:{settings:{tv:tv.data,movies:movies.data},schedules:schedules.data,provider,policies}};
+}
+
+// Native health is scoped by registry identity, never by a synthetic media ID.
+import type { HealthScope, HealthSnapshot, HealthAdmission, HealthCommand, HealthTransitions, CommandStatus } from './api.generated';
+const healthScope = (scope:HealthScope) => ['all','tv','movies','system'].includes(scope);
+const healthOffset = (value:number,max:number) => Number.isSafeInteger(value)&&value>=0&&value<=max;
+const invalidHealth = <T>():Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid health scope, identifier or pagination.'});
+export const getHealth = (scope:HealthScope='all',offset=0) => healthScope(scope)&&healthOffset(offset,127)?request<HealthSnapshot>(`/api/v1/health?${new URLSearchParams({scope,limit:'16',offset:String(offset)})}`,undefined,undefined,true):invalidHealth<HealthSnapshot>();
+export const createHealthCommand = (scope:HealthScope) => healthScope(scope)?request<HealthAdmission>('/api/v1/health/commands',{scope,priority:'normal'},'POST',true):invalidHealth<HealthAdmission>();
+export const listHealthCommands = (scope:HealthScope='all',offset=0,status:CommandStatus|''='') => {
+  if(!healthScope(scope)||!healthOffset(offset,128)||!['','queued','running','retry_wait','succeeded','failed','cancelled'].includes(status))return invalidHealth<ApiPage<HealthCommand>>();
+  const params=new URLSearchParams({scope,limit:'20',offset:String(offset)});if(status)params.set('status',status);
+  return request<ApiPage<HealthCommand>>(`/api/v1/health/commands?${params}`,undefined,undefined,true);
+};
+export const getHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}`,undefined,undefined,true):invalidHealth<HealthCommand>();
+export const cancelHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}/cancel`,undefined,'POST',true):invalidHealth<HealthCommand>();
+export const getHealthTransitions = (after=0) => healthOffset(after,Number.MAX_SAFE_INTEGER)?request<HealthTransitions>(`/api/v1/health/transitions?${new URLSearchParams({after_sequence:String(after),limit:'16'})}`,undefined,undefined,true):invalidHealth<HealthTransitions>();
+
+export const getMovieRenamePreview = (movieIds: number[]): Promise<Result<import('./api.generated').MovieRenamePreview>> => {
+  if (!Array.isArray(movieIds) || movieIds.length === 0 || movieIds.length > 200 || new Set(movieIds).size !== movieIds.length || movieIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+    return Promise.resolve({ ok: false, error: 'Select up to 200 distinct movies with positive safe IDs.' });
+  }
+  const query = new URLSearchParams({ movie_ids: [...movieIds].sort((a, b) => a - b).join(',') });
+  return request<import('./api.generated').MovieRenamePreview>(`/api/v1/movies/rename-preview?${query}`, undefined, undefined, true);
+};
+
+export const getHistory = (query: import('./api.generated').HistoryQuery = {}): Promise<Result<ApiPage<import('./api.generated').HistoryEvent>>> => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  const suffix = params.size ? `?${params}` : '';
+  return request<ApiPage<import('./api.generated').HistoryEvent>>(`/api/v1/history${suffix}`, undefined, undefined, true);
+};
+export const getHostSettings =(): Promise<Result<import('./api.generated').HostSettings>> =>
+  request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);
