@@ -31,7 +31,7 @@ pub mod rescan;
 pub mod rss;
 pub mod search;
 mod worker;
-pub use worker::{Driver, Runtime, start, start_driven, start_with_metadata};
+pub use worker::{Driver, IterationFailed, Runtime, start, start_driven, start_with_metadata};
 
 pub(crate) const MAX_COMMANDS: i64 = 1024;
 const MAX_SNAPSHOTS: i64 = 64;

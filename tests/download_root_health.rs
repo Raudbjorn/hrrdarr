@@ -199,22 +199,27 @@ impl Fixture {
         self.start().await;
     }
     /// Steps until `done`; idles only while no command is claimable (a future due time).
+    /// The idle window opens at the first unclaimable step and resets after every claim, so
+    /// slow steps never consume it.
     async fn drive<T>(&self, what: &str, mut done: impl AsyncFnMut() -> Option<T>) -> T {
         let worker = self.worker.as_ref().unwrap();
-        let (mut steps, idle_until) = (0, tokio::time::Instant::now() + MAX_IDLE);
+        let (mut steps, mut idle_until) = (0, None);
         loop {
             if let Some(value) = done().await {
                 return value;
             }
-            if worker.step().await {
+            if worker.step().await.expect("worker iteration failed") {
+                idle_until = None;
                 steps += 1;
                 assert!(
                     steps <= MAX_STEPS,
                     "{what}: no fixed point after {MAX_STEPS} steps"
                 );
             } else {
+                let until =
+                    *idle_until.get_or_insert_with(|| tokio::time::Instant::now() + MAX_IDLE);
                 assert!(
-                    tokio::time::Instant::now() < idle_until,
+                    tokio::time::Instant::now() < until,
                     "{what}: nothing became due"
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -302,7 +307,7 @@ impl Fixture {
         // Higher-priority health work is claimed first; loop only past unrelated due work.
         let step = tokio::spawn(async move {
             for _ in 0..MAX_STEPS {
-                worker.step().await;
+                worker.step().await.expect("worker iteration failed");
                 let bytes = client
                     .get(&url)
                     .send()
