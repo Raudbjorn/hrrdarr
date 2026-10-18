@@ -144,7 +144,7 @@
       if (current.data.revision !== revision) {conflict = true; error = 'Provider changed during testing. Reload the saved provider before editing or testing again.'; return;}
     }
     if (result.ok && result.data.provider_id === id && result.data.revision === revision) {testResult = result.data; notice = 'Saved connection test completed.';}
-    else error = result.ok ? 'Test result did not match the selected provider revision.' : `${result.error} The saved observation below may describe an earlier test; no successful result is assumed.`;
+    else error = result.ok ? 'Test result did not match the selected provider revision.' : `${/[.!?]$/.test(result.error.trim()) ? result.error.trim() : `${result.error.trim()}.`} The saved observation below may describe an earlier test; no successful result is assumed.`;
     if (!current.ok) error += `${error ? ' ' : ''}Could not refresh the saved observation. Reload the saved provider to check it.`;
     void load(page?.offset ?? 0);
   }
