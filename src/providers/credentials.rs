@@ -302,9 +302,9 @@ impl Credentials {
             return false;
         }
         match self {
-            // Transmission and NZBGet authenticate with HTTP basic credentials only.
+            // Transmission, NZBGet and rTorrent authenticate with HTTP basic credentials only.
             Self::ApiKey { api_key } => {
-                !matches!(implementation, "transmission" | "nzbget") && valid(api_key)
+                !matches!(implementation, "transmission" | "nzbget" | "rtorrent") && valid(api_key)
             }
             Self::Indexer {
                 api_key,
@@ -320,8 +320,10 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                matches!(implementation, "qbittorrent" | "transmission" | "nzbget")
-                    && valid(username)
+                matches!(
+                    implementation,
+                    "qbittorrent" | "transmission" | "nzbget" | "rtorrent"
+                ) && valid(username)
                     && valid(password)
             }
         }

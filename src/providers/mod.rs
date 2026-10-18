@@ -523,7 +523,9 @@ pub(crate) enum Protocol {
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
-            "torznab" | "qbittorrent" | "transmission" | "deluge" => Some(Self::Torrent),
+            "torznab" | "qbittorrent" | "transmission" | "deluge" | "rtorrent" => {
+                Some(Self::Torrent)
+            }
             "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
             _ => None,
         }
@@ -588,6 +590,15 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    /// Endpoint is the rTorrent XML-RPC URL (for example an nginx or ruTorrent `/RPC2` mount).
+    /// Optional HTTP basic credentials. Torrents are labelled with `d.custom1`.
+    Rtorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -599,6 +610,7 @@ impl ProviderSettings {
             Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
             Self::Deluge { .. } => "deluge",
+            Self::Rtorrent { .. } => "rtorrent",
         }
     }
     fn endpoint(&self) -> &str {
@@ -609,7 +621,8 @@ impl ProviderSettings {
             | Self::Sabnzbd { endpoint, .. }
             | Self::Nzbget { endpoint, .. }
             | Self::Transmission { endpoint, .. }
-            | Self::Deluge { endpoint, .. } => endpoint,
+            | Self::Deluge { endpoint, .. }
+            | Self::Rtorrent { endpoint, .. } => endpoint,
         }
     }
     pub(crate) fn protocol(&self) -> Protocol {
@@ -617,7 +630,8 @@ impl ProviderSettings {
             Self::Torznab { .. }
             | Self::Qbittorrent { .. }
             | Self::Transmission { .. }
-            | Self::Deluge { .. } => Protocol::Torrent,
+            | Self::Deluge { .. }
+            | Self::Rtorrent { .. } => Protocol::Torrent,
             Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
@@ -628,41 +642,59 @@ impl ProviderSettings {
                 | Self::Sabnzbd { .. }
                 | Self::Nzbget { .. }
                 | Self::Transmission { .. }
-                | Self::Deluge { .. }
-        )
+        ) || self.is_label_torrent()
+    }
+    /// The TV and movie scopes of a label-torrent client (one arm per client of the family).
+    fn label_pair(&self) -> Option<(&Option<TorrentLabelScope>, &Option<TorrentLabelScope>)> {
+        match self {
+            Self::Deluge { tv, movies, .. } | Self::Rtorrent { tv, movies, .. } => {
+                Some((tv, movies))
+            }
+            _ => None,
+        }
+    }
+    /// The same client with other label scopes (one arm per client of the family).
+    fn relabelled(
+        &self,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        match self {
+            Self::Deluge { endpoint, .. } => Some(Self::Deluge {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Rtorrent { endpoint, .. } => Some(Self::Rtorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            _ => None,
+        }
     }
     /// Whether this client uses the shared label-torrent engine.
     pub(crate) fn is_label_torrent(&self) -> bool {
-        matches!(self, Self::Deluge { .. })
+        self.label_pair().is_some()
     }
     /// The label scope of one domain on a label-torrent client.
     pub(crate) fn label_scope(&self, domain: MediaDomain) -> Option<&TorrentLabelScope> {
-        match (self, domain) {
-            (Self::Deluge { tv, .. }, MediaDomain::Tv) => tv.as_ref(),
-            (Self::Deluge { movies, .. }, MediaDomain::Movies) => movies.as_ref(),
-            _ => None,
+        let (tv, movies) = self.label_pair()?;
+        match domain {
+            MediaDomain::Tv => tv.as_ref(),
+            MediaDomain::Movies => movies.as_ref(),
         }
     }
     /// Copy without eligibility tags, which never change remote submission behaviour.
     pub(crate) fn without_label_tags(&self) -> Option<Self> {
+        let (tv, movies) = self.label_pair()?;
         let strip = |scope: &Option<TorrentLabelScope>| {
             scope.clone().map(|mut s| {
                 s.tags = None;
                 s
             })
         };
-        match self {
-            Self::Deluge {
-                endpoint,
-                tv,
-                movies,
-            } => Some(Self::Deluge {
-                endpoint: endpoint.clone(),
-                tv: strip(tv),
-                movies: strip(movies),
-            }),
-            _ => None,
-        }
+        self.relabelled(strip(tv), strip(movies))
     }
     /// Whether a download client configures this media domain; indexers always answer false.
     pub(crate) fn client_scoped(&self, domain: MediaDomain) -> bool {
@@ -675,9 +707,7 @@ impl ProviderSettings {
             (Self::Nzbget { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (Self::Transmission { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (Self::Transmission { movies, .. }, MediaDomain::Movies) => movies.is_some(),
-            (Self::Deluge { tv, .. }, MediaDomain::Tv) => tv.is_some(),
-            (Self::Deluge { movies, .. }, MediaDomain::Movies) => movies.is_some(),
-            _ => false,
+            _ => self.label_scope(domain).is_some(),
         }
     }
     /// Domains configured by a download client, in TV/movies order.
@@ -826,7 +856,7 @@ impl ProviderSettings {
                     }
                 }
             }
-            Self::Deluge { tv, movies, .. } => {
+            Self::Deluge { tv, movies, .. } | Self::Rtorrent { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
                     return Err(bad());
                 }
@@ -2338,7 +2368,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             } else {
                 movie_torrent = Some(item)
             }
-        } else if implementation == "deluge" {
+        } else if implementation == "deluge" || implementation == "rtorrent" {
             let item = TorrentLabelScope {
                 category: scope.get(3)?,
                 recent_priority: TorrentQueuePriority::stored(scope.get::<i64>(5)?)?,
@@ -2480,6 +2510,11 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_label,
             movies: movie_label,
         },
+        "rtorrent" => ProviderSettings::Rtorrent {
+            endpoint,
+            tv: tv_label,
+            movies: movie_label,
+        },
         _ => return Err(corrupt()),
     };
     settings.validate().map_err(|_| corrupt())?;
@@ -2545,7 +2580,8 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
-        ProviderSettings::Deluge { tv, movies, .. } => [
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. } => [
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
@@ -2646,7 +2682,8 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.code(),s.older_priority.code(),state]).await?;
             }
         }
-        ProviderSettings::Deluge { tv, movies, .. } => {
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
                 .map(|s| ("tv", s))
@@ -2758,7 +2795,8 @@ impl HealthConfigurationChanges {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
-                ProviderSettings::Deluge { tv, movies, .. } => {
+                ProviderSettings::Deluge { tv, movies, .. }
+                | ProviderSettings::Rtorrent { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }

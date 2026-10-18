@@ -272,6 +272,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     // Deluge registry plus label-family scope triggers, file 0068 (renumbered by position at merge).
     ("deluge", include_str!("../../migrations/0068_deluge.sql")),
+    // rTorrent registry row, file 0069 (renumbered by position at merge).
+    (
+        "rtorrent",
+        include_str!("../../migrations/0069_rtorrent.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -929,5 +934,7 @@ mod download_client_registry_tests;
 mod download_client_selection_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
+mod rtorrent_registry_tests;
 #[cfg(test)]
 mod transmission_registry_tests;

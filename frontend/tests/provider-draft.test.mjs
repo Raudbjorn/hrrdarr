@@ -121,3 +121,12 @@ test('Deluge is a torrent download client for both domains and is never bound to
   assert.equal(eligibleDownloadClient(client,domain,'torznab'),true);
  }
 });
+
+test('rTorrent is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('rtorrent'),'torrent');
+ assert.equal(isClientImplementation('rtorrent'),true);
+ const client={id:'rt',enabled:true,settings:{implementation:'rtorrent',endpoint:'http://127.0.0.1/RPC2',tv:{category:'tv'},movies:null}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'tv','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'tv','newznab'),false);
+});
