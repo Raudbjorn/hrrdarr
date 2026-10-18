@@ -25,7 +25,7 @@ try{
  const tvRoot=`${scratch}/ren-tv`;await mkdir(tvRoot);
  const naming=await request('GET','/api/v1/tv/config/naming');
  await request('PUT','/api/v1/tv/config/naming',{...naming,rename_enabled:true,standard_episode_format:'{Series Title} - S{season:00}E{episode:00} - {Episode Title}',season_folder_format:'Season {season:00}',series_folder_format:'{Series Title} Renamed',multi_episode_style:4});
- const series=await request('POST','/api/v1/tv/series',{title:'Fixture series',tvdb_id:101,path:tvRoot},201);
+ const series=await request('POST','/api/v1/tv/series/lookup',{tvdb_id:101,path:tvRoot,settings:{}},201);
  const eps=(await request('GET',`/api/v1/episodes?series_id=${series.id}&limit=25`)).items;
  assert.equal(eps.length,2,'fixture catalogue supplies two episodes');
  const source=`${scratch}/incoming/episode.mkv`;
@@ -54,7 +54,7 @@ try{
  assert.equal(await exists(`${tvRoot}/pilot raw.mkv`),false);
  assert.deepEqual(await readFile(`${tvRoot}/Season 01/Fixture series - S01E01 - Pilot.mkv`),before,'bytes preserved');
  // The blocked file stays blocked and unmoved; removing the squatter makes it renamable via Rename all.
- await tvPanel.getByText('Blocked').waitFor();assert.equal(await exists(`${tvRoot}/second raw.mkv`),true);
+ await tvPanel.getByText(/File \d+ · Blocked/).waitFor();assert.equal(await exists(`${tvRoot}/second raw.mkv`),true);
  const { rm } = await import('node:fs/promises');await rm(`${tvRoot}/Season 01/Fixture series - S01E02 - Second episode.mkv`);
  await tvPanel.getByRole('button',{name:'Reload rename preview',exact:true}).click();
  await tvPanel.getByRole('button',{name:'Rename all',exact:true}).click();

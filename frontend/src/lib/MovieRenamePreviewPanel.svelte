@@ -124,7 +124,9 @@
 
 <style>
   section { margin-top: 1.5rem; }
-  li, .pattern { overflow-wrap: anywhere; }
+  li, .pattern, dd, p { overflow-wrap: anywhere; }
+  dl, dd { min-width: 0; }
+  input[type="checkbox"] { width: auto; margin: 0 .4rem 0 0; }
   ul { padding-inline-start: 1.3rem; }
   .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
   li { margin-block: 1rem; }
