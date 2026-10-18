@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 65); // Reasoning: latest is 0068 (0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

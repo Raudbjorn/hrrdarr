@@ -31,6 +31,7 @@ impl ProviderKind {
                     | ProviderSettings::Sabnzbd { .. }
                     | ProviderSettings::Nzbget { .. }
                     | ProviderSettings::Transmission { .. }
+                    | ProviderSettings::Deluge { .. }
             ) | (
                 Self::Indexer,
                 ProviderSettings::Torznab { .. } | ProviderSettings::Newznab { .. }
@@ -65,7 +66,8 @@ impl ProviderFilter {
                 settings @ (ProviderSettings::Qbittorrent { .. }
                 | ProviderSettings::Sabnzbd { .. }
                 | ProviderSettings::Nzbget { .. }
-                | ProviderSettings::Transmission { .. }),
+                | ProviderSettings::Transmission { .. }
+                | ProviderSettings::Deluge { .. }),
                 media,
             ) => settings.client_scoped(media),
         };
@@ -117,6 +119,14 @@ pub enum ProviderDefaults {
         // Suggested endpoint shape; the RPC path `/rpc` is appended to it.
         endpoint_hint: String,
     },
+    LabelTorrentClient {
+        recent_priority: TorrentQueuePriority,
+        older_priority: TorrentQueuePriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the API path `/json` is appended to it.
+        endpoint_hint: String,
+    },
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
@@ -127,6 +137,7 @@ pub enum ProviderImplementation {
     Sabnzbd,
     Torznab,
     Transmission,
+    Deluge,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -183,7 +194,8 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         ProviderImplementation::Qbittorrent
         | ProviderImplementation::Sabnzbd
         | ProviderImplementation::Nzbget
-        | ProviderImplementation::Transmission => vec![],
+        | ProviderImplementation::Transmission
+        | ProviderImplementation::Deluge => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -374,6 +386,21 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://transmission.example:9091/transmission".into(),
+                },
+            },
+            // The label has no safe default on a shared client; the user names each domain's label.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Deluge,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://deluge.example:8112".into(),
                 },
             },
         ],

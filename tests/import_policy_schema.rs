@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        64 // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        65 // Reasoning: latest is 0068 (0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);

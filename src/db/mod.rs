@@ -270,6 +270,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     // NZBGet registry, file 0064.
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
+    // Deluge registry plus label-family scope triggers, file 0068 (renumbered by position at merge).
+    ("deluge", include_str!("../../migrations/0068_deluge.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -917,6 +919,8 @@ mod indexer_client_tests;
 #[cfg(test)]
 mod indexer_backoff_tests;
 
+#[cfg(test)]
+mod deluge_registry_tests;
 #[cfg(test)]
 mod download_client_backoff_tests;
 #[cfg(test)]

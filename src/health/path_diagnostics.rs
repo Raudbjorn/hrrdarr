@@ -644,7 +644,7 @@ pub(super) async fn evaluate(
         }
         if !matches!(
             implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget"
+            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget" | "deluge"
         ) {
             evidence.record(Err("check_failed"));
             continue;
