@@ -1887,3 +1887,72 @@ async fn communication_cooldown_defers_config_recheck_to_cooldown_boundary() {
         CommandStatus::RetryWait
     ));
 }
+
+#[tokio::test]
+async fn communication_cooldown_keeps_scheduled_marker_and_defers_grace() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    // Grace batch: only the communication checks hit a 600s cooldown.
+    tick(&c, 1000).await;
+    let grace = take(&c, active(&c).await.unwrap().unwrap().id, 1000).await;
+    assert!(grace.is_grace);
+    let comm = |m: &HealthMember| m.identity.check_key == "download_client_communication";
+    let outcomes = grace
+        .members
+        .iter()
+        .map(|m| {
+            if comm(m) {
+                Err(PROVIDER_COOLDOWN)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect();
+    let cooldowns = grace
+        .members
+        .iter()
+        .map(|m| comm(m).then_some(600))
+        .collect();
+    publish_deferred(&c, &grace, outcomes, cooldowns, 1001)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read(&c, grace.id).await.unwrap().status,
+        CommandStatus::Failed
+    ));
+    // Grace is re-armed at the cooldown boundary, not every 60s.
+    let life = lifecycle(&c).await.unwrap();
+    assert_eq!(life.grace_phase, "pending");
+    assert_eq!(life.grace_due_at, 1601);
+    // Scheduled-only marker: a cooldown keeps it pending until the boundary.
+    c.execute("UPDATE health_checks SET pending_reasons=2,due_at=1700 WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();
+    c.execute(
+        "UPDATE health_lifecycle SET grace_phase='expired',last_batch_completed_at=grace_due_at WHERE id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    tick(&c, 1700).await;
+    let scheduled = take(&c, active(&c).await.unwrap().unwrap().id, 1700).await;
+    assert!(!scheduled.is_grace);
+    let outcomes = scheduled
+        .members
+        .iter()
+        .map(|m| {
+            if comm(m) {
+                Err(PROVIDER_COOLDOWN)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect();
+    let cooldowns = scheduled
+        .members
+        .iter()
+        .map(|m| comm(m).then_some(300))
+        .collect();
+    publish_deferred(&c, &scheduled, outcomes, cooldowns, 1701)
+        .await
+        .unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND pending_reasons=2 AND due_at=2001").await,1);
+}

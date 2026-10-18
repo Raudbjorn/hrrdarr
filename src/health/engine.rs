@@ -409,6 +409,8 @@ async fn publish_deferred(
         // Retrying cannot dispatch inside a cooldown; only another failure earns the retry budget.
         let deferred = |r: &CheckOutcome, s: &Option<u32>| s.is_some() && r.as_ref().err() == Some(&PROVIDER_COOLDOWN);
         let retry = cmd.attempts < 3 && results.iter().zip(&cooldowns).any(|(r, s)| r.is_err() && !deferred(r, s));
+        // A grace batch blocked by a cooldown must not re-arm every minute until it expires.
+        let grace_delay = results.iter().zip(&cooldowns).filter(|(r, s)| deferred(r, s)).filter_map(|(_, s)| *s).max().map_or(60, |s| i64::from(s.clamp(1, 86_400)).max(60));
         let life = lifecycle(&tx).await?;
         let in_grace = life.grace_phase != "expired";
         for ((member, result), seconds) in cmd.members.iter().zip(results).zip(cooldowns) {
@@ -430,9 +432,9 @@ async fn publish_deferred(
                 }
             }
             if let Some(seconds) = cooldown.filter(|_| !retry) {
-                // Cooldown is not an observation: keep an authoritative CONFIG change pending until
-                // the cached limit expires instead of dropping it until the six-hour schedule.
-                let keep = if cmd.is_grace { 15 } else { CONFIG };
+                // Cooldown is not an observation: keep every non-grace reason (startup, scheduled,
+                // manual, config) pending until the cached limit expires; grace re-arms via reset_grace.
+                let keep = STARTUP | SCHEDULED | MANUAL | CONFIG;
                 tx.execute("UPDATE health_checks SET pending_reasons=pending_reasons & ?,due_at=CASE WHEN (pending_reasons & ?)!=0 THEN max(coalesce(due_at,0),?) ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![keep,keep,timestamp+i64::from(seconds.clamp(1,86_400)),member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;
             } else if !retry {
                 // Partial grace exhaustion services only its grace reason, preserving other work.
@@ -443,7 +445,7 @@ async fn publish_deferred(
         if let Some(code) = error {
             // Retain ALL selected pending markers while retrying: claim must recapture every
             // frozen member, and a previously completed observation may change next attempt.
-            if !retry { reset_grace(&tx,cmd,timestamp,60).await?; }
+            if !retry { reset_grace(&tx,cmd,timestamp,grace_delay).await?; }
             settle_failure(&tx,cmd,timestamp,code,retry).await?;
             return Ok(());
         }
