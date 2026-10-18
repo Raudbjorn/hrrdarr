@@ -247,7 +247,6 @@ const PREDECESSORS: &[(&str, &str)] = &[
     ),
 ];
 const OBJECTS: &[&str] = &[
-    "provider_scope_authority_identity",
     "provider_scope_tags",
     "provider_scope_tags_tag",
     "provider_tags_limit",
@@ -441,20 +440,14 @@ async fn migration_late_failure_restores50_schema_and_evidence() -> Result<(), E
     Ok(())
 }
 #[tokio::test]
-async fn tag_authority_and_scope_identity_are_domain_scoped_and_bounded() -> Result<(), Error> {
+async fn tag_authority_is_domain_scoped_and_bounded() -> Result<(), Error> {
     let s = Scratch::new();
     let db = Database::open_local(s.database()).await?;
     let c = db.connect().await?;
     seed(&c).await?;
     objects(&c).await;
     // Reasoning: indexer modes moved to main's 0048 columns, so this test now covers
-    // only what 0051 owns: scope identity is immutable and tags are bounded per domain.
-    for sql in [
-        "UPDATE provider_scopes SET media_type='tv' WHERE provider_id=? AND media_type='movies'",
-        "UPDATE provider_scopes SET implementation='newznab' WHERE provider_id=?",
-    ] {
-        assert!(c.execute(sql, [INDEXER]).await.is_err());
-    }
+    // only what 0051 owns: tags are domain-scoped and bounded per domain.
     assert!(
         c.execute(
             "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES(?,'movies',1)",

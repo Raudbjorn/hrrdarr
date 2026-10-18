@@ -1,10 +1,8 @@
 -- Indexer operation modes and the download-client preference are not duplicated
 -- here: 0048/0049 store them as provider_scopes columns that round-trip through
 -- every provider update. This migration adds only authority 0048/0049 lack.
--- Scope tags cannot be orphaned by direct maintenance changing a scope identity.
-CREATE TRIGGER provider_scope_authority_identity BEFORE UPDATE OF provider_id,media_type,implementation ON provider_scopes
- WHEN NEW.provider_id IS NOT OLD.provider_id OR NEW.media_type IS NOT OLD.media_type OR NEW.implementation IS NOT OLD.implementation
- BEGIN SELECT RAISE(ABORT,'provider_scope_authority_identity'); END;
+-- No scope-identity trigger: the composite FK below already keeps scope tags from
+-- being orphaned, and an implementation change cannot orphan them.
 
 CREATE TABLE provider_scope_tags (
  provider_id TEXT NOT NULL,
