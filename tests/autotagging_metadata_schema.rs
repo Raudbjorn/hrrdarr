@@ -309,7 +309,7 @@ async fn upgrade_witness(
 ) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
     // 0053 appends one journal column and two indexes; preserve old columns separately below.
-    // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's; 0067 the rename term (same reasoning).
+    // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
     // 0059 resolves client kind through provider_implementations: map only that predicate back
     // to the qBittorrent literal, and exclude the provider tables/guards it rebuilds (their rows
     // and constraints are covered by db::download_client_registry_tests).
@@ -554,7 +554,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        63 // Reasoning: latest is migration file 0067 rename_commands, position 63 on this branch (0062 transmission precedes it; 0060 recycle bin, 0061 upgrade recycle (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        65 // Reasoning: latest is migration file 0067 rename_commands at position 65, after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -696,7 +696,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        63 // Reasoning: latest is migration file 0067 rename_commands, position 63 on this branch (0062 transmission precedes it; 0060 recycle bin, 0061 upgrade recycle (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        65 // Reasoning: latest is migration file 0067 rename_commands at position 65, after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

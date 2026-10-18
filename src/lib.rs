@@ -57,4 +57,5 @@ pub mod wanted;
 
 pub mod calendar;
 
+pub mod notifications;
 pub mod rename;

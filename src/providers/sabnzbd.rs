@@ -1154,7 +1154,7 @@ pub async fn job(
 }
 /// Completed output: the final destination, widened to an enclosing folder named after the job
 /// (sorting or nested unpacking can report a file or subfolder beneath the job folder).
-fn output_path(storage: &str, name: &str) -> Result<String> {
+pub(super) fn output_path(storage: &str, name: &str) -> Result<String> {
     validate_remote_path(storage)?;
     let rooted = storage.starts_with('/')
         || storage.starts_with("\\\\")

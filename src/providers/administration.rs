@@ -29,6 +29,7 @@ impl ProviderKind {
                 Self::DownloadClient,
                 ProviderSettings::Qbittorrent { .. }
                     | ProviderSettings::Sabnzbd { .. }
+                    | ProviderSettings::Nzbget { .. }
                     | ProviderSettings::Transmission { .. }
             ) | (
                 Self::Indexer,
@@ -63,6 +64,7 @@ impl ProviderFilter {
             (
                 settings @ (ProviderSettings::Qbittorrent { .. }
                 | ProviderSettings::Sabnzbd { .. }
+                | ProviderSettings::Nzbget { .. }
                 | ProviderSettings::Transmission { .. }),
                 media,
             ) => settings.client_scoped(media),
@@ -99,6 +101,14 @@ pub enum ProviderDefaults {
         older_priority: UsenetPriority,
         tags: Vec<i64>,
     },
+    NzbgetClient {
+        recent_priority: NzbgetPriority,
+        older_priority: NzbgetPriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the API path `/jsonrpc` is appended to it.
+        endpoint_hint: String,
+    },
     TransmissionClient {
         recent_priority: TorrentQueuePriority,
         older_priority: TorrentQueuePriority,
@@ -112,6 +122,7 @@ pub enum ProviderDefaults {
 #[serde(rename_all = "lowercase")]
 pub enum ProviderImplementation {
     Newznab,
+    Nzbget,
     Qbittorrent,
     Sabnzbd,
     Torznab,
@@ -171,6 +182,7 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
     match implementation {
         ProviderImplementation::Qbittorrent
         | ProviderImplementation::Sabnzbd
+        | ProviderImplementation::Nzbget
         | ProviderImplementation::Transmission => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
@@ -331,6 +343,21 @@ pub(super) async fn schema(
                     recent_priority: UsenetPriority::Default,
                     older_priority: UsenetPriority::Default,
                     tags: vec![],
+                },
+            },
+            // Categories have no safe default; the user names an existing NZBGet category.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Nzbget,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::NzbgetClient {
+                    recent_priority: NzbgetPriority::Normal,
+                    older_priority: NzbgetPriority::Normal,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://nzbget.example:6789".into(),
                 },
             },
             // Placement has no safe default on a shared client; the user names each domain's

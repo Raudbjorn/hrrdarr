@@ -265,6 +265,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0062_transmission.sql"),
     ),
     (
+        "notifications",
+        include_str!("../../migrations/0063_notifications.sql"),
+    ),
+    // NZBGet registry, file 0064.
+    ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
+    (
         "rename_commands",
         include_str!("../../migrations/0067_rename_commands.sql"),
     ),
@@ -921,5 +927,7 @@ mod download_client_backoff_tests;
 mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;
+#[cfg(test)]
+mod nzbget_registry_tests;
 #[cfg(test)]
 mod transmission_registry_tests;
