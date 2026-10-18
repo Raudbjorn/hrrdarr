@@ -58,7 +58,7 @@ async fn fresh_relations_enforce_domain_ownership_and_catalog_membership() -> Re
         INSERT INTO movie_metadata (id,tmdb_id,title,year) VALUES (1,10,'Film',2024),(2,20,'Catalog only',2025);
         INSERT INTO movies (id,metadata_id,path) VALUES (1,1,'/movies/Film');
         INSERT INTO movie_files (id,movie_id,path,edition) VALUES (8,1,'/movies/Film/film.mkv','Extended');
-        INSERT INTO movie_collections VALUES (1,30,'Collection');
+        INSERT INTO movie_collections(id,tmdb_id,title) VALUES (1,30,'Collection');
         INSERT INTO movie_collection_members VALUES (1,1),(1,2);
         INSERT INTO operations VALUES ('tv','episode',1,NULL,'source','copy','dest','preview','');
         INSERT INTO operations VALUES ('film','movie',NULL,1,'source','copy','dest','preview','');").await?;

@@ -263,7 +263,8 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
     for sql in [
         "SELECT id,tmdb_id,imdb_id,title,year,runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language FROM movie_metadata ORDER BY id",
         "SELECT * FROM movies ORDER BY id",
-        "SELECT * FROM movie_collections ORDER BY id",
+        // Reasoning: 0065 appends collection policy columns; the predecessor columns are preserved exactly.
+        "SELECT id,tmdb_id,title FROM movie_collections ORDER BY id",
         "SELECT * FROM movie_collection_members ORDER BY collection_id,metadata_id",
         "SELECT * FROM movie_alternative_titles ORDER BY metadata_id,title",
         "SELECT * FROM movie_files ORDER BY id",
@@ -315,7 +316,7 @@ async fn upgrade_witness(
     // and constraints are covered by db::download_client_registry_tests).
     let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
         name IN ({predecessor_names}) AND
-        NOT (type='table' AND name IN ('providers','provider_scopes')) AND
+        NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections')) AND
         name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
         NOT (type='table' AND name IN ('import_journal','download_processing')) AND
         name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND

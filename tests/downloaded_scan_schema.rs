@@ -318,6 +318,9 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 | "provider_scope_options_update"
                 | "provider_test_insert_owner"
                 | "provider_test_update_owner"
+                // Reasoning: 0065 appends collection policy columns to movie_collections; its rows
+                // and predecessor columns are covered by tests/autotagging_metadata_schema.rs.
+                | "movie_collections"
         ) {
             continue;
         }
