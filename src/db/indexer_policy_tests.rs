@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: the runner upgrades the schema47 predecessor through 0048, 0049, collections 0050 and latest provider authority 0051.
+    assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -139,11 +139,13 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert_eq!(&actual[..expected.len()], expected);
         assert_eq!(
             &actual[expected.len()..],
-            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column.
+            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column;
+            // 0050 appends the NULL feed-only minimum_seeders column.
             &[
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
+                libsql::Value::Null,
                 libsql::Value::Null
             ]
         );
@@ -268,7 +270,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 51); // Reasoning: latest migration is 0051 provider authority (collections 0050 follows 0049).
+    assert_eq!(version(&fresh.connect().await?).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,

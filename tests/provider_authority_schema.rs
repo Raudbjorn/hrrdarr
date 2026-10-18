@@ -46,7 +46,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0051_provider_authority.sql");
+const MIGRATION: &str = include_str!("../migrations/0052_provider_authority.sql");
 const PREDECESSORS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -242,8 +242,12 @@ const PREDECESSORS: &[(&str, &str)] = &[
         include_str!("../migrations/0049_indexer_client_binding.sql"),
     ),
     (
+        "torrent_rss_indexer",
+        include_str!("../migrations/0050_torrent_rss_indexer.sql"),
+    ),
+    (
         "collections",
-        include_str!("../migrations/0050_collections.sql"),
+        include_str!("../migrations/0051_collections.sql"),
     ),
 ];
 const OBJECTS: &[&str] = &[
@@ -350,7 +354,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='provider_authority_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade50_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
+async fn upgrade51_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -381,7 +385,7 @@ async fn upgrade50_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        51 // Reasoning: provider authority is 0051 after collections 0050.
+        52 // Reasoning: provider authority is 0052 after collections 0051.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -393,7 +397,7 @@ async fn upgrade50_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     Ok(())
 }
 #[tokio::test]
-async fn migration_late_failure_restores50_schema_and_evidence() -> Result<(), Error> {
+async fn migration_late_failure_restores51_schema_and_evidence() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -412,7 +416,7 @@ async fn migration_late_failure_restores50_schema_and_evidence() -> Result<(), E
     assert_eq!(number(&tx, "SELECT count(*) FROM provider_tests").await, 3);
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=50",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=51",
             ()
         )
         .await
@@ -434,7 +438,7 @@ async fn migration_late_failure_restores50_schema_and_evidence() -> Result<(), E
     let c = raw.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: predecessor chain now ends at collections 0050.
+        51 // Reasoning: predecessor chain now ends at collections 0051.
     );
     assert_eq!(witness(&c).await, before);
     Ok(())

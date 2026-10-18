@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: provider authority 0051 is latest (collections 0050 follows main's 0049); the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 52); // Reasoning: provider authority 0052 is latest (collections 0051 follows main's 0050 torrent RSS indexer); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,
@@ -445,7 +445,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: provider authority 0051 is latest (collections 0050 follows main's 0049); the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 52); // Reasoning: provider authority 0052 is latest (collections 0051 follows main's 0050 torrent RSS indexer); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,

@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Reasoning: 0048 seeds four indexer_search/indexer_rss rows and 0049 two indexer_download_client rows (one per domain), so the registry is 14 (was 12 at schema48, 8 before).
     new_registry(&c).await?;
@@ -180,8 +180,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Migration46 adds two removed-metadata identities; 0048 adds four indexer identities (8 -> 12); 0049 adds two indexer_download_client identities (12 -> 14); 0050/0051 add none.
+        assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 14); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");

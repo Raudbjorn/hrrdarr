@@ -112,7 +112,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
     assert_eq!(count(&c,"SELECT count(*) FROM download_processing_policies WHERE enabled_override=enabled AND revision IN (1,2)").await?,2);
     assert_eq!(count(&c,"SELECT count(*) FROM download_refresh_schedules WHERE requested_enabled=enabled AND intent='explicit' AND interval_seconds IN (123,777)").await?,2);
     assert_eq!(
@@ -208,7 +208,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 51); // Reasoning: latest migration is now 0051 provider authority (0050 collections renumbered after main's 0049 indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
     Ok(())
 }
 

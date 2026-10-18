@@ -1,6 +1,6 @@
 # Collections implementation checkpoint
 
-This branch contains prerequisites, not a complete Collections feature. Collection API, refresh jobs, automatic additions/search, provider-authority consumers and UI remain unfinished. Migrations 50 (collections) and 51 (provider authority) add persistent state; no dependencies were added. They were renumbered from 47/48 when merging main, whose 0047–0049 landed first. Migration 51 adds no indexer modes or download-client overrides: main's 0048/0049 already store those as `provider_scopes` columns.
+This branch contains prerequisites, not a complete Collections feature. Collection API, refresh jobs, automatic additions/search, provider-authority consumers and UI remain unfinished. Migrations 51 (collections) and 52 (provider authority) add persistent state; no dependencies were added. They were renumbered from 47/48 when merging main, whose 0047–0050 landed first. Migration 52 adds no indexer modes or download-client overrides: main's 0048/0049 already store those as `provider_scopes` columns.
 
 ## Metadata protocol
 
@@ -34,4 +34,4 @@ Parent verification passed 84 focused Rust tests (41 integration, 38 database, 5
 
 ## Not claimed
 
-The full Rust suite and browser workflows were not rerun for this checkpoint. Collections API, refresh/add/search automation, provider-authority consumers and UI are incomplete; these tests do not establish full Collections parity. New collection/provider tables and snapshot replay markers are introduced by migrations 50/51. No new dependencies or live-service access.
+The full Rust suite and browser workflows were not rerun for this checkpoint. Collections API, refresh/add/search automation, provider-authority consumers and UI are incomplete; these tests do not establish full Collections parity. New collection/provider tables and snapshot replay markers are introduced by migrations 51/52. No new dependencies or live-service access.
