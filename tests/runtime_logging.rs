@@ -232,7 +232,7 @@ async fn providers(base: &str, remote: &str) -> (Value, Value) {
             base,
             "POST",
             "/api/v1/providers",
-            json!({"name":"owned","enabled":true,"priority":1,"credentials":if settings["implementation"] == "torznab" {json!({"kind":"api_key","api_key":API_KEY})}else{json!({"kind":"username_password","username":USER,"password":PASSWORD})},"settings":settings}),
+            json!({"name":"owned","enabled":false,"priority":1,"credentials":if settings["implementation"] == "torznab" {json!({"kind":"api_key","api_key":API_KEY})}else{json!({"kind":"username_password","username":USER,"password":PASSWORD})},"settings":settings}),
         )
         .await;
         assert_eq!(code, 201, "{value}");
@@ -330,7 +330,10 @@ async fn exercise() {
     drop(c);
     drop(db);
     let (process, base) = Process::start(directory.clone()).await;
-    let (indexer, client) = providers(&base, &origin).await;
+    // Saved Test deliberately supports disabled providers. Keep these fixtures disabled
+    // while asserting four exact network-test diagnostics: enabled scopes provision
+    // immediate polling and health probes which legitimately contend for the same lane.
+    let (mut indexer, mut client) = providers(&base, &origin).await;
     for fail in [false, true] {
         peer_state.fail.store(fail, Ordering::SeqCst);
         for provider in [&indexer, &client] {
@@ -348,6 +351,45 @@ async fn exercise() {
         }
     }
     peer_state.fail.store(false, Ordering::SeqCst);
+    // Install explicit-off polling while the client is still disabled, before any
+    // automatic command can be admitted. Reconciliation preserves this intent when
+    // enabling it. This test owns explicit RSS/import/refresh work, not CDH scheduling.
+    for media in ["tv", "movies"] {
+        let (code, schedule) = request(&base,"PUT","/api/v1/download-refresh/schedules",
+            json!({"target":{"provider_id":client["id"],"media_type":media},"revision":null,"provider_revision":client["revision"],"enabled":false,"interval_seconds":60})).await;
+        assert_eq!(code, 200, "{schedule}");
+        assert_eq!(schedule["intent"], "explicit");
+        assert_eq!(schedule["requested_enabled"], false);
+        assert_eq!(schedule["enabled"], false);
+    }
+    for provider in [&mut indexer, &mut client] {
+        let (code, enabled) = request(&base,"PUT",&format!("/api/v1/providers/{}",provider["id"].as_str().unwrap()),
+            json!({"revision":provider["revision"],"name":provider["name"],"priority":provider["priority"],"settings":provider["settings"],"enabled":true})).await;
+        assert_eq!(code, 200, "{enabled}");
+        assert_eq!(enabled["enabled"], true);
+        *provider = enabled;
+    }
+    let (code, schedules) = request(
+        &base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    let schedules = schedules.as_array().unwrap();
+    assert_eq!(schedules.len(), 2);
+    for media in ["tv", "movies"] {
+        let schedule = schedules
+            .iter()
+            .find(|s| {
+                s["target"]["provider_id"] == client["id"] && s["target"]["media_type"] == media
+            })
+            .unwrap();
+        assert_eq!(schedule["requested_enabled"], false);
+        assert_eq!(schedule["enabled"], false);
+        assert_eq!(schedule["provider_revision"], client["revision"]);
+    }
     for media in ["tv", "movies"] {
         let (code,value)=request(&base,"POST",&format!("/api/v1/{media}/remote-path-mappings"),json!({"host":"127.0.0.1","remote_path":"/remote","local_path":directory.join(format!("source-{media}"))})).await;
         assert_eq!(code, 201, "{value}");

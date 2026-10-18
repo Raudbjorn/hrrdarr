@@ -13,7 +13,10 @@ use libsql::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 mod api;
+mod download_roots;
 mod engine;
+mod indexers;
+mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
     HealthTransition, HealthTransitions, router,
@@ -336,9 +339,40 @@ pub(crate) async fn provider_configuration_changed(
     let keys = selection(
         c,
         scope,
-        "check_key IN ('completed_download_handling','download_client_communication')",
+        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder')",
     )
     .await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+/// Indexer policy mutations mark only their scoped checks in the caller's transaction.
+pub(crate) async fn indexer_configuration_changed(
+    c: &Connection,
+    media: MediaDomain,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key IN ('indexer_search','indexer_rss')").await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+/// Indexer download-client bindings are evaluated separately from search/RSS capability checks.
+/// The caller deduplicates affected referencing domains in the authoritative mutation transaction.
+pub(crate) async fn indexer_client_configuration_changed(
+    c: &Connection,
+    media: MediaDomain,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key='indexer_download_client'").await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 /// Status is not trailing configuration debounce. Repeated observations cannot postpone work.
@@ -372,4 +406,19 @@ async fn communication_status_at(c: &Connection, media: MediaDomain, timestamp: 
         if c.execute("UPDATE health_checks SET generation=generation+1,due_at=CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END,pending_reasons=pending_reasons|8 WHERE scope=? AND check_key=? AND generation=?",params![due,due,k.identity.scope.text(),k.identity.check_key,k.generation]).await? != 1 { return Err(invariant()); }
     }
     Ok(())
+}
+
+/// Root declarations affect either client's destinations; mappings remain source-domain scoped.
+/// Must share the authoritative mutation's transaction so stale probes cannot publish.
+pub(crate) async fn download_roots_changed(
+    c: &Connection,
+    media: Option<MediaDomain>,
+) -> Result<()> {
+    let scope = match media {
+        Some(MediaDomain::Tv) => HealthScope::Tv,
+        Some(MediaDomain::Movies) => HealthScope::Movies,
+        None => HealthScope::All,
+    };
+    let keys = selection(c, scope, "check_key='download_client_root_folder'").await?;
+    mark(c, &keys, CONFIG, now()?).await
 }

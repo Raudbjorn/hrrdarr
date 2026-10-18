@@ -140,15 +140,26 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    let started = std::time::Instant::now();
     let response = client
         .request(method.parse().unwrap(), format!("{base}{path}"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "owned request failed: method={method} path={path} elapsed={:?} error={error:?}",
+                started.elapsed()
+            )
+        });
     let status = response.status().as_u16();
-    let text = response.text().await.unwrap();
+    let text = response.text().await.unwrap_or_else(|error| {
+        panic!(
+            "owned response body failed: method={method} path={path} status={status} elapsed={:?} error={error:?}",
+            started.elapsed()
+        )
+    });
     assert!(!text.contains("PRIVATE_REMOTE_ERROR"));
     (
         status,
@@ -449,34 +460,94 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     let done = until(&base, interrupted["id"].as_str().unwrap(), "succeeded").await;
     assert_eq!(done["attempts"], 2);
     runtime.shutdown().await;
-    // Explicit schedules survive restart, enqueue both scopes once, and do not catch up missed ticks.
+    // Schedule last_run_at records admission, not completion. Capture history first,
+    // then wait for the actual new command in each domain before stopping the worker.
+    let (code, prior_history) =
+        request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+    assert_eq!(code, 200, "{prior_history}");
+    let prior_ids: Vec<Value> = prior_history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    assert_eq!(
+        prior_history["total"].as_u64().unwrap(),
+        prior_ids.len() as u64,
+        "capture every pre-schedule ID"
+    );
     for media in ["tv", "movies"] {
         enable_observation(&base, &provider, media).await;
     }
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(8), async {
+    let mut scheduled_ids = std::collections::BTreeMap::<String, Value>::new();
+    let mut last_history = Value::Null;
+    let completion = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            let (_, v) = request(
-                &base,
-                "GET",
-                "/api/v1/download-refresh/schedules",
-                Value::Null,
-            )
-            .await;
-            if v.as_array()
-                .unwrap()
-                .iter()
-                .all(|s| !s["last_run_at"].is_null())
+            let (code, history) =
+                request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+            last_history = history;
+            if code != 200 {
+                return false;
+            }
+            let items = last_history["items"].as_array().unwrap();
+            if last_history["total"].as_u64().unwrap() != items.len() as u64 {
+                return false;
+            }
+            for command in items.iter().filter(|v| !prior_ids.contains(&v["id"])) {
+                let Some(media) = command["target"]["media_type"].as_str() else {
+                    return false;
+                };
+                if !matches!(media, "tv" | "movies")
+                    || command["target"]["provider_id"] != provider["id"]
+                    || command["provider_revision"] != provider["revision"]
+                {
+                    return false;
+                }
+                if let Some(previous) =
+                    scheduled_ids.insert(media.to_string(), command["id"].clone())
+                {
+                    if previous != command["id"] {
+                        return false;
+                    }
+                }
+                if matches!(command["status"].as_str(), Some("failed" | "cancelled")) {
+                    return false;
+                }
+            }
+            if scheduled_ids.len() == 2
+                && scheduled_ids.values().all(|id| {
+                    items
+                        .iter()
+                        .any(|v| v["id"] == *id && v["status"] == "succeeded")
+                })
             {
-                break;
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    .await;
     runtime.shutdown().await;
+    if !matches!(completion, Ok(true)) {
+        stop(server).await;
+        stop(upstream).await;
+        panic!(
+            "scheduled TV/movie commands did not both succeed: {last_history}; captured={scheduled_ids:?}; outcome={completion:?}"
+        );
+    }
+    let (code, schedules) = request(
+        &base,
+        "GET",
+        "/api/v1/download-refresh/schedules",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{schedules}");
+    assert_eq!(schedules.as_array().unwrap().len(), 2);
+    for schedule in schedules.as_array().unwrap() {
+        assert!(!schedule["last_run_at"].is_null(), "{schedules}");
+    }
     let (_, history) = request(&base, "GET", "/api/v1/commands", Value::Null).await;
     let total = history["total"].clone();
     let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
@@ -490,7 +561,31 @@ async fn durable_refresh_preserves_domains_retries_cancellation_schedules_and_re
     );
     // Provider edit invalidates snapshots and fences queued old revisions. CDH preserves
     // explicit observation intent and reauthorizes schedules for the current provider.
+    // Shutdown cannot reset attempts on recovered work. Prove this is fresh admission
+    // before expecting provider revision fencing to fail it without a first attempt.
+    let (code, before_stale) =
+        request(&base, "GET", "/api/v1/commands?limit=100", Value::Null).await;
+    assert_eq!(code, 200, "{before_stale}");
+    let previous = before_stale["items"].as_array().unwrap();
+    assert_eq!(
+        before_stale["total"].as_u64().unwrap(),
+        previous.len() as u64
+    );
+    assert!(
+        !previous
+            .iter()
+            .any(|v| v["target"]["provider_id"] == provider["id"]
+                && v["target"]["media_type"] == "tv"
+                && matches!(
+                    v["status"].as_str(),
+                    Some("queued" | "running" | "retry_wait")
+                )),
+        "{before_stale}"
+    );
     let stale = submit(&base, &provider, "tv").await;
+    assert!(!previous.iter().any(|v| v["id"] == stale["id"]), "{stale}");
+    assert_eq!(stale["status"], "queued", "{stale}");
+    assert_eq!(stale["attempts"], 0, "{stale}");
     let mut changed = config;
     changed["revision"] = json!(1);
     changed["name"] = json!("edited");
@@ -571,7 +666,26 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     )
     .await;
     let (app, client) = providers::router_with_refresh(db.clone(), None);
-    let (base, server) = serve(app.merge(commands::router(db.clone()))).await;
+    // Only this fixture traces owned command reads. Sequential polling correlates
+    // method/path with the phase IDs below; no request headers or budgets change.
+    let trace_origin = std::time::Instant::now();
+    let app = app.merge(commands::router(db.clone())).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let trace = request.method() == Method::GET
+                && request.uri().path().starts_with("/api/v1/commands/");
+            let path = request.uri().path().to_owned();
+            let arrived = std::time::Instant::now();
+            if trace {
+                eprintln!("event=owned_command_read_arrived path={path} since_start={:?}", trace_origin.elapsed());
+            }
+            let response = next.run(request).await;
+            if trace {
+                eprintln!("event=owned_command_read_completed path={path} status={} elapsed={:?} since_start={:?}", response.status(), arrived.elapsed(), trace_origin.elapsed());
+            }
+            response
+        },
+    ));
+    let (base, server) = serve(app).await;
     let scope =
         |c| json!({"category":c,"imported_category":null,"recent_priority":0,"older_priority":1});
     let config = json!({"name":"shared","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("{endpoint}/config-1/"),"tv":scope("tv"),"movies":scope("movies")},"credentials":null});
@@ -620,6 +734,10 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     .await;
     state.mode.store(0, Ordering::SeqCst);
     state.release.add_permits(1);
+    eprintln!(
+        "event=owned_command_wait phase=initial_normal id={}",
+        tv["id"]
+    );
     until(&base, tv["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
     // Synthetic persisted Retry-After boundary: a future obsolete retry must not reserve its scope for a day.
@@ -653,6 +771,10 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     assert_eq!(failed["error_code"], "provider_changed");
     assert_eq!(state.refresh_reads_for("/config-1/"), calls);
     let corrected = submit(&base, &provider, "tv").await;
+    eprintln!(
+        "event=owned_command_wait phase=corrected_revision id={}",
+        corrected["id"]
+    );
     until(&base, corrected["id"].as_str().unwrap(), "succeeded").await;
     runtime.shutdown().await;
     // Restart cannot reset a consumed attempt budget, even when the third attempt was interrupted.
@@ -682,7 +804,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-            if current == 4 { break; }
+            // Reasoning: 0049 adds two indexer_download_client checks to 0048's four indexer checks and the two removed-metadata additions; startup must settle all fourteen (was twelve).
+            if current == 14 { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.unwrap();
@@ -981,7 +1104,9 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-                    if current == 4 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
+                    // Reasoning: all fourteen checks (0048 adds the local-only indexer pair and 0049 the binding check per domain) must settle
+                    // without changing the exact communication traffic assertion below.
+                    if current == 14 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }).await.unwrap();

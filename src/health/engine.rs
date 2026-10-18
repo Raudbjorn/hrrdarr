@@ -489,6 +489,20 @@ async fn evaluate(
         _ => return Err("check_failed"),
     };
     match member.identity.check_key.as_str() {
+        "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
+        "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
+        "indexer_download_client" => {
+            Ok(crate::health_detectors::evaluate_indexer_client(db, domain)
+                .await?
+                .map(|v| HealthIssue {
+                    identity: member.identity.clone(),
+                    severity: v.severity,
+                    reason: v.reason.into(),
+                    message: v.message,
+                    wiki_url: v.wiki_url.into(),
+                    compatibility_type: v.compatibility_type.into(),
+                }))
+        }
         "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
             db, client, domain,
         )
@@ -513,6 +527,20 @@ async fn evaluate(
             wiki_url: v.wiki_url.into(),
             compatibility_type: v.compatibility_type.into(),
         })),
+        "download_client_root_folder" => {
+            download_roots::evaluate(db, client, domain)
+                .await
+                .map(|issue| {
+                    issue.map(|v| HealthIssue {
+                        identity: member.identity.clone(),
+                        severity: HealthSeverity::Warning,
+                        reason: v.reason.into(),
+                        message: v.message.into(),
+                        wiki_url: v.wiki_url.into(),
+                        compatibility_type: v.compatibility_type.into(),
+                    })
+                })
+        }
         _ => Err("check_failed"),
     }
 }
