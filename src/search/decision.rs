@@ -409,35 +409,68 @@ pub(crate) async fn evaluate_with_pending(
     Ok(result)
 }
 fn available(c: &Candidate, now: i64, delay_days: i64) -> bool {
-    let reached = |value: &Option<String>| {
+    movie_available(
+        &MovieReleaseFacts {
+            minimum: c.minimum.as_deref(),
+            status: c.status.as_deref(),
+            cinema: c.cinema.as_deref(),
+            digital: c.digital.as_deref(),
+            physical: c.physical.as_deref(),
+        },
+        now,
+        delay_days,
+    )
+}
+/// Persisted movie facts read by the background minimum-availability rule.
+pub(crate) struct MovieReleaseFacts<'a> {
+    pub minimum: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub cinema: Option<&'a str>,
+    pub digital: Option<&'a str>,
+    pub physical: Option<&'a str>,
+}
+/// The single background movie availability rule. Release decisions apply it only to RSS;
+/// Wanted reports it as a display fact and never uses it to bypass user-search semantics.
+pub(crate) fn movie_available(c: &MovieReleaseFacts<'_>, now: i64, delay_days: i64) -> bool {
+    let reached = |value: Option<&str>| {
         value
-            .as_deref()
             .and_then(timestamp)
             .is_some_and(|t| t.saturating_add(delay_days * 86400) <= now)
     };
-    match c.minimum.as_deref() {
+    match c.minimum {
         Some("tba") => true,
         Some("announced") => {
             c.status
-                .as_deref()
                 .is_some_and(|s| matches!(s, "announced" | "in_cinemas" | "released"))
                 || c.cinema.is_some()
                 || c.digital.is_some()
                 || c.physical.is_some()
         }
-        Some("in_cinemas") => reached(&c.cinema) || reached(&c.digital) || reached(&c.physical),
+        Some("in_cinemas") => reached(c.cinema) || reached(c.digital) || reached(c.physical),
         Some("released") => {
-            reached(&c.digital)
-                || reached(&c.physical)
+            reached(c.digital)
+                || reached(c.physical)
                 || (c.digital.is_none()
                     && c.physical.is_none()
                     && c.cinema
-                        .as_deref()
                         .and_then(timestamp)
                         .is_some_and(|t| t.saturating_add((90 + delay_days) * 86400) <= now))
         }
         _ => false,
     }
+}
+/// Background availability delay in days; `None` means no movie availability policy is
+/// persisted, in which case background decisions apply no availability gate.
+pub(crate) async fn movie_availability_delay(c: &Connection) -> Result<Option<i64>> {
+    Ok(c.query(
+        "SELECT availability_delay_days FROM release_delay_policies WHERE media_type='movies'",
+        (),
+    )
+    .await?
+    .next()
+    .await?
+    .map(|row| row.get::<i64>(0))
+    .transpose()?)
 }
 
 /// Shared profile/rank/size/cutoff checks for releases and already downloaded files.

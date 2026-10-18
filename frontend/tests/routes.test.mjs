@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseHash,hashFor,VIEW_IDS,VIEW_PATHS,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS,MAX_DISPLAY_LENGTH,MAX_HASH_LENGTH} from '../src/lib/routes.ts';
 
-const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history'];
+const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff'];
 
 test('table covers exactly the existing views',()=>{
   assert.deepEqual([...VIEW_IDS].sort(),[...EXPECTED_VIEWS].sort());
@@ -17,6 +17,12 @@ test('every view round-trips and has a unique path',()=>{
   }
   assert.equal(paths.size,VIEW_IDS.length);
   assert.equal(hashFor('library'),'#/');
+});
+
+test('wanted routes use the reference paths',()=>{
+  assert.deepEqual(parseHash('#/wanted/missing'),{kind:'view',view:'wanted-missing'});
+  assert.deepEqual(parseHash('#/wanted/cutoffunmet'),{kind:'view',view:'wanted-cutoff'});
+  assert.equal(parseHash('#/wanted/cutoff').kind,'not-found');
 });
 
 test('empty hashes map to library',()=>{
