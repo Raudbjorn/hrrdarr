@@ -4,7 +4,7 @@
   import type { ApiPage, Command, CommandStatus, CompletedDownloadHandling, ProcessingPolicy, MediaDomain, Provider, QueueSnapshot, RefreshSchedule, RefreshTarget } from './api.generated';
   import type {SettingsWriteState} from './api';
   import {readDownloadHandling,saveCompletedDownloadHandling,inheritRefreshSchedule, listCommands, getCommand, createCommand, cancelCommand, deleteCommand, listRefreshSchedules, saveRefreshSchedule, deleteRefreshSchedule, getQueueSnapshot, listProviders, getProvider } from './api';
-  let {active=true,relatedWrite='idle',providerVersion=0,onwrite=()=>{}}:{active?:boolean;relatedWrite?:SettingsWriteState;providerVersion?:number;onwrite?:(state:SettingsWriteState)=>void}=$props();
+  let {active=true,relatedWrite='idle',providerVersion=0,onwrite=()=>{},request=null,onnavigate=()=>{}}:{request?:{domain:MediaDomain;nonce:number}|null;onnavigate?:(nonce:number,accepted:boolean)=>void;active?:boolean;relatedWrite?:SettingsWriteState;providerVersion?:number;onwrite?:(state:SettingsWriteState)=>void}=$props();
   let settings=$state<Partial<Record<MediaDomain,CompletedDownloadHandling>>>({}),policies=$state<Partial<Record<MediaDomain,ProcessingPolicy>>>({});
   let master=$state<CompletedDownloadHandling|null>(null),masterEnabled=$state(true),masterDirty=$state(false),masterStale=$state(false),scheduleStale=$state(false),scheduleProviderRevision=$state<number|null>(null);
   let childWrite=$state<SettingsWriteState>('idle'),childDirty=$state(false),providerMissing=$state(false);
@@ -81,7 +81,18 @@
     reading = false; error = ''; notice = ''; confirmDelete = null; scheduleReady = false; snapshot = null; queueOffset = 0;
     if (result.ok) {provider = result.data;providerMissing=false; media = domain; masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false; await read(false, true);} else {readError = result.error; schedulePoll();}
   }
-  async function changeScope(next:MediaDomain) {if(!keepDrafts()||reading)return;media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; await read(false,true);}
+  async function changeScope(next:MediaDomain) {if(reading||!keepDrafts())return false;media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; await read(false,true);return true;}
+  let navigationSeen=$state<number|null>(null),navigationNotice=$state('');
+  $effect(()=>{
+    const next=request,shown=active,busy=reading||mutating||writeReadback||relatedWrite==='busy'||childWrite==='busy',blocked=uncertain||relatedWrite==='uncertain'||childWrite==='uncertain';
+    if(!shown||!next||next.nonce===navigationSeen)return;
+    if(busy){navigationNotice=`Waiting to open ${next.domain} completed-download settings until current work finishes.`;return;}
+    navigationSeen=next.nonce;
+    untrack(()=>{
+      if(blocked){navigationNotice='Settings navigation refused: resolve the unknown write outcome, then request navigation again.';onnavigate(next.nonce,false);return;}
+      void changeScope(next.domain).then(accepted=>{navigationNotice=accepted?`Opened ${next.domain} completed-download settings.`:'Settings navigation declined; previous domain and drafts retained.';onnavigate(next.nonce,accepted);if(accepted&&active)document.getElementById('cdh-heading')?.focus();});
+    });
+  });
   async function filters() {++version; commandOffset = 0; selectedCommand = null; confirmDelete = null; await read();}
   async function inspect(command: Command) {if (reading || mutating) return; selectedCommand = command; confirmDelete = null; await read();}
   async function mutate(action: 'refresh' | 'cancel' | 'deleteCommand' | 'saveSchedule' | 'deleteSchedule' | 'inheritSchedule') {
@@ -116,9 +127,10 @@
   {#if relatedWrite!=='idle'}<p role="alert">Provider changes have a pending or unknown outcome. Resolve them in Providers before another settings write.</p>{/if}
   {#if uncertain}<p role="alert">The request may have committed. Related writes remain blocked until a complete readback. Reload activity to inspect saved settings.</p>{/if}
   {#if providerMissing}<p role="alert">Selected provider was removed. Retained drafts cannot be saved; select another provider after reviewing them.</p>{/if}
+  {#if navigationNotice}<p role="status">{navigationNotice}</p>{/if}
   <div class="heading"><div><h1 id="activity-heading">Activity</h1><p>Download observations, refresh schedules and completed-download imports. Only confirmed submissions with an enabled import policy can be processed automatically.</p></div><button disabled={reading || mutating} onclick={reloadSettings}>Reload activity</button></div>
   {#if reading}<p role="status">Reading activity…</p>{/if}{#if mutating}<p role="status">Saving request…</p>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}{#if readError}<p class="error" role="alert">{readError}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
-  <section class="surface" aria-labelledby="cdh-heading"><h2 id="cdh-heading">Completed-download handling</h2>
+  <section class="surface" aria-labelledby="cdh-heading"><h2 id="cdh-heading" tabindex="-1">Completed-download handling</h2>
     <label>Completed-download media<select value={media} disabled={reading||locked} onchange={event=>void changeScope(event.currentTarget.value as MediaDomain)}><option value="tv">TV</option><option value="movies">Movies</option></select></label>
     {#if settings[media]}{@const current=settings[media]!}<p>{current.defined?'Explicitly defined':'Default setting (not explicitly defined)'}. {current.locally_edited?'Native choice saved.':'No native edit recorded.'} Desired domain imports: {current.enabled?'on':'off'}.</p><p>{current.effective_scopes} effective import scopes; {current.observation_disabled_scopes} with automatic observation disabled.</p>
       {#if current.reconciliation_pending}<p role="alert">Automatic coverage incomplete: {current.reconciliation_reason==='schedule_limit'?'refresh schedule capacity reached.':'reconciliation pending.'} Existing valid explicit work may continue.</p>{/if}

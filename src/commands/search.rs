@@ -12,6 +12,12 @@ pub enum SearchMode {
     Interactive,
 }
 impl SearchMode {
+    pub(super) fn operation(self) -> crate::providers::IndexerOperation {
+        match self {
+            Self::Automatic => crate::providers::IndexerOperation::Automatic,
+            Self::Interactive => crate::providers::IndexerOperation::Interactive,
+        }
+    }
     fn text(self) -> &'static str {
         match self {
             Self::Automatic => "automatic",
@@ -86,6 +92,15 @@ pub enum CandidateOrigin {
         result_id: Uuid,
         mode: SearchMode,
     },
+}
+
+impl CandidateOrigin {
+    pub(super) fn operation(&self) -> crate::providers::IndexerOperation {
+        match self {
+            Self::Rss => crate::providers::IndexerOperation::Rss,
+            Self::Search { mode, .. } => mode.operation(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -335,7 +350,7 @@ async fn create(
  return bounded(existing)
  },Err(Error(StatusCode::NOT_FOUND,"search_command_not_found"))=>(),Err(e)=>return Err(e)}
  let source=rss::RssTarget{media_type:media,indexer_id:input.indexer_id,indexer_revision:input.indexer_revision,client_id:input.client_id,client_revision:input.client_revision};
- if !rss::valid_target(&tx,source).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
+ if !rss::valid_target(&tx,source,input.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
  // A selected offer must never depend on an unencrypted locator fallback.
  s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;
  let captured=identity(&tx,&input.target).await?;let timestamp=now()?;
@@ -534,7 +549,7 @@ async fn select(
     {
         return Err(conflict());
     }
-    if !rss::valid_target(c, command.source).await? {
+    if !rss::valid_target(c, command.source, command.mode.operation()).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     check_identity(c, command).await?;
@@ -600,7 +615,7 @@ async fn fetch(
 ) -> Result<Vec<Vec<u8>>> {
     let c = connection(db).await?;
     check_identity(&c, command).await?;
-    if !rss::valid_target(&c, command.source).await? {
+    if !rss::valid_target(&c, command.source, command.mode.operation()).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     let mut query_index = 0;
@@ -616,6 +631,7 @@ async fn fetch(
             .raw_search(
                 &command.source.indexer_id.to_string(),
                 command.source.indexer_revision,
+                command.mode.operation(),
                 &request,
             )
             .await
@@ -677,7 +693,7 @@ async fn publish(
         .await?;
     let outcome=async{
  if !matches!(read(&tx,command.id).await?.status,CommandStatus::Running){return Ok(())}
- if !rss::valid_target(&tx,command.source).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}check_identity(&tx,command).await?;
+ if !rss::valid_target(&tx,command.source, command.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}check_identity(&tx,command).await?;
  let timestamp=now()?;let mut seen=std::collections::BTreeSet::new();let mut best:Option<(crate::search::revision::ReleasePreference,String,Uuid)>=None;let mut count=0;
  for mut bytes in releases {
  let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;

@@ -77,6 +77,9 @@ async fn metadata_mode(
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        // Owned removed-health browser: actual404 and explicit valid restoration.
+        Some("4") => 4,
+        Some("5") => 5,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.store(value, Ordering::SeqCst);
@@ -87,6 +90,9 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
         return Json(search_show(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -96,6 +102,10 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
 
     if id == "101" {
         let mut value = show();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> series");
+            value["status"] = json!("continuing");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed series");
             value["episodes"][0]["title"] = json!("Refreshed pilot");
@@ -111,6 +121,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
         return Json(search_movie(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -120,6 +133,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
 
     if id == "101" {
         let mut value = movie();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> movie");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed movie");
         }
@@ -174,6 +190,7 @@ async fn mode(
         Some("0") => 0,
         Some("1") => 1,
         Some("2") => 2,
+        Some("3") => 3,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
@@ -389,6 +406,10 @@ async fn provider_mock(
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
     }
+    // Bounded owned health probe delay for pending-generation/cancel browser checks.
+    if uri.path() == "/api/v2/app/preferences" && state.1.load(Ordering::SeqCst) == 3 {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
     if uri.path() == "/api/v2/torrents/info" {
         match state.1.load(Ordering::SeqCst) {
             1 => {
@@ -500,7 +521,7 @@ async fn provider_mock(
     match uri.path() {
         "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
         "/api/v2/app/version"=>"v4.6.0".into_response(),
-        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/app/preferences"=>Json(json!({"save_path":"/remote","queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
         "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
         "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([{"hash":"1111111111111111111111111111111111111111","category":query.get("category"),"name":"Fixture download","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0}])).into_response(),
         _=>StatusCode::NOT_FOUND.into_response(),
@@ -713,6 +734,7 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::health::router(db.clone()))
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))

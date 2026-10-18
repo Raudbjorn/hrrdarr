@@ -1,4 +1,5 @@
 pub mod api;
+pub mod credits;
 pub mod db;
 pub mod episodes;
 pub mod library;
@@ -45,4 +46,7 @@ pub mod revision_policy;
 
 pub mod release_profile_terms;
 
+pub mod health;
 pub mod health_detectors;
+
+pub mod host;
