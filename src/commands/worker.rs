@@ -168,6 +168,7 @@ async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
                 provider_revision: schedule.provider_revision,
                 priority: CommandPriority::Normal,
             },
+            CommandOrigin::Automatic,
             timestamp,
         )
         .await;
@@ -405,6 +406,7 @@ mod tests {
                 provider_revision: 1,
                 priority: CommandPriority::Normal,
             },
+            CommandOrigin::Automatic,
             1,
         )
         .await
@@ -496,6 +498,123 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn enqueue_persists_origin_and_manual_coalesce_promotes_automatic_once() {
+        let (_scratch, _db, c, provider) = health_refresh_fixture().await;
+        let input = |media_type| CommandInput {
+            name: CommandName::RefreshDownloads,
+            target: RefreshTarget {
+                provider_id: provider,
+                media_type,
+            },
+            provider_revision: 1,
+            priority: CommandPriority::Normal,
+        };
+        let automatic = enqueue(&c, input(MediaDomain::Tv), CommandOrigin::Automatic, 1)
+            .await
+            .unwrap();
+        let manual = enqueue(&c, input(MediaDomain::Movies), CommandOrigin::Manual, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM commands WHERE origin='legacy_unknown'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='tv' AND origin='automatic' AND manual_bypass=0").await, 1);
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
+        // Automatic coalescing never promotes; a manual request onto automatic work does, once.
+        assert_eq!(
+            enqueue(&c, input(MediaDomain::Tv), CommandOrigin::Automatic, 2)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT manual_bypass FROM commands WHERE media_type='tv'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            enqueue(&c, input(MediaDomain::Tv), CommandOrigin::Manual, 2)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(
+            enqueue(&c, input(MediaDomain::Tv), CommandOrigin::Manual, 3)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='tv' AND origin='automatic' AND manual_bypass=1").await, 1);
+        // Manual work is never relabelled by later admissions.
+        assert_eq!(
+            enqueue(&c, input(MediaDomain::Movies), CommandOrigin::Automatic, 2)
+                .await
+                .unwrap()
+                .id,
+            manual.id
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
+    }
+    #[tokio::test]
+    async fn provider_writers_rebind_backoff_status_and_drop_unserved_domains() {
+        let (_scratch, _db, c, provider) = health_refresh_fixture().await;
+        let id = provider.to_string();
+        for media in ["tv", "movies"] {
+            c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until)VALUES(?,?,1,2,100,200,500)",params![id.clone(),media]).await.unwrap();
+        }
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        tx.execute("UPDATE providers SET revision=2 WHERE id=?", [id.clone()])
+            .await
+            .unwrap();
+        tx.execute(
+            "DELETE FROM provider_scopes WHERE provider_id=? AND media_type='movies'",
+            [id.clone()],
+        )
+        .await
+        .unwrap();
+        crate::providers::reconcile_download_client_status(&tx, &id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // History survives the edit at the new revision; the removed domain loses its authority.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM download_client_status WHERE media_type='tv' AND config_revision=2 AND escalation_level=2 AND disabled_until=500").await, 1);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM download_client_status WHERE media_type='movies'"
+            )
+            .await,
+            0
+        );
+        // Ordinary status writes are accepted again at the rebound revision.
+        c.execute(
+            "UPDATE download_client_status SET escalation_level=3 WHERE provider_id=?",
+            [id.clone()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::providers::reconcile_download_client_status(&c, &id)
+                .await
+                .is_err(),
+            "autocommit is rejected"
+        );
+    }
+    #[tokio::test]
     async fn health_refresh_exhaustion_keeps_snapshot_and_cancelled_callback_does_not_mark() {
         let (_scratch, db, c, provider) = health_refresh_fixture().await;
         c.execute("DELETE FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();
@@ -578,6 +697,7 @@ mod tests {
                 provider_revision: provider["revision"].as_i64().unwrap(),
                 priority: CommandPriority::Normal,
             },
+            CommandOrigin::Automatic,
             now().unwrap(),
         )
         .await

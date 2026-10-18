@@ -437,6 +437,7 @@ pub(super) async fn update(
         let mut items=Vec::with_capacity(providers.len());
         for provider in providers {
             if tx.execute("UPDATE providers SET enabled=?,priority=?,revision=revision+1 WHERE id=? AND revision=?",params![i64::from(input.changes.enabled.unwrap_or(provider.enabled)),i64::from(input.changes.priority.unwrap_or(provider.priority)),provider.id.to_string(),provider.revision]).await?!=1 {return Err(conflict());}
+            super::reconcile_download_client_status(&tx,&provider.id.to_string()).await.map_err(super::status_reconciliation)?;
             items.push(read(&tx,&provider.id.to_string()).await?.0);
         }
         changes.mark(&tx).await?;

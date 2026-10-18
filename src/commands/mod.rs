@@ -345,13 +345,36 @@ async fn finish<T>(tx: libsql::Transaction, result: Result<T>) -> Result<T> {
         }
     }
 }
-async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<Command> {
+/// Admission provenance is persisted once; priority is not evidence of who asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandOrigin {
+    Automatic,
+    Manual,
+}
+impl CommandOrigin {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
+}
+async fn enqueue(
+    c: &Connection,
+    input: CommandInput,
+    origin: CommandOrigin,
+    timestamp: i64,
+) -> Result<Command> {
     if !valid_provider(c, input.target, input.provider_revision).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
     if let Some(row)=c.query(&format!("SELECT {COMMAND_COLUMNS} FROM commands WHERE provider_id=? AND media_type=? AND status IN ('queued','running','retry_wait')"),params![input.target.provider_id.to_string(),domain(input.target.media_type)]).await?.next().await?{
         let current=command_row(row)?;
         if current.provider_revision!=input.provider_revision{return Err(conflict())}
+        // A manual request coalesced onto in-flight automatic work promotes it exactly once.
+        if origin==CommandOrigin::Manual{
+            c.execute("UPDATE commands SET manual_bypass=1 WHERE id=? AND origin='automatic' AND manual_bypass=0",[current.id.to_string()]).await?;
+        }
         return Ok(current)
     }
     let count = command_capacity(c).await?;
@@ -359,7 +382,7 @@ async fn enqueue(c: &Connection, input: CommandInput, timestamp: i64) -> Result<
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
     }
     let id = Uuid::new_v4();
-    c.execute("INSERT INTO commands(id,name,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,items_observed) VALUES(?,'refresh_downloads',?,?,?,?,'queued',0,?,?,0)",params![id.to_string(),input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,input.priority.number(),timestamp,timestamp]).await?;
+    c.execute("INSERT INTO commands(id,name,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,items_observed,origin) VALUES(?,'refresh_downloads',?,?,?,?,'queued',0,?,?,0,?)",params![id.to_string(),input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,input.priority.number(),timestamp,timestamp,origin.text()]).await?;
     read_command(c, id).await
 }
 
@@ -405,7 +428,7 @@ async fn create(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let result = async { bounded(enqueue(&tx, input, now()?).await?) }.await;
+    let result = async { bounded(enqueue(&tx, input, CommandOrigin::Manual, now()?).await?) }.await;
     Ok((StatusCode::ACCEPTED, finish(tx, result).await?))
 }
 async fn list(

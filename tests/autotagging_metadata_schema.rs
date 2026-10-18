@@ -286,7 +286,13 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // CHECK lists in place (providers table text) and in nine guard triggers; those objects change text by
         // design and are compared exactly in src/db/torrent_rss_tests.rs, so they join the exclusion lists by name.
         "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id','minimum_seeders') ORDER BY cid",
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits') AND NOT (type='table' AND name IN ('provider_scopes','providers')) AND name NOT IN ('provider_test_insert_owner','provider_test_update_owner','provider_scope_options_insert','provider_scope_options_update','provider_client_options_insert','provider_client_options_update','rss_commands_admit','rss_schedules_admit','rss_schedules_update') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // Reasoning: migration 0051 adds download_client_status (table + triggers), appends next_expiry_at to
+        // health_checks and origin/manual_bypass to commands (rewriting those two CREATE TABLE texts), recreates
+        // commands_transition and adds commands_backoff_identity. Predecessor columns of both altered tables are
+        // compared exactly below; backoff objects are covered by src/db/backoff_tests.rs.
+        "SELECT * FROM pragma_table_info('health_checks') WHERE name!='next_expiry_at' ORDER BY cid",
+        "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','download_client_status') AND NOT (type='table' AND name IN ('provider_scopes','providers','health_checks','commands')) AND name NOT IN ('provider_test_insert_owner','provider_test_update_owner','provider_scope_options_insert','provider_scope_options_update','provider_client_options_insert','provider_client_options_update','rss_commands_admit','rss_schedules_admit','rss_schedules_update','commands_transition','commands_backoff_identity') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -501,7 +507,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        50 // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
+        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -627,7 +633,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        50 // Reasoning: latest migration is now 0050 torrent RSS indexer (was 49: indexer client binding); historical migration prefixes stay fixed.
+        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);
