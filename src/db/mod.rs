@@ -216,6 +216,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
     ),
+    (
+        "download_client_backoff",
+        include_str!("../../migrations/0051_download_client_backoff.sql"),
+    ),
+    (
+        "collections",
+        include_str!("../../migrations/0052_collections.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0053_provider_authority.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -778,3 +790,6 @@ mod indexer_policy_tests;
 mod indexer_client_tests;
 #[cfg(test)]
 mod torrent_rss_tests;
+
+#[cfg(test)]
+mod backoff_tests;

@@ -149,6 +149,21 @@ fn parse_pad(digits: &str) -> Option<u8> {
     }
     Some(digits.len() as u8)
 }
+/// Selectors are exact names, so a trailing `)`/`]` that closes a bracket opened inside the
+/// selector (`DV (WEB-DL)`) stays in it; only unbalanced trailing punctuation is the
+/// conditional suffix. `end` is the boundary after trimming all suffix punctuation.
+fn balanced_selector_end(filter: &str, mut end: usize) -> usize {
+    let unclosed =
+        |s: &str, open: char, close: char| s.matches(open).count() > s.matches(close).count();
+    for ch in filter[end..].chars() {
+        let head = &filter[..end];
+        if !((ch == ')' && unclosed(head, '(', ')')) || (ch == ']' && unclosed(head, '[', ']'))) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
 fn parse_token(text: &str) -> Result<Token, TemplateError> {
     if text.chars().any(char::is_control) {
         return Err(TemplateError::IllegalLiteralCharacter);
@@ -168,9 +183,12 @@ fn parse_token(text: &str) -> Result<Token, TemplateError> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
     {
         let suffix_text = if text.contains(':') { filter } else { start };
-        let suffix_start = suffix_text
+        let mut suffix_start = suffix_text
             .trim_end_matches([' ', '.', '-', '_', ']', ')'])
             .len();
+        if text.contains(':') {
+            suffix_start = balanced_selector_end(filter, suffix_start);
+        }
         let selector = if text.contains(':') {
             &filter[..suffix_start]
         } else {
@@ -524,9 +542,10 @@ fn token_value(token: &Token, facts: RenderFacts<'_>) -> String {
                 } else if filter.trim().is_empty() {
                     true
                 } else if let Some(excluded) = filter.strip_prefix('-') {
-                    !excluded.split(',').any(|n| n == name.as_str())
+                    // `A, B` lists B, not ` B`: names are exact, list separators are not.
+                    !excluded.split(',').any(|n| n.trim() == name.as_str())
                 } else {
-                    filter.split(',').any(|n| n == name.as_str())
+                    filter.split(',').any(|n| n.trim() == name.as_str())
                 }
             })
             .collect::<Vec<_>>();
@@ -764,6 +783,32 @@ mod tests {
     }
 
     #[test]
+    fn custom_format_selector_keeps_balanced_closing_brackets() {
+        let mut movie = movie_facts();
+        movie.custom_formats = vec!["DV (WEB-DL)".into(), "HDR [10bit]".into()];
+        for (input, expected) in [
+            // The `)` closes the selector's own `(`: part of the exact name.
+            ("{Custom Format:DV (WEB-DL)}", "DV (WEB-DL)"),
+            ("{Custom Formats:HDR [10bit]}", "HDR [10bit]"),
+            // The unmatched `]` is still the conditional suffix of the `[` prefix.
+            ("{[Custom Format:DV (WEB-DL)]}", "[DV (WEB-DL)]"),
+            ("title {[Custom Format:missing (x)]}", "title"),
+        ] {
+            let parsed = parse(TemplateField::StandardMovie, input).unwrap();
+            assert_eq!(
+                render(
+                    &parsed,
+                    RenderFacts::Movie(&movie),
+                    &cfg(true, ColonPolicy::Dash)
+                )
+                .unwrap(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn custom_format_filters_normalization_and_bounded_paths() {
         let mut episode = episode_facts();
         let mut movie = movie_facts();
@@ -790,6 +835,9 @@ mod tests {
                 ("{[Custom Formats:A Format]}", "[A Format]"),
                 ("title  {Custom Formats:missing}.", "title"),
                 ("title {Custom Format:a format}", "title"),
+                // A space after a list comma separates names; it is not part of B's name.
+                ("{Custom Formats:Zulu, A Format}", "A Format Zulu"),
+                ("{Custom Formats:-ignored, Zulu}", "A Format"),
             ] {
                 let parsed = parse(field, input).unwrap();
                 assert_eq!(
