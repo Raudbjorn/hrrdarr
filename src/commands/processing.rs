@@ -19,6 +19,7 @@ pub struct ProcessingPolicyInput {
 #[serde(deny_unknown_fields)]
 pub struct ProcessingPolicyReset {
     pub provider_revision: i64,
+    #[serde(deserialize_with = "required_nullable")]
     pub revision: Option<i64>,
     pub mode: ProcessingMode,
 }
@@ -207,13 +208,16 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
+    let provider=c.query("SELECT p.revision,p.enabled FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
+    let provider_enabled = provider.get::<i64>(1)? == 1;
     let stored=c.query("SELECT provider_revision,revision,enabled,mode,enabled_override FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
-    let master = crate::completed_download_handling::read(c, media)
-        .await
-        .map_err(|e| Error(e.0, e.1))?
-        .enabled;
+    // Mirrors cdh_scope_authority.desired_enabled so reads match reconciliation.
+    let master = provider_enabled
+        && crate::completed_download_handling::read(c, media)
+            .await
+            .map_err(|e| Error(e.0, e.1))?
+            .enabled;
     let observation=c.query("SELECT intent,enabled FROM download_refresh_schedules WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
     let (observation_suppressed, observation_enabled) = match observation {
         Some(r) => (r.get::<String>(0)? == "suppressed", r.get::<i64>(1)? == 1),
