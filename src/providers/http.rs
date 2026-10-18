@@ -12,6 +12,15 @@ use tokio::{
     time::Instant,
 };
 use uuid::Uuid;
+
+/// RFC 7617 `Authorization: Basic` value, shared by providers and notifications.
+pub fn basic_auth(user: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
 const MAX_OPERATIONS: usize = 8;
 const MAX_LANES: usize = 256;
 const LANE_IDLE: Duration = Duration::from_secs(60);

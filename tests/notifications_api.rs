@@ -76,7 +76,12 @@ async fn fake_handler(
             .collect(),
         body: String::from_utf8_lossy(&body).into_owned(),
     });
-    if target.contains("/fail") {
+    if target.contains("/slow") {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    // "/fail" in the target, or a FAILME marker in the body (one request of a multi-request
+    // delivery), answers `fail_status`.
+    if target.contains("/fail") || String::from_utf8_lossy(&body).contains("FAILME") {
         let status = *fake.fail_status.lock().unwrap();
         return (StatusCode::from_u16(status).unwrap(), "no").into_response();
     }
@@ -1172,7 +1177,8 @@ async fn custom_script_receives_domain_environment_without_a_shell() {
     let h = harness().await;
     let out = h._dir.join("env.txt");
     let script = h._dir.join("hook.sh");
-    std::fs::write(&script, format!("#!/bin/sh\n{{ env | sort; echo \"ARGS:$1|$2\"; echo \"PWD:$(pwd)\"; }} > {}\necho hello\n", out.display())).unwrap();
+    // The TV and movie runs of a test are concurrent, so each domain writes its own file.
+    std::fs::write(&script, format!("#!/bin/sh\nif [ -n \"$radarr_eventtype\" ]; then f={0}.movies; else f={0}.tv; fi\n{{ env | sort; echo \"ARGS:$1|$2\"; echo \"PWD:$(pwd)\"; }} > \"$f\"\necho hello\n", out.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let draft = input(
         "Script",
@@ -1186,8 +1192,16 @@ async fn custom_script_receives_domain_environment_without_a_shell() {
         .await;
     assert_eq!(code, 200, "{result}");
     assert_eq!(result["results"].as_array().unwrap().len(), 2);
-    let text = std::fs::read_to_string(&out).unwrap();
-    assert!(text.contains("radarr_eventtype=Test") || text.contains("sonarr_eventtype=Test"));
+    let tv = std::fs::read_to_string(format!("{}.tv", out.display())).unwrap();
+    assert!(
+        tv.contains("sonarr_eventtype=Test") && !tv.contains("radarr_"),
+        "{tv}"
+    );
+    let text = std::fs::read_to_string(format!("{}.movies", out.display())).unwrap();
+    assert!(
+        text.contains("radarr_eventtype=Test") && !text.contains("sonarr_"),
+        "{text}"
+    );
     assert!(
         text.contains("ARGS:two words|$HOME"),
         "no shell expansion: {text}"
@@ -1197,8 +1211,9 @@ async fn custom_script_receives_domain_environment_without_a_shell() {
         !text.contains("HRRDARR_PROVIDER_KEY") && !text.contains("HOME="),
         "environment is cleared"
     );
-    // Per-domain contract: TV runs get sonarr_*, movie runs get radarr_* (the later run wrote the file).
+    // Per-domain contract: TV runs get sonarr_*, movie runs get radarr_*.
     assert!(text.contains("radarr_instancename=hrrdarr"));
+    assert!(tv.contains("sonarr_instancename=hrrdarr"));
     // Not executable / relative / failing scripts are failures, never executed through a shell.
     let plain = h._dir.join("plain.sh");
     std::fs::write(&plain, "#!/bin/sh\nexit 3\n").unwrap();
@@ -1265,4 +1280,318 @@ async fn plex_refreshes_only_sections_containing_the_changed_path() {
             .starts_with("/library/sections/1/refresh?path=%2Ftv%2Fs")
     );
     assert_eq!(refreshes[0].headers["x-plex-token"], "plextok");
+}
+
+/// A system health event is rendered for the scope whose trigger matched, not for whichever scope
+/// the notification happens to configure first.
+#[tokio::test]
+async fn system_health_event_uses_the_matching_scope() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness().await;
+    let out = h._dir.join("health.txt");
+    let script = h._dir.join("health.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nenv | sort > {}\n", out.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Script",
+                "custom_script",
+                json!({"path":script.to_str().unwrap()}),
+                json!({}),
+                both(
+                    json!({"on_grab":true}),
+                    json!({"on_health_issue":true,"include_health_warnings":true}),
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    h.sql("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES('00000000-0000-4000-8000-000000000041','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000141',1,'system','update_check','issue',0,100,3,'r','Disk full','https://wiki.invalid/h','DiskSpaceCheck');").await;
+    h.pump().await;
+    assert_eq!(
+        h.count("SELECT count(*) FROM notification_deliveries WHERE media_type='movies' AND state='delivered'")
+            .await,
+        1,
+        "the delivery records the movies scope that matched"
+    );
+    let env = std::fs::read_to_string(&out).unwrap();
+    assert!(env.contains("radarr_eventtype=HealthIssue"), "{env}");
+    assert!(
+        !env.contains("sonarr_"),
+        "the TV scope did not ask for health events: {env}"
+    );
+}
+
+/// A restored transition carries the cleared issue's severity, so a warning that was never
+/// announced (warnings excluded) is not announced as restored either; an error still is.
+#[tokio::test]
+async fn health_restored_respects_include_health_warnings() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Errors only",
+                "webhook",
+                json!({"url":format!("{base}/errors")}),
+                json!({}),
+                tv_only(json!({"on_health_issue":true,"on_health_restored":true,"include_health_warnings":false})),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    let health = |id: u8, kind: &str, severity: u8| {
+        format!(
+            "INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES('00000000-0000-4000-8000-0000000000{id:02}','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-0000000001{id:02}',1,'tv','indexer_status','{kind}',0,100,{severity},'r','Indexers unavailable','https://wiki.invalid/h','IndexerStatusCheck');"
+        )
+    };
+    h.sql(&format!(
+        "{}{}{}{}",
+        health(51, "issue", 2),
+        health(52, "restored", 2),
+        health(53, "issue", 3),
+        health(54, "restored", 3)
+    ))
+    .await;
+    h.pump().await;
+    let kinds: Vec<String> = h
+        .seen()
+        .iter()
+        .filter(|c| c.target == "/errors")
+        .map(|c| c.json()["eventType"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["HealthIssue", "HealthRestored"],
+        "only the error and its recovery"
+    );
+}
+
+/// One acknowledged request of a multi-request delivery is not repeated when a later one fails
+/// and the delivery is retried.
+#[tokio::test]
+async fn retry_resends_only_unacknowledged_requests() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Topics",
+                "ntfy",
+                json!({"server_url":format!("{base}/ntfy"),"topics":"alpha,FAILME"}),
+                json!({}),
+                tv_only(json!({"on_series_add":true})),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    *h.fake.fail_status.lock().unwrap() = 503;
+    h.sql("INSERT INTO series(id,title,path)VALUES(1,'S','/tv/s');")
+        .await;
+    h.pump().await;
+    assert_eq!(
+        h.count("SELECT state='pending' AND attempts=1 AND json_array_length(sent_parts)=1 FROM notification_deliveries")
+            .await,
+        1,
+        "alpha was acknowledged and recorded before FAILME failed"
+    );
+    *h.fake.fail_status.lock().unwrap() = 200;
+    h.sql("UPDATE notification_deliveries SET next_attempt_at=0;")
+        .await;
+    h.pump().await;
+    assert_eq!(
+        h.count("SELECT state='delivered' AND attempts=2 AND json_array_length(sent_parts)=2 FROM notification_deliveries")
+            .await,
+        1
+    );
+    let topics: Vec<String> = h
+        .seen()
+        .iter()
+        .map(|c| c.json()["topic"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(topics, ["alpha", "FAILME", "FAILME"], "alpha is sent once");
+}
+
+/// Disabling a notification holds its pending deliveries instead of failing them; re-enabling
+/// resumes them without having spent an attempt while disabled.
+#[tokio::test]
+async fn disabled_notification_holds_pending_deliveries() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Maintenance",
+                "webhook",
+                json!({"url":format!("{base}/fail/maintenance")}),
+                json!({}),
+                tv_only(json!({"on_series_add":true})),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    *h.fake.fail_status.lock().unwrap() = 503;
+    h.sql("INSERT INTO series(id,title,path)VALUES(1,'S','/tv/s');")
+        .await;
+    h.pump().await;
+    assert_eq!(h.seen().len(), 1);
+    h.sql("UPDATE notifications SET enabled=0,revision=revision+1;")
+        .await;
+    h.sql("UPDATE notification_deliveries SET next_attempt_at=0;")
+        .await;
+    h.pump().await;
+    assert_eq!(h.seen().len(), 1, "nothing is sent while disabled");
+    assert_eq!(
+        h.count("SELECT state='pending' AND attempts=1 FROM notification_deliveries")
+            .await,
+        1,
+        "held, not failed, and no attempt spent"
+    );
+    *h.fake.fail_status.lock().unwrap() = 200;
+    h.sql("UPDATE notifications SET enabled=1,revision=revision+1;")
+        .await;
+    h.pump().await;
+    assert_eq!(
+        h.count("SELECT state='delivered' AND attempts=2 FROM notification_deliveries")
+            .await,
+        1
+    );
+}
+
+/// Only an unfinished deletion journal makes a file delete `Manual`: an aborted request kept the
+/// file, so a later reconciliation of the same file id is `MissingFromDisk`.
+#[tokio::test]
+async fn file_delete_reason_ignores_aborted_deletion_journals() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Deletes",
+                "webhook",
+                json!({"url":format!("{base}/deletes")}),
+                json!({}),
+                json!({"movies":{"triggers":{"on_movie_file_delete":true}}}),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    let journal = |id: u8, file: u8, phase: &str| {
+        format!(
+            "INSERT INTO file_deletions(id,batch_id,media_type,file_id,owner_id,path,mode,phase,created_at,updated_at) VALUES('00000000-0000-4000-8000-0000000000{id:02}','00000000-0000-4000-8000-000000000099','movies',{file},1,'/movies/film/f{file}.mkv','absent','{phase}',1,1);"
+        )
+    };
+    h.sql("INSERT INTO movie_metadata(id,tmdb_id,title,year)VALUES(1,201,'Film',2000);INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies/film');\
+           INSERT INTO movie_files(id,movie_id,path)VALUES(7,1,'/movies/film/f7.mkv');").await;
+    h.sql(&journal(61, 7, "aborted")).await;
+    h.sql("DELETE FROM movie_files WHERE id=7;").await;
+    h.sql("INSERT INTO movie_files(id,movie_id,path)VALUES(8,1,'/movies/film/f8.mkv');")
+        .await;
+    h.sql(&journal(62, 8, "admitted")).await;
+    h.sql("DELETE FROM movie_files WHERE id=8;").await;
+    h.pump().await;
+    let reasons: Vec<String> = h
+        .seen()
+        .iter()
+        .filter(|c| c.target == "/deletes")
+        .map(|c| c.json()["deleteReason"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(reasons, ["MissingFromDisk", "Manual"]);
+}
+
+/// Secret webhook URLs get the URL and host policy when they are written, not as a permanent
+/// failure on the first delivery.
+#[tokio::test]
+async fn secret_webhook_urls_are_validated_on_save() {
+    let h = harness().await;
+    for bad in [
+        "not a url",
+        "http://169.254.169.254/latest",
+        "ftp://example.com/x",
+    ] {
+        let (code, body) = h
+            .call(
+                "POST",
+                "/api/v1/notifications",
+                input(
+                    "Discord",
+                    "discord",
+                    json!({}),
+                    json!({"webhook_url":bad}),
+                    tv_only(json!({"on_grab":true})),
+                ),
+            )
+            .await;
+        assert_eq!(code, 400, "{bad}: {body}");
+        assert!(
+            !body.to_string().contains(bad),
+            "the secret is not echoed: {body}"
+        );
+    }
+    let (code, body) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Slack",
+                "slack",
+                json!({}),
+                json!({"webhook_url":"https://hooks.slack.com/services/T/B/x"}),
+                tv_only(json!({"on_grab":true})),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{body}");
+}
+
+/// `/testall` runs notifications concurrently, so three 2 s targets finish well inside the time a
+/// sequential run would need.
+#[tokio::test]
+async fn test_all_runs_notifications_concurrently() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    for name in ["One", "Two", "Three"] {
+        let (code, n) = h
+            .call(
+                "POST",
+                "/api/v1/notifications",
+                input(
+                    name,
+                    "webhook",
+                    json!({"url":format!("{base}/slow/{name}")}),
+                    json!({}),
+                    tv_only(json!({"on_grab":true})),
+                ),
+            )
+            .await;
+        assert_eq!(code, 201, "{n}");
+    }
+    let started = std::time::Instant::now();
+    let (code, result) = h
+        .call("POST", "/api/v1/notifications/testall", json!({}))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(code, 200, "{result}");
+    let items = result["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    for item in items {
+        assert_eq!(item["results"][0]["status"], "delivered", "{item}");
+    }
+    // Sequential would take at least 6 s; concurrent takes about 2 s.
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
 }
