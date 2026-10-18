@@ -213,8 +213,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0049_indexer_client_binding.sql"),
     ),
     (
+        "torrent_rss_indexer",
+        include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
+    ),
+    (
         "download_client_backoff",
-        include_str!("../../migrations/0050_download_client_backoff.sql"),
+        include_str!("../../migrations/0051_download_client_backoff.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -776,6 +780,8 @@ mod indexer_policy_tests;
 
 #[cfg(test)]
 mod indexer_client_tests;
+#[cfg(test)]
+mod torrent_rss_tests;
 
 #[cfg(test)]
 mod backoff_tests;

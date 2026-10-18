@@ -813,7 +813,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     let id = admit(&c, HealthScope::All, 102).await;
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
-        // Reasoning: registry now contains eight checks per domain (0048 adds indexer_search/indexer_rss, 0049 indexer_download_client, 0050 download_client_backoff); retry must retain all sixteen (was fourteen).
+        // Reasoning: registry now contains eight checks per domain (0048 adds indexer_search/indexer_rss, 0049 indexer_download_client, 0051 download_client_backoff); retry must retain all sixteen (was fourteen).
         assert_eq!(cmd.members.len(), 16);
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
@@ -828,7 +828,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 16 } else { 0 } // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0050 two backoff checks (14 -> 16) that retain pending reasons
+            if attempt < 3 { 16 } else { 0 } // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16) that retain pending reasons
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -881,7 +881,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0050 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
+        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -943,7 +943,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     init(&c, 100).await;
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
-    // Reasoning: the full registry now has sixteen members (0050 adds one backoff check per domain), so every member needs an outcome.
+    // Reasoning: the full registry now has sixteen members (0051 adds one backoff check per domain), so every member needs an outcome.
     publish(&c, &cmd, Ok(vec![None; 16]), 101).await.unwrap();
     for at in 200..212 {
         let tx = c
@@ -998,7 +998,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0050 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
+        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
 }
 
@@ -1189,7 +1189,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        8 // Reasoning: 0048 adds tv indexer_search/indexer_rss, 0049 tv indexer_download_client and 0050 tv download_client_backoff, so the scoped TV request covers eight identities (was 7).
+        8 // Reasoning: 0048 adds tv indexer_search/indexer_rss, 0049 tv indexer_download_client and 0051 tv download_client_backoff, so the scoped TV request covers eight identities (was 7).
     );
     assert_eq!(
         count(
@@ -1210,7 +1210,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 8); // Reasoning: 0048 adds two TV indexer identities (4 -> 6), 0049 one more (6 -> 7) and 0050 the TV backoff check (7 -> 8); all eight newly requested TV checks survive.
+    assert_eq!(next.members.len(), 8); // Reasoning: 0048 adds two TV indexer identities (4 -> 6), 0049 one more (6 -> 7) and 0051 the TV backoff check (7 -> 8); all eight newly requested TV checks survive.
     assert!(
         next.members
             .iter()
@@ -1486,7 +1486,7 @@ async fn removed_metadata_scheduled_dispatch_and_invalid_identity_preserve_prior
     }
 }
 
-// This policy marker uses all sixteen actual migration seeds (0048 added the indexer pair, 0049 the binding check and 0050 the backoff check per domain), independent of the
+// This policy marker uses all sixteen actual migration seeds (0048 added the indexer pair, 0049 the binding check and 0051 the backoff check per domain), independent of the
 // historical lifecycle fixtures above. No detector or worker dispatch is exercised.
 async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, Option<i64>)> {
     let mut rows = c.query("SELECT scope,check_key,generation,pending_reasons,due_at FROM health_checks ORDER BY scope,check_key", ()).await.unwrap();
@@ -1507,7 +1507,7 @@ async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, 
 async fn indexer_configuration_marker_is_scoped_transactional_and_debounced() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 16); // Reasoning: 0050 adds two download_client_backoff seeds (was 14).
+    assert_eq!(initial.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(indexer_configuration_changed(&c, media).await.is_err());
     }
@@ -1571,7 +1571,7 @@ async fn indexer_configuration_exhaustion_preflights_all_keys_and_rolls_back_aut
             .await
             .unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 16); // Reasoning: 0050 adds two download_client_backoff seeds (was 14).
+        assert_eq!(before.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -1674,7 +1674,7 @@ async fn indexer_capability_gaps_are_reported_per_domain_from_eligible_scopes() 
 async fn indexer_client_marker_scoped_transaction_and_rollback() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 16); // Reasoning: 0050 adds two download_client_backoff seeds (was 14).
+    assert_eq!(initial.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(
             indexer_client_configuration_changed(&c, media)
@@ -1786,7 +1786,7 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         .unwrap();
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES(?,'indexer_download_client',1,1,?,'IndexerDownloadClientCheck')",params![scope,MAX_INTEGER]).await.unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 16); // Reasoning: 0050 adds two download_client_backoff seeds (was 14).
+        assert_eq!(before.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await

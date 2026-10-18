@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -216,19 +216,22 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     // Upgrade from 0046: drop the 0047 objects and history row, then reopen through the real runner.
     // Reasoning: 0048 now sits above 0047, so a faithful 0046 state must also undo 0048 (its three provider_scopes
     // columns, four indexer health rows and history row) and 0049 (its download_client_id column, two
-    // indexer_download_client health rows and history row); otherwise max(version) stays 49 and the runner
+    // indexer_download_client health rows and history row) and 0050 (its minimum_seeders column and history row; the widened
+    // CHECK/trigger edits are idempotent on rerun; the two scope-option triggers 0050 rewrote now name the
+    // enable_* columns, so SQLite refuses to drop those columns until the triggers are dropped, which 0050's
+    // DROP TRIGGER IF EXISTS tolerates); otherwise max(version) stays 50 and the runner
     // would re-run ALTER ADD COLUMN against columns that already exist.
-    // Reasoning: 0050 must likewise be undone: its status table, two backoff health rows, appended
+    // Reasoning: 0051 must likewise be undone: its status table, two backoff health rows, appended
     // health_checks/commands columns and command triggers, restoring the 0016 commands_transition body
-    // that 0050 replaces (0050 begins with DROP TRIGGER commands_transition).
+    // that 0051 replaces (0051 begins with DROP TRIGGER commands_transition).
     let migration16 = include_str!("../migrations/0016_download_refresh.sql");
     let start = migration16
         .find("CREATE TRIGGER commands_transition")
         .expect("0016 defines commands_transition");
     let end = start + migration16[start..].find("\nEND;").expect("trigger end") + 5;
-    c.execute_batch(&format!("DROP TABLE download_client_status; DROP TRIGGER commands_backoff_identity; DROP TRIGGER commands_transition; ALTER TABLE commands DROP COLUMN manual_bypass; ALTER TABLE commands DROP COLUMN origin; {} DELETE FROM health_checks WHERE check_key='download_client_backoff'; ALTER TABLE health_checks DROP COLUMN next_expiry_at; DELETE FROM schema_migrations WHERE version=50;", &migration16[start..end]))
+    c.execute_batch(&format!("DROP TABLE download_client_status; DROP TRIGGER commands_backoff_identity; DROP TRIGGER commands_transition; ALTER TABLE commands DROP COLUMN manual_bypass; ALTER TABLE commands DROP COLUMN origin; {} DELETE FROM health_checks WHERE check_key='download_client_backoff'; ALTER TABLE health_checks DROP COLUMN next_expiry_at; DELETE FROM schema_migrations WHERE version=51;", &migration16[start..end]))
         .await?;
-    c.execute_batch("DROP TABLE movie_credits; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); DELETE FROM schema_migrations WHERE version IN (47,48,49);")
+    c.execute_batch("DROP TABLE movie_credits; DROP TRIGGER provider_scope_options_insert; DROP TRIGGER provider_scope_options_update; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); ALTER TABLE provider_scopes DROP COLUMN minimum_seeders; DELETE FROM schema_migrations WHERE version IN (47,48,49,50);")
         .await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
@@ -244,7 +247,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

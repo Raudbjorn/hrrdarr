@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -139,18 +139,20 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert_eq!(&actual[..expected.len()], expected);
         assert_eq!(
             &actual[expected.len()..],
-            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column.
+            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column;
+            // 0050 appends the NULL feed-only minimum_seeders column.
             &[
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
+                libsql::Value::Null,
                 libsql::Value::Null
             ]
         );
     }
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: schema47 predecessor holds 8 health_checks rows; 0048 adds 4 indexer search/rss checks, 0049 adds 2 indexer_download_client checks and 0050 adds 2 download_client_backoff checks.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: schema47 predecessor holds 8 health_checks rows; 0048 adds 4 indexer search/rss checks, 0049 adds 2 indexer_download_client checks and 0051 adds 2 download_client_backoff checks.
     // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
-    // Reasoning: 0050 appends the NULL next_expiry_at column; every predecessor value stays exact.
+    // Reasoning: 0051 appends the NULL next_expiry_at column; every predecessor value stays exact.
     let mut predecessor = before[2].clone();
     for row in &mut predecessor {
         row.push(libsql::Value::Null);
@@ -243,7 +245,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     }
     let tx = c.transaction().await?;
     for i in 0..112
-    /* Reasoning: 16 registry rows exist at schema50 (was 14 at schema49), so 112 fixtures fill the 128 cap */
+    /* Reasoning: 16 registry rows exist at schema51 (was 14 at schema50), so 112 fixtures fill the 128 cap */
     {
         tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'fixture')",[format!("fixture_{i}")]).await?;
     }
@@ -255,7 +257,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(rows(&c, policy_sql).await?, policies);
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: 16 health rows at schema50 (was 14 at schema49).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: 16 health rows at schema51 (was 14 at schema50).
     c.execute("DELETE FROM providers WHERE id=?", [torznab.clone()])
         .await?;
     assert_eq!(
@@ -273,14 +275,14 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
             "SELECT count(*) FROM health_checks"
         )
         .await?,
-        16 // Reasoning: fresh schema50 registry has 16 rows (14 at schema49).
+        16 // Reasoning: fresh schema51 registry has 16 rows (14 at schema50).
     );
     Ok(())
 }

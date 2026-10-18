@@ -126,8 +126,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
-    // Migration50 appends honest provenance defaults; every historical field stays exact.
+    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    // Migration51 appends honest provenance defaults; every historical field stays exact.
     for row in &mut before[2] {
         row.extend([
             libsql::Value::Text("legacy_unknown".into()),
@@ -142,6 +142,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             for row in &mut expected {
                 row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
                 // Reasoning: 0049 then appends the NULL download_client_id preference column.
+                row.push(libsql::Value::Null);
+                // Reasoning: 0050 appends the nullable feed-only minimum_seeders column (NULL for old rows).
                 row.push(libsql::Value::Null);
             }
         }
@@ -158,7 +160,15 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             .await?
             .unwrap()
             .get::<String>(0)?;
-        assert_eq!(actual.replace(added, ""), *sql);
+        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
+        // indexer implementation list to torrentrss; reversing that one exact edit must recover the predecessor.
+        assert_eq!(
+            actual.replace(added, "").replace(
+                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab')"
+            ),
+            *sql
+        );
     }
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE severity IS NULL AND checked_at IS NULL AND observed_generation IS NULL AND pending_reasons=0 AND compatibility_type='ImportMechanismCheck'").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_lifecycle WHERE started_at=0 AND grace_due_at=0 AND next_scheduled_at=0 AND last_batch_completed_at IS NULL").await?,1);
@@ -191,7 +201,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -235,7 +245,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Migration46 adds a fourth TV identity; 0048 adds tv indexer_search/indexer_rss, 0049 indexer_download_client and 0050 download_client_backoff, so eight TV identities (was seven); Reasoning: registry growth, intent unchanged.
+    // Migration46 adds a fourth TV identity; 0048 adds tv indexer_search/indexer_rss, 0049 indexer_download_client and 0051 download_client_backoff, so eight TV identities (was seven); Reasoning: registry growth, intent unchanged.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
         8
@@ -409,7 +419,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        8 // Reasoning: migrations 46/48/49 added five movie checks and 0050 adds download_client_backoff; publication still covers the full scope.
+        8 // Reasoning: migrations 46/48/49 added five movie checks and 0051 adds download_client_backoff; publication still covers the full scope.
     );
     assert!(
         c.execute(
@@ -623,8 +633,8 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
-    // Existing states are unchanged; communication43, root-health44 and backoff50 append their scoped registry pairs.
+    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    // Existing states are unchanged; communication43, root-health44 and backoff51 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
@@ -713,10 +723,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds removed metadata; 0048 adds four indexer identities; 0049 adds two indexer_download_client identities; 0050 adds two download_client_backoff identities (14 -> 16).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds removed metadata; 0048 adds four indexer identities; 0049 adds two indexer_download_client identities; 0051 adds two download_client_backoff identities (14 -> 16).
     }
     Ok(())
 }

@@ -543,6 +543,32 @@ mod tests {
             )]),
         }
     }
+    // Reasoning: the reference applications' TorrentRss rows keep the feed URL, which usually embeds a
+    // passkey in its query, inside source settings. Mapping would have to split secret query parameters
+    // into sealed credentials, which is not small; the row is therefore reported as unsupported, never
+    // imported and never silently dropped.
+    #[test]
+    fn torrent_rss_source_rows_are_reported_unsupported_for_both_applications() {
+        for app in [Application::Sonarr, Application::Radarr] {
+            let snapshot = source(
+                "Indexers",
+                "TorrentRss",
+                r#"{"baseUrl":"https://tracker.example/rss?passkey=SOURCE_SECRET","cookie":"uid=1"}"#,
+            );
+            let mut unsupported = vec![];
+            let records = read(&snapshot, app, &mut unsupported).unwrap();
+            assert!(records.is_empty());
+            assert_eq!(unsupported.len(), 1);
+            assert_eq!(
+                (unsupported[0].table.as_str(), unsupported[0].rows),
+                ("Indexers", 1)
+            );
+            assert!(
+                !format!("{:?}", unsupported[0].columns).contains("SOURCE_SECRET"),
+                "reports name columns, never values"
+            );
+        }
+    }
     #[test]
     fn source_operation_flags_are_top_level_strict_and_missing_is_disabled() {
         for app in [Application::Sonarr, Application::Radarr] {
