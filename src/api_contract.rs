@@ -31,6 +31,7 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::host::HostSettings>();
     registry.visit::<crate::release_profiles::Catalog>();
     registry.visit::<crate::release_profiles::Detail>();
     registry.visit::<crate::release_profiles::TvInput>();
@@ -85,6 +86,11 @@ pub fn render() -> String {
         crate::commands::manual_import::ManualImportBatchInput,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
+        crate::health::HealthCommandInput,
+        crate::health::HealthSnapshot,
+        crate::health::HealthAdmission,
+        crate::health::HealthTransitions,
+        crate::api::ApiPage<crate::health::HealthCommand>,
         crate::commands::quality_reset::QualityResetInput,
         crate::api::ApiPage<crate::commands::quality_reset::QualityResetCommand>,
         crate::commands::rescan::RescanInput,
@@ -148,6 +154,10 @@ pub fn render() -> String {
         crate::providers::ProviderQuery,
         crate::providers::ProviderRevision,
         crate::api::ApiPage<crate::providers::Provider>,
+        crate::naming::movie_preview::MovieRenamePreview,
+        crate::naming::movie_preview::MovieRenamePreviewItem,
+        crate::naming::movie_preview::MovieRenamePreviewStatus,
+        crate::naming::movie_preview::MovieRenamePreviewReason,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,
@@ -165,6 +175,10 @@ pub fn render() -> String {
         crate::metadata::LookupResult,
         crate::metadata::SeriesDetails,
         crate::metadata::MovieDetails,
+        crate::metadata::CreditDetails,
+        crate::credits::CreditQuery,
+        crate::credits::Credit,
+        crate::api::ApiPage<crate::credits::Credit>,
         crate::metadata::EpisodeDetails,
         crate::library::Patch,
         crate::library::Bulk,

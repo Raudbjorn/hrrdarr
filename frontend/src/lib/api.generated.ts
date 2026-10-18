@@ -72,6 +72,12 @@ export type CompletedDownloadHandlingReconciliationReason = "pending" | "schedul
 
 export type CompletedDownloadHandlingUpdate = { enabled: boolean, revision: number, };
 
+export type CreditDetails = { credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, kind: CreditKind, images: Array<CreditImage>, };
+
+export type CreditImage = { cover_type: string, url: string, };
+
+export type CreditKind = "cast" | "crew";
+
 export type CustomFormat = { id: number, media_type: MediaDomain, name: string, include_when_renaming: boolean, specifications: Array<CustomFormatSpecification>, };
 
 export type CustomFormatBulkInput = { ids: Array<number>, include_when_renaming?: boolean | null, };
@@ -190,6 +196,40 @@ export type FilesystemPath = { path: string, };
 
 export type FilesystemType = { type: FilesystemKind, };
 
+export type HealthAdmission = { "outcome": "queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "coalesced_queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "pending", active_command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, };
+
+export type HealthCheckState = { identity: HealthIdentity, startup: boolean, scheduled: boolean, generation: number, observed_generation: number | null, checked_at: number | null, observed_epoch: string | null, evaluation: HealthEvaluation, last_error: string | null, pending_reasons: number, due_at: number | null, };
+
+export type HealthCommand = { id: string, scope: HealthScope, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, epoch: string, is_grace: boolean, members: Array<HealthMember>, };
+
+export type HealthCommandInput = { scope: HealthScope, priority: CommandPriority, };
+
+export type HealthCoverage = { registered_only: boolean, identities: Array<HealthIdentity>, };
+
+export type HealthEvaluation = "never_run" | "current" | "pending" | "running" | "stale" | "failed";
+
+export type HealthIdentity = { scope: HealthScope, check_key: string, };
+
+export type HealthIssue = { identity: HealthIdentity, severity: HealthSeverity, reason: string, message: string, wiki_url: string, compatibility_type: string, };
+
+export type HealthLifecycle = { epoch: string, started_at: number, grace_due_at: number, grace_phase: string, next_scheduled_at: number, schedule_error: string | null, last_batch_completed_at: number | null, };
+
+export type HealthMember = { identity: HealthIdentity, admitted_generation: number, captured_generation: number | null, captured_reasons: number | null, captured_due_at: number | null, };
+
+export type HealthScope = "tv" | "movies" | "system" | "all";
+
+export type HealthSelectionToken = { identity: HealthIdentity, generation: number, };
+
+export type HealthSeverity = "ok" | "notice" | "warning" | "error";
+
+export type HealthSnapshot = { checks: Array<HealthCheckState>, issues: Array<HealthIssue>, total: number, limit: number, offset: number, lifecycle: HealthLifecycle, active_command: HealthCommand | null, pending_keys: Array<HealthSelectionToken>, summary: HealthSummary, coverage: HealthCoverage, };
+
+export type HealthSummary = { total: number, current: number, never_run: number, stale: number, failed: number, non_ok: number, };
+
+export type HealthTransition = { sequence: number, event_id: string, epoch: string, command_id: string, kind: string, in_grace: boolean, created_at: number, issue: HealthIssue, };
+
+export type HealthTransitions = { oldest_retained_sequence: number | null, latest_sequence: number | null, next_cursor: number, gap: boolean, items: Array<HealthTransition>, };
+
 export type HistoricalFile = { media_type: MediaDomain, id: number, };
 
 export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent;
@@ -197,6 +237,18 @@ export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | 
 export type HistoryEventType = "file_imported";
 
 export type HistoryQuery = { media_type?: MediaDomain, episode_id?: number, movie_id?: number, series_id?: number, season?: number, from?: string, to?: string, limit?: number, offset?: number, };
+
+export type HostApplyMode = "process_restart";
+
+export type HostAuthentication = "none";
+
+export type HostCapabilities = { persisted_edits: boolean, tls: boolean, url_base: boolean, trusted_forwarding: boolean, };
+
+export type HostMutability = "deployment";
+
+export type HostSettingSource = "default" | "environment";
+
+export type HostSettings = { authentication: HostAuthentication, configured_bind: string, bound_address: string, bind_source: HostSettingSource, allowed_hosts: Array<string>, allowed_hosts_source: HostSettingSource, filtering_enabled: boolean, trusted_networks: Array<string>, trusted_networks_source: HostSettingSource, forwarding_enabled: boolean, mutability: HostMutability, apply_mode: HostApplyMode, capabilities: HostCapabilities, };
 
 export type ImportInput = ManualImportRequest | ImportRequest;
 
@@ -306,11 +358,15 @@ export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
-export type MovieDetails = { tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, };
+export type MovieCredit = { id: number, metadata_id: number, credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, type: CreditKind, images: Array<CreditImage>, };
+
+export type MovieCreditQuery = { limit?: number, offset?: number, movie_id?: number, metadata_id?: number, };
+
+export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, };
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type MovieIndexerScope = { categories: Array<number>, remove_year?: boolean, };
+export type MovieIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, remove_year?: boolean, };
 
 export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
 
@@ -325,6 +381,14 @@ export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, rep
 export type MovieParseResult = { title: string, parsed: ParsedRelease | null, movie: MatchedMovie | null, };
 
 export type MovieReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
+
+export type MovieRenamePreview = { naming_revision: number, rename_enabled: boolean, standard_movie_format: string | null, movie_ids: Array<number>, files_considered: number, unchanged_count: number, unavailable_count: number, items: Array<MovieRenamePreviewItem>, };
+
+export type MovieRenamePreviewItem = { movie_id: number, movie_file_id: number, existing_path: string | null, new_path: string | null, status: MovieRenamePreviewStatus, reasons: Array<MovieRenamePreviewReason>, };
+
+export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "invalid_file_facts" | "naming_render_failed";
+
+export type MovieRenamePreviewStatus = "change" | "unavailable";
 
 export type NamingErrorDetail = { code: string, message: string, };
 
@@ -562,7 +626,7 @@ export type SearchMode = "automatic" | "interactive";
 
 export type SearchResult = { id: string, command_id: string, metadata: ReleaseMetadata, decision: ReleaseDecision, expires_at: number, selected_candidate_id: string | null, };
 
-export type SeriesDetails = { original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
+export type SeriesDetails = { network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
 export type SeriesLookupAdd = { tvdb_id: number, path: string, settings?: LibraryPatch, };
 
@@ -600,7 +664,7 @@ export type TestStatus = "never_tested" | "success" | "failure";
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
-export type TvIndexerScope = { categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
+export type TvIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
 
 export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 

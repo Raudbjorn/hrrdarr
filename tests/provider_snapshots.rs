@@ -5,6 +5,9 @@ use hrrdarr::{
 };
 use libsql::{Connection, params};
 use std::path::{Path, PathBuf};
+// The importer has a process-wide admission gate, even for separate scratch databases.
+static IMPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Sandbox(PathBuf);
 impl Sandbox {
     fn new() -> Self {
@@ -53,7 +56,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
 CREATE TABLE MovieMetadata(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER);INSERT INTO MovieMetadata VALUES(1,456,'tt456','Film',2021);
 CREATE TABLE Movies(Id INTEGER,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);INSERT INTO Movies VALUES(1,1,'/movies/Film',1,0);
 CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);"#}).await.unwrap();
-    c.execute_batch("CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER); CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);").await.unwrap();
+    c.execute_batch("CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER,EnableAutomaticSearch INTEGER,EnableInteractiveSearch INTEGER); CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);").await.unwrap();
     for (id, implementation) in [(1, "Torznab"), (2, "Newznab")] {
         let settings = if tv {
             serde_json::json!({"baseUrl":format!("https://{}.example",implementation.to_lowercase()),"apiPath":"/api","apiKey":"PRIVATE_INDEXER_SECRET","categories":[5000],"animeCategories":[5070],"animeStandardFormatSearch":true,"additionalParameters":"&custom=PRIVATE_QUERY_SECRET","PRIVATE_UNKNOWN_KEY_SECRET":{"unknown":true}})
@@ -61,7 +64,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
             serde_json::json!({"baseUrl":format!("https://{}.example",implementation.to_lowercase()),"apiPath":"/api","apiKey":"PRIVATE_INDEXER_SECRET","categories":[2000],"removeYear":true,"additionalParameters":"&custom=PRIVATE_QUERY_SECRET"})
         };
         c.execute(
-            "INSERT INTO Indexers VALUES(?,?,?,?,?,1,1)",
+            "INSERT INTO Indexers VALUES(?,?,?,?,?,1,0,1,0)",
             params![
                 id,
                 implementation,
@@ -84,7 +87,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
     )
     .await
     .unwrap();
-    c.execute("INSERT INTO Indexers VALUES(3,'Unknown','FutureIndexer','FutureSettings','{\"unknown\":1}',1,1)",()).await.unwrap();
+    c.execute("INSERT INTO Indexers VALUES(3,'Unknown','FutureIndexer','FutureSettings','{\"unknown\":1}',1,1,1,1)",()).await.unwrap();
     drop(c);
     drop(db);
     std::fs::read(path).unwrap()
@@ -92,6 +95,7 @@ CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEX
 #[tokio::test]
 async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe()
 -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
     let s = Sandbox::new();
     let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
     let wrong = CredentialKey::from_hex(&"cd".repeat(32)).unwrap();
@@ -125,7 +129,18 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
         snapshots::import_with_providers(&db, Application::Sonarr, tv.clone(), false, Some(&key))
             .await?;
     assert!(report.applied);
+    assert_eq!(
+        serde_json::to_value(&preview.unsupported)?,
+        serde_json::to_value(&report.unsupported)?
+    );
     assert_eq!(report.mapped, 3);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=0 AND enable_automatic_search=1 AND enable_interactive_search=0").await, 2);
+    // The source fixture predates a DownloadClientId column, so the missing association is reported, never guessed.
+    assert!(report.unsupported.iter().any(|u| {
+        u.columns
+            .iter()
+            .any(|c| c == "DownloadClientId (absent; source association unknown)")
+    }));
     let public = serde_json::to_string(&report)?;
     assert!(!public.contains("PRIVATE_"));
     assert!(!public.contains("client.example"));
@@ -222,8 +237,10 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
             .applied
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 6);
-    // Any local revision change conflicts even if values are changed back.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=0 AND enable_automatic_search=1 AND enable_interactive_search=0").await, 4);
+    // A native policy edit is revisioned and must conflict rather than overwrite source intent.
     c.execute("UPDATE providers SET revision=revision+1 WHERE id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='sonarr' AND source_table='Indexers' AND source_id=1 LIMIT 1)",()).await?;
+    c.execute("UPDATE provider_scopes SET enable_rss=1 WHERE provider_id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='sonarr' AND source_table='Indexers' AND source_id=1 LIMIT 1)", ()).await?;
     let conflict =
         snapshots::import_with_providers(&db, Application::Sonarr, tv.clone(), false, Some(&key))
             .await?;
@@ -300,5 +317,344 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
     let c = db.connect().await?;
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 5);
     assert!(scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await > 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_and_malformed_snapshot_policy_is_conservative_and_atomic() -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        let source_path = scratch.0.join(format!("{label}-source.db"));
+        fixture(&source_path, app, false).await;
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let c = raw.connect()?;
+        c.execute_batch("ALTER TABLE Indexers DROP COLUMN EnableAutomaticSearch;")
+            .await?;
+        drop(c);
+        drop(raw);
+        let bytes = std::fs::read(&source_path)?;
+        let db = destination(&scratch.0.join(format!("{label}-dest.db"))).await;
+        let preview =
+            snapshots::import_with_providers(&db, app, bytes.clone(), true, Some(&key)).await?;
+        let report =
+            snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key)).await?;
+        assert!(report.applied);
+        assert_eq!(
+            serde_json::to_value(&preview.unsupported)?,
+            serde_json::to_value(&report.unsupported)?
+        );
+        assert!(report.unsupported.iter().any(|u| {
+            u.columns
+                .iter()
+                .any(|c| c == "EnableAutomaticSearch (absent; imported disabled)")
+        }));
+        let c = db.connect().await?;
+        assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_automatic_search=0 AND enable_rss=0 AND enable_interactive_search=0").await, 2);
+        let repeat = snapshots::import_with_providers(&db, app, bytes, false, Some(&key)).await?;
+        assert!(repeat.applied && repeat.conflicts == 0 && repeat.duplicates >= 3);
+        let before = scalar(&c, "SELECT sum(generation) FROM health_checks").await;
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute("UPDATE Indexers SET EnableRss=1 WHERE Id=1", ())
+            .await?;
+        drop(source);
+        drop(raw);
+        let changed = snapshots::import_with_providers(
+            &db,
+            app,
+            std::fs::read(&source_path)?,
+            false,
+            Some(&key),
+        )
+        .await?;
+        assert!(
+            !changed.applied && changed.conflicts > 0,
+            "Changed source policies must not overwrite a native provider"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+        let raw = libsql::Builder::new_local(&source_path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute("UPDATE Indexers SET EnableRss='unknown' WHERE Id=2", ())
+            .await?;
+        drop(source);
+        drop(raw);
+        assert!(
+            snapshots::import_with_providers(
+                &db,
+                app,
+                std::fs::read(&source_path)?,
+                false,
+                Some(&key)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 3);
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent()
+-> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    let db = destination(&scratch.0.join("bindings.db")).await;
+    let c = db.connect().await?;
+    let mut native_clients = Vec::new();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        // Report.mapped includes core entities: series+library_settings, or movie_metadata+movies+library_settings.
+        let core_mapped = if matches!(app, Application::Sonarr) {
+            2
+        } else {
+            3
+        };
+        let path = scratch.0.join(format!("{label}.db"));
+        fixture(&path, app, false).await;
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        source.execute_batch("ALTER TABLE Indexers ADD COLUMN DownloadClientId INTEGER DEFAULT 0; UPDATE Indexers SET DownloadClientId=1 WHERE Id IN (1,2);").await?;
+        drop(source);
+        drop(raw);
+        let bytes = std::fs::read(&path)?;
+        let before = scalar(&c, "SELECT sum(generation) FROM health_checks").await;
+        let preview = snapshots::import_with_providers(&db, app, bytes.clone(), true, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: binding dry-run: {error:?}"));
+        assert!(!preview.applied);
+        // This destination has no prior core import: preview includes core rows and all three providers.
+        assert_eq!(preview.mapped, core_mapped + 3);
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+        let report = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: binding commit: {error:?}"));
+        assert!(report.applied);
+        // Dry-run rolled back its core rows too, so commit has the same aggregate mapping count.
+        assert_eq!(report.mapped, core_mapped + 3);
+        assert_eq!(
+            serde_json::to_value(&preview.unsupported)?,
+            serde_json::to_value(&report.unsupported)?
+        );
+        // One marker for each affected class key, not once per imported indexer.
+        // Reasoning: per domain the commit marks the indexer class once (search, RSS and the 0049 binding
+        // check = 3 keys) and the download-client class once (CDH, communication and root folder = 3 keys),
+        // so 6 generations in total; the pre-0048/0049 expectation of 3 counted only CDH, communication and binding.
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before + 6
+        );
+        let row=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='DownloadClients' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},report.fingerprint.clone()]).await?.next().await?.unwrap();
+        let client: String = row.get(0)?;
+        // libsql Row owns its Statement; release this read lock before imports write through another connection.
+        drop(row);
+        native_clients.push(client.clone());
+        let count: i64=c.query("SELECT count(*) FROM provider_scopes s JOIN providers p ON p.id=s.provider_id WHERE s.media_type=? AND s.download_client_id=? AND p.enabled=0",params![label,client.clone()]).await?.next().await?.unwrap().get(0)?;
+        assert_eq!(count, 2);
+        let before = scalar(&c, "SELECT sum(generation) FROM health_checks").await;
+        let repeat = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: exact replay: {error:?}"));
+        assert!(repeat.applied && repeat.conflicts == 0 && repeat.duplicates >= 3);
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+        // A changed source association must conflict instead of overwriting the native binding.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute("UPDATE Indexers SET DownloadClientId=0 WHERE Id=1", ())
+            .await?;
+        drop(source);
+        drop(raw);
+        let changed =
+            snapshots::import_with_providers(&db, app, std::fs::read(&path)?, false, Some(&key))
+                .await
+                .unwrap_or_else(|error| panic!("{label}: changed source association: {error:?}"));
+        assert!(!changed.applied && changed.conflicts == 1);
+        assert_eq!(
+            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
+            before
+        );
+        // A revisioned native association edit also conflicts with exact source replay.
+        let indexer:String=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='Indexers' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},repeat.fingerprint.clone()]).await?.next().await?.unwrap().get(0)?;
+        let tx = c.transaction().await?;
+        tx.execute(
+            "UPDATE providers SET revision=revision+1 WHERE id=?",
+            [indexer.clone()],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE provider_scopes SET download_client_id=NULL WHERE provider_id=?",
+            [indexer],
+        )
+        .await?;
+        tx.commit().await?;
+        let repeat = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: changed native association: {error:?}"));
+        assert!(!repeat.applied && repeat.conflicts == 1);
+        // Unknown positive intent is retained as unsupported, never reconstructed with NULL.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        source
+            .execute(
+                "UPDATE Indexers SET DownloadClientId=999 WHERE Id IN (1,2)",
+                (),
+            )
+            .await?;
+        drop(source);
+        drop(raw);
+        let isolated = destination(&scratch.0.join(format!("{label}-unmapped.db"))).await;
+        let report = snapshots::import_with_providers(
+            &isolated,
+            app,
+            std::fs::read(&path)?,
+            false,
+            Some(&key),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: unmapped client: {error:?}"));
+        assert!(report.applied);
+        // Both bound indexers are omitted; fresh core entities and the one client still map.
+        assert_eq!(report.mapped, core_mapped + 1);
+        assert_eq!(
+            report
+                .unsupported
+                .iter()
+                .filter(|u| u
+                    .columns
+                    .iter()
+                    .any(|c| c == "DownloadClientId (unmapped; indexer not reconstructed)"))
+                .count(),
+            2
+        );
+        let isolated_c = isolated.connect().await?;
+        assert_eq!(
+            scalar(
+                &isolated_c,
+                "SELECT count(*) FROM providers WHERE implementation!='qbittorrent'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar(
+                &isolated_c,
+                "SELECT count(*) FROM snapshot_records WHERE source_table='Indexers'"
+            )
+            .await,
+            3
+        );
+        // Missing/unsupported source client has the same no-executable-fallback rule.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        source.execute_batch("UPDATE Indexers SET DownloadClientId=1 WHERE Id IN (1,2); UPDATE DownloadClients SET Implementation='Unknown';").await?;
+        drop(source);
+        drop(raw);
+        let unsupported = destination(&scratch.0.join(format!("{label}-unsupported.db"))).await;
+        let report = snapshots::import_with_providers(
+            &unsupported,
+            app,
+            std::fs::read(&path)?,
+            false,
+            Some(&key),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: unsupported client: {error:?}"));
+        assert!(report.applied);
+        // No executable providers map here; Report.mapped still includes this fresh destination's core entities.
+        assert_eq!(report.mapped, core_mapped);
+        assert_eq!(
+            scalar(
+                &unsupported.connect().await?,
+                "SELECT count(*) FROM providers"
+            )
+            .await,
+            0
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        source.execute("DELETE FROM DownloadClients", ()).await?;
+        drop(source);
+        drop(raw);
+        let missing = destination(&scratch.0.join(format!("{label}-missing.db"))).await;
+        let report = snapshots::import_with_providers(
+            &missing,
+            app,
+            std::fs::read(&path)?,
+            false,
+            Some(&key),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: missing client: {error:?}"));
+        assert!(report.applied);
+        // No executable providers map here; Report.mapped still includes this fresh destination's core entities.
+        assert_eq!(report.mapped, core_mapped);
+        assert_eq!(
+            report
+                .unsupported
+                .iter()
+                .filter(|u| u
+                    .columns
+                    .iter()
+                    .any(|c| c == "DownloadClientId (unmapped; indexer not reconstructed)"))
+                .count(),
+            2
+        );
+        // Malformed source values fail before retaining any partial provider or marker writes.
+        for malformed in ["-1", "'unknown'", "1.5", "NULL"] {
+            let before = scalar(&isolated_c, "SELECT sum(generation) FROM health_checks").await;
+            let raw = libsql::Builder::new_local(&path).build().await?;
+            let source = raw.connect()?;
+            source
+                .execute(
+                    &format!("UPDATE Indexers SET DownloadClientId={malformed} WHERE Id=1"),
+                    (),
+                )
+                .await?;
+            drop(source);
+            drop(raw);
+            assert!(
+                snapshots::import_with_providers(
+                    &isolated,
+                    app,
+                    std::fs::read(&path)?,
+                    false,
+                    Some(&key)
+                )
+                .await
+                .is_err(),
+                "{label}: malformed DownloadClientId={malformed} must reject"
+            );
+            assert_eq!(
+                scalar(&isolated_c, "SELECT count(*) FROM providers").await,
+                1
+            );
+            assert_eq!(
+                scalar(&isolated_c, "SELECT sum(generation) FROM health_checks").await,
+                before
+            );
+        }
+    }
+    assert_ne!(
+        native_clients[0], native_clients[1],
+        "Same source client ID is namespaced by application"
+    );
     Ok(())
 }
