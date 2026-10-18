@@ -515,7 +515,6 @@ fn processing_error(code: &str) -> &'static str {
         "custom_format_busy" => "custom_format_busy",
         "custom_format_timeout" => "custom_format_timeout",
         "custom_format_worker_failed" => "custom_format_worker_failed",
-        "custom_format_state_changed" => "custom_format_state_changed",
         _ => "import_conflict",
     }
 }
@@ -843,7 +842,6 @@ mod preflight_error_tests {
             ("custom_format_busy", "custom_format_busy"),
             ("custom_format_timeout", "custom_format_timeout"),
             ("custom_format_worker_failed", "custom_format_worker_failed"),
-            ("custom_format_state_changed", "custom_format_state_changed"),
         ] {
             assert_eq!(processing_error(code), mapped, "{code}");
         }

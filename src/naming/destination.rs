@@ -25,12 +25,13 @@ pub(crate) enum DestinationError {
     Unavailable(&'static str),
 }
 /// Maps a custom-format evaluation failure code to a retry code; `None` is deterministic.
+/// `custom_format_state_changed` is a writer-side cache miss: the facts changed since the
+/// warm-up, which callers already treat as a decided preflight conflict, not load.
 fn transient(code: &'static str) -> Option<&'static str> {
     match code {
-        "custom_format_busy"
-        | "custom_format_timeout"
-        | "custom_format_worker_failed"
-        | "custom_format_state_changed" => Some(code),
+        "custom_format_busy" | "custom_format_timeout" | "custom_format_worker_failed" => {
+            Some(code)
+        }
         "release_storage_error" | "database_error" => Some("storage_error"),
         _ => None,
     }
@@ -300,13 +301,14 @@ mod tests {
             ("custom_format_busy", "custom_format_busy"),
             ("custom_format_timeout", "custom_format_timeout"),
             ("custom_format_worker_failed", "custom_format_worker_failed"),
-            ("custom_format_state_changed", "custom_format_state_changed"),
             ("release_storage_error", "storage_error"),
             ("database_error", "storage_error"),
         ] {
             assert_eq!(transient(code), Some(retry), "{code}");
         }
+        // A writer-side cache miss is a decided conflict (owned_tests pins it as Render).
         for code in [
+            "custom_format_state_changed",
             "custom_format_regex_invalid",
             "custom_format_facts_invalid",
             "invalid_request",
