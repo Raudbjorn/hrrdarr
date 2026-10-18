@@ -532,3 +532,28 @@ export const listCalendar = <T extends TvCalendarEntry | MovieCalendarEntry>(dom
   (domain === 'tv' || domain === 'movies') && query.length > 0 && query.length <= 4096
     ? request<CalendarPage<T>>(`/api/v1/${domain}/calendar?${query}`, undefined, undefined, true)
     : Promise.resolve<Result<CalendarPage<T>>>({ ok: false, error: 'Invalid calendar request.' });
+
+// AutoTagging rules (per media domain) and movie collections; native errors carry status/code.
+const autoTagPath = (domain: MediaDomain) => `/api/v1/${domain}/autotagging`;
+export const listAutoTags = (domain: MediaDomain) => request<import('./api.generated').AutoTag[]>(autoTagPath(domain), undefined, undefined, true);
+export const getAutoTagSchema = (domain: MediaDomain) => request<import('./api.generated').AutoTagSchemaEntry[]>(`${autoTagPath(domain)}/schema`, undefined, undefined, true);
+export const createAutoTag = (domain: MediaDomain, input: import('./api.generated').AutoTagInput) => request<import('./api.generated').AutoTag>(autoTagPath(domain), input, 'POST', true);
+export const updateAutoTag = (domain: MediaDomain, id: number, input: import('./api.generated').AutoTagInput) => validId(id) ? request<import('./api.generated').AutoTag>(`${autoTagPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').AutoTag>();
+export const deleteAutoTag = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`${autoTagPath(domain)}/${id}`, undefined, 'DELETE', true) : invalid<void>();
+
+const COLLECTIONS = '/api/v1/movies/collections';
+export const listCollections = (query: { limit?: number; offset?: number; monitored?: boolean; q?: string } = {}) => {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+  if (query.offset !== undefined) params.set('offset', String(query.offset));
+  if (query.monitored !== undefined) params.set('monitored', String(query.monitored));
+  if (query.q) params.set('q', query.q);
+  const text = params.toString();
+  return request<ApiPage<import('./api.generated').MovieCollection>>(text ? `${COLLECTIONS}?${text}` : COLLECTIONS, undefined, undefined, true);
+};
+export const getCollection = (id: number) => validId(id) ? request<import('./api.generated').MovieCollection>(`${COLLECTIONS}/${id}`, undefined, undefined, true) : invalid<import('./api.generated').MovieCollection>();
+export const updateCollection = (id: number, patch: import('./api.generated').CollectionPatch) => validId(id) ? request<import('./api.generated').MovieCollection>(`${COLLECTIONS}/${id}`, patch, 'PUT', true) : invalid<import('./api.generated').MovieCollection>();
+export const bulkUpdateCollections = (ids: number[], patch: import('./api.generated').CollectionPatch) => ids.length > 0 && ids.length <= 200 && ids.every(validId) ? request<import('./api.generated').MovieCollection[]>(COLLECTIONS, { ids, patch }, 'PUT', true) : invalid<import('./api.generated').MovieCollection[]>();
+export const startCollectionRefresh = () => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands`, {}, 'POST', true);
+export const getCollectionRefresh = (id: string) => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands/${encodeURIComponent(id)}`, undefined, undefined, true);
+export const listCollectionRefreshes = (limit = 5) => request<ApiPage<import('./api.generated').CollectionRefreshCommand>>(`${COLLECTIONS}/refresh-commands?limit=${limit}`, undefined, undefined, true);

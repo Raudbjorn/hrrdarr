@@ -2,7 +2,7 @@
 export type ViewId =
   | 'library' | 'health' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles'
   | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'
-  | 'wanted-missing' | 'wanted-cutoff' | 'calendar';
+  | 'wanted-missing' | 'wanted-cutoff' | 'calendar' | 'collections' | 'autotagging';
 
 export type Route =
   | { kind: 'view'; view: ViewId }
@@ -24,6 +24,8 @@ export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   'wanted-missing': '/wanted/missing',
   'wanted-cutoff': '/wanted/cutoffunmet',
   calendar: '/calendar',
+  collections: '/collections',
+  autotagging: '/settings/autotagging',
   providers: '/settings/providers',
   qualities: '/settings/quality',
   profiles: '/settings/profiles',
@@ -48,6 +50,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { view: 'media-management', label: 'Media management', description: 'Revision, import policy and recycle bin' },
   { view: 'custom-formats', label: 'Custom formats', description: 'Release matching formats' },
   { view: 'tags', label: 'Tags', description: 'Tags shared by library items and settings' },
+  { view: 'autotagging', label: 'Auto tagging', description: 'Rules that apply tags from catalog facts' },
   { view: 'general', label: 'General', description: 'Host and general settings' },
 ];
 
