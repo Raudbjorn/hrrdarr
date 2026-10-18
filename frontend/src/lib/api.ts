@@ -532,3 +532,19 @@ export const listCalendar = <T extends TvCalendarEntry | MovieCalendarEntry>(dom
   (domain === 'tv' || domain === 'movies') && query.length > 0 && query.length <= 4096
     ? request<CalendarPage<T>>(`/api/v1/${domain}/calendar?${query}`, undefined, undefined, true)
     : Promise.resolve<Result<CalendarPage<T>>>({ ok: false, error: 'Invalid calendar request.' });
+
+// Notifications (Connect): registry, schema-driven forms, test and delivery journal.
+import type { NotificationList, NotificationImplementationList, Notification, NotificationInput, NotificationTestInput, NotificationTestResult, NotificationTestAllResult, NotificationDeliveryList } from './api.generated';
+const validUuid = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+const badUuid = <T>(): Promise<Result<T>> => Promise.resolve({ ok: false, error: 'Notification ID must be a UUID.' });
+export const listNotifications = () => request<NotificationList>('/api/v1/notifications', undefined, undefined, true);
+export const getNotificationSchema = () => request<NotificationImplementationList>('/api/v1/notifications/schema', undefined, undefined, true);
+export const createNotification = (input: NotificationInput) => request<Notification>('/api/v1/notifications', input, 'POST', true);
+export const updateNotification = (id: string, input: NotificationInput) => validUuid(id) ? request<Notification>(`/api/v1/notifications/${id}`, input, 'PUT', true) : badUuid<Notification>();
+export const deleteNotification = (id: string) => validUuid(id) ? request<void>(`/api/v1/notifications/${id}`, undefined, 'DELETE', true) : badUuid<void>();
+export const testNotificationDraft = (input: NotificationTestInput) => request<NotificationTestResult>('/api/v1/notifications/test', input, 'POST', true, 60_000);
+export const testSavedNotification = (id: string) => validUuid(id) ? request<NotificationTestResult>(`/api/v1/notifications/${id}/test`, undefined, 'POST', true, 60_000) : badUuid<NotificationTestResult>();
+export const testAllNotifications = () => request<NotificationTestAllResult>('/api/v1/notifications/testall', {}, 'POST', true, 120_000);
+export const listNotificationDeliveries = (limit = 20) => Number.isInteger(limit) && limit >= 1 && limit <= 200
+  ? request<NotificationDeliveryList>(`/api/v1/notifications/deliveries?limit=${limit}`, undefined, undefined, true)
+  : Promise.resolve<Result<NotificationDeliveryList>>({ ok: false, error: 'Limit must be 1 to 200.' });
