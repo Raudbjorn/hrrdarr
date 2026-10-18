@@ -34,7 +34,7 @@ matches the longest configured root folder that contains the item path.
 * Automatic assignments are not recorded as user edits. Tags referenced by a rule (or by a collection) cannot be
   deleted (409 `tag_in_use`); `GET /tags/detail` lists `auto_tagging_ids` and `collection_ids`.
 
-Storage: migration `0064_autotagging_rules.sql` (rules, tag links with restrictive tag FK, ordered
+Storage: migration `0065_autotagging_rules.sql` (rules, tag links with restrictive tag FK, ordered
 specifications with validated JSON conditions). Facts come from migration 0045 columns and library settings.
 
 ## Not claimed

@@ -31,7 +31,7 @@ Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 par
 applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
 missing members are added. A run spans worker slices through a cursor and survives restarts. Per-collection fetch
 failures are counted; if nothing succeeded and the service was unavailable the command fails
-(`metadata_unavailable`). Migration `0065_collections.sql`.
+(`metadata_unavailable`). Migration `0066_collections.sql`.
 
 ## Not claimed
 

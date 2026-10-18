@@ -264,15 +264,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "transmission",
         include_str!("../../migrations/0062_transmission.sql"),
     ),
-    // Versions follow array position: 0063 (notifications) is reserved by another lane, so the
-    // parent must insert that entry before this one when integrating.
+    // Versions follow array position: 0063 (notifications) and 0064 (nzbget) live on parity/loop; the
+    // parent must merge parity/loop first so these entries land at array positions 65 and 66.
     (
         "autotagging_rules",
-        include_str!("../../migrations/0064_autotagging_rules.sql"),
+        include_str!("../../migrations/0065_autotagging_rules.sql"),
     ),
     (
         "collections",
-        include_str!("../../migrations/0065_collections.sql"),
+        include_str!("../../migrations/0066_collections.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
