@@ -280,7 +280,16 @@ async fn inline_and_unresolved_modern_preserve_both_domains_after_reopen() {
         scalar(&c, "SELECT count(*) FROM movie_collection_members").await,
         3
     );
-    assert_eq!(scalar(&c,"SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=202 AND title IS NULL AND year IS NULL").await,1);
+    // Reasoning: the later 242 backup carries an ImportExclusions table without 202, so the
+    // source removed it; the snapshot-owned row (local_edit=0) goes, like a cleared membership.
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=202"
+        )
+        .await,
+        0
+    );
 }
 #[tokio::test]
 async fn recognized_raw_text_is_validated_before_lossy_driver_extraction() {
@@ -501,5 +510,94 @@ async fn newer_backup_replaces_snapshot_membership_and_tolerates_title_drift() {
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=950").await,
         1
+    );
+}
+#[tokio::test]
+async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved_members() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = Database::open_local(s.0.join("native.db")).await.unwrap();
+    let c = db.connect().await.unwrap();
+    let older = source(&s, MODERN, "", None).await;
+    assert!(
+        snapshots::import(&db, Application::Radarr, older, false)
+            .await
+            .unwrap()
+            .applied
+    );
+    let revision = scalar(
+        &c,
+        "SELECT settings_revision FROM movie_collection_settings",
+    )
+    .await;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_settings WHERE monitored=1 AND search_on_add=1 AND snapshot_owned=1 AND local_edit=0").await,
+        1
+    );
+    // A native tombstone on 102 must outlive any backup that omits it.
+    c.execute(
+        "UPDATE movie_import_exclusions SET local_edit=1,revision=revision+1 WHERE tmdb_id=102",
+        (),
+    )
+    .await
+    .unwrap();
+    // The newer backup turns the collection's automation off and drops both exclusions.
+    let newer = source(
+        &s,
+        MODERN,
+        "UPDATE Collections SET Monitored=0,SearchOnAdd=0; DELETE FROM ImportExclusions;",
+        None,
+    )
+    .await;
+    let report = snapshots::import(&db, Application::Radarr, newer, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_settings WHERE monitored=0 AND search_on_add=0 AND snapshot_owned=1").await,
+        1
+    );
+    assert!(
+        scalar(
+            &c,
+            "SELECT settings_revision FROM movie_collection_settings"
+        )
+        .await
+            > revision
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=999"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=102 AND local_edit=1"
+        )
+        .await,
+        1
+    );
+    // A backup naming collection 900 without any resolvable title leaves memberships alone.
+    let unresolved = source(
+        &s,
+        MODERN,
+        "DELETE FROM Collections; UPDATE MovieMetadata SET CollectionTitle=NULL;",
+        None,
+    )
+    .await;
+    assert!(
+        snapshots::import(&db, Application::Radarr, unresolved, false)
+            .await
+            .unwrap()
+            .applied
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=900 AND m.origin='snapshot'").await,
+        2
     );
 }

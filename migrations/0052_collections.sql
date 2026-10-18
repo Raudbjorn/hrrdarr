@@ -20,6 +20,8 @@ CREATE TABLE movie_collection_settings (
  minimum_availability TEXT CHECK(minimum_availability IN('tba','announced','in_cinemas','released')),
  search_on_add INTEGER CHECK(search_on_add IN(0,1)),
  local_edit INTEGER NOT NULL DEFAULT 0 CHECK(local_edit IN(0,1)),
+ -- Written by a snapshot import; a newer backup may replace it while local_edit stays 0.
+ snapshot_owned INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_owned IN(0,1)),
  FOREIGN KEY(quality_profile_id,media_type) REFERENCES quality_profiles(id,media_type) ON DELETE RESTRICT,
  CHECK(monitored=0 OR (root_folder_id IS NOT NULL AND quality_profile_id IS NOT NULL AND minimum_availability IS NOT NULL AND search_on_add IS NOT NULL))
 );

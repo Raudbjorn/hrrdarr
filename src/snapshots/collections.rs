@@ -136,7 +136,11 @@ pub(super) async fn preflight(c: &Connection, table: &str, bytes: &mut usize) ->
 pub(super) struct Collections {
     facts: BTreeMap<i64, Fact>,
     members: Vec<(i64, i64)>,
+    // Source movies naming a collection this backup cannot resolve: unknown, not cleared.
+    unresolved: BTreeSet<i64>,
     exclusions: Vec<(i64, Option<String>, Option<i64>)>,
+    // The backup carries an ImportExclusions table, so omissions are deliberate removals.
+    exclusions_listed: bool,
 }
 #[derive(Default)]
 struct Fact {
@@ -361,6 +365,7 @@ pub(super) fn read(
                             "MovieMetadata",
                             "collection title unresolved; association inactive",
                         );
+                        plan.unresolved.insert(id(r, "Id")?);
                         continue;
                     };
                     plan.facts.insert(
@@ -408,6 +413,7 @@ pub(super) fn read(
                     "Movies",
                     "Collection: missing name; association inactive",
                 );
+                plan.unresolved.insert(id(r, "Id")?);
                 continue;
             };
             if title.len() > 1024 || title.contains('\0') {
@@ -434,6 +440,7 @@ pub(super) fn read(
         consume(u, "Movies", &["Collection"]);
     }
     if let Some(table) = source.tables.get("ImportExclusions") {
+        plan.exclusions_listed = true;
         let mut seen = BTreeSet::new();
         let mut source_ids = BTreeSet::new();
         for r in &table.rows {
@@ -544,16 +551,19 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
             }
             c.execute("INSERT INTO snapshot_mappings(application,fingerprint,destination_table,source_id,destination_id)VALUES('radarr',?,'movie_collections',?,?) ON CONFLICT DO NOTHING",params![report.fingerprint.clone(),source,collection]).await?;
         }
-        if created
-            || c.query(
-                "SELECT 1 FROM movie_collection_settings WHERE collection_id=?",
+        // Native settings (discovery or local edits) win; settings an earlier snapshot wrote
+        // and nobody edited since are replaced by this newer source policy.
+        let settings = c
+            .query(
+                "SELECT snapshot_owned=1 AND local_edit=0 FROM movie_collection_settings WHERE collection_id=?",
                 [collection],
             )
             .await?
             .next()
             .await?
-            .is_none()
-        {
+            .map(|r| r.get::<i64>(0).map(|v| v != 0))
+            .transpose()?;
+        if created || settings != Some(false) {
             let profile = if let Some(source) = fact.profile {
                 mapped(c, report, "quality_profiles", source).await?
             } else {
@@ -593,7 +603,16 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
                     "unresolved or absent defaults; collection policy inactive",
                 );
             }
-            c.execute("INSERT INTO movie_collection_settings(collection_id,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add)VALUES(?,?,?,?,?,?)",params![collection,i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),fact.search.map(i64::from)]).await?;
+            if settings.is_some() {
+                c.execute(
+                    "DELETE FROM movie_collection_tags WHERE collection_id=?",
+                    [collection],
+                )
+                .await?;
+                c.execute("UPDATE movie_collection_settings SET monitored=?,root_folder_id=?,quality_profile_id=?,minimum_availability=?,search_on_add=?,settings_revision=settings_revision+1 WHERE collection_id=? AND snapshot_owned=1 AND local_edit=0",params![i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),fact.search.map(i64::from),collection]).await?;
+            } else {
+                c.execute("INSERT INTO movie_collection_settings(collection_id,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,snapshot_owned)VALUES(?,?,?,?,?,?,1)",params![collection,i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),fact.search.map(i64::from)]).await?;
+            }
             // A partly mapped tag set must never broaden automatic matching/defaults.
             if resolved {
                 for tag in tags {
@@ -692,7 +711,8 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
         .await?;
     let mut cleared = Vec::new();
     while let Some(r) = catalog.next().await? {
-        if !listed.contains_key(&r.get::<i64>(0)?) {
+        let source = r.get::<i64>(0)?;
+        if !listed.contains_key(&source) && !plan.unresolved.contains(&source) {
             cleared.push(r.get::<i64>(1)?);
         }
     }
@@ -757,6 +777,36 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
         )
         .await?;
         report.mapped += 1;
+    }
+    // A backup that lists exclusions but omits one an earlier snapshot imported removed it at
+    // the source. Only snapshot-owned rows (local_edit=0) go; native tombstones are retained.
+    if plan.exclusions_listed {
+        let kept: BTreeSet<i64> = plan
+            .exclusions
+            .iter()
+            .map(|(remote, _, _)| *remote)
+            .collect();
+        let mut rows = c
+            .query(
+                "SELECT tmdb_id FROM movie_import_exclusions WHERE local_edit=0",
+                (),
+            )
+            .await?;
+        let mut omitted = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let remote = r.get::<i64>(0)?;
+            if !kept.contains(&remote) {
+                omitted.push(remote);
+            }
+        }
+        drop(rows);
+        for remote in omitted {
+            c.execute(
+                "DELETE FROM movie_import_exclusions WHERE tmdb_id=? AND local_edit=0",
+                [remote],
+            )
+            .await?;
+        }
     }
     c.execute("UPDATE snapshot_imports SET collection_version=1 WHERE application='radarr' AND fingerprint=?",[report.fingerprint.clone()]).await?;
     Ok(())
