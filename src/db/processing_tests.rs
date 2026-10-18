@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest schema44 includes backoff storage; historical starting version is unchanged.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

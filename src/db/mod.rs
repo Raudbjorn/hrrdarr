@@ -189,8 +189,32 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0043_health_communication.sql"),
     ),
     (
+        "health_download_client_roots",
+        include_str!("../../migrations/0044_health_download_client_roots.sql"),
+    ),
+    (
+        "autotagging_metadata",
+        include_str!("../../migrations/0045_autotagging_metadata.sql"),
+    ),
+    (
+        "removed_metadata_health",
+        include_str!("../../migrations/0046_removed_metadata_health.sql"),
+    ),
+    (
+        "movie_credits",
+        include_str!("../../migrations/0047_movie_credits.sql"),
+    ),
+    (
+        "indexer_operation_policy",
+        include_str!("../../migrations/0048_indexer_operation_policy.sql"),
+    ),
+    (
+        "indexer_client_binding",
+        include_str!("../../migrations/0049_indexer_client_binding.sql"),
+    ),
+    (
         "download_client_backoff",
-        include_str!("../../migrations/0044_download_client_backoff.sql"),
+        include_str!("../../migrations/0050_download_client_backoff.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -740,6 +764,18 @@ mod cdh_tests;
 mod health_tests;
 #[cfg(test)]
 mod release_profile_tests;
+
+#[cfg(test)]
+mod download_root_health_tests;
+
+#[cfg(test)]
+mod removed_metadata_health_tests;
+
+#[cfg(test)]
+mod indexer_policy_tests;
+
+#[cfg(test)]
+mod indexer_client_tests;
 
 #[cfg(test)]
 mod backoff_tests;

@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Latest schema44 includes backoff storage; historical starting version is unchanged.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

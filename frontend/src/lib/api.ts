@@ -293,3 +293,20 @@ export const listHealthCommands = (scope:HealthScope='all',offset=0,status:Comma
 export const getHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}`,undefined,undefined,true):invalidHealth<HealthCommand>();
 export const cancelHealthCommand = (id:string) => validOperation(id)?request<HealthCommand>(`/api/v1/health/commands/${id}/cancel`,undefined,'POST',true):invalidHealth<HealthCommand>();
 export const getHealthTransitions = (after=0) => healthOffset(after,Number.MAX_SAFE_INTEGER)?request<HealthTransitions>(`/api/v1/health/transitions?${new URLSearchParams({after_sequence:String(after),limit:'16'})}`,undefined,undefined,true):invalidHealth<HealthTransitions>();
+
+export const getMovieRenamePreview = (movieIds: number[]): Promise<Result<import('./api.generated').MovieRenamePreview>> => {
+  if (!Array.isArray(movieIds) || movieIds.length === 0 || movieIds.length > 200 || new Set(movieIds).size !== movieIds.length || movieIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+    return Promise.resolve({ ok: false, error: 'Select up to 200 distinct movies with positive safe IDs.' });
+  }
+  const query = new URLSearchParams({ movie_ids: [...movieIds].sort((a, b) => a - b).join(',') });
+  return request<import('./api.generated').MovieRenamePreview>(`/api/v1/movies/rename-preview?${query}`, undefined, undefined, true);
+};
+
+export const getHistory = (query: import('./api.generated').HistoryQuery = {}): Promise<Result<ApiPage<import('./api.generated').HistoryEvent>>> => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  const suffix = params.size ? `?${params}` : '';
+  return request<ApiPage<import('./api.generated').HistoryEvent>>(`/api/v1/history${suffix}`, undefined, undefined, true);
+};
+export const getHostSettings =(): Promise<Result<import('./api.generated').HostSettings>> =>
+  request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);

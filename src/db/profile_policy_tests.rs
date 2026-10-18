@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 44); // Latest schema44 includes backoff storage; historical starting version is unchanged.
+    assert_eq!(version(&conn).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

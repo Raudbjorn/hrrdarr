@@ -126,8 +126,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Reopen applies backoff migration too.
-    // Migration44 appends honest provenance defaults; every historical field stays exact.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+    // Migration50 appends honest provenance defaults; every historical field stays exact.
     for row in &mut before[2] {
         row.extend([
             libsql::Value::Text("legacy_unknown".into()),
@@ -135,7 +135,17 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         ]);
     }
     for (table, expected) in tables.iter().zip(&before) {
-        assert_eq!(&rows(&c, table).await?, expected);
+        let mut expected = expected.clone();
+        if *table == "provider_scopes" {
+            // Reasoning: 0048 appends enable_rss/enable_automatic_search/enable_interactive_search with DEFAULT 1,
+            // so every predecessor scope row is preserved byte-for-byte plus exactly three Integer(1) values.
+            for row in &mut expected {
+                row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
+                // Reasoning: 0049 then appends the NULL download_client_id preference column.
+                row.push(libsql::Value::Null);
+            }
+        }
+        assert_eq!(&rows(&c, table).await?, &expected);
     }
     // Exact removal of the one new count must recover every original predicate.
     let added =
@@ -181,7 +191,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 44); // Current schema, not historical input.
+    assert_eq!(version(&db.connect().await?).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -225,10 +235,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Exactly all three TV members must retain generation1; an extra or changed member fails.
+    // Migration46 adds a fourth TV identity; 0048 adds tv indexer_search/indexer_rss, 0049 indexer_download_client and 0050 download_client_backoff, so eight TV identities (was seven); Reasoning: registry growth, intent unchanged.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        3
+        8
     );
     assert_eq!(
         scalar(
@@ -236,7 +246,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        3, // All three TV identities retain admission generation1 despite later dirtying.
+        8, // Reasoning: migrations 46/48/49/50 grew the scoped TV registry to eight identities; admission generation stays fixed.
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -399,7 +409,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        3 // Migration44 adds a third movie identity covered by the same publication.
+        8 // Reasoning: migrations 46/48/49 added five movie checks and 0050 adds download_client_backoff; publication still covers the full scope.
     );
     assert!(
         c.execute(
@@ -410,8 +420,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Six registered checks leave exactly122 slots before the unchanged128 ceiling.
-    for i in 0..122 {
+    // Reasoning: 0050 raises the registry to sixteen identities, leaving 112 slots within the unchanged 128 ceiling.
+    for i in 0..112 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -430,7 +440,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        384 // Migration44 gives each retained command three TV identities.
+        1024 // Reasoning: 0050 gives eight TV identities per admitted command (was seven): 128 retained commands * 8.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -613,8 +623,8 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44); // Current reopen also applies backoff migration.
-    // Existing states are unchanged; only the two requested registry identities are appended.
+    assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
+    // Existing states are unchanged; communication43, root-health44 and backoff50 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
@@ -703,10 +713,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 44); // Current reopen also applies backoff migration.
+        assert_eq!(version(&c).await?, 50); // Reasoning: latest migration is now 0050 download-client backoff (was 49: indexer client binding); historical migration prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 6); // Two backoff identities added by current reopen.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds removed metadata; 0048 adds four indexer identities; 0049 adds two indexer_download_client identities; 0050 adds two download_client_backoff identities (14 -> 16).
     }
     Ok(())
 }

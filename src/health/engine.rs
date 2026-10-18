@@ -190,6 +190,25 @@ pub(crate) async fn sweep(c: &Connection, timestamp: i64) -> Result<()> {
         .await?;
         mark(c, &grace, GRACE, timestamp).await?;
     }
+    // A persisted cooldown expiry is consumed once and re-observes only its own identity;
+    // publication rearms it from the stored status, independent of other pending work.
+    let expired = selection(c, HealthScope::All, &format!("next_expiry_at<={timestamp}")).await?;
+    if !expired.is_empty() {
+        if expired.iter().any(|key| key.generation >= MAX_INTEGER) {
+            c.execute(
+                "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1",
+                (),
+            )
+            .await?;
+            return Ok(());
+        }
+        c.execute(
+            "UPDATE health_checks SET next_expiry_at=NULL WHERE next_expiry_at<=?",
+            [timestamp],
+        )
+        .await?;
+        mark(c, &expired, SCHEDULED, timestamp).await?;
+    }
     let keys = selection(c, HealthScope::All, &format!("due_at<={timestamp}")).await?;
     match enqueue(c, &keys, CommandPriority::Normal, false, timestamp).await {
         Err(Error(_, "command_history_full")) => {
@@ -396,6 +415,7 @@ async fn publish_outcomes(
                         _ => {}
                     }
                     tx.execute("UPDATE health_checks SET observed_generation=generation,observed_epoch=?,checked_at=?,last_error=NULL,severity=?,reason=?,message=?,wiki_url=? WHERE scope=? AND check_key=?",params![cmd.epoch.to_string(),timestamp,new.as_ref().map_or(0,|v|v.severity.number()),new.as_ref().map(|v|v.reason.clone()),new.as_ref().map(|v|v.message.clone()),new.as_ref().map(|v|v.wiki_url.clone()),member.identity.scope.text(),member.identity.check_key.clone()]).await?;
+                    backoff::rearm(&tx,&member.identity,timestamp).await?;
                 }
                 Err(code) => {
                     // Only the failed member's error changes; its observed payload remains intact.
@@ -489,6 +509,23 @@ async fn evaluate(
         _ => return Err("check_failed"),
     };
     match member.identity.check_key.as_str() {
+        "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
+        "download_client_backoff" => {
+            backoff::evaluate(db, &member.identity, now().map_err(|_| "check_failed")?).await
+        }
+        "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
+        "indexer_download_client" => {
+            Ok(crate::health_detectors::evaluate_indexer_client(db, domain)
+                .await?
+                .map(|v| HealthIssue {
+                    identity: member.identity.clone(),
+                    severity: v.severity,
+                    reason: v.reason.into(),
+                    message: v.message,
+                    wiki_url: v.wiki_url.into(),
+                    compatibility_type: v.compatibility_type.into(),
+                }))
+        }
         "completed_download_handling" => Ok(crate::health_detectors::evaluate_current(
             db, client, domain,
         )
@@ -513,6 +550,20 @@ async fn evaluate(
             wiki_url: v.wiki_url.into(),
             compatibility_type: v.compatibility_type.into(),
         })),
+        "download_client_root_folder" => {
+            download_roots::evaluate(db, client, domain)
+                .await
+                .map(|issue| {
+                    issue.map(|v| HealthIssue {
+                        identity: member.identity.clone(),
+                        severity: HealthSeverity::Warning,
+                        reason: v.reason.into(),
+                        message: v.message.into(),
+                        wiki_url: v.wiki_url.into(),
+                        compatibility_type: v.compatibility_type.into(),
+                    })
+                })
+        }
         _ => Err("check_failed"),
     }
 }

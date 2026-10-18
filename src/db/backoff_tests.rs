@@ -28,12 +28,12 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<Vec<libsql::Value>>, Erro
     }
     Ok(result)
 }
-async fn seed43(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+async fn seed49(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let db = libsql::Builder::new_local(path).build().await?;
     let c = db.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(43).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(49).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -48,15 +48,15 @@ async fn status(c: &Connection, p: &str, media: &str) -> Result<(), libsql::Erro
     Ok(())
 }
 #[tokio::test]
-async fn backoff_upgrade43_rollback_reopen_preserves_authority() -> Result<(), Error> {
+async fn backoff_upgrade49_rollback_reopen_preserves_authority() -> Result<(), Error> {
     let s = Scratch::new();
     let path = s.0.join("db");
-    let (raw, c) = seed43(&path).await?;
+    let (raw, c) = seed49(&path).await?;
     let p = super::refresh_tests::provider(&c).await?;
     super::refresh_tests::enqueue(&c, &p, "tv").await?;
     c.execute("UPDATE health_checks SET next_expiry_at=NULL", ())
         .await
-        .expect_err("expiry absent before migration44");
+        .expect_err("expiry absent before migration50");
     // Migration43 already creates exactly one sequence row, including for an empty ring.
     assert_eq!(
         scalar(
@@ -89,7 +89,7 @@ async fn backoff_upgrade43_rollback_reopen_preserves_authority() -> Result<(), E
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[43].1).await?;
+    tx.execute_batch(MIGRATIONS[49].1).await?;
     assert!(
         tx.execute(
             "UPDATE health_checks SET next_expiry_at=-1 WHERE check_key='download_client_backoff'",
@@ -106,7 +106,7 @@ async fn backoff_upgrade43_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 44);
+    assert_eq!(version(&c).await?, 50); // Reasoning: backoff is now migration 0050 (was 44) after main landed 0044-0049.
     for i in [0, 1, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
@@ -131,7 +131,7 @@ async fn backoff_upgrade43_rollback_reopen_preserves_authority() -> Result<(), E
     let backup = libsql::Builder::new_local(db.migration_backup().unwrap().join("database.db"))
         .build()
         .await?;
-    assert_eq!(version(&backup.connect()?).await?, 43);
+    assert_eq!(version(&backup.connect()?).await?, 49); // Reasoning: the predecessor of 0050 is schema49 (was 43).
     drop(backup);
     integrity(&c).await?;
     let schema = rows(&c, queries[8]).await?;
