@@ -1372,6 +1372,46 @@ async fn applicable_release_restrictions_and_precise_tv_time_rules() {
         .disposition,
         Disposition::Accept
     );
+    // Native add/refresh stores canonical naive UTC (no offset). Those values are
+    // known instants: aired ones must not trip the window, unaired ones still must.
+    c.execute("UPDATE episodes SET air_date_utc='2026-09-23 12:00:00'", ())
+        .await
+        .unwrap();
+    let reasons = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        indexer,
+        &empty_pack,
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap()
+    .reasons;
+    assert!(
+        !reasons.iter().any(|r| r == "season_pack_not_aired"),
+        "{reasons:?}"
+    );
+    c.execute(
+        "UPDATE episodes SET air_date_utc='2026-09-25 12:00:00.001' WHERE id=2",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        search::evaluate(
+            &c,
+            MediaDomain::Tv,
+            indexer,
+            &empty_pack,
+            SearchContext::UserSearch,
+            now
+        )
+        .await
+        .unwrap()
+        .reasons,
+        vec!["season_pack_not_aired"]
+    );
     c.execute(
         "UPDATE episodes SET air_date_utc='2026-09-24T12:00:00Z'",
         (),
@@ -1481,7 +1521,11 @@ async fn applicable_release_restrictions_and_precise_tv_time_rules() {
         ("2026-09-24T12:00:00Z", false),
         ("2026-09-24T12:00:00.500Z", true),
         ("2026-09-24", true),
-        ("2026-09-24 12:00:00", true),
+        // Offset-less canonical storage form (history::canonical_timestamp) is UTC
+        // by contract, as library.rs's julianday() aggregates already assume;
+        // only date-only values are unknown.
+        ("2026-09-24 12:00:00", false),
+        ("2026-09-24 12:00:00.5", true),
     ] {
         c.execute("UPDATE episodes SET air_date_utc=?", [date])
             .await

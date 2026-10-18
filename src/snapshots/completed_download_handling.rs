@@ -119,15 +119,42 @@ pub(super) async fn write(c: &Connection, plan: Option<Plan>, report: &mut Repor
         // Equality permits unrelated import work, but never adds source authority over local intent.
         return Ok(());
     }
-    if current.enabled == plan.enabled && current.defined == plan.defined {
-        report.duplicates += 1;
-        native::reconcile(c, None, Some(m))
-            .await
-            .map_err(|_| ImportError("completed download handling reconciliation failed"))?;
+    let equal = current.enabled == plan.enabled && current.defined == plan.defined;
+    // Capacity is checked before reconcile writes, so only the CDH step is rolled back; the
+    // library import still commits and an unstamped snapshot can apply CDH on a later rerun.
+    c.execute("SAVEPOINT snapshot_cdh", ()).await?;
+    let activated = if equal {
+        native::reconcile(c, None, Some(m)).await
     } else {
         native::set(c, m, plan.enabled, plan.defined, current.revision, false)
             .await
-            .map_err(|_| ImportError("completed download handling activation failed"))?;
+            .map(|_| ())
+    };
+    match activated {
+        Ok(()) => c.execute("RELEASE snapshot_cdh", ()).await?,
+        Err(e) if e.1 == "schedule_limit" => {
+            c.execute("ROLLBACK TO snapshot_cdh", ()).await?;
+            c.execute("RELEASE snapshot_cdh", ()).await?;
+            report.unsupported.push(Unsupported {
+                table: "Config".into(),
+                rows: 1,
+                columns: vec![
+                    "completed download handling deferred: refresh schedule capacity reached"
+                        .into(),
+                ],
+            });
+            return Ok(());
+        }
+        Err(_) if equal => {
+            return Err(ImportError(
+                "completed download handling reconciliation failed",
+            ));
+        }
+        Err(_) => return Err(ImportError("completed download handling activation failed")),
+    };
+    if equal {
+        report.duplicates += 1;
+    } else {
         report.metadata_backfilled += 1;
     }
     c.execute(

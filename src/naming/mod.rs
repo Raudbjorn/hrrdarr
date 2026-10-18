@@ -2,6 +2,7 @@
 //! endpoint. Persists to the `naming_settings` table (migration 0029). Not wired
 //! into any automated import path yet; see docs/naming-api.md.
 pub(crate) mod destination;
+pub mod movie_preview;
 pub mod render;
 use crate::db::Database;
 use axum::{
@@ -522,6 +523,7 @@ struct Context {
     db: Arc<Database>,
 }
 pub fn router(db: Arc<Database>) -> Router {
+    let previews = movie_preview::router(db.clone());
     let tv = Router::new()
         .route("/api/v1/tv/config/naming", get(get_tv).put(put_tv))
         .route("/api/v1/tv/config/naming/examples", get(examples_tv))
@@ -536,7 +538,9 @@ pub fn router(db: Arc<Database>) -> Router {
             get(examples_movies),
         )
         .with_state(Context { db });
-    tv.merge(movies).layer(DefaultBodyLimit::max(32 * 1024))
+    tv.merge(movies)
+        .merge(previews)
+        .layer(DefaultBodyLimit::max(32 * 1024))
 }
 
 async fn get_tv(State(ctx): State<Context>) -> Result<Json<TvNamingConfig>> {

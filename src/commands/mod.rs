@@ -22,6 +22,7 @@ use std::{
 use uuid::Uuid;
 
 pub mod blocklist;
+pub mod housekeeping;
 pub mod manual_import;
 pub mod metadata;
 pub mod processing;

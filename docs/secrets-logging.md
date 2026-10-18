@@ -7,7 +7,7 @@ chains or panic payloads. Escaping a string as JSON is not secret redaction.
 `src/main.rs` consumes startup/server errors before Rust's `Result` termination
 handler can print their raw `Debug` representation. Failures retain a nonzero
 exit, an operation phase (`database_open`, `provider_key`, `metadata_client`,
-`bind_address`, `listener_bind`, `command_worker`, `http_server`) and a safe error
+`host_configuration`, `listener_bind`, `command_worker`, `http_server`) and a safe error
 class. Database classes distinguish connection/protocol/SQL/other failures; I/O
 errors report `ErrorKind`. Unknown errors never fall back to their message.
 The backup-created notice omits the configured database path; recovery artifacts
@@ -71,7 +71,7 @@ reports an old engine version and verifies the safe compatibility capability and
 engine identity survive while connection setup remains unattempted.
 
 `invalid_environment_values_have_safe_phase_diagnostics` covers malformed provider
-key, malformed bind address and inaccessible local database path without printing
+key, malformed bind address, malformed allowed-host list and inaccessible local database path without printing
 the supplied values. All subprocess captures have time/output bounds and cleanup; no live
 services or real credentials are used.
 
