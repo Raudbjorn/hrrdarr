@@ -729,85 +729,189 @@ async fn source_false_governs_later_clients_and_local_false_blocks_source_true()
         server.stop().await;
     }
 }
+/// Seeds 65 enabled legacy qBittorrent scopes so any CDH activation needs 65 schedules (> 64).
+async fn legacy_clients(c: &libsql::Connection, media: &str, endpoint: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for _ in 0..65 {
+        let id = uuid::Uuid::new_v4().to_string();
+        c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'qbittorrent','legacy',1,1,1,1,?)",libsql::params![id.clone(),endpoint]).await.unwrap();
+        c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES(?,'qbittorrent',?,'owned',0,0,'started','default',0,0,0)",libsql::params![id.clone(),media]).await.unwrap();
+        ids.push(id);
+    }
+    ids
+}
+fn capacity_source(version: i64, cdh_key: bool) -> String {
+    let config = if version == 233 {
+        json!({"host":"127.0.0.1","port":9,"tvCategory":"tv"})
+    } else {
+        json!({"host":"127.0.0.1","port":9,"movieCategory":"movies"})
+    };
+    // Without the key the plan is true/undefined, equal to the native default (reconcile branch).
+    let key = if cdh_key {
+        "enablecompleteddownloadhandling"
+    } else {
+        "unrelated"
+    };
+    format!(
+        "CREATE TABLE Config(Key TEXT,Value TEXT);INSERT INTO Config VALUES('{key}','True');CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);INSERT INTO DownloadClients VALUES(1,'Source client','QBittorrent','QBittorrentSettings','{config}',1,1);"
+    )
+}
 #[tokio::test]
-async fn snapshot_capacity_failure_defers_cdh_without_aborting_library_import() {
+async fn snapshot_capacity_shortfall_commits_intent_pending_and_activates_when_slot_frees() {
     let _serial = SNAPSHOTS.lock().await;
     for version in [233, 206, 242] {
-        let media = if version == 233 { "tv" } else { "movies" };
-        let app = if version == 233 {
-            Application::Sonarr
-        } else {
-            Application::Radarr
-        };
-        let s = Scratch::new();
-        let path = s.0.join("db");
-        let db = Database::open_local(&path).await.unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let c = db.connect().await.unwrap();
-        for _ in 0..65 {
-            let id = uuid::Uuid::new_v4().to_string();
-            c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'qbittorrent','legacy',1,1,1,1,'http://127.0.0.2:9')",[id.clone()]).await.unwrap();
-            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES(?,'qbittorrent',?,'owned',0,0,'started','default',0,0,0)",libsql::params![id,media]).await.unwrap();
+        for cdh_key in [true, false] {
+            let media = if version == 233 { "tv" } else { "movies" };
+            let app = if version == 233 {
+                Application::Sonarr
+            } else {
+                Application::Radarr
+            };
+            let s = Scratch::new();
+            let path = s.0.join("db");
+            let db = Arc::new(Database::open_local(&path).await.unwrap());
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let c = db.connect().await.unwrap();
+            // Distinct legacy endpoints keep source-client matching unambiguous; this test isolates
+            // capacity. The shared-endpoint shape is pinned separately below.
+            let legacy = legacy_clients(&c, media, "http://127.0.0.2:9").await;
+            let bytes = fixture(&s, version, "capacity", &capacity_source(version, cdh_key)).await;
+            let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
+            let revision_before = scalar(&c, &format!("SELECT revision FROM completed_download_handling_settings WHERE media_type='{media}'")).await;
+            // Before this change an overflowed import aborted entirely and could not restore any
+            // backup until a slot was freed. Now intent commits and activation is deferred.
+            let report =
+                snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+                    .await
+                    .unwrap();
+            let shape = format!("version {version}, cdh key {cdh_key}");
+            assert!(
+                report.applied,
+                "{shape}: library import commits: {report:?}"
+            );
+            let library = if version == 233 { "series" } else { "movies" };
+            assert_eq!(
+                scalar(&c, &format!("SELECT count(*) FROM {library}")).await,
+                1,
+                "{shape}"
+            );
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
+                1,
+                "{shape}"
+            );
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM providers").await,
+                66,
+                "{shape}"
+            );
+            assert_eq!(
+                scalar(&c, "SELECT sum(cdh_version) FROM snapshot_imports").await,
+                1,
+                "{shape}: stamped, because the intent itself committed"
+            );
+            // A source key is defined intent (a new settings revision); its absence equals the default.
+            assert_eq!(
+                scalar(&c, &format!("SELECT defined*10+(revision-{revision_before}) FROM completed_download_handling_settings WHERE media_type='{media}'")).await,
+                if cdh_key { 11 } else { 0 },
+                "{shape}"
+            );
+            assert_eq!(
+                report.unsupported.iter().any(|u| u
+                    .columns
+                    .iter()
+                    .any(|c| c.contains("refresh schedule capacity reached"))),
+                cdh_key,
+                "{shape}: only defined source intent is reported as pending: {report:?}"
+            );
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM download_processing_policies WHERE enabled=1"
+                )
+                .await
+                    + scalar(&c, "SELECT count(*) FROM download_refresh_schedules").await,
+                0,
+                "{shape}: reconcile checks capacity before writing, so nothing partially activates"
+            );
+            let (base, server) = server(db.clone()).await;
+            let cdh = settings(&base, media).await;
+            assert_eq!(cdh["reconciliation_pending"], true, "{shape}: {cdh}");
+            assert_eq!(
+                cdh["reconciliation_reason"], "schedule_limit",
+                "{shape}: {cdh}"
+            );
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM providers WHERE enabled=1").await,
+                65,
+                "{shape}: reconstructed source client stays disabled"
+            );
+            // An exact rerun is a duplicate and changes nothing.
+            let rerun = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+                .await
+                .unwrap();
+            assert_eq!(rerun.conflicts, 0, "{shape}: {rerun:?}");
+            assert_eq!(
+                settings(&base, media).await["revision"],
+                cdh["revision"],
+                "{shape}"
+            );
+            // Freeing one slot retries the pending batch without re-importing the snapshot.
+            let (code, v) = request(
+                &base,
+                "DELETE",
+                &format!("/api/v1/providers/{}?revision=1", legacy[0]),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, 204, "{shape}: {v}");
+            let cdh = settings(&base, media).await;
+            assert_eq!(cdh["reconciliation_pending"], false, "{shape}: {cdh}");
+            assert_eq!(
+                cdh["defined"], cdh_key,
+                "{shape}: source intent survived the deferral"
+            );
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM download_processing_policies WHERE enabled=1"
+                )
+                .await,
+                64,
+                "{shape}"
+            );
+            assert_eq!(scalar(&c, "SELECT count(*) FROM download_refresh_schedules WHERE enabled=1 AND intent='inherited'").await, 64, "{shape}");
+            server.stop().await;
         }
-        // Distinct legacy endpoints keep source-client matching unambiguous; this test isolates capacity.
-        let config = if version == 233 {
-            json!({"host":"127.0.0.1","port":9,"tvCategory":"tv"})
-        } else {
-            json!({"host":"127.0.0.1","port":9,"movieCategory":"movies"})
-        };
-        let extra = format!(
-            "CREATE TABLE Config(Key TEXT,Value TEXT);INSERT INTO Config VALUES('enablecompleteddownloadhandling','True');CREATE TABLE DownloadClients(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,Enable INTEGER);INSERT INTO DownloadClients VALUES(1,'Source client','QBittorrent','QBittorrentSettings','{config}',1,1);"
-        );
-        let bytes = fixture(&s, version, "capacity", &extra).await;
-        let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
-        let settings_before = scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='tv'").await
-            + scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='movies'").await;
-        // Previously the whole import aborted here, so an overflowed upgrade could not restore any
-        // backup until a schedule slot was freed. Only the CDH step is deferred now: native CDH is
-        // the untouched default at this point, so rolling the step back never leaves imports more
-        // enabled than the source intent, and reconciliation_pending still drives provisioning.
-        let report = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+    }
+}
+#[tokio::test]
+async fn snapshot_shared_legacy_endpoint_is_an_ambiguous_match_not_a_capacity_deferral() {
+    let _serial = SNAPSHOTS.lock().await;
+    let s = Scratch::new();
+    let path = s.0.join("db");
+    let db = Database::open_local(&path).await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let c = db.connect().await.unwrap();
+    // Same host/port as the source client: matching cannot pick one of 65 candidates, so the
+    // import is a conflict and nothing applies. This is source-client matching, not capacity.
+    legacy_clients(&c, "tv", "http://127.0.0.1:9").await;
+    let before = database_state(&c).await;
+    let bytes = fixture(&s, 233, "shared", &capacity_source(233, true)).await;
+    let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
+    let report =
+        snapshots::import_with_providers(&db, Application::Sonarr, bytes, false, Some(&key))
             .await
             .unwrap();
-        assert!(
-            report.applied,
-            "library import commits despite CDH capacity: {report:?}"
-        );
-        assert!(
-            report.unsupported.iter().any(|u| u
-                .columns
-                .iter()
-                .any(|c| c.contains("refresh schedule capacity reached"))),
-            "deferral is reported, not silent"
-        );
-        assert_eq!(
-            scalar(&c, "SELECT sum(cdh_version) FROM snapshot_imports").await,
-            0,
-            "unstamped so a rerun after freeing slots can apply CDH"
-        );
-        assert_eq!(
-            scalar(
-                &c,
-                "SELECT count(*) FROM download_processing_policies WHERE enabled=1"
-            )
-            .await
-                + scalar(&c, "SELECT count(*) FROM download_refresh_schedules").await,
-            0,
-            "no partial authority or schedules from the rolled-back step"
-        );
-        assert_eq!(
-            scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='tv'").await
-                + scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='movies'").await,
-            settings_before,
-            "master settings unchanged"
-        );
-        assert_eq!(
-            scalar(&c, "SELECT count(*) FROM providers WHERE enabled=1").await,
-            65,
-            "reconstructed source client stays disabled"
-        );
-    }
+    assert!(!report.applied, "{report:?}");
+    assert!(report.conflicts >= 1, "{report:?}");
+    assert_eq!(
+        database_state(&c).await,
+        before,
+        "an unapplied import leaves no state"
+    );
 }
 #[tokio::test]
 async fn desired_policy_tracks_provider_state_and_reset_requires_revision() {
@@ -853,6 +957,19 @@ async fn desired_policy_tracks_provider_state_and_reset_requires_revision() {
         .await;
         assert_eq!(code, 200, "{v}");
         assert_eq!(v["desired_enabled"], false);
+        // The save endpoint shares the contract: no stored policy must not make omission a null CAS.
+        let save = format!(
+            "/api/v1/download-processing/policies/{}/{media}",
+            id.as_str().unwrap()
+        );
+        let (code, v) = request(
+            &base,
+            "PUT",
+            &save,
+            json!({"provider_revision":disabled["revision"],"enabled":false,"mode":"hardlink"}),
+        )
+        .await;
+        assert_eq!(code, 400, "{v}");
     }
     server.stop().await;
 }

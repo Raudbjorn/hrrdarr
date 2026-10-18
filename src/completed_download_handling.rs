@@ -178,14 +178,14 @@ pub(crate) async fn startup(db: &Database) -> Result<()> {
         }
     }
 }
-pub(crate) async fn set(
+async fn write_intent(
     c: &Connection,
     m: MediaDomain,
     enabled: bool,
     defined: bool,
     revision: i64,
     local: bool,
-) -> Result<Settings> {
+) -> Result<()> {
     if c.is_autocommit() {
         return Err(invariant());
     }
@@ -195,10 +195,48 @@ pub(crate) async fn set(
     if c.execute("UPDATE completed_download_handling_settings SET enabled=?,defined=?,revision=revision+1,locally_edited=CASE WHEN ? THEN 1 ELSE locally_edited END WHERE media_type=? AND revision=?",params![enabled,defined,local,domain(m),revision]).await?!=1{return Err(Error(StatusCode::CONFLICT,"cdh_conflict"))}
     crate::health::configuration_changed(c, m)
         .await
-        .map_err(|e| Error(e.0, e.1))?;
+        .map_err(|e| Error(e.0, e.1))
+}
+pub(crate) async fn set(
+    c: &Connection,
+    m: MediaDomain,
+    enabled: bool,
+    defined: bool,
+    revision: i64,
+    local: bool,
+) -> Result<Settings> {
+    write_intent(c, m, enabled, defined, revision, local).await?;
     // Disabling cannot require a schedule slot. The projection gates explicit-on policies too.
     reconcile(c, None, Some(m)).await?;
     read(c, m).await
+}
+/// Snapshot import: commits source intent (when given) even if activation needs more schedule
+/// slots than remain. reconcile checks capacity before any write, so a shortfall activates
+/// nothing; the domain stays reconciliation_pending (reason schedule_limit) until
+/// reconcile_pending or startup runs after slots are released. Returns whether it deferred.
+pub(crate) async fn import(
+    c: &Connection,
+    m: MediaDomain,
+    intent: Option<(bool, bool, i64)>,
+) -> Result<bool> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    if let Some((enabled, defined, revision)) = intent {
+        write_intent(c, m, enabled, defined, revision, false).await?;
+    }
+    match reconcile(c, None, Some(m)).await {
+        Ok(()) => Ok(false),
+        Err(e) if e.1 == "schedule_limit" => {
+            c.execute(
+                "UPDATE completed_download_handling_settings SET reconciliation_pending=1 WHERE media_type=?",
+                [domain(m)],
+            )
+            .await?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 pub fn router(db: Arc<Database>) -> Router {
     let mut r = Router::new();

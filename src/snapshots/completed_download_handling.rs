@@ -120,38 +120,23 @@ pub(super) async fn write(c: &Connection, plan: Option<Plan>, report: &mut Repor
         return Ok(());
     }
     let equal = current.enabled == plan.enabled && current.defined == plan.defined;
-    // Capacity is checked before reconcile writes, so only the CDH step is rolled back; the
-    // library import still commits and an unstamped snapshot can apply CDH on a later rerun.
-    c.execute("SAVEPOINT snapshot_cdh", ()).await?;
-    let activated = if equal {
-        native::reconcile(c, None, Some(m)).await
-    } else {
-        native::set(c, m, plan.enabled, plan.defined, current.revision, false)
-            .await
-            .map(|_| ())
-    };
-    match activated {
-        Ok(()) => c.execute("RELEASE snapshot_cdh", ()).await?,
-        Err(e) if e.1 == "schedule_limit" => {
-            c.execute("ROLLBACK TO snapshot_cdh", ()).await?;
-            c.execute("RELEASE snapshot_cdh", ()).await?;
-            report.unsupported.push(Unsupported {
-                table: "Config".into(),
-                rows: 1,
-                columns: vec![
-                    "completed download handling deferred: refresh schedule capacity reached"
-                        .into(),
-                ],
-            });
-            return Ok(());
-        }
-        Err(_) if equal => {
-            return Err(ImportError(
-                "completed download handling reconciliation failed",
-            ));
-        }
-        Err(_) => return Err(ImportError("completed download handling activation failed")),
-    };
+    // Source intent commits and stamps even when schedule capacity is short; activation stays
+    // reconciliation_pending (reason schedule_limit) like startup, so no rerun is needed.
+    let intent = (!equal).then_some((plan.enabled, plan.defined, current.revision));
+    let deferred = native::import(c, m, intent).await.map_err(|_| {
+        ImportError(if equal {
+            "completed download handling reconciliation failed"
+        } else {
+            "completed download handling activation failed"
+        })
+    })?;
+    if deferred && plan.defined {
+        profiles::issue(
+            &mut report.unsupported,
+            "Config",
+            "completed download handling activation pending: refresh schedule capacity reached",
+        );
+    }
     if equal {
         report.duplicates += 1;
     } else {

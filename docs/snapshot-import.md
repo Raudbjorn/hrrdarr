@@ -96,6 +96,16 @@ conflict is a successful reconciliation report (200, `applied=false`), not a par
 write. A database rollback failure requires operator integrity inspection before
 retrying. Read the report's `applied` field, not just the HTTP status.
 
+Completed download handling never blocks the library import on refresh-schedule
+capacity. When activation would exceed the 64-schedule bound, the source's setting
+and definedness still commit and the snapshot is stamped. The domain's
+completed-download-handling read then reports `reconciliation_pending` with reason
+`schedule_limit`, which is the machine-readable signal. The report adds a `Config`
+unsupported entry only when the source defined the key. Activation follows the next
+slot-releasing mutation or startup; re-importing is unnecessary. Source-client matching
+is separate: a source client whose host/port matches several existing clients is an
+ambiguous conflict, and that import does not apply.
+
 ## Verification limits
 
 `cargo test --locked --test snapshot_import` covers both versions/layouts, combined
