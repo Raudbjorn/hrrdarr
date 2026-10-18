@@ -22,6 +22,7 @@ use std::{
 use uuid::Uuid;
 
 pub mod blocklist;
+pub mod housekeeping;
 pub mod manual_import;
 pub mod metadata;
 pub mod processing;
@@ -32,13 +33,13 @@ pub mod search;
 mod worker;
 pub use worker::{Runtime, start, start_with_metadata};
 
-const MAX_COMMANDS: i64 = 1024;
+pub(crate) const MAX_COMMANDS: i64 = 1024;
 const MAX_SNAPSHOTS: i64 = 64;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_REVISION: i64 = 9007199254740991;
 
 #[derive(Debug)]
-pub struct Error(StatusCode, &'static str);
+pub struct Error(pub(crate) StatusCode, pub(crate) &'static str);
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.1)
@@ -69,11 +70,11 @@ fn conflict() -> Error {
 /// Every command table admitted through the shared 1024-row capacity pool (see each
 /// `*_admit` trigger) must be counted here; a table left out here can still be inserted
 /// past the trigger's own limit undetected by any pre-check. Only non-terminal rows count
-/// (migration 0033): a capacity limit bounds concurrent/pending work, not historical audit
-/// rows, and nothing in this schema prunes terminal rows -- counting them here too would let
-/// ordinary scheduled churn alone exhaust the pool over long uptimes.
-const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))";
-async fn command_capacity(c: &Connection) -> Result<i64> {
+/// (migration 0033): capacity bounds concurrent/pending work independently of history
+/// retention. Health retains 128 terminal rows; other command histories remain retained.
+/// Counting either terminal history here would let ordinary scheduled churn exhaust the pool.
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
+pub(crate) async fn command_capacity(c: &Connection) -> Result<i64> {
     Ok(c.query(COMMAND_CAPACITY_SQL, ())
         .await?
         .next()
@@ -87,7 +88,7 @@ fn domain(value: MediaDomain) -> &'static str {
         MediaDomain::Movies => "movies",
     }
 }
-fn now() -> Result<i64> {
+pub(crate) fn now() -> Result<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -119,7 +120,7 @@ pub enum CommandPriority {
     High,
 }
 impl CommandPriority {
-    fn number(self) -> i64 {
+    pub(crate) fn number(self) -> i64 {
         match self {
             Self::Normal => 0,
             Self::High => 1,
@@ -201,8 +202,24 @@ fn required_nullable<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<i64>, D::Error> {
     Option::<i64>::deserialize(d)
 }
+#[derive(Clone, Copy, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshScheduleIntent {
+    Inherited,
+    Explicit,
+}
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshScheduleReset {
+    pub target: RefreshTarget,
+    #[serde(deserialize_with = "required_nullable")]
+    pub revision: Option<i64>,
+    pub provider_revision: i64,
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct RefreshSchedule {
+    pub intent: RefreshScheduleIntent,
+    pub requested_enabled: Option<bool>,
     pub target: RefreshTarget,
     pub revision: i64,
     pub provider_revision: i64,
@@ -242,7 +259,7 @@ pub struct QueueSnapshot {
 }
 
 impl CommandStatus {
-    fn text(self) -> &'static str {
+    pub(crate) fn text(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -252,7 +269,7 @@ impl CommandStatus {
             Self::Cancelled => "cancelled",
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
@@ -359,6 +376,10 @@ pub fn router(db: Arc<Database>) -> Router {
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
         .route("/api/v1/commands/{id}/cancel", post(cancel))
         .route(
+            "/api/v1/download-refresh/schedules/inherit",
+            axum::routing::put(reset_schedule),
+        )
+        .route(
             "/api/v1/download-refresh/schedules",
             get(schedules).put(schedule).delete(delete_schedule),
         )
@@ -463,9 +484,15 @@ async fn delete(
     finish(tx, result).await
 }
 
-const SCHEDULE_COLUMNS: &str = "provider_id,media_type,revision,provider_revision,enabled,interval_seconds,next_run_at,last_run_at,error_code";
+const SCHEDULE_COLUMNS: &str = "provider_id,media_type,revision,provider_revision,enabled,interval_seconds,next_run_at,last_run_at,error_code,intent,requested_enabled";
 fn schedule_row(row: libsql::Row) -> Result<RefreshSchedule> {
     Ok(RefreshSchedule {
+        intent: match row.get::<String>(9)?.as_str() {
+            "inherited" => RefreshScheduleIntent::Inherited,
+            "explicit" => RefreshScheduleIntent::Explicit,
+            _ => return Err(bad()),
+        },
+        requested_enabled: row.get::<Option<i64>>(10)?.map(|v| v == 1),
         target: RefreshTarget {
             provider_id: Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| bad())?,
             media_type: MediaDomain::parse(&row.get::<String>(1)?).map_err(|_| bad())?,
@@ -480,7 +507,7 @@ fn schedule_row(row: libsql::Row) -> Result<RefreshSchedule> {
     })
 }
 async fn read_schedule(c: &Connection, target: RefreshTarget) -> Result<Option<RefreshSchedule>> {
-    c.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM download_refresh_schedules WHERE provider_id=? AND media_type=?"),params![target.provider_id.to_string(),domain(target.media_type)]).await?.next().await?.map(schedule_row).transpose()
+    c.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM download_refresh_schedules WHERE provider_id=? AND media_type=? AND intent!='suppressed'"),params![target.provider_id.to_string(),domain(target.media_type)]).await?.next().await?.map(schedule_row).transpose()
 }
 async fn schedules(
     State(db): State<Arc<Database>>,
@@ -488,7 +515,7 @@ async fn schedules(
 ) -> Result<Json<Vec<RefreshSchedule>>> {
     q.map_err(|_| bad())?;
     let c = connection(&db).await?;
-    let mut rows=c.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM download_refresh_schedules ORDER BY provider_id,media_type LIMIT 65"),()).await?;
+    let mut rows=c.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM download_refresh_schedules WHERE intent!='suppressed' ORDER BY provider_id,media_type LIMIT 65"),()).await?;
     let mut items = Vec::new();
     while let Some(row) = rows.next().await? {
         items.push(schedule_row(row)?)
@@ -505,28 +532,58 @@ async fn schedule(
 ) -> Result<Json<RefreshSchedule>> {
     q.map_err(|_| bad())?;
     let input = input.map_err(|_| bad())?.0;
+    write_schedule(&db, input, false).await
+}
+async fn reset_schedule(
+    State(db): State<Arc<Database>>,
+    q: std::result::Result<Query<Empty>, QueryRejection>,
+    input: std::result::Result<Json<RefreshScheduleReset>, JsonRejection>,
+) -> Result<Json<RefreshSchedule>> {
+    q.map_err(|_| bad())?;
+    let input = input.map_err(|_| bad())?.0;
+    write_schedule(
+        &db,
+        RefreshScheduleInput {
+            target: input.target,
+            revision: input.revision,
+            provider_revision: input.provider_revision,
+            enabled: false,
+            interval_seconds: 60,
+        },
+        true,
+    )
+    .await
+}
+async fn write_schedule(
+    db: &Database,
+    input: RefreshScheduleInput,
+    inherited: bool,
+) -> Result<Json<RefreshSchedule>> {
     if !(60..=86400).contains(&input.interval_seconds)
         || !(1..=MAX_REVISION).contains(&input.provider_revision)
         || input
             .revision
-            .is_some_and(|r| !(1..MAX_REVISION).contains(&r))
+            .is_some_and(|v| !(1..MAX_REVISION).contains(&v))
     {
         return Err(bad());
     }
-    let c = connection(&db).await?;
+    let c = connection(db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let result=async{
+    let result=async {
         let old=read_schedule(&tx,input.target).await?;
         if old.as_ref().map(|v|v.revision)!=input.revision{return Err(conflict())}
         if tx.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.implementation='qbittorrent' AND s.media_type=? AND (?=0 OR p.enabled=1)",params![input.target.provider_id.to_string(),input.provider_revision,domain(input.target.media_type),i64::from(input.enabled)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
-        if old.is_none()&&tx.query("SELECT count(*) FROM download_refresh_schedules",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?>=64{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"schedule_limit"))}
-        tx.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at,revision,error_code) VALUES(?,?,?,?,?,?,1,NULL) ON CONFLICT(provider_id,media_type) DO UPDATE SET provider_revision=excluded.provider_revision,enabled=excluded.enabled,interval_seconds=excluded.interval_seconds,next_run_at=excluded.next_run_at,revision=download_refresh_schedules.revision+1,error_code=NULL",params![input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,i64::from(input.enabled),i64::from(input.interval_seconds),now()?]).await?;
+        if old.is_none()&&tx.query("SELECT count(*) FROM download_refresh_schedules WHERE intent!='suppressed'",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?>=64{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"schedule_limit"))}
+        // Suppressed rows are publicly absent, but keep their monotonically increasing revision.
+        tx.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at,revision,error_code,intent,requested_enabled) VALUES(?,?,?,?,?,?,1,NULL,?,?) ON CONFLICT(provider_id,media_type) DO UPDATE SET provider_revision=excluded.provider_revision,enabled=excluded.enabled,interval_seconds=excluded.interval_seconds,next_run_at=excluded.next_run_at,revision=download_refresh_schedules.revision+1,error_code=NULL,intent=excluded.intent,requested_enabled=excluded.requested_enabled",params![input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,i64::from(input.enabled),i64::from(input.interval_seconds),now()?,if inherited {"inherited"} else {"explicit"},if inherited {None} else {Some(i64::from(input.enabled))}]).await?;
+        crate::completed_download_handling::reconcile(&tx,Some(&input.target.provider_id.to_string()),Some(input.target.media_type)).await.map_err(|e|Error(e.0,e.1))?;
         bounded(read_schedule(&tx,input.target).await?.ok_or_else(bad)?)
     }.await;
     finish(tx, result).await
 }
+
 async fn queue(
     State(db): State<Arc<Database>>,
     q: std::result::Result<Query<QueueQuery>, QueryRejection>,
@@ -609,6 +666,13 @@ async fn delete_schedule(
         return Err(bad());
     }
     let c = connection(&db).await?;
-    if c.execute("DELETE FROM download_refresh_schedules WHERE provider_id=? AND media_type=? AND revision=?",params![input.target.provider_id.to_string(),domain(input.target.media_type),input.revision]).await?!=1{return Err(conflict())}
-    Ok(StatusCode::NO_CONTENT)
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let result=async {
+        if tx.execute("UPDATE download_refresh_schedules SET enabled=0,intent='suppressed',requested_enabled=NULL,revision=revision+1 WHERE provider_id=? AND media_type=? AND revision=? AND intent!='suppressed'",params![input.target.provider_id.to_string(),domain(input.target.media_type),input.revision]).await?!=1{return Err(conflict())}
+        crate::completed_download_handling::reconcile_pending(&tx).await.map_err(|e|Error(e.0,e.1))?;
+        Ok(StatusCode::NO_CONTENT)
+    }.await;
+    finish(tx, result).await
 }

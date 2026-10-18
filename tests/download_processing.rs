@@ -347,6 +347,7 @@ async fn wait_status(base: &str, path: &str, status: &str) -> Value {
 async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     // Keep the new end-to-end scenarios in this same serial lease owner, first so
     // fixture failures are reported before the longer established recovery matrix.
+    cdh_master_and_receipt_revision_http().await;
     search_revision_import_preserves_durable_origin_http().await;
     legacy_receipt_requires_observed_revision_http().await;
     let scratch =
@@ -372,6 +373,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
     let router = router
         .merge(commands::router(db.clone()))
+        .merge(hrrdarr::completed_download_handling::router(db.clone()))
         .merge(hrrdarr::library::router(db.clone()))
         .merge(hrrdarr::library::metadata_router(
             db.clone(),
@@ -466,7 +468,18 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
         )
         .await;
         assert_eq!(code, 201, "{v}");
-        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":if media=="tv"{"copy"}else{"hardlink"}})).await;
+        // CDH now provisions authority at provider creation; preserve strict CAS for this explicit mode override.
+        let (_, current_policy) = request(
+            &base,
+            "GET",
+            &format!(
+                "/api/v1/download-processing/policies/{}/{media}",
+                download["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":current_policy["revision"],"enabled":true,"mode":if media=="tv"{"copy"}else{"hardlink"}})).await;
         assert_eq!(code, 200, "{v}");
         roots.push(root);
         sources.push(media_source);
@@ -697,8 +710,19 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
         assert_eq!(parked["error_code"], "import_failed");
         assert_eq!(parked["operation_id"], failed["operation_id"]);
         assert_eq!(parked["import_phase"], "published");
-        // Disabled automation cannot strand recovery of a linked, already-published local operation.
-        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":1,"enabled":false,"mode":if *media=="tv"{"copy"}else{"hardlink"}})).await;
+        // Default provisioning and the explicit setup save advance CAS independently.
+        // Read current authority; retain the successful-disable and recovery assertions.
+        let policy_path = format!(
+            "/api/v1/download-processing/policies/{}/{media}",
+            download["id"].as_str().unwrap()
+        );
+        let (code, current) = request(&base, "GET", &policy_path, Value::Null).await;
+        assert_eq!(code, 200, "{current}");
+        // Neither per-client off nor master off can strand an already-published operation.
+        cdh_master(&base, media, false).await;
+        let (code, current) = request(&base, "GET", &policy_path, Value::Null).await;
+        assert_eq!(code, 200, "{current}");
+        let(code,v)=request(&base,"PUT",&policy_path,json!({"provider_revision":download["revision"],"revision":current["revision"],"enabled":false,"mode":if *media=="tv"{"copy"}else{"hardlink"}})).await;
         assert_eq!(code, 200, "{v}");
         upgrades.push((receipt.clone(), failed["operation_id"].clone(), old_id));
     }
@@ -719,6 +743,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     let (base, _api) = serve(
         router
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(hrrdarr::history::router(db.clone())),
     )
     .await;
@@ -828,6 +853,7 @@ async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     let (base, _api) = serve(
         router
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(hrrdarr::history::router(db.clone())),
     )
     .await;
@@ -1071,6 +1097,7 @@ async fn same_basename_http() {
     let (base, _api) = serve(
         router
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(hrrdarr::library::router(db.clone()))
             .merge(hrrdarr::library::metadata_router(
                 db.clone(),
@@ -1145,7 +1172,18 @@ async fn same_basename_http() {
         )
         .await;
         assert_eq!(code, 201, "{v}");
-        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":if i==0{"copy"}else{"hardlink"}})).await;
+        // CDH now provisions authority at provider creation; preserve strict CAS for this explicit mode override.
+        let (_, current_policy) = request(
+            &base,
+            "GET",
+            &format!(
+                "/api/v1/download-processing/policies/{}/{media}",
+                download["id"].as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":current_policy["revision"],"enabled":true,"mode":if i==0{"copy"}else{"hardlink"}})).await;
         assert_eq!(code, 200, "{v}");
         paths.push((root.join(name), new));
     }
@@ -1306,6 +1344,7 @@ impl Ctx {
     async fn shutdown(self) {
         self.runtime.shutdown().await;
         self.api.stop().await;
+        self._upstream.stop().await;
     }
 }
 // `tv_release_stem` (no extension) overrides the tv search-feed title and completed-download
@@ -1340,6 +1379,7 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
     let router = router
         .merge(commands::router(db.clone()))
+        .merge(hrrdarr::completed_download_handling::router(db.clone()))
         .merge(hrrdarr::search::router(db.clone(), client.clone()))
         .merge(hrrdarr::release_profiles::router(db.clone()))
         .merge(hrrdarr::library::router(db.clone()))
@@ -1410,7 +1450,18 @@ async fn naming_ctx(movie: bool, tv_series_type: &str, tv_release_stem: Option<&
     )
     .await;
     assert_eq!(code, 201, "{v}");
-    let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":if movie{"hardlink"}else{"copy"}})).await;
+    // CDH now provisions authority at provider creation; preserve strict CAS for this explicit mode override.
+    let (_, current_policy) = request(
+        &base,
+        "GET",
+        &format!(
+            "/api/v1/download-processing/policies/{}/{media}",
+            download["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    )
+    .await;
+    let(code,v)=request(&base,"PUT",&format!("/api/v1/download-processing/policies/{}/{media}",download["id"].as_str().unwrap()),json!({"provider_revision":download["revision"],"revision":current_policy["revision"],"enabled":true,"mode":if movie{"hardlink"}else{"copy"}})).await;
     assert_eq!(code, 200, "{v}");
     let runtime = commands::start_with_metadata(db.clone(), client, metadata)
         .await
@@ -2487,5 +2538,109 @@ async fn legacy_receipt_requires_observed_revision_http() {
         );
         drop(row);
         ctx.shutdown().await;
+    }
+}
+
+async fn cdh_master(base: &str, media: &str, enabled: bool) {
+    let path = format!("/api/v1/{media}/completed-download-handling");
+    let (code, old) = request(base, "GET", &path, Value::Null).await;
+    assert_eq!(code, 200, "{old}");
+    let (code, value) = request(
+        base,
+        "PUT",
+        &path,
+        json!({"revision":old["revision"],"enabled":enabled}),
+    )
+    .await;
+    assert_eq!(code, 200, "{value}");
+}
+async fn cdh_refresh(ctx: &Ctx, revision: &Value, media: &str) {
+    let (code, value) = request(&ctx.base,"POST","/api/v1/commands",json!({"name":"refresh_downloads","target":{"provider_id":ctx.download["id"],"media_type":media},"provider_revision":revision,"priority":"normal"})).await;
+    assert_eq!(code, 202, "{value}");
+    wait_status(
+        &ctx.base,
+        &format!("/api/v1/commands/{}", value["id"].as_str().unwrap()),
+        "succeeded",
+    )
+    .await;
+}
+// Reuse the serial import lease and actual RSS producer: a settings transition may
+// admit an existing current receipt, but must never rewrite an old provider fence.
+async fn cdh_master_and_receipt_revision_http() {
+    for movie in [false, true] {
+        for stale in [false, true] {
+            let ctx = naming_ctx(movie, "standard", None).await;
+            let media = if movie { "movies" } else { "tv" };
+            cdh_master(&ctx.base, media, false).await;
+            let receipt = naming_grab_and_complete(&ctx).await;
+            cdh_refresh(&ctx, &ctx.download["revision"], media).await;
+            let c = ctx.db.connect().await.unwrap();
+            let unlinked = async || {
+                for table in ["download_processing", "rss_candidate_imports"] {
+                    let column = "candidate_id";
+                    let n = c
+                        .query(
+                            &format!("SELECT count(*) FROM {table} WHERE {column}=?"),
+                            [receipt.as_str().unwrap()],
+                        )
+                        .await
+                        .unwrap()
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get::<i64>(0)
+                        .unwrap();
+                    assert_eq!(
+                        n, 0,
+                        "master-off/stale receipt cannot acquire ownership: {table}"
+                    );
+                }
+            };
+            unlinked().await;
+            let (code, value) = naming_process(&ctx, &receipt).await;
+            assert_eq!(code, 409, "{value}");
+            let mut revision = ctx.download["revision"].clone();
+            if stale {
+                let path = format!("/api/v1/providers/{}", ctx.download["id"].as_str().unwrap());
+                let mut input = ctx.download.clone();
+                // Provider responses carry additional read-only fields; send only the write DTO.
+                input = json!({"name":"changed receipt fence","enabled":true,"priority":1,"revision":input["revision"],"settings":input["settings"]});
+                let (code, value) = request(&ctx.base, "PUT", &path, input).await;
+                assert_eq!(code, 200, "{value}");
+                revision = value["revision"].clone();
+            }
+            cdh_master(&ctx.base, media, true).await;
+            cdh_refresh(&ctx, &revision, media).await;
+            if stale {
+                unlinked().await;
+                let (code,value)=request(&ctx.base,"POST","/api/v1/download-processing",json!({"provider_id":ctx.download["id"],"provider_revision":revision,"media_type":media,"receipt_ids":[receipt]})).await;
+                assert_eq!(code, 409, "{value}");
+                let old = c
+                    .query(
+                        "SELECT client_revision FROM rss_candidates WHERE id=?",
+                        [receipt.as_str().unwrap()],
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<i64>(0)
+                    .unwrap();
+                assert_eq!(old, ctx.download["revision"].as_i64().unwrap());
+            } else {
+                let path = format!("/api/v1/download-processing/{}", receipt.as_str().unwrap());
+                let imported = wait_status(&ctx.base, &path, "imported").await;
+                assert!(!imported["operation_id"].is_null(), "{imported}");
+            }
+            assert_eq!(
+                std::fs::read_dir(&ctx.source).unwrap().count(),
+                1,
+                "original source remains intact"
+            );
+            ctx.shutdown().await;
+        }
     }
 }

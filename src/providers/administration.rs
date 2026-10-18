@@ -113,6 +113,10 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
     match media {
         MediaDomain::Tv => PresetScope::Tv {
             settings: TvIndexerScope {
+                enable_rss: true,
+                enable_automatic_search: true,
+                enable_interactive_search: true,
+                download_client_id: None,
                 categories: if finder {
                     vec![5030, 5040, 5045]
                 } else {
@@ -124,6 +128,10 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
         },
         MediaDomain::Movies => PresetScope::Movies {
             settings: MovieIndexerScope {
+                enable_rss: true,
+                enable_automatic_search: true,
+                enable_interactive_search: true,
+                download_client_id: None,
                 categories: if finder {
                     vec![2030, 2040, 2045, 2050, 2060, 2070]
                 } else {
@@ -248,11 +256,19 @@ pub(super) async fn schema(
             priority: 1,
             defaults: ProviderDefaults::Indexer {
                 tv: TvIndexerScope {
+                    enable_rss: true,
+                    enable_automatic_search: true,
+                    enable_interactive_search: true,
+                    download_client_id: None,
                     categories: vec![],
                     anime_categories: vec![],
                     anime_standard_format_search: false,
                 },
                 movies: MovieIndexerScope {
+                    enable_rss: true,
+                    enable_automatic_search: true,
+                    enable_interactive_search: true,
+                    download_client_id: None,
                     categories: vec![],
                     remove_year: false,
                 },
@@ -390,11 +406,14 @@ pub(super) async fn update(
         .await?;
     let outcome=async {
         let providers=selected(&context,&tx,&input.selection,false).await?;
+        let mut changes = HealthConfigurationChanges::default();
+        for provider in &providers { changes.capture(&tx, &provider.id.to_string(), Some(&provider.settings), None).await?; }
         let mut items=Vec::with_capacity(providers.len());
         for provider in providers {
             if tx.execute("UPDATE providers SET enabled=?,priority=?,revision=revision+1 WHERE id=? AND revision=?",params![i64::from(input.changes.enabled.unwrap_or(provider.enabled)),i64::from(input.changes.priority.unwrap_or(provider.priority)),provider.id.to_string(),provider.revision]).await?!=1 {return Err(conflict());}
             items.push(read(&tx,&provider.id.to_string()).await?.0);
         }
+        changes.mark(&tx).await?;
         bounded(ProviderBulkResult{items})
     }.await;
     finish(tx, outcome).await
@@ -411,6 +430,17 @@ pub(super) async fn delete(
         .await?;
     let outcome = async {
         let providers = selected(&context, &tx, &input, true).await?;
+        let mut changes = HealthConfigurationChanges::default();
+        for provider in &providers {
+            changes
+                .capture(
+                    &tx,
+                    &provider.id.to_string(),
+                    Some(&provider.settings),
+                    None,
+                )
+                .await?;
+        }
         for provider in providers {
             if tx
                 .execute(
@@ -423,6 +453,7 @@ pub(super) async fn delete(
                 return Err(conflict());
             }
         }
+        changes.mark(&tx).await?;
         Ok(StatusCode::NO_CONTENT)
     }
     .await;

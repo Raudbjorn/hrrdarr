@@ -1,6 +1,8 @@
 # Owned completed-download processing
 
-Native processing is opt-in per qBittorrent provider and media domain. `GET/PUT /api/v1/download-processing/policies/{provider_id}/{media_type}` reads or changes enabled/copy-or-hardlink policy with a revision compare-and-swap. Missing policies are disabled. Sources remain available for seeding; this workflow never removes client downloads, changes their category, or moves source bytes.
+Completed Download Handling defaults on per media domain and provisions persisted processing authority plus a 60-second inherited refresh schedule for each enabled qBittorrent scope. The domain master switch gates every per-client override. Existing explicit disabled policies/schedules stay disabled on upgrade; historical absent schedules inherit the new default because a prior deletion cannot be distinguished from never configuring one. New schedule deletions retain suppression so reconciliation cannot recreate them. See [backend settings contract](completed-download-handling.md).
+
+`GET/PUT /api/v1/download-processing/policies/{provider_id}/{media_type}` retains revision compare-and-swap and explicit copy/hardlink overrides; `/inherit` resets the override. Read the current revision after provider creation. Sources remain available for seeding; this workflow never removes client downloads, changes their category, or moves source bytes.
 
 A successful download refresh enqueues completed observations only when they match a trusted RSS receipt's exact client UUID, revision, domain and returned remote torrent ID. Unassociated, pre-existing and uncertain submissions cannot import. `POST /api/v1/download-processing` admits up to 100 unique receipt UUIDs atomically. It accepts the captured provider revision, domain and receipt IDs; repeated requests retain the same receipt and operation.
 

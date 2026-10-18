@@ -77,6 +77,9 @@ async fn metadata_mode(
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        // Owned removed-health browser: actual404 and explicit valid restoration.
+        Some("4") => 4,
+        Some("5") => 5,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.store(value, Ordering::SeqCst);
@@ -87,6 +90,9 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
         return Json(search_show(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -96,6 +102,10 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
 
     if id == "101" {
         let mut value = show();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> series");
+            value["status"] = json!("continuing");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed series");
             value["episodes"][0]["title"] = json!("Refreshed pilot");
@@ -111,6 +121,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
         return Json(search_movie(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -120,6 +133,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
 
     if id == "101" {
         let mut value = movie();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> movie");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed movie");
         }
@@ -174,6 +190,7 @@ async fn mode(
         Some("0") => 0,
         Some("1") => 1,
         Some("2") => 2,
+        Some("3") => 3,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.1.store(value, Ordering::SeqCst);
@@ -186,6 +203,51 @@ async fn processing_mode(State(state): State<Arc<ProviderObservations>>) -> Stat
 async fn search_mode(State(state): State<Arc<ProviderObservations>>) -> StatusCode {
     state.2.store(2, Ordering::SeqCst);
     StatusCode::NO_CONTENT
+}
+// Only already-submitted owned mock torrents may complete; no application rows are fabricated.
+async fn complete_search(
+    State(state): State<Arc<ProviderObservations>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> StatusCode {
+    let Some(hash) = query
+        .get("hash")
+        .filter(|hash| hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let mut downloads = state.3.lock().unwrap();
+    let Some(download) = downloads
+        .iter_mut()
+        .find(|row| row["hash"] == hash.as_str())
+    else {
+        return StatusCode::NOT_FOUND;
+    };
+    download["state"] = json!("uploading");
+    download["progress"] = json!(1.0);
+    download["amount_left"] = json!(0);
+    StatusCode::NO_CONTENT
+}
+fn search_download_name(hash: &str) -> Option<String> {
+    let digit = hash.as_bytes().first().copied()?;
+    if hash.len() != 40 || !hash.bytes().all(|b| b == digit) {
+        return None;
+    }
+    let (tv, external, quality) = match digit {
+        b'1' => (true, 202, "720p"),
+        b'2' => (true, 202, "1080p"),
+        b'3' => (false, 202, "720p"),
+        b'4' => (false, 202, "1080p"),
+        b'5' => (true, 203, "720p"),
+        b'6' => (true, 203, "1080p"),
+        b'7' => (false, 203, "720p"),
+        b'8' => (false, 203, "1080p"),
+        _ => return None,
+    };
+    Some(if tv {
+        format!("Search.series.{external}.S01E01.{quality}.WEB-DL.mkv")
+    } else {
+        format!("Search.movie.{external}.2030.{quality}.WEB-DL.English.mkv")
+    })
 }
 async fn completed_observations(
     State(state): State<Arc<ProviderObservations>>,
@@ -344,6 +406,10 @@ async fn provider_mock(
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "PRIVATE_FIXTURE_AUTH_FAILURE").into_response();
     }
+    // Bounded owned health probe delay for pending-generation/cancel browser checks.
+    if uri.path() == "/api/v2/app/preferences" && state.1.load(Ordering::SeqCst) == 3 {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
     if uri.path() == "/api/v2/torrents/info" {
         match state.1.load(Ordering::SeqCst) {
             1 => {
@@ -391,7 +457,15 @@ async fn provider_mock(
                 "b".repeat(40)
             };
             let searching = state.2.load(Ordering::SeqCst) == 2;
-            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":name(tv),"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{}",name(tv))}));
+            let download_name = if searching {
+                let Some(name) = search_download_name(&hash) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                name
+            } else {
+                name(tv).to_owned()
+            };
+            state.3.lock().unwrap().push(json!({"hash":hash,"category":category,"name":download_name,"state":if searching {"downloading"}else{"uploading"},"progress":if searching {0.5}else{1.0},"size":1048576,"amount_left":if searching {524288}else{0},"dlspeed":0,"upspeed":0,"ratio":0.0,"seeding_time":0,"ratio_limit":-2.0,"seeding_time_limit":-2,"inactive_seeding_time_limit":-1,"seq_dl":false,"f_l_piece_prio":false,"auto_tmm":false,"force_start":false,"priority":5,"tags":"","save_path":"/remote","content_path":format!("/remote/{download_name}")}));
             return "Ok.".into_response();
         }
         if uri.path() == "/api/v2/torrents/setForceStart" {
@@ -430,11 +504,15 @@ async fn provider_mock(
             return Json(rows).into_response();
         }
         if uri.path() == "/api/v2/torrents/files" {
-            let tv = query.get("hash").is_some_and(|v| v == &"a".repeat(40));
-            return Json(
-                json!([{"index":0,"name":name(tv),"size":1048576,"progress":1.0,"priority":1}]),
-            )
-            .into_response();
+            let downloads = state.3.lock().unwrap();
+            let Some(row) = downloads.iter().find(|row| {
+                query
+                    .get("hash")
+                    .is_some_and(|hash| row["hash"] == hash.as_str())
+            }) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            return Json(json!([{"index":0,"name":row["name"],"size":1048576,"progress":row["progress"],"priority":1}])).into_response();
         }
         if uri.path() == "/api/v2/torrents/properties" {
             return Json(json!({"save_path":"/remote","total_size":1048576,"addition_date":1,"completion_date":2,"seeding_time":0})).into_response();
@@ -443,7 +521,7 @@ async fn provider_mock(
     match uri.path() {
         "/api/v2/app/webapiVersion"=>"2.8.3".into_response(),
         "/api/v2/app/version"=>"v4.6.0".into_response(),
-        "/api/v2/app/preferences"=>Json(json!({"queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
+        "/api/v2/app/preferences"=>Json(json!({"save_path":"/remote","queueing_enabled":true,"dht":true,"max_ratio_enabled":false,"max_ratio":-1,"max_seeding_time_enabled":false,"max_seeding_time":-1,"max_ratio_act":0})).into_response(),
         "/api/v2/torrents/categories"=>Json(json!({"tv":{"savePath":"/fixture/tv"},"movies":{"savePath":"/fixture/movies"}})).into_response(),
         "/api/v2/torrents/info" if query.get("category").is_some_and(|v|matches!(v.as_str(),"tv"|"movies"))=>Json(json!([{"hash":"1111111111111111111111111111111111111111","category":query.get("category"),"name":"Fixture download","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0}])).into_response(),
         _=>StatusCode::NOT_FOUND.into_response(),
@@ -537,6 +615,42 @@ async fn blocklist_fixture(
     })
 }
 
+// Genuine source backups seed historical unresolved references through the importer.
+async fn release_profile_fixture(
+    db: Arc<Database>,
+    root: &std::path::Path,
+) -> Arc<BlocklistFixture> {
+    let mut bytes = Vec::new();
+    for tv in [true, false] {
+        let path = root.join(if tv {
+            "release-sonarr.db"
+        } else {
+            "release-radarr.db"
+        });
+        let source = libsql::Builder::new_local(&path).build().await.unwrap();
+        let c = source.connect().unwrap();
+        c.execute_batch(if tv {r#"CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(233);
+CREATE TABLE Series(Id INTEGER,TvdbId INTEGER,Title TEXT,Year INTEGER,Path TEXT,Monitored INTEGER,Seasons TEXT);
+CREATE TABLE Episodes(Id INTEGER,SeriesId INTEGER,SeasonNumber INTEGER,EpisodeNumber INTEGER,Title TEXT,Monitored INTEGER,EpisodeFileId INTEGER);
+CREATE TABLE EpisodeFiles(Id INTEGER,SeriesId INTEGER,RelativePath TEXT);
+CREATE TABLE ReleaseProfiles(Id INTEGER,Name TEXT,Enabled INTEGER,Required TEXT,Ignored TEXT,IndexerIds TEXT,Tags TEXT,ExcludedTags TEXT,AirDateRestriction INTEGER,AirDateGracePeriod INTEGER,AllowSeasonPackWithoutAllEpisodesAired INTEGER);
+INSERT INTO ReleaseProfiles VALUES(77,'Historical unresolved',0,'["WEB"]','[]','[77]','[]','[]',0,0,0);"#} else {r#"CREATE TABLE VersionInfo(Version INTEGER);INSERT INTO VersionInfo VALUES(242);
+CREATE TABLE MovieMetadata(Id INTEGER,TmdbId INTEGER,ImdbId TEXT,Title TEXT,Year INTEGER);
+CREATE TABLE Movies(Id INTEGER,MovieMetadataId INTEGER,Path TEXT,Monitored INTEGER,MovieFileId INTEGER);
+CREATE TABLE MovieFiles(Id INTEGER,MovieId INTEGER,RelativePath TEXT,Edition TEXT);
+CREATE TABLE ReleaseProfiles(Id INTEGER,Name TEXT,Enabled INTEGER,Required TEXT,Ignored TEXT,IndexerId INTEGER,Tags TEXT);
+INSERT INTO ReleaseProfiles VALUES(77,'Historical unresolved',0,'["WEB"]','[]',77,'[]');"#}).await.unwrap();
+        drop(c);
+        drop(source);
+        bytes.push(std::fs::read(path).unwrap());
+    }
+    Arc::new(BlocklistFixture {
+        db,
+        tv: bytes.remove(0),
+        movies: bytes.remove(0),
+    })
+}
+
 #[tokio::test]
 #[ignore = "manual browser fixture; owned loopback servers, max 15 minutes"]
 async fn library_ui_fixture() {
@@ -559,6 +673,13 @@ async fn library_ui_fixture() {
         "Refreshed.movie.2021.1080p.WEB-DL.mkv",
     ] {
         std::fs::write(incoming.join(name), vec![7u8; 1048576]).unwrap();
+    }
+    for digit in ["1", "3", "6", "8"] {
+        std::fs::write(
+            incoming.join(search_download_name(&digit.repeat(40)).unwrap()),
+            vec![7u8; 1048576],
+        )
+        .unwrap();
     }
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
@@ -591,12 +712,14 @@ async fn library_ui_fixture() {
             .route("/fixture-processing", post(processing_mode))
             .route("/fixture-search", post(search_mode))
             .route("/fixture-completed", get(completed_observations))
+            .route("/fixture-complete-search", post(complete_search))
             .fallback(provider_mock)
             .with_state(Arc::new(ProviderObservations::default())),
     )
     .await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let release_fixture = release_profile_fixture(db.clone(), &scratch.0).await;
     let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0, 901).await;
     let clear_root = scratch.0.join("clear-source");
     std::fs::create_dir(&clear_root).unwrap();
@@ -611,10 +734,21 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::health::router(db.clone()))
+            .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
+            .merge(hrrdarr::release_profiles::router(db.clone()))
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/fixture/import-release-profiles",
+                        post(import_blocklists),
+                    )
+                    .with_state(release_fixture),
+            )
             .merge(hrrdarr::delay_profiles::router(db.clone()))
             .merge(hrrdarr::revision_policy::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))

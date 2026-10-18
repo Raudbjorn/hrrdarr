@@ -6,7 +6,7 @@ use axum::{
     routing::post,
 };
 use hrrdarr::{db::Database, snapshots};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, sync::Arc};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -75,6 +75,9 @@ impl ProcessFailure {
 }
 
 async fn run() -> Result<(), ProcessFailure> {
+    // Validate host inputs before database migration or worker side effects.
+    let host = hrrdarr::host::HostConfig::from_env()
+        .map_err(|e| ProcessFailure::at("host_configuration", e))?;
     let db = if let (Ok(url), Ok(token)) =
         (env::var("TURSO_DATABASE_URL"), env::var("TURSO_AUTH_TOKEN"))
     {
@@ -117,18 +120,13 @@ async fn run() -> Result<(), ProcessFailure> {
         metadata,
     });
     let (app, refresh) = router_parts(state.clone());
-    let addr: SocketAddr = env::var("HRRDARR_BIND")
-        // 8787 collides with a live Readarr instance on hosts running the rest of the *arr
-        // family alongside hrrdarr; 8760 avoids the whole 76xx-97xx range those apps use.
-        .unwrap_or_else(|_| "127.0.0.1:8760".into())
-        .parse()
-        .map_err(|e| ProcessFailure::at("bind_address", e))?;
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind(host.bind_address())
         .await
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     let bound = listener
         .local_addr()
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
+    let app = host.apply(app, bound);
     println!("hrrdarr listening on http://{bound}");
     let runtime = if state.db.permits_local_imports() {
         Some(
@@ -144,7 +142,11 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -172,10 +174,14 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
         .merge(hrrdarr::tags::router(state.db.clone()))
         .merge(hrrdarr::revision_policy::router(state.db.clone()))
+        .merge(hrrdarr::completed_download_handling::router(
+            state.db.clone(),
+        ))
         .merge(hrrdarr::delay_profiles::router(state.db.clone()))
         .merge(hrrdarr::release_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
+        .merge(hrrdarr::credits::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
         .merge(hrrdarr::library::metadata_router(
             state.db.clone(),
@@ -187,6 +193,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
         .merge(hrrdarr::commands::router(state.db.clone()))
+        .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))
         .merge(hrrdarr::blocklist::router(state.db.clone()))
         .merge(hrrdarr::naming::router(state.db.clone()))
