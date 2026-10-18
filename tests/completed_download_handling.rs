@@ -887,31 +887,121 @@ async fn snapshot_capacity_shortfall_commits_intent_pending_and_activates_when_s
     }
 }
 #[tokio::test]
-async fn snapshot_shared_legacy_endpoint_is_an_ambiguous_match_not_a_capacity_deferral() {
+async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_applies_library() {
     let _serial = SNAPSHOTS.lock().await;
-    let s = Scratch::new();
-    let path = s.0.join("db");
-    let db = Database::open_local(&path).await.unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let c = db.connect().await.unwrap();
-    // Same host/port as the source client: matching cannot pick one of 65 candidates, so the
-    // import is a conflict and nothing applies. This is source-client matching, not capacity.
-    legacy_clients(&c, "tv", "http://127.0.0.1:9").await;
-    let before = database_state(&c).await;
-    let bytes = fixture(&s, 233, "shared", &capacity_source(233, true)).await;
-    let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
-    let report =
-        snapshots::import_with_providers(&db, Application::Sonarr, bytes, false, Some(&key))
+    for version in [233, 206, 242] {
+        let media = if version == 233 { "tv" } else { "movies" };
+        let app = if version == 233 {
+            Application::Sonarr
+        } else {
+            Application::Radarr
+        };
+        let library = if version == 233 { "series" } else { "movies" };
+        let shape = format!("version {version}");
+        let s = Scratch::new();
+        let path = s.0.join("db");
+        let db = Database::open_local(&path).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let c = db.connect().await.unwrap();
+        // Same host/port as the source client: matching cannot pick one of 65 candidates.
+        legacy_clients(&c, media, "http://127.0.0.1:9").await;
+        // An indexer bound to the ambiguous client depends on it and must not be reconstructed unbound.
+        let bound = format!(
+            "{}CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER,EnableAutomaticSearch INTEGER,EnableInteractiveSearch INTEGER,DownloadClientId INTEGER);INSERT INTO Indexers VALUES(1,'Bound','Torznab','TorznabSettings','{{\"baseUrl\":\"https://indexer.test\"}}',1,1,1,1,1);",
+            capacity_source(version, true)
+        );
+        let bytes = fixture(&s, version, "shared", &bound).await;
+        let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
+        // Reasoning: before #20 this whole import rolled back (applied=false). The ambiguous client
+        // row writes nothing and nothing in this import references it, so the library now applies
+        // and the report names the source row and candidate count instead.
+        let report = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
             .await
             .unwrap();
-    assert!(!report.applied, "{report:?}");
-    assert!(report.conflicts >= 1, "{report:?}");
-    assert_eq!(
-        database_state(&c).await,
-        before,
-        "an unapplied import leaves no state"
-    );
+        assert!(report.applied, "{shape}: {report:?}");
+        assert_eq!(report.conflicts, 0, "{shape}: {report:?}");
+        let conflict = serde_json::to_value(&report.provider_conflicts).unwrap();
+        assert_eq!(
+            conflict,
+            json!([{"table":"DownloadClients","source_id":1,"reason":"ambiguous","candidates":65,"blocking":false}]),
+            "{shape}"
+        );
+        let public = serde_json::to_string(&report).unwrap();
+        assert!(
+            !public.contains("127.0.0.1") && !public.contains("Source client"),
+            "{shape}: reports never contain source values"
+        );
+        assert_eq!(
+            scalar(&c, &format!("SELECT count(*) FROM {library}")).await,
+            1,
+            "{shape}"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
+            0,
+            "{shape}: no mapping is guessed"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM providers").await,
+            65,
+            "{shape}: no duplicate client and no unbound indexer is created"
+        );
+        assert!(
+            report.unsupported.iter().any(|u| u
+                .columns
+                .iter()
+                .any(|c| c == "DownloadClientId (unmapped; indexer not reconstructed)")),
+            "{shape}: {report:?}"
+        );
+        // The raw source row is still archived privately for a later reconciliation.
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM snapshot_records WHERE source_table='DownloadClients'"
+            )
+            .await,
+            1,
+            "{shape}"
+        );
+        // An exact rerun is idempotent: same report entry, no state change.
+        let before = database_state(&c).await;
+        let rerun = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+            .await
+            .unwrap();
+        assert!(rerun.applied && rerun.conflicts == 0, "{shape}: {rerun:?}");
+        assert_eq!(
+            serde_json::to_value(&rerun.provider_conflicts).unwrap(),
+            conflict,
+            "{shape}"
+        );
+        assert_eq!(database_state(&c).await, before, "{shape}");
+        // Once the candidates are resolved, rerunning the same snapshot maps the row, because the
+        // conflicted row stored no mapping.
+        c.execute("DELETE FROM providers", ()).await.unwrap();
+        let mapped = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+            .await
+            .unwrap();
+        assert!(
+            mapped.applied && mapped.conflicts == 0,
+            "{shape}: {mapped:?}"
+        );
+        assert!(mapped.provider_conflicts.is_empty(), "{shape}: {mapped:?}");
+        assert_eq!(
+            mapped.mapped, 2,
+            "{shape}: only the client and its bound indexer are new"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
+            2,
+            "{shape}"
+        );
+        assert_eq!(
+            scalar(&c, &format!("SELECT count(*) FROM {library}")).await,
+            1,
+            "{shape}"
+        );
+    }
 }
 #[tokio::test]
 async fn desired_policy_tracks_provider_state_and_reset_requires_revision() {

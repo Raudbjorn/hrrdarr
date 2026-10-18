@@ -56,10 +56,37 @@ pub struct Report {
     pub mapped: usize,
     pub duplicates: usize,
     pub metadata_backfilled: usize,
+    // Blocking conflicts: any nonzero count rolls back the whole import.
     pub conflicts: usize,
     pub missing_file_records: usize,
     pub unsupported: Vec<Unsupported>,
+    // Source provider rows left unmapped, or whose stored mapping diverged. Never contains source values.
+    pub provider_conflicts: Vec<ProviderConflict>,
     pub policy: &'static str,
+}
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(rename = "SnapshotProviderConflict")]
+pub struct ProviderConflict {
+    // `Indexers` or `DownloadClients`.
+    pub table: &'static str,
+    pub source_id: i64,
+    pub reason: ProviderConflictReason,
+    // Destination configurations examined: those sharing the reconciliation identity, or the
+    // stored mapping's target (0 when it was deleted).
+    pub candidates: usize,
+    // Only a diverged stored mapping blocks; other provider conflicts leave the row unmapped.
+    pub blocking: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "SnapshotProviderConflictReason")]
+pub enum ProviderConflictReason {
+    // Several destination configurations share implementation, endpoint and media domain.
+    Ambiguous,
+    // One destination configuration shares the identity but differs in a reconstructed field.
+    Differs,
+    // The provider this snapshot row was mapped to was edited, tested or deleted since.
+    MappingChanged,
 }
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "SnapshotUnsupported")]
@@ -231,6 +258,7 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
+        provider_conflicts: Vec::new(),
         policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
@@ -737,6 +765,7 @@ pub(crate) async fn write_core_snapshot_fixture(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
+        provider_conflicts: Vec::new(),
         policy: "test predecessor",
     };
     write(conn, &source, &plan.entities, &plan.seasons, &mut report).await?;

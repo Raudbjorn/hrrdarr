@@ -642,7 +642,11 @@ export type SnapshotApplication = "sonarr" | "radarr";
 
 export type SnapshotOptions = { application: SnapshotApplication, dry_run?: boolean, import_providers?: boolean, };
 
-export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, policy: string, };
+export type SnapshotProviderConflict = { table: string, source_id: number, reason: SnapshotProviderConflictReason, candidates: number, blocking: boolean, };
+
+export type SnapshotProviderConflictReason = "ambiguous" | "differs" | "mapping_changed";
+
+export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, provider_conflicts: Array<SnapshotProviderConflict>, policy: string, };
 
 export type SnapshotUnsupported = { table: string, rows: number, columns: Array<string>, };
 

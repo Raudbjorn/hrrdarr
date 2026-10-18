@@ -2432,6 +2432,19 @@ async fn files(
         .map_err(|_| http_error(http::HttpError::Timeout).0)?
 }
 
+/// Result of reconciling one archived source provider against destination configurations.
+pub(crate) enum ImportOutcome {
+    /// An equal existing configuration, or a newly created disabled one.
+    Mapped {
+        id: String,
+        revision: i64,
+        created: bool,
+    },
+    /// Nothing was written. `candidates` counts the destination configurations examined: those
+    /// sharing the reconciliation identity, or the stored mapping's target (0 once deleted).
+    Conflict { candidates: usize },
+}
+
 /// Snapshot writer supplies the transaction; no updates, network calls or independent commit.
 pub(crate) async fn import_configuration(
     conn: &Connection,
@@ -2440,7 +2453,7 @@ pub(crate) async fn import_configuration(
     download_client_id: Option<Uuid>,
     changes: &mut HealthConfigurationChanges,
     mapped: Option<(&str, i64)>,
-) -> std::result::Result<Option<(String, i64, bool)>, &'static str> {
+) -> std::result::Result<ImportOutcome, &'static str> {
     const INVALID: &str = "invalid source provider configuration";
     const FAILED: &str = "provider reconstruction failed; transaction not committed";
     const LOCKED: &str = "provider reconstruction requires the matching credential key";
@@ -2515,23 +2528,24 @@ pub(crate) async fn import_configuration(
     };
     // Endpoint + implementation + source domain is a conservative reconciliation identity.
     // Never merge independent TV/movie configurations or pick among ambiguous candidates.
-    let mut rows = if let Some((id, _)) = mapped {
-        conn.query("SELECT id FROM providers WHERE id=?", [id])
+    let row = if let Some((id, _)) = mapped {
+        conn.query("SELECT count(*), min(id) FROM providers WHERE id=?", [id])
             .await
             .map_err(|_| FAILED)?
     } else {
-        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,settings.endpoint(),domain]).await.map_err(|_| FAILED)?
-    };
-    let candidate = rows
-        .next()
-        .await
-        .map_err(|_| FAILED)?
-        .map(|row| row.get::<String>(0).map_err(|_| FAILED))
-        .transpose()?;
-    if candidate.is_some() && rows.next().await.map_err(|_| FAILED)?.is_some() {
-        return Ok(None);
+        conn.query("SELECT count(DISTINCT p.id), min(p.id) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=?", params![implementation,settings.endpoint(),domain]).await.map_err(|_| FAILED)?
     }
-    drop(rows);
+    .next()
+    .await
+    .map_err(|_| FAILED)?
+    .ok_or(FAILED)?;
+    let candidates = usize::try_from(row.get::<i64>(0).map_err(|_| FAILED)?).map_err(|_| FAILED)?;
+    let candidate = row.get::<Option<String>>(1).map_err(|_| FAILED)?;
+    // The row must be fully released before another statement uses the connection.
+    drop(row);
+    if candidates > 1 {
+        return Ok(ImportOutcome::Conflict { candidates });
+    }
     if let Some(id) = candidate {
         let (existing, cipher) = read(conn, &id).await.map_err(|_| FAILED)?;
         let secret = cipher
@@ -2551,10 +2565,18 @@ pub(crate) async fn import_configuration(
                 == serde_json::to_value(&settings).map_err(|_| FAILED)?
             && serde_json::to_value(&secret).map_err(|_| FAILED)?
                 == serde_json::to_value(wanted_secret).map_err(|_| FAILED)?;
-        return Ok(equals.then_some((id, existing.revision, false)));
+        return Ok(if equals {
+            ImportOutcome::Mapped {
+                id,
+                revision: existing.revision,
+                created: false,
+            }
+        } else {
+            ImportOutcome::Conflict { candidates }
+        });
     }
     if mapped.is_some() {
-        return Ok(None);
+        return Ok(ImportOutcome::Conflict { candidates });
     }
     let id = Uuid::new_v4().to_string();
     let encrypted = wanted_secret
@@ -2575,7 +2597,11 @@ pub(crate) async fn import_configuration(
     crate::completed_download_handling::reconcile(conn, Some(&id), None)
         .await
         .map_err(|_| FAILED)?;
-    Ok(Some((id, 1, true)))
+    Ok(ImportOutcome::Mapped {
+        id,
+        revision: 1,
+        created: true,
+    })
 }
 
 #[derive(Deserialize)]
