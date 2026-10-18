@@ -57,6 +57,14 @@ pub fn render() -> String {
     registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
     registry.visit::<crate::recycle_bin::deletion::Deletion>();
     registry.visit::<crate::recycle_bin::deletion::Batch>();
+    registry.visit::<crate::notifications::model::NotificationInput>();
+    registry.visit::<crate::notifications::model::Notification>();
+    registry.visit::<crate::notifications::model::NotificationList>();
+    registry.visit::<crate::notifications::model::ImplementationList>();
+    registry.visit::<crate::notifications::model::TestInput>();
+    registry.visit::<crate::notifications::model::TestResult>();
+    registry.visit::<crate::notifications::model::TestAllResult>();
+    registry.visit::<crate::notifications::model::DeliveryList>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
