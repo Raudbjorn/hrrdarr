@@ -72,7 +72,8 @@ pub async fn start_with_metadata(
             if let (Some(schedule), Ok(timestamp)) = (housekeeping.as_mut(), now()) {
                 housekeeping::tick(&db, schedule, &housekeeping_policy, timestamp).await;
             }
-            iteration(&db, &client, &metadata).await;
+            // Failures are logged and recovered inside; the next tick retries.
+            let _ = iteration(&db, &client, &metadata).await;
         }
     });
     Ok(Runtime { task: Some(task) })
@@ -80,12 +81,14 @@ pub async fn start_with_metadata(
 
 /// Test seam: the background worker's ownership, startup recovery and iteration without its
 /// one-second cadence or housekeeping, so integration tests decide when a command is claimed.
-/// Callers must not overlap `step` calls: like the background loop, one iteration at a time.
+/// `step` calls are serialized: an overlapping iteration would recover (re-queue) the command
+/// the other one is running.
 #[doc(hidden)]
 pub struct Driver {
     db: Arc<Database>,
     client: RefreshClient,
     metadata: Arc<crate::metadata::MetadataClient>,
+    gate: tokio::sync::Mutex<()>,
     _owner: Owner,
 }
 #[doc(hidden)]
@@ -99,12 +102,15 @@ pub async fn start_driven(db: Arc<Database>, client: RefreshClient) -> Result<Dr
         db,
         client,
         metadata,
+        gate: tokio::sync::Mutex::new(()),
         _owner: owner,
     })
 }
 impl Driver {
-    /// Runs one worker iteration; returns whether a command was claimed.
-    pub async fn step(&self) -> bool {
+    /// Runs one worker iteration; `Ok` reports whether a command was claimed. `Err` means the
+    /// iteration failed or timed out and its storage recovery already ran, as in the loop.
+    pub async fn step(&self) -> std::result::Result<bool, IterationFailed> {
+        let _gate = self.gate.lock().await;
         iteration(&self.db, &self.client, &self.metadata).await
     }
 }
@@ -148,15 +154,19 @@ async fn acquire(db: &Arc<Database>, client: &RefreshClient) -> Result<Owner> {
     Ok(owner)
 }
 
-/// One bounded claim/run; storage failures are logged and recovered, never propagated.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct IterationFailed;
+
+/// One bounded claim/run; storage failures are logged and recovered before returning `Err`.
 async fn iteration(
     db: &Arc<Database>,
     client: &RefreshClient,
     metadata: &crate::metadata::MetadataClient,
-) -> bool {
+) -> std::result::Result<bool, IterationFailed> {
     let result = tokio::time::timeout(Duration::from_secs(45), step(db, client, metadata)).await;
     if let Ok(Ok(claimed)) = result {
-        return claimed;
+        return Ok(claimed);
     }
     eprintln!("event=command_worker_error code=storage_error");
     if !matches!(
@@ -175,8 +185,7 @@ async fn iteration(
     ) {
         eprintln!("event=command_recovery_error code=storage_error");
     }
-    // A failed or timed-out iteration may have claimed work; report progress so drivers retry.
-    true
+    Err(IterationFailed)
 }
 async fn recover_rss(db: &Database, code: &str) -> Result<()> {
     rss::recover(&connection(db).await?, now()?, code).await
