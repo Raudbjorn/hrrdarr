@@ -1,6 +1,7 @@
 <script lang="ts">
   import MediaFilesPanel from './lib/MediaFilesPanel.svelte';
   import MovieRenamePreviewPanel from './lib/MovieRenamePreviewPanel.svelte';
+  import SeriesRenamePanel from './lib/SeriesRenamePanel.svelte';
   import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
@@ -163,6 +164,16 @@
     }
     detailLoading = false;
   }
+  // A rename changes stored paths: reread detail and file lists without remounting the rename panel.
+  async function renamed() {
+    const current = selected, scope = domain;
+    if (!current || !fileTarget || fileTarget.domain !== scope || fileTarget.id !== current.id) return;
+    fileRefresh = {domain: scope, id: current.id, version: fileRefresh.version + 1};
+    const result = await getLibrary(scope, current.id);
+    if (!alive || !selected || selected.id !== current.id || domain !== scope || !result.ok) return;
+    selected = result.data;
+    void load(page?.offset ?? 0);
+  }
   async function search() {
     if(libraryLocked)return;const version = ++searchVersion, scope = domain; searching = true; searched = false; results = []; choice = null; error = '';
     const result = await lookupLibrary(scope, term);
@@ -315,10 +326,11 @@
           <button disabled={libraryLocked || profilesLoading}>Save settings</button></form></details>
         {#if domain === 'movies'}
           {#if fileWrite==='idle'}
-            {#key `${selected.id}:${movieFileVersion.id===selected.id?movieFileVersion.version:0}`}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+            {#key `${selected.id}:${movieFileVersion.id===selected.id?movieFileVersion.version:0}`}<MovieRenamePreviewPanel movieId={selected.id} onrenamed={() => void renamed()} />{/key}
           {:else}<p role="status">Filename previews are available after the file metadata write is reconciled.</p>{/if}
         {/if}
         {#if domain === 'tv'}
+          {#key `tv:${selected.id}`}<SeriesRenamePanel seriesId={selected.id} onrenamed={() => void renamed()} />{/key}
           <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={libraryLocked} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
           <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={libraryLocked} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
           <div class="pagination"><button disabled={libraryLocked || episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={libraryLocked || episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
