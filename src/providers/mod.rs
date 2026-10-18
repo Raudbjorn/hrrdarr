@@ -2548,23 +2548,26 @@ pub(crate) async fn import_configuration(
     }
     if let Some(id) = candidate {
         let (existing, cipher) = read(conn, &id).await.map_err(|_| FAILED)?;
-        let secret = cipher
-            .as_ref()
-            .map(|bytes| {
-                key.ok_or(LOCKED)?
-                    .open(&id, existing.settings.implementation(), bytes)
-                    .map_err(|_| LOCKED)
-            })
-            .transpose()?;
+        // Classify a plain or credential-presence difference without the key; decrypt only to decide equality.
         let equals = existing.name == input.name
             && !existing.enabled
             && existing.priority == input.priority
             && existing.last_test.is_none()
             && mapped.is_none_or(|(_, revision)| existing.revision == revision)
+            && cipher.is_some() == wanted_secret.is_some()
             && serde_json::to_value(&existing.settings).map_err(|_| FAILED)?
-                == serde_json::to_value(&settings).map_err(|_| FAILED)?
-            && serde_json::to_value(&secret).map_err(|_| FAILED)?
-                == serde_json::to_value(wanted_secret).map_err(|_| FAILED)?;
+                == serde_json::to_value(&settings).map_err(|_| FAILED)?;
+        let equals = match (equals, &cipher, wanted_secret) {
+            (true, Some(bytes), Some(wanted)) => {
+                let secret = key
+                    .ok_or(LOCKED)?
+                    .open(&id, existing.settings.implementation(), bytes)
+                    .map_err(|_| LOCKED)?;
+                serde_json::to_value(&secret).map_err(|_| FAILED)?
+                    == serde_json::to_value(wanted).map_err(|_| FAILED)?
+            }
+            (equals, _, _) => equals,
+        };
         return Ok(if equals {
             ImportOutcome::Mapped {
                 id,

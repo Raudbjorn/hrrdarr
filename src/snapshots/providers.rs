@@ -140,6 +140,10 @@ pub(super) fn read(
         let mut ids = std::collections::BTreeSet::new();
         for row in &table.rows {
             let id = positive(row, "Id")?;
+            // Reported as a TypeScript number in provider_conflicts; larger IDs cannot round-trip.
+            if id > 9_007_199_254_740_991 {
+                return Err(INVALID);
+            }
             if !ids.insert(id) {
                 return Err(ImportError("duplicate source provider identity"));
             }
@@ -738,6 +742,18 @@ mod tests {
             );
         }
         assert!(validate_encoding("&key=hello+world%26%E2%98%83").is_ok());
+        for (id, accepted) in [
+            (9_007_199_254_740_991, true),
+            (9_007_199_254_740_992, false),
+        ] {
+            let mut snapshot = source("DownloadClients", "QBittorrent", "{}");
+            snapshot.tables.get_mut("DownloadClients").unwrap().rows[0]
+                .insert("Id".into(), Value::Integer(id));
+            assert_eq!(
+                read(&snapshot, Application::Sonarr, &mut vec![]).is_ok(),
+                accepted
+            );
+        }
         let mut oversized = source("Indexers", "Unknown", "{}");
         let table = oversized.tables.get_mut("Indexers").unwrap();
         let row = table.rows[0].clone();
