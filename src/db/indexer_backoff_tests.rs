@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 63); // Reasoning: latest is migration file 0067 rename_commands, position 63 on this branch (0062 transmission precedes it; 0060 recycle bin, 0061 upgrade recycle (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 13 } // Reasoning: thirteen migrations follow 49 through 62 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); 0060 adds the two recycle_bin identities and 0054 through 0059, 0061 and 0062 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 14 } // Reasoning: thirteen migrations follow 49 through 62 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); 0060 adds the two recycle_bin identities and 0054 through 0059, 0061 and 0062 add none, so Health still gains ten rows.
                 );
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.
