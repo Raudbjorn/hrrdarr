@@ -728,6 +728,13 @@ pub(crate) async fn provider_scopes_allowed(
                     _ => false,
                 }
             }
+            Some(crate::providers::ProviderSettings::Torrentrss { tv, movies, .. }) => {
+                match media.as_str() {
+                    "tv" => tv.is_some(),
+                    "movies" => movies.is_some(),
+                    _ => false,
+                }
+            }
             _ => false,
         };
         if !supported {

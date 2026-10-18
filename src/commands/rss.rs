@@ -385,6 +385,18 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
     let mut query_index = 0;
     let mut offset = 0;
     let mut release_bytes = 0usize;
+    // A generic feed is one document: request it whole instead of refetching per local page.
+    let feed = connection(db)
+        .await?
+        .query(
+            "SELECT 1 FROM providers WHERE id=? AND implementation='torrentrss'",
+            [t.indexer_id.to_string()],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    let limit = if feed { indexer::FEED_PAGE_LIMIT } else { 100 };
     for page_number in 0..10 {
         let page = client
             .raw_search(
@@ -395,7 +407,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
                     media_type: t.media_type,
                     offset,
                     query_index,
-                    limit: 100,
+                    limit,
                 },
             )
             .await;

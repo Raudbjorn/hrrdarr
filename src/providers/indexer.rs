@@ -10,6 +10,8 @@ pub use feed::{FeedDomainTest, FeedTest};
 
 const XML_BYTES: usize = 1024 * 1024;
 const MAX_ITEMS: u32 = 500;
+/// One RSS request covers a whole generic feed document, so it is fetched once per capture.
+pub(crate) const FEED_PAGE_LIMIT: u32 = feed::FEED_MAX_ITEMS as u32;
 const MAX_QUERY_TEXT_BYTES: usize = 8192;
 const MAX_QUERIES: usize = 70;
 const NEWZNAB: &str = "http://www.newznab.com/DTD/2010/feeds/attributes/";
@@ -2153,12 +2155,22 @@ pub(crate) async fn raw_search(
     })
 }
 
+const MIN_REDACTED_COOKIE_VALUE: usize = 8;
 /// Raw locators remain private, but metadata may later appear in decision receipts.
 fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
+    // Individual cookie values are redacted too; short ones (ids, flags) are left alone,
+    // since replacing e.g. "7" would corrupt release titles that later feed parsing.
+    let cookie_values = access
+        .cookie
+        .into_iter()
+        .flat_map(|header| header.split(';'))
+        .filter_map(|pair| pair.split_once('=').map(|(_, value)| value.trim()))
+        .filter(|value| value.len() >= MIN_REDACTED_COOKIE_VALUE);
     for secret in access
         .api_key
         .into_iter()
         .chain(access.cookie)
+        .chain(cookie_values)
         .chain(
             access
                 .tv_parameters

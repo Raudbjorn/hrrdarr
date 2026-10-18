@@ -161,6 +161,7 @@ const MALFORMED_ITEM: u8 = 7;
 const SEEDERS: u8 = 8;
 const RATE_LIMITED: u8 = 9;
 const ENCLOSURE_ONLY: u8 = 10;
+const LARGE: u8 = 11;
 const TORRENT_FILE: &str =
     "d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
 // SHA-1 of the exact bencoded info dictionary served above.
@@ -188,6 +189,8 @@ fn feed_xml(kind: &str, mode: u8, endpoint: &str) -> String {
     };
     let body = match mode {
         EMPTY => String::new(),
+        // More than one local page (100) of valid items in a single document.
+        LARGE => (0..150).map(|i| format!(r#"<item><title>Large.{i}.S01E01.1080p</title><guid>g-large-{i}</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://t.example/large/{i}</link></item>"#)).collect(),
         SEEDERS => r#"<item><title>High.Seeds.S01E01.1080p</title><guid>g-high</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://t.example/1</link><torrent:seeds>10</torrent:seeds></item><item><title>Low.Seeds.S01E01.1080p</title><guid>g-low</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://t.example/2</link><torrent:seeds>1</torrent:seeds></item><item><title>Unknown.Seeds.S01E01.1080p</title><guid>g-unknown</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://t.example/3</link></item>"#.to_string(),
         _ => format!("{good}{extra}"),
     };
@@ -1279,4 +1282,54 @@ async fn bulk_administration_and_test_all_treat_feeds_as_indexers() {
         1,
         "only the client remains"
     );
+}
+
+#[tokio::test]
+async fn feeds_larger_than_one_page_are_fetched_once_per_capture() {
+    let (scratch, db, state, remote_base, _remote, base, _server, client) = harness().await;
+    seed(&db).await;
+    let _keep = &scratch;
+    let feed = create_feed(&base, &remote_base, Some(scope(None)), None).await;
+    let download = create_client(&base, &remote_base).await;
+    let runtime = commands::start(db.clone(), client).await.unwrap();
+    state.feed_mode.store(LARGE, Ordering::SeqCst);
+    let command = enqueue(&base, target(&feed, &download, "tv")).await;
+    let done = until(&base, &command["id"]).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    // Paging locally over a refetched document could skip or repeat shifted items.
+    assert_eq!(feed_hits(&state), 1, "one fetch even past 100 items");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn release_profile_references_allow_feed_updates_but_block_scope_removal() {
+    let (scratch, _db, _state, remote_base, _remote, base, _server, _client) = harness().await;
+    let _keep = &scratch;
+    let feed = create_feed(&base, &remote_base, Some(scope(None)), Some(scope(None))).await;
+    let profile = json!({"name":null,"enabled":true,"required":["WEB"],"ignored":[],"tag_ids":[],
+        "indexers":[{"kind":"provider","id":feed["id"]}],"excluded_tag_ids":[],
+        "air_date_restriction":false,"air_date_grace_period_days":0,
+        "allow_season_pack_without_all_episodes_aired":false});
+    let (code, value) = request(
+        &base,
+        "POST",
+        "/api/v1/tv/release-profiles",
+        json!({"revision":1,"profile":profile}),
+    )
+    .await;
+    assert_eq!(code, 201, "{value}");
+    let path = format!("/api/v1/providers/{}", feed["id"].as_str().unwrap());
+    let mut change = feed_body(&remote_base, Some(scope(Some(3))), Some(scope(None)));
+    change.as_object_mut().unwrap().remove("credentials");
+    change["revision"] = feed["revision"].clone();
+    let (code, updated) = request(&base, "PUT", &path, change.clone()).await;
+    assert_eq!(
+        code, 200,
+        "a referenced scope that remains present permits updates: {updated}"
+    );
+    change["revision"] = updated["revision"].clone();
+    change["settings"]["tv"] = Value::Null;
+    let (code, error) = request(&base, "PUT", &path, change).await;
+    assert_eq!(code, 409, "{error}");
+    assert_eq!(error["error"]["code"], "provider_in_use");
 }

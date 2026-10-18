@@ -468,3 +468,47 @@ fn categories_come_from_the_scope_unless_the_item_states_numeric_ones() {
     .unwrap();
     assert_eq!((feed.items.len(), feed.warnings.len()), (1, 1));
 }
+
+#[test]
+fn blank_enclosure_urls_fall_back_to_the_link() {
+    // A blank URL would otherwise resolve to the feed endpoint and grab the RSS XML.
+    for url in ["", "   "] {
+        let release = one(&format!(
+            r#"<item><title>A</title><pubDate>2024-01-01T12:00:00Z</pubDate>
+            <link>https://tracker.example/dl/a.torrent</link>
+            <enclosure url="{url}" length="1" type="application/x-bittorrent"/></item>"#
+        ));
+        assert_eq!(release.download_url, "https://tracker.example/dl/a.torrent");
+    }
+}
+
+#[test]
+fn individual_cookie_values_are_redacted_but_short_ids_are_not() {
+    let mut items = vec![one(
+        r#"<item><title>Show.S07E07.secretTOKEN123.uid7</title><pubDate>2024-01-01T12:00:00Z</pubDate>
+        <link>https://tracker.example/dl/a.torrent</link></item>"#,
+    )];
+    let access = crate::providers::credentials::IndexerAccess {
+        api_key: None,
+        cookie: Some("uid=7; pass=secretTOKEN123"),
+        tv_parameters: &[],
+        movie_parameters: &[],
+    };
+    super::super::redact_secrets(&mut items, &access);
+    // Short values like uid=7 are not redacted: replacing "7" would corrupt S07E07.
+    assert_eq!(
+        items[0].metadata.title.as_deref(),
+        Some("Show.S07E07.[redacted].uid7")
+    );
+}
+
+#[test]
+fn namespaced_title_and_guid_extensions_are_ignored() {
+    let release = one(
+        r#"<item xmlns:media="http://search.yahoo.com/mrss/"><title>Show.S01E01</title>
+        <media:title>Extension title</media:title><guid>g-1</guid><media:guid>ext</media:guid>
+        <pubDate>2024-01-01T12:00:00Z</pubDate><link>https://tracker.example/dl/a.torrent</link></item>"#,
+    );
+    assert_eq!(release.metadata.title.as_deref(), Some("Show.S01E01"));
+    assert_eq!(release.guid.as_deref(), Some("g-1"));
+}
