@@ -557,6 +557,33 @@ export const bulkUpdateCollections = (ids: number[], patch: import('./api.genera
 export const startCollectionRefresh = () => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands`, {}, 'POST', true);
 export const getCollectionRefresh = (id: string) => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands/${encodeURIComponent(id)}`, undefined, undefined, true);
 export const listCollectionRefreshes = (limit = 5) => request<ApiPage<import('./api.generated').CollectionRefreshCommand>>(`${COLLECTIONS}/refresh-commands?limit=${limit}`, undefined, undefined, true);
+// ---- rename (cmd.011/cmd.012, api.044) ------------------------------------------------------
+import type { TvRenamePreview, FolderRenamePreview, RenameInput, RenameCommand, RenameCommandDetail } from './api.generated';
+const posId = (id: number) => Number.isSafeInteger(id) && id > 0;
+const idList = (ids: number[], max: number) => Array.isArray(ids) && ids.length > 0 && ids.length <= max && new Set(ids).size === ids.length && ids.every(posId);
+const invalidRename = <T>(error = 'Invalid rename request.'): Result<T> => ({ ok: false, error });
+export const getTvRenamePreview = (seriesId: number, season?: number): Promise<Result<TvRenamePreview>> => {
+  if (!posId(seriesId) || (season !== undefined && !(Number.isSafeInteger(season) && season >= 0))) return Promise.resolve(invalidRename('Select one series with a positive safe ID.'));
+  const query = new URLSearchParams({ series_id: String(seriesId), ...(season === undefined ? {} : { season: String(season) }) });
+  return request<TvRenamePreview>(`/api/v1/tv/rename-preview?${query}`, undefined, undefined, true);
+};
+export const getFolderRenamePreview = (media: MediaDomain, ids: number[]): Promise<Result<FolderRenamePreview>> => {
+  if (!idList(ids, 50)) return Promise.resolve(invalidRename('Select up to 50 distinct positive IDs.'));
+  const key = media === 'tv' ? 'series_ids' : 'movie_ids';
+  const query = new URLSearchParams({ [key]: [...ids].sort((a, b) => a - b).join(',') });
+  return request<FolderRenamePreview>(`/api/v1/${media}/rename-folder-preview?${query}`, undefined, undefined, true);
+};
+export const createRenameCommand = (input: RenameInput): Promise<Result<RenameCommand>> => {
+  const t = input?.target;
+  const tv = t?.media_type === 'tv';
+  const owners = tv ? t.series_ids : t?.movie_ids;
+  const files = input?.name === 'rename_files';
+  if (!t || !['tv', 'movies'].includes(t.media_type) || !idList(owners ?? [], files ? 1 : 50) || (files ? !idList(t.file_ids, 200) : t.file_ids.length !== 0) || (tv ? t.movie_ids.length : t.series_ids.length) !== 0)
+    return Promise.resolve(invalidRename());
+  return request<RenameCommand>('/api/v1/rename/commands', input, 'POST', true);
+};
+export const getRenameCommand = (id: string): Promise<Result<RenameCommandDetail>> => validOperation(id) ? request<RenameCommandDetail>(`/api/v1/rename/commands/${id}`, undefined, undefined, true) : Promise.resolve(invalidRename('Invalid command ID.'));
+export const cancelRenameCommand = (id: string): Promise<Result<RenameCommand>> => validOperation(id) ? request<RenameCommand>(`/api/v1/rename/commands/${id}/cancel`, undefined, 'POST', true) : Promise.resolve(invalidRename('Invalid command ID.'));
 // Notifications (Connect): registry, schema-driven forms, test and delivery journal.
 import type { NotificationList, NotificationImplementationList, Notification, NotificationInput, NotificationTestInput, NotificationTestResult, NotificationTestAllResult, NotificationDeliveryList } from './api.generated';
 const validUuid = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);

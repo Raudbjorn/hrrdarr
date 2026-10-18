@@ -314,7 +314,7 @@ async fn upgrade_witness(
     // 0059 resolves client kind through provider_implementations: map only that predicate back
     // to the qBittorrent literal, and exclude the provider tables/guards it rebuilds (their rows
     // and constraints are covered by db::download_client_registry_tests).
-    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(replace(sql,'+(SELECT count(*) FROM rename_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
         name IN ({predecessor_names}) AND
         NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections')) AND
         name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
@@ -555,7 +555,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        66 // Reasoning: latest is 0066 (0065 autotagging rules, 0066 collections, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -697,7 +697,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        66 // Reasoning: latest is 0066 (0065 autotagging rules, 0066 collections, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

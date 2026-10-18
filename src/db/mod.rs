@@ -271,6 +271,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     // NZBGet registry, file 0064.
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     (
+        "rename_commands",
+        include_str!("../../migrations/0067_rename_commands.sql"),
+    ),
+    (
         "autotagging_rules",
         include_str!("../../migrations/0065_autotagging_rules.sql"),
     ),

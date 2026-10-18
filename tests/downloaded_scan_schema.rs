@@ -16,7 +16,7 @@ const ADMISSION: [&str; 9] = [
 ];
 const CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
 // Reasoning: reopening applies every later migration; 0060 appends exactly the recycle bin cleanup term after 0054's scan term.
-const LATEST_CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
+const LATEST_CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        66 // Reasoning: latest is 0066 (0065 autotagging rules, 0066 collections, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;

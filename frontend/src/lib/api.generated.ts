@@ -302,6 +302,10 @@ export type FilesystemPath = { path: string, };
 
 export type FilesystemType = { type: FilesystemKind, };
 
+export type FolderRenamePreview = { media_type: MediaDomain, naming_revision: number, folder_format: string | null, ids: Array<number>, unchanged_count: number, items: Array<FolderRenamePreviewItem>, };
+
+export type FolderRenamePreviewItem = { series_id: number | null, movie_id: number | null, existing_path: string, new_path: string | null, status: RenameStatus, reasons: Array<RenameReason>, };
+
 export type HealthAdmission = { "outcome": "queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "coalesced_queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "pending", active_command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, };
 
 export type HealthCheckState = { identity: HealthIdentity, startup: boolean, scheduled: boolean, generation: number, observed_generation: number | null, checked_at: number | null, observed_epoch: string | null, evaluation: HealthEvaluation, last_error: string | null, pending_reasons: number, due_at: number | null, };
@@ -794,6 +798,44 @@ export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: In
 
 export type ReleaseTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
+export type RenameCommand = { id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+/**
+ * More changes existed than one run handles; run the command again to continue.
+ */
+bounded: boolean, };
+
+export type RenameCommandDetail = { items: Array<RenameItem>, id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+/**
+ * More changes existed than one run handles; run the command again to continue.
+ */
+bounded: boolean, };
+
+export type RenameEvent = { id: string, event_type: string, kind: RenameEventKind, owner: RenameOwner, file_id: number | null, command_id: string, old_path: string, new_path: string, sidecar_count: number, occurred_at: string, dispatched: boolean, };
+
+export type RenameEventKind = "file" | "folder";
+
+export type RenameEventQuery = { media_type?: MediaDomain, limit?: number, offset?: number, };
+
+export type RenameInput = { name: RenameName, target: RenameTarget, 
+/**
+ * Fence against configuration changes after the preview the user looked at.
+ */
+expected_naming_revision?: number, priority: CommandPriority, };
+
+export type RenameItem = { kind: RenameEventKind, series_id: number | null, movie_id: number | null, file_id: number | null, old_path: string, new_path: string, state: RenameItemState, error_code: string | null, sidecar_count: number, };
+
+export type RenameItemState = "planned" | "committed" | "failed" | "rolled_back";
+
+export type RenameName = "rename_files" | "rename_series" | "rename_movie" | "rename_series_folder" | "rename_movie_folder";
+
+export type RenameOwner = { "media_type": "tv", "id": number } | { "media_type": "movies", "id": number };
+
+export type RenameReason = "invalid_path" | "outside_owner_folder" | "missing_extension" | "invalid_file_facts" | "naming_render_failed" | "multi_episode_style_required" | "no_linked_episodes" | "invalid_episode_set" | "folder_format_unavailable" | "destination_in_use" | "duplicate_destination" | "destination_exists" | "source_missing" | "path_unsafe";
+
+export type RenameStatus = "change" | "unavailable" | "blocked";
+
+export type RenameTarget = { media_type: MediaDomain, series_ids: Array<number>, movie_ids: Array<number>, file_ids: Array<number>, };
+
 export type RescanBatch = { commands: Array<RescanCommand>, busy_target_ids: Array<number>, };
 
 export type RescanCommand = { id: string, media_type: MediaDomain, series_id: number | null, movie_id: number | null, priority: CommandPriority, status: RescanStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, skip_reason: string | null, files_adopted: number | null, files_removed: number | null, };
@@ -977,6 +1019,10 @@ export type TvNumbering = { "kind": "episode", season: number, episode: number, 
 export type TvParseResult = { title: string, parsed: ParsedRelease | null, series: MatchedSeries | null, episodes: Array<MatchedEpisode>, };
 
 export type TvReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, excluded_tag_ids: Array<number>, air_date_restriction: boolean, air_date_grace_period_days: number, allow_season_pack_without_all_episodes_aired: boolean, };
+
+export type TvRenamePreview = { naming_revision: number, rename_enabled: boolean, series_ids: Array<number>, season: number | null, files_considered: number, unchanged_count: number, unavailable_count: number, blocked_count: number, items: Array<TvRenamePreviewItem>, };
+
+export type TvRenamePreviewItem = { series_id: number, episode_file_id: number, season_number: number | null, episode_ids: Array<number>, episode_numbers: Array<number>, existing_path: string | null, new_path: string | null, status: RenameStatus, reasons: Array<RenameReason>, };
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
