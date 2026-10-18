@@ -157,6 +157,20 @@ pub(crate) fn indexer_operation_enabled(
             scope.enable_automatic_search,
             scope.enable_interactive_search,
         ),
+        // A plain feed has no search API: only RSS can ever be enabled, whatever else is stored.
+        (
+            ProviderSettings::Torrentrss {
+                tv: Some(scope), ..
+            },
+            MediaDomain::Tv,
+        )
+        | (
+            ProviderSettings::Torrentrss {
+                movies: Some(scope),
+                ..
+            },
+            MediaDomain::Movies,
+        ) => (scope.enable_rss, false, false),
         _ => return false,
     };
     match operation {
@@ -221,6 +235,20 @@ pub struct MovieIndexerScope {
     #[ts(as = "Option<bool>", optional)]
     pub remove_year: bool,
 }
+// A generic feed scope. Feeds carry no capability list, so scope presence is the domain opt-in.
+// There are deliberately no search flags: sending one is rejected as an unknown field.
+#[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct FeedScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    // Releases that report fewer seeders are skipped; releases that report none are kept.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub minimum_seeders: Option<u32>,
+}
+pub(crate) const MAX_MINIMUM_SEEDERS: u32 = 1_000_000;
 #[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadInitialState {
@@ -490,7 +518,7 @@ pub(crate) enum Protocol {
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
-            "torznab" | "qbittorrent" | "transmission" => Some(Self::Torrent),
+            "torznab" | "torrentrss" | "qbittorrent" | "transmission" => Some(Self::Torrent),
             "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
             _ => None,
         }
@@ -546,6 +574,13 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TransmissionScope>,
     },
+    Torrentrss {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<FeedScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<FeedScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -556,6 +591,7 @@ impl ProviderSettings {
             Self::Sabnzbd { .. } => "sabnzbd",
             Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
+            Self::Torrentrss { .. } => "torrentrss",
         }
     }
     fn endpoint(&self) -> &str {
@@ -565,14 +601,16 @@ impl ProviderSettings {
             | Self::Qbittorrent { endpoint, .. }
             | Self::Sabnzbd { endpoint, .. }
             | Self::Nzbget { endpoint, .. }
-            | Self::Transmission { endpoint, .. } => endpoint,
+            | Self::Transmission { endpoint, .. }
+            | Self::Torrentrss { endpoint, .. } => endpoint,
         }
     }
     pub(crate) fn protocol(&self) -> Protocol {
         match self {
-            Self::Torznab { .. } | Self::Qbittorrent { .. } | Self::Transmission { .. } => {
-                Protocol::Torrent
-            }
+            Self::Torznab { .. }
+            | Self::Torrentrss { .. }
+            | Self::Qbittorrent { .. }
+            | Self::Transmission { .. } => Protocol::Torrent,
             Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
@@ -624,6 +662,18 @@ impl ProviderSettings {
                 }) || movies
                     .as_ref()
                     .is_some_and(|s| s.categories.is_empty() || !categories(&s.categories))
+                {
+                    return Err(bad());
+                }
+            }
+            Self::Torrentrss { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                if tv
+                    .iter()
+                    .chain(movies.iter())
+                    .any(|s| s.minimum_seeders.is_some_and(|n| n > MAX_MINIMUM_SEEDERS))
                 {
                     return Err(bad());
                 }
@@ -868,6 +918,7 @@ pub struct ProviderTestResult {
 #[serde(untagged)]
 pub enum ProviderTestOutcome {
     Indexer(indexer::IndexerTest),
+    Feed(indexer::FeedTest),
     DownloadClient(qbittorrent::ClientTest),
     UsenetClient(sabnzbd::SabnzbdTest),
     NzbgetClient(nzbget::NzbgetTest),
@@ -1112,6 +1163,8 @@ fn refresh_error(error: Error) -> RefreshError {
 pub(crate) enum CommunicationProbeError {
     RemoteFailure,
     Unevaluated(&'static str),
+    /// A cached cooldown refused dispatch; remaining seconds until a request may be sent.
+    Cooldown(u32),
 }
 fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError {
     use CommunicationProbeError::{RemoteFailure, Unevaluated};
@@ -1129,7 +1182,6 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
         | Q::ScopeConflict
         | Q::UnsupportedFeature
         | Q::UnsafeRetention
-        | Q::NotFound
         | Q::MutationUnknown => Unevaluated("check_failed"),
         Q::Http(
             H::Authentication
@@ -1139,6 +1191,8 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
             | H::Timeout
             | H::InvalidResponse,
         )
+        // The item-list probe only yields NotFound from an HTTP 404: a rejected route is remote.
+        | Q::NotFound
         | Q::InvalidResponse
         | Q::UnsupportedVersion
         | Q::Rejected => RemoteFailure,
@@ -1208,7 +1262,12 @@ impl RefreshClient {
         // Acquisition cooldown is old evidence; an HTTP429 returned by the probe is new evidence.
         let operation = transport
             .operation(provider.id)
-            .map_err(|_| Unevaluated("check_failed"))?;
+            .map_err(|error| match error {
+                http::HttpError::RateLimited {
+                    retry_after_seconds,
+                } => CommunicationProbeError::Cooldown(retry_after_seconds.unwrap_or(60)),
+                _ => Unevaluated("check_failed"),
+            })?;
         let work = async {
             let result =
                 refresh_items(&operation, &provider.settings, credentials.as_ref(), domain)
@@ -2131,7 +2190,9 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id,minimum_seeders FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut tv_feed = None;
+    let mut movie_feed = None;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -2144,7 +2205,28 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let mut movie_torrent = None;
     while let Some(scope) = scopes.next().await? {
         let media: String = scope.get(0)?;
-        if implementation == "transmission" {
+        if implementation == "torrentrss" {
+            // Search flags and the client binding are storage-guarded to 0/NULL for feeds; any other
+            // stored value is corruption, never silently reinterpreted.
+            if stored_bool(scope.get(15)?)?
+                || stored_bool(scope.get(16)?)?
+                || scope.get::<Option<String>>(17)?.is_some()
+            {
+                return Err(corrupt());
+            }
+            let item = FeedScope {
+                enable_rss: stored_bool(scope.get(14)?)?,
+                minimum_seeders: scope
+                    .get::<Option<i64>>(18)?
+                    .map(|n| u32::try_from(n).map_err(|_| corrupt()))
+                    .transpose()?,
+            };
+            if media == "tv" {
+                tv_feed = Some(item)
+            } else {
+                movie_feed = Some(item)
+            }
+        } else if implementation == "transmission" {
             let directory: Option<String> = conn
                 .query(
                     "SELECT directory FROM provider_scope_directories WHERE provider_id=? AND media_type=?",
@@ -2280,6 +2362,11 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             endpoint,
             tv: tv_client,
             movies: movie_client,
+        },
+        "torrentrss" => ProviderSettings::Torrentrss {
+            endpoint,
+            tv: tv_feed,
+            movies: movie_feed,
         },
         "sabnzbd" => ProviderSettings::Sabnzbd {
             endpoint,
@@ -2430,6 +2517,15 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year,rss,automatic,interactive,client]).await?;
             }
         }
+        ProviderSettings::Torrentrss { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_rss,enable_automatic_search,enable_interactive_search,minimum_seeders) VALUES(?,?,?,?,0,0,?)",params![id,implementation,domain,i64::from(s.enable_rss),s.minimum_seeders.map(i64::from)]).await?;
+            }
+        }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
@@ -2542,6 +2638,10 @@ impl HealthConfigurationChanges {
             let (selected, tv, movies) = match settings {
                 ProviderSettings::Torznab { tv, movies, .. }
                 | ProviderSettings::Newznab { tv, movies, .. } => {
+                    (&mut self.indexers, tv.is_some(), movies.is_some())
+                }
+                // Feeds count toward the indexer capability checks (RSS) but are never bound.
+                ProviderSettings::Torrentrss { tv, movies, .. } => {
                     (&mut self.indexers, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -3257,6 +3357,15 @@ async fn probe(
             .await
             .map(ProviderTestOutcome::DownloadClient)
             .map_err(qbit_error)
+    } else if matches!(settings, ProviderSettings::Torrentrss { .. }) {
+        indexer::test_feed(
+            operation,
+            settings,
+            &IndexerAccess::from_credentials(credentials),
+        )
+        .await
+        .map(ProviderTestOutcome::Feed)
+        .map_err(|e| indexer_error(e, operation))
     } else {
         indexer::test(
             operation,
@@ -3728,6 +3837,11 @@ pub(crate) async fn import_configuration(
             tv: Some(_),
             movies: None,
             ..
+        }
+        | ProviderSettings::Torrentrss {
+            tv: Some(_),
+            movies: None,
+            ..
         } => "tv",
         ProviderSettings::Torznab {
             tv: None,
@@ -3740,6 +3854,11 @@ pub(crate) async fn import_configuration(
             ..
         }
         | ProviderSettings::Qbittorrent {
+            tv: None,
+            movies: Some(_),
+            ..
+        }
+        | ProviderSettings::Torrentrss {
             tv: None,
             movies: Some(_),
             ..
@@ -3881,7 +4000,12 @@ mod communication_error_tests {
         ] {
             assert_eq!(communication_error(Q::Http(error)), RemoteFailure);
         }
-        for error in [Q::UnsupportedVersion, Q::InvalidResponse, Q::Rejected] {
+        for error in [
+            Q::UnsupportedVersion,
+            Q::InvalidResponse,
+            Q::Rejected,
+            Q::NotFound,
+        ] {
             assert_eq!(communication_error(error), RemoteFailure);
         }
         for error in [

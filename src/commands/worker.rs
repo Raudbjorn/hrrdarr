@@ -542,6 +542,75 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn enqueue_persists_origin_and_manual_coalesce_promotes_automatic_once() {
+        let (_scratch, _db, c, provider) = health_refresh_fixture().await;
+        let input = |media_type| CommandInput {
+            name: CommandName::RefreshDownloads,
+            target: RefreshTarget {
+                provider_id: provider,
+                media_type,
+            },
+            provider_revision: 1,
+            priority: CommandPriority::Normal,
+        };
+        let automatic = enqueue_origin(&c, input(MediaDomain::Tv), 1, CommandOrigin::Automatic)
+            .await
+            .unwrap();
+        let manual = enqueue_origin(&c, input(MediaDomain::Movies), 1, CommandOrigin::Manual)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM commands WHERE origin='legacy_unknown'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='tv' AND origin='automatic' AND manual_bypass=0").await, 1);
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
+        // Automatic coalescing never promotes; a manual request onto automatic work does, once.
+        assert_eq!(
+            enqueue_origin(&c, input(MediaDomain::Tv), 2, CommandOrigin::Automatic)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT manual_bypass FROM commands WHERE media_type='tv'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            enqueue_origin(&c, input(MediaDomain::Tv), 2, CommandOrigin::Manual)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(
+            enqueue_origin(&c, input(MediaDomain::Tv), 3, CommandOrigin::Manual)
+                .await
+                .unwrap()
+                .id,
+            automatic.id
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='tv' AND origin='automatic' AND manual_bypass=1").await, 1);
+        // Manual work is never relabelled by later admissions.
+        assert_eq!(
+            enqueue_origin(&c, input(MediaDomain::Movies), 2, CommandOrigin::Automatic)
+                .await
+                .unwrap()
+                .id,
+            manual.id
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
+    }
+    #[tokio::test]
     async fn health_refresh_exhaustion_keeps_snapshot_and_cancelled_callback_does_not_mark() {
         let (_scratch, db, c, provider) = health_refresh_fixture().await;
         c.execute("DELETE FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();

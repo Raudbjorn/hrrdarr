@@ -5,6 +5,10 @@ use hrrdarr::{
     search::{self, Disposition, ReleaseTarget, SearchContext},
 };
 use std::sync::Arc;
+// Release-term evaluation admits two process-wide operations with no wait queue and sheds the
+// rest as retryable `release_term_busy`. That is intended load shedding, but libtest runs these
+// tests on parallel threads in one process, so serialize them instead of tripping it.
+static TERM_ADMISSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -33,6 +37,7 @@ fn release(title: &str, tv: bool) -> indexer::Release {
 }
 #[tokio::test]
 async fn both_domain_decisions_and_real_search_consumer() {
+    let _serial = TERM_ADMISSION.lock().await;
     let path = std::env::temp_dir().join(format!("hrrdarr-release-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&path).unwrap();
     let _scratch = Scratch(path.clone());
@@ -247,6 +252,8 @@ async fn both_domain_decisions_and_real_search_consumer() {
     c.execute("UPDATE file_metadata SET quality_id=3", ())
         .await
         .unwrap();
+    // Equal quality and score (0 <= 0) at both cutoffs: Sonarr's disk CutoffNotMet gate
+    // rejects as cutoff met before IsUpgradable would report the non-improving score.
     assert!(
         search::evaluate(
             &c,
@@ -565,6 +572,7 @@ async fn both_domain_decisions_and_real_search_consumer() {
 // plain-column duplicate that must still fail once the fallback runs.
 #[tokio::test]
 async fn anime_scene_absolute_falls_back_to_plain_column_at_decision_time() {
+    let _serial = TERM_ADMISSION.lock().await;
     let path = std::env::temp_dir().join(format!("hrrdarr-release-anime-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&path).unwrap();
     let _scratch = Scratch(path.clone());
@@ -667,6 +675,7 @@ async fn anime_scene_absolute_falls_back_to_plain_column_at_decision_time() {
 
 #[tokio::test]
 async fn cross_type_numbering_resolves_identity_before_policy_facts() {
+    let _serial = TERM_ADMISSION.lock().await;
     let path =
         std::env::temp_dir().join(format!("hrrdarr-cross-numbering-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&path).unwrap();
@@ -817,6 +826,7 @@ async fn cross_type_numbering_resolves_identity_before_policy_facts() {
 
 #[tokio::test]
 async fn factual_revisions_apply_domain_policy_to_every_current_file() {
+    let _serial = TERM_ADMISSION.lock().await;
     let scratch = Scratch(std::env::temp_dir().join(format!(
         "hrrdarr-revision-decisions-{}",
         uuid::Uuid::new_v4()
@@ -1051,6 +1061,7 @@ async fn selected_delay(base: &str, domain: &str, settings: serde_json::Value) {
 }
 #[tokio::test]
 async fn selected_full_delay_uses_domain_revision_and_highest_allowed_quality() {
+    let _serial = TERM_ADMISSION.lock().await;
     use serde_json::json;
     let scratch = Scratch(std::env::temp_dir().join(format!(
         "hrrdarr-full-delay-decisions-{}",
@@ -1321,6 +1332,7 @@ fn restriction_profile(tv: bool) -> serde_json::Value {
 }
 #[tokio::test]
 async fn applicable_release_restrictions_and_precise_tv_time_rules() {
+    let _serial = TERM_ADMISSION.lock().await;
     use serde_json::json;
     let scratch = Scratch(
         std::env::temp_dir().join(format!("hrrdarr-restrictions-{}", uuid::Uuid::new_v4())),
@@ -1371,6 +1383,46 @@ async fn applicable_release_restrictions_and_precise_tv_time_rules() {
         .unwrap()
         .disposition,
         Disposition::Accept
+    );
+    // Native add/refresh stores canonical naive UTC (no offset). Those values are
+    // known instants: aired ones must not trip the window, unaired ones still must.
+    c.execute("UPDATE episodes SET air_date_utc='2026-09-23 12:00:00'", ())
+        .await
+        .unwrap();
+    let reasons = search::evaluate(
+        &c,
+        MediaDomain::Tv,
+        indexer,
+        &empty_pack,
+        SearchContext::UserSearch,
+        now,
+    )
+    .await
+    .unwrap()
+    .reasons;
+    assert!(
+        !reasons.iter().any(|r| r == "season_pack_not_aired"),
+        "{reasons:?}"
+    );
+    c.execute(
+        "UPDATE episodes SET air_date_utc='2026-09-25 12:00:00.001' WHERE id=2",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        search::evaluate(
+            &c,
+            MediaDomain::Tv,
+            indexer,
+            &empty_pack,
+            SearchContext::UserSearch,
+            now
+        )
+        .await
+        .unwrap()
+        .reasons,
+        vec!["season_pack_not_aired"]
     );
     c.execute(
         "UPDATE episodes SET air_date_utc='2026-09-24T12:00:00Z'",
@@ -1481,7 +1533,11 @@ async fn applicable_release_restrictions_and_precise_tv_time_rules() {
         ("2026-09-24T12:00:00Z", false),
         ("2026-09-24T12:00:00.500Z", true),
         ("2026-09-24", true),
-        ("2026-09-24 12:00:00", true),
+        // Offset-less canonical storage form (history::canonical_timestamp) is UTC
+        // by contract, as library.rs's julianday() aggregates already assume;
+        // only date-only values are unknown.
+        ("2026-09-24 12:00:00", false),
+        ("2026-09-24 12:00:00.5", true),
     ] {
         c.execute("UPDATE episodes SET air_date_utc=?", [date])
             .await

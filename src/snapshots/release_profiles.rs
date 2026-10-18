@@ -322,7 +322,7 @@ async fn resolve(
                 } else {
                     "movies"
                 };
-                if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab')",params![provider,media]).await?.next().await?.is_none(){report.conflicts+=1;return Ok(None)}
+                if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab','torrentrss')",params![provider,media]).await?.next().await?.is_none(){report.conflicts+=1;return Ok(None)}
                 IndexerReference::Provider {
                     id: row
                         .get::<String>(0)?

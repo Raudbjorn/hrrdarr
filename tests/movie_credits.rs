@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -263,7 +263,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

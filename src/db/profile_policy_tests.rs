@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 67); // Reasoning: latest is migration file 0067 rename_commands at position 65, after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

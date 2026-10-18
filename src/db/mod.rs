@@ -282,6 +282,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "collections",
         include_str!("../../migrations/0066_collections.sql"),
     ),
+    // Generic torrent RSS feed indexer: origin/main authored this as 0050 before the registry
+    // migrations; it is appended here and written against the registry shape.
+    (
+        "torrent_rss_indexer",
+        include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -937,5 +943,7 @@ mod download_client_registry_tests;
 mod download_client_selection_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
+mod torrent_rss_tests;
 #[cfg(test)]
 mod transmission_registry_tests;

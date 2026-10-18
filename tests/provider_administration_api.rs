@@ -196,15 +196,15 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
             // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
-            // Transmission (dlc.015); the Transmission commit left this assertion stale at two.
-            assert_eq!(templates.len(), if kind == "indexer" { 2 } else { 4 });
+            // Transmission (dlc.015); indexers are Torznab, Newznab and the 0068 torrentrss feed.
+            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 4 });
             assert_eq!(
                 templates
                     .iter()
                     .map(|t| t["implementation"].as_str().unwrap())
                     .collect::<Vec<_>>(),
                 if kind == "indexer" {
-                    vec!["newznab", "torznab"]
+                    vec!["newznab", "torznab", "torrentrss"]
                 } else {
                     vec!["qbittorrent", "sabnzbd", "nzbget", "transmission"]
                 }
@@ -212,7 +212,16 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             for t in templates {
                 assert_eq!(t["enabled"], false);
                 assert_eq!(t["priority"], 1);
-                if kind == "indexer" {
+                if t["implementation"] == "torrentrss" {
+                    // Reasoning: feed defaults carry no categories or search flags; both scopes default to RSS on.
+                    assert_eq!(t["defaults"]["kind"], "feed");
+                    assert_eq!(
+                        t["defaults"]["tv"],
+                        json!({"enable_rss":true,"minimum_seeders":null})
+                    );
+                    assert_eq!(t["defaults"]["movies"], t["defaults"]["tv"]);
+                    assert_eq!(t["presets"], json!([]));
+                } else if kind == "indexer" {
                     assert_eq!(t["defaults"]["tv"]["categories"], json!([]));
                     assert_eq!(t["defaults"]["tv"]["anime_standard_format_search"], false);
                     assert_eq!(t["defaults"]["movies"]["remove_year"], false);

@@ -33,7 +33,9 @@ impl ProviderKind {
                     | ProviderSettings::Transmission { .. }
             ) | (
                 Self::Indexer,
-                ProviderSettings::Torznab { .. } | ProviderSettings::Newznab { .. }
+                ProviderSettings::Torznab { .. }
+                    | ProviderSettings::Newznab { .. }
+                    | ProviderSettings::Torrentrss { .. }
             )
         )
     }
@@ -61,6 +63,8 @@ impl ProviderFilter {
                 ProviderSettings::Torznab { movies, .. } | ProviderSettings::Newznab { movies, .. },
                 MediaDomain::Movies,
             ) => movies.is_some(),
+            (ProviderSettings::Torrentrss { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (ProviderSettings::Torrentrss { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (
                 settings @ (ProviderSettings::Qbittorrent { .. }
                 | ProviderSettings::Sabnzbd { .. }
@@ -84,6 +88,10 @@ pub enum ProviderDefaults {
     Indexer {
         tv: TvIndexerScope,
         movies: MovieIndexerScope,
+    },
+    Feed {
+        tv: FeedScope,
+        movies: FeedScope,
     },
     DownloadClient {
         imported_category: Option<String>,
@@ -125,6 +133,7 @@ pub enum ProviderImplementation {
     Nzbget,
     Qbittorrent,
     Sabnzbd,
+    Torrentrss,
     Torznab,
     Transmission,
 }
@@ -183,7 +192,8 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         ProviderImplementation::Qbittorrent
         | ProviderImplementation::Sabnzbd
         | ProviderImplementation::Nzbget
-        | ProviderImplementation::Transmission => vec![],
+        | ProviderImplementation::Transmission
+        | ProviderImplementation::Torrentrss => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -312,6 +322,23 @@ pub(super) async fn schema(
                 },
             },
         })
+        .chain(std::iter::once(ProviderTemplate {
+            implementation: ProviderImplementation::Torrentrss,
+            presets: vec![],
+            supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+            enabled: false,
+            priority: 1,
+            defaults: ProviderDefaults::Feed {
+                tv: FeedScope {
+                    enable_rss: true,
+                    minimum_seeders: None,
+                },
+                movies: FeedScope {
+                    enable_rss: true,
+                    minimum_seeders: None,
+                },
+            },
+        }))
         .collect(),
         ProviderKind::DownloadClient => vec![
             ProviderTemplate {

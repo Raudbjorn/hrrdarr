@@ -112,7 +112,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 67); // Reasoning: latest is migration file 0067 rename_commands at position 65, after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     assert_eq!(count(&c,"SELECT count(*) FROM download_processing_policies WHERE enabled_override=enabled AND revision IN (1,2)").await?,2);
     assert_eq!(count(&c,"SELECT count(*) FROM download_refresh_schedules WHERE requested_enabled=enabled AND intent='explicit' AND interval_seconds IN (123,777)").await?,2);
     assert_eq!(
@@ -208,7 +208,7 @@ async fn cdh_upgrade40_false_intent_rollback_reopen_and_capacity_recovery() -> R
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 67); // Reasoning: latest is migration file 0067 rename_commands at position 65, after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     Ok(())
 }
 

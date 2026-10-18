@@ -289,7 +289,7 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
         // one CREATE TABLE text. Its predecessor columns are still compared exactly via the table_info row below;
         // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
         // Reasoning: migration 0049 likewise appends the nullable download_client_id column, so it joins the exclusion list.
-        "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id') ORDER BY cid",
+        "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id','minimum_seeders') ORDER BY cid",
         // Reasoning: 0051 appends command origin/bypass and replaces its transition trigger; preserve predecessor columns exactly.
         "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
         // Reasoning: 0050 adds only indexer_status objects and its provider reset trigger; its dedicated migration tests cover them.
@@ -555,7 +555,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -697,7 +697,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        67 // Reasoning: latest is migration file 0067 rename_commands at position 67 (0065 autotagging rules, 0066 collections follow notifications and NZBGet in array order before it), after 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);
