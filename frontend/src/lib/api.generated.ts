@@ -394,6 +394,10 @@ export type IndexerSearch = { "kind": "rss", media_type: MediaDomain, offset?: n
 
 export type IndexerTest = { capabilities: Capabilities, domains: Array<MediaDomain>, };
 
+export type LabelClientTest = { client_version: string, domains: Array<MediaDomain>, warnings: Array<LabelTestWarning>, };
+
+export type LabelTestWarning = "label_not_created";
+
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
 
 export type LegacyError = { error: string, };
@@ -658,7 +662,7 @@ export type ProviderChanges = { enabled?: boolean | null, priority?: number | nu
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, } | { "kind": "feed", cookie?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "feed", tv: FeedScope, movies: FeedScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "nzbget_client", recent_priority: NzbgetPriority, older_priority: NzbgetPriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "feed", tv: FeedScope, movies: FeedScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "nzbget_client", recent_priority: NzbgetPriority, older_priority: NzbgetPriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "label_torrent_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -672,7 +676,7 @@ export type ProviderFilesResult = { provider_id: string, revision: number, resul
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };
 
-export type ProviderImplementation = "newznab" | "nzbget" | "qbittorrent" | "sabnzbd" | "torrentrss" | "torznab" | "transmission";
+export type ProviderImplementation = "newznab" | "nzbget" | "qbittorrent" | "sabnzbd" | "torrentrss" | "torznab" | "transmission" | "deluge";
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -696,13 +700,13 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
-export type ProviderTestOutcome = IndexerTest | FeedTest | ClientTest | SabnzbdTest | NzbgetTest | TransmissionTest;
+export type ProviderTestOutcome = IndexerTest | FeedTest | ClientTest | SabnzbdTest | NzbgetTest | TransmissionTest | LabelClientTest;
 
 export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: ProviderTestOutcome, };
 
@@ -991,6 +995,8 @@ export type TagOwners = { ids: Array<number>, total: number, limit: number, offs
 export type TagOwnersQuery = { limit?: number, offset?: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
+
+export type TorrentLabelScope = { category: string, recent_priority?: TorrentQueuePriority, older_priority?: TorrentQueuePriority, add_paused?: boolean, tags?: Array<number>, };
 
 export type TorrentPlacement = { "strategy": "category", category: string, } | { "strategy": "directory", directory: string, };
 

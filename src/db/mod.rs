@@ -294,6 +294,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "collection_snapshot",
         include_str!("../../migrations/0069_collection_snapshot.sql"),
     ),
+    // Deluge registry plus label-family scope triggers, file 0070.
+    ("deluge", include_str!("../../migrations/0070_deluge.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -941,6 +943,8 @@ mod indexer_client_tests;
 #[cfg(test)]
 mod indexer_backoff_tests;
 
+#[cfg(test)]
+mod deluge_registry_tests;
 #[cfg(test)]
 mod download_client_backoff_tests;
 #[cfg(test)]

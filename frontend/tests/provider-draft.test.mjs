@@ -108,3 +108,16 @@ test('NZBGet is a usenet download client for both domains and never accepts torr
   assert.equal(eligibleDownloadClient(client,domain==='tv'?'movies':'tv'),false);
  }
 });
+
+test('Deluge is a torrent download client for both domains and is never bound to a usenet indexer',()=>{
+ assert.equal(protocolOf('deluge'),'torrent');
+ assert.equal(isClientImplementation('deluge'),true);
+ for(const domain of ['tv','movies']){
+  const client={id:'dg',enabled:true,settings:{implementation:'deluge',endpoint:'http://127.0.0.1:8112',tv:domain==='tv'?{category:'tv'}:null,movies:domain==='movies'?{category:'movies'}:null}};
+  assert.equal(isDownloadClient(client),true);
+  assert.equal(eligibleDownloadClient(client,domain),true);
+  assert.equal(eligibleDownloadClient(client,domain==='tv'?'movies':'tv'),false);
+  assert.equal(eligibleDownloadClient(client,domain,'newznab'),false);
+  assert.equal(eligibleDownloadClient(client,domain,'torznab'),true);
+ }
+});

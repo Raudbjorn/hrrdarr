@@ -196,8 +196,8 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
             // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
-            // Transmission (dlc.015); indexers are Torznab, Newznab and the 0068 torrentrss feed.
-            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 4 });
+            // Transmission (dlc.015) and Deluge (dlc.004); indexers are Torznab, Newznab and the 0068 torrentrss feed.
+            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 5 });
             assert_eq!(
                 templates
                     .iter()
@@ -206,7 +206,7 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                 if kind == "indexer" {
                     vec!["newznab", "torznab", "torrentrss"]
                 } else {
-                    vec!["qbittorrent", "sabnzbd", "nzbget", "transmission"]
+                    vec!["qbittorrent", "sabnzbd", "nzbget", "transmission", "deluge"]
                 }
             );
             for t in templates {
@@ -238,6 +238,10 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                     assert_eq!(t["defaults"]["older_priority"], "normal");
                     assert_eq!(t["defaults"]["add_paused"], false);
                     assert_eq!(t["defaults"]["tags"], json!([]));
+                    assert!(t["defaults"].get("category").is_none());
+                } else if t["implementation"] == "deluge" {
+                    assert_eq!(t["defaults"]["kind"], "label_torrent_client");
+                    assert_eq!(t["defaults"]["add_paused"], false);
                     assert!(t["defaults"].get("category").is_none());
                 } else if t["implementation"] == "transmission" {
                     assert_eq!(t["defaults"]["kind"], "transmission_client");

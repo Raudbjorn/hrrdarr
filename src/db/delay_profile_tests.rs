@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 69); // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 70); // Reasoning: latest is migration file 0070 deluge at position 70, appended after 0069 collection_snapshot; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 69); // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 70); // Reasoning: latest is migration file 0070 deluge at position 70, appended after 0069 collection_snapshot; historical prefixes stay fixed.
     Ok(())
 }

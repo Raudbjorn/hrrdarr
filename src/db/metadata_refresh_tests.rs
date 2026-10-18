@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 69); // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 70); // Reasoning: latest is migration file 0070 deluge at position 70, appended after 0069 collection_snapshot; historical prefixes stay fixed.
     // Reasoning: 0051 adds explicit legacy provenance to every preserved command.
     for row in &mut before[0] {
         row.extend([

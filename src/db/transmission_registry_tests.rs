@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 69); // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 70); // Reasoning: latest is migration file 0070 deluge at position 70, appended after 0069 collection_snapshot; historical prefixes stay fixed.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -135,9 +135,10 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
         assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     // Reasoning: the runner continues through the later nzbget migration, so the registry holds
-    // both appended rows, ordered by implementation name.
+    // all appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
     for (name, kind, protocol) in [
+        ("deluge", "download_client", "torrent"),
         ("nzbget", "download_client", "usenet"),
         ("transmission", "download_client", "torrent"),
         ("torrentrss", "indexer", "torrent"),
@@ -279,6 +280,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 69); // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 70); // Reasoning: latest is migration file 0070 deluge at position 70, appended after 0069 collection_snapshot; historical prefixes stay fixed.
     Ok(())
 }
