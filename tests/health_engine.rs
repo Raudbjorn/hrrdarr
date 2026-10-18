@@ -33,7 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            if v["summary"]["current"] == 2 {
+            // Migration46 adds removed metadata per domain; wait for all fourteen current checks (0048 adds the indexer pair and 0049 the binding check per domain).
+            if v["summary"]["current"] == 14 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -63,7 +64,38 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    assert_eq!(fresh["summary"]["never_run"], 2);
+    // Migration46 adds removed metadata to CDH, communication and roots in each domain.
+    // Reasoning: 0048 adds indexer_search and indexer_rss and 0049 indexer_download_client per domain, so the fresh registry has fourteen identities (was 12 at schema48, 8 before).
+    assert_eq!(fresh["summary"]["never_run"], 14);
+    let identities = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["identity"]["scope"].as_str().unwrap().to_owned(),
+                    row["identity"]["check_key"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let expected = ["tv", "movies"]
+        .into_iter()
+        .flat_map(|scope| {
+            [
+                "completed_download_handling",
+                "download_client_communication",
+                "download_client_root_folder",
+                "indexer_download_client",
+                "indexer_rss",
+                "indexer_search",
+                "removed_metadata",
+            ]
+            .into_iter()
+            .map(move |key| (scope.to_owned(), key.to_owned()))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(identities(&fresh["checks"]), expected);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -133,7 +165,10 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(detail["members"].as_array().unwrap().len(), 2);
+    // Admission includes all four identities per domain, not only a larger count.
+    // Reasoning: seven identities per domain after 0049 (indexer_search/indexer_rss from 0048 and indexer_download_client); the union is fourteen.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 14);
+    assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
         &base,
@@ -170,7 +205,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     // Real provider mutations dirty the union of old/new domains, including bulk deletion.
     let c = db.connect().await.unwrap();
     let tv_before = c
-        .query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        .query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
         .await
         .unwrap()
         .next()
@@ -192,7 +227,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     .await;
     assert_eq!(status, 201, "{provider}");
     assert_eq!(
-        c.query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        c.query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
             .await
             .unwrap()
             .next()
@@ -216,7 +251,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     .await;
     assert_eq!(status, 200, "{updated}");
     assert_eq!(
-        c.query("SELECT generation FROM health_checks WHERE scope='tv'", ())
+        c.query("SELECT generation FROM health_checks WHERE scope='tv' AND check_key='completed_download_handling'", ())
             .await
             .unwrap()
             .next()
@@ -229,7 +264,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     );
     let movie_before = c
         .query(
-            "SELECT generation FROM health_checks WHERE scope='movies'",
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='completed_download_handling'",
             (),
         )
         .await
@@ -262,7 +297,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     assert_eq!(status, 204, "{error}");
     assert_eq!(
         c.query(
-            "SELECT generation FROM health_checks WHERE scope='movies'",
+            "SELECT generation FROM health_checks WHERE scope='movies' AND check_key='completed_download_handling'",
             ()
         )
         .await
@@ -278,8 +313,18 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let runtime = commands::start(db.clone(), refresh.clone()).await.unwrap();
     assert!(commands::start(db.clone(), refresh).await.is_err());
     let result = wait_current(&client, &base).await;
-    assert_eq!(result["issues"].as_array().unwrap().len(), 1);
-    assert_eq!(result["issues"][0]["identity"]["scope"], "tv");
+    // Two communication warnings now coexist with the original TV CDH warning.
+    // Reasoning: the fixture configures no indexer, so each domain's indexer_search check now also reports the
+    // none-enabled Error (indexer_rss reports nothing without an enabled indexer): 3 + 2 = 5 issues.
+    assert_eq!(result["issues"].as_array().unwrap().len(), 5);
+    assert!(
+        result["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["identity"]["scope"] == "tv"
+                && v["identity"]["check_key"] == "completed_download_handling")
+    );
     let (_, settings) = request(
         &client,
         &base,
@@ -312,7 +357,16 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     assert_eq!(pending["summary"]["stale"], 1);
-    let generation = pending["checks"][0]["generation"].clone();
+    let cdh = |snapshot: &Value| {
+        snapshot["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["identity"]["check_key"] == "completed_download_handling")
+            .unwrap()["generation"]
+            .clone()
+    };
+    let generation = cdh(&pending);
     assert_eq!(
         request(
             &client,
@@ -333,9 +387,28 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(unchanged["checks"][0]["generation"], generation);
+    assert_eq!(cdh(&unchanged), generation);
     let healthy = wait_current(&client, &base).await;
-    assert!(healthy["issues"].as_array().unwrap().is_empty());
+    // Reasoning: the fixture has no indexer, so after the CDH warning is restored the remaining issues are the two
+    // communication warnings plus each domain's none-enabled indexer_search Error (0048): 2 + 2 = 4. Intent is kept
+    // by asserting no CDH issue remains and that exactly the expected keys are present.
+    assert_eq!(healthy["issues"].as_array().unwrap().len(), 4);
+    let mut keys = healthy["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["identity"]["check_key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "download_client_communication",
+            "download_client_communication",
+            "indexer_search",
+            "indexer_search"
+        ]
+    );
     let (_, transitions) = request(
         &client,
         &base,
@@ -344,17 +417,28 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(transitions["items"].as_array().unwrap().len(), 2);
-    assert_eq!(transitions["items"][1]["kind"], "restored");
+    // Reasoning: two additional "issue" transitions record the none-enabled indexer_search Errors (one per domain).
+    assert_eq!(transitions["items"].as_array().unwrap().len(), 6);
+    let restored = transitions["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["kind"] == "restored")
+        .unwrap();
     assert_eq!(
-        transitions["items"][1]["issue"]["compatibility_type"],
+        restored["issue"]["identity"]["check_key"],
+        "completed_download_handling"
+    );
+    assert_eq!(
+        restored["issue"]["compatibility_type"],
         "ImportMechanismCheck"
     );
     runtime.shutdown().await;
     let c = db.connect().await.unwrap();
     let epoch = healthy["lifecycle"]["epoch"].as_str().unwrap();
+    // Synthetic diagnostic events explicitly belong to first attempts; no legacy provenance is invented.
     for _ in 0..1025 {
-        c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,'tv','completed_download_handling','issue',0,1,2,'test','test','https://example.invalid','ImportMechanismCheck')",libsql::params![uuid::Uuid::new_v4().to_string(),epoch,uuid::Uuid::new_v4().to_string()]).await.unwrap();
+        c.execute("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES(?,?,?,1,'tv','completed_download_handling','issue',0,1,2,'test','test','https://example.invalid','ImportMechanismCheck')",libsql::params![uuid::Uuid::new_v4().to_string(),epoch,uuid::Uuid::new_v4().to_string()]).await.unwrap();
     }
     let (_, gap) = request(
         &client,
@@ -382,7 +466,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     // Maximum-byte issue text with worst-case JSON escaping remains a bounded real response.
     let message = "\u{0001}".repeat(4096);
     let wiki = "\u{0001}".repeat(2048);
-    c.execute("UPDATE health_checks SET severity=2,reason='bounded',message=?,wiki_url=? WHERE scope='tv'",libsql::params![message,wiki]).await.unwrap();
+    c.execute("UPDATE health_checks SET severity=2,reason='bounded',message=?,wiki_url=? WHERE scope='tv' AND check_key='completed_download_handling'",libsql::params![message,wiki]).await.unwrap();
     let response = client
         .get(format!("{base}/api/v1/health"))
         .send()
@@ -392,7 +476,89 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let bytes = response.bytes().await.unwrap();
     assert!(bytes.len() < 1024 * 1024);
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["issues"][0]["message"].as_str().unwrap().len(), 4096);
+    assert!(
+        body["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["message"].as_str().unwrap().len() == 4096)
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+// A bound indexer whose download client is disabled must surface through the real worker, and
+// repairing the binding through the provider API must re-dirty and clear it (marker -> worker -> evaluator).
+#[tokio::test]
+async fn indexer_download_client_binding_is_reported_and_cleared_through_the_owned_worker() {
+    let path =
+        std::env::temp_dir().join(format!("hrrdarr-health-binding-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _scratch = Scratch(path.clone());
+    let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), None);
+    let app = health::router(db.clone())
+        .merge(completed_download_handling::router(db.clone()))
+        .merge(provider_routes);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    // The example.invalid endpoints are never contacted: creation and the health evaluator are storage-only.
+    let scope = |category: &str| json!({"category":category,"imported_category":null,"recent_priority":0,"older_priority":0});
+    let (status, download_client) = request(&client, &base, reqwest::Method::POST, "/api/v1/providers", Some(json!({"name":"Disabled client","enabled":false,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":"http://example.invalid","tv":scope("tv"),"movies":scope("movies")}}))).await;
+    assert_eq!(status, 201, "{download_client}");
+    let (status, indexer) = request(&client, &base, reqwest::Method::POST, "/api/v1/providers", Some(json!({"name":"Bound indexer","enabled":true,"priority":1,"settings":{"implementation":"torznab","endpoint":"http://example.invalid/api","tv":{"categories":[5030],"anime_categories":[],"download_client_id":download_client["id"]},"movies":{"categories":[2000],"download_client_id":download_client["id"]}}}))).await;
+    assert_eq!(status, 201, "{indexer}");
+    let runtime = commands::start(db.clone(), refresh).await.unwrap();
+    let issues = |body: &Value| {
+        body["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["identity"]["check_key"] == "indexer_download_client")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let reported = wait_current(&client, &base).await;
+    let found = issues(&reported);
+    assert_eq!(found.len(), 2, "{reported}");
+    for issue in &found {
+        assert_eq!(issue["severity"], "warning");
+        assert_eq!(issue["compatibility_type"], "IndexerDownloadClientCheck");
+        assert!(issue["message"].as_str().unwrap().contains("Bound indexer"));
+    }
+    // Repair: clear both preferences through the real API; the mutation dirties both domains.
+    let mut repair = json!({"name":indexer["name"],"enabled":indexer["enabled"],"priority":indexer["priority"],"revision":indexer["revision"],"settings":indexer["settings"]});
+    repair["settings"]["tv"]["download_client_id"] = Value::Null;
+    repair["settings"]["movies"]["download_client_id"] = Value::Null;
+    let (status, saved) = request(
+        &client,
+        &base,
+        reqwest::Method::PUT,
+        &format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap()),
+        Some(repair),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved}");
+    let cleared = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (_, v) =
+                request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
+            if v["summary"]["current"] == 14 && issues(&v).is_empty() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("clearing the binding must publish a healthy binding check");
+    assert!(issues(&cleared).is_empty());
+    runtime.shutdown().await;
     server.abort();
     let _ = server.await;
 }

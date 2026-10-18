@@ -77,6 +77,9 @@ async fn metadata_mode(
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
+        // Owned removed-health browser: actual404 and explicit valid restoration.
+        Some("4") => 4,
+        Some("5") => 5,
         _ => return StatusCode::BAD_REQUEST,
     };
     state.store(value, Ordering::SeqCst);
@@ -87,6 +90,9 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
         return Json(search_show(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -96,6 +102,10 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
 
     if id == "101" {
         let mut value = show();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> series");
+            value["status"] = json!("continuing");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed series");
             value["episodes"][0]["title"] = json!("Refreshed pilot");
@@ -111,6 +121,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
         return Json(search_movie(id)).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
+    if mode == 4 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if mode == 2 {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -120,6 +133,9 @@ async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>
 
     if id == "101" {
         let mut value = movie();
+        if mode == 5 {
+            value["title"] = json!("Removed <img src=x onerror=alert(1)> movie");
+        }
         if mode == 1 || mode == 3 {
             value["title"] = json!("Refreshed movie");
         }

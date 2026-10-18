@@ -296,11 +296,13 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Me
     read(c, id).await
 }
 struct Failure {
+    actual_not_found: bool,
     code: &'static str,
     retryable: bool,
     retry_after: Option<u32>,
 }
 fn remote_failure(error: MetadataError) -> Failure {
+    let actual_not_found = matches!(error, MetadataError::NotFound);
     let (code, retryable, retry_after) = match error {
         MetadataError::NotFound => ("metadata_not_found", false, None),
         MetadataError::InvalidInput | MetadataError::InvalidResponse => {
@@ -311,6 +313,7 @@ fn remote_failure(error: MetadataError) -> Failure {
         MetadataError::RateLimited(delay) => ("metadata_rate_limited", true, delay),
     };
     Failure {
+        actual_not_found,
         code,
         retryable,
         retry_after,
@@ -370,7 +373,7 @@ async fn publish(
         let current_target=refresh::capture(&tx,command.target.writer()).await;
         let result=match current_target {
             Ok(value) if value==command.captured()=>result,
-            Ok(_)|Err(refresh::Error::TargetChanged)|Err(refresh::Error::Conflict)=>Err(Failure{code:"target_changed",retryable:false,retry_after:None}),
+            Ok(_)|Err(refresh::Error::TargetChanged)|Err(refresh::Error::Conflict)=>Err(Failure{actual_not_found:false,code:"target_changed",retryable:false,retry_after:None}),
             Err(refresh::Error::Storage)=>return Err(Error(StatusCode::INTERNAL_SERVER_ERROR,"command_storage_error")),
         };
         match result {
@@ -378,7 +381,18 @@ async fn publish(
                 let count=refresh::apply(&tx,&command.captured(),details).await.map_err(capture_error)?;
                 tx.execute("UPDATE metadata_refresh_commands SET status='succeeded',completed_at=?,records_updated=? WHERE id=?",params![now()?,i64::from(count),command.id.to_string()]).await?;
             },
-            Err(error)=>failure(&tx,command,error).await?,
+            Err(error)=>{
+                // Only an actual refresh HTTP404, after the running/identity fences above,
+                // can mark this captured owner deleted. Settlement must commit with it.
+                if error.actual_not_found {
+                    let (sql,id)=match command.target {
+                        MetadataRefreshTarget::Tv{series_id}=>("UPDATE series SET status='deleted' WHERE id=?",series_id),
+                        MetadataRefreshTarget::Movies{..}=>("UPDATE movie_metadata SET status='deleted' WHERE id=?",command.metadata_id.ok_or(Error(StatusCode::CONFLICT,"target_changed"))?),
+                    };
+                    tx.execute(sql,[id]).await?;
+                }
+                failure(&tx,command,error).await?;
+            },
         }
         Ok(Some(read(&tx,command.id).await?))
     }.await;
@@ -399,6 +413,7 @@ async fn publish(
                     &tx,
                     command,
                     Failure {
+                        actual_not_found: false,
                         code,
                         retryable: false,
                         retry_after: None,
