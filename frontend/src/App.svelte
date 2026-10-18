@@ -35,6 +35,9 @@
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
   let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
+  // A receipt's scan link opens that scan in the library view; it never starts or retries anything.
+  let scanRequest=$state<{domain:MediaDomain;id:string;nonce:number}|null>(null),scanNonce=0;
+  function openScan(scope:MediaDomain,id:string){scanRequest={domain:scope,id,nonce:++scanNonce};navigate('library');}
   function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;navigate('activity');}
   let activityVisited=$state(false),providersVisited=$state(false),providerVersion=$state(0);
   let activityWrite=$state<SettingsWriteState>('idle'),providerWrite=$state<SettingsWriteState>('idle');
@@ -245,7 +248,7 @@
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={providerRelatedWrite} {tagVersions} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
-  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state} onscan={openScan}/></div>{/if}
   {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
   {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
@@ -320,7 +323,7 @@
   <div hidden={view!=='library'}>
     {#if importRefreshError}<p role="alert">Import completed, but library refresh failed: {importRefreshError}</p><button disabled={libraryLocked || importRefreshing} onclick={()=>importRefreshError=''}>Retry library refresh</button>{/if}
     <ImportPanel {target} label={targetLabel} owner={selected?{domain,id:selected.id}:null} active={view==='library'} relatedWrite={manualRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;manualWrite=state;}} oncomplete={refreshAfterImport} />
-    <DownloadedScanPanel {domain} active={view==='library'} relatedWrite={scanRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;scanWrite=state;}} oncomplete={refreshAfterScan} />
+    <DownloadedScanPanel {domain} active={view==='library'} request={scanRequest} relatedWrite={scanRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;scanWrite=state;}} oncomplete={refreshAfterScan} />
   </div>
 </main>
 

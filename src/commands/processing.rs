@@ -181,9 +181,12 @@ pub struct DownloadProcessing {
     pub reasons: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    // Downloaded-folder scan that reserved (or settled) this receipt; singleton retry/cancel
-    // are refused while it owns the receipt.
+    // Newest downloaded-folder scan that reserved, settled or continues (explicit successor)
+    // this receipt, or the latest scan that read its linked predecessor.
     pub scan_command_id: Option<Uuid>,
+    // The receipt is owned by scan coverage proof: singleton retry/cancel are refused
+    // (`409 processing_reserved_by_scan`); only a coverage-aware scan successor continues it.
+    pub scan_reserved: bool,
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -241,7 +244,7 @@ impl ProcessingStatus {
         }
     }
 }
-const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,CASE WHEN typeof(d.reasons_json)='text' AND length(CAST(d.reasons_json AS BLOB))<=8192 THEN CAST(d.reasons_json AS BLOB) ELSE x'00' END,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' AND length(CAST(j.path_failure_code AS BLOB))<=64 THEN CAST(j.path_failure_code AS BLOB) ELSE x'00' END,j.error_code IS NOT NULL,coalesce(d.scan_command_id,(SELECT s.id FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id ORDER BY s.created_at DESC,s.id DESC LIMIT 1))";
+const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,CASE WHEN typeof(d.reasons_json)='text' AND length(CAST(d.reasons_json AS BLOB))<=8192 THEN CAST(d.reasons_json AS BLOB) ELSE x'00' END,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' AND length(CAST(j.path_failure_code AS BLOB))<=64 THEN CAST(j.path_failure_code AS BLOB) ELSE x'00' END,j.error_code IS NOT NULL,coalesce((SELECT s.id FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id ORDER BY s.created_at DESC,s.id DESC LIMIT 1),d.scan_command_id),(d.scan_command_id IS NOT NULL OR EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.candidate_id=s.candidate_id AND ri.operation_id=s.predecessor_operation_id)))";
 const FROM: &str = "download_processing d JOIN rss_candidates r ON r.id=d.candidate_id LEFT JOIN rss_candidate_episodes e ON e.candidate_id=r.id LEFT JOIN rss_candidate_imports i ON i.candidate_id=r.id LEFT JOIN import_journal j ON j.operation_id=i.operation_id";
 fn positive(value: i64) -> Result<i64> {
     if (1..=MAX_REVISION).contains(&value) {
@@ -308,6 +311,7 @@ fn row(r: libsql::Row) -> Result<DownloadProcessing> {
             .get::<Option<String>>(23)?
             .map(|s| Uuid::parse_str(&s).map_err(|_| bad()))
             .transpose()?,
+        scan_reserved: r.get::<i64>(24)? == 1,
     })
 }
 async fn read(c: &Connection, id: Uuid) -> Result<DownloadProcessing> {

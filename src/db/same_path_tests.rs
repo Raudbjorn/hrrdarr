@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

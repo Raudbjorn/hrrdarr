@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        58 // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+        59 // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -263,7 +263,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        58 // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+        59 // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

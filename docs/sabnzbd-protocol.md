@@ -78,7 +78,7 @@ Any failure after dispatch is `MutationUnknown`, except a definite authenticatio
 
 ## Protocol routing
 
-Migration 0058 adds `provider_implementations(implementation, kind, protocol)`, a write-once table:
+Migration 0059 adds `provider_implementations(implementation, kind, protocol)`, a write-once table:
 
 | Implementation | Kind | Protocol |
 | --- | --- | --- |

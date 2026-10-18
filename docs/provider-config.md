@@ -1,6 +1,6 @@
 # Native provider configuration
 
-The first provider foundation stores Torznab, Newznab, qBittorrent and SABnzbd configuration for TV, movies, or both. Implementations, their kind and transfer protocol (torrent/usenet) are registered in `provider_implementations` (migration 0058); indexers only route to clients of the same protocol. SABnzbd settings, test and refresh behaviour are in [sabnzbd-protocol.md](sabnzbd-protocol.md). Saving it does not contact the endpoint. Torznab/Newznab now provide capability negotiation, explicit tests and scoped metadata searches; full controllers and download/grab workflows remain incomplete.
+The first provider foundation stores Torznab, Newznab, qBittorrent and SABnzbd configuration for TV, movies, or both. Implementations, their kind and transfer protocol (torrent/usenet) are registered in `provider_implementations` (migration 0059); indexers only route to clients of the same protocol. SABnzbd settings, test and refresh behaviour are in [sabnzbd-protocol.md](sabnzbd-protocol.md). Saving it does not contact the endpoint. Torznab/Newznab now provide capability negotiation, explicit tests and scoped metadata searches; full controllers and download/grab workflows remain incomplete.
 
 ## HTTP contract
 

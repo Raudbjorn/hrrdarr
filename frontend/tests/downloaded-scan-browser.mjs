@@ -1,9 +1,10 @@
 // Owned fresh library_ui_fixture + Vite proxy only. Every scan runs through the real HTTP API and
 // worker against the fixture's isolated scratch tree. One disclosed overlay: the 409 check replays
 // an earlier REAL children response so the UI holds a stale resume generation; the 409 itself is
-// produced by the real backend.
+// produced by the real backend. One disclosed seed: the fixture hook stores an observed tracked
+// receipt (no download client is contacted), then the tracked scan, handback and successor are real.
 import assert from 'node:assert/strict';
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
@@ -186,12 +187,59 @@ try {
  // page.request calls are not page traffic: only the two UI resumes were sent by the browser.
  assert.equal(resumeBodies.length,2,'Exactly the explicit UI resumes were sent');
 
- // 7. List rediscovery and mobile layout without storage: the parent list comes from the API.
+ // 7. Tracked receipt with incomplete coverage, then a reviewed "Scan remaining files" successor.
+ const seeded=await api('post','/api/fixture/tracked-scan-receipt',{series_id:series.id});
+ const trackedFolder=join(sources,'tracked','Fixture.series.S01E03.1080p.WEB-DL'),trackedFile='Fixture.series.S01E03.1080p.WEB-DL.flv';
+ const trackedIdentity={provider_id:seeded.provider_id,remote_id:seeded.remote_id};
+ await page.reload();await libraryType('tv');await panel.getByRole('heading',{name:'New TV scan',exact:true}).waitFor();
+ await setForm(trackedFolder,'copy');
+ await panel.getByLabel('Download ID',{exact:true}).isDisabled().then(disabled=>assert.ok(disabled,'Download ID needs a chosen client'));
+ await panel.getByLabel('Scan tracked client',{exact:true}).selectOption({label:'Tracked client'});
+ await panel.getByLabel('Download ID',{exact:true}).fill('NOT-A-HASH');await scanButton.click();
+ await panel.getByText('The download ID must be a lowercase 40- or 64-character hexadecimal hash.',{exact:true}).waitFor();
+ const postsBeforeTracked=scanPosts.length;
+ await panel.getByLabel('Download ID',{exact:true}).fill(seeded.remote_id);await scanButton.click();
+ await summary('Finished without importing anything (0 imported, 1 rejected');
+ assert.equal(scanPosts.length,postsBeforeTracked+1,'Invalid tracked input never reached the network');
+ const trackedScan=scanPosts.at(-1);
+ assert.deepEqual({...trackedScan.body,id:undefined},{id:undefined,path:trackedFolder,mode:'copy',priority:'normal',tracked:trackedIdentity});
+ await detail.getByText('Incomplete: 0 of 1 covered; the download stays blocked.',{exact:true}).waitFor();
+ const remaining=detail.getByRole('button',{name:'Scan remaining files',exact:true});await remaining.waitFor();
+ // Activity: the scan-reserved receipt offers no singleton retry and links back to its scan.
+ await nav.getByRole('button',{name:'Activity',exact:true}).click();
+ await page.getByRole('region',{name:'Activity',exact:true}).getByLabel('Download client').selectOption(seeded.provider_id);
+ const processing=page.getByRole('region',{name:'Completed downloads',exact:true});
+ await processing.getByText(`Episode ${seeded.episode_id}: blocked`,{exact:true}).waitFor();
+ await processing.getByText('A downloaded-folder scan holds this download\'s coverage.',{exact:false}).waitFor();
+ assert.equal(await processing.getByRole('button',{name:`Retry processing ${seeded.candidate_id}`,exact:true}).count(),0,'No singleton retry for a scan-reserved receipt');
+ await processing.getByRole('button',{name:`Open scan ${trackedScan.body.id}`,exact:true}).click();
+ await detail.getByText(`${trackedScan.body.id}`,{exact:true}).waitFor();await remaining.waitFor();
+ // The missing file arrives; the reviewed successor is a NEW request naming the settled scan.
+ writeFileSync(join(trackedFolder,trackedFile),Buffer.concat([readFileSync(join(recoveryFolder,recoveryFile)),Buffer.from([9])]));
+ await until(async()=>remaining.isEnabled(),Boolean,'Scan remaining files did not unlock');
+ await remaining.click();
+ await summary('Finished: 1 imported, 1 rejected, 0 already imported, 0 failed.');
+ assert.equal(scanPosts.length,postsBeforeTracked+2);
+ const successor=scanPosts.at(-1);assert.notEqual(successor.body.id,trackedScan.body.id,'The original inventory is never reopened');
+ assert.deepEqual({...successor.body,id:undefined},{id:undefined,path:trackedFolder,mode:'copy',priority:'normal',tracked:trackedIdentity,supersedes_command_id:trackedScan.body.id});
+ await detail.getByText('Complete: 1 of 1 covered.',{exact:true}).waitFor();
+ await entry(trackedFile).getByText('complete',{exact:true}).waitFor();
+ assert.ok(existsSync(join(tvRoot,trackedFile)),'The remaining file reached the library');
+ const handedBack=await api('get',`/api/v1/download-processing/${seeded.candidate_id}`);
+ assert.deepEqual([handedBack.status,handedBack.scan_command_id,handedBack.scan_reserved,handedBack.reasons],['imported',successor.body.id,true,[]]);
+ const original=await api('get',`/api/v1/tv/downloaded-scan-commands/${trackedScan.body.id}`);
+ assert.deepEqual([original.coverage.state,original.successor_command_id,original.successor_allowed],['incomplete',successor.body.id,false]);
+ await detail.getByRole('button',{name:`Open earlier scan ${trackedScan.body.id}`,exact:true}).click();
+ await detail.getByRole('button',{name:`Open later scan ${successor.body.id}`,exact:true}).waitFor();
+ assert.equal(await remaining.count(),0,'A continued scan offers no second successor');
+
+ // 8. List rediscovery and mobile layout without storage: the parent list comes from the API.
  await page.evaluate(key=>localStorage.removeItem(key),KEY);await page.setViewportSize({width:390,height:844});await page.reload();
  await nav.getByRole('button',{name:'Library',exact:true}).click();
  await until(()=>panel.getByRole('listitem').filter({has:page.getByRole('button',{name:new RegExp(`^${escape(recoveryFolder)}`)})}).count(),n=>n===1,'Parent not rediscovered from the list');
  assert.equal(await panel.evaluate(el=>el.scrollWidth<=el.clientWidth),true,'Scan panel overflows on mobile');
- assert.equal(scanPosts.length,7,'One POST per explicit Scan and import click');
+ // Reasoning: step 7 adds exactly two explicit POSTs (the tracked scan and its reviewed successor).
+ assert.equal(scanPosts.length,9,'One POST per explicit Scan and import or Scan remaining files click');
  assert.deepEqual(errors,[]);
- console.log('Downloaded-scan browser passed TV/movie real imports with library refresh, lost-202 same-ID readback without re-POST, zero-import/missing/empty outcomes, queued cancel, real 409 stale-generation and explicit same-child resume, list rediscovery and mobile layout.');
+ console.log('Downloaded-scan browser passed TV/movie real imports with library refresh, lost-202 same-ID readback without re-POST, zero-import/missing/empty outcomes, queued cancel, real 409 stale-generation and explicit same-child resume, tracked incomplete coverage with no singleton retry and a receipt-to-scan link, reviewed Scan remaining files successor completing coverage, list rediscovery and mobile layout.');
 } finally {await browser.close();}

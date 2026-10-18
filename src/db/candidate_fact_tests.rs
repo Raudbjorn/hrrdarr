@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,

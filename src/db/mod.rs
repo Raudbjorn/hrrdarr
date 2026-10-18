@@ -245,8 +245,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0057_scan_media.sql"),
     ),
     (
+        "scan_successor",
+        include_str!("../../migrations/0058_scan_successor.sql"),
+    ),
+    (
         "download_client_registry",
-        include_str!("../../migrations/0058_download_client_registry.sql"),
+        include_str!("../../migrations/0059_download_client_registry.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (

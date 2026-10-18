@@ -1,4 +1,4 @@
-//! Migration 0058: provider implementation registry, provider table rebuilds and
+//! Migration 0059: provider implementation registry, provider table rebuilds and
 //! protocol-aware admission. Upgrade, late-failure rollback, reopen and new constraints.
 use super::*;
 
@@ -60,16 +60,16 @@ const TABLES: [&str; 8] = [
 ];
 
 #[tokio::test]
-async fn registry_upgrade57_preserves_provider_rows_rolls_back_and_enforces_protocols()
+async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_protocols()
 -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
     let raw = libsql::Builder::new_local(&path).build().await?;
     let c = raw.connect()?;
-    // Like the runner, rebuild migrations (0052, 0058) execute with foreign keys off.
+    // Like the runner, rebuild migrations (0052, 0059) execute with foreign keys off.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(57).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(58).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -78,7 +78,7 @@ async fn registry_upgrade57_preserves_provider_rows_rolls_back_and_enforces_prot
         .await?;
     }
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
-    // Schema 57 cannot store SABnzbd: the old implementation CHECK rejects it.
+    // Schema 58 cannot store SABnzbd: the old implementation CHECK rejects it.
     assert!(sabnzbd(&c).await.is_err());
     c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'One'); INSERT INTO movie_metadata(id,tmdb_id,title,year) VALUES(1,101,'Movie',2020); INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movies');").await?;
     let client = super::refresh_tests::provider(&c).await?;
@@ -99,12 +99,12 @@ async fn registry_upgrade57_preserves_provider_rows_rolls_back_and_enforces_prot
     )
     .await?;
 
-    // Late failure after every rebuild and trigger replacement leaves schema 57 intact.
+    // Late failure after every rebuild and trigger replacement leaves schema 58 intact.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[57].1).await?;
+    tx.execute_batch(MIGRATIONS[58].1).await?;
     // The registry immutability trigger exists inside the migration transaction.
     assert!(tx.execute("UPDATE provider_implementations SET protocol='usenet' WHERE implementation='qbittorrent'",()).await.is_err());
     tx.rollback().await?;
@@ -123,12 +123,12 @@ async fn registry_upgrade57_preserves_provider_rows_rolls_back_and_enforces_prot
     drop(c);
     drop(raw);
 
-    // The real runner applies 0058; every predecessor row is preserved byte for byte.
+    // The real runner applies 0059; every predecessor row is preserved byte for byte.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(58)]]
+        vec![vec![libsql::Value::Integer(59)]] // Reasoning: renumbered after 0058 scan successor landed first.
     );
     for (sql, expected) in TABLES.iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");

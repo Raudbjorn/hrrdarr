@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 58); // Reasoning: latest adds 0058 download-client registry; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 59); // Reasoning: latest is 0059 (0058 scan successor, then 0059 download-client registry); historical prefixes stay fixed.
     Ok(())
 }

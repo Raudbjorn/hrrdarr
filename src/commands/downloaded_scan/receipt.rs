@@ -118,6 +118,23 @@ pub(super) async fn resolve(
     if !known {
         return Err(Failure::Fail("scan_tracked_provider_unavailable"));
     }
+    // An explicit successor continues exactly its predecessor's captured receipt.
+    let lineage: Option<String> = match &claim.supersedes {
+        None => None,
+        Some(previous) => c
+            .query(
+                "SELECT candidate_id FROM downloaded_scan_commands WHERE id=? AND coverage_state='incomplete'",
+                [previous.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .map(|r| r.get::<Option<String>>(0))
+            .transpose()?
+            .flatten()
+            .map(Some)
+            .ok_or(Failure::Fail("scan_successor_receipt_changed"))?,
+    };
     // (client, observed hash) is unique across domains, so this is the only possible receipt.
     let Some(row) = c
         .query(
@@ -128,9 +145,19 @@ pub(super) async fn resolve(
         .next()
         .await?
     else {
+        // A successor never degrades into ordinary identification.
+        if lineage.is_some() {
+            return Err(Failure::Fail("scan_successor_receipt_changed"));
+        }
         return Ok(None);
     };
     let candidate: String = row.get(0)?;
+    if lineage
+        .as_deref()
+        .is_some_and(|expected| expected != candidate)
+    {
+        return Err(Failure::Fail("scan_successor_receipt_changed"));
+    }
     if row.get::<String>(1)? != domain(claim.media) {
         // The same remote item is a receipt of the other domain: it cannot authorize this one.
         return Err(Failure::Fail("scan_tracked_receipt_domain"));
@@ -144,15 +171,16 @@ pub(super) async fn resolve(
     }
     drop(row);
     if c.query(
-        "SELECT 1 FROM downloaded_scan_commands WHERE candidate_id=? AND id!=?",
-        params![candidate.clone(), key],
+        "WITH RECURSIVE ancestry(id,previous,depth) AS (SELECT id,supersedes_command_id,1 FROM downloaded_scan_commands WHERE id=?3 UNION ALL SELECT a.id,a.supersedes_command_id,x.depth+1 FROM downloaded_scan_commands a JOIN ancestry x ON a.id=x.previous WHERE x.depth<1024) SELECT 1 FROM downloaded_scan_commands WHERE candidate_id=?1 AND id!=?2 AND (status IN ('queued','running','retry_wait') OR id NOT IN (SELECT id FROM ancestry)) LIMIT 1",
+        params![candidate.clone(), key, claim.supersedes.clone()],
     )
     .await?
     .next()
     .await?
     .is_some()
     {
-        // Another scan holds (or settled) this receipt; a later retry needs explicit lineage.
+        // Another scan holds (or settled) this receipt outside this request's explicit
+        // lineage; only an explicit successor of the latest settled holder may continue it.
         return Err(Failure::Fail("scan_tracked_receipt_reserved"));
     }
     let processing = c
@@ -306,7 +334,7 @@ pub(super) async fn credit(tx: &Connection, command: &str) -> Result<()> {
     drop(row);
     let mut rows = tx
         .query(
-            "SELECT p.predecessor_operation_id FROM downloaded_scan_commands p JOIN import_journal j ON j.operation_id=p.predecessor_operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE p.id=?1 AND j.phase='complete' UNION SELECT c.operation_id FROM downloaded_scan_children c JOIN import_journal j ON j.operation_id=c.operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE c.command_id=?1 AND c.disposition='imported' AND j.phase='complete' LIMIT 20002",
+            "SELECT p.predecessor_operation_id FROM downloaded_scan_commands p JOIN import_journal j ON j.operation_id=p.predecessor_operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE p.id=?1 AND j.phase='complete' UNION SELECT c.operation_id FROM downloaded_scan_children c JOIN import_journal j ON j.operation_id=c.operation_id JOIN import_history h ON h.operation_id=j.operation_id WHERE c.command_id=?1 AND c.disposition='imported' AND j.phase='complete' UNION SELECT v.credited_operation_id FROM downloaded_scan_commands p JOIN downloaded_scan_coverage v ON v.command_id=p.supersedes_command_id JOIN import_journal j ON j.operation_id=v.credited_operation_id WHERE p.id=?1 AND v.credited_operation_id IS NOT NULL AND j.phase='complete' LIMIT 20002",
             [command],
         )
         .await?;
@@ -318,15 +346,48 @@ pub(super) async fn credit(tx: &Connection, command: &str) -> Result<()> {
     if operations.len() > 20_001 {
         return Err(Error(StatusCode::CONFLICT, "scan_coverage_limit"));
     }
+    // The authority clause mirrors the trigger's three sources: this receipt's linked
+    // predecessor operation, this parent's imported child, or an explicit predecessor scan's
+    // credit for the SAME member and the SAME (still current) file. A prior credit whose file
+    // was since replaced is simply not carried.
     let sql = if media == "tv" {
-        "UPDATE downloaded_scan_coverage SET credited_operation_id=?2,credited_file_id=(SELECT e.episode_file_id FROM episodes e WHERE e.id=downloaded_scan_coverage.episode_id) WHERE command_id=?1 AND credited_operation_id IS NULL AND episode_id IS NOT NULL AND EXISTS(SELECT 1 FROM import_history h JOIN episodes e ON e.id=downloaded_scan_coverage.episode_id JOIN episode_files ef ON ef.id=e.episode_file_id AND ef.series_id=e.series_id WHERE h.operation_id=?2 AND h.media_type='episode' AND ef.path=h.destination AND ((h.episode_id=e.id AND h.episode_file_id=ef.id) OR EXISTS(SELECT 1 FROM import_history_episodes hm WHERE hm.operation_id=h.operation_id AND hm.episode_id=e.id AND hm.episode_file_id=ef.id)))"
+        "UPDATE downloaded_scan_coverage SET credited_operation_id=?2,credited_file_id=(SELECT e.episode_file_id FROM episodes e WHERE e.id=downloaded_scan_coverage.episode_id) WHERE command_id=?1 AND credited_operation_id IS NULL AND episode_id IS NOT NULL AND EXISTS(SELECT 1 FROM import_history h JOIN episodes e ON e.id=downloaded_scan_coverage.episode_id JOIN episode_files ef ON ef.id=e.episode_file_id AND ef.series_id=e.series_id WHERE h.operation_id=?2 AND h.media_type='episode' AND ef.path=h.destination AND ((h.episode_id=e.id AND h.episode_file_id=ef.id) OR EXISTS(SELECT 1 FROM import_history_episodes hm WHERE hm.operation_id=h.operation_id AND hm.episode_id=e.id AND hm.episode_file_id=ef.id))) AND (EXISTS(SELECT 1 FROM downloaded_scan_commands p WHERE p.id=?1 AND p.predecessor_operation_id=?2) OR EXISTS(SELECT 1 FROM downloaded_scan_children c WHERE c.command_id=?1 AND c.operation_id=?2 AND c.disposition='imported') OR EXISTS(SELECT 1 FROM downloaded_scan_commands p JOIN downloaded_scan_coverage v ON v.command_id=p.supersedes_command_id WHERE p.id=?1 AND v.credited_operation_id=?2 AND v.episode_id=downloaded_scan_coverage.episode_id AND v.credited_file_id=(SELECT e.episode_file_id FROM episodes e WHERE e.id=downloaded_scan_coverage.episode_id)))"
     } else {
-        "UPDATE downloaded_scan_coverage SET credited_operation_id=?2,credited_file_id=(SELECT h.movie_file_id FROM import_history h WHERE h.operation_id=?2) WHERE command_id=?1 AND credited_operation_id IS NULL AND movie_id IS NOT NULL AND EXISTS(SELECT 1 FROM import_history h JOIN movie_files mf ON mf.id=h.movie_file_id AND mf.movie_id=h.movie_id WHERE h.operation_id=?2 AND h.media_type='movie' AND h.movie_id=downloaded_scan_coverage.movie_id AND mf.path=h.destination)"
+        "UPDATE downloaded_scan_coverage SET credited_operation_id=?2,credited_file_id=(SELECT h.movie_file_id FROM import_history h WHERE h.operation_id=?2) WHERE command_id=?1 AND credited_operation_id IS NULL AND movie_id IS NOT NULL AND EXISTS(SELECT 1 FROM import_history h JOIN movie_files mf ON mf.id=h.movie_file_id AND mf.movie_id=h.movie_id WHERE h.operation_id=?2 AND h.media_type='movie' AND h.movie_id=downloaded_scan_coverage.movie_id AND mf.path=h.destination) AND (EXISTS(SELECT 1 FROM downloaded_scan_commands p WHERE p.id=?1 AND p.predecessor_operation_id=?2) OR EXISTS(SELECT 1 FROM downloaded_scan_children c WHERE c.command_id=?1 AND c.operation_id=?2 AND c.disposition='imported') OR EXISTS(SELECT 1 FROM downloaded_scan_commands p JOIN downloaded_scan_coverage v ON v.command_id=p.supersedes_command_id WHERE p.id=?1 AND v.credited_operation_id=?2 AND v.movie_id=downloaded_scan_coverage.movie_id AND v.credited_file_id=(SELECT h.movie_file_id FROM import_history h WHERE h.operation_id=?2)))"
     };
     for operation in operations {
         tx.execute(sql, params![command, operation]).await?;
     }
     Ok(())
+}
+
+/// Expected members an explicit predecessor already proved against the CURRENT association
+/// (the same file is still attached). A successor's inventory treats a file whose every member
+/// is carried as already covered, so only explicitly authorized remaining work is selected.
+pub(super) async fn carried_members(
+    c: &Connection,
+    claim: &ScanClaim,
+) -> std::result::Result<HashSet<i64>, Failure> {
+    let Some(previous) = &claim.supersedes else {
+        return Ok(HashSet::new());
+    };
+    let sql = match claim.media {
+        MediaDomain::Tv => {
+            "SELECT v.episode_id FROM downloaded_scan_coverage v JOIN import_journal j ON j.operation_id=v.credited_operation_id JOIN episodes e ON e.id=v.episode_id WHERE v.command_id=? AND v.episode_id IS NOT NULL AND j.phase='complete' AND e.episode_file_id=v.credited_file_id LIMIT 20001"
+        }
+        MediaDomain::Movies => {
+            "SELECT v.movie_id FROM downloaded_scan_coverage v JOIN import_journal j ON j.operation_id=v.credited_operation_id JOIN movie_files mf ON mf.id=v.credited_file_id AND mf.movie_id=v.movie_id WHERE v.command_id=? AND v.movie_id IS NOT NULL AND j.phase='complete' LIMIT 20001"
+        }
+    };
+    let mut rows = c.query(sql, [previous.clone()]).await?;
+    let mut members = HashSet::new();
+    while let Some(r) = rows.next().await? {
+        members.insert(r.get::<i64>(0)?);
+    }
+    if members.len() > 20_000 {
+        return Err(Failure::Fail("scan_decision_limit"));
+    }
+    Ok(members)
 }
 
 #[derive(Clone, Copy)]
@@ -369,7 +430,7 @@ pub(super) async fn finalize(
 async fn handback(tx: &Connection, command: &str, timestamp: i64) -> Result<()> {
     let row = tx
         .query(
-            "SELECT p.candidate_id,p.coverage_state,p.media_type,json_type(p.processing_fence_json,'$.absent') IS 'true',EXISTS(SELECT 1 FROM rss_candidate_imports i WHERE i.candidate_id=p.candidate_id),EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=p.candidate_id) FROM downloaded_scan_commands p WHERE p.id=? AND p.candidate_id IS NOT NULL",
+            "SELECT p.candidate_id,p.coverage_state,p.media_type,json_type(p.processing_fence_json,'$.absent') IS 'true',EXISTS(SELECT 1 FROM rss_candidate_imports i WHERE i.candidate_id=p.candidate_id),EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=p.candidate_id),CASE WHEN json_type(p.processing_fence_json,'$.scan_command_id') IS 'text' THEN json_extract(p.processing_fence_json,'$.scan_command_id') END FROM downloaded_scan_commands p WHERE p.id=? AND p.candidate_id IS NOT NULL",
             [command],
         )
         .await?
@@ -382,6 +443,9 @@ async fn handback(tx: &Connection, command: &str, timestamp: i64) -> Result<()> 
     let absent = row.get::<i64>(3)? == 1;
     let linked = row.get::<i64>(4)? == 1;
     let exists = row.get::<i64>(5)? == 1;
+    // An explicit successor captured the previous lineage handback as its fence; it must still
+    // be exactly that row (the 0054 handback trigger repeats the full fence comparison).
+    let fenced: Option<String> = row.get(6)?;
     drop(row);
     if absent || linked {
         if absent && exists {
@@ -400,8 +464,8 @@ async fn handback(tx: &Connection, command: &str, timestamp: i64) -> Result<()> 
     }
     let previous: String = tx
         .query(
-            "SELECT reasons_json FROM download_processing WHERE candidate_id=? AND scan_command_id IS NULL",
-            [candidate.clone()],
+            "SELECT reasons_json FROM download_processing WHERE candidate_id=? AND scan_command_id IS ?",
+            params![candidate.clone(), fenced.clone()],
         )
         .await?
         .next()
@@ -431,8 +495,8 @@ async fn handback(tx: &Connection, command: &str, timestamp: i64) -> Result<()> 
     let reasons = serde_json::to_string(&reasons).map_err(|_| bad())?;
     let changed = tx
         .execute(
-            "UPDATE download_processing SET scan_command_id=?,status=?,error_code=?,reasons_json=?,updated_at=max(updated_at,?) WHERE candidate_id=? AND scan_command_id IS NULL",
-            params![command, status, error, reasons, timestamp, candidate.clone()],
+            "UPDATE download_processing SET scan_command_id=?,status=?,error_code=?,reasons_json=?,updated_at=max(updated_at,?) WHERE candidate_id=? AND scan_command_id IS ?",
+            params![command, status, error, reasons, timestamp, candidate.clone(), fenced],
         )
         .await?;
     if changed != 1 {

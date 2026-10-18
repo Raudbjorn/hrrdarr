@@ -10,8 +10,9 @@ import journal engine (`src/commands/downloaded_scan/continuation.rs` drives
 `src/import/scan_owned.rs`); see [Import phase](#import-phase-phase-b). **Phase C** reserves a
 tracked download receipt and hands it back with typed coverage
 ([Tracked requests](#tracked-requests)), and removes source directories emptied by move imports
-([Source cleanup](#source-cleanup-phase-c)). Storage is migrations 0054, 0056 and 0057; no
-migration was added for any phase.
+([Source cleanup](#source-cleanup-phase-c)). An incomplete tracked receipt is continued only by
+an explicit [successor](#explicit-successor-scan-remaining-files). Storage is migrations 0054,
+0056, 0057 and 0058 (successor lineage reservation plus two indexes for the bounded Health reader).
 
 This is a native contract, not Sonarr/Radarr V3 wire or SignalR compatibility. Progress is bounded
 polling of the routes below.
@@ -23,7 +24,7 @@ numeric owner ID. A command UUID asked for under the other domain is `404`.
 
 | Route | Purpose |
 | --- | --- |
-| `POST /api/v1/{tv\|movies}/downloaded-scan-commands` | Admit. `202` new, `200` exact replay, `409` identity mismatch. |
+| `POST /api/v1/{tv\|movies}/downloaded-scan-commands` | Admit (optionally an explicit successor). `202` new, `200` exact replay, `409` identity mismatch or invalid lineage. |
 | `GET  /api/v1/{tv\|movies}/downloaded-scan-commands` | Newest-first page. Filter `status`; `limit` 1-100 (default 25), `offset` 0-100000. |
 | `GET  /api/v1/{tv\|movies}/downloaded-scan-commands/{id}` | One parent with aggregate counts (never embedded children). |
 | `GET  /api/v1/{tv\|movies}/downloaded-scan-commands/{id}/children` | Ordinal-ordered child page. Filter `disposition`; same paging. |
@@ -45,13 +46,14 @@ returning a truncated page. The generated TypeScript contract is
 
 ```json
 {"id":"<client uuid>","path":"/downloads/Harbor.S01.1080p.WEB-DL","mode":"auto","priority":"normal",
- "tracked":{"provider_id":"<uuid>","remote_id":"<40 or 64 lowercase hex>"}}
+ "tracked":{"provider_id":"<uuid>","remote_id":"<40 or 64 lowercase hex>"},
+ "supersedes_command_id":"<settled scan uuid, optional>"}
 ```
 
 - `id` is the immutable client-generated identity. It is checked first, inside the `IMMEDIATE`
   transaction: the same canonical request returns the existing command with `200` and consumes no
-  capacity; any differing domain, path, mode, priority or tracked identity is `409
-  downloaded_scan_conflict`. After a lost response, `GET` the same UUID; never mint a new one.
+  capacity; any differing domain, path, mode, priority, tracked identity or
+  `supersedes_command_id` is `409 downloaded_scan_conflict`. After a lost response, `GET` the same UUID; never mint a new one.
   `404` is only current absence.
 - `path` must be absolute, normalized UTF-8 of at most 4096 bytes: no NUL, no `.`/`..`/empty
   components, no trailing slash, not `/`. Newlines and tabs inside a name are legal. A valid path
@@ -61,8 +63,10 @@ returning a truncated page. The generated TypeScript contract is
   never implies a move. Explicit `move`/`copy` stay explicit.
 - `priority` is `normal|high`.
 - `tracked` is optional. The provider must exist and be scoped to the route's domain (`409
-  downloaded_scan_provider_unknown`). `supersedes_command_id` is not accepted in phase A and is
-  rejected like any unknown field.
+  downloaded_scan_provider_unknown`).
+- `supersedes_command_id` is optional and names the settled scan this request explicitly
+  continues; see [Explicit successor](#explicit-successor-scan-remaining-files). A malformed
+  value is `400`.
 - Capacity is the shared 1024 non-terminal pool across all ten command tables (`429
   command_history_full`). The shared pre-check (`command_capacity`) previously omitted the scan
   table, so every other producer would have hit the admission trigger instead of a clean `429`;
@@ -114,7 +118,7 @@ transaction as publication (`success` requires an imported child).
 Error codes (`error_code`, static and path-free): `scan_inventory_limit` (entries, depth, bytes or
 encoding), `scan_source_denied`, `scan_source_invalid`, `scan_source_changed` (retry),
 `scan_source_io` (retry), `scan_discovery_timeout` (retry), `scan_storage_error` (retry),
-`scan_target_busy` (retry; another scan reservation, an active rescan, an in-flight transfer or an unrelated in-flight download receipt owns a selected episode or movie), `scan_facts_changed`
+`scan_target_busy` (retry; another scan reservation, an active rescan, an in-flight transfer or an unrelated in-flight download receipt owns a selected episode or movie), `scan_successor_receipt_changed` (an explicit successor's tracked identity no longer resolves to its predecessor's receipt), `scan_facts_changed`
 (retry), `scan_facts_invalid`, `scan_decision_limit`, `scan_identity_unsupported`,
 `scan_history_limit`, `scan_file_limit`, `scan_multiple_owners`, and the tracked codes
 `scan_tracked_provider_unavailable`, `scan_tracked_receipt_domain`,
@@ -340,8 +344,35 @@ replacement is then reconciled as `complete` (the earlier attempt removed it); o
 an absent folder is `identity_changed`. A second uncertain failure needs another generation.
 
 Every cleanup transition that is effectful or settles (intent, settlement, uncertain failure)
-invalidates the domain's `remote_path_mapping` Health generation in the same transaction. Health
-has no dedicated reader for cleanup evidence yet (see [Not established](#not-established)).
+invalidates the domain's `remote_path_mapping` Health generation in the same transaction (an
+uncertain failure as a failure, a settlement as a completion). See [Health](#health) for the reader.
+
+## Health
+
+Scan evidence feeds the existing scoped `remote_path_mapping` check (`RemotePathMappingCheck`);
+there is no new registry. Like the rest of that check it is evaluated only while completed-download
+handling is enabled for the domain. `src/health/path_diagnostics.rs` reads, in the same read-only
+snapshot as the journal and receipt readers:
+
+- **Source cleanup.** Running parents of the domain with `cleanup_state: pending` (bounded by the
+  1024 pool through the status-prefixed `downloaded_scan_ready` index): `observed` is not
+  evidence; a `remove_intent` whose removal is not executing reports `path_scan_cleanup_uncertain`;
+  one executing right now (its `scan-cleanup-{id}` effect permit is held) is an unknown result,
+  never healthy. A settled cleanup is not evidence. A malformed phase or error code is unknown.
+- **Selected-child prepare refusals.** Failed children with no operation whose `error_code` is a
+  measured `hc021_*_prepare` cause (0058 partial `downloaded_scan_prepare_refused` index), mapped
+  with the same closed cause table as receipt prepare markers (`path_permission_denied`,
+  `path_import_unavailable`, ...). The refusal and the Health invalidation share one transaction;
+  ordinary refusals (`scan_decision_changed`, naming, ...) are not path evidence. The evidence stays
+  current until a LATER request for the same domain and source publishes a new inventory (0058
+  `downloaded_scan_source_request` index); that publication invalidates Health in its own
+  transaction. Repairing the path alone never clears it.
+- **Scan-owned journals.** The journal reader still sees scan operations through the no-RSS
+  branch, but a journal with `scan_import_facts` must be the exact linked child of a same-domain
+  scan (and not RSS-linked); malformed ownership is unknown, never healthy.
+
+Each reader is bounded to 1024 records; overflow is an unknown result. A blocked scan handback
+also remains visible through the existing receipt reader until a successor completes coverage.
 
 ## Tracked requests
 
@@ -354,7 +385,7 @@ has no dedicated reader for cleanup evidence yet (see [Not established](#not-est
 | Unknown remote id | Ordinary identification, `tracking: unknown_fallback` once published. |
 | Receipt of the other domain (same client and hash) | `failed`, `scan_tracked_receipt_domain`; it never authorizes this parent. |
 | Receipt not `observed`, or its client disabled/reconfigured | `failed`, `scan_tracked_receipt_unavailable`. |
-| Another scan holds or settled this receipt | `failed`, `scan_tracked_receipt_reserved` (a retry needs explicit successor lineage, not implemented). |
+| Another scan holds or settled this receipt outside this request's explicit lineage | `failed`, `scan_tracked_receipt_reserved` (only an [explicit successor](#explicit-successor-scan-remaining-files) of the latest settled holder may continue it). |
 | Download processing is `checking` (its preflight owner) | `retry_wait`, `scan_tracked_receipt_busy`; never stolen. |
 | Linked singleton import (`rss_candidate_imports`) not complete | Captured now; phase `waiting_predecessor`. |
 | Otherwise | Captured in the publication transaction. |
@@ -400,7 +431,55 @@ receipt back in the **same** transaction:
 The receipt stays scan-owned after the handback (the 0054 guard), so a singleton retry cannot
 import missing coverage behind the scan's proof. A parent that fails before publication never
 captured (capture is in the publication transaction) unless it was waiting for a predecessor,
-whose owner keeps the receipt.
+whose owner keeps the receipt. The handback updates the processing row only if it still carries
+exactly the `scan_command_id` captured in the fence (no scan, or this lineage's previous
+handback); the 0054 trigger repeats the full fence comparison.
+
+`DownloadProcessing.scan_command_id` is the newest scan that holds, settled or continues the
+receipt (falling back to the recorded handback), and `DownloadProcessing.scan_reserved` reports
+the same ownership predicate the singleton routes enforce (`409 processing_reserved_by_scan`).
+
+## Explicit successor ("Scan remaining files")
+
+An incomplete tracked receipt is retried only by a NEW request (new client UUID) that names the
+settled scan in `supersedes_command_id`; the original inventory and proof are never reopened.
+Admission validates and reserves the lineage inside the same `IMMEDIATE` transaction:
+
+| Check | Refusal (`409`, nothing created) |
+| --- | --- |
+| Predecessor exists in this route's domain, same `path`, and the request carries the predecessor's exact `tracked` provider/remote id | `downloaded_scan_successor_invalid` |
+| Predecessor is terminal with no unresolved effect: no reserved child (unfinished journal), no pending cleanup, linked singleton predecessor operation (if any) complete | `downloaded_scan_successor_not_settled` |
+| Predecessor captured a receipt and settled `coverage_state: incomplete` | `downloaded_scan_successor_not_incomplete` |
+| No other successor holds the lineage (an active successor, or one that captured the receipt); no active scan holds the receipt; the processing row carries no foreign scan handback and is not `checking` | `downloaded_scan_successor_conflict` |
+| The receipt is still `observed` for that client and hash, the client is enabled, scoped to the domain and at the receipt's revision | `downloaded_scan_successor_receipt_unavailable` |
+
+Storage repeats the own-state checks: 0054 `downloaded_scan_admit` (settled, incomplete, same
+media/path, no reserved child) and 0058 `scan_successor_unique` (one lineage holder). A
+successor that settled before capturing (for example cancelled while queued) never held the
+lineage, so another successor of the same predecessor may then be admitted. Once a successor
+captured the receipt, only a successor of THAT scan continues it.
+
+At discovery the successor resolves the same provider/remote id and must reach its
+predecessor's candidate (`scan_successor_receipt_changed` otherwise; it never falls back to
+ordinary identification). The receipt-held check accepts every settled holder in its explicit
+ancestry (bounded recursive lineage, depth 1024, the same as the 0054/0057 capture triggers),
+so capture re-verifies provider, receipt, fence and lineage in storage. The new complete
+inventory contains only remaining work: a file whose every typed member is still credited by
+the predecessor against the current association is rejected as `coverage_already_credited`.
+Credits are carried only while still valid: a predecessor credit for the SAME member, operation
+and still-attached file (the 0054 `scan_coverage_credit` proof); a credit whose file was since
+replaced is simply not carried. Each member is credited at most once per command (write-once
+coverage). Full coverage hands the receipt back `imported` through the successor (clearing the
+hc021 marker by proven completion); anything less hands it back `blocked` again with the marker
+preserved, and a further successor of the new scan may follow.
+
+`DownloadedScanCommand` reports `supersedes_command_id`, `successor_command_id` (newest scan
+naming this one) and `successor_allowed` (the own-state admission checks hold; receipt validity
+is re-checked only at admission, so it never grants authority).
+
+Receipts are currently singletons (0025), so an incomplete predecessor has zero credits in
+practice; the carried-credit path is exercised only by its SQL predicates and the schema
+lineage test, not by a multi-member receipt.
 
 ## Worker integration
 
@@ -417,14 +496,15 @@ longer publish: publication and settlement are fenced by generation.
 
 ## Not established
 
-- `supersedes_command_id` (an explicit coverage-aware successor for an incomplete tracked scan)
-  is not implemented; an incomplete receipt stays blocked and scan-owned with no in-product
-  retry. The UI form does not offer tracked requests.
 - Download receipts are singletons (migration 0025 admits one episode per candidate), so typed
   coverage is exercised only for single-episode and movie receipts; a predecessor and a scan
-  child are alternatives for that one member, not a split pack.
-- Health has no reader for cleanup evidence; cleanup transitions only invalidate the existing
-  `remote_path_mapping` generation. The processing panel does not yet link `scan_command_id`.
+  child are alternatives for that one member, not a split pack, and carried successor credits
+  are never non-empty in practice.
+- Prepare-refusal Health evidence is superseded only by a later published scan of the same
+  domain and source; a manual import of the same file does not clear it (import history has no
+  source index to make that check bounded).
+- Health evidence from scans, like the rest of the remote-path check, is not evaluated while
+  completed-download handling is disabled for the domain.
 - Cleanup removes directories by name after an identity check on an open descriptor; a
   directory swapped for another **empty** directory between that check and `rmdir` could be
   removed instead (never a non-empty one, never a file).
@@ -433,8 +513,6 @@ longer publish: publication and settlement are fenced by generation.
   the owner's path, settings and members.
 - `GET /api/v1/history` filters by the anchor episode only; non-anchor members of a multi-episode
   import are recorded in `import_history_episodes` but not yet surfaced by that reader.
-- Health invalidation for a measured prepare refusal (child `error_code`, no journal) is not wired;
-  journal-backed failures use the existing engine hooks.
 - Discovery is read-only but non-atomic with the filesystem: a file added between
   `verify_before_publish` and commit is not in the inventory; prepare revalidates each source's
   inode, size and mtime before creating its operation.
@@ -443,13 +521,18 @@ longer publish: publication and settlement are fenced by generation.
   5-second visible-only polling with backoff, child pages, cancel and explicit child resume. Covered by
   `frontend/tests/downloaded-scan-state.test.mjs` and `frontend/tests/downloaded-scan-browser.mjs` (real fixture
   backend). The detail shows tracked coverage and source-cleanup state and offers the explicit cleanup resume.
-  Tracked requests are not offered in the form, and lost resume responses are retained only in memory.
+  The form offers an optional tracked download (a download client configured for the domain, from a
+  bounded provider read, plus its download ID), and a settled scan with incomplete tracked coverage
+  offers a confirmed "Scan remaining files" successor (new UUID, `supersedes_command_id`, saved
+  before the POST like any admission). `DownloadProcessingPanel` links `scan_command_id` to that scan
+  in the library view and offers no singleton retry, resume or cancel for a `scan_reserved` receipt.
+  Lost resume responses are retained only in memory.
 - Per-request owner resolution scans the title catalog once per distinct normalized title; very
   large libraries combined with very many distinct files can exhaust the 30-second budget, which
   fails visibly (`scan_discovery_timeout`) rather than truncating.
 - Covered by [unit tests](../src/commands/downloaded_scan/tests.rs),
   [HTTP + worker tests](../tests/downloaded_scan_commands.rs) and
-  [tracked/cleanup tests](../tests/downloaded_scan_tracked.rs) against temporary directories (the
+  [tracked/cleanup/successor/Health tests](../tests/downloaded_scan_tracked.rs) against temporary directories (the
   tracked predecessor's completion is simulated with the rows its commit writes, not by running
   the singleton engine); the
   media probe results depend on the installed `ffprobe` (an unavailable probe is recorded, not

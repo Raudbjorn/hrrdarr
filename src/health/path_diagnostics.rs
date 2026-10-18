@@ -9,8 +9,16 @@ use libsql::{Connection, TransactionBehavior};
 use serde_json::Value;
 use std::{io::Read, path::Path, time::Duration};
 
-const JOURNAL_QUERY: &str = "SELECT substr(CAST(j.operation_id AS BLOB),1,37),substr(CAST(j.path_failure_code AS BLOB),1,65),substr(CAST(j.error_code AS BLOB),1,65),substr(CAST(j.plan_json AS BLOB),1,16385),substr(CAST(i.provenance_json AS BLOB),1,16385),substr(CAST(j.phase AS BLOB),1,17) FROM import_journal j JOIN operations o ON o.id=j.operation_id LEFT JOIN rss_candidate_imports i ON i.operation_id=j.operation_id WHERE j.phase!='complete' AND (j.path_failure_code IS NOT NULL OR j.error_code IS NOT NULL OR j.phase!='preview') AND o.media_type=? AND (i.candidate_id IS NULL OR EXISTS(SELECT 1 FROM rss_candidates r JOIN providers p ON p.id=r.client_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=r.media_type WHERE r.id=i.candidate_id AND p.enabled=1 AND p.revision=r.client_revision AND ((o.media_type='movie' AND r.media_type='movies' AND r.movie_id=o.movie_id) OR (o.media_type='episode' AND r.media_type='tv' AND EXISTS(SELECT 1 FROM rss_candidate_episodes e JOIN episodes ep ON ep.id=e.episode_id WHERE e.candidate_id=r.id AND e.episode_id=o.episode_id AND ep.series_id=r.series_id))))) ORDER BY j.operation_id LIMIT 1025";
+const JOURNAL_QUERY: &str = "SELECT substr(CAST(j.operation_id AS BLOB),1,37),substr(CAST(j.path_failure_code AS BLOB),1,65),substr(CAST(j.error_code AS BLOB),1,65),substr(CAST(j.plan_json AS BLOB),1,16385),substr(CAST(i.provenance_json AS BLOB),1,16385),substr(CAST(j.phase AS BLOB),1,17),EXISTS(SELECT 1 FROM scan_import_facts f WHERE f.operation_id=j.operation_id),EXISTS(SELECT 1 FROM scan_import_facts f JOIN downloaded_scan_children c ON c.id=f.child_id AND c.command_id=f.command_id AND c.operation_id=f.operation_id JOIN downloaded_scan_commands p ON p.id=f.command_id WHERE f.operation_id=j.operation_id AND p.media_type=CASE o.media_type WHEN 'episode' THEN 'tv' WHEN 'movie' THEN 'movies' END AND i.operation_id IS NULL) FROM import_journal j JOIN operations o ON o.id=j.operation_id LEFT JOIN rss_candidate_imports i ON i.operation_id=j.operation_id WHERE j.phase!='complete' AND (j.path_failure_code IS NOT NULL OR j.error_code IS NOT NULL OR j.phase!='preview') AND o.media_type=? AND (i.candidate_id IS NULL OR EXISTS(SELECT 1 FROM rss_candidates r JOIN providers p ON p.id=r.client_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=r.media_type WHERE r.id=i.candidate_id AND p.enabled=1 AND p.revision=r.client_revision AND ((o.media_type='movie' AND r.media_type='movies' AND r.movie_id=o.movie_id) OR (o.media_type='episode' AND r.media_type='tv' AND EXISTS(SELECT 1 FROM rss_candidate_episodes e JOIN episodes ep ON ep.id=e.episode_id WHERE e.candidate_id=r.id AND e.episode_id=o.episode_id AND ep.series_id=r.series_id))))) ORDER BY j.operation_id LIMIT 1025";
 const RECEIPT_QUERY: &str = "SELECT substr(CAST(d.reasons_json AS BLOB),1,8193),substr(CAST(d.error_code AS BLOB),1,65),d.total_preflight_attempts,substr(CAST(d.status AS BLOB),1,17) FROM download_processing d JOIN rss_candidates r ON r.id=d.candidate_id JOIN providers p ON p.id=r.client_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=r.media_type WHERE d.status NOT IN ('imported','cancelled') AND r.media_type=? AND p.enabled=1 AND p.revision=r.client_revision AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports i JOIN import_journal j ON j.operation_id=i.operation_id WHERE i.candidate_id=d.candidate_id AND (j.phase!='preview' OR j.path_failure_code IS NOT NULL OR j.error_code IS NOT NULL)) ORDER BY d.candidate_id LIMIT 1025";
+
+/// Downloaded-scan source cleanup: only running parents can hold a pending removal intent, so
+/// the 1024-command pool bounds this read (status-prefixed `downloaded_scan_ready` index).
+const SCAN_CLEANUP_QUERY: &str = "SELECT substr(CAST(p.id AS BLOB),1,37),substr(CAST(json_extract(p.cleanup_json,'$.phase') AS BLOB),1,17),substr(CAST(json_type(p.cleanup_json,'$.error') AS BLOB),1,17),substr(CAST(json_extract(p.cleanup_json,'$.error') AS BLOB),1,65) FROM downloaded_scan_commands p INDEXED BY downloaded_scan_ready WHERE p.status='running' AND p.media_type=? AND p.cleanup_state='pending' ORDER BY p.id LIMIT 1025";
+/// Measured selected-child prepare refusals (no operation ever existed). Evidence stays current
+/// until a later request for the same domain and source publishes a new inventory (0058
+/// partial `downloaded_scan_prepare_refused` and `downloaded_scan_source_request` indexes).
+const SCAN_PREPARE_QUERY: &str = "SELECT substr(CAST(c.error_code AS BLOB),1,65) FROM downloaded_scan_children c INDEXED BY downloaded_scan_prepare_refused JOIN downloaded_scan_commands p ON p.id=c.command_id WHERE c.disposition='failed' AND c.operation_id IS NULL AND substr(c.error_code,1,6)='hc021_' AND p.media_type=? AND NOT EXISTS(SELECT 1 FROM downloaded_scan_commands q WHERE q.media_type=p.media_type AND q.source_path=p.source_path AND q.inventory_revision=1 AND (q.created_at>p.created_at OR (q.created_at=p.created_at AND q.id>p.id))) ORDER BY c.command_id,c.id LIMIT 1025";
 
 const MAX_RECORDS: usize = 1024;
 const MAX_CLIENTS: usize = 256;
@@ -38,6 +46,11 @@ struct Finding {
     message: &'static str,
     anchor: &'static str,
 }
+const SCAN_CLEANUP: Finding = Finding {
+    reason: "path_scan_cleanup_uncertain",
+    message: "Removing emptied downloaded-scan source folders stopped after it started, so its effect is unknown. Check the scanned folder, then explicitly resume that scan's source-folder cleanup; only empty folders are ever removed.",
+    anchor: "remote-path-import-failed",
+};
 const GENERIC: Finding = Finding {
     reason: "path_import_failed",
     message: "An import remains unresolved. Inspect its recorded status and retry the same operation after checking download mappings and access to source, destination and staging directories.",
@@ -328,6 +341,13 @@ async fn snapshot(c: &Connection, domain: MediaDomain) -> Result<Option<Evidence
             ) {
                 return Err("check_failed");
             }
+            // A scan-owned journal shares the no-RSS branch with manual imports: its ownership
+            // must be the exact linked child of a same-domain scan, or it is never healthy.
+            let scan_owned = row.get::<i64>(6).map_err(|_| "storage_error")? == 1;
+            let scan_valid = row.get::<i64>(7).map_err(|_| "storage_error")? == 1;
+            if scan_owned && !scan_valid {
+                return Err("check_failed");
+            }
             match code.as_deref() {
                 Some("unresolved_attempt") | None => {
                     if crate::import::operation_active(&id).map_err(|_| "check_failed")? {
@@ -345,6 +365,7 @@ async fn snapshot(c: &Connection, domain: MediaDomain) -> Result<Option<Evidence
         evidence.record(result);
     }
     drop(rows);
+    scan_evidence(&tx, media, &mut evidence).await?;
     // A clean linked preview has not armed the journal yet; its receipt still owns the evidence.
     let mut rows = tx
         .query(RECEIPT_QUERY, [media])
@@ -399,6 +420,78 @@ async fn snapshot(c: &Connection, domain: MediaDomain) -> Result<Option<Evidence
     drop(rows);
     tx.commit().await.map_err(|_| "storage_error")?;
     Ok(Some(evidence))
+}
+/// Bounded downloaded-scan evidence that has no journal of its own: an armed or uncertain
+/// source-cleanup removal intent, and measured selected-child prepare refusals.
+async fn scan_evidence(c: &Connection, media: &str, evidence: &mut Evidence) -> Result<()> {
+    let mut rows = c
+        .query(SCAN_CLEANUP_QUERY, [media])
+        .await
+        .map_err(|_| "storage_error")?;
+    let mut count = 0;
+    while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
+        count += 1;
+        if count > MAX_RECORDS {
+            evidence.unknown = Some("check_failed");
+            break;
+        }
+        let result = (|| {
+            let id = text(&row, 0, 36)?.ok_or("check_failed")?;
+            uuid::Uuid::parse_str(&id).map_err(|_| "check_failed")?;
+            let phase = text(&row, 1, 16)?.ok_or("check_failed")?;
+            match text(&row, 2, 16)?.as_deref() {
+                None | Some("null") => {}
+                Some("text") => {
+                    let code = text(&row, 3, 64)?.ok_or("check_failed")?;
+                    if code.is_empty()
+                        || !code
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    {
+                        return Err("check_failed");
+                    }
+                }
+                Some(_) => return Err("check_failed"),
+            }
+            match phase.as_str() {
+                // Observation only: nothing has been removed.
+                "observed" => Ok(None),
+                "remove_intent" => {
+                    // A removal in flight has not settled either way yet.
+                    if crate::import::operation_active(&format!("scan-cleanup-{id}"))
+                        .map_err(|_| "check_failed")?
+                    {
+                        return Err("check_failed");
+                    }
+                    Ok(Some(SCAN_CLEANUP))
+                }
+                _ => Err("check_failed"),
+            }
+        })();
+        evidence.record(result);
+    }
+    drop(rows);
+    let mut rows = c
+        .query(SCAN_PREPARE_QUERY, [media])
+        .await
+        .map_err(|_| "storage_error")?;
+    count = 0;
+    while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
+        count += 1;
+        if count > MAX_RECORDS {
+            evidence.unknown = Some("check_failed");
+            break;
+        }
+        let result = (|| {
+            let code = text(&row, 0, 64)?.ok_or("check_failed")?;
+            // Only closed measured prepare causes; anything else is malformed evidence.
+            let cause = code.strip_prefix("hc021_").ok_or("check_failed")?;
+            path_code(cause, true).map(Some)
+        })();
+        evidence.record(result);
+    }
+    drop(rows);
+    Ok(())
 }
 /// Tests exercise the same retained-evidence snapshot without unrelated client probes.
 #[cfg(test)]
@@ -789,6 +882,14 @@ mod tests {
                 RECEIPT_QUERY,
                 "movies",
                 "download_processing_path_unresolved",
+            ),
+            (SCAN_CLEANUP_QUERY, "tv", "downloaded_scan_ready"),
+            (SCAN_CLEANUP_QUERY, "movies", "downloaded_scan_ready"),
+            (SCAN_PREPARE_QUERY, "tv", "downloaded_scan_prepare_refused"),
+            (
+                SCAN_PREPARE_QUERY,
+                "movies",
+                "downloaded_scan_source_request",
             ),
         ] {
             let mut rows = c
