@@ -55,6 +55,11 @@ pub struct SnapshotOptions {
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub import_providers: bool,
+    // Requires import_providers. Commits the rest of the import while unresolved source providers
+    // stay unmapped and are reported as non-blocking provider_conflicts.
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub allow_unmapped_providers: bool,
 }
 fn default_dry_run() -> bool {
     true

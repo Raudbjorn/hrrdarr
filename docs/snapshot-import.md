@@ -48,9 +48,12 @@ resolve through file records and their correct owner, never into path strings.
 
 HTTP 200 returns `application`, `fingerprint` (SHA-256 of upload), `schema_version`,
 `dry_run`, `applied`, `mapped`, `duplicates`, `metadata_backfilled`, `conflicts`, `missing_file_records`,
-`unsupported` and a `policy` explanation. `mapped` counts new proposed records;
-`duplicates` counts matching existing records. With any conflict, `applied=false`
-and **the entire destination transaction rolls back**, including otherwise valid rows.
+`unsupported`, `provider_conflicts` and a `policy` explanation. `mapped` counts new proposed records;
+`duplicates` counts matching existing records. `conflicts` counts blocking conflicts: with any,
+`applied=false` and **the entire destination transaction rolls back**, including otherwise valid rows.
+`provider_conflicts` names each source provider row that was not mapped. Its entries are
+blocking, and counted in `conflicts`, unless the caller explicitly sets
+`allow_unmapped_providers=true` (see provider reconstruction below).
 A dry run always rolls back. Existing rows are compared across all imported fields;
 no existing library is cleared or overwritten. Reruns validate stored mappings and
 conflict if local records were edited or deleted. Numeric source IDs are scoped by
@@ -92,9 +95,24 @@ validate the imported contract.
 
 Malformed query options or rejected uploads/import attempts return HTTP 400; an
 oversized HTTP body returns 413. Errors are static, without SQL/source values. A
-conflict is a successful reconciliation report (200, `applied=false`), not a partial
-write. A database rollback failure requires operator integrity inspection before
-retrying. Read the report's `applied` field, not just the HTTP status.
+blocking conflict is a successful reconciliation report (200, `applied=false`), not a
+partial write. With `allow_unmapped_providers=true`, an unresolved provider row is the
+one deliberate partial outcome: `applied=true` while that row stays unmapped, as listed
+in `provider_conflicts`. A database rollback failure requires operator integrity
+inspection before retrying. Read the report's `applied` field and `provider_conflicts`,
+not just the HTTP status.
+
+Completed download handling never blocks the library import on refresh-schedule
+capacity. When activation would exceed the 64-schedule bound, the source's setting
+and definedness still commit and the snapshot is stamped. The domain's
+completed-download-handling read then reports `reconciliation_pending` with reason
+`schedule_limit`, which is the machine-readable signal. The report adds a `Config`
+unsupported entry only when the source defined the key. Activation follows the next
+slot-releasing mutation or startup; re-importing is unnecessary.
+
+Source-provider matching is a separate concern. By default, an unresolved source provider
+blocks the import. With `allow_unmapped_providers=true`, it is left unmapped and the rest
+of the import applies; see provider reconstruction below.
 
 ## Verification limits
 
@@ -120,8 +138,13 @@ See [episode API](episode-api.md) for date, numbering, cover-field and replay ru
 configuration while importing the same supported Sonarr/Radarr snapshot versions.
 The default is `false`, which preserves the previous archival-only behavior and
 requires no provider key. `dry_run` still defaults to `true`.
+`allow_unmapped_providers=true` (default `false`, valid only with `import_providers=true`,
+otherwise HTTP 400) lets the rest of the import commit while unresolved source
+providers stay unmapped; see reconciliation below.
 
-Reconstructed providers are always **disabled and untested**. Review unsupported
+Newly created providers are always **disabled and untested**. A source provider that
+binds to an existing exact match leaves that provider unchanged, including its enabled
+state and test observations. Review unsupported
 fields before enabling them through the native provider API. The importer never
 contacts an indexer/client, starts a session, submits a download, resumes a job or
 imports external queue/test state. Source enable flags, indexer automation policies,
@@ -153,22 +176,43 @@ custody remains separate from database backups; see [provider configuration](pro
 Provider mappings use application + snapshot fingerprint + source table + numeric
 source ID, with a UUID destination and captured revision. Equal Indexers and
 DownloadClients IDs remain distinct, as do TV/movie imports. Existing archived
-snapshots can be replayed with the option to add these mappings. Exact replay
-requires the mapped provider to exist with unchanged revision, complete configuration,
-plaintext credential content, disabled state and no test observation. Local changes,
-deletions or testing cause conflicts; nothing is overwritten or silently recreated.
+snapshots can be replayed with the option to add these mappings.
 
-For a different backup, implementation + exact endpoint + media domain identify
-candidate configurations. No candidate creates a new disabled configuration. If a
-candidate exists, exactly one must match every reconstructed field and decrypted
-credential; otherwise the import reports a conflict. Independent
-TV/movie configurations are not automatically merged. Multiple configurations at
-the same endpoint within a domain may therefore require explicit reconciliation,
-even when they have different names or credentials. This conservative rule prevents
-ambiguous ownership and duplicate configuration creation.
+A provider *matches* a source row exactly when its name, priority, every reconstructed
+setting and its credential content are equal. Enabled state, test observations and
+revision are local operation, not configuration, and never prevent a match. Plain-field
+and credential-presence differences are decided without the key. The key is used only
+to compare the credentials of an otherwise equal candidate, and a wrong key there fails
+closed.
+
+Replay requires the mapped provider to still match. Enabling, disabling or testing it
+does not affect replay. Deleting it, or changing a reconstructed setting or credential,
+is `mapping_changed`; nothing is overwritten or silently recreated.
+
+Without a stored mapping, implementation + exact endpoint + media domain select candidate
+configurations. A provider already mapped to another source row of the same snapshot is
+never a candidate, so two source clients on one host:port map to two configurations. No
+candidate creates a new disabled configuration. Exactly one exact match binds to it.
+Several exact matches are `ambiguous`; candidates that all differ are `differs`. Each
+entry gives the source table, source ID and number of candidates examined. TV and movie
+configurations are never merged.
+
+An unresolved row writes nothing. An indexer bound to an unresolved or unsupported source
+client is not reconstructed and appears as `client_unmapped`, which never blocks on its
+own. Release profiles apply their existing rule for an unavailable indexer: an enabled
+profile that references one leaves the **whole** release-profile catalog inactive, and the
+report names that profile and indexer by source ID.
+
+By default every unresolved row is blocking (`blocking: true`, counted in `conflicts`)
+and nothing applies. Dry runs report the same entries. With
+`allow_unmapped_providers=true` the entries are non-blocking and the rest of the import
+applies. A rerun of the same snapshot retries rows that stored no mapping. A rerun can
+still be blocked by an unrelated conflict, such as a local edit to an imported series,
+because core records keep their own replay rule. In that case, use a newer export: a new
+fingerprint has no stored mappings.
 
 All core records, providers, scopes, archives and mappings share the import
-transaction. Any conflict or late error rolls everything back; dry runs persist
+transaction. Any blocking conflict or late error rolls everything back; dry runs persist
 nothing. At most 256 total source indexer/client rows can be reconstructed per upload,
 including unsupported implementations. No source database or media is modified.
 

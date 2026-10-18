@@ -3,8 +3,9 @@ use super::*;
 use crate::{
     library::Change,
     providers::{
-        CredentialKey, Credentials, DownloadContentLayout, DownloadInitialState, DownloadScope,
-        IndexerParameter, MovieIndexerScope, ProviderInput, ProviderSettings, TvIndexerScope,
+        Credentials, DownloadContentLayout, DownloadInitialState, DownloadScope, ImportOutcome,
+        ImportSource, IndexerParameter, MovieIndexerScope, ProviderInput, ProviderSettings,
+        TvIndexerScope,
     },
 };
 use serde_json::{Map, Value as Json};
@@ -153,6 +154,11 @@ pub(super) fn read(
                     columns: table.columns.clone(),
                 });
                 continue;
+            }
+            // Supported rows can appear in provider_conflicts as a TypeScript number, which cannot
+            // round-trip larger IDs. Unsupported rows above stay archive-only and are not bounded.
+            if id > 9_007_199_254_740_991 {
+                return Err(INVALID);
             }
             if output.len() >= 256 {
                 return Err(ImportError("snapshot exceeds supported provider limit"));
@@ -454,10 +460,13 @@ pub(super) fn read(
     }
     Ok(output)
 }
+// An unresolved row wrote nothing. Its dependents already treat it as absent: a bound indexer is
+// not reconstructed and release profiles apply their unavailable-indexer rule. Only the caller's
+// explicit opt-in lets the rest of the import commit around it.
 pub(super) async fn write(
     conn: &Connection,
     records: &[ProviderRecord],
-    key: Option<&CredentialKey>,
+    options: ProviderOptions<'_>,
     report: &mut Report,
 ) -> Result<()> {
     let mut changes = crate::providers::HealthConfigurationChanges::default();
@@ -481,6 +490,13 @@ pub(super) async fn write(
                     rows: 1,
                     columns: vec!["DownloadClientId (unmapped; indexer not reconstructed)".into()],
                 });
+                report.provider_conflicts.push(ProviderConflict {
+                    table: record.table,
+                    source_id: record.id,
+                    reason: ProviderConflictReason::ClientUnmapped,
+                    candidates: 0,
+                    blocking: false,
+                });
                 continue;
             };
             let id = mapped.get::<String>(0)?;
@@ -490,31 +506,52 @@ pub(super) async fn write(
         } else {
             None
         };
-        let mapped=conn.query("SELECT provider_id,provider_revision FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table=? AND source_id=?",params![report.application.name(),report.fingerprint.clone(),record.table,record.id]).await?.next().await?.map(|r|->Result<(String,i64)>{Ok((r.get(0)?,r.get(1)?))}).transpose()?;
+        let mapped=conn.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table=? AND source_id=?",params![report.application.name(),report.fingerprint.clone(),record.table,record.id]).await?.next().await?.map(|r|r.get::<String>(0)).transpose()?;
         let outcome = crate::providers::import_configuration(
             conn,
-            key,
+            options.key,
             &record.input,
             download_client_id,
             &mut changes,
-            mapped
-                .as_ref()
-                .map(|(id, revision)| (id.as_str(), *revision)),
+            &ImportSource {
+                application: report.application.name(),
+                fingerprint: &report.fingerprint,
+                table: record.table,
+                id: record.id,
+            },
+            mapped.as_deref(),
         )
         .await
         .map_err(ImportError)?;
-        if let Some((id, revision, created)) = outcome {
-            if created {
-                report.mapped += 1
-            } else {
-                report.duplicates += 1
+        match outcome {
+            ImportOutcome::Mapped {
+                id,
+                revision,
+                created,
+            } => {
+                if created {
+                    report.mapped += 1
+                } else {
+                    report.duplicates += 1
+                }
+                conn.execute("INSERT INTO snapshot_provider_mappings(application,fingerprint,source_table,source_id,provider_id,provider_revision) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![report.application.name(),report.fingerprint.clone(),record.table,record.id,id,revision]).await?;
+                if record.table == "DownloadClients" {
+                    reconciled_clients.insert(record.id);
+                }
             }
-            conn.execute("INSERT INTO snapshot_provider_mappings(application,fingerprint,source_table,source_id,provider_id,provider_revision) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![report.application.name(),report.fingerprint.clone(),record.table,record.id,id,revision]).await?;
-            if record.table == "DownloadClients" {
-                reconciled_clients.insert(record.id);
+            ImportOutcome::Conflict { reason, candidates } => {
+                let blocking = !options.allow_unmapped;
+                if blocking {
+                    report.conflicts += 1
+                }
+                report.provider_conflicts.push(ProviderConflict {
+                    table: record.table,
+                    source_id: record.id,
+                    reason,
+                    candidates,
+                    blocking,
+                });
             }
-        } else {
-            report.conflicts += 1
         }
     }
     changes.finish(conn).await.map_err(ImportError)
@@ -706,6 +743,27 @@ mod tests {
             );
         }
         assert!(validate_encoding("&key=hello+world%26%E2%98%83").is_ok());
+        for (implementation, id, accepted) in [
+            ("QBittorrent", 9_007_199_254_740_991, true),
+            ("QBittorrent", 9_007_199_254_740_992, false),
+            // Unsupported rows never reach provider_conflicts, so they stay archived, not rejected.
+            ("Unknown", 9_007_199_254_740_992, true),
+        ] {
+            let mut snapshot = source("DownloadClients", implementation, "{}");
+            snapshot.tables.get_mut("DownloadClients").unwrap().rows[0]
+                .insert("Id".into(), Value::Integer(id));
+            let mut unsupported = vec![];
+            assert_eq!(
+                read(&snapshot, Application::Sonarr, &mut unsupported).is_ok(),
+                accepted,
+                "{implementation} {id}"
+            );
+            assert_eq!(
+                unsupported.len(),
+                usize::from(implementation == "Unknown"),
+                "{implementation} {id}"
+            );
+        }
         let mut oversized = source("Indexers", "Unknown", "{}");
         let table = oversized.tables.get_mut("Indexers").unwrap();
         let row = table.rows[0].clone();

@@ -625,7 +625,10 @@ async fn snapshot_unresolved_disabled_indexers_never_broaden_and_unsupported_is_
                     report
                         .unsupported
                         .iter()
-                        .any(|u| u.columns.iter().any(|s| s.contains("indexer unavailable")))
+                        // The note names the source indexer ID (never values) so the caller can act on it.
+                        .any(|u| u.columns.iter().any(|s| s.contains(
+                            "references unavailable indexer 77; whole catalog inactive"
+                        )))
                 );
             } else {
                 assert_eq!(scalar(&c,"SELECT count(*) FROM release_profile_indexers WHERE provider_id IS NULL AND source_id=77").await,1);
