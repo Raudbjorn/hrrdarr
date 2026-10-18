@@ -903,3 +903,175 @@ async fn delete(
         }
     }
 }
+
+/// How the Wanted quality threshold was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThresholdBasis {
+    /// Upgrades are allowed: the configured cutoff quality or group position.
+    ConfiguredCutoff,
+    /// Upgrades are disabled: the first allowed top-level item position.
+    FirstAllowed,
+}
+/// Quality-only cutoff facts for one profile. Every quality in the profile, allowed or not,
+/// carries the outer item position it occupies; qualities grouped together share one rank.
+/// A current file is below cutoff exactly when its rank is lower than `threshold`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QualityThreshold {
+    pub threshold: usize,
+    pub basis: ThresholdBasis,
+    pub ranks: Vec<(i64, usize)>,
+}
+/// Independent of custom-format scores, revisions, sizes and candidate evaluation. `None`
+/// means the cutoff cannot be determined (no policy, an unresolved cutoff, or no allowed item
+/// when upgrades are disabled); callers must report that as unknown, never as met or below.
+pub(crate) fn quality_threshold(profile: &Profile) -> Option<QualityThreshold> {
+    let policy = profile.policy.as_ref()?;
+    let mut ranks = Vec::new();
+    for (rank, item) in profile.items.iter().enumerate() {
+        match item {
+            ProfileItem::Quality(leaf) => ranks.push((leaf.quality_id, rank)),
+            ProfileItem::Group { items, .. } => {
+                ranks.extend(items.iter().map(|leaf| (leaf.quality_id, rank)))
+            }
+        }
+    }
+    let item_allowed = |item: &ProfileItem| match item {
+        ProfileItem::Quality(leaf) => leaf.allowed,
+        ProfileItem::Group { allowed, items, .. } => *allowed && items.iter().any(|l| l.allowed),
+    };
+    let (threshold, basis) = if policy.upgrade_allowed {
+        let position = match policy.cutoff {
+            Cutoff::Quality { quality_id } => ranks
+                .iter()
+                .find(|(id, _)| *id == quality_id)
+                .map(|(_, rank)| *rank)?,
+            Cutoff::Group { position } => {
+                matches!(profile.items.get(position), Some(ProfileItem::Group { .. }))
+                    .then_some(position)?
+            }
+        };
+        (position, ThresholdBasis::ConfiguredCutoff)
+    } else {
+        (
+            profile.items.iter().position(item_allowed)?,
+            ThresholdBasis::FirstAllowed,
+        )
+    };
+    Some(QualityThreshold {
+        threshold,
+        basis,
+        ranks,
+    })
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+    fn leaf(quality_id: i64, allowed: bool) -> ProfileLeaf {
+        ProfileLeaf {
+            quality_id,
+            allowed,
+            min_size: None,
+            max_size: None,
+            preferred_size: None,
+        }
+    }
+    fn profile(items: Vec<ProfileItem>, upgrade_allowed: bool, cutoff: Cutoff) -> Profile {
+        Profile {
+            id: 1,
+            media_type: crate::api::MediaDomain::Tv,
+            name: "Threshold".into(),
+            items,
+            policy: Some(Policy {
+                upgrade_allowed,
+                cutoff,
+                min_format_score: 0,
+                cutoff_format_score: 10_000,
+                min_upgrade_format_score: 1,
+                language_id: None,
+                format_items: Vec::new(),
+            }),
+        }
+    }
+    fn below(t: &QualityThreshold, quality: i64) -> Option<bool> {
+        t.ranks
+            .iter()
+            .find(|(id, _)| *id == quality)
+            .map(|(_, rank)| *rank < t.threshold)
+    }
+    fn grouped() -> Vec<ProfileItem> {
+        vec![
+            ProfileItem::Quality(leaf(1, false)),
+            ProfileItem::Quality(leaf(4, true)),
+            ProfileItem::Group {
+                name: "WEB 1080p".into(),
+                allowed: true,
+                items: vec![leaf(3, true), leaf(15, true)],
+            },
+            ProfileItem::Quality(leaf(7, true)),
+        ]
+    }
+
+    #[test]
+    fn grouped_cutoff_treats_members_as_equal_and_includes_disallowed_lower_items() {
+        let t =
+            quality_threshold(&profile(grouped(), true, Cutoff::Group { position: 2 })).unwrap();
+        assert_eq!(
+            (t.threshold, t.basis),
+            (2, ThresholdBasis::ConfiguredCutoff)
+        );
+        // A disallowed lower quality is still below cutoff; grouped members are equal (met).
+        assert_eq!(below(&t, 1), Some(true));
+        assert_eq!(below(&t, 4), Some(true));
+        assert_eq!(below(&t, 3), Some(false));
+        assert_eq!(below(&t, 15), Some(false));
+        assert_eq!(below(&t, 7), Some(false));
+        // Qualities absent from the profile stay unknown rather than rank zero.
+        assert_eq!(below(&t, 9), None);
+    }
+
+    #[test]
+    fn quality_cutoff_uses_the_outer_position_of_that_quality() {
+        let t = quality_threshold(&profile(grouped(), true, Cutoff::Quality { quality_id: 7 }))
+            .unwrap();
+        assert_eq!(t.threshold, 3);
+        assert_eq!(below(&t, 15), Some(true));
+        assert_eq!(below(&t, 7), Some(false));
+    }
+
+    #[test]
+    fn upgrades_disabled_use_the_first_allowed_item_not_an_empty_threshold() {
+        let t = quality_threshold(&profile(
+            grouped(),
+            false,
+            Cutoff::Quality { quality_id: 7 },
+        ))
+        .unwrap();
+        assert_eq!((t.threshold, t.basis), (1, ThresholdBasis::FirstAllowed));
+        assert_eq!(below(&t, 1), Some(true));
+        assert_eq!(below(&t, 4), Some(false));
+        assert_eq!(below(&t, 7), Some(false));
+    }
+
+    #[test]
+    fn missing_policy_or_unresolvable_cutoff_is_unknown() {
+        let mut p = profile(grouped(), true, Cutoff::Group { position: 1 });
+        assert_eq!(quality_threshold(&p), None, "position 1 is not a group");
+        p.policy = None;
+        assert_eq!(quality_threshold(&p), None);
+        let none_allowed = profile(
+            vec![ProfileItem::Quality(leaf(1, false))],
+            false,
+            Cutoff::Quality { quality_id: 1 },
+        );
+        assert_eq!(quality_threshold(&none_allowed), None);
+    }
+
+    #[test]
+    fn custom_format_cutoff_score_does_not_change_quality_membership() {
+        let mut p = profile(grouped(), true, Cutoff::Quality { quality_id: 4 });
+        let before = quality_threshold(&p).unwrap();
+        p.policy.as_mut().unwrap().cutoff_format_score = -10_000;
+        assert_eq!(quality_threshold(&p).unwrap(), before);
+    }
+}

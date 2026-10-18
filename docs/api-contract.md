@@ -94,6 +94,9 @@ All paths below start with `/api/v1`. `{media}` is `tv` or `movies`; library `{b
 | POST `/{media}/quality-profiles` | `QualityProfileInput` | `QualityProfile` (201) |
 | GET `/{media}/quality-profiles/{id}` | none | `QualityProfile` |
 | PUT `/{media}/quality-profiles/{id}` | `QualityProfileInput` | `QualityProfile` |
+| GET `/tv/wanted/{missing,cutoff}` | `WantedQuery` (strict; see `docs/wanted-api.md`) | `WantedPage<TvWantedItem>` |
+| GET `/movies/wanted/{missing,cutoff}` | `WantedQuery` | `WantedPage<MovieWantedItem>` |
+| POST `/{media}/wanted/search` | `WantedSearchInput` | `WantedSearchReceipt` (202; atomic admission of ordinary search commands) |
 
 Other listed successes return 200. Native errors use `ApiErrorEnvelope` (`error.code`, `error.message`); main import/snapshot errors use `LegacyError` (`error` string). Framework extractor failures, unknown routes and unsupported methods can have non-JSON bodies. Status/range/selector/size constraints remain in handlers and the feature API documents: [library](library-api.md), [episodes](episode-api.md), [files](file-api.md), [qualities](quality-api.md), [snapshots](snapshot-import.md). The table documents routing; the generator exports DTOs, not a generated route client.
 

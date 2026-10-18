@@ -385,22 +385,288 @@ async fn create(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
- match read(&tx,input.request_id).await { Ok(existing)=>{
- if existing.mode!=input.mode||existing.target!=input.target||existing.source.indexer_id!=input.indexer_id||existing.source.indexer_revision!=input.indexer_revision||existing.source.selection_kind!=source.selection_kind||existing.source.client_id!=source.client_id||existing.source.client_revision!=source.client_revision||existing.priority.number()!=input.priority.number(){return Err(conflict())}
- return bounded(existing)
- },Err(Error(StatusCode::NOT_FOUND,"search_command_not_found"))=>(),Err(e)=>return Err(e)}
- if rss::protocol_mismatch(&tx,source).await?{return Err(rss::protocol_rejection())}
- if !rss::valid_target(&tx,source,input.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
- // A selected offer must never depend on an unencrypted locator fallback.
- s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;
- let captured=identity(&tx,&input.target).await?;let timestamp=now()?;
- if command_capacity(&tx).await?>=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
- tx.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete,selection_kind)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0,?)",params![input.request_id.to_string(),input.mode.text(),domain(media),episode,movie,captured,input.indexer_id.to_string(),input.indexer_revision,source.client_id.map(|v|v.to_string()),source.client_revision,input.priority.number(),timestamp,timestamp,source.selection_kind.text()]).await?;
- bounded(read(&tx,input.request_id).await?)
- }.await;
+    let outcome = async {
+        match read(&tx, input.request_id).await {
+            Ok(existing) => {
+                if existing.mode != input.mode
+                    || existing.target != input.target
+                    || !same_source(&existing, source)
+                    || existing.priority.number() != input.priority.number()
+                {
+                    return Err(conflict());
+                }
+                return bounded(existing);
+            }
+            Err(Error(StatusCode::NOT_FOUND, "search_command_not_found")) => (),
+            Err(e) => return Err(e),
+        }
+        preflight(&tx, &s.client, source, input.mode).await?;
+        let captured = identity(&tx, &input.target).await?;
+        let timestamp = now()?;
+        if command_capacity(&tx).await? >= MAX_COMMANDS {
+            return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
+        }
+        insert(
+            &tx,
+            input.request_id,
+            input.mode,
+            &input.target,
+            &captured,
+            source,
+            input.priority,
+            timestamp,
+        )
+        .await?;
+        bounded(read(&tx, input.request_id).await?)
+    }
+    .await;
     Ok((StatusCode::ACCEPTED, finish(tx, outcome).await?))
 }
+fn same_source(existing: &SearchCommand, source: rss::RssTarget) -> bool {
+    existing.source.media_type == source.media_type
+        && existing.source.indexer_id == source.indexer_id
+        && existing.source.indexer_revision == source.indexer_revision
+        && existing.source.selection_kind == source.selection_kind
+        && existing.source.client_id == source.client_id
+        && existing.source.client_revision == source.client_revision
+}
+/// Provider scope, protocol and key readiness shared by single and Wanted admission.
+async fn preflight(
+    c: &Connection,
+    client: &RefreshClient,
+    source: rss::RssTarget,
+    mode: SearchMode,
+) -> Result<()> {
+    if rss::protocol_mismatch(c, source).await? {
+        return Err(rss::protocol_rejection());
+    }
+    if !rss::valid_target(c, source, mode.operation()).await? {
+        return Err(Error(StatusCode::CONFLICT, "provider_changed"));
+    }
+    // A selected offer must never depend on an unencrypted locator fallback.
+    client
+        .seal_release("search-key-preflight", b"configured")
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code))?;
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+async fn insert(
+    c: &Connection,
+    id: Uuid,
+    mode: SearchMode,
+    target: &MediaTarget,
+    captured: &str,
+    source: rss::RssTarget,
+    priority: CommandPriority,
+    timestamp: i64,
+) -> Result<()> {
+    let (media, episode, movie) = target_parts(target);
+    c.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete,selection_kind)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0,?)",params![id.to_string(),mode.text(),domain(media),episode,movie,captured.to_owned(),source.indexer_id.to_string(),source.indexer_revision,source.client_id.map(|v|v.to_string()),source.client_revision,priority.number(),timestamp,timestamp,source.selection_kind.text()]).await?;
+    Ok(())
+}
+
+/// Most targets one Wanted request may capture; it equals the shared active-command pool.
+pub(crate) const MAX_WANTED_TARGETS: usize = MAX_COMMANDS as usize;
+pub(crate) struct WantedChild {
+    pub target: MediaTarget,
+    pub command_id: Uuid,
+}
+pub(crate) struct WantedAdmission {
+    pub replayed: bool,
+    pub matched: Option<u32>,
+    pub skipped_active: Option<u32>,
+    pub children: Vec<WantedChild>,
+}
+fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(context.finish().as_ref());
+    out
+}
+/// Children of one Wanted request share a 64-bit prefix derived from the request UUID alone,
+/// so an exact replay finds its original capture by an indexed range read. The suffix binds
+/// the canonical request digest and target; a different body under the same UUID conflicts.
+fn child_id(request: Uuid, digest: &[u8; 32], media: MediaDomain, target: i64) -> Uuid {
+    let prefix = sha256(&[b"hrrdarr-wanted-request-v1", request.as_bytes()]);
+    let suffix = sha256(&[
+        b"hrrdarr-wanted-child-v1",
+        request.as_bytes(),
+        digest,
+        domain(media).as_bytes(),
+        &target.to_be_bytes(),
+    ]);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&prefix[..8]);
+    bytes[8..].copy_from_slice(&suffix[..8]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+fn child_range(request: Uuid) -> (String, String) {
+    let prefix = child_id(request, &[0; 32], MediaDomain::Tv, 0).to_string()[..18].to_owned();
+    (
+        format!("{prefix}-0000-000000000000"),
+        format!("{prefix}-ffff-ffffffffffff"),
+    )
+}
+fn target_id(target: &MediaTarget) -> i64 {
+    match target {
+        MediaTarget::Episode(id) | MediaTarget::Movie(id) => *id,
+    }
+}
+/// Atomically admits every target `select` captures inside one Immediate transaction as
+/// ordinary durable user-search commands (no batch table, no second worker). Whole requests
+/// beyond the target bound or the remaining shared pool are refused; nothing is partially
+/// admitted. `skip_active` omits targets that already have an active search command.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn admit_wanted<F>(
+    db: &Database,
+    client: &RefreshClient,
+    request_id: Uuid,
+    digest: [u8; 32],
+    source: rss::RssTargetInput,
+    priority: CommandPriority,
+    skip_active: bool,
+    select: F,
+) -> Result<WantedAdmission>
+where
+    F: AsyncFnOnce(&Connection, i64) -> Result<Vec<i64>>,
+{
+    let media = source.media_type;
+    let source = source.normalize()?;
+    let mode = SearchMode::Automatic;
+    let c = connection(db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let (low, high) = child_range(request_id);
+        let mut rows = tx
+            .query(
+                &format!("SELECT {COLUMNS} FROM search_commands c WHERE c.id BETWEEN ? AND ? ORDER BY c.id LIMIT ?"),
+                params![low, high, MAX_WANTED_TARGETS as i64 + 1],
+            )
+            .await?;
+        let mut existing = Vec::new();
+        while let Some(row) = rows.next().await? {
+            existing.push(command_row(row)?);
+        }
+        drop(rows);
+        if !existing.is_empty() {
+            let mut children = Vec::with_capacity(existing.len());
+            for command in existing {
+                if child_id(request_id, &digest, media, target_id(&command.target)) != command.id
+                    || command.mode != mode
+                    || !same_source(&command, source)
+                    || command.priority.number() != priority.number()
+                {
+                    return Err(conflict());
+                }
+                children.push(WantedChild {
+                    target: command.target,
+                    command_id: command.id,
+                });
+            }
+            children.sort_by_key(|child| target_id(&child.target));
+            return Ok(WantedAdmission {
+                replayed: true,
+                matched: None,
+                skipped_active: None,
+                children,
+            });
+        }
+        preflight(&tx, client, source, mode).await?;
+        let timestamp = now()?;
+        let mut ids = select(&*tx, timestamp).await?;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() > MAX_WANTED_TARGETS {
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "wanted_search_target_limit"));
+        }
+        if ids.iter().any(|id| !(1..=MAX_REVISION).contains(id)) {
+            return Err(bad());
+        }
+        let matched = ids.len();
+        if skip_active {
+            let column = match media {
+                MediaDomain::Tv => "requested_episode_id",
+                MediaDomain::Movies => "requested_movie_id",
+            };
+            let mut rows = tx
+                .query(
+                    &format!("SELECT DISTINCT {column} FROM search_commands WHERE media_type=? AND status IN ('queued','running','retry_wait') AND {column} IS NOT NULL LIMIT ?"),
+                    params![domain(media), MAX_COMMANDS + 1],
+                )
+                .await?;
+            let mut active = std::collections::BTreeSet::new();
+            while let Some(row) = rows.next().await? {
+                active.insert(row.get::<i64>(0)?);
+            }
+            ids.retain(|id| !active.contains(id));
+        }
+        if command_capacity(&tx).await? + ids.len() as i64 > MAX_COMMANDS {
+            return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
+        }
+        let mut children = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let target = match media {
+                MediaDomain::Tv => MediaTarget::Episode(*id),
+                MediaDomain::Movies => MediaTarget::Movie(*id),
+            };
+            let captured = identity(&tx, &target).await?;
+            let command_id = child_id(request_id, &digest, media, *id);
+            insert(&tx, command_id, mode, &target, &captured, source, priority, timestamp).await?;
+            children.push(WantedChild { target, command_id });
+        }
+        Ok(WantedAdmission {
+            replayed: false,
+            matched: Some(matched as u32),
+            skipped_active: Some((matched - ids.len()) as u32),
+            children,
+        })
+    }
+    .await;
+    finish(tx, outcome).await
+}
+
+#[cfg(test)]
+mod wanted_child_tests {
+    use super::*;
+    #[test]
+    fn children_share_a_request_prefix_and_bind_body_and_target() {
+        let request = Uuid::new_v4();
+        let (low, high) = child_range(request);
+        let a = child_id(request, &[1; 32], MediaDomain::Tv, 7).to_string();
+        let b = child_id(request, &[1; 32], MediaDomain::Tv, 8).to_string();
+        let c = child_id(request, &[2; 32], MediaDomain::Tv, 7).to_string();
+        let movie = child_id(request, &[1; 32], MediaDomain::Movies, 7).to_string();
+        for id in [&a, &b, &c, &movie] {
+            assert!(
+                low.as_str() <= id.as_str() && id.as_str() <= high.as_str(),
+                "{id}"
+            );
+            assert_eq!(
+                &id[14..15],
+                "8",
+                "version 8 never collides with client v4 ids"
+            );
+        }
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, movie);
+        assert_eq!(
+            a,
+            child_id(request, &[1; 32], MediaDomain::Tv, 7).to_string()
+        );
+        let other = child_id(Uuid::new_v4(), &[1; 32], MediaDomain::Tv, 7).to_string();
+        assert_ne!(&a[..18], &other[..18]);
+    }
+}
+
 async fn detail(
     State(s): State<Context>,
     Path(id): Path<String>,

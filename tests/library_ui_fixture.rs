@@ -496,6 +496,163 @@ async fn seed_tracked_receipt(
     tx.commit().await.unwrap();
     Json(json!({"provider_id":client,"remote_id":hash,"candidate_id":candidate,"episode_id":episode})).into_response()
 }
+// One-use Wanted browser hook (no production route, inert elsewhere): adds a small owned
+// library whose episode and movie IDs collide numerically, with aired/future episodes and
+// files below/at the supplied profiles' cutoff. Profiles are created by the browser via API.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WantedSeedInput {
+    tv_profile_id: i64,
+    movie_profile_id: i64,
+}
+async fn seed_wanted(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<WantedSeedInput>,
+) -> Response {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let (tv, movies) = (input.tv_profile_id, input.movie_profile_id);
+    let series: i64 = tx.query("INSERT INTO series(tvdb_id,title,path,monitored,runtime) VALUES(9101,'Wanted Harbor','/owned-wanted/tv',1,30) RETURNING id", ()).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+    tx.execute(
+        "INSERT INTO seasons(series_id,number,monitored) VALUES(?,1,1)",
+        [series],
+    )
+    .await
+    .unwrap();
+    tx.execute("INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering) VALUES('tv',?,?,'standard',0)", libsql::params![series, tv]).await.unwrap();
+    let mut episodes = serde_json::Map::new();
+    for (key, number, title, air, quality) in [
+        (
+            "pilot",
+            1,
+            "Wanted pilot",
+            Some("2020-01-01T00:00:00Z"),
+            None,
+        ),
+        (
+            "second",
+            2,
+            "Wanted second",
+            Some("2020-01-08T00:00:00Z"),
+            None,
+        ),
+        (
+            "future",
+            3,
+            "Wanted future",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+        ),
+        (
+            "low",
+            4,
+            "Wanted low quality",
+            Some("2020-01-15T00:00:00Z"),
+            Some(4),
+        ),
+        (
+            "good",
+            5,
+            "Wanted good quality",
+            Some("2020-01-22T00:00:00Z"),
+            Some(3),
+        ),
+    ] {
+        let file = match quality {
+            Some(quality) => {
+                let file: i64 = tx
+                    .query(
+                        "INSERT INTO episode_files(series_id,path) VALUES(?,?) RETURNING id",
+                        libsql::params![series, format!("/owned-wanted/tv/e{number}.mkv")],
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get(0)
+                    .unwrap();
+                tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,quality_id) VALUES('tv',?,?)", libsql::params![file, quality]).await.unwrap();
+                Some(file)
+            }
+            None => None,
+        };
+        let id: i64 = tx.query("INSERT INTO episodes(series_id,season,number,title,monitored,air_date_utc,episode_file_id) VALUES(?,1,?,?,1,?,?) RETURNING id", libsql::params![series, number, title, air, file]).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+        episodes.insert(key.into(), json!(id));
+    }
+    let mut movie_ids = serde_json::Map::new();
+    for (key, tmdb, title, year, digital, quality) in [
+        (
+            "alpha",
+            9201,
+            "Wanted Alpha",
+            2020,
+            "2020-06-01 00:00:00",
+            None,
+        ),
+        (
+            "bravo",
+            9202,
+            "Wanted Bravo",
+            2099,
+            "2099-06-01 00:00:00",
+            None,
+        ),
+        (
+            "charlie",
+            9203,
+            "Wanted Charlie",
+            2018,
+            "2018-06-01 00:00:00",
+            Some(4),
+        ),
+    ] {
+        let metadata: i64 = tx.query("INSERT INTO movie_metadata(tmdb_id,title,year,digital_release) VALUES(?,?,?,?) RETURNING id", libsql::params![tmdb, title, year, digital]).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+        let id: i64 = tx
+            .query(
+                "INSERT INTO movies(metadata_id,path,monitored) VALUES(?,?,1) RETURNING id",
+                libsql::params![metadata, format!("/owned-wanted/movies/{tmdb}")],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        tx.execute("INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability) VALUES('movies',?,?,'released')", libsql::params![id, movies]).await.unwrap();
+        if let Some(quality) = quality {
+            let file: i64 = tx
+                .query(
+                    "INSERT INTO movie_files(movie_id,path) VALUES(?,?) RETURNING id",
+                    libsql::params![id, format!("/owned-wanted/movies/{tmdb}/f.mkv")],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            tx.execute("INSERT INTO file_metadata(media_type,movie_file_id,quality_id) VALUES('movies',?,?)", libsql::params![file, quality]).await.unwrap();
+        }
+        movie_ids.insert(key.into(), json!(id));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO release_delay_policies VALUES('movies',0,0,0)",
+        (),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    Json(json!({"series_id":series,"episodes":episodes,"movies":movie_ids})).into_response()
+}
 // This one-use hook has no production route and is inert in existing browser flows.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1165,7 +1322,8 @@ async fn library_ui_fixture() {
             .merge(commands::router(db.clone()))
             .merge(hrrdarr::health::router(db.clone()))
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
-            .merge(releases::router(db.clone(), refresh))
+            .merge(releases::router(db.clone(), refresh.clone()))
+            .merge(hrrdarr::wanted::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
@@ -1195,6 +1353,7 @@ async fn library_ui_fixture() {
                         post(seed_tracked_receipt),
                     )
                     .route("/api/fixture/client-backoff/age", post(age_client_failure))
+                    .route("/api/fixture/wanted-seed", post(seed_wanted))
                     .route(
                         "/api/fixture/client-backoff/pending",
                         post(pending_client_refreshes),

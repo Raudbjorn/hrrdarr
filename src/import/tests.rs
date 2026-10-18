@@ -91,6 +91,7 @@ async fn count(db: &Database, table: &str) -> i64 {
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
+    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     durable_path_diagnostics().await;
     // All execute() cases share the process-wide import permit. Keep this regression in the
     // serial recovery test so unrelated scratch databases cannot race for that permit.

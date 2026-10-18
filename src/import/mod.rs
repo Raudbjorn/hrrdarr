@@ -699,6 +699,11 @@ pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
 }
 // ponytail: one import at a time per process; per-library workers when throughput requires it.
 static EXECUTING: AtomicBool = AtomicBool::new(false);
+/// Test-only serialisation for lib tests that reach the process-wide execution permit
+/// (import execution, file deletion, recycle cleanup). Parallel test threads would otherwise
+/// observe each other's permit as `import_busy`.
+#[cfg(test)]
+pub(crate) static PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MAX_FAILED_OWNED: usize = 1024; // Same cap as durable RSS receipts; no eviction of failed work.
 static FAILED_OWNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());

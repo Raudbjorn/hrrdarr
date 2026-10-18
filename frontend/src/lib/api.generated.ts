@@ -430,6 +430,8 @@ export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "i
 
 export type MovieRenamePreviewStatus = "change" | "unavailable";
 
+export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+
 export type MultiEpisodeExampleStatus = "rendered" | "preserved" | "needs_policy" | "invalid";
 
 export type MultiEpisodeNamingExample = { field: string, contiguous: boolean, episodes: Array<number>, status: MultiEpisodeExampleStatus, filename: string | null, reason: string | null, };
@@ -794,8 +796,42 @@ export type TvReleaseProfileInput = { name: string | null, enabled: boolean, req
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
+export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+
 export type UnmappedFolder = { name: string, path: string, relative_path: string, };
 
 export type UsenetPriority = "default" | "paused" | "low" | "normal" | "high" | "force";
 
 export type UsenetScope = { category: string, recent_priority?: UsenetPriority, older_priority?: UsenetPriority, tags?: Array<number>, };
+
+export type WantedAvailability = "all" | "available" | "unavailable";
+
+export type WantedCutoff = { profile_id: number, quality_rank: number, threshold_rank: number, basis: WantedCutoffBasis, };
+
+export type WantedCutoffBasis = "configured_cutoff" | "first_allowed";
+
+export type WantedDiagnostics = { unknown_air_date: number | null, unknown_series_runtime: number | null, unknown_year: number | null, unknown_cutoff: number | null, };
+
+export type WantedDirection = "asc" | "desc";
+
+export type WantedFile = { id: number, path: string, quality_id: number | null, quality_name: string | null, };
+
+export type WantedKind = "missing" | "cutoff";
+
+export type WantedMonitored = "monitored" | "unmonitored" | "all";
+
+export type WantedMovieAvailability = "available" | "unavailable" | "ungated";
+
+export type WantedPage<T> = { media_type: MediaDomain, kind: WantedKind, items: Array<T>, total: number, limit: number, offset: number, sort: WantedSort, direction: WantedDirection, monitored: WantedMonitored, evaluated_at: number, diagnostics: WantedDiagnostics, };
+
+export type WantedQuery = { limit?: number, offset?: number, monitored?: WantedMonitored, sort?: WantedSort, direction?: WantedDirection, availability?: WantedAvailability, };
+
+export type WantedSearchCommand = { target: MediaTarget, command_id: string, };
+
+export type WantedSearchInput = { request_id: string, kind: WantedKind, selection: WantedSelection, indexer_id: string, indexer_revision: number, client_selection: ClientSelection, priority: CommandPriority, };
+
+export type WantedSearchReceipt = { request_id: string, media_type: MediaDomain, kind: WantedKind, replayed: boolean, matched: number | null, skipped_active: number | null, admitted: number, commands: Array<WantedSearchCommand>, };
+
+export type WantedSelection = { "kind": "ids", ids: Array<number>, } | { "kind": "all", monitored: WantedMonitored, availability?: WantedAvailability, };
+
+export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality";

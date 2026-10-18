@@ -1,3 +1,4 @@
+import type { WantedKind, WantedPage, TvWantedItem, MovieWantedItem, WantedSearchInput, WantedSearchReceipt } from './api.generated';
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
 import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanChildMember, ScanMemberQuery } from './api.generated';
@@ -504,3 +505,22 @@ export const listRecycleBinCleanups = (domain: MediaDomain, limit = 5) => fileDo
   : Promise.resolve(invalidFiles<ApiPage<RecycleBinCleanupCommand>>());
 export const createRecycleBinCleanup = (domain: MediaDomain) => fileDomain(domain) ? request<RecycleBinCleanupCommand>('/api/v1/recycle-bin/cleanup-commands', { target: { media_type: domain }, priority: 'high' }, 'POST', true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());
 export const getRecycleBinCleanup = (id: string) => validOperation(id) ? request<RecycleBinCleanupCommand>(`/api/v1/recycle-bin/cleanup-commands/${id}`, undefined, undefined, true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());
+
+// Wanted lists are read-only GETs; searches admit durable commands and are never retried
+// automatically. A lost response is reconciled by resending the SAME request (exact replay).
+export const listWanted = <T extends TvWantedItem | MovieWantedItem>(domain: MediaDomain, kind: WantedKind, query: string) =>
+  (domain === 'tv' || domain === 'movies') && (kind === 'missing' || kind === 'cutoff')
+    ? request<WantedPage<T>>(`/api/v1/${domain}/wanted/${kind}${query ? `?${query}` : ''}`, undefined, undefined, true)
+    : Promise.resolve<Result<WantedPage<T>>>({ ok: false, error: 'Unknown Wanted list.' });
+const validWantedSelection = (input: WantedSearchInput) => input.selection.kind === 'all'
+  || (input.selection.ids.length >= 1 && input.selection.ids.length <= 1024 && input.selection.ids.every(validId));
+export const createWantedSearch = (domain: MediaDomain, input: WantedSearchInput) =>
+  (domain === 'tv' || domain === 'movies') && validOperation(input.request_id) && validOperation(input.indexer_id) && validId(input.indexer_revision)
+    && validClientSelection({ client_selection: input.client_selection }) && validWantedSelection(input)
+    ? request<WantedSearchReceipt>(`/api/v1/${domain}/wanted/search`, input, 'POST', true)
+    : Promise.resolve<Result<WantedSearchReceipt>>({ ok: false, error: 'Invalid Wanted search request.' });
+const validMonitorIds = (ids: number[]) => ids.length >= 1 && ids.length <= 100 && ids.every(validId) && new Set(ids).size === ids.length;
+export const monitorEpisodes = (ids: number[], monitored: boolean) => validMonitorIds(ids)
+  ? request<Episode[]>('/api/v1/episodes/monitor', { episode_ids: ids, monitored }, 'PUT', true) : invalid<Episode[]>();
+export const monitorMovies = (ids: number[], monitored: boolean) => validMonitorIds(ids)
+  ? request<LibraryItem[]>('/api/v1/movies/editor', { ids, patch: { monitored } }, 'PUT', true) : invalid<LibraryItem[]>();
