@@ -99,12 +99,23 @@ pub(super) async fn apply(
     Ok(())
 }
 
-// An episode UTC instant needs an explicit offset; date-only/naive values are
-// unknown here. Preserve subseconds rather than rounding before admission.
+// An indexer publication instant needs an explicit offset; date-only/naive
+// values are unknown here. Preserve subseconds rather than rounding before admission.
 pub(super) fn instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|v| v.with_timezone(&chrono::Utc))
+}
+
+// Stored episode air instants: native add/refresh writes the offset-less
+// `history::canonical_timestamp` form, which is UTC by contract; snapshot rows
+// keep their source offset. Date-only values stay unknown.
+pub(super) fn stored_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    instant(value).or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+            .ok()
+            .map(|v| v.and_utc())
+    })
 }
 
 // One worker dispatch is serial, but HTTP search/grab may overlap it. Bound the
