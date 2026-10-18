@@ -200,7 +200,7 @@ pub(super) async fn best(
     let mut best: Option<(crate::search::revision::ReleasePreference, Uuid)> = None;
     for item in items {
         let p = &item.work.public;
-        if !singleton(&p.target) || !valid_target(c, p.source).await? {
+        if !singleton(&p.target) || !valid_target(c, p.source, p.origin.operation()).await? {
             continue;
         }
         let decision = match crate::search::evaluate_with_pending(

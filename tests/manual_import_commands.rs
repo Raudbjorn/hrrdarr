@@ -916,11 +916,22 @@ async fn operation_owned_by_download_rejected_at_submission() {
     )
     .await;
     assert_eq!(code, 201, "{v}");
+    // Provider creation now installs an inherited policy. Preserve this scenario's
+    // explicit policy edit, using its current CAS revision instead of claiming absence.
+    let policy_path = format!(
+        "/api/v1/download-processing/policies/{}/tv",
+        download["id"].as_str().unwrap()
+    );
+    let (code, policy) = request(&base, "GET", &policy_path, Value::Null).await;
+    assert_eq!(code, 200, "{policy}");
+    assert_eq!(policy["enabled_override"], Value::Null);
+    assert_eq!(policy["enabled"], true);
+    assert_eq!(policy["mode"], "copy");
     let (code, v) = request(
         &base,
         "PUT",
-        &format!("/api/v1/download-processing/policies/{}/tv", download["id"].as_str().unwrap()),
-        json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":"copy"}),
+        &policy_path,
+        json!({"provider_revision":download["revision"],"revision":policy["revision"],"enabled":true,"mode":"copy"}),
     )
     .await;
     assert_eq!(code, 200, "{v}");

@@ -100,9 +100,93 @@ fn corrupt() -> Error {
     )
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// Server-owned intent: request payloads cannot select automatic authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexerOperation {
+    Rss,
+    Automatic,
+    Interactive,
+}
+
+pub(crate) fn indexer_operation_enabled(
+    provider: &Provider,
+    domain: MediaDomain,
+    operation: IndexerOperation,
+) -> bool {
+    if !provider.enabled {
+        return false;
+    }
+    let flags = match (&provider.settings, domain) {
+        (
+            ProviderSettings::Torznab {
+                tv: Some(scope), ..
+            }
+            | ProviderSettings::Newznab {
+                tv: Some(scope), ..
+            },
+            MediaDomain::Tv,
+        ) => (
+            scope.enable_rss,
+            scope.enable_automatic_search,
+            scope.enable_interactive_search,
+        ),
+        (
+            ProviderSettings::Torznab {
+                movies: Some(scope),
+                ..
+            }
+            | ProviderSettings::Newznab {
+                movies: Some(scope),
+                ..
+            },
+            MediaDomain::Movies,
+        ) => (
+            scope.enable_rss,
+            scope.enable_automatic_search,
+            scope.enable_interactive_search,
+        ),
+        _ => return false,
+    };
+    match operation {
+        IndexerOperation::Rss => flags.0,
+        IndexerOperation::Automatic => flags.1,
+        IndexerOperation::Interactive => flags.2,
+    }
+}
+
+fn request_policy(
+    provider: &Provider,
+    operation: IndexerOperation,
+    request: &indexer::IndexerSearch,
+) -> bool {
+    let (domain, rss) = match request {
+        indexer::IndexerSearch::Rss { media_type, .. } => (*media_type, true),
+        indexer::IndexerSearch::Tv { .. } => (MediaDomain::Tv, false),
+        indexer::IndexerSearch::Movie { .. } => (MediaDomain::Movies, false),
+    };
+    rss == (operation == IndexerOperation::Rss)
+        && indexer_operation_enabled(provider, domain, operation)
+}
+
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct TvIndexerScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_automatic_search: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_interactive_search: bool,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub download_client_id: Option<Uuid>,
     pub categories: Vec<u32>,
     pub anime_categories: Vec<u32>,
     #[serde(default)]
@@ -112,6 +196,18 @@ pub struct TvIndexerScope {
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct MovieIndexerScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_automatic_search: bool,
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_interactive_search: bool,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub download_client_id: Option<Uuid>,
     pub categories: Vec<u32>,
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
@@ -483,12 +579,243 @@ fn refresh_error(error: Error) -> RefreshError {
         _ => RefreshError::new("refresh_failed", true),
     }
 }
+/// Private health distinction, before lossy public automation error mapping.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommunicationProbeError {
+    RemoteFailure,
+    Unevaluated(&'static str),
+}
+fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError {
+    use CommunicationProbeError::{RemoteFailure, Unevaluated};
+    use http::HttpError as H;
+    use qbittorrent::QbitError as Q;
+    match error {
+        Q::Http(H::LocalUnavailable { timeout: true }) => Unevaluated("check_timeout"),
+        Q::Http(
+            H::LocalUnavailable { timeout: false }
+            | H::Busy
+            | H::InvalidRequest
+            | H::ResponseTooLarge,
+        )
+        | Q::InvalidRequest
+        | Q::ScopeConflict
+        | Q::UnsupportedFeature
+        | Q::UnsafeRetention
+        | Q::NotFound
+        | Q::MutationUnknown => Unevaluated("check_failed"),
+        Q::Http(
+            H::Authentication
+            | H::RateLimited { .. }
+            | H::Redirect
+            | H::Transport
+            | H::Timeout
+            | H::InvalidResponse,
+        )
+        | Q::InvalidResponse
+        | Q::UnsupportedVersion
+        | Q::Rejected => RemoteFailure,
+    }
+}
+// Identity mapping is valid only for local POSIX syntax; never reinterpret an unmapped UNC.
+fn local_download_root(path: &str) -> Option<String> {
+    if path.starts_with("//") {
+        return None;
+    }
+    if path == "/" {
+        return Some(path.into());
+    }
+    crate::library::normalized_path(path)
+}
+
 /// Private download paths and file facts; never directly serialize these into an API response.
 pub(crate) struct OwnedDownloadDetails {
     pub details: qbittorrent::TorrentDetails,
     pub host: String,
 }
 impl RefreshClient {
+    /// Read the actual scoped item list; connection/version success alone is insufficient.
+    pub(crate) async fn probe_download_communication(
+        &self,
+        id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<(), CommunicationProbeError> {
+        use CommunicationProbeError::Unevaluated;
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, id),
+        )
+        .await
+        .map_err(|_| Unevaluated("check_timeout"))?
+        .map_err(|error| match error {
+            Error::Plain(_, "provider_database_error", _) => Unevaluated("storage_error"),
+            _ => Unevaluated("check_failed"),
+        })?;
+        let scoped = match &provider.settings {
+            ProviderSettings::Qbittorrent { tv, movies, .. } => match domain {
+                MediaDomain::Tv => tv.is_some(),
+                MediaDomain::Movies => movies.is_some(),
+            },
+            _ => false,
+        };
+        if provider.revision != revision || !provider.enabled || !scoped {
+            return Err(Unevaluated("check_failed"));
+        }
+        provider
+            .settings
+            .validate()
+            .map_err(|_| Unevaluated("check_failed"))?;
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|_| Unevaluated("check_failed"))?;
+        // Acquisition cooldown is old evidence; an HTTP429 returned by the probe is new evidence.
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|_| Unevaluated("check_failed"))?;
+        let work = async {
+            let result = qbittorrent::refresh_pages(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                domain,
+            )
+            .await
+            .map(|_| ())
+            .map_err(communication_error);
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(|error| match error {
+                    Error::Plain(_, "provider_database_error", _) => Unevaluated("storage_error"),
+                    _ => Unevaluated("check_failed"),
+                })?;
+            operation
+                .ensure_active()
+                .map_err(|_| Unevaluated("check_timeout"))?;
+            result
+        };
+        tokio::time::timeout_at(operation.deadline(), work)
+            .await
+            .map_err(|_| Unevaluated("check_timeout"))?
+    }
+    /// Fresh, revision-fenced status for health; never exposes remote paths or credentials.
+    pub(crate) async fn inspect_client_status(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<qbittorrent::EndpointLocality, AutomationError> {
+        self.inspect_client_status_snapshot(provider_id, revision, domain)
+            .await
+            .map(|(_, status, _)| status.locality)
+    }
+
+    /// Fresh active-scope output directories in the configured local path namespace.
+    /// Private facts only: the health engine owns comparisons, invalidation and publication.
+    pub(crate) async fn inspect_download_roots(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<Vec<String>, AutomationError> {
+        let (provider, status, deadline) = self
+            .inspect_client_status_snapshot(provider_id, revision, domain)
+            .await?;
+        let endpoint = url::Url::parse(provider.settings.endpoint())
+            .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let host = crate::remote_paths::host(
+            endpoint
+                .host_str()
+                .ok_or_else(|| RefreshError::new("provider_unavailable", false))?,
+        )
+        .map_err(|_| RefreshError::new("provider_unavailable", false))?;
+        let work = async {
+            // No DB connection or transaction spans the remote status request above.
+            let connection = self
+                .0
+                .db
+                .connect()
+                .await
+                .map_err(|_| RefreshError::new("storage_error", true))?;
+            let resolution = crate::remote_paths::resolve(
+                &connection,
+                domain,
+                crate::remote_paths::ResolveInput {
+                    host,
+                    path: status.remote_root,
+                    direction: crate::remote_paths::Direction::RemoteToLocal,
+                },
+            )
+            .await
+            .map_err(|_| RefreshError::new("download_root_mapping_failed", false))?;
+            let path = local_download_root(&resolution.output)
+                .ok_or_else(|| RefreshError::new("download_root_unresolved", false))?;
+            current_revision(&self.0.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            Ok::<_, AutomationError>(vec![path])
+        };
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+
+    async fn inspect_client_status_snapshot(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<
+        (Provider, qbittorrent::ClientStatus, tokio::time::Instant),
+        AutomationError,
+    > {
+        let context = &self.0;
+        let (provider, credentials) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            network_snapshot(context, provider_id),
+        )
+        .await
+        .map_err(|_| RefreshError::new("refresh_timeout", true))?
+        .map_err(refresh_error)?;
+        if provider.revision != revision {
+            return Err(RefreshError::new("provider_changed", false));
+        }
+        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+            return Err(RefreshError::new("provider_unavailable", false));
+        }
+        let transport = context
+            .transport
+            .as_ref()
+            .as_ref()
+            .map_err(|e| refresh_error(http_error(*e).0))?;
+        let operation = transport
+            .operation(provider.id)
+            .map_err(|e| refresh_error(http_error(e).0))?;
+        let work = async {
+            let status = qbittorrent::client_status(
+                &operation,
+                &provider.settings,
+                credentials.as_ref(),
+                domain,
+            )
+            .await
+            .map_err(|e| refresh_error(qbit_error(e).0))?;
+            current_revision(&context.db, &provider)
+                .await
+                .map_err(refresh_error)?;
+            operation
+                .ensure_active()
+                .map_err(|e| refresh_error(http_error(e).0))?;
+            Ok::<_, AutomationError>(status)
+        };
+        let deadline = operation.deadline();
+        let status = tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| RefreshError::new("refresh_timeout", true))??;
+        Ok((provider, status, deadline))
+    }
     pub(crate) async fn inspect_download(
         &self,
         provider_id: &str,
@@ -551,8 +878,8 @@ impl RefreshClient {
             .await
             .map_err(|_| RefreshError::new("refresh_timeout", true))?
     }
-    pub(crate) fn matches_database(&self, db: &Arc<Database>) -> bool {
-        Arc::ptr_eq(&self.0.db, db)
+    pub(crate) fn matches_database(&self, db: &Database) -> bool {
+        std::ptr::eq(self.0.db.as_ref(), db)
     }
 
     pub(crate) fn seal_release(
@@ -745,6 +1072,7 @@ impl RefreshClient {
         &self,
         provider_id: &str,
         revision: i64,
+        operation: IndexerOperation,
         request: &indexer::IndexerSearch,
     ) -> std::result::Result<indexer::RawIndexerPage, AutomationError> {
         let context = &self.0;
@@ -758,7 +1086,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        if !provider.enabled || matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        if !request_policy(&provider, operation, request) {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let transport = context
@@ -882,7 +1210,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let row=conn.query("SELECT implementation,name,enabled,priority,revision,endpoint,credentials FROM providers WHERE id=?",[id]).await?.next().await?.ok_or_else(missing)?;
     let implementation: String = row.get(0)?;
     let endpoint: String = row.get(5)?;
-    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags FROM provider_scopes WHERE provider_id=?",[id]).await?;
+    let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -921,6 +1249,13 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 serde_json::from_str(&scope.get::<String>(1)?).map_err(|_| corrupt())?;
             if media == "tv" {
                 tv_index = Some(TvIndexerScope {
+                    enable_rss: stored_bool(scope.get(14)?)?,
+                    enable_automatic_search: stored_bool(scope.get(15)?)?,
+                    enable_interactive_search: stored_bool(scope.get(16)?)?,
+                    download_client_id: scope
+                        .get::<Option<String>>(17)?
+                        .map(|id| Uuid::parse_str(&id).map_err(|_| corrupt()))
+                        .transpose()?,
                     categories: cats,
                     anime_standard_format_search: stored_bool(scope.get::<i64>(7)?)?,
                     anime_categories: serde_json::from_str(&scope.get::<String>(2)?)
@@ -928,6 +1263,13 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 })
             } else {
                 movie_index = Some(MovieIndexerScope {
+                    enable_rss: stored_bool(scope.get(14)?)?,
+                    enable_automatic_search: stored_bool(scope.get(15)?)?,
+                    enable_interactive_search: stored_bool(scope.get(16)?)?,
+                    download_client_id: scope
+                        .get::<Option<String>>(17)?
+                        .map(|id| Uuid::parse_str(&id).map_err(|_| corrupt()))
+                        .transpose()?,
                     categories: cats,
                     remove_year: stored_bool(scope.get::<i64>(8)?)?,
                 })
@@ -978,12 +1320,38 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
 }
 async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) -> Result<()> {
     let implementation = settings.implementation();
+    if let ProviderSettings::Torznab { tv, movies, .. }
+    | ProviderSettings::Newznab { tv, movies, .. } = settings
+    {
+        for (domain, client) in [
+            ("tv", tv.as_ref().and_then(|s| s.download_client_id)),
+            ("movies", movies.as_ref().and_then(|s| s.download_client_id)),
+        ] {
+            if let Some(client) = client {
+                // Existence and native domain are configuration facts at write time; a later
+                // disabled or removed client stays a stored preference that health reports.
+                if conn.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?", params![client.to_string(), domain]).await?.next().await?.is_none() {
+                    return Err(bad());
+                }
+            }
+        }
+    }
     conn.execute("DELETE FROM provider_scopes WHERE provider_id=?", [id])
         .await?;
     match settings {
         ProviderSettings::Torznab { tv, movies, .. }
         | ProviderSettings::Newznab { tv, movies, .. } => {
-            for (domain, categories, anime, standard, remove_year) in tv
+            for (
+                domain,
+                categories,
+                anime,
+                standard,
+                remove_year,
+                rss,
+                automatic,
+                interactive,
+                client,
+            ) in tv
                 .iter()
                 .map(|s| {
                     (
@@ -992,6 +1360,10 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                         s.anime_categories.as_slice(),
                         Some(i64::from(s.anime_standard_format_search)),
                         None::<i64>,
+                        i64::from(s.enable_rss),
+                        i64::from(s.enable_automatic_search),
+                        i64::from(s.enable_interactive_search),
+                        s.download_client_id.map(|id| id.to_string()),
                     )
                 })
                 .chain(movies.iter().map(|s| {
@@ -1001,12 +1373,16 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                         &[][..],
                         None,
                         Some(i64::from(s.remove_year)),
+                        i64::from(s.enable_rss),
+                        i64::from(s.enable_automatic_search),
+                        i64::from(s.enable_interactive_search),
+                        s.download_client_id.map(|id| id.to_string()),
                     )
                 }))
             {
                 let categories = serde_json::to_string(categories).map_err(|_| bad())?;
                 let anime = serde_json::to_string(anime).map_err(|_| bad())?;
-                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year]).await?;
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,categories,anime,standard,remove_year,rss,automatic,interactive,client]).await?;
             }
         }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -1049,6 +1425,85 @@ fn credentials(
             .map_err(|_| locked()),
     }
 }
+// One collector per writer transaction deduplicates bulk/import invalidation. The old and new
+// scope union and the indexer references to a client are captured before replacement/deletion.
+#[derive(Default)]
+pub(crate) struct HealthConfigurationChanges {
+    // Indexer edits affect capability checks (0048) and the download-client binding check.
+    indexers: [bool; 2],
+    // Client edits affect client checks; the binding check is marked through `referenced`.
+    clients: [bool; 2],
+    // Domains where some indexer references the changed client; only the binding check applies.
+    referenced: [bool; 2],
+}
+impl HealthConfigurationChanges {
+    async fn capture(
+        &mut self,
+        c: &Connection,
+        id: &str,
+        old: Option<&ProviderSettings>,
+        new: Option<&ProviderSettings>,
+    ) -> Result<()> {
+        let mut client = false;
+        for settings in [old, new].into_iter().flatten() {
+            let (selected, tv, movies) = match settings {
+                ProviderSettings::Torznab { tv, movies, .. }
+                | ProviderSettings::Newznab { tv, movies, .. } => {
+                    (&mut self.indexers, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Qbittorrent { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+            };
+            selected[0] |= tv;
+            selected[1] |= movies;
+        }
+        if client {
+            // The client may already lack a referenced domain, so read references before mutation.
+            let mut rows = c.query("SELECT DISTINCT media_type FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND download_client_id=?", [id]).await?;
+            while let Some(row) = rows.next().await? {
+                match row.get::<String>(0)?.as_str() {
+                    "tv" => self.referenced[0] = true,
+                    "movies" => self.referenced[1] = true,
+                    _ => return Err(corrupt()),
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn mark(self, c: &Connection) -> Result<()> {
+        let recorded = |e: crate::health::Error| {
+            Error::Plain(e.0, e.1, "Health configuration could not be recorded")
+        };
+        for (i, domain) in [MediaDomain::Tv, MediaDomain::Movies]
+            .into_iter()
+            .enumerate()
+        {
+            if self.indexers[i] {
+                crate::health::indexer_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
+            if self.indexers[i] || self.referenced[i] {
+                crate::health::indexer_client_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
+            if self.clients[i] {
+                crate::health::provider_configuration_changed(c, domain)
+                    .await
+                    .map_err(recorded)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn finish(self, c: &Connection) -> std::result::Result<(), &'static str> {
+        self.mark(c)
+            .await
+            .map_err(|_| "provider health configuration could not be recorded")
+    }
+}
 async fn create(
     State(context): State<Context>,
     input: std::result::Result<Json<ProviderInput>, JsonRejection>,
@@ -1068,9 +1523,12 @@ async fn create(
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
     let outcome = async {
+    let mut changes = HealthConfigurationChanges::default();
+    changes.capture(&tx, &id, None, Some(&input.settings)).await?;
     tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,?,?,1,1,?,?)",params![id.clone(),input.settings.implementation(),input.name,i64::from(input.enabled),i64::from(input.priority),input.settings.endpoint(),secret]).await?;
     write_scopes(&tx, &id, &input.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
+    changes.mark(&tx).await?;
     Ok((StatusCode::CREATED, bounded(read(&tx, &id).await?.0)?))
     }.await;
     finish(tx, outcome).await
@@ -1105,12 +1563,15 @@ async fn update(
         &input.config.credentials,
     )?;
     release_profile_references(&tx,&id,Some(&input.config.settings)).await?;
+    let mut changes = HealthConfigurationChanges::default();
+    changes.capture(&tx, &id, Some(&old.settings), Some(&input.config.settings)).await?;
     let changed=tx.execute("UPDATE providers SET name=?,enabled=?,priority=?,revision=revision+1,endpoint=?,credentials=? WHERE id=? AND revision=?",params![input.config.name,i64::from(input.config.enabled),i64::from(input.config.priority),input.config.settings.endpoint(),secret,id.clone(),input.revision]).await?;
     if changed != 1 {
         return Err(conflict());
     }
     write_scopes(&tx, &id, &input.config.settings).await?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
+    changes.mark(&tx).await?;
     bounded(read(&tx, &id).await?.0)
     }.await;
     finish(tx, outcome).await
@@ -1201,6 +1662,8 @@ async fn delete(
             &Change::Null,
         )?;
         release_profile_references(&tx, &id, None).await?;
+        let mut changes = HealthConfigurationChanges::default();
+        changes.capture(&tx, &id, Some(&old.settings), None).await?;
         if tx
             .execute(
                 "DELETE FROM providers WHERE id=? AND revision=?",
@@ -1220,6 +1683,7 @@ async fn delete(
                     "Completed download handling reconciliation failed",
                 )
             })?;
+        changes.mark(&tx).await?;
         Ok(StatusCode::NO_CONTENT)
     }
     .await;
@@ -1252,7 +1716,98 @@ async fn finish<T>(tx: libsql::Transaction, outcome: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_root_namespace_requires_posix_or_explicit_mapping() {
+        assert_eq!(super::local_download_root("/"), Some("/".into()));
+        assert_eq!(
+            super::local_download_root("/media//downloads/"),
+            Some("/media/downloads".into())
+        );
+        for invalid in [
+            "//server/share",
+            "\\\\server\\share",
+            "C:/downloads",
+            "relative",
+            "/a/../b",
+            "/a\0b",
+        ] {
+            assert_eq!(super::local_download_root(invalid), None, "{invalid}");
+        }
+    }
     use super::*;
+    #[test]
+    fn operation_policy_requires_intent_global_scope_and_strict_flags() {
+        let value = serde_json::json!({"implementation":"torznab","endpoint":"https://example.test/api","tv":{"categories":[5030],"anime_categories":[],"enable_rss":false},"movies":{"categories":[2000],"enable_automatic_search":false,"enable_interactive_search":false}});
+        let settings: ProviderSettings = serde_json::from_value(value.clone()).unwrap();
+        let mut provider = Provider {
+            id: Uuid::nil(),
+            revision: 1,
+            name: "policy".into(),
+            enabled: true,
+            priority: 1,
+            settings,
+            has_credentials: false,
+            test_supported: true,
+            test_status: TestStatus::NeverTested,
+            last_test: None,
+        };
+        for (domain, expected) in [
+            (MediaDomain::Tv, [false, true, true]),
+            (MediaDomain::Movies, [true, false, false]),
+        ] {
+            for (operation, expected) in [
+                IndexerOperation::Rss,
+                IndexerOperation::Automatic,
+                IndexerOperation::Interactive,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    indexer_operation_enabled(&provider, domain, operation),
+                    expected
+                );
+            }
+        }
+        let rss = indexer::IndexerSearch::Rss {
+            media_type: MediaDomain::Movies,
+            offset: 0,
+            query_index: 0,
+            limit: 10,
+        };
+        assert!(request_policy(&provider, IndexerOperation::Rss, &rss));
+        assert!(!request_policy(
+            &provider,
+            IndexerOperation::Interactive,
+            &rss
+        ));
+        assert!(!request_policy(
+            &provider,
+            IndexerOperation::Automatic,
+            &rss
+        ));
+        let tv: indexer::IndexerSearch = serde_json::from_value(serde_json::json!({"kind":"tv","title":"Show","numbering":{"kind":"episode","season":1,"episode":1}})).unwrap();
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &tv));
+        assert!(request_policy(&provider, IndexerOperation::Automatic, &tv));
+        provider.enabled = false;
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &rss));
+        provider.enabled = true;
+        if let ProviderSettings::Torznab { movies, .. } = &mut provider.settings {
+            *movies = None;
+        }
+        assert!(!request_policy(&provider, IndexerOperation::Rss, &rss));
+        provider.settings = serde_json::from_value(serde_json::json!({"implementation":"qbittorrent","endpoint":"https://example.test","tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":null})).unwrap();
+        assert!(!request_policy(&provider, IndexerOperation::Automatic, &tv));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!("true"),
+        ] {
+            let mut malformed = value.clone();
+            malformed["tv"]["enable_rss"] = invalid;
+            assert!(serde_json::from_value::<ProviderSettings>(malformed).is_err());
+        }
+    }
     #[test]
     fn configuration_wire_and_domain_validation_are_closed() {
         let input = serde_json::json!({"revision":1,"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"newznab","endpoint":"https://example.invalid/api","tv":null,"movies":{"categories":[2147483647]}}});
@@ -1394,6 +1949,9 @@ fn http_error(error: http::HttpError) -> (Error, &'static str) {
     use http::HttpError as H;
     match error {
         H::InvalidRequest => (bad(), "invalid_request"),
+        H::LocalUnavailable { timeout } => {
+            http_error(if timeout { H::Timeout } else { H::Transport })
+        }
         H::Authentication => (
             Error::Plain(
                 StatusCode::BAD_GATEWAY,
@@ -1509,10 +2067,35 @@ async fn record_test(
     let tested_at = i64::try_from(now).map_err(|_| corrupt())?;
     let conn = db.connect().await?;
     let status = if code.is_none() { "success" } else { "failure" };
-    let changed=conn.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,?,?,? FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code",params![tested_at,status,code,provider.id.to_string(),provider.revision]).await?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let previous = tx.query("SELECT status,error_code FROM provider_tests WHERE provider_id=? AND config_revision=?", params![provider.id.to_string(),provider.revision]).await?.next().await?
+        .map(|row| -> Result<(String,Option<String>)> { Ok((row.get(0)?,row.get(1)?)) }).transpose()?;
+    let changed=tx.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) SELECT id,revision,?,?,? FROM providers WHERE id=? AND revision=? ON CONFLICT(provider_id) DO UPDATE SET config_revision=excluded.config_revision,tested_at=excluded.tested_at,status=excluded.status,error_code=excluded.error_code",params![tested_at,status,code,provider.id.to_string(),provider.revision]).await?;
     if changed != 1 {
         return Err(conflict());
     }
+    let different = previous
+        .as_ref()
+        .is_none_or(|(old_status, old_code)| old_status != status || old_code.as_deref() != code);
+    if different {
+        if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
+            for (selected, domain) in [
+                (tv.is_some(), MediaDomain::Tv),
+                (movies.is_some(), MediaDomain::Movies),
+            ] {
+                if selected {
+                    crate::health::communication_status_changed(&tx, domain)
+                        .await
+                        .map_err(|e| {
+                            Error::Plain(e.0, e.1, "Health observation could not be recorded")
+                        })?;
+                }
+            }
+        }
+    }
+    tx.commit().await?;
     eprintln!(
         "{}",
         serde_json::json!({"level":if code.is_none(){"INFO"}else{"ERROR"},"event":"provider_test_completed","provider_id":provider.id,"revision":provider.revision,"result":status,"error_code":code,"correlation_id":Uuid::new_v4()})
@@ -1595,6 +2178,17 @@ async fn search(
     let (provider, credentials) = network_snapshot(&context, &id).await?;
     if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
         return Err(unsupported_operation());
+    }
+    let intent = match &input {
+        indexer::IndexerSearch::Rss { .. } => IndexerOperation::Rss,
+        _ => IndexerOperation::Interactive,
+    };
+    if !request_policy(&provider, intent, &input) {
+        return Err(Error::Plain(
+            StatusCode::CONFLICT,
+            "provider_unavailable",
+            "Provider operation is disabled or out of scope",
+        ));
     }
     let transport = context
         .transport
@@ -1735,16 +2329,31 @@ pub(crate) async fn import_configuration(
     conn: &Connection,
     key: Option<&CredentialKey>,
     input: &ProviderInput,
+    download_client_id: Option<Uuid>,
+    changes: &mut HealthConfigurationChanges,
     mapped: Option<(&str, i64)>,
 ) -> std::result::Result<Option<(String, i64, bool)>, &'static str> {
     const INVALID: &str = "invalid source provider configuration";
     const FAILED: &str = "provider reconstruction failed; transaction not committed";
     const LOCKED: &str = "provider reconstruction requires the matching credential key";
     validate(input).map_err(|_| INVALID)?;
+    let mut settings = input.settings.clone();
+    if let ProviderSettings::Torznab { tv, movies, .. }
+    | ProviderSettings::Newznab { tv, movies, .. } = &mut settings
+    {
+        if let Some(scope) = tv {
+            scope.download_client_id = download_client_id;
+        }
+        if let Some(scope) = movies {
+            scope.download_client_id = download_client_id;
+        }
+    } else if download_client_id.is_some() {
+        return Err(INVALID);
+    }
     if input.enabled {
         return Err(INVALID);
     }
-    let implementation = input.settings.implementation();
+    let implementation = settings.implementation();
     let wanted_secret = match &input.credentials {
         Change::Value(value) => Some(value),
         Change::Null => None,
@@ -1753,7 +2362,7 @@ pub(crate) async fn import_configuration(
     if wanted_secret.is_some() && key.is_none() {
         return Err(LOCKED);
     }
-    let domain = match &input.settings {
+    let domain = match &settings {
         ProviderSettings::Torznab {
             tv: Some(_),
             movies: None,
@@ -1793,7 +2402,7 @@ pub(crate) async fn import_configuration(
             .await
             .map_err(|_| FAILED)?
     } else {
-        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,input.settings.endpoint(),domain]).await.map_err(|_| FAILED)?
+        conn.query("SELECT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? LIMIT 2", params![implementation,settings.endpoint(),domain]).await.map_err(|_| FAILED)?
     };
     let candidate = rows
         .next()
@@ -1821,7 +2430,7 @@ pub(crate) async fn import_configuration(
             && existing.last_test.is_none()
             && mapped.is_none_or(|(_, revision)| existing.revision == revision)
             && serde_json::to_value(&existing.settings).map_err(|_| FAILED)?
-                == serde_json::to_value(&input.settings).map_err(|_| FAILED)?
+                == serde_json::to_value(&settings).map_err(|_| FAILED)?
             && serde_json::to_value(&secret).map_err(|_| FAILED)?
                 == serde_json::to_value(wanted_secret).map_err(|_| FAILED)?;
         return Ok(equals.then_some((id, existing.revision, false)));
@@ -1837,8 +2446,12 @@ pub(crate) async fn import_configuration(
                 .map_err(|_| LOCKED)
         })
         .transpose()?;
-    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),input.settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
-    write_scopes(conn, &id, &input.settings)
+    changes
+        .capture(conn, &id, None, Some(&settings))
+        .await
+        .map_err(|_| FAILED)?;
+    conn.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials) VALUES(?,?,?,0,?,1,1,?,?)",params![id.clone(),implementation,input.name.clone(),i64::from(input.priority),settings.endpoint(),encrypted]).await.map_err(|_| FAILED)?;
+    write_scopes(conn, &id, &settings)
         .await
         .map_err(|_| FAILED)?;
     crate::completed_download_handling::reconcile(conn, Some(&id), None)
@@ -1906,4 +2519,53 @@ async fn path_preview(
         provider_revision: provider.revision,
         resolution,
     }))
+}
+
+#[cfg(test)]
+mod communication_error_tests {
+    use super::*;
+    #[test]
+    fn raw_probe_classification_keeps_local_limits_unevaluated_and_legacy_errors() {
+        use CommunicationProbeError::*;
+        use http::HttpError as H;
+        use qbittorrent::QbitError as Q;
+        for error in [
+            H::Authentication,
+            H::Transport,
+            H::Timeout,
+            H::Redirect,
+            H::InvalidResponse,
+            H::RateLimited {
+                retry_after_seconds: Some(60),
+            },
+        ] {
+            assert_eq!(communication_error(Q::Http(error)), RemoteFailure);
+        }
+        for error in [Q::UnsupportedVersion, Q::InvalidResponse, Q::Rejected] {
+            assert_eq!(communication_error(error), RemoteFailure);
+        }
+        for error in [
+            Q::UnsupportedFeature,
+            Q::InvalidRequest,
+            Q::ScopeConflict,
+            Q::Http(H::Busy),
+            Q::Http(H::ResponseTooLarge),
+            Q::Http(H::LocalUnavailable { timeout: false }),
+        ] {
+            assert_eq!(communication_error(error), Unevaluated("check_failed"));
+        }
+        assert_eq!(
+            communication_error(Q::Http(H::LocalUnavailable { timeout: true })),
+            Unevaluated("check_timeout")
+        );
+        for timeout in [false, true] {
+            let local = refresh_error(http_error(H::LocalUnavailable { timeout }).0);
+            let prior =
+                refresh_error(http_error(if timeout { H::Timeout } else { H::Transport }).0);
+            assert_eq!(
+                (local.code, local.retryable, local.retry_after_seconds),
+                (prior.code, prior.retryable, prior.retry_after_seconds)
+            );
+        }
+    }
 }
