@@ -44,12 +44,14 @@ impl Drop for Runtime {
     }
 }
 
+fn default_metadata() -> Result<Arc<crate::metadata::MetadataClient>> {
+    crate::metadata::MetadataClient::new()
+        .map(Arc::new)
+        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))
+}
+
 pub async fn start(db: Arc<Database>, client: RefreshClient) -> Result<Runtime> {
-    let metadata = Arc::new(
-        crate::metadata::MetadataClient::new()
-            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))?,
-    );
-    start_with_metadata(db, client, metadata).await
+    start_with_metadata(db, client, default_metadata()?).await
 }
 
 pub async fn start_with_metadata(
@@ -93,10 +95,7 @@ pub struct Driver {
 }
 #[doc(hidden)]
 pub async fn start_driven(db: Arc<Database>, client: RefreshClient) -> Result<Driver> {
-    let metadata = Arc::new(
-        crate::metadata::MetadataClient::new()
-            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))?,
-    );
+    let metadata = default_metadata()?;
     let owner = acquire(&db, &client).await?;
     Ok(Driver {
         db,
