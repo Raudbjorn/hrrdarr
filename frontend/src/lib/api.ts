@@ -341,3 +341,54 @@ export const getHistory = (query: import('./api.generated').HistoryQuery = {}): 
 };
 export const getHostSettings =(): Promise<Result<import('./api.generated').HostSettings>> =>
   request<import('./api.generated').HostSettings>('/api/v1/config/host', undefined, undefined, true);
+
+// File IDs are scoped by domain; owner-qualified readback is required after uncertain writes.
+import type { FilePatch, FileResource } from './api.generated';
+import { FILE_PAGE_SIZE, validFileIds, validFileResource, validateFileReadback } from './file-metadata-draft.ts';
+const fileDomain = (domain: MediaDomain) => domain === 'tv' || domain === 'movies';
+const invalidFiles = <T>(error = 'Invalid file request.'): Result<T> => ({ ok: false, error });
+const filePageValid = (value: unknown): value is ApiPage<FileResource> => {
+  if (!value || typeof value !== 'object') return false;
+  const page = value as ApiPage<FileResource>;
+  return Array.isArray(page.items) && page.items.length <= FILE_PAGE_SIZE && Number.isSafeInteger(page.total) && page.total >= 0 && page.limit === FILE_PAGE_SIZE && Number.isSafeInteger(page.offset) && page.offset >= 0 && page.offset <= 4294967295 && page.items.length === Math.min(FILE_PAGE_SIZE, Math.max(0, page.total - page.offset));
+};
+export async function listMediaFiles(domain: MediaDomain, ownerId: number, offset = 0): Promise<Result<ApiPage<FileResource>>> {
+  if (!fileDomain(domain) || !validId(ownerId) || !Number.isInteger(offset) || offset < 0 || offset > 4294967295) return invalidFiles();
+  const query = new URLSearchParams({ [domain === 'tv' ? 'series_id' : 'movie_ids']: String(ownerId), limit: String(FILE_PAGE_SIZE), offset: String(offset) });
+  const result = await request<ApiPage<FileResource>>(`/api/v1/${domain}/files?${query}`, undefined, undefined, true);
+  if (!result.ok) return result;
+  if (!filePageValid(result.data) || result.data.offset !== offset) return invalidFiles('Invalid file page response.');
+  if (result.data.items.length) {
+    const checked = validateFileReadback(domain, ownerId, result.data.items.map(file => file?.id), result.data.items);
+    if (!checked.ok) return checked;
+  }
+  return result;
+}
+export async function getMediaFile(domain: MediaDomain, fileId: number): Promise<Result<FileResource>> {
+  if (!fileDomain(domain) || !validId(fileId)) return invalidFiles();
+  const result = await request<FileResource>(`/api/v1/${domain}/files/${fileId}`, undefined, undefined, true);
+  return !result.ok || (validFileResource(domain, result.data) && result.data.id === fileId) ? result : invalidFiles('Invalid file detail response.');
+}
+export async function updateMediaFile(domain: MediaDomain, fileId: number, patch: FilePatch): Promise<Result<FileResource>> {
+  if (!fileDomain(domain) || !validId(fileId) || !patch || !Object.keys(patch).length) return invalidFiles();
+  const result = await request<FileResource>(`/api/v1/${domain}/files/${fileId}`, patch, 'PUT', true);
+  return !result.ok || (validFileResource(domain, result.data) && result.data.id === fileId) ? result : invalidFiles('Invalid file update response; read back before another write.');
+}
+export async function editMediaFiles(domain: MediaDomain, fileIds: number[], patch: FilePatch): Promise<Result<FileResource[]>> {
+  if (!fileDomain(domain) || !validFileIds(fileIds) || !patch || !Object.keys(patch).length) return invalidFiles();
+  const ids = [...fileIds];
+  const result = await request<FileResource[]>(`/api/v1/${domain}/files/editor`, { ...patch, file_ids: ids }, 'PUT', true);
+  if (!result.ok) return result;
+  if (!Array.isArray(result.data) || result.data.length !== ids.length || new Set(result.data.map(file => file?.id)).size !== ids.length || result.data.some(file => !validFileResource(domain, file) || !ids.includes(file.id))) return invalidFiles('Invalid file editor response; read back every attempted file before another write.');
+  return result;
+}
+export async function readMediaFiles(domain: MediaDomain, ownerId: number, fileIds: number[]): Promise<Result<FileResource[]>> {
+  if (!fileDomain(domain) || !validId(ownerId) || !validFileIds(fileIds)) return invalidFiles();
+  // Snapshot the selection before awaiting; callers may change their local selection.
+  const ids = [...fileIds];
+  const query = new URLSearchParams({ file_ids: ids.join(','), limit: String(FILE_PAGE_SIZE), offset: '0' });
+  const result = await request<ApiPage<FileResource>>(`/api/v1/${domain}/files?${query}`, undefined, undefined, true);
+  if (!result.ok) return result;
+  if (!filePageValid(result.data) || result.data.offset !== 0 || result.data.total !== ids.length) return invalidFiles('Readback did not return the complete attempted selection.');
+  return validateFileReadback(domain, ownerId, ids, result.data.items);
+}
