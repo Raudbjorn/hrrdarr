@@ -22,6 +22,7 @@ use super::{
     },
 };
 use crate::{api::MediaDomain, db::MediaTarget};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -169,25 +170,6 @@ pub(crate) fn settings_fingerprint(settings: &ProviderSettings) -> Result<String
     Ok(digest_hex(&ring::digest::SHA256, &bytes))
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-/// Standard padded base64 (RFC 4648 §4), used for basic authentication and `metainfo`.
-fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for (index, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
-            if index <= chunk.len() {
-                out.push(BASE64[((n >> shift) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// Path segments of a rooted remote path; drive-letter paths compare case-insensitively.
 fn segments(path: &str) -> Option<(bool, Vec<String>)> {
     let drive = path.len() >= 3
@@ -265,10 +247,7 @@ impl<'o, 'a> Rpc<'o, 'a> {
                     return Err(QbitError::InvalidRequest);
                 }
                 (
-                    Some(format!(
-                        "Basic {}",
-                        base64(format!("{username}:{password}").as_bytes())
-                    )),
+                    Some(super::http::basic_auth(username, password)),
                     [username, password]
                         .into_iter()
                         .filter(|s| !s.is_empty())
@@ -1047,7 +1026,7 @@ async fn submit_inner(
             }
             arguments["filename"] = json!(value);
         }
-        AddSource::Torrent { bytes, .. } => arguments["metainfo"] = json!(base64(bytes)),
+        AddSource::Torrent { bytes, .. } => arguments["metainfo"] = json!(BASE64.encode(bytes)),
         AddSource::Url(_) => return Err(QbitError::InvalidRequest),
     }
     let labelled = owner.label.is_some() && session.labels_supported();
@@ -1360,20 +1339,6 @@ pub async fn control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn base64_matches_rfc4648_vectors() {
-        for (input, expected) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(input.as_bytes()), expected);
-        }
-    }
     #[test]
     fn containment_is_segment_wise_and_rooted() {
         assert!(within("/data/tv", "/data/tv"));

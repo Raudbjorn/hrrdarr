@@ -1,10 +1,12 @@
 //! Outbox fan-out and delivery. At-least-once: a delivery is claimed with a lease, resolved after
 //! the send, and re-claimable if the process dies in between. Retries back off per delivery; a
 //! permanent failure or exhausted attempts parks it as `failed` and never blocks other targets.
+//! A multi-request delivery records each acknowledged request, so a retry re-sends only the rest.
+//! Deliveries of a disabled notification are held, not failed, and resume when it is re-enabled.
 use super::{
     catalog::{self, Build, Config},
     events::{self, EventKind, EventRow, Message, Scope},
-    model::TestStatus,
+    model::{DomainTestResult, Notification, TestStatus},
     script,
     store::{Runtime, Store},
     transport::{SendError, Transport},
@@ -14,6 +16,7 @@ use libsql::{Connection, params};
 use serde_json::Value;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::{Notify, Semaphore};
+use tokio::time::Instant;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const FAN_OUT_BATCH: i64 = 64;
@@ -24,6 +27,15 @@ const BACKOFF_BASE_SECONDS: i64 = 30;
 const BACKOFF_CAP_SECONDS: i64 = 6 * 60 * 60;
 const MAX_CONCURRENT_DELIVERIES: usize = 4;
 const MAX_CONCURRENT_SCRIPTS: usize = 2;
+/// Notification tests running at once across every test endpoint.
+const MAX_CONCURRENT_TESTS: usize = 4;
+/// One domain's synthetic send: the 30 s script timeout plus spawn and permit slack.
+const TEST_DOMAIN_TIMEOUT: Duration = Duration::from_secs(40);
+/// One notification's test, both domains concurrently, including the wait for a test slot. Kept
+/// below the client's 60 s timeout for single and draft tests.
+pub const TEST_DEADLINE: Duration = Duration::from_secs(45);
+/// `/testall` as a whole. Kept below the client's 120 s timeout.
+pub const TEST_ALL_DEADLINE: Duration = Duration::from_secs(90);
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -77,6 +89,22 @@ pub struct Dispatcher {
     pub store: Arc<Store>,
     pub transport: Arc<Transport>,
     scripts: Arc<Semaphore>,
+    tests: Arc<Semaphore>,
+}
+
+/// What an attempt did with a claimed delivery.
+enum Outcome {
+    /// Sent, or nothing to send.
+    Done,
+    /// The notification is disabled; the delivery stays pending without spending an attempt.
+    Held,
+}
+
+/// The acknowledged requests of the delivery being attempted.
+struct Progress<'a> {
+    c: &'a Connection,
+    delivery: i64,
+    sent: BTreeSet<String>,
 }
 
 impl Dispatcher {
@@ -85,11 +113,24 @@ impl Dispatcher {
             store: Arc::new(Store { db, key }),
             transport: Arc::new(transport),
             scripts: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRIPTS)),
+            tests: Arc::new(Semaphore::new(MAX_CONCURRENT_TESTS)),
         }
     }
 
     /// Performs the I/O for one message. `Ok(false)` means the implementation had nothing to send.
     pub async fn send(&self, rt: &Runtime, msg: &Message) -> Result<bool, DeliveryError> {
+        self.send_tracked(rt, msg, None).await
+    }
+
+    /// Like `send`; with `progress`, HTTP requests already acknowledged for this delivery are
+    /// skipped and each newly acknowledged one is recorded before the next is sent. A request
+    /// that timed out may still have arrived, so this narrows duplicates; it cannot remove them.
+    async fn send_tracked(
+        &self,
+        rt: &Runtime,
+        msg: &Message,
+        mut progress: Option<Progress<'_>>,
+    ) -> Result<bool, DeliveryError> {
         let config = Config {
             settings: &rt.notification.settings,
             secrets: &rt.secrets,
@@ -115,7 +156,28 @@ impl Dispatcher {
                     return Ok(false);
                 }
                 for request in &requests {
+                    let Some(progress) = progress.as_mut() else {
+                        self.transport.send(request).await?;
+                        continue;
+                    };
+                    let part = request.fingerprint();
+                    if progress.sent.contains(&part) {
+                        continue;
+                    }
                     self.transport.send(request).await?;
+                    progress
+                        .c
+                        .execute(
+                            "UPDATE notification_deliveries SET sent_parts=json_insert(sent_parts,'$[#]',?1) WHERE id=?2",
+                            params![part.clone(), progress.delivery],
+                        )
+                        .await
+                        .map_err(|_| DeliveryError {
+                            code: "storage",
+                            retryable: true,
+                            retry_after: None,
+                        })?;
+                    progress.sent.insert(part);
                 }
                 Ok(true)
             }
@@ -138,32 +200,52 @@ impl Dispatcher {
         }
     }
 
-    /// Sends a synthetic Test event for every configured domain of a runtime definition.
-    pub async fn test(&self, rt: &Runtime) -> Vec<super::model::DomainTestResult> {
-        let mut out = Vec::new();
-        let mut domains = Vec::new();
-        if rt.notification.tv.is_some() {
-            domains.push(MediaDomain::Tv);
+    /// Sends a synthetic Test event for every configured domain of a runtime definition, within
+    /// `TEST_DEADLINE`.
+    pub async fn test(&self, rt: &Runtime) -> Vec<DomainTestResult> {
+        self.test_until(rt, Instant::now() + TEST_DEADLINE).await
+    }
+
+    /// Tests both configured domains concurrently once a test slot is free. Anything unfinished at
+    /// `deadline` reports `timeout`; a send cut off there may still have been delivered.
+    pub async fn test_until(&self, rt: &Runtime, deadline: Instant) -> Vec<DomainTestResult> {
+        let domains = configured_domains(&rt.notification);
+        let run = async {
+            let _permit = self.tests.acquire().await.ok()?;
+            let domain = |on: bool, domain| async move {
+                if on {
+                    Some(self.test_domain(rt, domain).await)
+                } else {
+                    None
+                }
+            };
+            let (tv, movies) = tokio::join!(
+                domain(domains.contains(&MediaDomain::Tv), MediaDomain::Tv),
+                domain(domains.contains(&MediaDomain::Movies), MediaDomain::Movies),
+            );
+            Some(tv.into_iter().chain(movies).collect::<Vec<_>>())
+        };
+        match tokio::time::timeout_at(deadline, run).await {
+            Ok(Some(results)) => results,
+            Ok(None) => failed_tests(&domains, "test_unavailable"),
+            Err(_) => failed_tests(&domains, "timeout"),
         }
-        if rt.notification.movies.is_some() {
-            domains.push(MediaDomain::Movies);
+    }
+
+    async fn test_domain(&self, rt: &Runtime, domain: MediaDomain) -> DomainTestResult {
+        let msg = events::test_message(domain);
+        let (status, error) =
+            match tokio::time::timeout(TEST_DOMAIN_TIMEOUT, self.send(rt, &msg)).await {
+                Ok(Ok(true)) => (TestStatus::Delivered, None),
+                Ok(Ok(false)) => (TestStatus::Skipped, None),
+                Ok(Err(e)) => (TestStatus::Failed, Some(e.code.to_owned())),
+                Err(_) => (TestStatus::Failed, Some("timeout".into())),
+            };
+        DomainTestResult {
+            media_type: domain,
+            status,
+            error,
         }
-        for domain in domains {
-            let msg = events::test_message(domain);
-            let (status, error) =
-                match tokio::time::timeout(Duration::from_secs(40), self.send(rt, &msg)).await {
-                    Ok(Ok(true)) => (TestStatus::Delivered, None),
-                    Ok(Ok(false)) => (TestStatus::Skipped, None),
-                    Ok(Err(e)) => (TestStatus::Failed, Some(e.code.to_owned())),
-                    Err(_) => (TestStatus::Failed, Some("timeout".into())),
-                };
-            out.push(super::model::DomainTestResult {
-                media_type: domain,
-                status,
-                error,
-            });
-        }
-        out
     }
 
     /// Turns unprocessed events into per-notification delivery rows.
@@ -212,11 +294,11 @@ impl Dispatcher {
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
             let t = now();
-            for id in &targets {
+            for (id, domain) in &targets {
                 created += tx
                     .execute(
-                        "INSERT OR IGNORE INTO notification_deliveries(event_sequence,notification_id,next_attempt_at,created_at) VALUES(?,?,?,?)",
-                        params![sequence, id.clone(), t, t],
+                        "INSERT OR IGNORE INTO notification_deliveries(event_sequence,notification_id,media_type,next_attempt_at,created_at) VALUES(?,?,?,?,?)",
+                        params![sequence, id.clone(), Scope::Domain(*domain).as_str(), t, t],
                     )
                     .await? as usize;
             }
@@ -238,7 +320,7 @@ impl Dispatcher {
         {
             let mut rows = c
                 .query(
-                    "SELECT id,event_sequence,notification_id,attempts FROM notification_deliveries WHERE state='pending' AND next_attempt_at<=?1 AND lease_until<=?1 ORDER BY next_attempt_at,id LIMIT ?2",
+                    "SELECT d.id,d.event_sequence,d.notification_id,d.attempts FROM notification_deliveries d JOIN notifications n ON n.id=d.notification_id WHERE d.state='pending' AND d.next_attempt_at<=?1 AND d.lease_until<=?1 AND n.enabled=1 ORDER BY d.next_attempt_at,d.id LIMIT ?2",
                     params![t, DELIVERY_BATCH],
                 )
                 .await?;
@@ -291,11 +373,19 @@ impl Dispatcher {
         attempts: i64,
     ) -> Result<(), libsql::Error> {
         let c = self.store.db.connect().await?;
-        let outcome = self.prepare_and_send(&c, sequence, notification).await;
+        let outcome = self.prepare_and_send(&c, id, sequence, notification).await;
         let attempts = attempts + 1;
         let t = now();
         match outcome {
-            Ok(_) => {
+            Ok(Outcome::Held) => {
+                c.execute(
+                    "UPDATE notification_deliveries SET lease_until=0 WHERE id=?",
+                    [id],
+                )
+                .await?;
+                eprintln!("event=notification_held delivery={id} reason=notification_disabled");
+            }
+            Ok(Outcome::Done) => {
                 c.execute(
                     "UPDATE notification_deliveries SET state='delivered',attempts=?,completed_at=?,lease_until=0,last_error=NULL WHERE id=?",
                     params![attempts, t, id],
@@ -333,9 +423,10 @@ impl Dispatcher {
     async fn prepare_and_send(
         &self,
         c: &Connection,
+        delivery: i64,
         sequence: i64,
         notification: &str,
-    ) -> Result<bool, DeliveryError> {
+    ) -> Result<Outcome, DeliveryError> {
         let storage = || DeliveryError {
             code: "storage",
             retryable: true,
@@ -350,8 +441,29 @@ impl Dispatcher {
             Err(_) => return Err(permanent("credentials_unavailable")),
         };
         if !rt.notification.enabled {
-            return Err(permanent("notification_disabled"));
+            // Disabled after this delivery was claimed. Unclaimed ones are not selected at all.
+            return Ok(Outcome::Held);
         }
+        let (domain, sent) = {
+            let mut rows = c
+                .query(
+                    "SELECT media_type,sent_parts FROM notification_deliveries WHERE id=?",
+                    [delivery],
+                )
+                .await
+                .map_err(|_| storage())?;
+            let r = rows
+                .next()
+                .await
+                .map_err(|_| storage())?
+                .ok_or_else(|| permanent("delivery_removed"))?;
+            let domain = MediaDomain::parse(&r.get::<String>(0).map_err(|_| storage())?)
+                .map_err(|_| permanent("delivery_invalid"))?;
+            let sent: BTreeSet<String> =
+                serde_json::from_str(&r.get::<String>(1).map_err(|_| storage())?)
+                    .map_err(|_| permanent("delivery_invalid"))?;
+            (domain, sent)
+        };
         let mut rows = c
             .query(
                 "SELECT kind,scope,subject_id,payload_json,tag_ids_json FROM notification_events WHERE sequence=?",
@@ -375,20 +487,17 @@ impl Dispatcher {
                 .map_err(|_| permanent("event_invalid"))?,
             tag_ids: None,
         };
+        // A domain event matched its own domain; a system event matched the recorded scope.
         let domain = match event.scope {
             Scope::Domain(d) => d,
-            Scope::System => {
-                if rt.notification.tv.is_some() {
-                    MediaDomain::Tv
-                } else {
-                    MediaDomain::Movies
-                }
-            }
+            Scope::System => domain,
         };
         let message = events::build(c, &event, domain)
             .await
             .map_err(|_| storage())?;
-        self.send(&rt, &message).await
+        let progress = Progress { c, delivery, sent };
+        self.send_tracked(&rt, &message, Some(progress)).await?;
+        Ok(Outcome::Done)
     }
 
     /// One poll cycle.
@@ -417,9 +526,13 @@ async fn catalog_plex(
     Ok(n > 0)
 }
 
-/// Notification ids that should receive this event: enabled, scoped to the event domain, trigger
-/// flag set, tag scope satisfied. One id per notification even when several scopes match.
-pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, libsql::Error> {
+/// Notifications that should receive this event, each with the scope that matched: enabled,
+/// scoped to the event domain, trigger flag set, tag scope satisfied. One entry per notification;
+/// when both scopes of a system event match, TV wins.
+pub async fn matching(
+    c: &Connection,
+    event: &EventRow,
+) -> Result<Vec<(String, MediaDomain)>, libsql::Error> {
     let flag = match event.kind {
         EventKind::Grab => "on_grab",
         EventKind::Import => "on_import",
@@ -435,13 +548,17 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
     };
     let upgrade = event.payload.get("is_upgrade").and_then(Value::as_i64) == Some(1);
     let delete_for_upgrade = event.payload.get("reason").and_then(Value::as_str) == Some("Upgrade");
-    let warning_only = event.kind == EventKind::HealthIssue
-        && event
-            .payload
-            .get("severity")
-            .and_then(Value::as_i64)
-            .unwrap_or(3)
-            < 3;
+    // A restored transition carries the severity of the issue it clears, so both directions are
+    // gated alike: a warning that was never announced is not announced as restored either.
+    let warning_only = matches!(
+        event.kind,
+        EventKind::HealthIssue | EventKind::HealthRestored
+    ) && event
+        .payload
+        .get("severity")
+        .and_then(Value::as_i64)
+        .unwrap_or(3)
+        < 3;
     // `flag` comes from the closed list above.
     let sql = format!(
         "SELECT n.id,s.media_type,s.on_upgrade,s.on_file_delete_for_upgrade,s.include_health_warnings FROM notifications n JOIN notification_scopes s ON s.notification_id=n.id WHERE n.enabled=1 AND (?1='system' OR s.media_type=?1) AND s.{flag}=1 ORDER BY n.id,s.media_type DESC"
@@ -474,11 +591,14 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
             }
             _ => None,
         };
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, MediaDomain)> = Vec::new();
     for (id, media, on_upgrade, on_delete_upgrade, warnings) in candidates {
-        if out.contains(&id) {
+        if out.iter().any(|(seen, _)| *seen == id) {
             continue;
         }
+        let Ok(domain) = MediaDomain::parse(&media) else {
+            continue;
+        };
         if upgrade && !on_upgrade {
             continue;
         }
@@ -503,9 +623,37 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
                 continue;
             }
         }
-        out.push(id);
+        out.push((id, domain));
     }
     Ok(out)
+}
+
+fn configured_domains(n: &Notification) -> Vec<MediaDomain> {
+    let mut out = Vec::new();
+    if n.tv.is_some() {
+        out.push(MediaDomain::Tv);
+    }
+    if n.movies.is_some() {
+        out.push(MediaDomain::Movies);
+    }
+    out
+}
+
+/// Every configured domain reported as failed with `code`.
+fn failed_tests(domains: &[MediaDomain], code: &str) -> Vec<DomainTestResult> {
+    domains
+        .iter()
+        .map(|&media_type| DomainTestResult {
+            media_type,
+            status: TestStatus::Failed,
+            error: Some(code.to_owned()),
+        })
+        .collect()
+}
+
+/// Every configured domain of a notification reported as failed with `code`.
+pub fn failed_notification_tests(n: &Notification, code: &str) -> Vec<DomainTestResult> {
+    failed_tests(&configured_domains(n), code)
 }
 
 pub struct Handle {

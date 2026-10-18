@@ -79,6 +79,47 @@ impl Outgoing {
         self.headers.push((name.to_owned(), value.into()));
         self
     }
+    /// Stable 64-bit identity of the whole request (method, URL, headers, body), recorded once
+    /// it is acknowledged so a retried delivery skips it. A digest, so no secret is stored.
+    pub fn fingerprint(&self) -> String {
+        let mut bytes = Vec::new();
+        let mut field = |part: &[u8]| {
+            bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(part);
+        };
+        field(match self.method {
+            Method::Get => b"GET",
+            Method::Post => b"POST",
+            Method::Put => b"PUT",
+        });
+        field(self.url.as_bytes());
+        for (name, value) in &self.headers {
+            field(name.as_bytes());
+            field(value.as_bytes());
+        }
+        match &self.body {
+            Body::None => field(b"none"),
+            Body::Json(value) => {
+                field(b"json");
+                field(&serde_json::to_vec(value).unwrap_or_default());
+            }
+            Body::Form(pairs) => {
+                field(b"form");
+                for (name, value) in pairs {
+                    field(name.as_bytes());
+                    field(value.as_bytes());
+                }
+            }
+            Body::Text { content_type, text } => {
+                field(b"text");
+                field(content_type.as_bytes());
+                field(text.as_bytes());
+            }
+        }
+        let mut hex = crate::providers::qbittorrent::digest_hex(&ring::digest::SHA256, &bytes);
+        hex.truncate(16);
+        hex
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,48 +428,34 @@ fn classify(error: reqwest::Error) -> SendError {
     }
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-pub fn base64(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(BASE64[(n >> 18) as usize & 63] as char);
-        out.push(BASE64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            BASE64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            BASE64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-pub fn basic_auth(user: &str, password: &str) -> String {
-    format!("Basic {}", base64(format!("{user}:{password}").as_bytes()))
-}
+pub use crate::providers::http::basic_auth;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        for (plain, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(plain.as_bytes()), encoded);
-        }
+    fn fingerprint_separates_requests_and_is_stable() {
+        let a = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"a"}));
+        let b = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"b"}));
+        assert_eq!(a.fingerprint(), a.clone().fingerprint());
+        assert_eq!(a.fingerprint().len(), 16);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(
+            a.fingerprint(),
+            a.clone().header("Authorization", "Bearer x").fingerprint()
+        );
+        // Length-prefixed fields: moving bytes between URL and header cannot collide.
+        assert_ne!(
+            Outgoing::get("http://h/ab").header("c", "d").fingerprint(),
+            Outgoing::get("http://h/a").header("bc", "d").fingerprint()
+        );
+    }
+    #[test]
+    fn basic_auth_matches_rfc7617_example() {
+        assert_eq!(
+            basic_auth("Aladdin", "open sesame"),
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
     }
     #[test]
     fn policy_denies_only_unreachable_targets() {
