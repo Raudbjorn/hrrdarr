@@ -685,3 +685,54 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn credential_presence_difference_is_classified_without_the_key() -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        let path = scratch.0.join(format!("{label}.db"));
+        let credentialed = fixture(&path, app, false).await;
+        let db = destination(&scratch.0.join(format!("{label}-dest.db"))).await;
+        assert!(
+            snapshots::import_with_providers(&db, app, credentialed, false, Some(&key))
+                .await?
+                .applied
+        );
+        // A newer export of the same client endpoint without credentials needs no key itself.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        let settings = if matches!(app, Application::Sonarr) {
+            r#"{"host":"client.example","port":8080,"useSsl":true,"urlBase":"/qbit"}"#
+        } else {
+            r#"{"host":"client.example","port":8080,"useSsl":true,"urlBase":"/qbit","movieCategory":"movies"}"#
+        };
+        source.execute("DELETE FROM Indexers", ()).await?;
+        source
+            .execute("UPDATE DownloadClients SET Settings=?", [settings])
+            .await?;
+        drop(source);
+        drop(raw);
+        // Reasoning: the destination candidate holds ciphertext and the source has none, so they
+        // differ without decrypting. Before this fix the importer decrypted first and aborted with
+        // the key error, blocking the library even though the row is a non-blocking `differs`.
+        let report =
+            snapshots::import_with_providers(&db, app, std::fs::read(&path)?, false, None).await?;
+        assert!(
+            report.applied && report.conflicts == 0,
+            "{label}: {report:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&report.provider_conflicts)?,
+            serde_json::json!([{"table":"DownloadClients","source_id":1,"reason":"differs","candidates":1,"blocking":false}]),
+            "{label}"
+        );
+        assert_eq!(
+            scalar(&db.connect().await?, "SELECT count(*) FROM providers WHERE implementation='qbittorrent' AND credentials IS NOT NULL").await,
+            1,
+            "{label}: the native client is untouched"
+        );
+    }
+    Ok(())
+}
