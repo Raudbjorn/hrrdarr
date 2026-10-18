@@ -283,6 +283,8 @@ export const getMovieNamingExamples = (query: MovieNamingExamplesQuery = {}) => 
 };
 
 export const listSearchCommands = (target:MediaTarget,offset=0) => validId(target.id) ? request<ApiPage<SearchCommand>>(`/api/v1/search/commands?target_type=${target.media_type}&target_id=${target.id}&limit=25&offset=${offset}`,undefined,undefined,true) : invalid<ApiPage<SearchCommand>>();
+/** All search commands, newest first; `query` comes from `searchActivityQuery`. */
+export const listAllSearchCommands = (query:string) => query.length <= 256 ? request<ApiPage<SearchCommand>>(`/api/v1/search/commands?${query}`,undefined,undefined,true) : Promise.resolve<Result<ApiPage<SearchCommand>>>({ok:false,error:'Invalid search command query.'});
 export const getSearchCommand = (id:string) => validOperation(id) ? request<SearchCommand>(`/api/v1/search/commands/${id}`,undefined,undefined,true) : invalidProvider<SearchCommand>();
 export const createSearchCommand = (input:SearchCommandInput) => validOperation(input.request_id)&&validId(input.target.id)&&validOperation(input.indexer_id)&&validId(input.indexer_revision)&&validClientSelection(input) ? request<SearchCommand>('/api/v1/search/commands',input,'POST',true) : invalidProvider<SearchCommand>();
 export const cancelSearchCommand = (id:string) => validOperation(id) ? request<SearchCommand>(`/api/v1/search/commands/${id}/cancel`,{},'POST',true) : invalidProvider<SearchCommand>();

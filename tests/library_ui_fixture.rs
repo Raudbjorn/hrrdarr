@@ -115,6 +115,24 @@ fn downloaded_scan_sources(root: &std::path::Path) {
     }
     std::fs::create_dir_all(root.join("empty")).unwrap();
 }
+/// scn007 downloaded-scan sources (separate root): one low-quality file per domain so the real
+/// scan import records a below-cutoff quality for the has-file episode and the cutoff movie.
+fn scn007_scan_sources(root: &std::path::Path) {
+    for (relative, tag) in [
+        (
+            "tv/Harbor.Watch.S01E03.720p.HDTV.x264/Harbor.Watch.S01E03.720p.HDTV.x264.flv",
+            11,
+        ),
+        (
+            "movies/Harbor.Rerun.2018.720p.HDTV.x264.English/Harbor.Rerun.2018.720p.HDTV.x264.English.flv",
+            12,
+        ),
+    ] {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, scan_payload(tag)).unwrap();
+    }
+}
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -162,6 +180,40 @@ fn search_show(id: u32) -> serde_json::Value {
 fn search_movie(id: u32) -> serde_json::Value {
     json!({"tmdbId":id,"title":format!("Search movie {id}"),"year":2030,"originalLanguage":"en","runtime":100,"digitalRelease":"2099-01-01T00:00:00Z"})
 }
+// scn007 catalog (tvdb 118; tmdb 118-120): dates relative to the fixture's UTC clock so one
+// series spans aired-missing, has-file and future episodes and one movie has cinema, digital
+// and physical dates inside the default calendar/feed window. Added through the real lookup API.
+const SCN007_ID: u32 = 118;
+fn scn007_day(offset: i64) -> String {
+    (chrono::Utc::now().date_naive() + chrono::Duration::days(offset))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+fn scn007_show() -> serde_json::Value {
+    let episode = |number: i64, title: &str, offset: i64| {
+        let day = scn007_day(offset);
+        json!({"tvdbId":11800+number,"seasonNumber":1,"episodeNumber":number,"title":title,"airDate":day,"airDateUtc":format!("{day}T20:00:00Z"),"runtime":30})
+    };
+    json!({"tvdbId":SCN007_ID,"title":"Harbor Watch","firstAired":scn007_day(-3),"runtime":30,"network":"Harbor Net","seasons":[{"seasonNumber":1}],"episodes":[
+        episode(1,"Harbor arrival",-3),episode(2,"Harbor storm",-2),episode(3,"Harbor repairs",-1),episode(4,"Harbor regatta",2)
+    ]})
+}
+fn scn007_movie(id: u32) -> Option<serde_json::Value> {
+    let at = |offset: i64| format!("{}T00:00:00Z", scn007_day(offset));
+    let year: i64 = scn007_day(0)[..4].parse().ok()?;
+    match id {
+        118 => Some(
+            json!({"tmdbId":118,"title":"Harbor Premiere","year":year,"originalLanguage":"en","runtime":100,"studio":"Harbor Studio","inCinema":at(-5),"digitalRelease":at(3),"physicalRelease":at(12)}),
+        ),
+        119 => Some(
+            json!({"tmdbId":119,"title":"Harbor Archive","year":2019,"originalLanguage":"en","runtime":95,"inCinema":"2019-03-01T00:00:00Z","digitalRelease":"2019-06-01T00:00:00Z","physicalRelease":"2019-08-01T00:00:00Z"}),
+        ),
+        120 => Some(
+            json!({"tmdbId":120,"title":"Harbor Rerun","year":2018,"originalLanguage":"en","runtime":90,"digitalRelease":"2018-06-01T00:00:00Z"}),
+        ),
+        _ => None,
+    }
+}
 async fn metadata_mode(
     State(state): State<Arc<AtomicU8>>,
     Query(query): Query<HashMap<String, String>>,
@@ -188,6 +240,9 @@ async fn metadata_mode(
 async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
     if let Ok(id @ (202 | 203)) = id.parse::<u32>() {
         return Json(search_show(id)).into_response();
+    }
+    if id.parse::<u32>() == Ok(SCN007_ID) {
+        return Json(scn007_show()).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
     if mode == 4 {
@@ -219,6 +274,9 @@ async fn tv_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -
 async fn movie_detail(State(state): State<Arc<AtomicU8>>, Path(id): Path<String>) -> Response {
     if let Ok(id @ (202 | 203)) = id.parse::<u32>() {
         return Json(search_movie(id)).into_response();
+    }
+    if let Some(value) = id.parse::<u32>().ok().and_then(scn007_movie) {
+        return Json(value).into_response();
     }
     let mode = state.load(Ordering::SeqCst);
     if mode == 4 {
@@ -1323,6 +1381,7 @@ async fn library_ui_fixture() {
         .unwrap();
     }
     downloaded_scan_sources(&scratch.0.join("downloaded-scan"));
+    scn007_scan_sources(&scratch.0.join("scn007-scan"));
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
