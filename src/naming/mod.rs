@@ -3,6 +3,7 @@
 //! into any automated import path yet; see docs/naming-api.md.
 pub(crate) mod destination;
 pub mod movie_preview;
+pub mod plan;
 pub mod render;
 use crate::db::Database;
 use axum::{
@@ -566,7 +567,7 @@ struct Context {
     db: Arc<Database>,
 }
 pub fn router(db: Arc<Database>) -> Router {
-    let previews = movie_preview::router(db.clone());
+    let previews = movie_preview::router(db.clone()).merge(plan::router(db.clone()));
     let tv = Router::new()
         .route("/api/v1/tv/config/naming", get(get_tv).put(put_tv))
         .route("/api/v1/tv/config/naming/examples", get(examples_tv))

@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Reasoning: 0062 is allocated; the unknown-history probe must use future version 63.
+    // Reasoning: 0067 rename_commands holds version 63; the unknown-history probe must use future version 64.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (63,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (64,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -2924,6 +2924,12 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
         expected = expected.replacen(
             ">=1024",
             "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
         // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.
@@ -3283,7 +3289,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -3354,6 +3360,12 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
             "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
         // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.
         if matches!(name, "rss_commands_admit" | "search_commands_admit") {
             expected = expected.replace(
@@ -3391,9 +3403,9 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
         .get(0)?;
     assert!(
         rescan_admit_sql.contains(
-            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
+            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
         ),
-        // Reasoning: 0060 appends the recycle bin cleanup term after the 0054 scan term.
+        // Reasoning: 0060 appends the recycle bin cleanup term after the 0054 scan term; 0067 appends rename.
         "{rescan_admit_sql}"
     );
 
@@ -4040,13 +4052,14 @@ async fn pool_admit_triggers_cross_reference_every_capacity_table() -> Result<()
         "health_commands", // Migration0042 joins the active pool; terminal history remains excluded.
         "downloaded_scan_commands", //0054 adds parents; children never consume extra job slots.
         "recycle_bin_cleanup_commands", // 0060 manual/scheduled CleanUpRecycleBin joins the active pool.
+        "rename_commands", // 0067 file/folder rename commands join the active pool (reasoning: every admit trigger was re-created to count them).
     ]
     .into_iter()
     .map(String::from)
     .collect();
     assert_eq!(
         pool_tables, known_pool_tables,
-        "the shared command-capacity pool must have exactly these eleven member tables; update \
+        "the shared command-capacity pool must have exactly these twelve member tables; update \
          both this list and every admit trigger body together if that ever changes"
     );
     assert_eq!(
@@ -4322,7 +4335,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        63 // Reasoning: latest is migration file 0067 rename_commands (position 63 on this branch; files 0063-0066 are reserved for other lanes and the merge renumbers); historical prefixes stay fixed.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.
@@ -4382,6 +4395,12 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
         expected = expected.replacen(
             ">=1024",
             "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
         // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.

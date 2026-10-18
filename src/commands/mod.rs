@@ -29,6 +29,7 @@ pub mod metadata;
 pub mod processing;
 pub mod quality_reset;
 pub mod recycle_cleanup;
+pub mod rename;
 pub mod rescan;
 pub mod rss;
 pub mod search;
@@ -75,7 +76,7 @@ fn conflict() -> Error {
 /// (migration 0033): capacity bounds concurrent/pending work independently of history
 /// retention. Health retains 128 terminal rows; other command histories remain retained.
 /// Counting either terminal history here would let ordinary scheduled churn exhaust the pool.
-const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))";
+const COMMAND_CAPACITY_SQL: &str = "SELECT (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))";
 pub(crate) async fn command_capacity(c: &Connection) -> Result<i64> {
     Ok(c.query(COMMAND_CAPACITY_SQL, ())
         .await?
@@ -424,6 +425,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let rescan = rescan::router(db.clone());
     let downloaded_scan = downloaded_scan::router(db.clone());
     let recycle_cleanup = recycle_cleanup::router(db.clone());
+    let rename = rename::router(db.clone()).merge(crate::rename::events::router(db.clone()));
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -447,6 +449,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(quality_reset)
         .merge(rescan)
         .merge(recycle_cleanup)
+        .merge(rename)
         .merge(downloaded_scan)
 }
 async fn create(
