@@ -96,7 +96,14 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    // Migration51 appends provenance defaults without changing historical command fields.
+    for row in &mut before[0] {
+        row.extend([
+            libsql::Value::Text("legacy_unknown".into()),
+            libsql::Value::Integer(0),
+        ]);
+    }
     //0041 appends explicit scheduler intent; compare every historical field unchanged.
     for row in &mut before[1] {
         let enabled = row[3].clone();

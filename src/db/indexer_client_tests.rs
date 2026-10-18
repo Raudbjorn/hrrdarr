@@ -110,7 +110,7 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         let mut expected = before[1].clone();
         // Only the appended preference column differs: all old values remain exact and NULL.
@@ -121,12 +121,17 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
         }
         assert_eq!(rows(&c, "provider_scopes").await?, expected);
         let registry = rows(&c, "health_checks").await?;
-        assert_eq!(&registry[..12], before[2].as_slice());
-        assert_eq!(registry.len(), 14);
+        // Reasoning: 0051 appends the NULL next_expiry_at column and two backoff rows; predecessor values stay exact.
+        let mut predecessor = before[2].clone();
+        for row in &mut predecessor {
+            row.push(libsql::Value::Null);
+        }
+        assert_eq!(&registry[..12], predecessor.as_slice());
+        assert_eq!(registry.len(), 16);
         assert_eq!(rows(&c, "health_lifecycle").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..48], before[4].as_slice());
-        assert_eq!(history.len(), 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+        assert_eq!(history.len(), 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
         assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='IndexerDownloadClientCheck'").await?,2);
         integrity(&c).await?;
     }

@@ -26,7 +26,8 @@ CREATE TRIGGER provider_tags_delete_invalidates_test AFTER DELETE ON provider_sc
  DELETE FROM provider_tests WHERE provider_id=OLD.provider_id;
 END;
 
--- One current observation per physical provider, shared by its domain scopes.
+-- One current observation per physical indexer, shared by its domain scopes. Download
+-- clients are excluded: 0051 download_client_status owns their per-domain backoff.
 -- Configuration changes preserve this row; only completed fenced observations
 -- advance it. No failure rows or timestamps are invented by migration.
 CREATE TABLE provider_status (
@@ -43,11 +44,11 @@ CREATE TABLE provider_status (
 );
 CREATE TRIGGER provider_status_insert BEFORE INSERT ON provider_status BEGIN
  SELECT CASE WHEN NEW.status_version!=1 THEN RAISE(ABORT,'provider_status_version') END;
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM providers WHERE id=NEW.provider_id AND revision=NEW.last_observed_config_revision AND (implementation IN('torznab','newznab') OR (implementation='qbittorrent' AND NEW.escalation_level<=5))) THEN RAISE(ABORT,'provider_status_owner_revision') END;
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM providers WHERE id=NEW.provider_id AND revision=NEW.last_observed_config_revision AND implementation IN('torznab','newznab','torrentrss')) THEN RAISE(ABORT,'provider_status_owner_revision') END;
 END;
 CREATE TRIGGER provider_status_update BEFORE UPDATE ON provider_status BEGIN
  SELECT CASE WHEN NEW.provider_id IS NOT OLD.provider_id OR OLD.status_version=9007199254740991 OR NEW.status_version!=OLD.status_version+1 THEN RAISE(ABORT,'provider_status_version') END;
- SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM providers WHERE id=NEW.provider_id AND revision=NEW.last_observed_config_revision AND (implementation IN('torznab','newznab') OR (implementation='qbittorrent' AND NEW.escalation_level<=5))) THEN RAISE(ABORT,'provider_status_owner_revision') END;
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM providers WHERE id=NEW.provider_id AND revision=NEW.last_observed_config_revision AND implementation IN('torznab','newznab','torrentrss')) THEN RAISE(ABORT,'provider_status_owner_revision') END;
 END;
 
 CREATE TABLE provider_selection_cursors (

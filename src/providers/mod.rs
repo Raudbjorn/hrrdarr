@@ -1404,6 +1404,27 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
         credentials,
     ))
 }
+/// Backoff history belongs to a provider/domain, so a configuration writer rebinds retained
+/// rows to the final revision and drops domains the final scopes no longer serve. Call after
+/// the revision bump and scope rewrite, inside the writer's transaction.
+pub(crate) async fn reconcile_download_client_status(
+    conn: &Connection,
+    id: &str,
+) -> std::result::Result<(), &'static str> {
+    if conn.is_autocommit() {
+        return Err("invariant");
+    }
+    conn.execute("DELETE FROM download_client_status WHERE provider_id=?1 AND NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=?1 AND p.implementation='qbittorrent' AND s.media_type=download_client_status.media_type)",[id]).await.map_err(|_| "storage_error")?;
+    conn.execute("UPDATE download_client_status SET config_revision=(SELECT revision FROM providers WHERE id=?1) WHERE provider_id=?1 AND config_revision!=(SELECT revision FROM providers WHERE id=?1)",[id]).await.map_err(|_| "storage_error")?;
+    Ok(())
+}
+fn status_reconciliation(code: &'static str) -> Error {
+    Error::Plain(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        code,
+        "Download client status reconciliation failed",
+    )
+}
 async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) -> Result<()> {
     let implementation = settings.implementation();
     if let ProviderSettings::Torznab { tv, movies, .. }
@@ -1690,6 +1711,9 @@ async fn update(
         return Err(conflict());
     }
     write_scopes(&tx, &id, &input.config.settings).await?;
+    reconcile_download_client_status(&tx, &id)
+        .await
+        .map_err(status_reconciliation)?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     changes.mark(&tx).await?;
     bounded(read(&tx, &id).await?.0)

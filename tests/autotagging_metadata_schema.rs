@@ -286,13 +286,19 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // CHECK lists in place (providers table text) and in nine guard triggers; those objects change text by
         // design and are compared exactly in src/db/torrent_rss_tests.rs, so they join the exclusion lists by name.
         "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id','minimum_seeders') ORDER BY cid",
-        // Collections51 appends facts to two existing tables and adds precisely the named
+        // Collections 0052 appends facts to two existing tables and adds precisely the named
         // objects below; collection_schema independently asserts every new object and
-        // legacy row/FK preservation. Provider authority52 adds only the explicitly named
+        // legacy row/FK preservation. Provider authority 0053 adds only the explicitly named
         // tables/triggers below; provider_authority_schema checks them and old facts.
-        // Reasoning: 0052's indexer modes and client overrides were dropped because
+        // Reasoning: 0053's indexer modes and client overrides were dropped because
         // 0048/0049 already store them as provider_scopes columns.
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_scope_tags','provider_status','provider_selection_cursors') AND NOT (type='table' AND name IN ('provider_scopes','providers')) AND name NOT IN ('provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain','provider_test_insert_owner','provider_test_update_owner','provider_scope_options_insert','provider_scope_options_update','provider_client_options_insert','provider_client_options_update','rss_commands_admit','rss_schedules_admit','rss_schedules_update') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // Reasoning: migration 0051 adds download_client_status (table + triggers), appends next_expiry_at to
+        // health_checks and origin/manual_bypass to commands (rewriting those two CREATE TABLE texts), recreates
+        // commands_transition and adds commands_backoff_identity. Predecessor columns of both altered tables are
+        // compared exactly below; backoff objects are covered by src/db/backoff_tests.rs.
+        "SELECT * FROM pragma_table_info('health_checks') WHERE name!='next_expiry_at' ORDER BY cid",
+        "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','download_client_status','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_scope_tags','provider_status','provider_selection_cursors') AND NOT (type='table' AND name IN ('provider_scopes','providers','health_checks','commands')) AND name NOT IN ('provider_test_insert_owner','provider_test_update_owner','provider_scope_options_insert','provider_scope_options_update','provider_client_options_insert','provider_client_options_update','rss_commands_admit','rss_schedules_admit','rss_schedules_update','commands_transition','commands_backoff_identity','provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -507,7 +513,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     );
     assert_eq!(witness(&c).await?, before);
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
@@ -633,7 +639,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

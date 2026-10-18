@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: provider authority 0052 is latest (collections 0051 follows main's 0050 torrent RSS indexer); the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 53); // Reasoning: provider authority 0053 is latest (collections 0052 follows main's 0051 download-client backoff); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,
@@ -381,7 +381,20 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     // Reasoning: the witness covers predecessor (version<=45) health rows only; 0048 later appends four
     // indexer_search/indexer_rss identities and 0049 two indexer_download_client identities, which are not
     // predecessor state and are asserted separately.
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client') ORDER BY scope,check_key").await?);
+    // Reasoning: 0051 appends download_client_backoff rows and the next_expiry_at column; neither is
+    // predecessor state, so the witness projects only the columns that existed at schema45.
+    let mut columns = vec![];
+    let mut info = c
+        .query(
+            "SELECT name FROM pragma_table_info('health_checks') WHERE name!='next_expiry_at' ORDER BY cid",
+            (),
+        )
+        .await?;
+    while let Some(row) = info.next().await? {
+        columns.push(row.get::<String>(0)?);
+    }
+    drop(info);
+    out.push(rows(c,&format!("SELECT {} FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','download_client_backoff') ORDER BY scope,check_key",columns.join(","))).await?);
     out.push(
         rows(
             c,
@@ -445,7 +458,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: provider authority 0052 is latest (collections 0051 follows main's 0050 torrent RSS indexer); the injected46 failure remains historical.
+    assert_eq!(version(&c).await?, 53); // Reasoning: provider authority 0053 is latest (collections 0052 follows main's 0051 download-client backoff); the injected46 failure remains historical.
     assert_eq!(
         scalar(
             &c,

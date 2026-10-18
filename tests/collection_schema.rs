@@ -43,7 +43,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0051_collections.sql");
+const MIGRATION: &str = include_str!("../migrations/0052_collections.sql");
 const PREDECESSORS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -242,6 +242,10 @@ const PREDECESSORS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../migrations/0050_torrent_rss_indexer.sql"),
     ),
+    (
+        "download_client_backoff",
+        include_str!("../migrations/0051_download_client_backoff.sql"),
+    ),
 ];
 const OBJECTS: &[&str] = &[
     "movie_collection_settings",
@@ -341,7 +345,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='collection_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade50_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
+async fn upgrade51_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -363,7 +367,7 @@ async fn upgrade50_preserves_both_domains_unknowns_and_multiple_memberships() ->
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        52 // Reasoning: latest runner adds provider authority 0052 after collections 0051 (renumbered behind main's 0047-0050).
+        53 // Reasoning: latest runner adds provider authority 0053 after collections 0052 (renumbered behind main's 0047-0051).
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -375,7 +379,7 @@ async fn upgrade50_preserves_both_domains_unknowns_and_multiple_memberships() ->
     Ok(())
 }
 #[tokio::test]
-async fn late_failure_rolls_back_all51_ddl_and_facts() -> Result<(), Error> {
+async fn late_failure_rolls_back_all_collections_ddl_and_facts() -> Result<(), Error> {
     let s = Scratch::new();
     let db = predecessor(&s).await?;
     let c = db.connect()?;
@@ -398,7 +402,7 @@ async fn late_failure_rolls_back_all51_ddl_and_facts() -> Result<(), Error> {
     .await?;
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=50",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=51",
             ()
         )
         .await
@@ -420,7 +424,7 @@ async fn late_failure_rolls_back_all51_ddl_and_facts() -> Result<(), Error> {
     let c = db.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        50 // Reasoning: predecessor chain now ends at main's 0050 torrent RSS indexer.
+        51 // Reasoning: predecessor chain now ends at main's 0051 download-client backoff.
     );
     assert_eq!(preserved(&c).await, before);
     Ok(())

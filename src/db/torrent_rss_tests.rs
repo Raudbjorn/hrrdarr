@@ -245,8 +245,8 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52
-    ); // Reasoning: 0050 is the torrent RSS indexer migration; collections 0051 and provider authority 0052 follow it.
+        53
+    ); // Reasoning: 0050 is the torrent RSS indexer migration; a fresh database continues past 0051 (download-client backoff) through collections 0052 to latest 0053 (provider authority).
     assert_eq!(
         text(&c, "SELECT name FROM schema_migrations WHERE version=50").await?,
         "torrent_rss_indexer"
@@ -303,8 +303,8 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            52
-        ); // Reasoning: the runner continues past torrent RSS 0050 through collections 0051 and provider authority 0052.
+            53
+        ); // Reasoning: 0050 is the torrent RSS indexer migration; the runner continues past 0051 (download-client backoff) through collections 0052 to latest 0053 (provider authority).
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -316,7 +316,7 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..49], before[4].as_slice());
-        assert_eq!(history.len(), 52); // Reasoning: 0051/0052 follow torrent RSS 0050.
+        assert_eq!(history.len(), 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,

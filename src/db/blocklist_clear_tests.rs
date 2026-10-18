@@ -123,9 +123,18 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: latest migration is now 0052 provider authority (collections 0051 and provider authority 0052 renumbered after main's 0050 torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
+        // Migration44 adds provenance defaults; keep every preceding field identical.
+        if *table == "commands" {
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Text("legacy_unknown".into()),
+                    libsql::Value::Integer(0),
+                ]);
+            }
+        }
         if *table == "snapshot_imports" {
             // Migrations36 through41,45,47 and48 append nine inactive metadata markers; retain every prior field and assert collection/provider replay starts at0.
             for row in &mut expected {

@@ -13,6 +13,7 @@ use libsql::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 mod api;
+mod backoff;
 mod download_roots;
 mod engine;
 mod indexers;

@@ -46,7 +46,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0052_provider_authority.sql");
+const MIGRATION: &str = include_str!("../migrations/0053_provider_authority.sql");
 const PREDECESSORS: &[(&str, &str)] = &[
     (
         "prototype",
@@ -246,8 +246,12 @@ const PREDECESSORS: &[(&str, &str)] = &[
         include_str!("../migrations/0050_torrent_rss_indexer.sql"),
     ),
     (
+        "download_client_backoff",
+        include_str!("../migrations/0051_download_client_backoff.sql"),
+    ),
+    (
         "collections",
-        include_str!("../migrations/0051_collections.sql"),
+        include_str!("../migrations/0052_collections.sql"),
     ),
 ];
 const OBJECTS: &[&str] = &[
@@ -291,6 +295,7 @@ async fn predecessor(s: &Scratch) -> Result<libsql::Database, Error> {
 const INDEXER: &str = "00000000-0000-0000-0000-000000000001";
 const CLIENT: &str = "00000000-0000-0000-0000-000000000002";
 const NEWS: &str = "00000000-0000-0000-0000-000000000003";
+const RSS: &str = "00000000-0000-0000-0000-000000000004";
 async fn client_scope(c: &Connection, domain: &str) -> Result<(), Error> {
     c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,0,'started','default',0,0,0)",params![CLIENT,domain,format!("owned-{domain}")]).await?;
     Ok(())
@@ -300,6 +305,7 @@ async fn seed(c: &Connection) -> Result<(), Error> {
         (INDEXER, "torznab"),
         (CLIENT, "qbittorrent"),
         (NEWS, "newznab"),
+        (RSS, "torrentrss"),
     ] {
         c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,?,?,1,1,1,1,'http://127.0.0.1:1/')",params![id,implementation,implementation]).await?;
     }
@@ -354,7 +360,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='provider_authority_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade51_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
+async fn upgrade52_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -385,7 +391,7 @@ async fn upgrade51_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        52 // Reasoning: provider authority is 0052 after collections 0051.
+        53 // Reasoning: provider authority is 0053 after collections 0052.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -397,7 +403,7 @@ async fn upgrade51_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     Ok(())
 }
 #[tokio::test]
-async fn migration_late_failure_restores51_schema_and_evidence() -> Result<(), Error> {
+async fn migration_late_failure_restores52_schema_and_evidence() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -416,7 +422,7 @@ async fn migration_late_failure_restores51_schema_and_evidence() -> Result<(), E
     assert_eq!(number(&tx, "SELECT count(*) FROM provider_tests").await, 3);
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=51",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=52",
             ()
         )
         .await
@@ -438,7 +444,7 @@ async fn migration_late_failure_restores51_schema_and_evidence() -> Result<(), E
     let c = raw.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        51 // Reasoning: predecessor chain now ends at collections 0051.
+        52 // Reasoning: predecessor chain now ends at collections 0052.
     );
     assert_eq!(witness(&c).await, before);
     Ok(())
@@ -530,17 +536,22 @@ async fn status_revision_class_dates_and_restart_do_not_reset_on_configuration_e
     let db = Database::open_local(s.database()).await?;
     let c = db.connect().await?;
     seed(&c).await?;
-    for (id, level) in [(INDEXER, 9), (CLIENT, 5)] {
+    // Every indexer implementation, torrent RSS included, owns one status row.
+    for (id, level) in [(INDEXER, 9), (RSS, 9)] {
         c.execute("INSERT INTO provider_status(provider_id,escalation_level,status_version,last_observed_config_revision,initial_failure,most_recent_failure,disabled_until) VALUES(?,?,1,1,'2026-10-01T00:00:00Z','2026-10-01T00:01:00Z','2026-10-01T01:00:00Z')",params![id,level]).await?;
     }
-    assert!(
-        c.execute(
-            "UPDATE provider_status SET escalation_level=6,status_version=2 WHERE provider_id=?",
-            [CLIENT]
-        )
-        .await
-        .is_err()
-    );
+    c.execute(
+        "UPDATE provider_status SET escalation_level=4,status_version=2 WHERE provider_id=?",
+        [RSS],
+    )
+    .await?;
+    c.execute(
+        "UPDATE provider_status SET escalation_level=9,status_version=3 WHERE provider_id=?",
+        [RSS],
+    )
+    .await?;
+    // Download-client backoff belongs to 0051 download_client_status, not this table.
+    assert!(c.execute("INSERT INTO provider_status(provider_id,escalation_level,status_version,last_observed_config_revision) VALUES(?,0,1,1)",[CLIENT]).await.is_err());
     for date in [
         "2026-02-30T00:00:00Z",
         "2026-10-01T24:00:00Z",
@@ -596,8 +607,7 @@ async fn status_revision_class_dates_and_restart_do_not_reset_on_configuration_e
         .await,
         1
     );
-    c.execute("DELETE FROM providers WHERE id=?", [CLIENT])
-        .await?;
+    c.execute("DELETE FROM providers WHERE id=?", [RSS]).await?;
     assert_eq!(number(&c, "SELECT count(*) FROM provider_status").await, 1);
     Ok(())
 }

@@ -536,8 +536,10 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
 // Reasoning: the registry holds seven identities per domain (CDH, communication, root folder, removed
 // metadata, indexer search/RSS from 0048 and the 0049 binding check). Every one is compared so an
 // unexpected marker on a sibling check fails; the helpers below name the intended marker sets.
-const IDENTITIES: [(&str, &str); 14] = [
+// Reasoning: 0051 registers download_client_backoff per domain (14 -> 16 identities).
+const IDENTITIES: [(&str, &str); 16] = [
     ("movies", "completed_download_handling"),
+    ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
     ("movies", "download_client_root_folder"),
     ("movies", "indexer_download_client"),
@@ -545,6 +547,7 @@ const IDENTITIES: [(&str, &str); 14] = [
     ("movies", "indexer_search"),
     ("movies", "removed_metadata"),
     ("tv", "completed_download_handling"),
+    ("tv", "download_client_backoff"),
     ("tv", "download_client_communication"),
     ("tv", "download_client_root_folder"),
     ("tv", "indexer_download_client"),

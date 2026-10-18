@@ -813,8 +813,8 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     let id = admit(&c, HealthScope::All, 102).await;
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
-        // Reasoning: registry now contains seven checks per domain (0048 adds indexer_search/indexer_rss, 0049 indexer_download_client); retry must retain all fourteen (was twelve).
-        assert_eq!(cmd.members.len(), 14);
+        // Reasoning: registry now contains eight checks per domain (0048 adds indexer_search/indexer_rss, 0049 indexer_download_client, 0051 download_client_backoff); retry must retain all sixteen (was fourteen).
+        assert_eq!(cmd.members.len(), 16);
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
             .await
@@ -828,7 +828,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 14 } else { 0 } // Reasoning: 0048 adds four indexer checks (8 -> 12) and 0049 two binding checks (12 -> 14) that retain pending reasons
+            if attempt < 3 { 16 } else { 0 } // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16) that retain pending reasons
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -881,7 +881,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        14 // Reasoning: 0048 adds four indexer checks (8 -> 12) and 0049 two binding checks (12 -> 14). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
+        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -943,8 +943,8 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     init(&c, 100).await;
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
-    // Reasoning: the full registry now has fourteen members (0049 adds one binding check per domain), so every member needs an outcome.
-    publish(&c, &cmd, Ok(vec![None; 14]), 101).await.unwrap();
+    // Reasoning: the full registry now has sixteen members (0051 adds one backoff check per domain), so every member needs an outcome.
+    publish(&c, &cmd, Ok(vec![None; 16]), 101).await.unwrap();
     for at in 200..212 {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -998,7 +998,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        14 // Reasoning: 0048 adds four indexer checks (8 -> 12) and 0049 two binding checks (12 -> 14). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
+        16 // Reasoning: 0048 adds four indexer checks (8 -> 12), 0049 two binding checks (12 -> 14) and 0051 two backoff checks (14 -> 16). Both removed-metadata seeds also retain pending reasons; all registered checks retain their pending reasons.
     );
 }
 
@@ -1189,7 +1189,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        7 // Reasoning: 0048 adds tv indexer_search/indexer_rss and 0049 tv indexer_download_client, so the scoped TV request covers seven identities (was 6).
+        8 // Reasoning: 0048 adds tv indexer_search/indexer_rss, 0049 tv indexer_download_client and 0051 tv download_client_backoff, so the scoped TV request covers eight identities (was 7).
     );
     assert_eq!(
         count(
@@ -1210,7 +1210,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 7); // Reasoning: 0048 adds two TV indexer identities (4 -> 6) and 0049 one more (6 -> 7); all seven newly requested TV checks survive.
+    assert_eq!(next.members.len(), 8); // Reasoning: 0048 adds two TV indexer identities (4 -> 6), 0049 one more (6 -> 7) and 0051 the TV backoff check (7 -> 8); all eight newly requested TV checks survive.
     assert!(
         next.members
             .iter()
@@ -1486,7 +1486,7 @@ async fn removed_metadata_scheduled_dispatch_and_invalid_identity_preserve_prior
     }
 }
 
-// This policy marker uses all fourteen actual migration seeds (0048 added the indexer pair and 0049 the binding check per domain), independent of the
+// This policy marker uses all sixteen actual migration seeds (0048 added the indexer pair, 0049 the binding check and 0051 the backoff check per domain), independent of the
 // historical lifecycle fixtures above. No detector or worker dispatch is exercised.
 async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, Option<i64>)> {
     let mut rows = c.query("SELECT scope,check_key,generation,pending_reasons,due_at FROM health_checks ORDER BY scope,check_key", ()).await.unwrap();
@@ -1507,7 +1507,7 @@ async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, 
 async fn indexer_configuration_marker_is_scoped_transactional_and_debounced() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 14); // Reasoning: 0049 adds two indexer_download_client seeds (was 12).
+    assert_eq!(initial.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(indexer_configuration_changed(&c, media).await.is_err());
     }
@@ -1571,7 +1571,7 @@ async fn indexer_configuration_exhaustion_preflights_all_keys_and_rolls_back_aut
             .await
             .unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 14); // Reasoning: 0049 adds two indexer_download_client seeds (was 12).
+        assert_eq!(before.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -1668,13 +1668,13 @@ async fn indexer_capability_gaps_are_reported_per_domain_from_eligible_scopes() 
     );
 }
 
-// Binding marker tests retain all fourteen migration seeds (Reasoning: 0048 and 0049 raised the
-// registry from six to fourteen; every sibling check is still compared so a stray marker fails).
+// Binding marker tests retain all sixteen migration seeds (Reasoning: 0048 and 0049 raised the
+// registry from six to fourteen and 0050 to sixteen; every sibling check is still compared so a stray marker fails).
 #[tokio::test]
 async fn indexer_client_marker_scoped_transaction_and_rollback() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 14);
+    assert_eq!(initial.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(
             indexer_client_configuration_changed(&c, media)
@@ -1786,7 +1786,7 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         .unwrap();
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES(?,'indexer_download_client',1,1,?,'IndexerDownloadClientCheck')",params![scope,MAX_INTEGER]).await.unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 14);
+        assert_eq!(before.len(), 16); // Reasoning: 0051 adds two download_client_backoff seeds (was 14).
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -1955,4 +1955,154 @@ async fn communication_cooldown_keeps_scheduled_marker_and_defers_grace() {
         .await
         .unwrap();
     assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND pending_reasons=2 AND due_at=2001").await,1);
+}
+
+#[tokio::test]
+async fn backoff_reports_current_revision_cooldowns_and_expiry_wakes_only_its_identity() {
+    let (_scratch, db, c) = fixture_all().await;
+    let identity = |scope| HealthIdentity {
+        scope,
+        check_key: "download_client_backoff".into(),
+    };
+    // No eligible client, or clients without status, are healthy rather than check failures.
+    assert!(
+        backoff::evaluate(&db, &identity(HealthScope::Tv), 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    communication_client(&c, "http://127.0.0.1:1/").await;
+    communication_client(&c, "http://127.0.0.1:2/").await;
+    let mut ids = vec![];
+    let mut rows = c
+        .query("SELECT id FROM providers ORDER BY id", ())
+        .await
+        .unwrap();
+    while let Some(r) = rows.next().await.unwrap() {
+        ids.push(r.get::<String>(0).unwrap());
+    }
+    drop(rows);
+    assert!(
+        backoff::evaluate(&db, &identity(HealthScope::Tv), 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until)VALUES(?,'tv',1,1,900,900,1500)",[ids[0].clone()]).await.unwrap();
+    let partial = backoff::evaluate(&db, &identity(HealthScope::Tv), 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            partial.severity,
+            partial.reason.as_str(),
+            partial.compatibility_type.as_str()
+        ),
+        (
+            HealthSeverity::Warning,
+            "download_clients_unavailable",
+            "DownloadClientStatusCheck"
+        )
+    );
+    // Status is scoped: Movies stays healthy while TV is cooling down.
+    assert!(
+        backoff::evaluate(&db, &identity(HealthScope::Movies), 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until)VALUES(?,'tv',1,1,900,900,1200)",[ids[1].clone()]).await.unwrap();
+    let all = backoff::evaluate(&db, &identity(HealthScope::Tv), 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (all.severity, all.reason.as_str()),
+        (HealthSeverity::Error, "download_clients_all_unavailable")
+    );
+    // An expired cooldown no longer counts.
+    assert_eq!(
+        backoff::evaluate(&db, &identity(HealthScope::Tv), 1300)
+            .await
+            .unwrap()
+            .unwrap()
+            .reason,
+        "download_clients_unavailable"
+    );
+    assert!(
+        backoff::evaluate(&db, &identity(HealthScope::Tv), 1500)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backoff::evaluate(&db, &identity(HealthScope::System), 1000)
+            .await
+            .is_err()
+    );
+    // Publication rearms the earliest future expiry from stored status.
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    backoff::rearm(&tx, &identity(HealthScope::Tv), 1000)
+        .await
+        .unwrap();
+    backoff::rearm(&tx, &identity(HealthScope::Movies), 1000)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(count(&c, "SELECT next_expiry_at FROM health_checks WHERE scope='tv' AND check_key='download_client_backoff'").await, 1200);
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE next_expiry_at IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    // The sweep consumes the deadline and marks only that identity due, outside the 6h schedule.
+    init(&c, 100).await;
+    c.execute(
+        "UPDATE health_lifecycle SET next_scheduled_at=99999,grace_phase='expired',last_batch_completed_at=grace_due_at",
+        (),
+    )
+    .await
+    .unwrap();
+    // Startup work is already pending for every identity; the expiry adds only its SCHEDULED reason.
+    let backoff = "SELECT generation FROM health_checks WHERE scope='tv' AND check_key='download_client_backoff'";
+    let generation = count(&c, backoff).await;
+    tick(&c, 1199).await;
+    assert_eq!(count(&c, backoff).await, generation);
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE (pending_reasons & 2)!=0"
+        )
+        .await,
+        0
+    );
+    tick(&c, 1200).await;
+    assert_eq!(count(&c, backoff).await, generation + 1);
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE next_expiry_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&c, "SELECT count(*) FROM health_checks WHERE (pending_reasons & 2)!=0 AND scope='tv' AND check_key='download_client_backoff'").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM health_checks WHERE (pending_reasons & 2)!=0"
+        )
+        .await,
+        1
+    );
 }
