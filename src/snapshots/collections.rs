@@ -513,9 +513,14 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
                 );
                 continue;
             }
+            // Identity is the TMDB id; a title is mutable display metadata that live
+            // adoption also refreshes, so spelling drift must not abort the import.
             if r.get::<String>(2)? != fact.title {
-                report.conflicts += 1;
-                continue;
+                issue(
+                    &mut report.unsupported,
+                    "Collections",
+                    "existing collection title retained",
+                );
             }
             report.duplicates += 1;
             (id, false)
@@ -608,6 +613,13 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
         }
         owners.insert(*remote, collection);
     }
+    // Every collection this snapshot lists per source movie; a snapshot-origin association
+    // outside that set came from an older backup and is replaced, never treated as native.
+    let mut listed: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for (remote, source) in &plan.members {
+        listed.entry(*source).or_default().insert(*remote);
+    }
+    let mut vacated = BTreeSet::new();
     for (remote, source) in &plan.members {
         let Some(collection) = owners.get(remote) else {
             continue;
@@ -620,26 +632,41 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
             );
             continue;
         };
-        let prior = c
+        let mut prior = c
             .query(
-                "SELECT collection_id,origin FROM movie_collection_members WHERE metadata_id=?",
+                "SELECT m.collection_id,m.origin,c.tmdb_id FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE m.metadata_id=?",
                 [metadata],
             )
             .await?;
-        let mut prior = prior;
         let mut same = false;
         let mut native = false;
+        let mut stale = Vec::new();
         while let Some(r) = prior.next().await? {
-            if r.get::<i64>(0)? == *collection {
-                same = true
-            } else {
-                native = true
-            }
-            if r.get::<String>(1)? != "snapshot" {
+            let id = r.get::<i64>(0)?;
+            let from_snapshot = r.get::<String>(1)? == "snapshot";
+            let tmdb = r.get::<Option<i64>>(2)?;
+            if id == *collection {
+                same = true;
+                if !from_snapshot {
+                    native = true
+                }
+            } else if from_snapshot && tmdb.is_some_and(|t| !listed[source].contains(&t)) {
+                stale.push(id)
+            } else if !from_snapshot || tmdb.is_none() {
                 native = true
             }
         }
         drop(prior);
+        if !native {
+            for old in stale {
+                c.execute(
+                    "DELETE FROM movie_collection_members WHERE collection_id=? AND metadata_id=? AND origin='snapshot'",
+                    params![old, metadata],
+                )
+                .await?;
+                vacated.insert(old);
+            }
+        }
         if same {
             report.duplicates += 1;
             continue;
@@ -654,6 +681,13 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
         }
         c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision)SELECT ?,?,'snapshot',metadata_revision FROM movie_collections WHERE id=?",params![*collection,metadata,*collection]).await?;
         report.mapped += 1;
+    }
+    // Deferred so a collection this snapshot is still populating is never retired mid-loop.
+    let populated: BTreeSet<i64> = owners.values().copied().collect();
+    for old in vacated.difference(&populated) {
+        crate::collections::repository::cleanup_without_library(c, *old)
+            .await
+            .map_err(|_| INVALID)?;
     }
     for (remote, title, year) in &plan.exclusions {
         if let Some(r) = c

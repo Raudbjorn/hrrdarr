@@ -419,3 +419,66 @@ async fn late_failure_rolls_back_core_archive_and_collection_activation() {
         .unwrap();
     assert_eq!(count, 1);
 }
+#[tokio::test]
+async fn newer_backup_replaces_snapshot_membership_and_tolerates_title_drift() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = Database::open_local(s.0.join("native.db")).await.unwrap();
+    let c = db.connect().await.unwrap();
+    let first = source(&s, MODERN, "", None).await;
+    assert!(
+        snapshots::import(&db, Application::Radarr, first, false)
+            .await
+            .unwrap()
+            .applied
+    );
+    // The later backup moves both movies from 900 to 950 and no longer lists 900.
+    let moved = "UPDATE MovieMetadata SET CollectionTmdbId=950,CollectionTitle='Moved';
+     INSERT INTO Collections SELECT 10,950,'Moved',SortTitle,CleanTitle,Overview,Images,Monitored,QualityProfileId,RootFolderPath,MinimumAvailability,SearchOnAdd,Added,LastInfoSync,Tags,PrivateFutureField FROM Collections WHERE Id=9;
+     DELETE FROM Collections WHERE Id=9;";
+    let second = source(&s, MODERN, moved, None).await;
+    let report = snapshots::import(&db, Application::Radarr, second, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=950").await,
+        2
+    );
+    // Snapshot-origin 900 membership was replaced and its emptied collection retired.
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collections WHERE tmdb_id=900"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT removed FROM movie_collection_intents WHERE tmdb_id=900"
+        )
+        .await,
+        1
+    );
+    // Spelling drift on the same TMDB identity is a diagnostic, not an import-wide conflict.
+    let renamed = format!(
+        "{moved} UPDATE Collections SET Title='Moved (renamed)' WHERE Id=10; UPDATE MovieMetadata SET CollectionTitle='Moved (renamed)';"
+    );
+    let third = source(&s, MODERN, &renamed, None).await;
+    let report = snapshots::import(&db, Application::Radarr, third, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collections WHERE tmdb_id=950 AND title='Moved'"
+        )
+        .await,
+        1
+    );
+}

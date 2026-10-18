@@ -214,6 +214,29 @@ async fn transactional_adoption_defaults_intent_and_fenced_refresh()
         .await?;
     assert!(!repository::adopt(&tx, 1, 7, association(55), None).await?);
     tx.commit().await?;
+    // The tombstone fences re-adding 55, not leaving the collection the movie moved from.
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    assert!(repository::adopt(&tx, 1, 7, association(66), None).await?);
+    tx.commit().await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    assert!(repository::adopt(&tx, 1, 7, association(55), None).await?);
+    tx.commit().await?;
+    assert_eq!(
+        number(&c, "SELECT count(*) FROM movie_collection_members").await,
+        0
+    );
+    assert_eq!(
+        number(
+            &c,
+            "SELECT removal_reason='user' FROM movie_collection_intents WHERE tmdb_id=55"
+        )
+        .await,
+        1
+    );
     // Legacy unidentified memberships are preserved, not guessed from title.
     c.execute(
         "INSERT INTO movie_collections(id,title)VALUES(999,'Legacy')",
@@ -228,12 +251,23 @@ async fn transactional_adoption_defaults_intent_and_fenced_refresh()
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    assert!(
-        repository::adopt(&tx, 1, 7, Association::Clear, None)
-            .await
-            .is_err()
+    // Reasoning: this previously asserted a Conflict, which fenced every later refresh of
+    // the movie; legacy rows are now skipped, so Clear succeeds and removes nothing.
+    assert!(!repository::adopt(&tx, 1, 7, Association::Clear, None).await?);
+    tx.commit().await?;
+    assert_eq!(
+        number(
+            &c,
+            "SELECT count(*) FROM movie_collection_members WHERE collection_id=999"
+        )
+        .await,
+        1
     );
-    tx.rollback().await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    assert!(repository::adopt(&tx, 1, 7, association(77), None).await?);
+    tx.commit().await?;
     assert_eq!(
         number(&c, "SELECT count(*) FROM movie_collection_members").await,
         2

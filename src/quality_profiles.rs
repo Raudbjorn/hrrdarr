@@ -884,6 +884,13 @@ async fn delete(
                 "Quality profile is assigned to a library item",
             ));
         }
+        // Collection defaults are policy, not library assignments: deleting their
+        // profile disables the policy instead of blocking on the RESTRICT reference.
+        tx.execute(
+            "UPDATE movie_collection_settings SET quality_profile_id=NULL,monitored=0,settings_revision=settings_revision+1 WHERE quality_profile_id=? AND media_type=?",
+            params![id, media.clone()],
+        )
+        .await?;
         tx.execute(
             "DELETE FROM quality_profiles WHERE id=? AND media_type=?",
             params![id, media],

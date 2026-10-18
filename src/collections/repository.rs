@@ -33,15 +33,20 @@ pub async fn adopt(
         };
     }
     let mut rows=c.query("SELECT c.id,c.tmdb_id FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE m.metadata_id=? LIMIT 1001",[metadata_id]).await?;
+    // (collection id, remote identity) for every identified prior association.
     let mut prior = Vec::new();
+    let mut seen = 0;
     while let Some(row) = rows.next().await? {
-        let id: i64 = row.get(0)?;
-        let remote: Option<i64> = row.get(1)?;
-        // Legacy unidentified associations require explicit reconciliation, never title matching.
-        if remote.is_none() || prior.len() >= 1000 {
+        seen += 1;
+        if seen > 1000 {
             return Err(Error::Conflict);
         }
-        prior.push(id);
+        let id: i64 = row.get(0)?;
+        // Legacy unidentified associations need explicit reconciliation, never title
+        // matching; leave them untouched rather than fencing every refresh on them.
+        if let Some(remote) = row.get::<Option<i64>>(1)? {
+            prior.push((id, remote));
+        }
     }
     drop(rows);
     let summary = match association {
@@ -49,15 +54,7 @@ pub async fn adopt(
             if enable.is_some() {
                 return Err(Error::Conflict);
             }
-            c.execute(
-                "DELETE FROM movie_collection_members WHERE metadata_id=?",
-                [metadata_id],
-            )
-            .await?;
-            for id in &prior {
-                cleanup_without_library(c, *id).await?;
-            }
-            return Ok(!prior.is_empty());
+            return detach(c, metadata_id, prior.iter().map(|(id, _)| *id)).await;
         }
         CollectionAssociation::Present(summary) => summary,
         CollectionAssociation::Absent => unreachable!(),
@@ -82,11 +79,15 @@ pub async fn adopt(
         let reason: Option<String> = row.get(1)?;
         drop(row);
         if removed && reason.as_deref() == Some("user") {
-            return if enable.is_some() {
-                Err(Error::Conflict)
-            } else {
-                Ok(false)
-            };
+            if enable.is_some() {
+                return Err(Error::Conflict);
+            }
+            // The tombstone fences re-adding this collection, not leaving a stale one.
+            let stale = prior
+                .iter()
+                .filter(|(_, remote)| *remote != summary.tmdb_id)
+                .map(|(id, _)| *id);
+            return detach(c, metadata_id, stale).await;
         }
         if removed {
             // Fresh authoritative discovery may restore a lifecycle removal. Retain
@@ -193,17 +194,34 @@ pub async fn adopt(
     if enable.is_some() {
         c.execute("UPDATE movie_collection_intents SET local_edit=1,revision=revision+1 WHERE tmdb_id=? AND local_edit=0",[summary.tmdb_id]).await?;
     }
-    for old in prior.iter().filter(|old| **old != id) {
+    changed |= detach(
+        c,
+        metadata_id,
+        prior.iter().map(|(old, _)| *old).filter(|old| *old != id),
+    )
+    .await?;
+    if !prior.iter().any(|(old, _)| *old == id) {
+        c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision) VALUES(?,?,'discovery',?)",params![id,metadata_id,revision]).await?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Removes the given identified associations and retires collections left without
+/// library members. Returns whether any association was removed.
+async fn detach(
+    c: &Connection,
+    metadata_id: i64,
+    collections: impl Iterator<Item = i64>,
+) -> Result<bool> {
+    let mut changed = false;
+    for old in collections {
         c.execute(
             "DELETE FROM movie_collection_members WHERE collection_id=? AND metadata_id=?",
             params![old, metadata_id],
         )
         .await?;
-        cleanup_without_library(c, *old).await?;
-        changed = true;
-    }
-    if !prior.contains(&id) {
-        c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision) VALUES(?,?,'discovery',?)",params![id,metadata_id,revision]).await?;
+        cleanup_without_library(c, old).await?;
         changed = true;
     }
     Ok(changed)
