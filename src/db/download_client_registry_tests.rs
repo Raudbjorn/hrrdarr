@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(66)]] // Reasoning: the runner applies through latest 0069 (0069 rtorrent registry, 0068 deluge registry, 0064 NZBGet registry, 0063 notifications; recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
+        vec![vec![libsql::Value::Integer(67)]] // Reasoning: the runner applies through latest 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge registry, 0064 NZBGet registry, 0063 notifications; recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
     );
     for (sql, expected) in TABLES.iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
@@ -142,7 +142,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
         rows(&c, "SELECT implementation,kind,protocol FROM provider_implementations ORDER BY implementation").await?,
         // Reasoning: the runner continues through 0062, which appends the transmission row; the
         // four 0059 rows are unchanged.
-        [("deluge", "download_client", "torrent"), ("newznab", "indexer", "usenet"), ("nzbget", "download_client", "usenet"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent")]
+        [("deluge", "download_client", "torrent"), ("newznab", "indexer", "usenet"), ("nzbget", "download_client", "usenet"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent"), ("utorrent", "download_client", "torrent")]
             .map(|(a, b, p)| vec![libsql::Value::Text(a.into()), libsql::Value::Text(b.into()), libsql::Value::Text(p.into())])
             .to_vec()
     );

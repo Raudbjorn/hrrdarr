@@ -130,3 +130,12 @@ test('rTorrent is a torrent download client for both domains',()=>{
  assert.equal(eligibleDownloadClient(client,'tv','torznab'),true);
  assert.equal(eligibleDownloadClient(client,'tv','newznab'),false);
 });
+
+test('uTorrent is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('utorrent'),'torrent');
+ assert.equal(isClientImplementation('utorrent'),true);
+ const client={id:'ut',enabled:true,settings:{implementation:'utorrent',endpoint:'http://127.0.0.1:8080/gui',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});

@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 66); // Reasoning: latest is 0069 (0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 67); // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -274,7 +274,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 66); // Reasoning: latest is 0069 (0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 67); // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
