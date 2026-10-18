@@ -115,6 +115,14 @@ async fn peer(State(p): State<Peer>, method: Method, OriginalUri(uri): OriginalU
 /// (CONFIG rechecks are due 5 s after a mutation), never worker cadence or load.
 const MAX_STEPS: usize = 64;
 const MAX_IDLE: Duration = Duration::from_secs(10);
+/// Re-check cadence while nothing is claimable (production ticks every 1 s).
+const IDLE_POLL: Duration = Duration::from_millis(250);
+/// Hang guard only: correctness is bounded by `MAX_STEPS`/`MAX_IDLE`, not by this budget.
+const MAX_DRIVE: Duration = Duration::from_secs(120);
+/// Matches the health engine's per-attempt deadline (`health::run`, 30 s).
+const ATTEMPT_DEADLINE: Duration = Duration::from_secs(30);
+/// A claimed root probe reaches the peer well within the qBittorrent read timeout (5 s).
+const PROBE_ENTRY: Duration = Duration::from_secs(5);
 struct Fixture {
     worker: Option<Arc<commands::Driver>>,
     app: Option<Server>,
@@ -194,8 +202,15 @@ impl Fixture {
                 .unwrap(),
         ));
     }
+    /// Drops the sole worker handle so its DB ownership is released; an un-awaited parked
+    /// step would otherwise keep it registered and the restart would report a 409.
+    fn release_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            drop(Arc::into_inner(worker).expect("an in-flight step still holds the worker"));
+        }
+    }
     async fn restart(&mut self) {
-        drop(self.worker.take().unwrap());
+        self.release_worker();
         self.start().await;
     }
     /// Steps until `done`; idles only while no command is claimable (a future due time).
@@ -203,11 +218,16 @@ impl Fixture {
     /// slow steps never consume it.
     async fn drive<T>(&self, what: &str, mut done: impl AsyncFnMut() -> Option<T>) -> T {
         let worker = self.worker.as_ref().unwrap();
+        let hang_guard = tokio::time::Instant::now() + MAX_DRIVE;
         let (mut steps, mut idle_until) = (0, None);
         loop {
             if let Some(value) = done().await {
                 return value;
             }
+            assert!(
+                tokio::time::Instant::now() < hang_guard,
+                "{what}: still driving after {MAX_DRIVE:?} ({steps} steps)"
+            );
             if worker.step().await.expect("worker iteration failed") {
                 idle_until = None;
                 steps += 1;
@@ -222,7 +242,7 @@ impl Fixture {
                     tokio::time::Instant::now() < until,
                     "{what}: nothing became due"
                 );
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(IDLE_POLL).await;
             }
         }
     }
@@ -298,34 +318,32 @@ impl Fixture {
                 202,
             )
             .await;
-        let (worker, client) = (self.worker.clone().unwrap(), self.client.clone());
-        let url = format!(
-            "{}/api/v1/health/commands/{}",
-            self.base,
-            command["command_id"].as_str().unwrap()
-        );
+        let (worker, db) = (self.worker.clone().unwrap(), self.db.clone());
+        let id = command["command_id"].as_str().unwrap().to_owned();
         // Higher-priority health work is claimed first; loop only past unrelated due work.
-        let step = tokio::spawn(async move {
+        // Status is read from storage directly: this task cannot borrow the fixture's client.
+        let mut step = tokio::spawn(async move {
             for _ in 0..MAX_STEPS {
-                worker.step().await.expect("worker iteration failed");
-                let bytes = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap();
-                let detail: Value = serde_json::from_slice(&bytes).unwrap();
-                if detail["status"] != "queued" {
+                if !worker.step().await.expect("worker iteration failed") {
+                    tokio::time::sleep(IDLE_POLL).await;
+                }
+                if health_command_status(&db, &id).await != "queued" {
                     return;
                 }
             }
             panic!("blocked health command was never claimed");
         });
-        tokio::time::timeout(Duration::from_secs(5), self.peer.entered.notified())
-            .await
-            .unwrap();
+        // A step that ends before the probe blocks means it never reached the root evaluator;
+        // join it so its own panic (not a generic timeout) is reported.
+        tokio::select! {
+            entered = tokio::time::timeout(PROBE_ENTRY, self.peer.entered.notified()) => {
+                entered.expect("claimed attempt must reach the root probe");
+            }
+            ended = &mut step => {
+                ended.unwrap();
+                panic!("health step finished without blocking in the root probe");
+            }
+        }
         let detail = self
             .call(
                 "GET",
@@ -414,14 +432,14 @@ impl Fixture {
     /// Lets a parked attempt publish; no later command can run before the caller asserts.
     async fn release(&self, step: tokio::task::JoinHandle<()>, id: &str) -> Value {
         self.peer.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(30), step)
+        tokio::time::timeout(ATTEMPT_DEADLINE, step)
             .await
             .expect("released attempt must finish within the health deadline")
             .unwrap();
         self.command(id).await
     }
     async fn stop(mut self) {
-        drop(self.worker.take());
+        self.release_worker();
         self.app.take().unwrap().stop().await;
         self.upstream.take().unwrap().stop().await;
         assert_eq!(
@@ -430,6 +448,18 @@ impl Fixture {
             "health cannot submit/change downloads"
         );
     }
+}
+async fn health_command_status(db: &Database, id: &str) -> String {
+    let c = db.connect().await.unwrap();
+    c.query("SELECT status FROM health_commands WHERE id=?", [id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .expect("health command row")
+        .get::<String>(0)
+        .unwrap()
 }
 fn peer_handler() -> axum::routing::MethodRouter<Peer> {
     axum::routing::any(peer)
@@ -648,6 +678,9 @@ async fn root_mapping_and_provider_mutations_fence_inflight_health_publication()
         }
         let id = command["command_id"].as_str().unwrap();
         let stale = f.release(step, id).await;
+        // stale_inputs is never retried (health::engine::fail: retry requires
+        // code != "stale_inputs"), so the fenced attempt must end `failed`, not `retry_wait`.
+        // A probe timeout before the mutation would instead yield a retryable provider error.
         assert_eq!(stale["status"], "failed", "{mutation}: {stale}");
         assert_eq!(stale["error_code"], "stale_inputs", "{mutation}: {stale}");
         let pending = f.health().await;
@@ -746,6 +779,8 @@ async fn both_snapshot_roots_invalidate_atomically_and_restart_preserves_media()
             [before[0] + 1, before[1] + 1]
         );
         let id = command["command_id"].as_str().unwrap();
+        // The release is awaited, so this reads the fenced attempt's own outcome; no later
+        // command can have run (the worker is stepped only by this test).
         assert_eq!(f.release(step, id).await["error_code"], "stale_inputs");
         f.call(
             "POST",
@@ -767,7 +802,9 @@ async fn both_snapshot_roots_invalidate_atomically_and_restart_preserves_media()
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
         drop(c);
     }
-    // Restart interrupts a real running read; original media and durable roots remain.
+    // Simulated crash: the attempt is cancelled mid-read (its future dropped while the probe
+    // is blocked), then the worker handle is dropped and a new one runs startup recovery.
+    // Original media and durable roots remain. The release permit only unblocks the peer.
     let (_, step) = f.blocked_movie_root().await;
     step.abort();
     assert!(step.await.unwrap_err().is_cancelled());
