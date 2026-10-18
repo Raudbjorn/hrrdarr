@@ -246,11 +246,20 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
             .await?;
     assert!(!conflict.applied);
     assert_eq!(conflict.conflicts, 1);
+    assert_eq!(
+        serde_json::to_value(&conflict.provider_conflicts)?,
+        serde_json::json!([{"table":"Indexers","source_id":1,"reason":"mapping_changed","candidates":1,"blocking":true}])
+    );
     c.execute("DELETE FROM providers WHERE id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='radarr' AND source_table='DownloadClients' LIMIT 1)",()).await?;
     let conflict =
         snapshots::import_with_providers(&db, Application::Radarr, film, false, Some(&key)).await?;
     assert!(!conflict.applied);
     assert_eq!(conflict.conflicts, 1);
+    // A deleted mapped target is still blocking; zero candidates remain.
+    assert_eq!(
+        serde_json::to_value(&conflict.provider_conflicts)?,
+        serde_json::json!([{"table":"DownloadClients","source_id":1,"reason":"mapping_changed","candidates":0,"blocking":true}])
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 5);
     // Credential-free configurations require no key; source constructor defaults are explicit.
     let trusted_path = s.0.join("trusted.db");
@@ -370,8 +379,20 @@ async fn absent_and_malformed_snapshot_policy_is_conservative_and_atomic() -> Re
             Some(&key),
         )
         .await?;
+        // Reasoning: a changed export is a new fingerprint with no stored mapping, so the differing
+        // indexer is a non-blocking `differs` row (#20): the import applies, that row stays unmapped
+        // and the native provider is untouched (health generations below are unchanged).
         assert!(
-            !changed.applied && changed.conflicts > 0,
+            changed.applied && changed.conflicts == 0,
+            "Changed source policies are reported, not blocking: {changed:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&changed.provider_conflicts)?,
+            serde_json::json!([{"table":"Indexers","source_id":1,"reason":"differs","candidates":1,"blocking":false}])
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=1").await,
+            0,
             "Changed source policies must not overwrite a native provider"
         );
         assert_eq!(
@@ -486,7 +507,13 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             snapshots::import_with_providers(&db, app, std::fs::read(&path)?, false, Some(&key))
                 .await
                 .unwrap_or_else(|error| panic!("{label}: changed source association: {error:?}"));
-        assert!(!changed.applied && changed.conflicts == 1);
+        // Reasoning: the new export has no stored mapping, so the differing indexer is a
+        // non-blocking `differs` row (#20); the native binding is still not overwritten.
+        assert!(changed.applied && changed.conflicts == 0, "{changed:?}");
+        assert_eq!(
+            serde_json::to_value(&changed.provider_conflicts)?,
+            serde_json::json!([{"table":"Indexers","source_id":1,"reason":"differs","candidates":1,"blocking":false}])
+        );
         assert_eq!(
             scalar(&c, "SELECT sum(generation) FROM health_checks").await,
             before

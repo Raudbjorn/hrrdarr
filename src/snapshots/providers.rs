@@ -4,7 +4,8 @@ use crate::{
     library::Change,
     providers::{
         CredentialKey, Credentials, DownloadContentLayout, DownloadInitialState, DownloadScope,
-        IndexerParameter, MovieIndexerScope, ProviderInput, ProviderSettings, TvIndexerScope,
+        ImportOutcome, IndexerParameter, MovieIndexerScope, ProviderInput, ProviderSettings,
+        TvIndexerScope,
     },
 };
 use serde_json::{Map, Value as Json};
@@ -454,6 +455,25 @@ pub(super) fn read(
     }
     Ok(output)
 }
+// A row this snapshot never mapped wrote nothing and nothing in the import references it:
+// bound indexers and release profiles already treat an unmapped source provider as absent.
+// It is reported and left unmapped so the library commits; a rerun can still map it later.
+// A stored mapping that diverged blocks, so reruns never silently drop an imported provider.
+fn conflict(record: &ProviderRecord, was_mapped: bool, candidates: usize) -> ProviderConflict {
+    ProviderConflict {
+        table: record.table,
+        source_id: record.id,
+        reason: if was_mapped {
+            ProviderConflictReason::MappingChanged
+        } else if candidates > 1 {
+            ProviderConflictReason::Ambiguous
+        } else {
+            ProviderConflictReason::Differs
+        },
+        candidates,
+        blocking: was_mapped,
+    }
+}
 pub(super) async fn write(
     conn: &Connection,
     records: &[ProviderRecord],
@@ -503,18 +523,30 @@ pub(super) async fn write(
         )
         .await
         .map_err(ImportError)?;
-        if let Some((id, revision, created)) = outcome {
-            if created {
-                report.mapped += 1
-            } else {
-                report.duplicates += 1
+        match outcome {
+            ImportOutcome::Mapped {
+                id,
+                revision,
+                created,
+            } => {
+                if created {
+                    report.mapped += 1
+                } else {
+                    report.duplicates += 1
+                }
+                conn.execute("INSERT INTO snapshot_provider_mappings(application,fingerprint,source_table,source_id,provider_id,provider_revision) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![report.application.name(),report.fingerprint.clone(),record.table,record.id,id,revision]).await?;
+                if record.table == "DownloadClients" {
+                    reconciled_clients.insert(record.id);
+                }
             }
-            conn.execute("INSERT INTO snapshot_provider_mappings(application,fingerprint,source_table,source_id,provider_id,provider_revision) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",params![report.application.name(),report.fingerprint.clone(),record.table,record.id,id,revision]).await?;
-            if record.table == "DownloadClients" {
-                reconciled_clients.insert(record.id);
+            ImportOutcome::Conflict { candidates } => {
+                report
+                    .provider_conflicts
+                    .push(conflict(record, mapped.is_some(), candidates));
+                if mapped.is_some() {
+                    report.conflicts += 1
+                }
             }
-        } else {
-            report.conflicts += 1
         }
     }
     changes.finish(conn).await.map_err(ImportError)

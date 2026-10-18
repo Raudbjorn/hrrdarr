@@ -48,9 +48,11 @@ resolve through file records and their correct owner, never into path strings.
 
 HTTP 200 returns `application`, `fingerprint` (SHA-256 of upload), `schema_version`,
 `dry_run`, `applied`, `mapped`, `duplicates`, `metadata_backfilled`, `conflicts`, `missing_file_records`,
-`unsupported` and a `policy` explanation. `mapped` counts new proposed records;
-`duplicates` counts matching existing records. With any conflict, `applied=false`
-and **the entire destination transaction rolls back**, including otherwise valid rows.
+`unsupported`, `provider_conflicts` and a `policy` explanation. `mapped` counts new proposed records;
+`duplicates` counts matching existing records. `conflicts` counts blocking conflicts: with any,
+`applied=false` and **the entire destination transaction rolls back**, including otherwise valid rows.
+The one non-blocking kind is an unresolved source provider, described under provider
+reconstruction below and listed in `provider_conflicts`.
 A dry run always rolls back. Existing rows are compared across all imported fields;
 no existing library is cleared or overwritten. Reruns validate stored mappings and
 conflict if local records were edited or deleted. Numeric source IDs are scoped by
@@ -102,9 +104,15 @@ and definedness still commit and the snapshot is stamped. The domain's
 completed-download-handling read then reports `reconciliation_pending` with reason
 `schedule_limit`, which is the machine-readable signal. The report adds a `Config`
 unsupported entry only when the source defined the key. Activation follows the next
-slot-releasing mutation or startup; re-importing is unnecessary. Source-client matching
-is separate: a source client whose host/port matches several existing clients is an
-ambiguous conflict, and that import does not apply.
+slot-releasing mutation or startup; re-importing is unnecessary.
+
+Source-provider matching never blocks the library on its own. A source client or indexer
+that this snapshot has not mapped yet and that matches several existing configurations
+(`ambiguous`), or one that differs (`differs`), is left unmapped. It appears in
+`provider_conflicts` with its source table, source ID and destination candidate count, and
+the rest of the import still applies. Only a stored mapping whose provider was edited,
+tested or deleted since (`mapping_changed`, `blocking: true`) counts in `conflicts` and rolls
+the import back. After resolving the candidates, rerun the same snapshot to map the row.
 
 ## Verification limits
 
@@ -166,19 +174,24 @@ DownloadClients IDs remain distinct, as do TV/movie imports. Existing archived
 snapshots can be replayed with the option to add these mappings. Exact replay
 requires the mapped provider to exist with unchanged revision, complete configuration,
 plaintext credential content, disabled state and no test observation. Local changes,
-deletions or testing cause conflicts; nothing is overwritten or silently recreated.
+deletions or testing cause a blocking `mapping_changed` conflict; nothing is overwritten
+or silently recreated.
 
 For a different backup, implementation + exact endpoint + media domain identify
 candidate configurations. No candidate creates a new disabled configuration. If a
 candidate exists, exactly one must match every reconstructed field and decrypted
-credential; otherwise the import reports a conflict. Independent
+credential; otherwise the source row is left unmapped and listed in `provider_conflicts`
+(`ambiguous` for several candidates, `differs` for one), without blocking the import.
+Nothing is written for that row. An indexer bound to that source client is not
+reconstructed, and release profiles apply their existing rule for an unavailable indexer.
+A later rerun of the same snapshot retries the match, because no mapping was stored. Independent
 TV/movie configurations are not automatically merged. Multiple configurations at
 the same endpoint within a domain may therefore require explicit reconciliation,
 even when they have different names or credentials. This conservative rule prevents
 ambiguous ownership and duplicate configuration creation.
 
 All core records, providers, scopes, archives and mappings share the import
-transaction. Any conflict or late error rolls everything back; dry runs persist
+transaction. Any blocking conflict or late error rolls everything back; dry runs persist
 nothing. At most 256 total source indexer/client rows can be reconstructed per upload,
 including unsupported implementations. No source database or media is modified.
 
