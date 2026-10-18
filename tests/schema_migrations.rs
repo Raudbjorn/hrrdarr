@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Reasoning: 0062 is allocated; the unknown-history probe must use future version 63.
+    // Reasoning: 0062 is allocated; the unknown-history probe must use future version 65.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (63,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (65,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -3283,7 +3283,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -4322,7 +4322,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.

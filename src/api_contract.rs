@@ -63,6 +63,17 @@ pub fn render() -> String {
     registry.visit::<crate::tags::Detail>();
     registry.visit::<crate::tags::Owners>();
     registry.visit::<crate::tags::Page>();
+    registry.visit::<crate::autotagging::Input>();
+    registry.visit::<crate::autotagging::Rule>();
+    registry.visit::<crate::autotagging::SchemaEntry>();
+    registry.visit::<crate::collections::Collection>();
+    registry.visit::<crate::collections::Patch>();
+    registry.visit::<crate::collections::BulkPatch>();
+    registry.visit::<crate::collections::ListQuery>();
+    registry.visit::<crate::api::ApiPage<crate::collections::Collection>>();
+    registry.visit::<crate::commands::collection_refresh::CollectionRefreshInput>();
+    registry.visit::<crate::commands::collection_refresh::ListParams>();
+    registry.visit::<crate::api::ApiPage<crate::commands::collection_refresh::CollectionRefreshCommand>>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
         crate::custom_formats::Input,

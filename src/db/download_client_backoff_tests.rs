@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections occupy array positions 63-64 until the notifications migration is integrated); historical prefixes stay fixed.
     for i in [0, 1, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

@@ -1,4 +1,6 @@
 pub mod api;
+pub mod autotagging;
+pub mod collections;
 pub mod credits;
 pub mod db;
 pub mod episodes;

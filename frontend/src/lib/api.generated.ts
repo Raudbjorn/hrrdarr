@@ -10,6 +10,32 @@ export type ApiErrorEnvelope = { error: ApiErrorDetail, };
 
 export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset: number, };
 
+export type AutoTag = { id: number, media_type: MediaDomain, name: string, remove_tags_automatically: boolean, tag_ids: Array<number>, specifications: Array<AutoTagSpecification>, };
+
+export type AutoTagCondition = { "implementation": "genre" } & AutoTagTextValues | { "implementation": "keyword" } & AutoTagTextValues | { "implementation": "network" } & AutoTagTextValues | { "implementation": "studio" } & AutoTagTextValues | { "implementation": "original_country" } & AutoTagTextValues | { "implementation": "year" } & AutoTagRange | { "implementation": "runtime" } & AutoTagRange | { "implementation": "root_folder" } & AutoTagRootFolder | { "implementation": "original_language" } & AutoTagIntegerValues | { "implementation": "quality_profile" } & AutoTagIntegerValues | { "implementation": "series_type" } & AutoTagTextValues | { "implementation": "status" } & AutoTagTextValues | { "implementation": "minimum_availability" } & AutoTagTextValues | { "implementation": "monitored" } & AutoTagFlag | { "implementation": "collection" } & AutoTagIntegerValues;
+
+export type AutoTagFieldKind = "text_list" | "integer_list" | "integer" | "text" | "boolean" | "enum_list";
+
+export type AutoTagFlag = { value: boolean, };
+
+export type AutoTagInput = { name: string, remove_tags_automatically: boolean, tag_ids: Array<number>, specifications: Array<AutoTagSpecificationInput>, };
+
+export type AutoTagIntegerValues = { values: Array<number>, };
+
+export type AutoTagRange = { min?: number | null, max?: number | null, };
+
+export type AutoTagRootFolder = { path: string, };
+
+export type AutoTagSchemaEntry = { implementation: string, label: string, fields: Array<AutoTagSchemaField>, };
+
+export type AutoTagSchemaField = { name: string, label: string, kind: AutoTagFieldKind, required: boolean, options: Array<string>, };
+
+export type AutoTagSpecification = { id: number, name: string, negate: boolean, required: boolean, condition: AutoTagCondition, };
+
+export type AutoTagSpecificationInput = { name: string, negate: boolean, required: boolean, condition: AutoTagCondition, };
+
+export type AutoTagTextValues = { values: Array<string>, };
+
 export type BlocklistClearCommand = { id: string, name: BlocklistClearName, target: BlocklistClearTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_removed: number, };
 
 export type BlocklistClearInput = { target: BlocklistClearTarget, priority: CommandPriority, };
@@ -67,6 +93,44 @@ export type ClientAttemptState = "selected" | "prepared" | "dispatching" | "defi
 export type ClientSelection = { "kind": "default", } | { "kind": "explicit", provider_id: string, provider_revision: number, };
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
+
+export type CollectionAssociation = { "state": "absent" } | { "state": "clear" } | { "state": "present", "value": CollectionRef };
+
+export type CollectionBulkPatch = { ids: Array<number>, patch: CollectionPatch, };
+
+export type CollectionMovie = { metadata_id: number, tmdb_id: number | null, title: string, year: number | null, 
+/**
+ * Library movie id when the movie is in the library; null for catalog-only members.
+ */
+movie_id: number | null, monitored: boolean | null, };
+
+export type CollectionPatch = { monitored?: boolean, search_on_add?: boolean, quality_profile_id?: number | null, root_folder_id?: number | null, minimum_availability?: MinimumAvailability | null, 
+/**
+ * Replaces the complete tag set applied to movies this collection adds.
+ */
+tag_ids?: Array<number>, 
+/**
+ * One-shot bulk action: set monitoring on movies of this collection already in the library.
+ */
+monitor_movies?: boolean, };
+
+export type CollectionQuery = { limit?: number, offset?: number, monitored?: boolean, q?: string, };
+
+export type CollectionRef = { tmdb_id: number, title: string, };
+
+export type CollectionRefreshCommand = { id: string, name: CollectionRefreshName, origin: CollectionRefreshOrigin, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, collections_checked: number, collections_failed: number, movies_added: number, 
+/**
+ * Added movies whose collection requested search-on-add. Counted, not submitted here.
+ */
+searches_pending: number, };
+
+export type CollectionRefreshInput = Record<symbol, never>;
+
+export type CollectionRefreshName = "refresh_collections";
+
+export type CollectionRefreshOrigin = "manual" | "automatic";
+
+export type CollectionRefreshQuery = { limit?: number, offset?: number, };
 
 export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
 
@@ -410,11 +474,17 @@ export type MonitorNewItems = "all" | "none";
 
 export type MovieCalendarEntry = { event_id: string, target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, release_type: MovieReleaseType, date: string, released_at: string, monitored: boolean, has_file: boolean, status: string | null, studio: string | null, runtime_minutes: number | null, };
 
+export type MovieCollection = { id: number, tmdb_id: number | null, title: string, overview: string | null, monitored: boolean, search_on_add: boolean, quality_profile_id: number | null, root_folder_id: number | null, root_folder_path: string | null, minimum_availability: string | null, tag_ids: Array<number>, last_info_sync: string | null, movie_count: number, library_movie_count: number, missing_movie_count: number, 
+/**
+ * Members are listed by the detail endpoint only; list responses carry an empty array.
+ */
+movies: Array<CollectionMovie>, };
+
 export type MovieCredit = { id: number, metadata_id: number, credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, type: CreditKind, images: Array<CreditImage>, };
 
 export type MovieCreditQuery = { limit?: number, offset?: number, movie_id?: number, metadata_id?: number, };
 
-export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, };
+export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, collection: CollectionAssociation, };
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
@@ -780,7 +850,7 @@ export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
 
 export type TagAssignmentMode = "add" | "remove" | "replace";
 
-export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, download_client_ids: Array<string>, };
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, download_client_ids: Array<string>, auto_tagging_ids: Array<number>, collection_ids: Array<number>, };
 
 export type TagInput = { label: string, };
 

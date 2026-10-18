@@ -554,7 +554,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -696,7 +696,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        64 // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections; array positions 63-64 until the notifications migration 0063 is integrated); historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

@@ -264,6 +264,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "transmission",
         include_str!("../../migrations/0062_transmission.sql"),
     ),
+    // Versions follow array position: 0063 (notifications) is reserved by another lane, so the
+    // parent must insert that entry before this one when integrating.
+    (
+        "autotagging_rules",
+        include_str!("../../migrations/0064_autotagging_rules.sql"),
+    ),
+    (
+        "collections",
+        include_str!("../../migrations/0065_collections.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

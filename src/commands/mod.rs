@@ -22,6 +22,7 @@ use std::{
 use uuid::Uuid;
 
 pub mod blocklist;
+pub mod collection_refresh;
 pub mod downloaded_scan;
 pub mod housekeeping;
 pub mod manual_import;
@@ -424,6 +425,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let rescan = rescan::router(db.clone());
     let downloaded_scan = downloaded_scan::router(db.clone());
     let recycle_cleanup = recycle_cleanup::router(db.clone());
+    let collection_refresh = collection_refresh::router(db.clone());
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
         .route("/api/v1/commands/{id}", get(detail).delete(delete))
@@ -448,6 +450,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(rescan)
         .merge(recycle_cleanup)
         .merge(downloaded_scan)
+        .merge(collection_refresh)
 }
 async fn create(
     State(db): State<Arc<Database>>,
