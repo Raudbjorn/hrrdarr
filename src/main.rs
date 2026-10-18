@@ -206,13 +206,22 @@ async fn migrate(
     Query(options): Query<SnapshotOptions>,
     bytes: axum::body::Bytes,
 ) -> Result<Json<snapshots::Report>, ApiError> {
+    if options.allow_unmapped_providers && !options.import_providers {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "allow_unmapped_providers requires import_providers".into(),
+        });
+    }
     let result = if options.import_providers {
-        snapshots::import_with_providers(
+        snapshots::import_with_provider_options(
             &state.db,
             options.application,
             bytes.to_vec(),
             options.dry_run,
-            state.provider_key.as_deref(),
+            snapshots::ProviderOptions {
+                key: state.provider_key.as_deref(),
+                allow_unmapped: options.allow_unmapped_providers,
+            },
         )
         .await
     } else {
@@ -335,8 +344,26 @@ mod tests {
                     application: snapshots::Application::Sonarr,
                     dry_run: true,
                     import_providers: false,
+                    allow_unmapped_providers: false,
                 }),
                 axum::body::Bytes::from_static(b"not a database")
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        // The opt-in only qualifies provider reconstruction; alone it is a malformed request.
+        assert_eq!(
+            migrate(
+                State(state.clone()),
+                Query(SnapshotOptions {
+                    application: snapshots::Application::Sonarr,
+                    dry_run: true,
+                    import_providers: false,
+                    allow_unmapped_providers: true,
+                }),
+                bytes.clone().into(),
             )
             .await
             .unwrap_err()
@@ -350,6 +377,7 @@ mod tests {
                     application: snapshots::Application::Sonarr,
                     dry_run,
                     import_providers: false,
+                    allow_unmapped_providers: false,
                 }),
                 bytes.clone().into(),
             )
@@ -381,6 +409,7 @@ mod tests {
                 application: snapshots::Application::Sonarr,
                 dry_run: false,
                 import_providers: true,
+                allow_unmapped_providers: false,
             }),
             bytes.clone().into(),
         )

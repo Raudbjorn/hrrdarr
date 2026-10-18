@@ -60,7 +60,8 @@ pub struct Report {
     pub conflicts: usize,
     pub missing_file_records: usize,
     pub unsupported: Vec<Unsupported>,
-    // Source provider rows left unmapped, or whose stored mapping diverged. Never contains source values.
+    // Source provider rows that were not mapped. Blocking entries are also counted in `conflicts`.
+    // Never contains source values.
     pub provider_conflicts: Vec<ProviderConflict>,
     pub policy: &'static str,
 }
@@ -71,22 +72,23 @@ pub struct ProviderConflict {
     pub table: &'static str,
     pub source_id: i64,
     pub reason: ProviderConflictReason,
-    // Destination configurations examined: those sharing the reconciliation identity, or the
-    // stored mapping's target (0 when it was deleted).
+    // Destination configurations examined for this row (0 for `client_unmapped`).
     pub candidates: usize,
-    // Only a diverged stored mapping blocks; other provider conflicts leave the row unmapped.
+    // Blocking unless the caller allowed unmapped providers; `client_unmapped` never blocks itself.
     pub blocking: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename = "SnapshotProviderConflictReason")]
 pub enum ProviderConflictReason {
-    // Several destination configurations share implementation, endpoint and media domain.
+    // More than one destination configuration exactly matches the source row.
     Ambiguous,
-    // One destination configuration shares the identity but differs in a reconstructed field.
+    // Destination configurations share implementation, endpoint and domain; none matches exactly.
     Differs,
-    // The provider this snapshot row was mapped to was edited, tested or deleted since.
+    // The provider mapped to this row was deleted or its reconstructed configuration changed.
     MappingChanged,
+    // An indexer bound to a source client that was not mapped; it is not reconstructed unbound.
+    ClientUnmapped,
 }
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "SnapshotUnsupported")]
@@ -174,10 +176,11 @@ pub async fn import(
     bytes: Vec<u8>,
     dry_run: bool,
 ) -> Result<Report> {
-    import_inner(db, app, bytes, dry_run, false, None).await
+    import_inner(db, app, bytes, dry_run, None).await
 }
 
 /// Explicitly reconstruct supported provider configuration, disabled and untested.
+/// Any unmapped source provider is a blocking conflict.
 pub async fn import_with_providers(
     db: &Database,
     app: Application,
@@ -185,15 +188,39 @@ pub async fn import_with_providers(
     dry_run: bool,
     key: Option<&crate::providers::CredentialKey>,
 ) -> Result<Report> {
-    import_inner(db, app, bytes, dry_run, true, key).await
+    import_with_provider_options(
+        db,
+        app,
+        bytes,
+        dry_run,
+        ProviderOptions {
+            key,
+            allow_unmapped: false,
+        },
+    )
+    .await
+}
+#[derive(Clone, Copy)]
+pub struct ProviderOptions<'a> {
+    pub key: Option<&'a crate::providers::CredentialKey>,
+    // Commit the rest of the import while unresolved source providers stay unmapped and reported.
+    pub allow_unmapped: bool,
+}
+pub async fn import_with_provider_options(
+    db: &Database,
+    app: Application,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    options: ProviderOptions<'_>,
+) -> Result<Report> {
+    import_inner(db, app, bytes, dry_run, Some(options)).await
 }
 async fn import_inner(
     db: &Database,
     app: Application,
     bytes: Vec<u8>,
     dry_run: bool,
-    reconstruct_providers: bool,
-    key: Option<&crate::providers::CredentialKey>,
+    provider_options: Option<ProviderOptions<'_>>,
 ) -> Result<Report> {
     if !db.permits_private_snapshots() {
         return Err(ImportError(
@@ -241,7 +268,7 @@ async fn import_inner(
     let profile_plan = profiles::read(&source, app, &mut plan.unsupported).await?;
     let blocklist_plan = blocklist::read(&source, app, &mut plan.unsupported)?;
     let history_plan = history::read(&source, app, &mut plan.unsupported)?;
-    let provider_plan = if reconstruct_providers {
+    let provider_plan = if provider_options.is_some() {
         providers::read(&source, app, &mut plan.unsupported)?
     } else {
         Vec::new()
@@ -261,8 +288,12 @@ async fn import_inner(
         provider_conflicts: Vec::new(),
         policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
-    if reconstruct_providers {
-        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs.";
+    if let Some(options) = provider_options {
+        report.policy = if options.allow_unmapped {
+            "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Unresolved source providers stay unmapped, are listed in provider_conflicts and do not block the rest of the import; indexers bound to them are not reconstructed. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
+        } else {
+            "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Any unresolved source provider is a blocking conflict listed in provider_conflicts. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
+        };
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -278,7 +309,9 @@ async fn import_inner(
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
-        providers::write(&tx, &provider_plan, key, &mut report).await?;
+        if let Some(options) = provider_options {
+            providers::write(&tx, &provider_plan, options, &mut report).await?;
+        }
         release_profiles::write(&tx, release_profile_plan.as_ref(), &mut report).await?;
         completed_download_handling::write(&tx, cdh_plan, &mut report).await
     }

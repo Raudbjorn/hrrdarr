@@ -5,6 +5,10 @@ use hrrdarr::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 static SNAPSHOTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Mirrors the private refresh-schedule bound in `completed_download_handling` (MAX_SCHEDULES).
+const SCHEDULE_CAP: i64 = 64;
+// One more enabled client than the cap, so any CDH activation needs a slot it cannot get.
+const LEGACY_CLIENTS: i64 = SCHEDULE_CAP + 1;
 struct Scratch(std::path::PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -393,7 +397,7 @@ async fn pending_capacity_recovers_through_real_schedule_delete_without_partial_
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let c = db.connect().await.unwrap();
     let mut first = String::new();
-    for i in 0..65 {
+    for i in 0..LEGACY_CLIENTS {
         let id = uuid::Uuid::new_v4().to_string();
         if i == 0 {
             first = id.clone();
@@ -447,7 +451,7 @@ async fn pending_capacity_recovers_through_real_schedule_delete_without_partial_
             "SELECT count(*) FROM download_refresh_schedules WHERE enabled=1 AND intent='inherited'"
         )
         .await,
-        64
+        SCHEDULE_CAP
     );
     let before = scalar(&c, "SELECT count(*) FROM providers").await;
     let (code, v) = request(&base, "POST", "/api/v1/providers", client_input()).await;
@@ -729,10 +733,10 @@ async fn source_false_governs_later_clients_and_local_false_blocks_source_true()
         server.stop().await;
     }
 }
-/// Seeds 65 enabled legacy qBittorrent scopes so any CDH activation needs 65 schedules (> 64).
+/// Seeds LEGACY_CLIENTS enabled legacy qBittorrent scopes, so CDH activation exceeds SCHEDULE_CAP.
 async fn legacy_clients(c: &libsql::Connection, media: &str, endpoint: &str) -> Vec<String> {
     let mut ids = Vec::new();
-    for _ in 0..65 {
+    for _ in 0..LEGACY_CLIENTS {
         let id = uuid::Uuid::new_v4().to_string();
         c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'qbittorrent','legacy',1,1,1,1,?)",libsql::params![id.clone(),endpoint]).await.unwrap();
         c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES(?,'qbittorrent',?,'owned',0,0,'started','default',0,0,0)",libsql::params![id.clone(),media]).await.unwrap();
@@ -803,7 +807,7 @@ async fn snapshot_capacity_shortfall_commits_intent_pending_and_activates_when_s
             );
             assert_eq!(
                 scalar(&c, "SELECT count(*) FROM providers").await,
-                66,
+                LEGACY_CLIENTS + 1,
                 "{shape}"
             );
             assert_eq!(
@@ -844,7 +848,7 @@ async fn snapshot_capacity_shortfall_commits_intent_pending_and_activates_when_s
             );
             assert_eq!(
                 scalar(&c, "SELECT count(*) FROM providers WHERE enabled=1").await,
-                65,
+                LEGACY_CLIENTS,
                 "{shape}: reconstructed source client stays disabled"
             );
             // An exact rerun is a duplicate and changes nothing.
@@ -878,16 +882,16 @@ async fn snapshot_capacity_shortfall_commits_intent_pending_and_activates_when_s
                     "SELECT count(*) FROM download_processing_policies WHERE enabled=1"
                 )
                 .await,
-                64,
+                SCHEDULE_CAP,
                 "{shape}"
             );
-            assert_eq!(scalar(&c, "SELECT count(*) FROM download_refresh_schedules WHERE enabled=1 AND intent='inherited'").await, 64, "{shape}");
+            assert_eq!(scalar(&c, "SELECT count(*) FROM download_refresh_schedules WHERE enabled=1 AND intent='inherited'").await, SCHEDULE_CAP, "{shape}");
             server.stop().await;
         }
     }
 }
 #[tokio::test]
-async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_applies_library() {
+async fn snapshot_shared_legacy_endpoint_blocks_by_default_and_opt_in_leaves_client_unmapped() {
     let _serial = SNAPSHOTS.lock().await;
     for version in [233, 206, 242] {
         let media = if version == 233 { "tv" } else { "movies" };
@@ -904,27 +908,53 @@ async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_appli
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let c = db.connect().await.unwrap();
-        // Same host/port as the source client: matching cannot pick one of 65 candidates.
+        // Same host/port as the source client; none of the legacy clients matches it exactly.
         legacy_clients(&c, media, "http://127.0.0.1:9").await;
-        // An indexer bound to the ambiguous client depends on it and must not be reconstructed unbound.
+        // An indexer bound to that client depends on it and must not be reconstructed unbound.
         let bound = format!(
             "{}CREATE TABLE Indexers(Id INTEGER,Name TEXT,Implementation TEXT,ConfigContract TEXT,Settings TEXT,Priority INTEGER,EnableRss INTEGER,EnableAutomaticSearch INTEGER,EnableInteractiveSearch INTEGER,DownloadClientId INTEGER);INSERT INTO Indexers VALUES(1,'Bound','Torznab','TorznabSettings','{{\"baseUrl\":\"https://indexer.test\"}}',1,1,1,1,1);",
             capacity_source(version, true)
         );
         let bytes = fixture(&s, version, "shared", &bound).await;
         let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
-        // Reasoning: before #20 this whole import rolled back (applied=false). The ambiguous client
-        // row writes nothing and nothing in this import references it, so the library now applies
-        // and the report names the source row and candidate count instead.
-        let report = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+        let conflicts = |blocking: bool| {
+            json!([
+                {"table":"DownloadClients","source_id":1,"reason":"differs","candidates":LEGACY_CLIENTS,"blocking":blocking},
+                {"table":"Indexers","source_id":1,"reason":"client_unmapped","candidates":0,"blocking":false}
+            ])
+        };
+        // The default keeps all-or-nothing: nothing applies, but the report now names the row.
+        let before = database_state(&c).await;
+        let strict = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
             .await
             .unwrap();
-        assert!(report.applied, "{shape}: {report:?}");
-        assert_eq!(report.conflicts, 0, "{shape}: {report:?}");
-        let conflict = serde_json::to_value(&report.provider_conflicts).unwrap();
+        assert!(
+            !strict.applied && strict.conflicts == 1,
+            "{shape}: {strict:?}"
+        );
         assert_eq!(
-            conflict,
-            json!([{"table":"DownloadClients","source_id":1,"reason":"ambiguous","candidates":65,"blocking":false}]),
+            serde_json::to_value(&strict.provider_conflicts).unwrap(),
+            conflicts(true),
+            "{shape}"
+        );
+        assert_eq!(database_state(&c).await, before, "{shape}: nothing applied");
+        // Reasoning: before #20 the only option was the rollback above. With the explicit opt-in the
+        // unresolved row writes nothing and nothing in the import references it, so the rest applies.
+        let options = snapshots::ProviderOptions {
+            key: Some(&key),
+            allow_unmapped: true,
+        };
+        let report =
+            snapshots::import_with_provider_options(&db, app, bytes.clone(), false, options)
+                .await
+                .unwrap();
+        assert!(
+            report.applied && report.conflicts == 0,
+            "{shape}: {report:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&report.provider_conflicts).unwrap(),
+            conflicts(false),
             "{shape}"
         );
         let public = serde_json::to_string(&report).unwrap();
@@ -944,15 +974,8 @@ async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_appli
         );
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM providers").await,
-            65,
+            LEGACY_CLIENTS,
             "{shape}: no duplicate client and no unbound indexer is created"
-        );
-        assert!(
-            report.unsupported.iter().any(|u| u
-                .columns
-                .iter()
-                .any(|c| c == "DownloadClientId (unmapped; indexer not reconstructed)")),
-            "{shape}: {report:?}"
         );
         // The raw source row is still archived privately for a later reconciliation.
         assert_eq!(
@@ -964,20 +987,21 @@ async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_appli
             1,
             "{shape}"
         );
-        // An exact rerun is idempotent: same report entry, no state change.
+        // An exact opt-in rerun is idempotent: same entries, no state change.
         let before = database_state(&c).await;
-        let rerun = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
-            .await
-            .unwrap();
+        let rerun =
+            snapshots::import_with_provider_options(&db, app, bytes.clone(), false, options)
+                .await
+                .unwrap();
         assert!(rerun.applied && rerun.conflicts == 0, "{shape}: {rerun:?}");
         assert_eq!(
             serde_json::to_value(&rerun.provider_conflicts).unwrap(),
-            conflict,
+            conflicts(false),
             "{shape}"
         );
         assert_eq!(database_state(&c).await, before, "{shape}");
-        // Once the candidates are resolved, rerunning the same snapshot maps the row, because the
-        // conflicted row stored no mapping.
+        // Once the candidates are resolved, rerunning the same snapshot (now strictly) maps the row,
+        // because the unresolved row stored no mapping.
         c.execute("DELETE FROM providers", ()).await.unwrap();
         let mapped = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
             .await
@@ -994,11 +1018,6 @@ async fn snapshot_shared_legacy_endpoint_leaves_source_client_unmapped_and_appli
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM snapshot_provider_mappings").await,
             2,
-            "{shape}"
-        );
-        assert_eq!(
-            scalar(&c, &format!("SELECT count(*) FROM {library}")).await,
-            1,
             "{shape}"
         );
     }
