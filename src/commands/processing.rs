@@ -510,6 +510,12 @@ fn processing_error(code: &str) -> &'static str {
         "target_changed" => "target_changed",
         "import_busy" => "import_busy",
         "source_unavailable" => "source_unavailable",
+        // Transient: preflight_failure requeues these (bounded) instead of blocking.
+        "import_error" | "storage_error" => "storage_error",
+        "custom_format_busy" => "custom_format_busy",
+        "custom_format_timeout" => "custom_format_timeout",
+        "custom_format_worker_failed" => "custom_format_worker_failed",
+        "custom_format_state_changed" => "custom_format_state_changed",
         _ => "import_conflict",
     }
 }
@@ -697,6 +703,9 @@ async fn preflight(
                 Err(crate::naming::destination::DestinationError::Db(e)) => {
                     return Err(Error::from(e));
                 }
+                Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+                    return Err(Error(StatusCode::SERVICE_UNAVAILABLE, code));
+                }
                 Err(crate::naming::destination::DestinationError::Internal(reason)) => {
                     eprintln!("event=naming_destination_unavailable condition={reason}");
                     return Err(Error(
@@ -822,5 +831,22 @@ mod preflight_error_tests {
             preflight_evaluation_error("custom_format_regex_invalid").1,
             "quality_rejected"
         );
+    }
+
+    // prepare_owned's transient failures must survive processing_error into a code that
+    // preflight_failure requeues; before, all of them became a blocking import_conflict.
+    #[test]
+    fn prepare_owned_transient_codes_reach_the_retry_set() {
+        for (code, mapped) in [
+            ("import_error", "storage_error"),
+            ("storage_error", "storage_error"),
+            ("custom_format_busy", "custom_format_busy"),
+            ("custom_format_timeout", "custom_format_timeout"),
+            ("custom_format_worker_failed", "custom_format_worker_failed"),
+            ("custom_format_state_changed", "custom_format_state_changed"),
+        ] {
+            assert_eq!(processing_error(code), mapped, "{code}");
+        }
+        assert_eq!(processing_error("preflight_changed"), "import_conflict");
     }
 }

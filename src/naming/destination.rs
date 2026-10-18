@@ -20,6 +20,20 @@ pub(crate) enum DestinationError {
     /// The configured template failed to parse or render against the current facts. The
     /// caller must surface this to the operator rather than falling back silently.
     Render(RenderFailure),
+    /// A failure that may clear on retry (matcher admission, timeout or worker loss, or a
+    /// storage read). Carries the processing retry code; the caller retries, never blocks.
+    Unavailable(&'static str),
+}
+/// Maps a custom-format evaluation failure code to a retry code; `None` is deterministic.
+fn transient(code: &'static str) -> Option<&'static str> {
+    match code {
+        "custom_format_busy"
+        | "custom_format_timeout"
+        | "custom_format_worker_failed"
+        | "custom_format_state_changed" => Some(code),
+        "release_storage_error" | "database_error" => Some("storage_error"),
+        _ => None,
+    }
 }
 /// Only allowlisted field/phase identifiers may cross the process-log boundary.
 #[derive(Debug)]
@@ -104,11 +118,14 @@ async fn matching_names(
     template: &str,
     evidence: &crate::custom_formats::Evidence,
 ) -> Result<Vec<String>, DestinationError> {
-    let fail = || {
-        DestinationError::Render(RenderFailure {
-            field: field.name(),
-            class: "custom_format_evaluation_failed",
-        })
+    let fail = |code: &'static str| {
+        transient(code).map_or(
+            DestinationError::Render(RenderFailure {
+                field: field.name(),
+                class: "custom_format_evaluation_failed",
+            }),
+            DestinationError::Unavailable,
+        )
     };
     let parsed = render::parse(field, template).map_err(|_| {
         DestinationError::Render(RenderFailure {
@@ -125,10 +142,10 @@ async fn matching_names(
     };
     let formats = crate::custom_formats::catalog(c, media)
         .await
-        .map_err(|_| fail())?;
+        .map_err(|e| fail(e.1))?;
     let original = crate::search::downloaded::original_language(c, target)
         .await
-        .map_err(|_| fail())?;
+        .map_err(|e| fail(e.0))?;
     let score = crate::custom_formats::score(
         &formats,
         media,
@@ -138,7 +155,7 @@ async fn matching_names(
         !c.is_autocommit(),
     )
     .await
-    .map_err(|_| fail())?;
+    .map_err(|e| fail(e.0))?;
     let mut names = formats
         .into_iter()
         .filter(|f| f.definition.include_when_renaming && score.format_ids.contains(&f.id))
@@ -275,6 +292,28 @@ pub(crate) async fn resolve_owned_destination(
 mod tests {
     use super::*;
     use render::ColonPolicy;
+
+    #[test]
+    fn transient_evaluation_failures_retry_and_decided_ones_render() {
+        // Each retry code must be one processing::preflight_failure requeues.
+        for (code, retry) in [
+            ("custom_format_busy", "custom_format_busy"),
+            ("custom_format_timeout", "custom_format_timeout"),
+            ("custom_format_worker_failed", "custom_format_worker_failed"),
+            ("custom_format_state_changed", "custom_format_state_changed"),
+            ("release_storage_error", "storage_error"),
+            ("database_error", "storage_error"),
+        ] {
+            assert_eq!(transient(code), Some(retry), "{code}");
+        }
+        for code in [
+            "custom_format_regex_invalid",
+            "custom_format_facts_invalid",
+            "invalid_request",
+        ] {
+            assert_eq!(transient(code), None, "{code}");
+        }
+    }
 
     fn config() -> RenderConfig<'static> {
         RenderConfig {
