@@ -124,16 +124,27 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(version(&c).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
-    for (sql, expected) in TABLES[..5].iter().zip(&before) {
-        assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
+    for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
+        let mut expected = expected.clone();
+        if index == 1 {
+            // 0068 appends the nullable minimum_seeders column to provider_scopes.
+            for row in &mut expected {
+                row.push(libsql::Value::Null);
+            }
+        }
+        assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     // Reasoning: the runner continues through the later nzbget migration, so the registry holds
     // both appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
-    for (name, protocol) in [("nzbget", "usenet"), ("transmission", "torrent")] {
+    for (name, kind, protocol) in [
+        ("nzbget", "download_client", "usenet"),
+        ("transmission", "download_client", "torrent"),
+        ("torrentrss", "indexer", "torrent"),
+    ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),
-            libsql::Value::Text("download_client".into()),
+            libsql::Value::Text(kind.into()),
             libsql::Value::Text(protocol.into()),
         ]);
     }

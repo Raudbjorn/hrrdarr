@@ -568,8 +568,8 @@ mod tests {
             0
         );
         assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='tv' AND origin='automatic' AND manual_bypass=0").await, 1);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
-        // Automatic coalescing never promotes; a manual request onto automatic work does, once.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=1").await, 1);
+        // Manual work is born bypassing (parity semantics); automatic coalescing never promotes, a manual request onto automatic work does, once.
         assert_eq!(
             enqueue_origin(&c, input(MediaDomain::Tv), 2, CommandOrigin::Automatic)
                 .await
@@ -608,7 +608,7 @@ mod tests {
                 .id,
             manual.id
         );
-        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=0").await, 1);
+        assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=1").await, 1);
     }
     #[tokio::test]
     async fn health_refresh_exhaustion_keeps_snapshot_and_cancelled_callback_does_not_mark() {

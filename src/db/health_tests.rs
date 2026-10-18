@@ -673,12 +673,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
         assert_eq!(&rows(&c, table).await?, expected);
     }
     let registry = rows(&c, "health_checks").await?;
-    // Migration44 appends NULL expiry authority; all historical values remain exact.
-    let mut expected_registry = original[0].clone();
-    for row in &mut expected_registry {
-        row.push(libsql::Value::Null);
-    }
-    assert_eq!(&registry[..2], &expected_registry);
+    assert_eq!(&registry[..2], &original[0]);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND check_key='download_client_communication' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='DownloadClientCheck'").await?, 2);
     let migrated = rows(&c, "health_transitions").await?;
     assert_eq!(migrated.len(), 1);

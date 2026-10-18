@@ -105,9 +105,15 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(version(&c).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
-    for i in [0, 1, 4, 5, 6] {
+    for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
+    // 0068 appends the nullable minimum_seeders column to provider_scopes; every predecessor value stays exact.
+    let mut scopes = before[1].clone();
+    for row in &mut scopes {
+        row.push(libsql::Value::Null);
+    }
+    assert_eq!(rows(&c, queries[1]).await?, scopes);
     let mut commands = before[2].clone();
     for row in &mut commands {
         row.extend([
