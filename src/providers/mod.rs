@@ -584,6 +584,8 @@ fn refresh_error(error: Error) -> RefreshError {
 pub(crate) enum CommunicationProbeError {
     RemoteFailure,
     Unevaluated(&'static str),
+    /// A cached cooldown refused dispatch; remaining seconds until a request may be sent.
+    Cooldown(u32),
 }
 fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError {
     use CommunicationProbeError::{RemoteFailure, Unevaluated};
@@ -676,9 +678,9 @@ impl RefreshClient {
         let operation = transport
             .operation(provider.id)
             .map_err(|error| match error {
-                http::HttpError::RateLimited { .. } => {
-                    Unevaluated(crate::health::PROVIDER_COOLDOWN)
-                }
+                http::HttpError::RateLimited {
+                    retry_after_seconds,
+                } => CommunicationProbeError::Cooldown(retry_after_seconds.unwrap_or(60)),
                 _ => Unevaluated("check_failed"),
             })?;
         let work = async {

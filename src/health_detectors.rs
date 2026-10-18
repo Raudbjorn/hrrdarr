@@ -164,6 +164,30 @@ pub async fn evaluate_communication(
     client: &RefreshClient,
     domain: MediaDomain,
 ) -> Result<Option<CommunicationIssue>, &'static str> {
+    evaluate_communication_detailed(db, client, domain)
+        .await
+        .map_err(|(code, _)| code)
+}
+
+/// As [`evaluate_communication`], also returning the remaining cooldown behind
+/// `provider_cooldown` so the engine can defer its recheck to that boundary.
+pub(crate) async fn evaluate_communication_detailed(
+    db: &Database,
+    client: &RefreshClient,
+    domain: MediaDomain,
+) -> Result<Option<CommunicationIssue>, (&'static str, Option<u32>)> {
+    let mut cooldown = None;
+    evaluate_communication_inner(db, client, domain, &mut cooldown)
+        .await
+        .map_err(|code| (code, cooldown))
+}
+
+async fn evaluate_communication_inner(
+    db: &Database,
+    client: &RefreshClient,
+    domain: MediaDomain,
+    cooldown: &mut Option<u32>,
+) -> Result<Option<CommunicationIssue>, &'static str> {
     use crate::providers::CommunicationProbeError;
     if !client.matches_database(db) {
         return Err("check_failed");
@@ -211,6 +235,10 @@ pub async fn evaluate_communication(
                 break;
             }
             Err(CommunicationProbeError::Unevaluated(code)) => return Err(code),
+            Err(CommunicationProbeError::Cooldown(seconds)) => {
+                *cooldown = Some(seconds);
+                return Err(crate::health::PROVIDER_COOLDOWN);
+            }
         }
     }
     if !empty && remote_failure.is_none() {

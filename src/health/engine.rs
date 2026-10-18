@@ -2,9 +2,8 @@ use super::*;
 use std::time::Duration;
 
 /// Internal outcome: a cached provider cooldown refused dispatch before any request was sent.
-/// Persisted as `check_failed`; the CONFIG recheck is deferred instead of being exhausted.
+/// Persisted as `check_failed`; the CONFIG recheck is deferred to the cooldown boundary.
 pub(crate) const PROVIDER_COOLDOWN: &str = "provider_cooldown";
-const COOLDOWN_RECHECK_SECONDS: i64 = 60;
 fn stored_code(code: &'static str) -> &'static str {
     if code == PROVIDER_COOLDOWN {
         "check_failed"
@@ -378,10 +377,23 @@ async fn publish(
     publish_outcomes(c, cmd, outcomes, timestamp).await
 }
 
+#[cfg(test)]
 async fn publish_outcomes(
     c: &Connection,
     cmd: &HealthCommand,
     results: Vec<CheckOutcome>,
+    timestamp: i64,
+) -> Result<()> {
+    let cooldowns = cmd.members.iter().map(|_| None).collect();
+    publish_deferred(c, cmd, results, cooldowns, timestamp).await
+}
+
+/// `cooldowns[i]` is the remaining provider cooldown (seconds) behind a `PROVIDER_COOLDOWN` outcome.
+async fn publish_deferred(
+    c: &Connection,
+    cmd: &HealthCommand,
+    results: Vec<CheckOutcome>,
+    cooldowns: Vec<Option<u32>>,
     timestamp: i64,
 ) -> Result<()> {
     let tx = c
@@ -392,13 +404,15 @@ async fn publish_outcomes(
         // A changed input invalidates this whole attempt, including completed observations.
         let stale = tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1", [cmd.id.to_string()]).await?.next().await?.is_some();
         if stale { return fail(&tx,cmd,timestamp,"stale_inputs").await; }
-        if results.len() != cmd.members.len() { return Err(invariant()); }
+        if results.len() != cmd.members.len() || cooldowns.len() != cmd.members.len() { return Err(invariant()); }
         let error = results.iter().find_map(|v| v.as_ref().err().copied()).map(stored_code);
-        let retry = error.is_some() && cmd.attempts < 3;
+        // Retrying cannot dispatch inside a cooldown; only another failure earns the retry budget.
+        let deferred = |r: &CheckOutcome, s: &Option<u32>| s.is_some() && r.as_ref().err() == Some(&PROVIDER_COOLDOWN);
+        let retry = cmd.attempts < 3 && results.iter().zip(&cooldowns).any(|(r, s)| r.is_err() && !deferred(r, s));
         let life = lifecycle(&tx).await?;
         let in_grace = life.grace_phase != "expired";
-        for (member, result) in cmd.members.iter().zip(results) {
-            let cooldown = result.as_ref().err() == Some(&PROVIDER_COOLDOWN);
+        for ((member, result), seconds) in cmd.members.iter().zip(results).zip(cooldowns) {
+            let cooldown = seconds.filter(|_| deferred(&result, &seconds));
             match result {
                 Ok(new) => {
                     if new.as_ref().is_some_and(|v| v.identity != member.identity || v.severity == HealthSeverity::Ok) { return Err(invariant()); }
@@ -415,11 +429,11 @@ async fn publish_outcomes(
                     tx.execute("UPDATE health_checks SET last_error=? WHERE scope=? AND check_key=?",params![stored_code(code),member.identity.scope.text(),member.identity.check_key.clone()]).await?;
                 }
             }
-            if !retry && cooldown {
-                // Cooldown is not an observation: keep an authoritative CONFIG change pending past
-                // the cached limit (default 60s) instead of dropping it until the six-hour schedule.
+            if let Some(seconds) = cooldown.filter(|_| !retry) {
+                // Cooldown is not an observation: keep an authoritative CONFIG change pending until
+                // the cached limit expires instead of dropping it until the six-hour schedule.
                 let keep = if cmd.is_grace { 15 } else { CONFIG };
-                tx.execute("UPDATE health_checks SET pending_reasons=pending_reasons & ?,due_at=CASE WHEN (pending_reasons & ?)!=0 THEN max(coalesce(due_at,0),?) ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![keep,keep,timestamp+COOLDOWN_RECHECK_SECONDS,member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;
+                tx.execute("UPDATE health_checks SET pending_reasons=pending_reasons & ?,due_at=CASE WHEN (pending_reasons & ?)!=0 THEN max(coalesce(due_at,0),?) ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![keep,keep,timestamp+i64::from(seconds.clamp(1,86_400)),member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;
             } else if !retry {
                 // Partial grace exhaustion services only its grace reason, preserving other work.
                 let grace_only = cmd.is_grace && error.is_some();
@@ -473,6 +487,7 @@ async fn run_with_deadline(
     // completed independent observations. Communication runs first to observe remote failures
     // before a CDH status probe can populate the shared transport's cooldown.
     let mut results: Vec<CheckOutcome> = cmd.members.iter().map(|_| Err("check_timeout")).collect();
+    let mut cooldowns: Vec<Option<u32>> = cmd.members.iter().map(|_| None).collect();
     let mut order: Vec<usize> = (0..cmd.members.len()).collect();
     order.sort_by_key(|&i| cmd.members[i].identity.check_key != "download_client_communication");
     let until = tokio::time::Instant::now() + deadline;
@@ -490,13 +505,44 @@ async fn run_with_deadline(
             }
         };
         match outcome {
-            Some(value) => results[index] = value,
+            Some((value, cooldown)) => (results[index], cooldowns[index]) = (value, cooldown),
             None => break,
         }
     }
-    publish_outcomes(&db.connect().await?, &cmd, results, now()?).await
+    publish_deferred(&db.connect().await?, &cmd, results, cooldowns, now()?).await
 }
+/// The second value is the remaining provider cooldown behind a `PROVIDER_COOLDOWN` outcome.
 async fn evaluate(
+    db: &Database,
+    client: &crate::providers::RefreshClient,
+    member: &HealthMember,
+) -> (CheckOutcome, Option<u32>) {
+    if member.identity.check_key == "download_client_communication" {
+        let domain = match member.identity.scope {
+            HealthScope::Tv => MediaDomain::Tv,
+            HealthScope::Movies => MediaDomain::Movies,
+            _ => return (Err("check_failed"), None),
+        };
+        return match crate::health_detectors::evaluate_communication_detailed(db, client, domain)
+            .await
+        {
+            Ok(issue) => (
+                Ok(issue.map(|v| HealthIssue {
+                    identity: member.identity.clone(),
+                    severity: v.severity,
+                    reason: v.reason.into(),
+                    message: v.message.into(),
+                    wiki_url: v.wiki_url.into(),
+                    compatibility_type: v.compatibility_type.into(),
+                })),
+                None,
+            ),
+            Err((code, cooldown)) => (Err(code), cooldown),
+        };
+    }
+    (evaluate_check(db, client, member).await, None)
+}
+async fn evaluate_check(
     db: &Database,
     client: &crate::providers::RefreshClient,
     member: &HealthMember,
@@ -528,18 +574,6 @@ async fn evaluate(
         .map(|v| HealthIssue {
             identity: member.identity.clone(),
             severity: HealthSeverity::Warning,
-            reason: v.reason.into(),
-            message: v.message.into(),
-            wiki_url: v.wiki_url.into(),
-            compatibility_type: v.compatibility_type.into(),
-        })),
-        "download_client_communication" => Ok(crate::health_detectors::evaluate_communication(
-            db, client, domain,
-        )
-        .await?
-        .map(|v| HealthIssue {
-            identity: member.identity.clone(),
-            severity: v.severity,
             reason: v.reason.into(),
             message: v.message.into(),
             wiki_url: v.wiki_url.into(),
