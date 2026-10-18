@@ -246,7 +246,8 @@ impl Credentials {
             return false;
         }
         match self {
-            Self::ApiKey { api_key } => valid(api_key),
+            // Transmission authenticates with HTTP basic credentials only.
+            Self::ApiKey { api_key } => implementation != "transmission" && valid(api_key),
             Self::Indexer {
                 api_key,
                 tv_parameters,
@@ -261,7 +262,9 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                implementation == "qbittorrent" && valid(username) && valid(password)
+                matches!(implementation, "qbittorrent" | "transmission")
+                    && valid(username)
+                    && valid(password)
             }
         }
     }

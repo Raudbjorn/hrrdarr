@@ -483,7 +483,7 @@ pub(crate) fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn hash(value: &str) -> Result<String> {
+pub(crate) fn hash(value: &str) -> Result<String> {
     if ![40, 64].contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(QbitError::InvalidRequest);
     }
@@ -2055,7 +2055,7 @@ pub(crate) fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn magnet_hashes(value: &str) -> Result<Vec<String>> {
+pub(crate) fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     if value.len() > 16384 || value.chars().any(char::is_control) {
         return Err(QbitError::InvalidRequest);
     }
@@ -2108,7 +2108,7 @@ fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     Ok(identities.into_iter().collect())
 }
 /// Walk bencode without reserializing: info hashes cover the original byte slice.
-fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
     struct Decoder<'a> {
         bytes: &'a [u8],
         position: usize,
@@ -2511,38 +2511,12 @@ pub async fn reconcile(
         },
     )
 }
-pub async fn prepare(
+/// Fetches a release URL into `.torrent` bytes (no redirects; bounded transport) and derives the
+/// info-hash identities of a magnet or metainfo payload. Shared by every torrent client.
+pub(crate) async fn resolve_source(
     operation: &HttpOperation<'_>,
-    settings: &ProviderSettings,
-    target: MediaTarget,
     source: AddSource,
-    recent: bool,
-    options: QbitOptions,
-) -> Result<PreparedDownload> {
-    let domain = target_domain(&target)?;
-    scope(settings, domain)?;
-    if options.tags.len() > 64
-        || options.tags.iter().any(|tag| {
-            tag.is_empty()
-                || tag.trim() != tag
-                || tag.len() > 64
-                || tag.contains(',')
-                || tag.chars().any(char::is_control)
-        })
-        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
-    {
-        return Err(QbitError::InvalidRequest);
-    }
-    if options
-        .ratio_limit
-        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
-        || [options.seeding_minutes, options.inactive_seeding_minutes]
-            .into_iter()
-            .flatten()
-            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
-    {
-        return Err(QbitError::InvalidRequest);
-    }
+) -> Result<(AddSource, Vec<String>)> {
     let source = match source {
         AddSource::Url(value) => {
             if value.len() > 16384 || value.chars().any(char::is_control) {
@@ -2584,6 +2558,41 @@ pub async fn prepare(
         }
         AddSource::Url(_) => return Err(QbitError::InvalidRequest),
     };
+    Ok((source, identities))
+}
+pub async fn prepare(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    target: MediaTarget,
+    source: AddSource,
+    recent: bool,
+    options: QbitOptions,
+) -> Result<PreparedDownload> {
+    let domain = target_domain(&target)?;
+    scope(settings, domain)?;
+    if options.tags.len() > 64
+        || options.tags.iter().any(|tag| {
+            tag.is_empty()
+                || tag.trim() != tag
+                || tag.len() > 64
+                || tag.contains(',')
+                || tag.chars().any(char::is_control)
+        })
+        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    if options
+        .ratio_limit
+        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
+        || [options.seeding_minutes, options.inactive_seeding_minutes]
+            .into_iter()
+            .flatten()
+            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    let (source, identities) = resolve_source(operation, source).await?;
     let payload = match &source {
         AddSource::Magnet(value) => value.as_bytes(),
         AddSource::Torrent { bytes, .. } => bytes,

@@ -122,7 +122,10 @@ pub async fn evaluate_current(
     let mut observations = Vec::with_capacity(providers.len());
     for (id, revision, implementation) in providers {
         // Do not silently treat a future unsupported client as a successful status.
-        if !matches!(implementation.as_str(), "qbittorrent" | "sabnzbd") {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent" | "sabnzbd" | "transmission"
+        ) {
             return Err("check_failed");
         }
         let locality = client
@@ -198,7 +201,10 @@ pub async fn evaluate_communication(
         if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
             return Err("check_failed");
         }
-        if !matches!(implementation.as_str(), "qbittorrent" | "sabnzbd") {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent" | "sabnzbd" | "transmission"
+        ) {
             return Err("check_failed");
         }
         match client
@@ -276,7 +282,7 @@ pub async fn evaluate_indexer_client(
          CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
           AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
           AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
-          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','qbittorrent','sabnzbd')
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','qbittorrent','sabnzbd','transmission')
           AND typeof(p.settings_version)='integer' AND p.settings_version=1
           AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
           AND typeof(s.implementation)='text' AND s.implementation=p.implementation
@@ -284,7 +290,7 @@ pub async fn evaluate_indexer_client(
            AND length(CAST(s.download_client_id AS BLOB))=36 AND instr(s.download_client_id,char(0))=0))
          THEN 1 ELSE 0 END,
          t.id IS NOT NULL,
-         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd') AND typeof(t.implementation)='text'
+         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission') AND typeof(t.implementation)='text'
           AND typeof(t.settings_version)='integer' AND t.settings_version=1
           AND typeof(t.enabled)='integer' AND t.enabled IN (0,1)
          THEN 1 ELSE 0 END,
@@ -317,12 +323,17 @@ pub async fn evaluate_indexer_client(
         let implementation = row.get::<String>(2).map_err(|_| "check_failed")?;
         let binding = row.get::<Option<String>>(4).map_err(|_| "check_failed")?;
         if binding.as_deref().is_some_and(|id| !canonical_uuid(id))
-            || (matches!(implementation.as_str(), "qbittorrent" | "sabnzbd") && binding.is_some())
+            || (matches!(
+                implementation.as_str(),
+                "qbittorrent" | "sabnzbd" | "transmission"
+            ) && binding.is_some())
         {
             return Err("check_failed");
         }
-        if matches!(implementation.as_str(), "qbittorrent" | "sabnzbd")
-            || row.get::<i64>(3).map_err(|_| "check_failed")? == 0
+        if matches!(
+            implementation.as_str(),
+            "qbittorrent" | "sabnzbd" | "transmission"
+        ) || row.get::<i64>(3).map_err(|_| "check_failed")? == 0
         {
             continue;
         }

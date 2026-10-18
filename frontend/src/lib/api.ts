@@ -345,6 +345,7 @@ export const createReleaseProfile=(domain:MediaDomain,input:import('./api.genera
 export const updateReleaseProfile=(domain:MediaDomain,id:number,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(id)&&validId(input.revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}`,input,'PUT',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 export const deleteReleaseProfile=(domain:MediaDomain,id:number,revision:number)=>validId(id)&&validId(revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}?revision=${revision}`,undefined,'DELETE',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 
+import { isClientImplementation } from './provider-draft.ts';
 // One readback boundary for settings which reconcile policies and schedules together.
 export const getCompletedDownloadHandling = (media: MediaDomain) => request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,undefined,undefined,true);
 export const saveCompletedDownloadHandling = (media: MediaDomain, input: import('./api.generated').CompletedDownloadHandlingUpdate) => validId(input.revision) ? request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,input,'PUT',true) : invalidProvider<import('./api.generated').CompletedDownloadHandling>();
@@ -360,7 +361,7 @@ export async function readDownloadHandling(providerId?: string): Promise<Result<
     if(!saved.ok && saved.status!==404)return saved;
     if(saved.ok){
       provider=saved.data;
-      if(provider.settings.implementation==='qbittorrent'||provider.settings.implementation==='sabnzbd')for(const media of ['tv','movies'] as const){
+      if(isClientImplementation(provider.settings.implementation))for(const media of ['tv','movies'] as const){
         if(!provider.settings[media])continue;
         const policy=await getProcessingPolicy(providerId,media);
         if(!policy.ok)return policy;

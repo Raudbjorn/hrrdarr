@@ -642,7 +642,10 @@ pub(super) async fn evaluate(
         if evidence.finding.is_some() {
             break;
         }
-        if !matches!(implementation.as_str(), "qbittorrent" | "sabnzbd") {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent" | "sabnzbd" | "transmission"
+        ) {
             evidence.record(Err("check_failed"));
             continue;
         }
