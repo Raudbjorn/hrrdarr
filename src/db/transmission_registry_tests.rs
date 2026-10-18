@@ -123,26 +123,21 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     for (sql, expected) in TABLES[..5].iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
     }
+    // Reasoning: the runner continues through the later nzbget migration, so the registry holds
+    // both appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
-    registry.push(vec![
-        libsql::Value::Text("transmission".into()),
-        libsql::Value::Text("download_client".into()),
-        libsql::Value::Text("torrent".into()),
-    ]);
-    // Reasoning: the real runner continues past 0062 through the NZBGet registry migration, which
-    // sorts between newznab and qbittorrent.
-    registry.insert(
-        1,
-        vec![
-            libsql::Value::Text("nzbget".into()),
+    for (name, protocol) in [("nzbget", "usenet"), ("transmission", "torrent")] {
+        registry.push(vec![
+            libsql::Value::Text(name.into()),
             libsql::Value::Text("download_client".into()),
-            libsql::Value::Text("usenet".into()),
-        ],
-    );
+            libsql::Value::Text(protocol.into()),
+        ]);
+    }
+    registry.sort_by_key(|row| format!("{:?}", row[0]));
     assert_eq!(rows(&c, TABLES[5]).await?, registry);
     assert!(rows(&c, "PRAGMA foreign_key_check").await?.is_empty());
     assert_eq!(
@@ -273,6 +268,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 64); // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Migration 0066 (NZBGet): registry row, replaced scope triggers and case-insensitive category
+//! Migration 0064 (NZBGet): registry row, replaced scope triggers and case-insensitive category
 //! uniqueness, exercised on a freshly migrated database and across reopen.
 use super::*;
 

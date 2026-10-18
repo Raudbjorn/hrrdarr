@@ -346,7 +346,7 @@ impl NzbgetPriority {
             Self::Force => 900,
         }
     }
-    /// Storage code: the scope table's priority CHECK predates NZBGet (see migration 0066).
+    /// Storage code: the scope table's priority CHECK predates NZBGet (see migration 0064).
     fn code(self) -> i64 {
         match self {
             Self::VeryLow => -100,

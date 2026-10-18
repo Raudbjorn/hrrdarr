@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Nzbget/` 
 
 ## Configuration
 
-`ProviderSettings::Nzbget { endpoint, tv, movies }`, stored by migration 0066 (applied here as the 63rd migration; see Not claimed).
+`ProviderSettings::Nzbget { endpoint, tv, movies }`, stored by migration 0064.
 
 - `endpoint` is the NZBGet base URL, including any URL base, for example `http://nzbget.example:6789`. The client appends `/jsonrpc`.
 - Each scope (`NzbgetScope`) has `category` (1-64 characters, trimmed, no control characters, `,`, `*`, `/`, `\`, `{` or `}`), `recent_priority` and `older_priority` (`very_low`, `low`, `normal`, `high`, `very_high`, `force`, sent as NZBGet's -100, -50, 0, 50, 100, 900), `add_paused` and optional eligibility `tags`. "Recent" uses the same thresholds as SABnzbd.
@@ -64,7 +64,7 @@ Reconciliation searches by token and never resubmits; as for the other clients a
 
 ## Protocol routing
 
-Migration 0066 registers `nzbget | download_client | usenet` and replaces the scope shape, options and client-options triggers with an NZBGet branch. Newznab indexers may bind to it; Torznab indexers are rejected with `protocol_mismatch`. Default selection, RSS/search dispatch, refresh schedules, Activity, completed-download processing and the download-root/path health checks treat it like SABnzbd.
+Migration 0064 registers `nzbget | download_client | usenet` and replaces the scope shape, options and client-options triggers with an NZBGet branch. Newznab indexers may bind to it; Torznab indexers are rejected with `protocol_mismatch`. Default selection, RSS/search dispatch, refresh schedules, Activity, completed-download processing and the download-root/path health checks treat it like SABnzbd.
 
 ## Not claimed
 
@@ -73,4 +73,4 @@ Migration 0066 registers `nzbget | download_client | usenet` and replaces the sc
 - The `editqueue` four-argument form and the nine-argument `append` were taken from the API reference, not observed. Versions before 13 are refused.
 - Large histories (over about 1 MiB or 8192 entries) fail refresh closed; there is no paging in NZBGet.
 - Controls exist at the protocol layer only. Snapshot import of Sonarr/Radarr NZBGet clients, failed-download redownload (`HistoryRedownload`) and the health classifier (still reports kind Other) are not implemented.
-- Migration 0066 is applied as the 63rd entry of this branch's migration list; the integrator must place it after 0063-0065 and bump the schema-version assertions accordingly.
+- Migration 0064 follows 0063 (notifications); the autotag lane renumbers after it.

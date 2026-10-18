@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

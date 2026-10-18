@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0064 (0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,
