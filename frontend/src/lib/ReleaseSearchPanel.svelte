@@ -8,7 +8,7 @@
   let providers: ApiPage<Provider> | null = $state(null), chosen: Provider | null = $state(null), providerId = $state('');
   let result: ReleaseSearchPage | null = $state(null), busy = $state(false), loading = $state(false), error = $state('');
   let alive = true;
-  const eligible = (provider:Provider) => provider.enabled && provider.settings.implementation !== 'qbittorrent' && provider.settings[domain] !== null;
+  const eligible = (provider:Provider) => provider.enabled && (provider.settings.implementation === 'torznab' || provider.settings.implementation === 'newznab') && provider.settings[domain] !== null;
   async function loadProviders(offset=0) {
     loading=true; error=''; chosen=null; providerId=''; result=null;
     const response=await listProviders(offset);

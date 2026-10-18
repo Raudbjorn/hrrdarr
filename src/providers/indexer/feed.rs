@@ -15,7 +15,7 @@
 use super::{
     IndexerError, IndexerItemWarning, IndexerItemWarningCode, Release, ReleaseFacts,
     ReleaseIdentifiers, ReleaseMetadata, Result, TorrentFacts, attributes, boolean, child, decimal,
-    identifier, locator, optional_text, scalar, selected_magnet, text, valid_text, xml,
+    identifier, locator, scalar, selected_magnet, valid_text, xml,
 };
 use crate::api::MediaDomain;
 use crate::providers::{IndexerAccess, ProviderSettings, http::HttpRequestBody};
@@ -182,12 +182,13 @@ fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Resul
     let ezrss: &[&str] = &[EZRSS];
     let nyaa: &[&str] = &[NYAA];
     let dc: &[&str] = &[DUBLIN_CORE];
-    let title = text(item, "title", 8192)?;
-    let title = html_escape::decode_html_entities(title.trim()).into_owned();
+    // RSS core fields live in no namespace; `<media:title>` and similar extensions are ignored.
+    let title = field_text(item, none, "title")?.ok_or(IndexerError::InvalidResponse)?;
+    let title = html_escape::decode_html_entities(&title).into_owned();
     if !valid_text(&title, 2048) {
         return Err(IndexerError::InvalidResponse);
     }
-    let guid = optional_text(item, "guid", 8192)?;
+    let guid = field_text(item, none, "guid")?;
     let attrs = attributes(item)?;
     let published_at = feed_date(
         &first_text(item, &[(none, "pubDate"), (dc, "date")])?
@@ -210,7 +211,11 @@ fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Resul
         if index >= MAX_ENCLOSURES {
             return Err(IndexerError::InvalidResponse);
         }
-        if node.attribute("url").is_none() {
+        // A blank URL would resolve to the feed endpoint itself; treat it as absent.
+        if node
+            .attribute("url")
+            .is_none_or(|url| url.trim().is_empty())
+        {
             continue;
         }
         let mime = node
