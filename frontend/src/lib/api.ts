@@ -1,3 +1,4 @@
+import type { CalendarPage, MovieCalendarEntry, TvCalendarEntry } from './api.generated';
 import type { WantedKind, WantedPage, TvWantedItem, MovieWantedItem, WantedSearchInput, WantedSearchReceipt } from './api.generated';
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
@@ -524,3 +525,9 @@ export const monitorEpisodes = (ids: number[], monitored: boolean) => validMonit
   ? request<Episode[]>('/api/v1/episodes/monitor', { episode_ids: ids, monitored }, 'PUT', true) : invalid<Episode[]>();
 export const monitorMovies = (ids: number[], monitored: boolean) => validMonitorIds(ids)
   ? request<LibraryItem[]>('/api/v1/movies/editor', { ids, patch: { monitored } }, 'PUT', true) : invalid<LibraryItem[]>();
+
+// Calendar reads are bounded GETs; the query string is built by calendar-view helpers.
+export const listCalendar = <T extends TvCalendarEntry | MovieCalendarEntry>(domain: MediaDomain, query: string) =>
+  (domain === 'tv' || domain === 'movies') && query.length > 0 && query.length <= 4096
+    ? request<CalendarPage<T>>(`/api/v1/${domain}/calendar?${query}`, undefined, undefined, true)
+    : Promise.resolve<Result<CalendarPage<T>>>({ ok: false, error: 'Invalid calendar request.' });

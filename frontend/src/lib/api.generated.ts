@@ -36,6 +36,16 @@ export type BlocklistSortDirection = "asc" | "desc";
 
 export type BlocklistTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
+export type CalendarDiagnostics = { invalid_dates: number, date_only_air_dates: number | null, };
+
+export type CalendarFeedQuery = { past_days?: number, future_days?: number, unmonitored?: boolean, tags?: string, specials?: boolean, release_types?: string, };
+
+export type CalendarPage<T> = { media_type: MediaDomain, start: string, end: string, first_date: string, end_date: string, include_unmonitored: boolean, include_specials: boolean, release_types: Array<MovieReleaseType>, tags: Array<number>, items: Array<T>, total: number, limit: number, evaluated_at: number, diagnostics: CalendarDiagnostics, };
+
+export type CalendarQuery = { start: string, end: string, unmonitored?: boolean, tags?: string, specials?: boolean, release_types?: string, };
+
+export type CalendarRuntimeSource = "series" | "episode";
+
 export type CandidateOrigin = { "kind": "rss" } | { "kind": "search", command_id: string, result_id: string, mode: SearchMode, };
 
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
@@ -398,6 +408,8 @@ export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
+export type MovieCalendarEntry = { event_id: string, target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, release_type: MovieReleaseType, date: string, released_at: string, monitored: boolean, has_file: boolean, status: string | null, studio: string | null, runtime_minutes: number | null, };
+
 export type MovieCredit = { id: number, metadata_id: number, credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, type: CreditKind, images: Array<CreditImage>, };
 
 export type MovieCreditQuery = { limit?: number, offset?: number, movie_id?: number, metadata_id?: number, };
@@ -421,6 +433,8 @@ export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, rep
 export type MovieParseResult = { title: string, parsed: ParsedRelease | null, movie: MatchedMovie | null, };
 
 export type MovieReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
+
+export type MovieReleaseType = "in_cinemas" | "digital" | "physical";
 
 export type MovieRenamePreview = { naming_revision: number, rename_enabled: boolean, standard_movie_format: string | null, movie_ids: Array<number>, files_considered: number, unchanged_count: number, unavailable_count: number, items: Array<MovieRenamePreviewItem>, };
 
@@ -775,6 +789,8 @@ export type TagOwners = { ids: Array<number>, total: number, limit: number, offs
 export type TagOwnersQuery = { limit?: number, offset?: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
+
+export type TvCalendarEntry = { event_id: string, target: MediaTarget, series_id: number, series_title: string, series_type: SeriesType | null, series_monitored: boolean, network: string | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, title: string, overview: string | null, finale_type: string | null, monitored: boolean, effective_monitored: boolean, air_date: string | null, starts_at: string, runtime_minutes: number | null, runtime_source: CalendarRuntimeSource | null, ends_at: string | null, has_file: boolean, };
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 

@@ -2,7 +2,7 @@
 export type ViewId =
   | 'library' | 'health' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles'
   | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'
-  | 'wanted-missing' | 'wanted-cutoff';
+  | 'wanted-missing' | 'wanted-cutoff' | 'calendar';
 
 export type Route =
   | { kind: 'view'; view: ViewId }
@@ -23,6 +23,7 @@ export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   history: '/activity/history',
   'wanted-missing': '/wanted/missing',
   'wanted-cutoff': '/wanted/cutoffunmet',
+  calendar: '/calendar',
   providers: '/settings/providers',
   qualities: '/settings/quality',
   profiles: '/settings/profiles',
