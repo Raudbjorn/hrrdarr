@@ -123,16 +123,21 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 64); // Reasoning: latest is 0065 (0064 autotagging rules, 0065 collections occupy array positions 63-64 until the notifications migration is integrated); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 66); // Reasoning: latest is 0066 (0065 autotagging rules, 0066 collections, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     for (sql, expected) in TABLES[..5].iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
     }
+    // Reasoning: the runner continues through the later nzbget migration, so the registry holds
+    // both appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
-    registry.push(vec![
-        libsql::Value::Text("transmission".into()),
-        libsql::Value::Text("download_client".into()),
-        libsql::Value::Text("torrent".into()),
-    ]);
+    for (name, protocol) in [("nzbget", "usenet"), ("transmission", "torrent")] {
+        registry.push(vec![
+            libsql::Value::Text(name.into()),
+            libsql::Value::Text("download_client".into()),
+            libsql::Value::Text(protocol.into()),
+        ]);
+    }
+    registry.sort_by_key(|row| format!("{:?}", row[0]));
     assert_eq!(rows(&c, TABLES[5]).await?, registry);
     assert!(rows(&c, "PRAGMA foreign_key_check").await?.is_empty());
     assert_eq!(
@@ -263,6 +268,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 64); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 66); // Reasoning: latest is 0066 (0065 autotagging rules, 0066 collections, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     Ok(())
 }

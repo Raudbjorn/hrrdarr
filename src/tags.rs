@@ -462,8 +462,19 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
             ));
         }
     }
+    // Notification scopes also reference tags; a referenced tag cannot be deleted.
+    let notification_scoped = c
+        .query(
+            "SELECT 1 FROM notification_tags WHERE tag_id=? LIMIT 1",
+            [t.id],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
     Ok(Detail {
-        in_use: !download_client_ids.is_empty()
+        in_use: notification_scoped
+            || !download_client_ids.is_empty()
             || !collection_ids.is_empty()
             || !auto_tagging_ids.is_empty()
             || count > 0

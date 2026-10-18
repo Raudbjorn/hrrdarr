@@ -264,8 +264,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "transmission",
         include_str!("../../migrations/0062_transmission.sql"),
     ),
-    // Versions follow array position: 0063 (notifications) and 0064 (nzbget) live on parity/loop; the
-    // parent must merge parity/loop first so these entries land at array positions 65 and 66.
+    (
+        "notifications",
+        include_str!("../../migrations/0063_notifications.sql"),
+    ),
+    // NZBGet registry, file 0064.
+    ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     (
         "autotagging_rules",
         include_str!("../../migrations/0065_autotagging_rules.sql"),
@@ -927,5 +931,7 @@ mod download_client_backoff_tests;
 mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;
+#[cfg(test)]
+mod nzbget_registry_tests;
 #[cfg(test)]
 mod transmission_registry_tests;

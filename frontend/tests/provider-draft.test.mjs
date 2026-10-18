@@ -96,3 +96,15 @@ test('Transmission placements mirror the server rules and keep domains apart',()
  assert.equal(transmissionPlacementConflict(dir('/srv/media'),dir('/srv/media-movies')),null);
  assert.equal(transmissionPlacementConflict(cat('tv'),dir('/srv/movies')),null);
 });
+
+test('NZBGet is a usenet download client for both domains and never accepts torrents',()=>{
+ assert.equal(protocolOf('nzbget'),'usenet');
+ assert.equal(isClientImplementation('nzbget'),true);
+ const newznab={id:'nz',enabled:true,settings:{implementation:'newznab',endpoint:'http://127.0.0.1:1',tv:{categories:[5030]},movies:null}};
+ for(const domain of ['tv','movies']){
+  const client={id:'ng',enabled:true,settings:{implementation:'nzbget',endpoint:'http://127.0.0.1:6789',tv:domain==='tv'?{category:'tv'}:null,movies:domain==='movies'?{category:'movies'}:null}};
+  assert.equal(isDownloadClient(client),true);
+  assert.equal(eligibleDownloadClient(client,domain),true);
+  assert.equal(eligibleDownloadClient(client,domain==='tv'?'movies':'tv'),false);
+ }
+});

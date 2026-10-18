@@ -1351,7 +1351,7 @@ async fn library_ui_fixture() {
     let (provider_origin, _providers) = serve(provider_router()).await;
     let (alternate_provider_origin, alternate_providers) = serve(provider_router()).await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
-    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key.clone()));
     let release_fixture = release_profile_fixture(db.clone(), &scratch.0).await;
     let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0, 901).await;
     let clear_root = scratch.0.join("clear-source");
@@ -1369,8 +1369,14 @@ async fn library_ui_fixture() {
             StatusCode::NO_CONTENT
         );
     }
+    // Production starts the outbox worker next to the command worker; the fixture does the same.
+    let _notifier = hrrdarr::notifications::start(db.clone(), Some(key.clone()));
     let (api, _api) = serve(
         library::router(db.clone())
+            .merge(hrrdarr::notifications::router(
+                db.clone(),
+                Some(key.clone()),
+            ))
             .merge(
                 Router::new()
                     .route(

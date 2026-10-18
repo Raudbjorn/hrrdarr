@@ -8,6 +8,7 @@ pub mod draft;
 pub mod http;
 pub mod indexer;
 mod indexer_backoff;
+pub mod nzbget;
 pub mod qbittorrent;
 pub mod sabnzbd;
 pub(crate) mod selection;
@@ -322,6 +323,75 @@ pub struct UsenetScope {
     #[ts(optional, as = "Option<Vec<i64>>")]
     pub tags: Option<Vec<i64>>,
 }
+/// NZBGet job priority. Wire values are NZBGet's own integer priorities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NzbgetPriority {
+    VeryLow,
+    Low,
+    #[default]
+    Normal,
+    High,
+    VeryHigh,
+    Force,
+}
+impl NzbgetPriority {
+    pub(crate) fn wire(self) -> i64 {
+        match self {
+            Self::VeryLow => -100,
+            Self::Low => -50,
+            Self::Normal => 0,
+            Self::High => 50,
+            Self::VeryHigh => 100,
+            Self::Force => 900,
+        }
+    }
+    /// Storage code: the scope table's priority CHECK predates NZBGet (see migration 0064).
+    fn code(self) -> i64 {
+        match self {
+            Self::VeryLow => -100,
+            Self::Low => -1,
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::VeryHigh => 2,
+            Self::Force => -2,
+        }
+    }
+    fn stored(value: i64) -> Result<Self> {
+        Ok(match value {
+            -100 => Self::VeryLow,
+            -1 => Self::Low,
+            0 => Self::Normal,
+            1 => Self::High,
+            2 => Self::VeryHigh,
+            -2 => Self::Force,
+            _ => return Err(corrupt()),
+        })
+    }
+}
+/// One media domain of an NZBGet client. The category isolates TV from movies on a shared client.
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct NzbgetScope {
+    pub category: String,
+    #[serde(default)]
+    #[ts(as = "Option<NzbgetPriority>", optional)]
+    pub recent_priority: NzbgetPriority,
+    #[serde(default)]
+    #[ts(as = "Option<NzbgetPriority>", optional)]
+    pub older_priority: NzbgetPriority,
+    /// The job is added paused and must be resumed in NZBGet.
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_paused: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
 /// Transmission queue placement for a new torrent; `first` moves it to the top of the queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -421,7 +491,7 @@ impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
             "torznab" | "qbittorrent" | "transmission" => Some(Self::Torrent),
-            "newznab" | "sabnzbd" => Some(Self::Usenet),
+            "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
             _ => None,
         }
     }
@@ -458,6 +528,15 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<UsenetScope>,
     },
+    /// Endpoint is the NZBGet base URL (scheme, host, port and URL base); the API is
+    /// `<endpoint>/jsonrpc`.
+    Nzbget {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<NzbgetScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<NzbgetScope>,
+    },
     /// Endpoint is the Transmission web base: scheme (SSL), host, port and URL base (default
     /// `/transmission`); the RPC is `<endpoint>/rpc`.
     Transmission {
@@ -475,6 +554,7 @@ impl ProviderSettings {
             Self::Newznab { .. } => "newznab",
             Self::Qbittorrent { .. } => "qbittorrent",
             Self::Sabnzbd { .. } => "sabnzbd",
+            Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
         }
     }
@@ -484,6 +564,7 @@ impl ProviderSettings {
             | Self::Newznab { endpoint, .. }
             | Self::Qbittorrent { endpoint, .. }
             | Self::Sabnzbd { endpoint, .. }
+            | Self::Nzbget { endpoint, .. }
             | Self::Transmission { endpoint, .. } => endpoint,
         }
     }
@@ -492,13 +573,16 @@ impl ProviderSettings {
             Self::Torznab { .. } | Self::Qbittorrent { .. } | Self::Transmission { .. } => {
                 Protocol::Torrent
             }
-            Self::Newznab { .. } | Self::Sabnzbd { .. } => Protocol::Usenet,
+            Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
     pub(crate) fn is_download_client(&self) -> bool {
         matches!(
             self,
-            Self::Qbittorrent { .. } | Self::Sabnzbd { .. } | Self::Transmission { .. }
+            Self::Qbittorrent { .. }
+                | Self::Sabnzbd { .. }
+                | Self::Nzbget { .. }
+                | Self::Transmission { .. }
         )
     }
     /// Whether a download client configures this media domain; indexers always answer false.
@@ -508,6 +592,8 @@ impl ProviderSettings {
             (Self::Qbittorrent { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (Self::Sabnzbd { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (Self::Sabnzbd { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (Self::Nzbget { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (Self::Nzbget { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (Self::Transmission { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (Self::Transmission { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             _ => false,
@@ -605,6 +691,38 @@ impl ProviderSettings {
                         && c.trim() == c
                         && c.len() <= 64
                         && c != "*"
+                        && !c.chars().any(|ch| {
+                            ch.is_control() || matches!(ch, ',' | '*' | '/' | '\\' | '{' | '}')
+                        })
+                };
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    if !category(&s.category) {
+                        return Err(bad());
+                    }
+                }
+                if let (Some(tv), Some(movies)) = (tv, movies) {
+                    if tv.category.to_lowercase() == movies.category.to_lowercase() {
+                        return Err(bad());
+                    }
+                }
+            }
+            Self::Nzbget { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                // Category names are free text in NZBGet, but a comma or path separator cannot
+                // identify one isolated domain and braces/stars are option syntax.
+                let category = |c: &str| {
+                    !c.is_empty()
+                        && c.trim() == c
+                        && c.len() <= 64
                         && !c.chars().any(|ch| {
                             ch.is_control() || matches!(ch, ',' | '*' | '/' | '\\' | '{' | '}')
                         })
@@ -752,6 +870,7 @@ pub enum ProviderTestOutcome {
     Indexer(indexer::IndexerTest),
     DownloadClient(qbittorrent::ClientTest),
     UsenetClient(sabnzbd::SabnzbdTest),
+    NzbgetClient(nzbget::NzbgetTest),
     TorrentClient(transmission::TransmissionTest),
 }
 #[derive(Serialize, ts_rs::TS)]
@@ -1267,6 +1386,15 @@ impl RefreshClient {
                     )
                     .await
                 }
+                ProviderSettings::Nzbget { .. } => {
+                    nzbget::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
                 ProviderSettings::Transmission { .. } => {
                     transmission::client_status_snapshot(
                         &operation,
@@ -1342,6 +1470,20 @@ impl RefreshClient {
             let result = match &provider.settings {
                 ProviderSettings::Sabnzbd { .. } => {
                     match sabnzbd::job(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        target,
+                        remote_id,
+                    )
+                    .await
+                    {
+                        Ok(job) => self.usenet_details(job, &host, target).await,
+                        Err(e) => Err(refresh_error(qbit_error(e).0)),
+                    }
+                }
+                ProviderSettings::Nzbget { .. } => {
+                    match nzbget::job(
                         &operation,
                         &provider.settings,
                         credentials.as_ref(),
@@ -1500,6 +1642,12 @@ impl RefreshClient {
                 )
                 .await
                 .map(download::PreparedSubmission::Torrent),
+                download::ReleaseSource::Usenet { url, title }
+                    if matches!(provider.settings, ProviderSettings::Nzbget { .. }) =>
+                {
+                    nzbget::prepare(provider.id, &provider.settings, target, url, &title, recent)
+                        .map(download::PreparedSubmission::Nzbget)
+                }
                 download::ReleaseSource::Usenet { url, title } => {
                     sabnzbd::prepare(provider.id, &provider.settings, target, url, &title, recent)
                         .map(download::PreparedSubmission::Usenet)
@@ -1588,6 +1736,18 @@ impl RefreshClient {
                     .await
                 }
                 (
+                    ProviderSettings::Nzbget { .. },
+                    download::PreparedSubmission::Nzbget(prepared),
+                ) => {
+                    nzbget::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                (
                     ProviderSettings::Transmission { .. },
                     download::PreparedSubmission::Transmission(prepared),
                 ) => {
@@ -1667,6 +1827,15 @@ impl RefreshClient {
             let result = match &provider.settings {
                 ProviderSettings::Sabnzbd { .. } => {
                     sabnzbd::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                ProviderSettings::Nzbget { .. } => {
+                    nzbget::reconcile(
                         &operation,
                         &provider.settings,
                         credentials.as_ref(),
@@ -1833,6 +2002,9 @@ async fn refresh_items(
         ProviderSettings::Sabnzbd { .. } => {
             sabnzbd::refresh_pages(operation, settings, credentials, domain).await
         }
+        ProviderSettings::Nzbget { .. } => {
+            nzbget::refresh_pages(operation, settings, credentials, domain).await
+        }
         ProviderSettings::Transmission { .. } => {
             transmission::refresh_pages(operation, settings, credentials, domain).await
         }
@@ -1966,6 +2138,8 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let mut movie_client = None;
     let mut tv_usenet = None;
     let mut movie_usenet = None;
+    let mut tv_nzbget = None;
+    let mut movie_nzbget = None;
     let mut tv_torrent = None;
     let mut movie_torrent = None;
     while let Some(scope) = scopes.next().await? {
@@ -2001,6 +2175,23 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 tv_torrent = Some(item)
             } else {
                 movie_torrent = Some(item)
+            }
+        } else if implementation == "nzbget" {
+            let item = NzbgetScope {
+                category: scope.get(3)?,
+                recent_priority: NzbgetPriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: NzbgetPriority::stored(scope.get::<i64>(6)?)?,
+                add_paused: match scope.get::<String>(9)?.as_str() {
+                    "started" => false,
+                    "stopped" => true,
+                    _ => return Err(corrupt()),
+                },
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_nzbget = Some(item)
+            } else {
+                movie_nzbget = Some(item)
             }
         } else if implementation == "sabnzbd" {
             let item = UsenetScope {
@@ -2095,6 +2286,11 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_usenet,
             movies: movie_usenet,
         },
+        "nzbget" => ProviderSettings::Nzbget {
+            endpoint,
+            tv: tv_nzbget,
+            movies: movie_nzbget,
+        },
         "transmission" => ProviderSettings::Transmission {
             endpoint,
             tv: tv_torrent,
@@ -2154,6 +2350,10 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
         ProviderSettings::Sabnzbd { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Nzbget { tv, movies, .. } => [
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
@@ -2248,6 +2448,16 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority) VALUES(?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.wire(),s.older_priority.wire()]).await?;
             }
         }
+        ProviderSettings::Nzbget { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                let state = if s.add_paused { "stopped" } else { "started" };
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.code(),s.older_priority.code(),state]).await?;
+            }
+        }
         ProviderSettings::Transmission { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
@@ -2339,6 +2549,10 @@ impl HealthConfigurationChanges {
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Sabnzbd { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Nzbget { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
@@ -3028,6 +3242,11 @@ async fn probe(
             .await
             .map(ProviderTestOutcome::UsenetClient)
             .map_err(sab_test_error)
+    } else if matches!(settings, ProviderSettings::Nzbget { .. }) {
+        nzbget::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::NzbgetClient)
+            .map_err(nzbget_test_error)
     } else if matches!(settings, ProviderSettings::Transmission { .. }) {
         transmission::test_connection(operation, settings, credentials.as_ref())
             .await
@@ -3084,6 +3303,26 @@ async fn run_test(
                     .map_err(|error| indexer_error(error, &operation)),
                 observation,
                 None,
+            )
+        } else if matches!(provider.settings, ProviderSettings::Nzbget { .. }) {
+            let result =
+                nzbget::test_connection(&operation, &provider.settings, credentials.as_ref()).await;
+            let observation = match result.as_ref() {
+                Ok(_) => Some(backoff::Observation::Success),
+                Err(failure)
+                    if communication_error(failure.error)
+                        == CommunicationProbeError::RemoteFailure =>
+                {
+                    Some(backoff::Observation::Failure)
+                }
+                Err(_) => None,
+            };
+            (
+                result
+                    .map(ProviderTestOutcome::NzbgetClient)
+                    .map_err(nzbget_test_error),
+                None,
+                observation,
             )
         } else if matches!(provider.settings, ProviderSettings::Transmission { .. }) {
             let result =
@@ -3268,6 +3507,29 @@ fn sab_test_error(failure: sabnzbd::SabTestFailure) -> (Error, &'static str) {
         "unsupported",
     )
 }
+/// NZBGet test problems keep the stored static code set while giving an actionable message.
+fn nzbget_test_error(failure: nzbget::NzbgetTestFailure) -> (Error, &'static str) {
+    use nzbget::NzbgetProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::CategoryMissing) => (
+            "nzbget_category_missing",
+            "A configured NZBGet category does not exist; create it in NZBGet",
+        ),
+        Some(P::KeepHistoryZero) => (
+            "nzbget_keep_history_zero",
+            "NZBGet KeepHistory is 0; completed downloads vanish before they can be imported",
+        ),
+        Some(P::KeepHistoryOverMax) => (
+            "nzbget_keep_history_over_max",
+            "NZBGet KeepHistory exceeds 25000 days; lower it",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
 /// Transmission test problems keep the stored static code set while giving an actionable message.
 fn transmission_test_error(
     failure: transmission::TransmissionTestFailure,
@@ -3347,6 +3609,9 @@ async fn downloads(
         let result = match &provider.settings {
             ProviderSettings::Sabnzbd { .. } => {
                 sabnzbd::query(&operation, &provider.settings, credentials.as_ref(), &input).await
+            }
+            ProviderSettings::Nzbget { .. } => {
+                nzbget::query(&operation, &provider.settings, credentials.as_ref(), &input).await
             }
             ProviderSettings::Transmission { .. } => {
                 transmission::query(&operation, &provider.settings, credentials.as_ref(), &input)

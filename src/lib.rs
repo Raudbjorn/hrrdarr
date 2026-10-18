@@ -58,3 +58,5 @@ pub mod host;
 pub mod wanted;
 
 pub mod calendar;
+
+pub mod notifications;
