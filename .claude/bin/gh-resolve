@@ -7,11 +7,17 @@
 # Auth: gh honors GH_TOKEN / GITHUB_TOKEN; GITHUB_PAT is mapped to GH_TOKEN
 # as a fallback. API failures (rate limits, auth, bad repo) are classified
 # and surfaced — never silently reported as empty results.
+#
+# Backends: GraphQL by default; REST inside Claude Code cloud sessions, whose
+# proxy blocks GraphQL but serves review threads on /ccr/ REST routes.
+# Override with GH_RESOLVE_BACKEND=graphql|rest.
 
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 SCRIPT_NAME="gh-resolve"
+BACKEND=""      # graphql|rest, set by main via select_backend
+ACTIVE_REPO=""  # OWNER/REPO, set by main; REST mutations need it
 
 # Colors and formatting (fallback if gum unavailable)
 has_gum() { command -v gum &>/dev/null; }
@@ -36,7 +42,10 @@ api_error() {
     local output="$1" context="$2"
     if is_rate_limited "$output"; then
         error "GitHub API rate limit hit while trying to ${context}."
-        error "Inspect quota: gh api rate_limit --jq '.resources.graphql'"
+        error "Inspect quota: gh api rate_limit --jq '.resources'"
+    elif grep -q 'GraphQL is not available' <<< "$output"; then
+        error "This session's proxy blocks GraphQL (Claude Code cloud) while trying to ${context}."
+        error "Re-run with GH_RESOLVE_BACKEND=rest; list threads again to get RT_ thread IDs."
     elif grep -q 'NOT_FOUND' <<< "$output"; then
         error "GitHub reports NOT_FOUND while trying to ${context}."
         error "This means the resource doesn't exist OR your token can't see it —"
@@ -53,20 +62,34 @@ api_error() {
     fi
 }
 
-# Abort if GraphQL quota is exhausted; warn if nearly so.
+# Abort if the active backend's quota is exhausted; warn if nearly so.
 # The /rate_limit endpoint itself does not count against quota.
 check_quota() {
-    local remaining="" reset=""
+    local remaining="" reset="" resource="graphql"
+    [ "$BACKEND" = "rest" ] && resource="core"
     read -r remaining reset < <(gh api rate_limit \
-        --jq '"\(.resources.graphql.remaining) \(.resources.graphql.reset)"' 2>/dev/null) || true
+        --jq "\"\(.resources.$resource.remaining) \(.resources.$resource.reset)\"" 2>/dev/null) || true
     [ -z "${remaining:-}" ] && return 0  # couldn't check; let real calls report
 
     if [ "$remaining" -eq 0 ]; then
-        error "GraphQL rate limit exhausted. Resets at $(date -d "@$reset" -Iseconds)"
+        error "$resource rate limit exhausted. Resets at $(date -d "@$reset" -Iseconds)"
         exit 1
     elif [ "$remaining" -lt 50 ]; then
-        warn "Only $remaining GraphQL requests remaining (resets $(date -d "@$reset" -Iseconds))"
+        warn "Only $remaining $resource requests remaining (resets $(date -d "@$reset" -Iseconds))"
     fi
+}
+
+# auto → rest inside Claude Code cloud sessions (GraphQL is blocked there).
+select_backend() {
+    local choice="${GH_RESOLVE_BACKEND:-auto}"
+    case "$choice" in
+        graphql|rest) echo "$choice" ;;
+        auto)
+            if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then echo "rest"; else echo "graphql"; fi ;;
+        *)
+            error "GH_RESOLVE_BACKEND must be auto, graphql or rest (got: $choice)"
+            exit 1 ;;
+    esac
 }
 
 usage() {
@@ -156,8 +179,15 @@ EXAMPLES:
     gh-resolve https://github.com/owner/repo/pull/42
 
 THREAD IDs:
-    Thread IDs are GraphQL node IDs (e.g., PRRT_kwDOABCDEF12345).
-    Use 'gh-resolve list' to get thread IDs for a PR.
+    Thread IDs are GraphQL node IDs (e.g., PRRT_kwDOABCDEF12345), or
+    RT_<pr>_<comment id> under the REST backend. They are not
+    interchangeable. Use 'gh-resolve list' to get thread IDs for a PR.
+
+BACKENDS:
+    GH_RESOLVE_BACKEND=auto|graphql|rest (default: auto). auto picks rest
+    inside Claude Code cloud sessions (CLAUDE_CODE_REMOTE=true), whose proxy
+    blocks GraphQL but serves review threads on /ccr/ REST routes; graphql
+    everywhere else. The /ccr/ routes exist only behind that proxy.
 
 NOTE:
     This tool uses GitHub's GraphQL API because the REST API does not
@@ -187,7 +217,9 @@ check_deps() {
     # auth — promoting it unconditionally would override keyring credentials
     # with a possibly narrower token (fine-grained PATs scoped to other repos
     # produce NOT_FOUND on private repos, indistinguishable from absence).
-    if ! gh auth status &>/dev/null; then
+    # Cloud sessions' gh reports the proxied token invalid although REST
+    # calls succeed, so the REST backend skips this and lets calls report.
+    if [ "$BACKEND" = "graphql" ] && ! gh auth status &>/dev/null; then
         if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_PAT:-}" ]; then
             export GH_TOKEN="$GITHUB_PAT"
             dim "No gh auth found; falling back to GITHUB_PAT"
@@ -220,6 +252,18 @@ parse_pr_input() {
 }
 
 get_current_repo() {
+    # gh repo view uses GraphQL; the REST backend reads the origin remote
+    if [ "$BACKEND" = "rest" ]; then
+        local url
+        url=$(git remote get-url origin 2>/dev/null || true)
+        url="${url%.git}"
+        if [[ "$url" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+            return 0
+        fi
+        error "Could not determine repository from the origin remote. Use --repo flag or provide a full GitHub URL."
+        exit 1
+    fi
     gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || {
         error "Could not determine repository. Use --repo flag or provide a full GitHub URL."
         exit 1
@@ -235,6 +279,10 @@ get_current_repo() {
 fetch_threads() {
     local owner="$1" repo="$2" pr_number="$3"
     local cursor="" response merged=""
+    if [ "$BACKEND" = "rest" ]; then
+        fetch_threads_rest "$owner" "$repo" "$pr_number"
+        return
+    fi
     local query='
         query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
             repository(owner: $owner, name: $repo) {
@@ -304,6 +352,10 @@ fetch_threads() {
 
 fetch_checks() {
     local owner="$1" repo="$2" pr_number="$3" response
+    if [ "$BACKEND" = "rest" ]; then
+        fetch_checks_rest "$owner" "$repo" "$pr_number"
+        return
+    fi
 
     if ! response=$(gh api graphql -f query='
         query($owner: String!, $repo: String!, $pr: Int!) {
@@ -356,7 +408,197 @@ fetch_checks() {
 }
 
 # ---------------------------------------------------------------------------
-# Mutations
+# REST backend — Claude Code cloud sessions block GraphQL (HTTP 403) but
+# proxy REST, plus /ccr/ routes for review threads. These adapters emit the
+# same document shape as the GraphQL queries, so every formatter is shared.
+# Thread IDs are RT_<pr>_<root comment id>: /ccr/ addresses a thread by PR
+# number and comment ID, and exposes no PRRT_ node ID.
+# Documents are piped to jq on stdin: one review comment's diffHunk can be
+# >10 KB, and a single argv string is capped at 128 KiB on Linux.
+# ---------------------------------------------------------------------------
+
+# GET via gh api, classifying failures. Args: <context> <gh api args...>
+rest_get() {
+    local context="$1" out
+    shift
+    if ! out=$(gh api "$@" 2>&1); then
+        api_error "$out" "$context"
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+fetch_threads_rest() {
+    local owner="$1" repo="$2" pr_number="$3"
+    local base="repos/$owner/$repo/pulls/$pr_number" pr threads comments
+
+    pr=$(rest_get "fetch PR #$pr_number" "$base") || return 1
+    # /ccr/review_threads: [{resolved, outdated, path, line, comment_ids}],
+    # unpaginated. Bodies, authors and hunks come from the comments listing.
+    threads=$(rest_get "fetch review threads for PR #$pr_number" "$base/ccr/review_threads") || return 1
+    comments=$(rest_get "fetch review comments for PR #$pr_number" \
+        --paginate "$base/comments?per_page=100" | jq -s 'add // []') || return 1
+
+    printf '%s\n%s\n%s\n' "$pr" "$threads" "$comments" | jq -s --arg prn "$pr_number" '
+        .[0] as $pr | .[1] as $threads
+        | (.[2] | map({key: (.id | tostring), value: .}) | from_entries) as $byid
+        | {data: {repository: {pullRequest: {
+            title: $pr.title,
+            number: $pr.number,
+            url: $pr.html_url,
+            headRefOid: $pr.head.sha,
+            headRefName: $pr.head.ref,
+            reviewThreads: {
+                totalCount: ($threads | length),
+                pageInfo: {hasNextPage: false, endCursor: null},
+                nodes: [$threads[] | . as $t
+                    | ($t.comment_ids | map($byid[tostring] // empty)
+                       | sort_by(.created_at)) as $cs
+                    | {
+                        id: "RT_\($prn)_\(($cs | map(select(.in_reply_to_id == null)) | .[0].id) // $t.comment_ids[0])",
+                        isResolved: $t.resolved,
+                        isOutdated: $t.outdated,
+                        path: $t.path,
+                        line: $t.line,
+                        startLine: ($cs[0].start_line // null),
+                        diffSide: ($cs[0].side // "RIGHT"),
+                        comments: {
+                            totalCount: ($t.comment_ids | length),
+                            nodes: [$cs[] | {
+                                author: {login: .user.login},
+                                body: .body,
+                                createdAt: .created_at,
+                                url: .html_url,
+                                diffHunk: .diff_hunk
+                            }]
+                        }
+                      }]
+            }
+        }}}}'
+}
+
+fetch_checks_rest() {
+    local owner="$1" repo="$2" pr_number="$3"
+    local base="repos/$owner/$repo" pr sha runs statuses
+
+    pr=$(rest_get "fetch PR #$pr_number" "$base/pulls/$pr_number") || return 1
+    sha=$(jq -r '.head.sha' <<< "$pr")
+    runs=$(rest_get "fetch check runs for PR #$pr_number" \
+        "$base/commits/$sha/check-runs?per_page=100") || return 1
+    statuses=$(rest_get "fetch commit statuses for PR #$pr_number" \
+        "$base/commits/$sha/status?per_page=100") || return 1
+
+    # REST enums are lowercase; GraphQL's are uppercase. The rollup mirrors
+    # GitHub's: any failure → FAILURE, else any pending → PENDING.
+    printf '%s\n%s\n%s\n' "$pr" "$runs" "$statuses" | jq -s '
+        .[0] as $pr | .[1] as $runs | .[2] as $st
+        | ([$runs.check_runs[] | {
+              __typename: "CheckRun",
+              name: .name,
+              status: (.status | ascii_upcase),
+              conclusion: (.conclusion | if . then ascii_upcase else null end),
+              detailsUrl: .details_url,
+              startedAt: .started_at,
+              completedAt: .completed_at,
+              checkSuite: {app: {name: .app.name, slug: .app.slug}}
+           }]
+           + [$st.statuses[] | {
+              __typename: "StatusContext",
+              context: .context,
+              state: (.state | ascii_upcase),
+              targetUrl: .target_url,
+              description: .description,
+              creator: {login: .creator.login}
+           }]) as $nodes
+        | ([$nodes[]
+            | if .__typename == "CheckRun" then
+                if .conclusion == null then "PENDING"
+                elif (.conclusion | IN("FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED")) then "FAILURE"
+                else "SUCCESS" end
+              else
+                if (.state | IN("PENDING", "EXPECTED")) then "PENDING"
+                elif .state == "SUCCESS" then "SUCCESS"
+                else "FAILURE" end
+              end]) as $states
+        | {data: {repository: {pullRequest: {
+            title: $pr.title,
+            number: $pr.number,
+            url: $pr.html_url,
+            commits: {nodes: [{commit: {
+                oid: $pr.head.sha,
+                statusCheckRollup: (if ($nodes | length) == 0 then null else {
+                    state: (if any($states[]; . == "FAILURE") then "FAILURE"
+                            elif any($states[]; . == "PENDING") then "PENDING"
+                            else "SUCCESS" end),
+                    contexts: {
+                        totalCount: (($runs.total_count // 0) + ($st.total_count // 0)),
+                        nodes: $nodes
+                    }
+                } end)
+            }}]}
+        }}}}'
+}
+
+# RT_<pr>_<comment id> → "<pr> <comment id>"
+parse_rest_thread_id() {
+    [[ "$1" =~ ^RT_([0-9]+)_([0-9]+)$ ]] || return 1
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+}
+
+# POST /ccr/.../resolve|unresolve, then re-read the thread list to confirm:
+# the route's response body is not a documented contract. On success prints
+# the GraphQL mutation's shape; on failure prints the error text.
+ccr_set_resolved() {
+    local thread_id="$1" action="$2"
+    local pr cid out state want key
+
+    if ! read -r pr cid < <(parse_rest_thread_id "$thread_id"); then
+        echo "Not a REST thread ID (want RT_<pr>_<comment id>): $thread_id"
+        return 1
+    fi
+    if ! out=$(gh api -X POST "repos/$ACTIVE_REPO/pulls/$pr/ccr/comments/$cid/$action" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+    if ! out=$(gh api "repos/$ACTIVE_REPO/pulls/$pr/ccr/review_threads" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+
+    # Not `.resolved // "missing"`: jq's // also replaces false
+    state=$(jq -r --argjson cid "$cid" \
+        '[.[] | select(any(.comment_ids[]; . == $cid))][0]
+         | if . == null then "missing" else .resolved end' <<< "$out")
+    want="true"; key="resolveReviewThread"
+    [ "$action" = "unresolve" ] && { want="false"; key="unresolveReviewThread"; }
+    if [ "$state" != "$want" ]; then
+        echo "$action of $thread_id returned 2xx but the thread reads resolved=$state"
+        return 1
+    fi
+    jq -n --arg key "$key" --arg id "$thread_id" --argjson resolved "$want" \
+        '{data: {($key): {thread: {id: $id, isResolved: $resolved}}}}'
+}
+
+ccr_reply() {
+    local thread_id="$1" body="$2" pr cid out
+
+    if ! read -r pr cid < <(parse_rest_thread_id "$thread_id"); then
+        echo "Not a REST thread ID (want RT_<pr>_<comment id>): $thread_id"
+        return 1
+    fi
+    if ! out=$(gh api -X POST "repos/$ACTIVE_REPO/pulls/$pr/comments/$cid/replies" \
+            -f body="$body" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+    jq '{data: {addPullRequestReviewThreadReply: {comment: {
+        id: (.id | tostring), url: .html_url, createdAt: .created_at,
+        author: {login: .user.login}}}}}' <<< "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Mutations — dispatch on thread ID shape: RT_ IDs only come from the REST
+# backend, PRRT_ node IDs only from GraphQL.
 # ---------------------------------------------------------------------------
 
 resolve_thread() {
@@ -365,6 +607,10 @@ resolve_thread() {
     if [ "$dry_run" = "true" ]; then
         dim "  [DRY RUN] Would resolve: $thread_id" >&2
         return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_set_resolved "$thread_id" resolve
+        return
     fi
 
     # stderr folded into stdout: on failure, callers classify the captured text
@@ -383,6 +629,10 @@ reply_thread() {
         dim "  [DRY RUN] Would reply to $thread_id with:" >&2
         printf '%s\n' "$body" | sed 's/^/    | /' >&2
         return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_reply "$thread_id" "$body"
+        return
     fi
 
     # Body passed as a GraphQL variable with -f (always a string; -F would
@@ -403,6 +653,10 @@ unresolve_thread() {
     if [ "$dry_run" = "true" ]; then
         dim "  [DRY RUN] Would unresolve: $thread_id" >&2
         return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_set_resolved "$thread_id" unresolve
+        return
     fi
 
     gh api graphql -f query='
@@ -1517,7 +1771,7 @@ main() {
                     exit 1
                 fi
                 ;;
-            PRRT_*|PR_*)
+            PRRT_*|PR_*|RT_*)
                 thread_id="$pos"
                 ;;
             *)
@@ -1540,6 +1794,8 @@ main() {
     # Default command
     [ -z "$command" ] && command="list"
 
+    BACKEND=$(select_backend)
+
     # Deps/auth/quota checked here — after parsing, so -h/-v stay dependency-free
     check_deps
 
@@ -1550,6 +1806,7 @@ main() {
         error "Repository must be in format OWNER/REPO"
         exit 1
     fi
+    ACTIVE_REPO="$repo"
 
     # Dispatch
     case "$command" in
