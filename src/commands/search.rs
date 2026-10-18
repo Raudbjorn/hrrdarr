@@ -302,7 +302,11 @@ async fn evaluate(
     if !matches_target(&command.target, &decision.target) {
         decision.deny("requested_target_mismatch")
     }
-    if release.facts.torrent.is_none() {
+    // Torrent indexers must supply torrent facts; usenet releases are dispatched to usenet clients.
+    if release.facts.torrent.is_none()
+        && rss::indexer_protocol(c, command.source.indexer_id).await?
+            != Some(crate::providers::Protocol::Usenet)
+    {
         decision.deny("unsupported_protocol")
     }
     decision.not_before = None;
@@ -386,6 +390,7 @@ async fn create(
  if existing.mode!=input.mode||existing.target!=input.target||existing.source.indexer_id!=input.indexer_id||existing.source.indexer_revision!=input.indexer_revision||existing.source.selection_kind!=source.selection_kind||existing.source.client_id!=source.client_id||existing.source.client_revision!=source.client_revision||existing.priority.number()!=input.priority.number(){return Err(conflict())}
  return bounded(existing)
  },Err(Error(StatusCode::NOT_FOUND,"search_command_not_found"))=>(),Err(e)=>return Err(e)}
+ if rss::protocol_mismatch(&tx,source).await?{return Err(rss::protocol_rejection())}
  if !rss::valid_target(&tx,source,input.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
  // A selected offer must never depend on an unencrypted locator fallback.
  s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;

@@ -15,7 +15,7 @@ const ADMISSION: [&str; 9] = [
     "health_admit",
 ];
 const CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
-// Reasoning: reopening applies every later migration; 0059 appends exactly the recycle bin cleanup term after 0054's scan term.
+// Reasoning: reopening applies every later migration; 0060 appends exactly the recycle bin cleanup term after 0054's scan term.
 const LATEST_CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
 struct Scratch(PathBuf);
 impl Scratch {
@@ -108,7 +108,7 @@ async fn witness_queries(c: &Connection) -> Result<Vec<String>, Error> {
         let filter = if name == "schema_migrations" {
             " WHERE version<=53"
         } else if name == "health_checks" {
-            // Reasoning: 0059 registers recycle_bin identities after this predecessor; preserved rows stay exact.
+            // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
             " WHERE check_key!='recycle_bin'"
         } else {
             ""
@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        60 // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -305,6 +305,22 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 .filter(|(name, _)| !matches!(name.as_str(), "series" | "snapshot_imports")),
         )
     {
+        // Reasoning: 0059 rebuilds the provider tables and their shape/options/test-owner
+        // guards (covered by db::download_client_registry_tests); skip only those objects.
+        if matches!(
+            name.as_str(),
+            "providers"
+                | "provider_scopes"
+                | "cdh_scope_authority"
+                | "provider_client_options_insert"
+                | "provider_client_options_update"
+                | "provider_scope_options_insert"
+                | "provider_scope_options_update"
+                | "provider_test_insert_owner"
+                | "provider_test_update_owner"
+        ) {
+            continue;
+        }
         let actual: String = after
             .query("SELECT sql FROM sqlite_schema WHERE name=?", [name.clone()])
             .await?
@@ -312,6 +328,17 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .await?
             .ok_or("missing preserved object")?
             .get(0)?;
+        // Reasoning: 0058 otherwise changes only the client predicate, now resolved through the
+        // provider_implementations registry (protocol-matched for RSS/search); map it back.
+        let actual = actual
+            .replace(
+                "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)",
+                "p.implementation='qbittorrent'",
+            )
+            .replace(
+                " IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')",
+                "='qbittorrent'",
+            );
         assert_eq!(
             actual, expected,
             "SQL changed outside allocated predicate: {name}"
@@ -336,7 +363,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             "SELECT count(*) FROM health_checks WHERE check_key!='recycle_bin'"
         )
         .await?,
-        22, // Reasoning: 0059 adds recycle_bin identities; 0054's scan itself adds none.
+        22, // Reasoning: 0060 adds recycle_bin identities; 0054's scan itself adds none.
         "scan reuses the existing scoped Health identities"
     );
     assert!(

@@ -249,8 +249,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0058_scan_successor.sql"),
     ),
     (
+        "download_client_registry",
+        include_str!("../../migrations/0059_download_client_registry.sql"),
+    ),
+    (
         "recycle_bin",
-        include_str!("../../migrations/0059_recycle_bin.sql"),
+        include_str!("../../migrations/0060_recycle_bin.sql"),
     ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -901,5 +905,7 @@ mod indexer_backoff_tests;
 
 #[cfg(test)]
 mod download_client_backoff_tests;
+#[cfg(test)]
+mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;

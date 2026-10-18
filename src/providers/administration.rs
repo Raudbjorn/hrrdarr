@@ -1,4 +1,4 @@
-//! Native administration for the three delivered providers. Media filters select whole providers.
+//! Native administration for the delivered providers. Media filters select whole providers.
 use super::*;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -25,11 +25,13 @@ impl ProviderKind {
     fn matches(self, settings: &ProviderSettings) -> bool {
         matches!(
             (self, settings),
-            (Self::DownloadClient, ProviderSettings::Qbittorrent { .. })
-                | (
-                    Self::Indexer,
-                    ProviderSettings::Torznab { .. } | ProviderSettings::Newznab { .. }
-                )
+            (
+                Self::DownloadClient,
+                ProviderSettings::Qbittorrent { .. } | ProviderSettings::Sabnzbd { .. }
+            ) | (
+                Self::Indexer,
+                ProviderSettings::Torznab { .. } | ProviderSettings::Newznab { .. }
+            )
         )
     }
     fn database(self) -> &'static str {
@@ -56,8 +58,11 @@ impl ProviderFilter {
                 ProviderSettings::Torznab { movies, .. } | ProviderSettings::Newznab { movies, .. },
                 MediaDomain::Movies,
             ) => movies.is_some(),
-            (ProviderSettings::Qbittorrent { tv, .. }, MediaDomain::Tv) => tv.is_some(),
-            (ProviderSettings::Qbittorrent { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (
+                settings
+                @ (ProviderSettings::Qbittorrent { .. } | ProviderSettings::Sabnzbd { .. }),
+                media,
+            ) => settings.client_scoped(media),
         };
         media && self.kind.matches(&provider.settings)
     }
@@ -86,12 +91,18 @@ pub enum ProviderDefaults {
         add_tags: bool,
         tags: Vec<i64>,
     },
+    UsenetClient {
+        recent_priority: UsenetPriority,
+        older_priority: UsenetPriority,
+        tags: Vec<i64>,
+    },
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderImplementation {
     Newznab,
     Qbittorrent,
+    Sabnzbd,
     Torznab,
 }
 #[derive(Serialize, ts_rs::TS)]
@@ -146,7 +157,7 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
 // Historical catalog metadata from both pinned references. No endpoint is contacted here.
 fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<ProviderPreset> {
     match implementation {
-        ProviderImplementation::Qbittorrent => vec![],
+        ProviderImplementation::Qbittorrent | ProviderImplementation::Sabnzbd => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -276,24 +287,39 @@ pub(super) async fn schema(
             },
         })
         .collect(),
-        ProviderKind::DownloadClient => vec![ProviderTemplate {
-            implementation: ProviderImplementation::Qbittorrent,
-            presets: vec![],
-            supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
-            enabled: false,
-            priority: 1,
-            defaults: ProviderDefaults::DownloadClient {
-                imported_category: None,
-                recent_priority: 0,
-                older_priority: 0,
-                initial_state: DownloadInitialState::default(),
-                content_layout: DownloadContentLayout::default(),
-                sequential_order: false,
-                first_last_first: false,
-                add_tags: false,
-                tags: vec![],
+        ProviderKind::DownloadClient => vec![
+            ProviderTemplate {
+                implementation: ProviderImplementation::Qbittorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::DownloadClient {
+                    imported_category: None,
+                    recent_priority: 0,
+                    older_priority: 0,
+                    initial_state: DownloadInitialState::default(),
+                    content_layout: DownloadContentLayout::default(),
+                    sequential_order: false,
+                    first_last_first: false,
+                    add_tags: false,
+                    tags: vec![],
+                },
             },
-        }],
+            // Domain categories have no safe default; the user names an existing SABnzbd category.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Sabnzbd,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::UsenetClient {
+                    recent_priority: UsenetPriority::Default,
+                    older_priority: UsenetPriority::Default,
+                    tags: vec![],
+                },
+            },
+        ],
     };
     bounded(ProviderSchema { templates })
 }
@@ -510,7 +536,7 @@ struct Candidate {
 async fn snapshots(context: &Context, filter: ProviderFilter) -> Result<Vec<Candidate>> {
     let conn = context.db.connect().await?;
     let tx = conn.transaction().await?;
-    let mut rows=tx.query("SELECT p.id,p.revision FROM providers p WHERE p.enabled=1 AND ((?='download_client' AND p.implementation='qbittorrent') OR (?='indexer' AND p.implementation IN('torznab','newznab'))) AND EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?) ORDER BY p.priority,p.name,p.id LIMIT ?",params![filter.kind.database(),filter.kind.database(),filter.media(),(MAX_TESTS+1) as i64]).await?;
+    let mut rows=tx.query("SELECT p.id,p.revision FROM providers p WHERE p.enabled=1 AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind=?) AND EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?) ORDER BY p.priority,p.name,p.id LIMIT ?",params![filter.kind.database(),filter.media(),(MAX_TESTS+1) as i64]).await?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next().await? {
         ids.push((row.get::<String>(0)?, row.get::<i64>(1)?));

@@ -33,7 +33,7 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Reasoning: 0053 adds remote_path_mapping and 0059 recycle_bin per domain; all 24 checks must settle.
+            // Reasoning: 0053 adds remote_path_mapping and 0060 recycle_bin per domain; all 24 checks must settle.
             if v["summary"]["current"] == 24 {
                 // Reasoning: twenty-four checks span two pages; issue assertions cover both complete domains.
                 let (_, second) = request(
@@ -605,7 +605,7 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            // Reasoning: 0059 recycle_bin identities are healthy while no bin is configured.
+            // Reasoning: 0060 recycle_bin identities are healthy while no bin is configured.
             if v["summary"]["current"] == 24 && issues(&v).is_empty() {
                 return v;
             }

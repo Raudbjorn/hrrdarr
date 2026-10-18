@@ -143,7 +143,7 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         "import_policies",
         "health_checks",
     ] {
-        // Reasoning: 0059 registers recycle_bin identities after this predecessor; preserved rows stay exact.
+        // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
         let filter = if table == "health_checks" {
             " WHERE check_key!='recycle_bin'"
         } else {
@@ -162,7 +162,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        60 // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

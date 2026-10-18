@@ -110,7 +110,7 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         let mut expected = before[1].clone();
         // Only the appended preference column differs: all old values remain exact and NULL.
@@ -120,11 +120,11 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
         assert_eq!(rows(&c, "provider_scopes").await?, expected);
         let registry = rows(&c, "health_checks").await?;
         assert_eq!(&registry[..12], before[2].as_slice());
-        assert_eq!(registry.len(), 24); // Reasoning: 0053 adds two path diagnostics identities and 0059 two recycle_bin identities (20 -> 24).
+        assert_eq!(registry.len(), 24); // Reasoning: 0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
         assert_eq!(rows(&c, "health_lifecycle").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..48], before[4].as_slice());
-        assert_eq!(history.len(), 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        assert_eq!(history.len(), 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
         assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='IndexerDownloadClientCheck'").await?,2);
         integrity(&c).await?;
     }

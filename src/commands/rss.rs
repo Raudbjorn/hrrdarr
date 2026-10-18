@@ -233,6 +233,21 @@ async fn read(c: &Connection, id: Uuid) -> Result<RssCommand> {
         .await?
         .ok_or(Error(StatusCode::NOT_FOUND, "rss_command_not_found"))?)
 }
+/// A fixed or explicit client must accept its indexer's release protocol. Default selection
+/// filters by protocol instead. This is a visible admission rejection, not an empty target.
+pub(super) async fn protocol_mismatch(c: &Connection, t: RssTarget) -> Result<bool> {
+    let Some(client) = t.client_id else {
+        return Ok(false);
+    };
+    let row = c.query("SELECT i.protocol,k.protocol FROM providers a JOIN provider_implementations i ON i.implementation=a.implementation, providers b JOIN provider_implementations k ON k.implementation=b.implementation WHERE a.id=? AND b.id=? AND i.kind='indexer' AND k.kind='download_client'",params![t.indexer_id.to_string(),client.to_string()]).await?.next().await?;
+    Ok(match row {
+        Some(row) => row.get::<String>(0)? != row.get::<String>(1)?,
+        None => false,
+    })
+}
+pub(super) fn protocol_rejection() -> Error {
+    Error(StatusCode::CONFLICT, "protocol_mismatch")
+}
 pub(super) async fn valid_target(
     c: &Connection,
     t: RssTarget,
@@ -254,6 +269,9 @@ pub(super) async fn valid_target(
         return Ok(true);
     }
     let (id, revision) = t.resolved()?;
+    if protocol_mismatch(c, t).await? {
+        return Ok(false);
+    }
     valid_provider(
         c,
         RefreshTarget {
@@ -298,6 +316,9 @@ async fn enqueue_target(
     priority: CommandPriority,
     timestamp: i64,
 ) -> Result<RssCommand> {
+    if protocol_mismatch(c, t).await? {
+        return Err(protocol_rejection());
+    }
     if !valid_target(c, t, IndexerOperation::Rss).await? {
         return Err(Error(StatusCode::CONFLICT, "provider_changed"));
     }
@@ -921,7 +942,10 @@ fn selection_error(code: &'static str) -> &'static str {
         | "unsupported_target"
         | "release_changed"
         | "payload_expired" => code,
-        "unsupported_protocol" => "unsupported_target",
+        // Durable candidate/command error codes are a closed vocabulary (0052 CHECKs); a
+        // client of the wrong protocol is stored as the existing unsupported-target outcome.
+        // Admission APIs still answer 409 `protocol_mismatch` before anything is stored.
+        "unsupported_protocol" | "protocol_mismatch" => "unsupported_target",
         _ => "refresh_failed",
     }
 }
@@ -931,7 +955,9 @@ fn selection_error(code: &'static str) -> &'static str {
 fn selection_fallback(code: &'static str) -> Result<bool> {
     match code {
         "download_client_unavailable" | "provider_changed" | "provider_unavailable" => Ok(true),
-        "refresh_limit" | "selection_limit" | "unsupported_target" => Ok(false),
+        "refresh_limit" | "selection_limit" | "unsupported_target" | "protocol_mismatch" => {
+            Ok(false)
+        }
         _ => Err(Error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "command_storage_error",
@@ -964,6 +990,7 @@ async fn park_batch(
     if !matches!(failed.origin, super::search::CandidateOrigin::Rss) {
         return Ok(());
     }
+    let failed_protocol = indexer_protocol(c, failed.source.indexer_id).await?;
     let mut rows=c.query("SELECT id FROM rss_candidates WHERE command_id=? AND id!=? AND status='pending' AND selection_kind='default' AND selection_round=0 AND selection_plan_json IS NULL AND active_attempt IS NULL ORDER BY created_at,id LIMIT 1024",params![command_id.to_string(),failed.id.to_string()]).await?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -985,9 +1012,8 @@ async fn park_batch(
         let decoded = indexer::decode_private(&bytes);
         bytes.fill(0);
         let release = decoded.map_err(|_| bad())?;
-        // The delivered executor supports torrent only; other protocol facts do
-        // not inherit this batch's torrent failure.
-        if release.facts.torrent.is_none() {
+        // Releases of another protocol do not inherit this batch's client failure.
+        if Some(release_protocol(&release)) != failed_protocol {
             continue;
         }
         let decision = pending::evaluate(
@@ -1017,6 +1043,38 @@ async fn park_batch(
         c.execute("UPDATE rss_candidates SET selection_strict=1,error_code='download_client_unavailable',decision_reasons_json='[\"download_client_unavailable\"]',not_before=max(coalesce(not_before,0),?),updated_at=? WHERE id=?",params![timestamp+60,timestamp,id.to_string()]).await?;
     }
     Ok(())
+}
+fn release_protocol(release: &indexer::Release) -> crate::providers::Protocol {
+    if release.facts.torrent.is_some() {
+        crate::providers::Protocol::Torrent
+    } else {
+        crate::providers::Protocol::Usenet
+    }
+}
+pub(super) async fn indexer_protocol(
+    c: &Connection,
+    indexer: Uuid,
+) -> Result<Option<crate::providers::Protocol>> {
+    Ok(c.query(
+        "SELECT implementation FROM providers WHERE id=?",
+        [indexer.to_string()],
+    )
+    .await?
+    .next()
+    .await?
+    .map(|row| row.get::<String>(0))
+    .transpose()?
+    .as_deref()
+    .and_then(crate::providers::Protocol::of_implementation))
+}
+/// Sonarr's recent-episode window (air date within 14 days) and Radarr's recent-movie window
+/// (physical/digital release within 21 days or cinema release within 120 days).
+async fn recent_target(c: &Connection, target: &crate::db::MediaTarget) -> Result<bool> {
+    let row = match target {
+        crate::db::MediaTarget::Episode(id) => c.query("SELECT coalesce(julianday(air_date_utc)>=julianday('now','start of day','-14 days'),0) FROM episodes WHERE id=?",[*id]).await?.next().await?,
+        crate::db::MediaTarget::Movie(id) => c.query("SELECT coalesce(julianday(d.physical_release)>=julianday('now','-21 days'),0) OR coalesce(julianday(d.digital_release)>=julianday('now','-21 days'),0) OR coalesce(julianday(d.in_cinemas)>=julianday('now','-120 days'),0) FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.id=?",[*id]).await?.next().await?,
+    };
+    Ok(row.map(|r| r.get::<i64>(0)).transpose()?.unwrap_or(0) == 1)
 }
 async fn park_unavailable(
     c: &Connection,
@@ -1422,22 +1480,33 @@ async fn process_candidate(
         ),
     };
     let source = match &release.facts.torrent {
-        Some(facts) => match &facts.magnet_url {
-            Some(value) => qbittorrent::AddSource::Magnet(value.clone()),
-            None => qbittorrent::AddSource::Url(release.download_url.clone()),
-        },
-        None => {
-            return candidate_state(&c, p.id, "rejected", Some("unsupported_target"), None).await;
+        Some(facts) => {
+            let mut options = qbittorrent::QbitOptions::default();
+            options.ratio_limit = facts.minimum_ratio;
+            options.seeding_minutes = facts
+                .minimum_seed_seconds
+                .and_then(|v| v.checked_add(59))
+                .and_then(|v| i64::try_from(v / 60).ok());
+            crate::providers::download::ReleaseSource::Torrent {
+                source: match &facts.magnet_url {
+                    Some(value) => qbittorrent::AddSource::Magnet(value.clone()),
+                    None => qbittorrent::AddSource::Url(release.download_url.clone()),
+                },
+                options,
+            }
         }
+        None => crate::providers::download::ReleaseSource::Usenet {
+            url: release.download_url.clone(),
+            title: release
+                .metadata
+                .title
+                .clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| p.title.clone()),
+        },
     };
-    let mut options = qbittorrent::QbitOptions::default();
-    if let Some(facts) = &release.facts.torrent {
-        options.ratio_limit = facts.minimum_ratio;
-        options.seeding_minutes = facts
-            .minimum_seed_seconds
-            .and_then(|v| v.checked_add(59))
-            .and_then(|v| i64::try_from(v / 60).ok());
-    }
+    // Clients configured with distinct recent/older priorities need the target's recency.
+    let recent = recent_target(&c, &media_target).await?;
     let (client_id, client_revision) = p.source.resolved()?;
     let prepared = match client
         .prepare_download(
@@ -1445,8 +1514,7 @@ async fn process_candidate(
             client_revision,
             media_target,
             source,
-            false,
-            options,
+            recent,
         )
         .await
     {
@@ -1790,6 +1858,7 @@ async fn save_schedule(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome=async{
+        if protocol_mismatch(&tx,t).await?{return Err(protocol_rejection())}
         if !valid_target(&tx,t,IndexerOperation::Rss).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
         let prior=tx.query(&format!("SELECT {SCHEDULE_COLUMNS} FROM rss_schedules WHERE indexer_id=? AND client_id IS ? AND selection_kind=? AND media_type=?"),params![t.indexer_id.to_string(),t.client_id.map(|v|v.to_string()),t.selection_kind.text(),domain(t.media_type)]).await?.next().await?.map(schedule_row).transpose()?;
         let timestamp=now()?;

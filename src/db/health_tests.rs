@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -154,7 +154,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     let added =
         "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
     let scan_added = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))";
-    // Reasoning: 0059 appends the recycle-bin cleanup pool term to every existing guard.
+    // Reasoning: 0060 appends the recycle-bin cleanup pool term to every existing guard.
     let recycle_added = "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))";
     for (name, sql) in &triggers {
         let actual = c
@@ -179,6 +179,11 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         } else {
             actual
         };
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // map only that predicate back to the 41-era qBittorrent literal.
+        let actual = actual
+            .replace("p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)", "p.implementation='qbittorrent'")
+            .replace("p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')", "p.implementation='qbittorrent'");
         // 0054 adds exactly one scan-parent capacity contribution to each old guard.
         assert_eq!(actual.matches(scan_added).count(), 1);
         assert_eq!(actual.matches(recycle_added).count(), 1);
@@ -221,7 +226,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -268,7 +273,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     // Reasoning: 0053 and 0059 give twelve TV identities; every admission retains generation1.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        12 // Reasoning: 0053 adds one path diagnostics and 0059 one recycle_bin identity per domain (10 -> 12).
+        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
     );
     assert_eq!(
         scalar(
@@ -276,7 +281,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        12, // Reasoning: 0053 adds one path diagnostics and 0059 one recycle_bin identity per domain (10 -> 12).
+        12, // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -439,7 +444,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        12 // Reasoning: 0053 adds one path diagnostics and 0059 one recycle_bin identity per domain (10 -> 12).
+        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
     );
     assert!(
         c.execute(
@@ -653,7 +658,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -738,10 +743,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0059 two recycle_bin identities (20 -> 24).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     }
     Ok(())
 }

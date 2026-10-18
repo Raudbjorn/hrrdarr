@@ -31,7 +31,7 @@ Reference requirements are the same pinned Sonarr/Radarr revisions above, `Healt
 
 ## Recycling bin
 
-Scoped `recycle_bin` (`RecyclingBinCheck`, migration 0059) is healthy when the domain has no
+Scoped `recycle_bin` (`RecyclingBinCheck`, migration 0060) is healthy when the domain has no
 recycle bin. A configured bin that does not exist reports error `recycle_bin_missing`; a bin that
 traverses a symlink, is not a directory or fails a create/remove write probe reports error
 `recycle_bin_unwritable`. Saving recycle bin settings marks the check for re-evaluation. File

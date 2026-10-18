@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 10 } // Reasoning: ten migrations follow49 through59; 0054 through 0058 add no Health identities and 0059 adds the two recycle_bin identities, so Health gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 11 } // Reasoning: eleven migrations follow 49 through 60 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); 0060 adds the two recycle_bin identities and 0054 through 0059 add none, so Health gains ten rows.
                 );
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.

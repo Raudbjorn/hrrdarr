@@ -66,7 +66,7 @@ try{
   const row=health.getByRole('article',{name:`${domain}:indexer_status`,exact:true});await row.getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();
   await health.getByRole('region',{name:'Health diagnostic transitions'}).getByText(new RegExp(`restored — ${domain}:indexer_status`)).first().waitFor();
  }
- // All twenty-four tokens (0053 added remote_path_mapping, 0059 recycle_bin) must be observed even though the first visible page holds only sixteen checks.
+ // All twenty-four tokens (0053 added remote_path_mapping, 0060 recycle_bin) must be observed even though the first visible page holds only sixteen checks.
  await health.getByLabel('Health scope').selectOption('all');await idle();
  const admitted=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await health.getByRole('button',{name:'Run all health checks',exact:true}).click();

@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -155,7 +155,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
             ]
         );
     }
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0059 two recycle_bin identities (20 -> 24).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
     assert_eq!(
         rows(&c, "SELECT * FROM health_checks ORDER BY rowid LIMIT 8").await?,
@@ -256,7 +256,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(rows(&c, policy_sql).await?, policies);
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0059 two recycle_bin identities (20 -> 24).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     c.execute("DELETE FROM providers WHERE id=?", [torznab.clone()])
         .await?;
     assert_eq!(
@@ -274,14 +274,14 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
             "SELECT count(*) FROM health_checks"
         )
         .await?,
-        24 // Reasoning: 0053 adds two path diagnostics and 0059 two recycle_bin identities (20 -> 24).
+        24 // Reasoning: 0053 adds two path diagnostics and 0060 two recycle_bin identities (20 -> 24).
     );
     Ok(())
 }

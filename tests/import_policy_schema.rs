@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+        60 // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);
@@ -222,7 +222,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
         defaults,
         dump(&c, "SELECT * FROM import_policies ORDER BY media_type").await?
     );
-    // Reasoning: 0059 registers recycle_bin identities after 0056; every predecessor row stays exact.
+    // Reasoning: 0060 registers recycle_bin identities after 0056; every predecessor row stays exact.
     assert_eq!(
         health,
         dump(

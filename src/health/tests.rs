@@ -814,7 +814,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
     for attempt in 1..=3 {
         let cmd = take(&c, id, 110 + attempt * 10).await;
         // Reasoning: registry now contains nine checks per domain (0050 adds indexer_status/indexer_failures); retry must retain all eighteen.
-        assert_eq!(cmd.members.len(), 24); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+        assert_eq!(cmd.members.len(), 24); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
         assert_eq!(i64::from(cmd.attempts), attempt);
         publish_outcomes(&c, &cmd, mixed(&cmd, attempt != 2), 111 + attempt * 10)
             .await
@@ -828,7 +828,7 @@ async fn communication_partial_attempts_preserve_failed_payload_and_retry_member
                 "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
             )
             .await,
-            if attempt < 3 { 24 } else { 0 } // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+            if attempt < 3 { 24 } else { 0 } // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
         );
         assert_eq!(
             lifecycle(&c).await.unwrap().last_batch_completed_at,
@@ -881,7 +881,7 @@ async fn communication_partial_grace_exhaustion_preserves_other_reasons_and_late
             "SELECT count(*) FROM health_checks WHERE pending_reasons=1"
         )
         .await,
-        24 // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+        24 // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
     );
     tick(&c, 1032).await;
     let ordinary = take(&c, active(&c).await.unwrap().unwrap().id, 1032).await;
@@ -944,7 +944,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
     let id = admit(&c, HealthScope::All, 100).await;
     let cmd = take(&c, id, 100).await;
     // Reasoning: the full registry now has twenty members (0051 adds one client backoff check per domain), so every member needs an outcome.
-    publish(&c, &cmd, Ok(vec![None; 24]), 101).await.unwrap(); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+    publish(&c, &cmd, Ok(vec![None; 24]), 101).await.unwrap(); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
     for at in 200..212 {
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -998,7 +998,7 @@ async fn communication_status_deadline_rollback_and_whole_attempt_invalidation()
             "SELECT count(*) FROM health_checks WHERE pending_reasons>0"
         )
         .await,
-        24 // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+        24 // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
     );
 }
 
@@ -1189,7 +1189,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
             "SELECT count(*) FROM health_checks WHERE scope='tv' AND pending_reasons>0"
         )
         .await,
-        12 // Reasoning: 0053 adds one path check and 0059 one recycle_bin check per domain; all twelve newly admitted TV generations survive cancellation of the older batch.
+        12 // Reasoning: 0053 adds one path check and 0060 one recycle_bin check per domain; all twelve newly admitted TV generations survive cancellation of the older batch.
     );
     assert_eq!(
         count(
@@ -1210,7 +1210,7 @@ async fn communication_partial_settlement_rollback_and_new_generation_cancel() {
     tick(&c, 106).await;
     let next = active(&c).await.unwrap().unwrap();
     assert_ne!(next.id, id);
-    assert_eq!(next.members.len(), 12); // Reasoning: 0053 adds one path check and 0059 one recycle_bin check per domain; the next batch must cover all twelve pending TV members.
+    assert_eq!(next.members.len(), 12); // Reasoning: 0053 adds one path check and 0060 one recycle_bin check per domain; the next batch must cover all twelve pending TV members.
     assert!(
         next.members
             .iter()
@@ -1507,7 +1507,7 @@ async fn indexer_marker_state(c: &Connection) -> Vec<(String, String, i64, i64, 
 async fn indexer_configuration_marker_is_scoped_transactional_and_debounced() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 24); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+    assert_eq!(initial.len(), 24); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(indexer_configuration_changed(&c, media).await.is_err());
     }
@@ -1575,7 +1575,7 @@ async fn indexer_configuration_exhaustion_preflights_all_keys_and_rolls_back_aut
             .await
             .unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 24); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+        assert_eq!(before.len(), 24); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -1678,7 +1678,7 @@ async fn indexer_capability_gaps_are_reported_per_domain_from_eligible_scopes() 
 async fn indexer_client_marker_scoped_transaction_and_rollback() {
     let (_scratch, _db, c) = fixture_all().await;
     let initial = indexer_marker_state(&c).await;
-    assert_eq!(initial.len(), 24); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+    assert_eq!(initial.len(), 24); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
     for media in [MediaDomain::Tv, MediaDomain::Movies] {
         assert!(
             indexer_client_configuration_changed(&c, media)
@@ -1790,7 +1790,7 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         .unwrap();
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,generation,compatibility_type) VALUES(?,'indexer_download_client',1,1,?,'IndexerDownloadClientCheck')",params![scope,MAX_INTEGER]).await.unwrap();
         let before = indexer_marker_state(&c).await;
-        assert_eq!(before.len(), 24); // Reasoning:0053 adds two path checks and 0059 two recycle_bin checks; all24 registry members remain covered.
+        assert_eq!(before.len(), 24); // Reasoning:0053 adds two path checks and 0060 two recycle_bin checks; all24 registry members remain covered.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await

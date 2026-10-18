@@ -128,7 +128,7 @@ export type Disposition = "accept" | "reject" | "delay";
 
 export type DownloadContentLayout = "default" | "original" | "subfolder";
 
-export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state";
+export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state" | "verifying" | "repairing" | "extracting" | "moving" | "post_processing" | "disk_full";
 
 export type DownloadFile = { index: number, name: string, size_bytes: number, progress: number, priority: number, };
 
@@ -482,7 +482,7 @@ export type ProviderChanges = { enabled?: boolean | null, priority?: number | nu
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -496,7 +496,7 @@ export type ProviderFilesResult = { provider_id: string, revision: number, resul
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };
 
-export type ProviderImplementation = "newznab" | "qbittorrent" | "torznab";
+export type ProviderImplementation = "newznab" | "qbittorrent" | "sabnzbd" | "torznab";
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -520,13 +520,13 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
-export type ProviderTestOutcome = IndexerTest | ClientTest;
+export type ProviderTestOutcome = IndexerTest | ClientTest | SabnzbdTest;
 
 export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: ProviderTestOutcome, };
 
@@ -674,6 +674,10 @@ export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_r
 
 export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, };
 
+export type SabnzbdTest = { sabnzbd_version: string, domains: Array<MediaDomain>, warnings: Array<SabnzbdTestWarning>, };
+
+export type SabnzbdTestWarning = "develop_version" | "removes_completed_downloads";
+
 export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, operation_phase: string | null, path_failure_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
 
 export type ScanChildMember = { episode_id: number, series_id: number, season_number: number, episode_number: number, expected_old_episode_file_id: number | null, };
@@ -791,3 +795,7 @@ export type TvReleaseProfileInput = { name: string | null, enabled: boolean, req
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
 export type UnmappedFolder = { name: string, path: string, relative_path: string, };
+
+export type UsenetPriority = "default" | "paused" | "low" | "normal" | "high" | "force";
+
+export type UsenetScope = { category: string, recent_priority?: UsenetPriority, older_priority?: UsenetPriority, tags?: Array<number>, };

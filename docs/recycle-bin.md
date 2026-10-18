@@ -1,6 +1,6 @@
 # File deletion and recycle bin
 
-Migration 0059 adds per-domain recycle bin settings, a file-deletion journal, deletion history and
+Migration 0060 adds per-domain recycle bin settings, a file-deletion journal, deletion history and
 the `CleanUpRecycleBin` command. TV and movies are configured, recycled, cleaned and health-checked
 independently; equal numeric file IDs in the two domains never select each other.
 

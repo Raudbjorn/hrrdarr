@@ -26,7 +26,7 @@ const TABLES: [&str; 9] = [
     "manual_import_commands",
     "quality_reset_commands",
     "rescan_commands",
-    // Reasoning: 0059 adds recycle bin cleanup history to the pruned command tables.
+    // Reasoning: 0060 adds recycle bin cleanup history to the pruned command tables.
     "recycle_bin_cleanup_commands",
 ];
 const DOMAINS: [&str; 2] = ["tv", "movies"];

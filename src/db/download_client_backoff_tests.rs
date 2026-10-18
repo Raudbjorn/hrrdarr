@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
     for i in [0, 1, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
@@ -117,7 +117,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     }
     assert_eq!(rows(&c, queries[2]).await?, commands);
     let checks = before[3].clone();
-    // Preserve schema50 rows; 0051, 0053 and 0059 (recycle_bin) add separate registry identities.
+    // Preserve schema50 rows; 0051, 0053 and 0060 (recycle_bin) add separate registry identities.
     assert_eq!(rows(&c,"SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?,checks);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='download_client_backoff' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND compatibility_type='DownloadClientStatusCheck' AND generation=0 AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND severity IS NULL AND last_error IS NULL AND due_at IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(

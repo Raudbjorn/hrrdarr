@@ -309,7 +309,7 @@ impl CommandStatus {
         }
     }
 }
-const COMMAND_COLUMNS: &str = "id,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,started_at,completed_at,error_code,items_observed,origin,manual_bypass,CASE WHEN status IN ('queued','retry_wait') AND origin='automatic' AND manual_bypass=0 THEN (SELECT b.disabled_until FROM download_client_status b JOIN providers p ON p.id=b.provider_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=b.media_type WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND p.revision=b.config_revision AND p.enabled=1 AND p.implementation='qbittorrent' AND b.disabled_until>unixepoch()) END";
+const COMMAND_COLUMNS: &str = "id,provider_id,media_type,provider_revision,priority,status,attempts,next_attempt_at,created_at,started_at,completed_at,error_code,items_observed,origin,manual_bypass,CASE WHEN status IN ('queued','retry_wait') AND origin='automatic' AND manual_bypass=0 THEN (SELECT b.disabled_until FROM download_client_status b JOIN providers p ON p.id=b.provider_id JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=b.media_type WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND p.revision=b.config_revision AND p.enabled=1 AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND b.disabled_until>unixepoch()) END";
 fn command_row(row: libsql::Row) -> Result<Command> {
     Ok(Command {
         id: Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| bad())?,
@@ -370,7 +370,7 @@ async fn valid_provider(c: &Connection, target: RefreshTarget, revision: i64) ->
     if !(1..=MAX_REVISION).contains(&revision) {
         return Err(bad());
     }
-    Ok(c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation='qbittorrent' AND s.media_type=?",params![target.provider_id.to_string(),revision,domain(target.media_type)]).await?.next().await?.is_some())
+    Ok(c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?",params![target.provider_id.to_string(),revision,domain(target.media_type)]).await?.next().await?.is_some())
 }
 async fn finish<T>(tx: libsql::Transaction, result: Result<T>) -> Result<T> {
     match result {
@@ -629,7 +629,7 @@ async fn write_schedule(
     let result=async {
         let old=read_schedule(&tx,input.target).await?;
         if old.as_ref().map(|v|v.revision)!=input.revision{return Err(conflict())}
-        if tx.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.implementation='qbittorrent' AND s.media_type=? AND (?=0 OR p.enabled=1)",params![input.target.provider_id.to_string(),input.provider_revision,domain(input.target.media_type),i64::from(input.enabled)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
+        if tx.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.revision=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=? AND (?=0 OR p.enabled=1)",params![input.target.provider_id.to_string(),input.provider_revision,domain(input.target.media_type),i64::from(input.enabled)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
         if old.is_none()&&tx.query("SELECT count(*) FROM download_refresh_schedules WHERE intent!='suppressed'",()).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?>=64{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"schedule_limit"))}
         // Suppressed rows are publicly absent, but keep their monotonically increasing revision.
         tx.execute("INSERT INTO download_refresh_schedules(provider_id,media_type,provider_revision,enabled,interval_seconds,next_run_at,revision,error_code,intent,requested_enabled) VALUES(?,?,?,?,?,?,1,NULL,?,?) ON CONFLICT(provider_id,media_type) DO UPDATE SET provider_revision=excluded.provider_revision,enabled=excluded.enabled,interval_seconds=excluded.interval_seconds,next_run_at=excluded.next_run_at,revision=download_refresh_schedules.revision+1,error_code=NULL,intent=excluded.intent,requested_enabled=excluded.requested_enabled",params![input.target.provider_id.to_string(),domain(input.target.media_type),input.provider_revision,i64::from(input.enabled),i64::from(input.interval_seconds),now()?,if inherited {"inherited"} else {"explicit"},if inherited {None} else {Some(i64::from(input.enabled))}]).await?;
