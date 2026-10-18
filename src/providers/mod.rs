@@ -601,7 +601,6 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
         | Q::ScopeConflict
         | Q::UnsupportedFeature
         | Q::UnsafeRetention
-        | Q::NotFound
         | Q::MutationUnknown => Unevaluated("check_failed"),
         Q::Http(
             H::Authentication
@@ -611,6 +610,8 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
             | H::Timeout
             | H::InvalidResponse,
         )
+        // The item-list probe only yields NotFound from an HTTP 404: a rejected route is remote.
+        | Q::NotFound
         | Q::InvalidResponse
         | Q::UnsupportedVersion
         | Q::Rejected => RemoteFailure,
@@ -674,7 +675,12 @@ impl RefreshClient {
         // Acquisition cooldown is old evidence; an HTTP429 returned by the probe is new evidence.
         let operation = transport
             .operation(provider.id)
-            .map_err(|_| Unevaluated("check_failed"))?;
+            .map_err(|error| match error {
+                http::HttpError::RateLimited { .. } => {
+                    Unevaluated(crate::health::PROVIDER_COOLDOWN)
+                }
+                _ => Unevaluated("check_failed"),
+            })?;
         let work = async {
             let result = qbittorrent::refresh_pages(
                 &operation,
@@ -2541,7 +2547,12 @@ mod communication_error_tests {
         ] {
             assert_eq!(communication_error(Q::Http(error)), RemoteFailure);
         }
-        for error in [Q::UnsupportedVersion, Q::InvalidResponse, Q::Rejected] {
+        for error in [
+            Q::UnsupportedVersion,
+            Q::InvalidResponse,
+            Q::Rejected,
+            Q::NotFound,
+        ] {
             assert_eq!(communication_error(error), RemoteFailure);
         }
         for error in [

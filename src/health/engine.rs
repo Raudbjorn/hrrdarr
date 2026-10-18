@@ -1,6 +1,18 @@
 use super::*;
 use std::time::Duration;
 
+/// Internal outcome: a cached provider cooldown refused dispatch before any request was sent.
+/// Persisted as `check_failed`; the CONFIG recheck is deferred instead of being exhausted.
+pub(crate) const PROVIDER_COOLDOWN: &str = "provider_cooldown";
+const COOLDOWN_RECHECK_SECONDS: i64 = 60;
+fn stored_code(code: &'static str) -> &'static str {
+    if code == PROVIDER_COOLDOWN {
+        "check_failed"
+    } else {
+        code
+    }
+}
+
 pub(crate) async fn startup(db: &Database) -> Result<()> {
     let c = db.connect().await?;
     let tx = c
@@ -381,11 +393,12 @@ async fn publish_outcomes(
         let stale = tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1", [cmd.id.to_string()]).await?.next().await?.is_some();
         if stale { return fail(&tx,cmd,timestamp,"stale_inputs").await; }
         if results.len() != cmd.members.len() { return Err(invariant()); }
-        let error = results.iter().find_map(|v| v.as_ref().err().copied());
+        let error = results.iter().find_map(|v| v.as_ref().err().copied()).map(stored_code);
         let retry = error.is_some() && cmd.attempts < 3;
         let life = lifecycle(&tx).await?;
         let in_grace = life.grace_phase != "expired";
         for (member, result) in cmd.members.iter().zip(results) {
+            let cooldown = result.as_ref().err() == Some(&PROVIDER_COOLDOWN);
             match result {
                 Ok(new) => {
                     if new.as_ref().is_some_and(|v| v.identity != member.identity || v.severity == HealthSeverity::Ok) { return Err(invariant()); }
@@ -399,10 +412,15 @@ async fn publish_outcomes(
                 }
                 Err(code) => {
                     // Only the failed member's error changes; its observed payload remains intact.
-                    tx.execute("UPDATE health_checks SET last_error=? WHERE scope=? AND check_key=?",params![code,member.identity.scope.text(),member.identity.check_key.clone()]).await?;
+                    tx.execute("UPDATE health_checks SET last_error=? WHERE scope=? AND check_key=?",params![stored_code(code),member.identity.scope.text(),member.identity.check_key.clone()]).await?;
                 }
             }
-            if !retry {
+            if !retry && cooldown {
+                // Cooldown is not an observation: keep an authoritative CONFIG change pending past
+                // the cached limit (default 60s) instead of dropping it until the six-hour schedule.
+                let keep = if cmd.is_grace { 15 } else { CONFIG };
+                tx.execute("UPDATE health_checks SET pending_reasons=pending_reasons & ?,due_at=CASE WHEN (pending_reasons & ?)!=0 THEN max(coalesce(due_at,0),?) ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![keep,keep,timestamp+COOLDOWN_RECHECK_SECONDS,member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;
+            } else if !retry {
                 // Partial grace exhaustion services only its grace reason, preserving other work.
                 let grace_only = cmd.is_grace && error.is_some();
                 tx.execute("UPDATE health_checks SET pending_reasons=CASE WHEN ? THEN pending_reasons & 15 ELSE 0 END,due_at=CASE WHEN ? AND (pending_reasons & 15)!=0 THEN due_at ELSE NULL END WHERE scope=? AND check_key=? AND generation=?",params![grace_only,grace_only,member.identity.scope.text(),member.identity.check_key.clone(),member.captured_generation]).await?;

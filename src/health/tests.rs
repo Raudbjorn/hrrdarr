@@ -1822,3 +1822,54 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         assert_eq!(count(&c, "SELECT revision FROM providers").await, 1);
     }
 }
+
+#[tokio::test]
+async fn communication_cooldown_defers_config_recheck_past_retry_budget() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    let baseline = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, baseline, 100).await;
+    publish(
+        &c,
+        &cmd,
+        Ok(cmd.members.iter().map(|_| None).collect()),
+        101,
+    )
+    .await
+    .unwrap();
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    communication_status_at(&tx, MediaDomain::Tv, 200)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    tick(&c, 205).await;
+    let id = active(&c).await.unwrap().unwrap().id;
+    let mut at = 205;
+    for _ in 1..=3 {
+        let cmd = take(&c, id, at).await;
+        assert!(!cmd.is_grace);
+        let outcomes = cmd.members.iter().map(|_| Err(PROVIDER_COOLDOWN)).collect();
+        publish_outcomes(&c, &cmd, outcomes, at + 1).await.unwrap();
+        at += 10;
+    }
+    let last = at - 10 + 1;
+    let command = read(&c, id).await.unwrap();
+    assert!(matches!(command.status, CommandStatus::Failed));
+    // The internal cooldown code never reaches persisted, CHECK-constrained columns.
+    assert_eq!(command.error_code.as_deref(), Some("check_failed"));
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND last_error='check_failed' AND pending_reasons=8").await,1);
+    // Exhausting the retry budget inside a cooldown re-arms the CONFIG recheck after it.
+    assert_eq!(count(&c,"SELECT due_at FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,last + 60);
+    tick(&c, last + 59).await;
+    assert!(active(&c).await.unwrap().is_none());
+    tick(&c, last + 60).await;
+    let next = take(&c, active(&c).await.unwrap().unwrap().id, last + 60).await;
+    assert!(
+        next.members
+            .iter()
+            .any(|m| m.identity.check_key == "download_client_communication")
+    );
+}

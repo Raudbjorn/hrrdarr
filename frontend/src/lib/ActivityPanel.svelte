@@ -81,7 +81,8 @@
     reading = false; error = ''; notice = ''; confirmDelete = null; scheduleReady = false; snapshot = null; queueOffset = 0;
     if (result.ok) {provider = result.data;providerMissing=false; media = domain; masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false; await read(false, true);} else {readError = result.error; schedulePoll();}
   }
-  async function changeScope(next:MediaDomain) {if(reading||!keepDrafts())return false;media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; await read(false,true);return true;}
+  // A failed readback leaves no baseline for the new domain: drop the previous domain's master so it cannot be shown or submitted; the next poll restores it.
+  async function changeScope(next:MediaDomain):Promise<'declined'|'failed'|'opened'> {if(reading||!keepDrafts())return 'declined';media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; if(await read(false,true))return 'opened';master=null;return 'failed';}
   let navigationSeen=$state<number|null>(null),navigationNotice=$state('');
   $effect(()=>{
     const next=request,shown=active,busy=reading||mutating||writeReadback||relatedWrite==='busy'||childWrite==='busy',blocked=uncertain||relatedWrite==='uncertain'||childWrite==='uncertain';
@@ -90,7 +91,7 @@
     navigationSeen=next.nonce;
     untrack(()=>{
       if(blocked){navigationNotice='Settings navigation refused: resolve the unknown write outcome, then request navigation again.';onnavigate(next.nonce,false);return;}
-      void changeScope(next.domain).then(accepted=>{navigationNotice=accepted?`Opened ${next.domain} completed-download settings.`:'Settings navigation declined; previous domain and drafts retained.';onnavigate(next.nonce,accepted);if(accepted&&active)document.getElementById('cdh-heading')?.focus();});
+      void changeScope(next.domain).then(outcome=>{navigationNotice=outcome==='opened'?`Opened ${next.domain} completed-download settings.`:outcome==='failed'?`Switched to ${next.domain} completed-download settings, but readback failed. Reload activity before editing.`:'Settings navigation declined; previous domain and drafts retained.';onnavigate(next.nonce,outcome==='opened');if(outcome!=='declined'&&active)document.getElementById('cdh-heading')?.focus();});
     });
   });
   async function filters() {++version; commandOffset = 0; selectedCommand = null; confirmDelete = null; await read();}
