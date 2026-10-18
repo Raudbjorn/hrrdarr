@@ -73,6 +73,7 @@ async fn put_capture(
     crate::search::evaluate(
         c,
         command.target.media_type,
+        command.target.indexer_id,
         &item.release,
         SearchContext::Rss,
         timestamp,
@@ -83,9 +84,16 @@ async fn put_capture(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await
         .unwrap();
-    insert_captured(&tx, client, command, item, timestamp)
-        .await
-        .unwrap();
+    insert_captured(
+        &tx,
+        client,
+        command,
+        item,
+        timestamp,
+        &mut crate::release_profile_terms::OperationEvidence::default(),
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     id
 }
@@ -104,6 +112,7 @@ async fn settle(
         expected,
         &release(expected.source.media_type, timestamp),
         timestamp,
+        &mut crate::release_profile_terms::OperationEvidence::default(),
     )
     .await;
     finish(tx, outcome).await
@@ -156,6 +165,7 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         let stale = crate::search::evaluate(
             &c,
             media,
+            indexer,
             &release(media, timestamp),
             SearchContext::Rss,
             timestamp,
@@ -180,6 +190,7 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
         let stale = crate::search::evaluate(
             &c,
             media,
+            indexer,
             &release(media, timestamp),
             SearchContext::Rss,
             timestamp,
@@ -194,9 +205,16 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .unwrap();
-        insert_captured(&tx, &client, &command, item, timestamp)
-            .await
-            .unwrap();
+        insert_captured(
+            &tx,
+            &client,
+            &command,
+            item,
+            timestamp,
+            &mut crate::release_profile_terms::OperationEvidence::default(),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let expected = candidate(&c, captured_id).await.unwrap().public;
         assert_eq!(expected.status, "pending");
@@ -309,9 +327,16 @@ async fn revision_policy_orders_pending_settlement_and_capture() {
                 .await
                 .unwrap();
             assert!(
-                insert_captured(&tx, &client, &command, item, timestamp)
-                    .await
-                    .is_err()
+                insert_captured(
+                    &tx,
+                    &client,
+                    &command,
+                    item,
+                    timestamp,
+                    &mut crate::release_profile_terms::OperationEvidence::default()
+                )
+                .await
+                .is_err()
             );
             tx.rollback().await.unwrap();
             assert!(
@@ -465,16 +490,30 @@ async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
             let mut other = captured(media, timestamp - 9999);
             other.title = "Harbor.S01E02.1080p.WEB-DL.BONUS".into();
             other.release.metadata.title = Some(other.title.clone());
-            crate::search::evaluate(&c, media, &other.release, SearchContext::Rss, timestamp)
-                .await
-                .unwrap();
+            crate::search::evaluate(
+                &c,
+                media,
+                old_command.target.indexer_id,
+                &other.release,
+                SearchContext::Rss,
+                timestamp,
+            )
+            .await
+            .unwrap();
             let tx = c
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .await
                 .unwrap();
-            insert_captured(&tx, &client, &old_command, other, timestamp)
-                .await
-                .unwrap();
+            insert_captured(
+                &tx,
+                &client,
+                &old_command,
+                other,
+                timestamp,
+                &mut crate::release_profile_terms::OperationEvidence::default(),
+            )
+            .await
+            .unwrap();
             tx.commit().await.unwrap();
         }
         let old = put_capture(&c, &client, &old_command, timestamp - 601).await;
@@ -502,18 +541,37 @@ async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
         // Oldest publication is independent of the old candidate's disabled provider.
         // Its age==delay does not bypass; age>delay does, even across command IDs.
         assert_eq!(
-            pending::best(&tx, &items, timestamp - 1).await.unwrap(),
+            pending::best(
+                &tx,
+                &items,
+                timestamp - 1,
+                &mut crate::release_profile_terms::OperationEvidence::default()
+            )
+            .await
+            .unwrap(),
             None
         );
         assert_eq!(
-            pending::best(&tx, &items, timestamp).await.unwrap(),
+            pending::best(
+                &tx,
+                &items,
+                timestamp,
+                &mut crate::release_profile_terms::OperationEvidence::default()
+            )
+            .await
+            .unwrap(),
             Some(young)
         );
         tx.commit().await.unwrap();
         let before = bytes(&c, young).await;
-        let selected = pending::select_work(&db, &client, candidate(&c, old).await.unwrap())
-            .await
-            .unwrap();
+        let selected = pending::select_work(
+            &db,
+            &client,
+            candidate(&c, old).await.unwrap(),
+            &mut crate::release_profile_terms::OperationEvidence::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(selected.public.id, young);
         assert_eq!(bytes(&c, young).await, before);
         assert_eq!(bytes(&c, cancelled).await, cancelled_before);
@@ -537,23 +595,32 @@ async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
             replace_scratch_payload(&c, broken, payload).await;
             // Exercise the actual selector with the corrupt sibling as original trigger.
             // A permanent sibling failure must never reject the healthy winner.
-            let selected = pending::select_work(&db, &client, candidate(&c, broken).await.unwrap())
-                .await
-                .unwrap();
+            let selected = pending::select_work(
+                &db,
+                &client,
+                candidate(&c, broken).await.unwrap(),
+                &mut crate::release_profile_terms::OperationEvidence::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(selected.public.id, young);
             let rejected = candidate(&c, broken).await.unwrap();
             assert_eq!(rejected.public.status, "rejected");
             assert!(rejected.payload.is_none());
             assert_eq!(bytes(&c, young).await, before);
         }
+        // Release restrictions now read applicability first; tag SQL failures retain
+        // the same retry behavior with the precise release-profile reader code.
         for (table, code) in [
+            ("release_profiles", "release_profile_storage_error"),
+            ("release_profile_domains", "release_profile_storage_error"),
             ("delay_profile_domains", "delay_profile_storage_error"),
             ("revision_policies", "revision_policy_storage_error"),
             ("episodes", "release_storage_error"),
             ("quality_profile_items", "release_storage_error"),
             ("custom_formats", "release_storage_error"),
-            ("series_tags", "delay_profile_storage_error"),
-            ("movie_tags", "delay_profile_storage_error"),
+            ("series_tags", "release_profile_storage_error"),
+            ("movie_tags", "release_profile_storage_error"),
         ] {
             if ((table == "episodes" || table == "series_tags") && media == MediaDomain::Movies)
                 || (table == "movie_tags" && media == MediaDomain::Tv)
@@ -587,14 +654,26 @@ async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
         let torrent = release(media, timestamp);
         let mut usenet = release(media, timestamp);
         usenet.facts.torrent = None;
-        let torrent_decision =
-            crate::search::evaluate(&c, media, &torrent, SearchContext::UserSearch, timestamp)
-                .await
-                .unwrap();
-        let usenet_decision =
-            crate::search::evaluate(&c, media, &usenet, SearchContext::UserSearch, timestamp)
-                .await
-                .unwrap();
+        let torrent_decision = crate::search::evaluate(
+            &c,
+            media,
+            old_command.target.indexer_id,
+            &torrent,
+            SearchContext::UserSearch,
+            timestamp,
+        )
+        .await
+        .unwrap();
+        let usenet_decision = crate::search::evaluate(
+            &c,
+            media,
+            old_command.target.indexer_id,
+            &usenet,
+            SearchContext::UserSearch,
+            timestamp,
+        )
+        .await
+        .unwrap();
         let torrent_rank =
             crate::search::revision::release_preference(&c, media, &torrent, &torrent_decision)
                 .await
@@ -652,6 +731,266 @@ async fn pending_cohort_crosses_commands_and_attributes_sibling_errors() {
         assert_eq!(rejected.public.error_code.as_deref(), Some("storage_error"));
         assert!(rejected.payload.is_none());
         assert_eq!(bytes(&c, old).await, old_before);
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn restriction_cohort_batch_keeps_evidence_and_fresh_writer_retries() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-restriction-cohort-{}", Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'Harbor','/fictional-tv'); INSERT INTO seasons(series_id,number)VALUES(1,1); INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00'); INSERT INTO movie_metadata(id,title,year,runtime,digital_release)VALUES(1,'Harbor',2020,100,'2020-01-01 00:00:00'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/fictional-movie'); INSERT INTO quality_profiles VALUES(1,'tv','HD'),(2,'movies','HD'); INSERT INTO quality_profile_items(profile_id,media_type,quality_id,position,allowed)VALUES(1,'tv',3,0,1),(2,'movies',3,0,1); INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id)VALUES(1,'tv',1,3,0,0,1,NULL),(2,'movies',1,3,0,0,1,-1); INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering)VALUES('tv',1,1,'standard',0); INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability)VALUES('movies',1,2,'released'); INSERT INTO release_delay_policies VALUES('tv',60,60,0),('movies',60,60,0); UPDATE quality_definitions SET min_size=0,max_size=NULL WHERE quality_id=3;").await.unwrap();
+    let key = Arc::new(crate::providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
+    let (_, client) = crate::providers::router_with_refresh(db.clone(), Some(key));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::release_profiles::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    for media in [MediaDomain::Tv, MediaDomain::Movies] {
+        let tv = media == MediaDomain::Tv;
+        let d = domain(media);
+        let timestamp = now().unwrap();
+        let old_command = cohort_command(&c, media, &base).await;
+        let new_command = cohort_command(&c, media, &base).await;
+        c.execute("INSERT INTO release_profiles(id,media_type,name,enabled,required_json,ignored_json,air_date_restriction,air_date_grace_period_days,allow_season_pack_without_all_episodes_aired)VALUES(?,?,'Cohort',1,'[\"WEB\"]','[]',?,?,?)",params![if tv{100}else{200},d,tv.then_some(0),tv.then_some(0),tv.then_some(0)]).await.unwrap();
+        let mut first = None;
+        for n in 0..129 {
+            let mut item = captured(media, timestamp - 7200);
+            item.title.push_str(&format!(".BATCH{n}"));
+            item.release.metadata.title = Some(item.title.clone());
+            let id = item.id;
+            let mut evidence = crate::release_profile_terms::OperationEvidence::default();
+            crate::search::evaluate_with_evidence(
+                &c,
+                media,
+                old_command.target.indexer_id,
+                &item.release,
+                SearchContext::Rss,
+                timestamp,
+                &mut evidence,
+            )
+            .await
+            .unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .unwrap();
+            insert_captured(&tx, &client, &old_command, item, timestamp, &mut evidence)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            first.get_or_insert(id);
+        }
+        let young = put_capture(&c, &client, &new_command, timestamp - 7200).await;
+        // Same-domain old source becomes restricted; youngest source remains eligible.
+        let mut p = json!({"name":"Scoped","enabled":true,"required":["MISSING_UNIQUE_TERM"],"ignored":[],"tag_ids":[],"indexers":[{"kind":"provider","id":old_command.target.indexer_id}]});
+        if tv {
+            p["excluded_tag_ids"] = json!([]);
+            p["air_date_restriction"] = json!(false);
+            p["air_date_grace_period_days"] = json!(0);
+            p["allow_season_pack_without_all_episodes_aired"] = json!(false);
+        }
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let response = http
+            .post(format!("{base}/api/v1/{d}/release-profiles"))
+            .header("content-type", "application/json")
+            .body(json!({"revision":1,"profile":p}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        let mut operation = crate::release_profile_terms::OperationEvidence::default();
+        let selected = pending::select_work(
+            &db,
+            &client,
+            candidate(&c, first.unwrap()).await.unwrap(),
+            &mut operation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.public.id, young);
+        assert_eq!(
+            selected.public.source.indexer_id,
+            new_command.target.indexer_id
+        );
+
+        let profile_id = if tv { 100 } else { 200 };
+        if tv {
+            // Policy fields are not part of pure term evidence. Identical terms
+            // must still use the new grace under the final writer.
+            c.execute(
+                "UPDATE episodes SET air_date_utc=?",
+                [chrono::DateTime::from_timestamp(timestamp, 0)
+                    .unwrap()
+                    .to_rfc3339()],
+            )
+            .await
+            .unwrap();
+            c.execute("UPDATE release_profiles SET air_date_restriction=1,air_date_grace_period_days=1 WHERE id=?",[profile_id]).await.unwrap();
+            let before = bytes(&c, young).await;
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .unwrap();
+            assert!(
+                settle_local(
+                    &tx,
+                    &client,
+                    &selected.public,
+                    &release(media, timestamp - 7200),
+                    timestamp,
+                    &mut operation
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            let changed = candidate(&tx, young).await.unwrap();
+            assert_eq!(changed.public.reasons, vec!["release_before_air_date"]);
+            tx.rollback().await.unwrap();
+            assert_eq!(bytes(&c, young).await, before);
+            c.execute("UPDATE release_profiles SET air_date_restriction=0,air_date_grace_period_days=0 WHERE id=?",[profile_id]).await.unwrap();
+        }
+        let tagged_id = if tv { 1000 } else { 2000 };
+        c.execute(
+            "INSERT INTO tags(id,media_type,label)VALUES(?,?,'applicability-change')",
+            params![tagged_id, d],
+        )
+        .await
+        .unwrap();
+        c.execute("INSERT INTO release_profiles(id,media_type,name,enabled,required_json,ignored_json,air_date_restriction,air_date_grace_period_days,allow_season_pack_without_all_episodes_aired)VALUES(?,?,'Tagged',1,'[\"TAG_ONLY_COLD\"]','[]',?,?,?)",params![tagged_id,d,tv.then_some(0),tv.then_some(0),tv.then_some(0)]).await.unwrap();
+        c.execute("INSERT INTO release_profile_tags(profile_id,media_type,tag_id,kind)VALUES(?,?,?,'include')",params![tagged_id,d,tagged_id]).await.unwrap();
+        // Real shared assignment writer changes applicability without changing the
+        // release-profile domain revision; the old term evidence cannot authorize it.
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        crate::tags::assign(
+            &tx,
+            media,
+            1,
+            &crate::tags::Assignment {
+                mode: crate::tags::Mode::Add,
+                ids: vec![tagged_id],
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let tagged_before = bytes(&c, young).await;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        assert_eq!(
+            settle_local(
+                &tx,
+                &client,
+                &selected.public,
+                &release(media, timestamp - 7200),
+                timestamp,
+                &mut operation
+            )
+            .await
+            .unwrap_err()
+            .1,
+            "release_term_state_changed"
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(bytes(&c, young).await, tagged_before);
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        crate::tags::assign(
+            &tx,
+            media,
+            1,
+            &crate::tags::Assignment {
+                mode: crate::tags::Mode::Remove,
+                ids: vec![tagged_id],
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let before = bytes(&c, young).await;
+        // Change exact current terms after prewarm: writer cache miss must leave the
+        // pending private payload/deadline intact, not settle a permanent mismatch.
+        let profile_id = if tv { 100 } else { 200 };
+        c.execute(
+            "UPDATE release_profiles SET required_json='[\"CHANGED_COLD_TERM\"]' WHERE id=?",
+            [profile_id],
+        )
+        .await
+        .unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        let outcome = settle_local(
+            &tx,
+            &client,
+            &selected.public,
+            &release(media, timestamp - 7200),
+            timestamp,
+            &mut operation,
+        )
+        .await;
+        assert_eq!(outcome.unwrap_err().1, "release_term_state_changed");
+        tx.rollback().await.unwrap();
+        assert_eq!(bytes(&c, young).await, before);
+        // Actual outside-writer reevaluation warms the new restriction; current writer
+        // then rejects truthfully, with the sibling's ownership unchanged.
+        crate::search::evaluate_with_evidence(
+            &c,
+            media,
+            new_command.target.indexer_id,
+            &release(media, timestamp - 7200),
+            SearchContext::Rss,
+            timestamp,
+            &mut operation,
+        )
+        .await
+        .unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        assert!(
+            settle_local(
+                &tx,
+                &client,
+                &selected.public,
+                &release(media, timestamp - 7200),
+                timestamp,
+                &mut operation
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            candidate(&c, young).await.unwrap().public.status,
+            "rejected"
+        );
+        assert_eq!(
+            candidate(&c, first.unwrap()).await.unwrap().public.status,
+            "pending"
+        );
     }
     server.abort();
     let _ = server.await;

@@ -1,7 +1,7 @@
 //! Bounded pure term matching for release restrictions; applicability belongs to the caller.
 //!
 //! Prepare/evaluate before opening a DB writer. Inside the writer, validate current
-//! inputs and use cached_terms; a cache miss is never a negative restriction result.
+//! inputs and use OperationEvidence for batches; a cache miss is never a negative result.
 //! Dialect limits are explicit errors. This adapter does not claim full .NET/culture
 //! equivalence: duplicate/numbered captures, balancing groups, class subtraction,
 //! ambiguous octal escapes, explicit Unicode properties and unsupported engine constructs
@@ -374,6 +374,126 @@ fn evaluate(prepared: &PreparedTerms, title: &str) -> Result<TermMatches> {
     deadline(started)?;
     Ok(TermMatches { profiles })
 }
+/// One search publication or RSS cohort may outlive global-cache eviction. This
+/// owner retains complete results only, never compiled patterns or private titles.
+/// Drop it when the operation finishes; it does not pin anything in global state.
+/// Callers must also bound the number of concurrent operations.
+pub struct OperationEvidence {
+    entries: Vec<Cached>,
+    bytes: usize,
+}
+/// Supports the largest current cohort without reducing search/RSS page sizes.
+pub const MAX_OPERATION_ENTRIES: usize = 1024;
+/// Covers 1024 maximum-shape results (1024 profile headers + 4096 match indices
+/// each), including allocated vector capacities. Independent of the global cache.
+pub const MAX_OPERATION_BYTES: usize = 128 * 1024 * 1024;
+impl Default for OperationEvidence {
+    fn default() -> Self {
+        let entries = Vec::with_capacity(MAX_OPERATION_ENTRIES);
+        let bytes =
+            std::mem::size_of::<Self>() + entries.capacity() * std::mem::size_of::<Cached>();
+        Self { entries, bytes }
+    }
+}
+impl OperationEvidence {
+    /// Pure, bounded identity verification for a fresh transactional catalog.
+    /// Missing/changed inputs are StateChanged, never an empty match result.
+    pub fn validated(
+        &self,
+        media: MediaDomain,
+        current: &[ProfileTerms],
+        title: &str,
+    ) -> Result<&TermMatches> {
+        self.find(digest_terms(media, current)?, title_digest(title)?)
+            .ok_or(TermError::StateChanged)
+    }
+    fn find(&self, terms: Digest, title: Digest) -> Option<&TermMatches> {
+        self.entries
+            .iter()
+            .find(|e| e.terms == terms && e.title == title)
+            .map(|e| &e.matches)
+    }
+    /// Evaluate outside the writer, preferably reusing one prepared catalog for
+    /// many titles. A cancelled/failed await never publishes partial evidence.
+    pub async fn evaluate(&mut self, prepared: &PreparedTerms, title: &str) -> Result<()> {
+        let key = title_digest(title)?;
+        self.record(prepared.digest(), key, evaluate_terms(prepared, title))
+            .await
+    }
+    /// Convenience for callers without an existing prepared catalog. Exact owner
+    /// and global hits avoid compilation; repeated new titles should use evaluate
+    /// with a shared PreparedTerms instead of recompiling the same catalog.
+    pub async fn evaluate_current(
+        &mut self,
+        media: MediaDomain,
+        current: Vec<ProfileTerms>,
+        title: &str,
+    ) -> Result<()> {
+        let terms = digest_terms(media, &current)?;
+        let key = title_digest(title)?;
+        self.record(terms, key, async {
+            match read_cache(terms, key) {
+                Ok(matches) => Ok(matches),
+                Err(TermError::StateChanged) => {
+                    let prepared = prepare_terms(media, current).await?;
+                    evaluate_terms(&prepared, title).await
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+    async fn record(
+        &mut self,
+        terms: Digest,
+        title: Digest,
+        work: impl std::future::Future<Output = Result<TermMatches>>,
+    ) -> Result<()> {
+        if self.find(terms, title).is_some() {
+            return Ok(());
+        }
+        // A changed input may exceed a full prewarmed cohort. Retry with a fresh
+        // owner; malformed catalog/title limits are still LimitExceeded upstream.
+        if self.entries.len() >= MAX_OPERATION_ENTRIES {
+            return Err(TermError::StateChanged);
+        }
+        let matches = work.await?;
+        let heap = matches_heap_bytes(&matches);
+        let bytes = self
+            .bytes
+            .checked_add(heap)
+            .ok_or(TermError::StateChanged)?;
+        if bytes > MAX_OPERATION_BYTES {
+            return Err(TermError::StateChanged);
+        }
+        // No await after publication starts: cancellation cannot leave half an entry.
+        self.entries.push(Cached {
+            terms,
+            title,
+            matches,
+            bytes: heap,
+        });
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+// Do not reveal user terms, titles, or result contents in diagnostics.
+impl std::fmt::Debug for OperationEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationEvidence")
+            .field("entries", &self.entries.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+fn matches_heap_bytes(matches: &TermMatches) -> usize {
+    matches.profiles.capacity() * std::mem::size_of::<ProfileMatches>()
+        + matches
+            .profiles
+            .iter()
+            .map(|p| (p.required.capacity() + p.ignored.capacity()) * std::mem::size_of::<usize>())
+            .sum::<usize>()
+}
 struct Cached {
     terms: Digest,
     title: Digest,
@@ -398,13 +518,7 @@ fn read_cache(terms: Digest, title: Digest) -> Result<TermMatches> {
         .ok_or(TermError::StateChanged)
 }
 fn write_cache(terms: Digest, title: Digest, matches: TermMatches) -> Result<()> {
-    let bytes = std::mem::size_of::<Cached>()
-        + matches.profiles.capacity() * std::mem::size_of::<ProfileMatches>()
-        + matches
-            .profiles
-            .iter()
-            .map(|p| (p.required.capacity() + p.ignored.capacity()) * std::mem::size_of::<usize>())
-            .sum::<usize>();
+    let bytes = std::mem::size_of::<Cached>() + matches_heap_bytes(&matches);
     if bytes > CACHE_BYTES {
         return Err(TermError::LimitExceeded);
     }

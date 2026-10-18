@@ -61,6 +61,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
     std::fs::create_dir(&scratch.0).unwrap();
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let c = db.connect().await.unwrap();
+    let fixture_indexer_id = fixture_indexer(&c).await;
     c.execute_batch("INSERT INTO series(id,title,path,original_language)VALUES(1,'Harbor','/tv',1);INSERT INTO seasons(series_id,number)VALUES(1,1);INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00');INSERT INTO movie_metadata(id,title,year,runtime,original_language,digital_release)VALUES(1,'Harbor',2020,100,1,'2020-01-01 00:00:00');INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies');INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -121,9 +122,16 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         // revision preference must not invent baseline facts from their old titles.
         // Explicit DoNotPrefer then isolates the original CF-only upgrade checks.
         for context in [SearchContext::UserSearch, SearchContext::Rss] {
-            let decision = search::evaluate(&c, domain, &candidate, context, 1800000000)
-                .await
-                .unwrap();
+            let decision = search::evaluate(
+                &c,
+                domain,
+                fixture_indexer_id,
+                &candidate,
+                context,
+                1800000000,
+            )
+            .await
+            .unwrap();
             assert_eq!(decision.disposition, Disposition::Reject);
             assert_eq!(decision.reasons, vec!["revision_unknown"]);
         }
@@ -153,9 +161,16 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             .unwrap();
         assert_eq!(unchanged, 1);
         for context in [SearchContext::UserSearch, SearchContext::Rss] {
-            let d = search::evaluate(&c, domain, &candidate, context, 1800000000)
-                .await
-                .unwrap();
+            let d = search::evaluate(
+                &c,
+                domain,
+                fixture_indexer_id,
+                &candidate,
+                context,
+                1800000000,
+            )
+            .await
+            .unwrap();
             assert_eq!(d.disposition, Disposition::Accept, "{:?}", d.reasons);
             assert_eq!(d.custom_formats.unwrap().score, 10);
         }
@@ -169,6 +184,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -183,6 +199,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -200,6 +217,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000
@@ -220,6 +238,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000
@@ -247,6 +266,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -271,6 +291,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             let decision = search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000,
@@ -677,4 +698,13 @@ async fn final_format_delete_resets_only_its_domain_atomically_and_survives_reop
             }
         }
     }
+}
+
+async fn fixture_indexer(c: &libsql::Connection) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'torznab','Decision fixture',1,1,1,1,'http://fixture.invalid')", [id.to_string()]).await.unwrap();
+    for media in ["tv", "movies"] {
+        c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year)VALUES(?,'torznab',?,'[2000,5000]','[]',?,?)", libsql::params![id.to_string(),media,(media=="tv").then_some(0),(media=="movies").then_some(0)]).await.unwrap();
+    }
+    id
 }

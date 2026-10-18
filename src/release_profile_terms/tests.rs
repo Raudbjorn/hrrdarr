@@ -330,4 +330,108 @@ async fn worker_cache_identity_and_cancellation_are_bounded() {
     );
     let cache = CACHE.get().unwrap().lock().unwrap();
     assert!(cache.entries.len() <= CACHE_ENTRIES && cache.bytes <= CACHE_BYTES);
+    drop(cache);
+    operation_evidence_survives_eviction().await;
+}
+
+async fn operation_evidence_survives_eviction() {
+    let input = terms(&["operation-title"], &["absent"]);
+    let prepared = prepare_terms(MediaDomain::Tv, input.clone()).await.unwrap();
+    let mut evidence = OperationEvidence::default();
+    // More than the global cache and the largest supported publication page.
+    for n in 0..MAX_OPERATION_ENTRIES {
+        evidence
+            .evaluate(&prepared, &format!("operation-title-{n}"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        cached_terms(MediaDomain::Tv, &input, "operation-title-0"),
+        Err(TermError::StateChanged)
+    );
+    for n in 0..MAX_OPERATION_ENTRIES {
+        let title = format!("operation-title-{n}");
+        let result = evidence.validated(MediaDomain::Tv, &input, &title).unwrap();
+        assert_eq!(result.profiles[0].required, vec![0]);
+        assert!(result.profiles[0].ignored.is_empty());
+    }
+    assert_eq!(
+        evidence.validated(MediaDomain::Movies, &input, "operation-title-0"),
+        Err(TermError::StateChanged)
+    );
+    assert_eq!(
+        evidence.validated(
+            MediaDomain::Tv,
+            &terms(&["changed"], &[]),
+            "operation-title-0"
+        ),
+        Err(TermError::StateChanged)
+    );
+    assert_eq!(
+        evidence.validated(MediaDomain::Tv, &input, "Operation-title-0"),
+        Err(TermError::StateChanged)
+    );
+    assert_eq!(
+        evidence
+            .evaluate(&prepared, "operation-title-over-limit")
+            .await,
+        Err(TermError::StateChanged)
+    );
+    // Existing entries remain usable at capacity, including the convenience path.
+    evidence
+        .evaluate_current(MediaDomain::Tv, input.clone(), "operation-title-0")
+        .await
+        .unwrap();
+    assert_eq!(evidence.entries.len(), MAX_OPERATION_ENTRIES);
+    assert!(evidence.bytes <= MAX_OPERATION_BYTES);
+    assert_eq!(
+        evidence
+            .evaluate(&prepared, &"x".repeat(MAX_TITLE_BYTES + 1))
+            .await,
+        Err(TermError::LimitExceeded)
+    );
+
+    let mut fresh = OperationEvidence::default();
+    fresh
+        .evaluate_current(MediaDomain::Tv, input.clone(), "operation-convenience-miss")
+        .await
+        .unwrap();
+    let before = fresh.bytes;
+    let key = title_digest("cancelled-proof").unwrap();
+    {
+        let mut pending = Box::pin(fresh.record(prepared.digest(), key, std::future::pending()));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Dropping an in-flight owner borrow publishes nothing.
+    }
+    assert_eq!(fresh.bytes, before);
+    assert!(fresh.find(prepared.digest(), key).is_none());
+    for error in [TermError::Timeout, TermError::Busy, TermError::WorkerFailed] {
+        assert_eq!(
+            fresh
+                .record(prepared.digest(), key, std::future::ready(Err(error)))
+                .await,
+            Err(error)
+        );
+        assert!(fresh.find(prepared.digest(), key).is_none());
+        assert_eq!(fresh.bytes, before);
+    }
+    // Exercise the byte ceiling without allocating 128 MiB in a unit test.
+    fresh.bytes = MAX_OPERATION_BYTES;
+    assert_eq!(
+        fresh
+            .record(
+                prepared.digest(),
+                key,
+                std::future::ready(Ok(TermMatches {
+                    profiles: vec![ProfileMatches::default()],
+                }))
+            )
+            .await,
+        Err(TermError::StateChanged)
+    );
+    assert!(fresh.find(prepared.digest(), key).is_none());
 }

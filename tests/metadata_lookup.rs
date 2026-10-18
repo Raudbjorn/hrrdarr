@@ -683,6 +683,10 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     let scratch = Scratch::new();
     let source = Arc::new(Mutex::new(show()));
     source.lock().unwrap()["originalLanguage"] = json!("ara");
+    source.lock().unwrap()["network"] = json!(" RÚV ");
+    source.lock().unwrap()["originalCountry"] = json!("isl");
+    source.lock().unwrap()["status"] = json!("Ended");
+    source.lock().unwrap()["genres"] = json!(["Drama", "drama", "Comedy"]);
     let upstream = Router::new()
         .route(
             "/shows/en/{id}",
@@ -724,6 +728,8 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     let id = added["id"].as_i64().unwrap();
     let c = db.connect().await.unwrap();
     assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 26); // TV Arabic is 26; movies use 31.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network=' RÚV ' AND original_country='ISL' AND status='ended' AND genres_json='[\"Comedy\",\"Drama\"]'").await, 1);
+    c.execute_batch("INSERT INTO tags(id,media_type,label) VALUES(1,'tv','keep'); INSERT INTO series_tags(series_id,tag_id) SELECT id,1 FROM series;").await.unwrap();
     c.execute(
         "INSERT INTO episode_files(id,series_id,path)VALUES(1,?,'/owned-fixture/original.mkv')",
         [id],
@@ -765,6 +771,33 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
             1
         );
     }
+    // All sparse language-only responses also preserve the other known facts.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network=' RÚV ' AND original_country='ISL' AND status='ended' AND genres_json='[\"Comedy\",\"Drama\"]'").await, 1);
+    // A successful supplied status restores an owner previously marked deleted.
+    c.execute("UPDATE series SET status='deleted' WHERE tvdb_id=101", ())
+        .await
+        .unwrap();
+    for genres in [json!([]), Value::Null] {
+        let mut body = show();
+        body["genres"] = genres;
+        body["network"] = json!("New network");
+        body["status"] = json!("Novel running status");
+        *source.lock().unwrap() = body;
+        let tx = c.transaction().await.unwrap();
+        refresh::apply(
+            &tx,
+            &captured,
+            Details::Series(metadata.series(101).await.unwrap()),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network='New network' AND status='continuing' AND original_country='ISL' AND genres_json='[]'").await, 1);
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM series_tags WHERE tag_id=1").await,
+            1
+        );
+    }
     // Invalid producer values never enter the write transaction.
     for wire in [
         json!(31),
@@ -778,6 +811,8 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     }
     source.lock().unwrap()["originalLanguage"] = json!("ar");
     source.lock().unwrap()["title"] = json!("Must roll back");
+    source.lock().unwrap()["network"] = json!("Rollback network");
+    source.lock().unwrap()["genres"] = json!(["Rollback"]);
     c.execute_batch("CREATE TRIGGER fixture_metadata_failure BEFORE UPDATE ON episodes BEGIN SELECT RAISE(ABORT,'fixture late failure'); END;").await.unwrap();
     source.lock().unwrap()["episodes"][1]["title"] = json!("Changed");
     let tx = c.transaction().await.unwrap();
@@ -791,6 +826,7 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
         .is_err()
     );
     tx.rollback().await.unwrap();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network='New network' AND genres_json='[]' AND status='continuing'").await, 1);
     assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
     assert_eq!(
         scalar(
@@ -836,6 +872,11 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     drop(db);
     let db = Database::open_local(&path).await.unwrap();
     let c = db.connect().await.unwrap();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=101 AND network='New network' AND genres_json='[]' AND status='continuing'").await, 1);
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series_tags WHERE tag_id=1").await,
+        1
+    );
     assert_eq!(
         scalar(&c, "SELECT original_language FROM series WHERE tvdb_id=101").await,
         9

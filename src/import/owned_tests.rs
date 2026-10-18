@@ -104,8 +104,10 @@ pub(super) async fn fixture(
     )
     .await
     .unwrap();
+    // Migration 0041 adds inheritance; this recovery fixture intentionally owns
+    // explicit-on copy authority at revision 1, rather than inheriting a default.
     c.execute(
-        "INSERT INTO download_processing_policies VALUES(?,?,1,1,1,'copy')",
+        "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode,enabled_override) VALUES(?,?,1,1,1,'copy',1)",
         params![client, domain],
     )
     .await

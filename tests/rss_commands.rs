@@ -36,6 +36,7 @@ impl Drop for Server {
 struct Remote {
     items: Mutex<Vec<Value>>,
     adds: Mutex<Vec<String>>,
+    indexer_requests: Mutex<Vec<String>>,
     mode: AtomicU8,
     v2: AtomicU8,
     date: Mutex<Option<String>>,
@@ -60,6 +61,7 @@ async fn remote(
             .into_owned()
             .collect();
     if uri.path() == "/api" || uri.path() == "/" {
+        s.indexer_requests.lock().unwrap().push(uri.to_string());
         if s.mode.load(Ordering::SeqCst) == 8 {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -244,7 +246,8 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
     let (base, server) = serve(
         router
             .merge(commands::router(db.clone()))
-            .merge(hrrdarr::delay_profiles::router(db)),
+            .merge(hrrdarr::delay_profiles::router(db.clone()))
+            .merge(hrrdarr::release_profiles::router(db)),
     )
     .await;
     (base, server, client)
@@ -930,17 +933,51 @@ async fn delayed_payloads_are_private_and_missing_key_rejects_without_starvation
     let (router, client) = providers::router_with_refresh(db.clone(), None);
     let (base, _server) = serve(router.merge(commands::router(db.clone()))).await;
     db.connect().await.unwrap().execute_batch("CREATE TABLE owned_order(seq INTEGER PRIMARY KEY,kind TEXT); CREATE TRIGGER owned_candidate AFTER UPDATE ON rss_candidates WHEN NEW.status='rejected' BEGIN INSERT INTO owned_order(kind)VALUES('candidate'); END; CREATE TRIGGER owned_command AFTER UPDATE ON blocklist_clear_commands WHEN NEW.status='running' BEGIN INSERT INTO owned_order(kind)VALUES('command'); END;").await.unwrap();
-    for media in ["tv", "movies"] {
-        assert_eq!(
-            request(
-                &base,
-                "POST",
-                "/api/v1/blocklist/clear-commands",
-                json!({"target":{"media_type":media},"priority":"normal"})
+    let candidate_created_at = {
+        let c = db.connect().await.unwrap();
+        let row = c
+            .query(
+                "SELECT count(*),max(created_at) FROM rss_candidates WHERE status='pending'",
+                (),
             )
             .await
-            .0,
-            202
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 2);
+        row.get::<i64>(1).unwrap()
+    };
+    // Claims order equal priorities by whole-second created_at, then UUID, not
+    // admission order. Establish the strict age assumed by the assertion below
+    // through the real clock/API rather than bypassing immutable timestamps.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if i64::try_from(now).unwrap() > candidate_created_at {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("setup clock must advance beyond the captured candidate creation second");
+    for media in ["tv", "movies"] {
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/blocklist/clear-commands",
+            json!({"target":{"media_type":media},"priority":"normal"}),
+        )
+        .await;
+        assert_eq!(code, 202, "{command}");
+        assert!(
+            command["created_at"].as_i64().unwrap() > candidate_created_at,
+            "clear command must be strictly newer than both candidates: {command}; candidate max={candidate_created_at}"
         );
     }
     let runtime = commands::start(db.clone(), client).await.unwrap();
@@ -1148,7 +1185,12 @@ async fn delayed_release_never_silently_switches_to_a_new_library_target() {
 
 #[tokio::test]
 async fn pending_cross_command_winner_keeps_provider_and_submits_once() {
-    for media in ["tv", "movies"] {
+    for (media, restriction) in [
+        ("tv", false),
+        ("movies", false),
+        ("tv", true),
+        ("movies", true),
+    ] {
         let scratch = Scratch(std::env::temp_dir().join(format!(
             "hrrdarr-rss-cohort-worker-{}",
             uuid::Uuid::new_v4()
@@ -1204,12 +1246,25 @@ async fn pending_cross_command_winner_keeps_provider_and_submits_once() {
         runtime.shutdown().await;
         assert!(old_state.adds.lock().unwrap().is_empty());
         assert!(young_state.adds.lock().unwrap().is_empty());
-        c.execute(
-            "UPDATE providers SET enabled=0,revision=revision+1 WHERE id=?",
-            [old_indexer["id"].as_str().unwrap()],
-        )
-        .await
-        .unwrap();
+        if restriction {
+            let mut profile = admission_profile(media);
+            profile["indexers"] = json!([{"kind":"provider","id":old_indexer["id"]}]);
+            let (code, value) = request(
+                &base,
+                "POST",
+                &format!("/api/v1/{media}/release-profiles"),
+                json!({"revision":1,"profile":profile}),
+            )
+            .await;
+            assert_eq!(code, 201, "{value}");
+        } else {
+            c.execute(
+                "UPDATE providers SET enabled=0,revision=revision+1 WHERE id=?",
+                [old_indexer["id"].as_str().unwrap()],
+            )
+            .await
+            .unwrap();
+        }
         save_delay(&base, media, 10).await;
         let young_id: String = c
             .query(
@@ -1361,6 +1416,334 @@ async fn prepared_owner_still_rechecks_increased_delay_before_post() {
         assert_eq!(rejected["error_code"], "target_changed");
         assert_eq!(rejected["reasons"], json!([]));
         assert!(state.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+    }
+}
+
+fn admission_profile(media: &str) -> Value {
+    let mut p = json!({"name":"Admission","enabled":true,"required":["NEVER_MATCH_THIS_TITLE"],"ignored":[],"tag_ids":[],"indexers":[]});
+    if media == "tv" {
+        p["excluded_tag_ids"] = json!([]);
+        p["air_date_restriction"] = json!(false);
+        p["air_date_grace_period_days"] = json!(0);
+        p["allow_season_pack_without_all_episodes_aired"] = json!(false);
+    }
+    p
+}
+#[tokio::test]
+async fn release_restriction_change_during_preparation_never_posts() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-restriction-held-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let state = Arc::new(Remote::default());
+        state.mode.store(4, Ordering::SeqCst);
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(state.clone()),
+        )
+        .await;
+        *state.endpoint.lock().unwrap() = remote_base.clone();
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let command = enqueue(&base, target(&indexer, &download, media)).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+            .await
+            .unwrap();
+        let c = db.connect().await.unwrap();
+        let id = c
+            .query(
+                "SELECT id FROM rss_candidates WHERE command_id=?",
+                [command["id"].as_str().unwrap()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap();
+        let payload_before: Vec<u8> = c
+            .query(
+                "SELECT private_payload FROM rss_candidates WHERE id=?",
+                [id.clone()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        // A unique term forces cold writer evidence even when another serial test
+        // has warmed the global cache. The writer must retry without submitting.
+        let mut profile = admission_profile(media);
+        profile["required"] = json!([format!("NEVER_{}", uuid::Uuid::new_v4())]);
+        let (code, value) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/{media}/release-profiles"),
+            json!({"revision":1,"profile":profile}),
+        )
+        .await;
+        assert_eq!(code, 201, "{value}");
+        let released_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        state.release.notify_one();
+        let retry = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let (code, value) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(code, 200, "{value}");
+                if value["status"] == "retry_wait" {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("cold policy evidence must retain a retryable parent");
+        assert_eq!(retry["error_code"], "storage_error");
+        assert_eq!(retry["attempts"], 1);
+        assert_eq!(retry["fetch_complete"], true);
+        let retry_deadline = retry["next_attempt_at"].as_i64().unwrap();
+        assert!((released_at + 30..=released_at + 42).contains(&retry_deadline));
+        assert_eq!(retry["completed_at"], Value::Null);
+        let pending = receipt_until(&base, "pending").await;
+        assert_eq!(pending["id"], id);
+        assert!(state.adds.lock().unwrap().is_empty());
+        let payload_after: Vec<u8> = c
+            .query(
+                "SELECT private_payload FROM rss_candidates WHERE id=?",
+                [id.clone()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(payload_after, payload_before);
+        let rejected = if media == "tv" {
+            // A real accepted save wakes pending ownership and its parent atomically.
+            let (code, saved) = request(
+                &base,
+                "PUT",
+                &format!(
+                    "/api/v1/{media}/release-profiles/{}",
+                    value["profiles"][0]["id"].as_i64().unwrap()
+                ),
+                json!({"revision":value["revision"],"profile":profile}),
+            )
+            .await;
+            assert_eq!(code, 200, "{saved}");
+            receipt_until(&base, "rejected").await
+        } else {
+            // Observe the actual 30-second automatic retry without a settings wake.
+            // This separate bound includes that backoff; existing request/receipt
+            // timeouts remain unchanged for all immediate-settlement scenarios.
+            tokio::time::timeout(Duration::from_secs(45), async {
+                loop {
+                    let (code, values) =
+                        request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
+                    assert_eq!(code, 200, "{values}");
+                    if let Some(value) = values["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|v| v["id"] == id && v["status"] == "rejected")
+                    {
+                        break value.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("automatic retry must evaluate fresh policy after its backoff")
+        };
+        assert_eq!(rejected["id"], id);
+        // A current policy veto records its precise decision reason; target_changed
+        // is reserved for identity changes or a prepared candidate becoming delayed.
+        assert_eq!(rejected["error_code"], Value::Null);
+        assert_eq!(
+            rejected["reasons"],
+            json!(["release_required_term_missing"])
+        );
+        assert!(state.adds.lock().unwrap().is_empty());
+        assert_eq!(
+            c.query("SELECT count(*) FROM rss_hash_claims", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_rss_schedule_and_queued_revision_send_no_http() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-rss-operation-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let peer = Arc::new(Remote::default());
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(peer.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let queued = enqueue(&base, target(&indexer, &download, media)).await;
+        let (code, schedule) = request(
+            &base,
+            "POST",
+            "/api/v1/rss/schedules",
+            json!({"target":target(&indexer,&download,media),"interval_seconds":60,"enabled":true}),
+        )
+        .await;
+        assert_eq!(code, 200, "{schedule}");
+        let mut settings = indexer["settings"].clone();
+        settings[media]["enable_rss"] = json!(false);
+        let (code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",indexer["id"].as_str().unwrap()),json!({"revision":indexer["revision"],"name":"RSS disabled","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        assert_eq!(request(&base,"POST","/api/v1/rss/schedules",json!({"revision":schedule["revision"],"target":target(&updated,&download,media),"interval_seconds":60,"enabled":true})).await.0,409);
+        // Advance only the owned scheduler fixture deadline; provider policy uses the real API.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE rss_schedules SET next_run_at=0", ())
+            .await
+            .unwrap();
+        let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
+        assert_eq!(until(&base, &queued["id"]).await["status"], "failed");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, rows) = request(&base, "GET", "/api/v1/rss/schedules", Value::Null).await;
+                if rows[0]["enabled"] == false {
+                    assert_eq!(rows[0]["error_code"], "provider_changed");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("stale schedule records disabled provider policy");
+        assert!(
+            peer.indexer_requests.lock().unwrap().is_empty(),
+            "stale queued feed and schedule must send neither CAPS nor query"
+        );
+        assert!(peer.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+        // Search switches are independent: re-enable RSS alone and execute actual feed/send.
+        let mut settings = updated["settings"].clone();
+        settings[media]["enable_rss"] = json!(true);
+        settings[media]["enable_automatic_search"] = json!(false);
+        settings[media]["enable_interactive_search"] = json!(false);
+        let(code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",updated["id"].as_str().unwrap()),json!({"revision":updated["revision"],"name":"RSS only","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        let runtime = commands::start(db, client).await.unwrap();
+        let command = enqueue(&base, target(&updated, &download, media)).await;
+        let done = until(&base, &command["id"]).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["observed"], 1, "{done}");
+        assert_eq!(peer.adds.lock().unwrap().len(), 1);
+        assert!(!peer.indexer_requests.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_retry_wait_feed_never_reuses_changed_revision() {
+    for media in ["tv", "movies"] {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-rss-policy-retry-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let peer = Arc::new(Remote::default());
+        peer.mode.store(8, Ordering::SeqCst);
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(peer.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
+        let command = enqueue(&base, target(&indexer, &download, media)).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, row) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", command["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                if row["status"] == "retry_wait" {
+                    assert_eq!(row["attempts"], 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("real remote rate limit leaves retry intent");
+        runtime.shutdown().await;
+        let before = peer.indexer_requests.lock().unwrap().len();
+        assert!(before > 0);
+        let mut settings = indexer["settings"].clone();
+        settings[media]["enable_rss"] = json!(false);
+        let (code,updated)=request(&base,"PUT",&format!("/api/v1/providers/{}",indexer["id"].as_str().unwrap()),json!({"revision":indexer["revision"],"name":"policy changed","enabled":true,"priority":1,"settings":settings})).await;
+        assert_eq!(code, 200, "{updated}");
+        peer.mode.store(0, Ordering::SeqCst);
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE rss_commands SET next_attempt_at=0 WHERE status='retry_wait'",
+                (),
+            )
+            .await
+            .unwrap();
+        let runtime = commands::start(db, client).await.unwrap();
+        let done = until(&base, &command["id"]).await;
+        assert_eq!(done["status"], "failed", "{done}");
+        assert_eq!(
+            peer.indexer_requests.lock().unwrap().len(),
+            before,
+            "retry must reject captured stale revision before CAPS"
+        );
+        assert!(peer.adds.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
 }
