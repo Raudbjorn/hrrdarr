@@ -26,7 +26,7 @@ pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
     HealthTransition, HealthTransitions, router,
 };
-pub(crate) use engine::{claim, recover, run, startup, sweep};
+pub(crate) use engine::{PROVIDER_COOLDOWN, claim, recover, run, startup, sweep};
 const MAX_INTEGER: i64 = 9_007_199_254_740_991;
 const STARTUP: i64 = 1;
 const SCHEDULED: i64 = 2;

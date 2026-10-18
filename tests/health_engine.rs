@@ -97,6 +97,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let expected = ["tv", "movies"]
         .into_iter()
         .flat_map(|scope| {
+            // Reasoning: 0051 registers download_client_backoff per domain.
             [
                 "completed_download_handling",
                 "download_client_backoff",
