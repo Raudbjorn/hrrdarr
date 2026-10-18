@@ -26,6 +26,7 @@ use std::{collections::BTreeSet, future::Future};
 
 pub mod aria2;
 pub mod deluge;
+pub mod flood;
 pub mod rtorrent;
 pub mod utorrent;
 
@@ -784,6 +785,24 @@ macro_rules! with_wire {
                     $operation,
                     endpoint,
                     $credentials,
+                )?;
+                $body
+            }
+            ProviderSettings::Flood {
+                endpoint,
+                tv,
+                movies,
+            } => {
+                let labels = [tv, movies]
+                    .into_iter()
+                    .flatten()
+                    .map(|scope| scope.category.clone())
+                    .collect();
+                let mut $wire = $crate::providers::label_client::flood::FloodWire::new(
+                    $operation,
+                    endpoint,
+                    $credentials,
+                    labels,
                 )?;
                 $body
             }
