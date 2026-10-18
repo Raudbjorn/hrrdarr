@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 61); // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {

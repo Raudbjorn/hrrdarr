@@ -92,4 +92,9 @@ test('history renders native deletion events with recycle path or permanent note
   assert.ok(recycled.facts.some(f=>f.label==='Recycle bin path'&&f.value==='/r/S/a.mkv'&&f.recorded));
   const permanent=describeEvent(event({recycle_path:null,target:{media_type:'movie',id:4}}));
   assert.equal(permanent.eventLabel,'File deleted');assert.equal(permanent.domain,'Movies');assert.equal(permanent.warnings.length,1,'tv file on a movie target is flagged');
+  // An upgrade recycle shares the deletion origin; only its reason distinguishes it.
+  const upgrade=describeEvent(event({reason:'upgrade',deletion_id:'r1'}));
+  assert.equal(upgrade.eventLabel,'Replaced file moved to recycle bin');
+  assert.ok(upgrade.facts.some(f=>f.label==='Reason'&&f.value==='Upgrade (an import replaced this file)'));
+  assert.ok(upgrade.facts.some(f=>f.label==='Recycle bin path'&&f.value==='/r/S/a.mkv'&&f.recorded));
 });

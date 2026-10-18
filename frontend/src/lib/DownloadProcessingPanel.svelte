@@ -91,7 +91,10 @@
         <p>Preflight attempts: {row.preflight_attempts} this round, {row.total_preflight_attempts} total. Provider revision {row.provider_revision}.</p>
         {#if row.operation_id}<p>Import {row.operation_id}: {row.import_phase??'Awaiting status'}</p>{/if}
         {#if row.resume_requested}<p role="status">Resume requested; waiting for an import worker. The same operation will continue.</p>{/if}
-        {#if row.retirement_state==='quarantined'}<p>Previous file retained in a private recovery location. Recovery bytes are not automatically deleted.</p>
+        {#if row.retirement_state==='quarantined' && row.recycle_state==='complete'}<p>Previous file moved to the recycle bin. Recycle bin cleanup removes it after the configured retention.</p>
+        {:else if row.retirement_state==='quarantined' && row.recycle_state==='retained'}<p role="alert">Previous file could not be moved to the recycle bin. It is retained in a private recovery location and is not automatically deleted; check the recycle bin health.</p>
+        {:else if row.retirement_state==='quarantined' && row.recycle_state}<p>Moving the previous file to the recycle bin is pending. Its bytes are retained.</p>
+        {:else if row.retirement_state==='quarantined'}<p>Previous file retained in a private recovery location. Recovery bytes are not automatically deleted.</p>
         {:else if row.retirement_state==='shared_retained'}<p>Previous file retained because other episodes still use it.</p>
         {:else if row.retirement_state==='pending'}<p>Previous file retirement is pending. Original or recovery bytes are retained.</p>{/if}
         {#if row.error_code && row.status !== 'imported' && row.import_phase !== 'complete'}<p role="alert">{row.error_code}{row.reasons.filter(reason=>!reason.startsWith('hc021_')).length?`: ${row.reasons.filter(reason=>!reason.startsWith('hc021_')).join(', ')}`:''}</p>{/if}

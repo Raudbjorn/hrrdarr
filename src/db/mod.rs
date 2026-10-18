@@ -256,6 +256,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "recycle_bin",
         include_str!("../../migrations/0060_recycle_bin.sql"),
     ),
+    (
+        "upgrade_recycle",
+        include_str!("../../migrations/0061_upgrade_recycle.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

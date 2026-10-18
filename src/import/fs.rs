@@ -764,6 +764,17 @@ impl OldFile {
         })()
         .map_err(|e: Error| e.at(PathRole::Retirement))
     }
+    /// Captured device, inode, size and modification time of the original. Renames into the
+    /// recovery artifact keep all four, so the artifact is re-identified by them.
+    pub(super) fn bin_identity(&self) -> crate::recycle_bin::fsops::Identity {
+        crate::recycle_bin::fsops::Identity {
+            dev: self.file.dev,
+            ino: self.file.ino,
+            size: self.file.size,
+            mtime: self.file.mtime,
+            mtime_ns: self.file.mtime_ns,
+        }
+    }
     pub(super) fn recovery_path(&self) -> Result<String> {
         let path = parts(&self.path)?
             .0

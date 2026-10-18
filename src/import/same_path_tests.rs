@@ -1,7 +1,7 @@
 //! Same-path evidence uses real owned preparation; only upstream receipt facts are seeded.
 use super::*;
 
-async fn fixture(
+pub(super) async fn fixture(
     dir: &Scratch,
     db: &Arc<Database>,
     movie: bool,

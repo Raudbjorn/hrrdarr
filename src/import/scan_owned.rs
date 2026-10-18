@@ -447,6 +447,39 @@ async fn referenced(c: &Connection, file: i64) -> Result<bool> {
     .await?
     .is_some())
 }
+/// Quarantined originals with every member episode that each one served (one entry per
+/// distinct original, so a multi-episode original is listed, and recycled, once).
+pub(super) async fn quarantined(
+    c: &Connection,
+    operation: &str,
+    target: &MediaTarget,
+) -> Result<Vec<super::recycle::Retired>> {
+    let f = facts(c, operation).await?;
+    let mut out = Vec::new();
+    for r in f.replacements {
+        if r.state != "quarantined" {
+            continue;
+        }
+        let targets = match target {
+            MediaTarget::Episode(_) => f
+                .members
+                .iter()
+                .filter(|(_, old)| *old == Some(r.old.file_id))
+                .map(|(episode, _)| MediaTarget::Episode(*episode))
+                .collect::<Vec<_>>(),
+            MediaTarget::Movie(movie) => vec![MediaTarget::Movie(*movie)],
+        };
+        if targets.is_empty() {
+            return Err(Error::internal());
+        }
+        out.push(super::recycle::Retired {
+            old: r.old,
+            targets,
+        });
+    }
+    Ok(out)
+}
+
 /// Each distinct original is checkpointed independently: shared originals stay in place,
 /// others move into a private per-original recovery directory. Bytes are never deleted.
 pub(super) async fn retire(

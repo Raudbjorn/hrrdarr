@@ -191,10 +191,10 @@ export function describeEvent(event: HistoryEvent): HistoryEventView {
     if (fileDomain !== domain) warnings.push(`Historical file domain (${fileDomain}) does not match the target domain (${domain}).`);
     return {
       key: `deletion:${event.id}`, origin: 'native_deletion', originLabel: 'Native file deletion', domain, target: label,
-      eventLabel: event.recycle_path === null ? 'File deleted' : 'File deleted (moved to recycle bin)',
+      eventLabel: event.reason === 'upgrade' ? 'Replaced file moved to recycle bin' : event.recycle_path === null ? 'File deleted' : 'File deleted (moved to recycle bin)',
       sourceEventType: null, sourceCodeNote: null, time: event.deleted_at, timeLabel: 'Record removed (UTC)',
       facts: [
-        fact('Deletion', event.deletion_id), fact('Reason', event.reason === 'manual' ? 'Manual (explicit request)' : event.reason),
+        fact('Deletion', event.deletion_id), fact('Reason', event.reason === 'manual' ? 'Manual (explicit request)' : event.reason === 'upgrade' ? 'Upgrade (an import replaced this file)' : event.reason),
         fact('Historical file', `${fileDomain} file ${event.file.id}`), fact('Path (as recorded)', event.path),
         { label: 'Recycle bin path', value: event.recycle_path ?? 'none — permanent or already missing', recorded: event.recycle_path !== null },
       ],

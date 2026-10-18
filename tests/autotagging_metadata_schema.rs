@@ -554,7 +554,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        60 // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+        61 // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -696,7 +696,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        60 // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+        61 // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

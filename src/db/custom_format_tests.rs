@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 61); // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

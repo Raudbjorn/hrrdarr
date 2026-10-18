@@ -1,5 +1,7 @@
 #[path = "owned_tests.rs"]
 mod owned_cases;
+#[path = "recycle_tests.rs"]
+mod recycle_cases;
 #[path = "same_path_tests.rs"]
 mod same_path_cases;
 use super::*;
@@ -95,6 +97,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     manual_hidden_extension_filename_preserves_explicit_mapping().await;
     owned_cases::replacements().await;
     same_path_cases::replacements().await;
+    recycle_cases::upgrades().await;
     // These use the real phase helpers and reopen the owned database between interruption and
     // execute. Boundary setup stops before the next journal write; it does not mock recovery.
     for movie in [false, true] {

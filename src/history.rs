@@ -92,10 +92,14 @@ pub enum DeletionEventType {
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum DeletionReason {
+    // An explicit file deletion request.
     Manual,
+    // An import replaced the file and moved the original into the domain's recycle bin.
+    Upgrade,
 }
-/// One explicit file deletion as it affected one target; a shared multi-episode file yields one
-/// event per detached episode, all with the same `deletion_id`.
+/// One explicit file deletion (reason `manual`) or upgrade recycle (reason `upgrade`) as it
+/// affected one target; a shared multi-episode file yields one event per detached episode, all
+/// with the same `deletion_id` (the upgrade recycle journal ID for reason `upgrade`).
 #[derive(Serialize, ts_rs::TS)]
 pub struct NativeDeletionEvent {
     pub id: Uuid,
@@ -347,7 +351,7 @@ fn source_event(row: libsql::Row) -> Result<SourceHistoryEvent> {
         languages,
     })
 }
-fn deletion_event(row: libsql::Row) -> Result<NativeDeletionEvent> {
+fn deletion_event(row: libsql::Row, reason: DeletionReason) -> Result<NativeDeletionEvent> {
     let id = Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| storage())?;
     let (target, media_type) = match row.get::<String>(1)?.as_str() {
         "episode" => (
@@ -372,7 +376,7 @@ fn deletion_event(row: libsql::Row) -> Result<NativeDeletionEvent> {
         id,
         deletion_id: Uuid::parse_str(&row.get::<String>(22)?).map_err(|_| storage())?,
         event_type: DeletionEventType::FileDeleted,
-        reason: DeletionReason::Manual,
+        reason,
         target,
         file: HistoricalFile {
             media_type,
@@ -389,7 +393,8 @@ fn event(row: libsql::Row) -> Result<HistoryEvent> {
     match row.get::<i64>(11)? {
         0 => native_event(row).map(HistoryEvent::NativeImport),
         1 => source_event(row).map(HistoryEvent::SourceSnapshot),
-        2 => deletion_event(row).map(HistoryEvent::NativeDeletion),
+        2 => deletion_event(row, DeletionReason::Manual).map(HistoryEvent::NativeDeletion),
+        3 => deletion_event(row, DeletionReason::Upgrade).map(HistoryEvent::NativeDeletion),
         _ => Err(storage()),
     }
 }
@@ -404,6 +409,9 @@ pub(crate) fn page_sql(predicate: &str) -> String {
     ), deletion_keys AS (
         SELECT h.id AS native_id,h.deleted_at AS event_at FROM file_deletion_history h {deletion_predicate}
         ORDER BY h.deleted_at DESC,h.id DESC LIMIT ?
+    ), recycle_keys AS (
+        SELECT h.id AS native_id,h.deleted_at AS event_at FROM upgrade_recycle_history h {deletion_predicate}
+        ORDER BY h.deleted_at DESC,h.id DESC LIMIT ?
     ), source_keys AS (
         SELECT h.application,h.fingerprint,h.source_id,h.occurred_at AS event_at FROM snapshot_history_events h {source_predicate}
         ORDER BY h.occurred_at DESC,h.application ASC,h.fingerprint ASC,h.source_id DESC LIMIT ?
@@ -414,22 +422,25 @@ pub(crate) fn page_sql(predicate: &str) -> String {
             SELECT 1,NULL,event_at,application,fingerprint,source_id FROM source_keys
             UNION ALL
             SELECT 2,native_id,event_at,NULL,NULL,NULL FROM deletion_keys
+            UNION ALL
+            SELECT 3,native_id,event_at,NULL,NULL,NULL FROM recycle_keys
         ) ORDER BY event_at DESC,origin_rank ASC,native_id DESC,application ASC,fingerprint ASC,source_id DESC LIMIT ? OFFSET ?
-    ) SELECT COALESCE(n.operation_id,d.id),COALESCE(n.media_type,e.media_type,d.media_type),COALESCE(n.episode_id,e.episode_id,d.episode_id),COALESCE(n.movie_id,e.movie_id,d.movie_id),
+    ) SELECT COALESCE(n.operation_id,d.id,u.id),COALESCE(n.media_type,e.media_type,d.media_type,u.media_type),COALESCE(n.episode_id,e.episode_id,d.episode_id,u.episode_id),COALESCE(n.movie_id,e.movie_id,d.movie_id,u.movie_id),
         n.episode_file_id,n.movie_file_id,n.source,n.destination,n.size,n.sha256,s.event_at,s.origin_rank,
         e.application,e.fingerprint,e.source_id,e.event_type,e.source_event_type,e.source_title,e.download_id,e.quality_id,e.quality_revision_json,e.languages_json,
-        d.deletion_id,d.file_id,d.path,d.recycle_path
+        COALESCE(d.deletion_id,u.recycle_id),COALESCE(d.file_id,u.file_id),COALESCE(d.path,u.path),COALESCE(d.recycle_path,u.recycle_path)
     FROM selected s
     LEFT JOIN import_history n ON s.origin_rank=0 AND n.operation_id=s.native_id
     LEFT JOIN snapshot_history_events e ON s.origin_rank=1 AND e.application=s.application AND e.fingerprint=s.fingerprint AND e.source_id=s.source_id
     LEFT JOIN file_deletion_history d ON s.origin_rank=2 AND d.id=s.native_id
+    LEFT JOIN upgrade_recycle_history u ON s.origin_rank=3 AND u.id=s.native_id
     ORDER BY s.event_at DESC,s.origin_rank ASC,s.native_id DESC,s.application ASC,s.fingerprint ASC,s.source_id DESC")
 }
 fn count_sql(predicate: &str) -> String {
     let source_predicate = predicate.replace("h.imported_at", "h.occurred_at");
     let deletion_predicate = predicate.replace("h.imported_at", "h.deleted_at");
     format!(
-        "SELECT (SELECT count(*) FROM import_history h {predicate}) + (SELECT count(*) FROM snapshot_history_events h {source_predicate}) + (SELECT count(*) FROM file_deletion_history h {deletion_predicate})"
+        "SELECT (SELECT count(*) FROM import_history h {predicate}) + (SELECT count(*) FROM snapshot_history_events h {source_predicate}) + (SELECT count(*) FROM file_deletion_history h {deletion_predicate}) + (SELECT count(*) FROM upgrade_recycle_history h {deletion_predicate})"
     )
 }
 pub fn router(db: Arc<Database>) -> Router {
@@ -453,6 +464,7 @@ async fn list(
                 .iter()
                 .chain(values.iter())
                 .chain(values.iter())
+                .chain(values.iter())
                 .cloned()
                 .collect::<Vec<_>>();
             let total = tx
@@ -466,8 +478,10 @@ async fn list(
                 return Err(storage());
             }
             let candidate_limit = i64::from(q.offset) + i64::from(q.limit);
-            // Parameter order follows the CTEs: native, deletion, then source keys.
+            // Parameter order follows the CTEs: native, deletion, upgrade recycle, then source keys.
             let mut page_values = values.clone();
+            page_values.push(Value::Integer(candidate_limit));
+            page_values.extend(values.clone());
             page_values.push(Value::Integer(candidate_limit));
             page_values.extend(values.clone());
             page_values.push(Value::Integer(candidate_limit));

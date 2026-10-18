@@ -120,7 +120,7 @@ export type DelaySettings = { "semantics": "legacy_age_only", torrent_delay_minu
 
 export type DeletionEventType = "file_deleted";
 
-export type DeletionReason = "manual";
+export type DeletionReason = "manual" | "upgrade";
 
 export type Direction = "remote_to_local" | "local_to_remote";
 
@@ -142,7 +142,7 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
-export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, scan_reserved: boolean, };
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recycle_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, scan_reserved: boolean, };
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 

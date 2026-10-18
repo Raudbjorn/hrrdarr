@@ -538,6 +538,31 @@ pub(super) async fn retire(
     Ok(())
 }
 
+/// Originals this operation moved into their private recovery artifact, each with the targets
+/// it served before the commit detached it. Shared or pending originals are not included.
+pub(super) async fn quarantined(
+    c: &Connection,
+    operation: &str,
+    target: &MediaTarget,
+) -> Result<Vec<super::recycle::Retired>> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::quarantined(c, operation, target).await;
+    }
+    let Some(facts) = facts(c, operation).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(match facts.old {
+        Some(old) if facts.retirement_state == "quarantined" => vec![super::recycle::Retired {
+            old,
+            targets: vec![match target {
+                MediaTarget::Episode(id) => MediaTarget::Episode(*id),
+                MediaTarget::Movie(id) => MediaTarget::Movie(*id),
+            }],
+        }],
+        _ => Vec::new(),
+    })
+}
+
 pub(super) async fn destination_available(
     c: &Connection,
     target: &MediaTarget,

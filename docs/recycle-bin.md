@@ -1,7 +1,8 @@
 # File deletion and recycle bin
 
 Migration 0060 adds per-domain recycle bin settings, a file-deletion journal, deletion history and
-the `CleanUpRecycleBin` command. TV and movies are configured, recycled, cleaned and health-checked
+the `CleanUpRecycleBin` command. Migration 0061 adds the upgrade-recycle journal and history used
+when an import replaces a file (see [Upgrades](#upgrades)). TV and movies are configured, recycled, cleaned and health-checked
 independently; equal numeric file IDs in the two domains never select each other.
 
 ## Settings
@@ -74,6 +75,75 @@ wait for the effect permit) and before every new deletion batch:
 Deletion history (`file_deletion_history`, reason `manual`) is written in the same transaction as
 the association changes and appears in `GET /api/v1/history` as `origin: native_deletion`.
 
+## Upgrades
+
+When an import replaces an existing TV episode file or movie file (a quality or revision upgrade,
+from a completed owned download or a downloaded-folder scan), the original is first retired into
+its private `.hrrdarr-replaced-*/original` recovery artifact exactly as before (retirement state
+`quarantined`; a TV original that still serves an episode outside the import stays in place as
+`shared_retained` and is never recycled). Then, before the import can complete, the domain's
+recycle bin settings are read:
+
+- **No bin configured:** nothing else happens. The artifact keeps the original's bytes in the
+  library folder and is never pruned; no recycle row or history is written.
+- **Bin configured:** the artifact moves to `<bin>/<series or movie folder name>/<path of the
+  original relative to that folder>`, using the original file name (with the same `name_N.ext`
+  suffix rule; nothing in the bin is overwritten). The transfer reuses the deletion primitives: a
+  same-device no-replace rename keeps the inode; a cross-device bin gets a private partial copy that
+  is fsynced, re-read and hash-compared, published without replacement and checkpointed before the
+  artifact is removed (only if it is still the recorded file). The recycled file's modification time
+  is set to the recycle time, so `CleanUpRecycleBin` expires it after `cleanup_days` like any other
+  bin content.
+
+A multi-episode TV original detached from every episode by one import is one original: it is
+recycled once, with one history event per episode it served.
+
+### Journal, states and recovery
+
+`upgrade_recycles` has one row per replaced original (`operation_id`, domain, original file ID),
+written before any filesystem effect with the artifact path and identity (device, inode, size,
+mtime) and the chosen bin destination. Phases: `admitted` → (`copied`, cross-device only) →
+`complete`, or `retained`. `complete` and `retained` are terminal, and a trigger refuses to mark the
+import `complete` while any row is `admitted` or `copied`. No database transaction spans a transfer.
+Each later run of the same import (an explicit resume, or a downloaded-scan resume) and the command
+worker's startup recovery (under the same global file-effect permit as deletions) reconcile a row
+from the journal and the observed disk state:
+
+- `admitted`, artifact gone and the destination is the recorded inode: the rename happened; roll
+  forward to `complete`. Both names on the recorded inode (interrupted link fallback): remove the
+  artifact name, then complete.
+- `admitted`, artifact still the recorded file and the destination free: remove only this row's own
+  partial file and perform the transfer. An occupied destination is never adopted or replaced.
+- `copied`: the verified copy is at the destination with the recorded identity; remove the artifact
+  if it is still the recorded file, then complete. A vanished copy settles as `retained`.
+- A crash after the import commits but before the row is admitted simply admits it on the next run.
+  A failed import commit leaves the original at its library path with its association (the
+  recycle step never runs before commit).
+
+Recycling never loses a file. Any filesystem refusal or failure (bin missing or unwritable, bin path
+traversing a symlink, occupied destination, changed or missing artifact, transfer limit) settles the
+row as `retained` with an `error_code` (`recycle_bin_unavailable`, `recycle_bin_unwritable`,
+`recycle_bin_unsafe`, `recycle_destination_exists`, `recycle_source_changed`,
+`recycle_source_missing`, `recycled_copy_missing`, `transfer_limit`, `recycle_filesystem_error`):
+the artifact keeps the bytes and the import still completes. A retained outcome marks the domain's
+`recycle_bin` health check for re-evaluation, logs `upgrade_recycle_retained` at ERROR, and is shown
+by the import status message (`GET /api/v1/imports/{id}`) and by `recycle_state` on
+`GET /api/v1/download-processing` (`recovery_bytes_retained` stays true). `complete` with
+`error_code` `recycle_source_retained` means the bin holds the verified copy but removing the
+artifact failed, so both copies remain. Storage errors are not settled: the import stays
+`committed` and is resumed.
+
+History rows (`upgrade_recycle_history`, reason `upgrade`, one per affected episode or the movie)
+are written in the same transaction that completes the row and appear in `GET /api/v1/history` as
+`origin: native_deletion` with `reason: "upgrade"`; `deletion_id` is the recycle journal row ID and
+`recycle_path` is always set. A movie keeps its file ID across the replacement, so its event's file
+ID is also the new file's ID.
+
+The TV original's file record keeps its reserved recovery path after recycling (it is the retirement
+receipt that snapshot mappings and journals reference); the recycle journal records where the bytes
+went. The emptied `.hrrdarr-replaced-*` directory stays as an ownership receipt, as it does for
+completed imports.
+
 ## CleanUpRecycleBin
 
 `POST /api/v1/recycle-bin/cleanup-commands` with `{"target":{"media_type":...},"priority":...}`
@@ -101,8 +171,9 @@ severity). Saving settings marks the check for re-evaluation.
 
 ## Not implemented
 
-Deleting a series/movie folder with its files, emptying the bin on demand, recycling replaced files
-during upgrades, extras/metadata sidecar retirement, importing source `RecycleBin` settings from
+Deleting a series/movie folder with its files, emptying the bin on demand, extras/metadata sidecar
+retirement (including on upgrade), manual imports replacing an existing file (they refuse occupied
+destinations, so they never retire anything), importing source `RecycleBin` settings from
 snapshots, and bind-mount alias detection. Files outside their library folder are refused rather
 than deleted. Deletion history stores the historical file ID; SQLite may reuse that ID for a later
 file in the same domain.

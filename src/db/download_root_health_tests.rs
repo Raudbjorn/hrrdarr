@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 61); // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     new_registry(&c).await?;
@@ -180,7 +180,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 60); // Reasoning: latest is 0060 (0058 scan successor, 0059 download-client registry, 0060 recycle bin); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 61); // Reasoning: latest is 0061 (0059 download-client registry, 0060 recycle bin, 0061 upgrade recycle); historical prefixes stay fixed.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {

@@ -262,7 +262,7 @@ struct Plan {
     subfolder: Vec<String>,
     leaf: String,
 }
-fn layout(owner_path: &str, path: &str) -> Result<(Vec<String>, String)> {
+pub(crate) fn layout(owner_path: &str, path: &str) -> Result<(Vec<String>, String)> {
     let owner = owner_path.trim_end_matches('/');
     let rest = path
         .strip_prefix(owner)
@@ -1082,8 +1082,17 @@ pub(crate) async fn startup(db: &Arc<Database>) -> Result<()> {
     const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + STARTUP_WAIT;
     loop {
-        if let Ok(_guard) = crate::import::acquire_deletion_guard(db, "startup-recovery") {
-            return recover_unfinished(db).await;
+        if let Ok(guard) = crate::import::acquire_deletion_guard(db, "startup-recovery") {
+            recover_unfinished(db).await?;
+            // Upgrade recycles share the permit; a failure here is retried by the import's own
+            // resume, so it is reported but never blocks worker startup.
+            if let Err(error) = crate::import::recover_upgrade_recycles(db, &guard).await {
+                eprintln!(
+                    "event=upgrade_recycle_recovery_failed code={}",
+                    error.code()
+                );
+            }
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             eprintln!("event=file_delete_recovery_deferred code=import_busy");

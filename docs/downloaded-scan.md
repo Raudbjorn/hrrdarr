@@ -231,7 +231,8 @@ resume_generation})`. The queue passes identities and fences only.
   plus one `import_history_episodes` row per member, or updates/creates the movie file. Each
   distinct original is independently checkpointed: still referenced by an episode outside the set
   -> `shared_retained`; otherwise moved into its private recovery directory (bytes retained) ->
-  `quarantined`. A failed replacement before commit restores a same-path exchange and leaves every
+  `quarantined`, then, when the domain has a recycle bin, recycled once per original through the
+  journaled upgrade-recycle step ([recycle bin upgrades](recycle-bin.md#upgrades)). A failed replacement before commit restores a same-path exchange and leaves every
   original's bytes, path and association intact (covered by the forced-failure test).
 - **Producer exclusion.** `POST /api/v1/imports/{id}/execute` refuses any scan-owned operation with
   `409 scan_recovery_required` (including completed ones); manual-command admission refuses it with

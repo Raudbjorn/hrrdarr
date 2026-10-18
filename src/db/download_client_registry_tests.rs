@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(60)]] // Reasoning: the runner applies through latest 0060 (recycle bin follows the 0059 registry).
+        vec![vec![libsql::Value::Integer(61)]] // Reasoning: the runner applies through latest 0061 (recycle bin 0060 and upgrade recycle 0061 follow the 0059 registry).
     );
     for (sql, expected) in TABLES.iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");

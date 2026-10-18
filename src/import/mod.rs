@@ -2,6 +2,7 @@
 mod fs;
 mod owned;
 pub(crate) mod probe;
+mod recycle;
 pub(crate) mod scan;
 pub(crate) mod scan_cleanup;
 mod scan_owned;
@@ -684,6 +685,15 @@ pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
     }
     if let Some(row)=c.query("SELECT old_file_json IS NOT NULL,retirement_state FROM rss_candidate_imports WHERE operation_id=?",[opid]).await?.next().await? {
         response.message=if row.get::<i64>(0)?==0 {"Owned download import; source bytes retained"} else {match row.get::<String>(1)?.as_str(){"quarantined"=>"Replacement imported; original bytes retained in private recovery artifact","shared_retained"=>"Replacement imported; original still serves other episodes",_=>"Owned replacement; original retirement pending and bytes retained"}}.into();
+        // The recycle outcome refines the quarantined message; the code names a retained cause.
+        if let Some((phase, _)) = recycle::summary(c, opid).await? {
+            response.message = match phase.as_str() {
+                "complete" => "Replacement imported; original moved to the recycle bin",
+                "retained" => "Replacement imported; recycling the original failed, bytes retained in private recovery artifact",
+                _ => "Replacement imported; moving the original to the recycle bin is pending, bytes retained",
+            }
+            .into();
+        }
     }
     Ok(response)
 }
@@ -785,6 +795,10 @@ pub(crate) fn acquire_cleanup_guard(db: &Arc<Database>, command_id: &str) -> Res
 /// permit, so no import, scan cleanup or other deletion touches files while they run.
 pub(crate) struct DeletionGuard {
     _permit: Arc<Permit>,
+}
+/// Worker-startup roll-forward of upgrade recycles interrupted between artifact and bin.
+pub(crate) async fn recover_upgrade_recycles(db: &Database, guard: &DeletionGuard) -> Result<()> {
+    recycle::recover(db, guard).await
 }
 pub(crate) fn acquire_deletion_guard(db: &Arc<Database>, key: &str) -> Result<DeletionGuard> {
     acquire(db, &format!("file-deletion-{key}"))
@@ -1130,6 +1144,12 @@ async fn run_inner(
         checkpoint(&c, opid, "committed", Some(&stage)).await?;
         committed_owner(&c, opid, &rec.target, &plan).await?;
         owned::retire(&c, opid, &rec.target, &plan, &stage, lease)
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
+        // Journaled part of retirement: with a configured bin, each quarantined original moves
+        // into it (or is recorded as retained) before the import can complete.
+        committed_owner(&c, opid, &rec.target, &plan).await?;
+        recycle::settle(&c, opid, &rec.target, &plan, lease)
             .await
             .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
         let p = plan.clone();
