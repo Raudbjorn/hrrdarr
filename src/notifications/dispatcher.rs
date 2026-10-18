@@ -464,28 +464,33 @@ impl Dispatcher {
                     .map_err(|_| permanent("delivery_invalid"))?;
             (domain, sent)
         };
-        let mut rows = c
-            .query(
-                "SELECT kind,scope,subject_id,payload_json,tag_ids_json FROM notification_events WHERE sequence=?",
-                [sequence],
-            )
-            .await
-            .map_err(|_| storage())?;
-        let r = rows
-            .next()
-            .await
-            .map_err(|_| storage())?
-            .ok_or_else(|| permanent("event_discarded"))?;
-        let event = EventRow {
-            sequence,
-            kind: EventKind::parse(&r.get::<String>(0).map_err(|_| storage())?)
-                .ok_or_else(|| permanent("event_invalid"))?,
-            scope: Scope::parse(&r.get::<String>(1).map_err(|_| storage())?)
-                .ok_or_else(|| permanent("event_invalid"))?,
-            subject_id: r.get(2).map_err(|_| storage())?,
-            payload: serde_json::from_str(&r.get::<String>(3).map_err(|_| storage())?)
-                .map_err(|_| permanent("event_invalid"))?,
-            tag_ids: None,
+        // Scoped so the cursor (and its read transaction) is closed before any network I/O: an
+        // open snapshot would make the progress write below fail with SQLITE_BUSY_SNAPSHOT once
+        // another delivery commits.
+        let event = {
+            let mut rows = c
+                .query(
+                    "SELECT kind,scope,subject_id,payload_json,tag_ids_json FROM notification_events WHERE sequence=?",
+                    [sequence],
+                )
+                .await
+                .map_err(|_| storage())?;
+            let r = rows
+                .next()
+                .await
+                .map_err(|_| storage())?
+                .ok_or_else(|| permanent("event_discarded"))?;
+            EventRow {
+                sequence,
+                kind: EventKind::parse(&r.get::<String>(0).map_err(|_| storage())?)
+                    .ok_or_else(|| permanent("event_invalid"))?,
+                scope: Scope::parse(&r.get::<String>(1).map_err(|_| storage())?)
+                    .ok_or_else(|| permanent("event_invalid"))?,
+                subject_id: r.get(2).map_err(|_| storage())?,
+                payload: serde_json::from_str(&r.get::<String>(3).map_err(|_| storage())?)
+                    .map_err(|_| permanent("event_invalid"))?,
+                tag_ids: None,
+            }
         };
         // A domain event matched its own domain; a system event matched the recorded scope.
         let domain = match event.scope {
