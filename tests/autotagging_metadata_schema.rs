@@ -309,7 +309,8 @@ async fn upgrade_witness(
 ) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
     // 0053 appends one journal column and two indexes; preserve old columns separately below.
-    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))','') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+    // 0059 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))','') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
         name IN ({predecessor_names}) AND
         NOT (type='table' AND name IN ('import_journal','download_processing')) AND
         name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND
@@ -548,7 +549,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -690,7 +691,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

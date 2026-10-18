@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

@@ -781,6 +781,21 @@ pub(crate) fn acquire_cleanup_guard(db: &Arc<Database>, command_id: &str) -> Res
             )
         })
 }
+/// Explicit library-file deletion and recycle-bin cleanup share the single global effect
+/// permit, so no import, scan cleanup or other deletion touches files while they run.
+pub(crate) struct DeletionGuard {
+    _permit: Arc<Permit>,
+}
+pub(crate) fn acquire_deletion_guard(db: &Arc<Database>, key: &str) -> Result<DeletionGuard> {
+    acquire(db, &format!("file-deletion-{key}"))
+        .map(|permit| DeletionGuard { _permit: permit })
+        .ok_or_else(|| {
+            Error::conflict(
+                "import_busy",
+                "Another import or file operation is executing; retry",
+            )
+        })
+}
 fn launch(
     db: Arc<Database>,
     opid: String,

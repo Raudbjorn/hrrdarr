@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

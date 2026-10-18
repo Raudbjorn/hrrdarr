@@ -118,7 +118,7 @@ export function historySearch(query: HistoryQuery): string {
 export type HistoryFact = { label: string; value: string; recorded: boolean };
 export type HistoryEventView = {
   key: string;
-  origin: 'native_import' | 'source_snapshot';
+  origin: 'native_import' | 'source_snapshot' | 'native_deletion';
   originLabel: string;
   domain: 'TV' | 'Movies';
   target: string;
@@ -185,6 +185,22 @@ export function describeEvent(event: HistoryEvent): HistoryEventView {
       warnings,
     };
   }
+  if (event.origin === 'native_deletion') {
+    const warnings: string[] = [];
+    const fileDomain = event.file.media_type === 'tv' ? 'TV' : 'Movies';
+    if (fileDomain !== domain) warnings.push(`Historical file domain (${fileDomain}) does not match the target domain (${domain}).`);
+    return {
+      key: `deletion:${event.id}`, origin: 'native_deletion', originLabel: 'Native file deletion', domain, target: label,
+      eventLabel: event.recycle_path === null ? 'File deleted' : 'File deleted (moved to recycle bin)',
+      sourceEventType: null, sourceCodeNote: null, time: event.deleted_at, timeLabel: 'Record removed (UTC)',
+      facts: [
+        fact('Deletion', event.deletion_id), fact('Reason', event.reason === 'manual' ? 'Manual (explicit request)' : event.reason),
+        fact('Historical file', `${fileDomain} file ${event.file.id}`), fact('Path (as recorded)', event.path),
+        { label: 'Recycle bin path', value: event.recycle_path ?? 'none — permanent or already missing', recorded: event.recycle_path !== null },
+      ],
+      warnings,
+    };
+  }
   const id = event.id;
   const semantic = SOURCE_EVENT_LABELS[event.event_type] ?? String(event.event_type);
   return {
@@ -224,6 +240,7 @@ const isEvent = (value: unknown): value is HistoryEvent => {
   if (!target || (target.media_type !== 'episode' && target.media_type !== 'movie') || !Number.isSafeInteger(target.id)) return false;
   if (e.origin === 'native_import') return typeof e.id === 'string' && !!e.file && typeof e.imported_at === 'string';
   if (e.origin === 'source_snapshot') return !!e.id && typeof e.id === 'object' && Number.isSafeInteger(e.source_event_type) && typeof e.occurred_at === 'string';
+  if (e.origin === 'native_deletion') return typeof e.id === 'string' && typeof e.deletion_id === 'string' && !!e.file && typeof e.path === 'string' && (e.recycle_path === null || typeof e.recycle_path === 'string') && typeof e.deleted_at === 'string';
   return false;
 };
 

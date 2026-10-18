@@ -25,8 +25,8 @@ async function healthFor(domain){
  await nav.getByRole('button',{name:'Health',exact:true}).click();await idle(health);await health.getByLabel('Health scope').selectOption(domain);await idle(health);
  const response=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await health.getByRole('button',{name:`Run ${domain} health checks`,exact:true}).click();const reply=await response;assert.equal(reply.status(),202);const admission=await reply.json();// Reasoning: migration 0053 added remote_path_mapping, so each domain registers 11 checks.
-assert.equal(admission.selection.length,11);
- const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===11&&!s.active_command&&admission.selection.every(token=>s.checks.some(c=>c.identity.check_key===token.identity.check_key&&c.observed_generation>=token.generation)),'Scoped health did not settle');
+assert.equal(admission.selection.length,12); // Reasoning: 0059 adds recycle_bin per domain (11 -> 12).
+ const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===12&&!s.active_command&&admission.selection.every(token=>s.checks.some(c=>c.identity.check_key===token.identity.check_key&&c.observed_generation>=token.generation)),'Scoped health did not settle');
  await health.getByRole('button',{name:'Refresh health',exact:true}).click();await idle(health);return snapshot;
 }
 async function schedules(provider,enabled){

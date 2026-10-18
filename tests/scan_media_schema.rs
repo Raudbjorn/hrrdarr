@@ -143,7 +143,13 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         "import_policies",
         "health_checks",
     ] {
-        out.push(dump(c, &format!("SELECT * FROM {table} ORDER BY rowid")).await?);
+        // Reasoning: 0059 registers recycle_bin identities after this predecessor; preserved rows stay exact.
+        let filter = if table == "health_checks" {
+            " WHERE check_key!='recycle_bin'"
+        } else {
+            ""
+        };
+        out.push(dump(c, &format!("SELECT * FROM {table}{filter} ORDER BY rowid")).await?);
     }
     Ok(out)
 }
@@ -156,7 +162,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

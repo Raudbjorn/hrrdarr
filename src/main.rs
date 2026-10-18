@@ -175,6 +175,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::tags::router(state.db.clone()))
         .merge(hrrdarr::revision_policy::router(state.db.clone()))
         .merge(hrrdarr::import_policy::router(state.db.clone()))
+        .merge(hrrdarr::recycle_bin::router(state.db.clone()))
         .merge(hrrdarr::completed_download_handling::router(
             state.db.clone(),
         ))

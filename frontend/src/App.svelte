@@ -5,6 +5,7 @@
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
   import ImportPolicyPanel from './lib/ImportPolicyPanel.svelte';
+  import RecycleBinPanel from './lib/RecycleBinPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
   import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
   import CreateTags from './lib/CreateTags.svelte';
@@ -108,6 +109,14 @@
   }
   function filesSaved(owner:{domain:MediaDomain;id:number}) {
     if(owner.domain==='movies')movieFileVersion={id:owner.id,version:movieFileVersion.version+1};
+  }
+  // A deletion removes file associations: reread library statistics and episode file state.
+  function filesDeleted(owner:{domain:MediaDomain;id:number}) {
+    importVersions={...importVersions,[owner.domain]:importVersions[owner.domain]+1};
+    if(selectionOwner?.domain===owner.domain && selectionOwner.id===owner.id) {
+      importDetailOwner=owner;
+      if(owner.domain==='movies')filesSaved(owner);
+    }
   }
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
   const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
@@ -255,7 +264,7 @@
   {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
   {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
   {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button><button aria-pressed={profileSection==='release'} onclick={()=>{releaseVisited=true;profileSection='release';}}>Release profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}{#if releaseVisited}<div hidden={profileSection!=='release'}><ReleaseProfilesPanel request={releaseRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>releaseWrites={...releaseWrites,[scope]:state}} onchange={scope=>releaseUsageVersion={...releaseUsageVersion,[scope]:releaseUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
-  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /><ImportPolicyPanel /></div>{/if}
+  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /><ImportPolicyPanel /><RecycleBinPanel /></div>{/if}
   {#if historyVisited}<div hidden={view!=='history'}><HistoryPanel /></div>{/if}
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
@@ -315,7 +324,7 @@
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
       {#if fileTarget}<div hidden={view!=='library' || detailLoading || !selected || selected.id!==fileTarget.id || domain!==fileTarget.domain}>
         <MediaFilesPanel target={fileTarget} active={view==='library' && !detailLoading && !!selected && selected.id===fileTarget.id && domain===fileTarget.domain}
-          relatedWrite={fileRelatedWrite} discardVersion={fileDiscardVersion} refreshVersion={fileRefresh.domain===fileTarget.domain && fileRefresh.id===fileTarget.id?fileRefresh.version:0} onwrite={state=>{if(state!=='idle')++importReadEpoch;fileWrite=state;}} ondirty={dirty=>fileDirty=dirty} onsaved={filesSaved} />
+          relatedWrite={fileRelatedWrite} discardVersion={fileDiscardVersion} refreshVersion={fileRefresh.domain===fileTarget.domain && fileRefresh.id===fileTarget.id?fileRefresh.version:0} onwrite={state=>{if(state!=='idle')++importReadEpoch;fileWrite=state;}} ondirty={dirty=>fileDirty=dirty} onsaved={filesSaved} ondeleted={filesDeleted} />
       </div>{/if}
     </article>
   </div>

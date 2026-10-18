@@ -51,6 +51,12 @@ pub fn render() -> String {
     registry.visit::<crate::revision_policy::Update>();
     registry.visit::<crate::import_policy::Policy>();
     registry.visit::<crate::import_policy::Update>();
+    registry.visit::<crate::recycle_bin::Settings>();
+    registry.visit::<crate::recycle_bin::Update>();
+    registry.visit::<crate::recycle_bin::deletion::DeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::Deletion>();
+    registry.visit::<crate::recycle_bin::deletion::Batch>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
@@ -85,6 +91,8 @@ pub fn render() -> String {
         crate::search::ReleasePolicy,
         crate::commands::blocklist::BlocklistClearInput,
         crate::api::ApiPage<crate::commands::blocklist::BlocklistClearCommand>,
+        crate::commands::recycle_cleanup::RecycleBinCleanupInput,
+        crate::api::ApiPage<crate::commands::recycle_cleanup::RecycleBinCleanupCommand>,
         crate::commands::manual_import::ManualImportBatchInput,
         crate::commands::manual_import::ManualImportReconcileInput,
         crate::commands::manual_import::ManualImportReconciliation,

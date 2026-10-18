@@ -118,6 +118,10 @@ export type DelayProtocol = "usenet" | "torrent";
 
 export type DelaySettings = { "semantics": "legacy_age_only", torrent_delay_minutes: number | null, usenet_delay_minutes: number | null, } | { "semantics": "profile" } & DelayProfileSettings;
 
+export type DeletionEventType = "file_deleted";
+
+export type DeletionReason = "manual";
+
 export type Direction = "remote_to_local" | "local_to_remote";
 
 export type Disposition = "accept" | "reject" | "delay";
@@ -177,6 +181,18 @@ export type EpisodeSeriesProjection = { runtime: number | null, id: number, tvdb
 export type EvaluatedRelease = { metadata: ReleaseMetadata, decision: ReleaseDecision, };
 
 export type FileBulk = { files: Array<FileUpdate>, };
+
+export type FileBulkDeleteInput = { file_ids: Array<number>, mode: FileDeletionMode, };
+
+export type FileDeleteInput = { mode: FileDeletionMode, };
+
+export type FileDeletion = { id: string, media_type: MediaDomain, file_id: number, path: string, effect: FileDeletionEffect, recycle_path: string | null, targets: Array<MediaTarget>, };
+
+export type FileDeletionBatch = { batch_id: string, deletions: Array<FileDeletion>, };
+
+export type FileDeletionEffect = "recycled" | "deleted" | "already_missing";
+
+export type FileDeletionMode = "recycle" | "permanent";
 
 export type FileEditor = { file_ids: Array<number>, quality?: FileQualityInput | null, languages?: Array<number> | null, release_group?: string | null, edition?: string | null, indexer_flags?: number | null, release_type?: number | null, };
 
@@ -248,7 +264,7 @@ export type HealthTransitions = { oldest_retained_sequence: number | null, lates
 
 export type HistoricalFile = { media_type: MediaDomain, id: number, };
 
-export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent;
+export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent | { "origin": "native_deletion" } & NativeDeletionEvent;
 
 export type HistoryEventType = "file_imported";
 
@@ -422,6 +438,8 @@ export type NamingErrorDetail = { code: string, message: string, };
 
 export type NamingErrorEnvelope = { error: NamingErrorDetail, };
 
+export type NativeDeletionEvent = { id: string, deletion_id: string, event_type: DeletionEventType, reason: DeletionReason, target: MediaTarget, file: HistoricalFile, path: string, recycle_path: string | null, deleted_at: string, };
+
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
 export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
@@ -557,6 +575,22 @@ export type QueueObservation = { association: MediaTarget | null, download: Down
 export type QueueQuery = { provider_id: string, media_type: MediaDomain, limit?: number, offset?: number, };
 
 export type QueueSnapshot = { target: RefreshTarget, provider_revision: number, observed_at: number, command_id: string | null, items: Array<QueueObservation>, total: number, limit: number, offset: number, };
+
+export type RecycleBinCleanupCommand = { id: string, name: RecycleBinCleanupName, target: RecycleBinCleanupTarget, origin: RecycleBinCleanupOrigin, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, outcome: RecycleBinCleanupOutcome | null, bin_path: string | null, cleanup_days: number | null, files_removed: number, folders_removed: number, entries_skipped: number, entries_failed: number, bounded: boolean, };
+
+export type RecycleBinCleanupInput = { target: RecycleBinCleanupTarget, priority: CommandPriority, };
+
+export type RecycleBinCleanupName = "clean_up_recycle_bin";
+
+export type RecycleBinCleanupOrigin = "manual" | "automatic";
+
+export type RecycleBinCleanupOutcome = "cleaned" | "not_configured" | "disabled";
+
+export type RecycleBinCleanupTarget = { media_type: MediaDomain, };
+
+export type RecycleBinSettings = { media_type: MediaDomain, revision: number, path: string | null, cleanup_days: number, };
+
+export type RecycleBinSettingsUpdate = { revision: number, path: string | null, cleanup_days: number, };
 
 export type RefreshSchedule = { intent: RefreshScheduleIntent, requested_enabled: boolean | null, target: RefreshTarget, revision: number, provider_revision: number, enabled: boolean, interval_seconds: number, next_run_at: number, last_run_at: number | null, error_code: string | null, };
 

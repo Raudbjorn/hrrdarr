@@ -248,6 +248,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "scan_successor",
         include_str!("../../migrations/0058_scan_successor.sql"),
     ),
+    (
+        "recycle_bin",
+        include_str!("../../migrations/0059_recycle_bin.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

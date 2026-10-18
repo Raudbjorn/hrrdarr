@@ -173,14 +173,14 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {
                 " WHERE version<=51"
             } else if *table == "health_checks" {
-                // 0053 adds two identities; all schema51 observations remain exact.
-                " WHERE check_key!='remote_path_mapping'"
+                // 0053 and 0059 add two identities each; all schema51 observations remain exact.
+                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin')"
             } else {
                 ""
             };

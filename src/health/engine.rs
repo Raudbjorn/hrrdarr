@@ -503,6 +503,7 @@ async fn evaluate(
             client_backoff::evaluate(&c, &member.identity, now().map_err(|_| "check_failed")?).await
         }
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
+        "recycle_bin" => recycle_bin::evaluate(db, &member.identity).await,
         "remote_path_mapping" => path_diagnostics::evaluate(db, client, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
         "indexer_status" | "indexer_failures" => {

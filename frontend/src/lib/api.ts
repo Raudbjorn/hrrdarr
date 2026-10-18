@@ -477,3 +477,30 @@ export async function readMediaFiles(domain: MediaDomain, ownerId: number, fileI
   if (!filePageValid(result.data) || result.data.offset !== 0 || result.data.total !== ids.length) return invalidFiles('Readback did not return the complete attempted selection.');
   return validateFileReadback(domain, ownerId, ids, result.data.items);
 }
+
+// Recycle bin settings, explicit file deletion and CleanUpRecycleBin. Deletion always carries the
+// mode the user confirmed; the server refuses it when current settings disagree.
+import type { RecycleBinSettings, RecycleBinSettingsUpdate, FileDeletion, FileDeletionBatch, FileDeletionMode, RecycleBinCleanupCommand } from './api.generated';
+import { MAX_DELETE_FILES } from './recycle-bin-draft.ts';
+/** Same-device recycling is one rename; a cross-device copy is bounded server-side at 30 minutes. */
+const FILE_DELETE_TIMEOUT_MS = 31 * 60 * 1000;
+export const getRecycleBin = (domain: MediaDomain) => fileDomain(domain) ? request<RecycleBinSettings>(`/api/v1/${domain}/recycle-bin`, undefined, undefined, true) : Promise.resolve(invalidFiles<RecycleBinSettings>());
+export const updateRecycleBin = (domain: MediaDomain, input: RecycleBinSettingsUpdate) => fileDomain(domain) ? request<RecycleBinSettings>(`/api/v1/${domain}/recycle-bin`, input, 'PUT', true) : Promise.resolve(invalidFiles<RecycleBinSettings>());
+export async function deleteMediaFile(domain: MediaDomain, fileId: number, mode: FileDeletionMode): Promise<Result<FileDeletion>> {
+  if (!fileDomain(domain) || !validId(fileId) || (mode !== 'recycle' && mode !== 'permanent')) return invalidFiles();
+  const result = await request<FileDeletion>(`/api/v1/${domain}/files/${fileId}`, { mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS);
+  return !result.ok || (result.data?.file_id === fileId && result.data.media_type === domain) ? result : invalidFiles('Invalid deletion response; reload the file list.');
+}
+export async function deleteMediaFiles(domain: MediaDomain, fileIds: number[], mode: FileDeletionMode): Promise<Result<FileDeletionBatch>> {
+  if (!fileDomain(domain) || !validFileIds(fileIds) || fileIds.length > MAX_DELETE_FILES || (mode !== 'recycle' && mode !== 'permanent')) return invalidFiles();
+  const ids = [...fileIds];
+  const result = await request<FileDeletionBatch>(`/api/v1/${domain}/files/bulk`, { file_ids: ids, mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS);
+  if (!result.ok) return result;
+  const deleted = result.data?.deletions;
+  return Array.isArray(deleted) && deleted.length === ids.length && deleted.every((d, i) => d?.file_id === ids[i] && d.media_type === domain) ? result : invalidFiles('Invalid bulk deletion response; reload the file list.');
+}
+export const listRecycleBinCleanups = (domain: MediaDomain, limit = 5) => fileDomain(domain) && Number.isInteger(limit) && limit >= 1 && limit <= 100
+  ? request<ApiPage<RecycleBinCleanupCommand>>(`/api/v1/recycle-bin/cleanup-commands?${new URLSearchParams({ media_type: domain, limit: String(limit) })}`, undefined, undefined, true)
+  : Promise.resolve(invalidFiles<ApiPage<RecycleBinCleanupCommand>>());
+export const createRecycleBinCleanup = (domain: MediaDomain) => fileDomain(domain) ? request<RecycleBinCleanupCommand>('/api/v1/recycle-bin/cleanup-commands', { target: { media_type: domain }, priority: 'high' }, 'POST', true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());
+export const getRecycleBinCleanup = (id: string) => validOperation(id) ? request<RecycleBinCleanupCommand>(`/api/v1/recycle-bin/cleanup-commands/${id}`, undefined, undefined, true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());

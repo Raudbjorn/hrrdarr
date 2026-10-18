@@ -20,6 +20,7 @@ mod indexers;
 mod path_diagnostics;
 #[cfg(test)]
 pub(crate) use path_diagnostics::retained_path_diagnostic;
+mod recycle_bin;
 mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
@@ -333,6 +334,16 @@ pub(crate) async fn configuration_changed(c: &Connection, media: MediaDomain) ->
         "check_key IN ('completed_download_handling','remote_path_mapping')",
     )
     .await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Recycle-bin settings writes re-evaluate hc.036 for that domain in the same transaction.
+pub(crate) async fn recycle_bin_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key='recycle_bin'").await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 

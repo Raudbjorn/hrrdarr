@@ -33,9 +33,9 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Reasoning: 0053 adds remote_path_mapping per domain; all22 checks must settle.
-            if v["summary"]["current"] == 22 {
-                // Reasoning: twenty-two checks span two pages; issue assertions cover both complete domains.
+            // Reasoning: 0053 adds remote_path_mapping and 0059 recycle_bin per domain; all 24 checks must settle.
+            if v["summary"]["current"] == 24 {
+                // Reasoning: twenty-four checks span two pages; issue assertions cover both complete domains.
                 let (_, second) = request(
                     client,
                     base,
@@ -81,7 +81,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
     // Reasoning: 0051 adds download_client_backoff per domain to the eighteen existing identities.
-    assert_eq!(fresh["summary"]["never_run"], 22); // Reasoning:0053 adds two initially unobserved checks.
+    assert_eq!(fresh["summary"]["never_run"], 24); // Reasoning:0053 and 0059 each add two initially unobserved checks.
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -107,6 +107,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
                 "indexer_rss",
                 "indexer_search",
                 "indexer_status",
+                "recycle_bin",
                 "remote_path_mapping",
                 "removed_metadata",
             ]
@@ -114,7 +115,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
             .map(move |key| (scope.to_owned(), key.to_owned()))
         })
         .collect::<std::collections::BTreeSet<_>>();
-    // Reasoning: 0053 gives twenty-two identities across two sixteen-row API pages.
+    // Reasoning: 0053 and 0059 give twenty-four identities across two sixteen-row API pages.
     let (_, second_page) = request(
         &client,
         &base,
@@ -124,7 +125,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     assert_eq!(fresh["checks"].as_array().unwrap().len(), 16);
-    assert_eq!(second_page["checks"].as_array().unwrap().len(), 6);
+    assert_eq!(second_page["checks"].as_array().unwrap().len(), 8);
     let mut actual = identities(&fresh["checks"]);
     actual.extend(identities(&second_page["checks"]));
     assert_eq!(actual, expected);
@@ -197,8 +198,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Reasoning: 0053 adds one identity per domain; compare all twenty-two members exactly.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 22); // Reasoning:0053 adds two selected identities.
+    // Reasoning: 0053 and 0059 each add one identity per domain; compare all twenty-four members exactly.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 24); // Reasoning:0053 and 0059 each add two selected identities.
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -604,7 +605,8 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            if v["summary"]["current"] == 22 && issues(&v).is_empty() {
+            // Reasoning: 0059 recycle_bin identities are healthy while no bin is configured.
+            if v["summary"]["current"] == 24 && issues(&v).is_empty() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

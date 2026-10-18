@@ -804,8 +804,8 @@ async fn priority_shared_transport_future_retries_and_history_admission_are_boun
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-            // Reasoning: 0053 adds two path checks; startup must settle all twenty-two identities.
-            if current == 22 { break; }
+            // Reasoning: 0053 adds two path checks and 0059 two recycle_bin checks; startup must settle all twenty-four identities.
+            if current == 24 { break; }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.unwrap();
@@ -1104,9 +1104,9 @@ async fn provider_edits_during_successful_and_failed_reads_invalidate_both_domai
             tokio::time::timeout(Duration::from_secs(12), async {
                 loop {
                     let current = conn.query("SELECT count(*) FROM health_checks h JOIN health_lifecycle l ON l.id=1 WHERE h.observed_epoch=l.epoch AND h.observed_generation=h.generation AND h.last_error IS NULL AND h.pending_reasons=0",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap();
-                    // Reasoning: all twenty-two checks (0053 adds one path check per domain) must settle
+                    // Reasoning: all twenty-four checks (0053 adds one path check, 0059 one recycle_bin check per domain) must settle
                     // without changing the exact communication traffic assertion below.
-                    if current == 22 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
+                    if current == 24 && state.refresh_reads_for(&new_prefix) >= 2 { break; }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }).await.unwrap();

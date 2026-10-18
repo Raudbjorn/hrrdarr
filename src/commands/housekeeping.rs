@@ -55,9 +55,9 @@ const MEDIA: &str = "{a}.media_type";
 ///   would abort anyway); expired unselected offers are deleted with the command.
 /// - `manual_import_commands`: kept while its operation journal is neither preview nor
 ///   complete (interrupted import state).
-/// - metadata/blocklist/quality/rescan rows have no inbound references and active-only
+/// - metadata/blocklist/quality/rescan/recycle-cleanup rows have no inbound references and active-only
 ///   dedup indexes, so terminal rows are pure history.
-const TABLES: [Table; 8] = [
+const TABLES: [Table; 9] = [
     Table {
         name: "commands",
         terminal: TERMINAL,
@@ -103,6 +103,13 @@ const TABLES: [Table; 8] = [
     Table {
         name: "rescan_commands",
         terminal: TERMINAL_RESCAN,
+        domain: MEDIA,
+        protect: "1",
+    },
+    // Cleanup history (0059) has no inbound references and an active-only dedup index.
+    Table {
+        name: "recycle_bin_cleanup_commands",
+        terminal: TERMINAL,
         domain: MEDIA,
         protect: "1",
     },

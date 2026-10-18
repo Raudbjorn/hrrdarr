@@ -41,7 +41,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { view: 'qualities', label: 'Quality', description: 'Quality definitions' },
   { view: 'profiles', label: 'Profiles', description: 'Quality, delay and release profiles' },
   { view: 'naming', label: 'Naming', description: 'Episode and movie file naming' },
-  { view: 'media-management', label: 'Media management', description: 'Revision and upgrade policy' },
+  { view: 'media-management', label: 'Media management', description: 'Revision, import policy and recycle bin' },
   { view: 'custom-formats', label: 'Custom formats', description: 'Release matching formats' },
   { view: 'tags', label: 'Tags', description: 'Tags shared by library items and settings' },
   { view: 'general', label: 'General', description: 'Host and general settings' },

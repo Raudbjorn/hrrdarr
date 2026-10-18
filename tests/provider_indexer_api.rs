@@ -543,7 +543,8 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
 }
 // Reasoning: 0053 adds scoped path diagnostics. Compare all eleven identities
 // per domain so unexpected sibling markers fail; client saves invalidate their path check too.
-const IDENTITIES: [(&str, &str); 22] = [
+// Reasoning: 0059 adds recycle_bin per domain; provider edits never mark it.
+const IDENTITIES: [(&str, &str); 24] = [
     ("movies", "completed_download_handling"),
     ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
@@ -553,6 +554,7 @@ const IDENTITIES: [(&str, &str); 22] = [
     ("movies", "indexer_rss"),
     ("movies", "indexer_search"),
     ("movies", "indexer_status"),
+    ("movies", "recycle_bin"),
     ("movies", "remote_path_mapping"),
     ("movies", "removed_metadata"),
     ("tv", "completed_download_handling"),
@@ -564,6 +566,7 @@ const IDENTITIES: [(&str, &str); 22] = [
     ("tv", "indexer_rss"),
     ("tv", "indexer_search"),
     ("tv", "indexer_status"),
+    ("tv", "recycle_bin"),
     ("tv", "remote_path_mapping"),
     ("tv", "removed_metadata"),
 ];

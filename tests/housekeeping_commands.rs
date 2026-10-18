@@ -17,7 +17,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 const NOW: i64 = 2_000_000_000;
-const TABLES: [&str; 8] = [
+const TABLES: [&str; 9] = [
     "commands",
     "metadata_refresh_commands",
     "blocklist_clear_commands",
@@ -26,6 +26,8 @@ const TABLES: [&str; 8] = [
     "manual_import_commands",
     "quality_reset_commands",
     "rescan_commands",
+    // Reasoning: 0059 adds recycle bin cleanup history to the pruned command tables.
+    "recycle_bin_cleanup_commands",
 ];
 const DOMAINS: [&str; 2] = ["tv", "movies"];
 
@@ -167,6 +169,9 @@ async fn seed(
             format!("INSERT INTO rescan_commands(media_type,series_id,movie_id,files_adopted,files_removed,skip_reason,{common})")
                 .replace("VALUES('", &format!("VALUES('{domain}',{},{},{extra},'", if series == 1 {"1"} else {"NULL"}, if movie == 1 {"1"} else {"NULL"}))
         }
+        "recycle_bin_cleanup_commands" => format!(
+            "INSERT INTO recycle_bin_cleanup_commands(name,media_type,origin,outcome,{common})"
+        ).replace("VALUES('", &format!("VALUES('clean_up_recycle_bin','{domain}','manual',{},'", if status == "succeeded" { "'not_configured'" } else { "NULL" })),
         other => panic!("unknown table {other}"),
     };
     c.execute(&sql, ())

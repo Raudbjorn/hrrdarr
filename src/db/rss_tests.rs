@@ -87,7 +87,7 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 58); // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 59); // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {

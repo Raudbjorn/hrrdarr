@@ -15,6 +15,8 @@ const ADMISSION: [&str; 9] = [
     "health_admit",
 ];
 const CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
+// Reasoning: reopening applies every later migration; 0059 appends exactly the recycle bin cleanup term after 0054's scan term.
+const LATEST_CAPACITY: &str = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024";
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -105,6 +107,9 @@ async fn witness_queries(c: &Connection) -> Result<Vec<String>, Error> {
         }
         let filter = if name == "schema_migrations" {
             " WHERE version<=53"
+        } else if name == "health_checks" {
+            // Reasoning: 0059 registers recycle_bin identities after this predecessor; preserved rows stay exact.
+            " WHERE check_key!='recycle_bin'"
         } else {
             ""
         };
@@ -200,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        58 // Reasoning: latest adds 0058 scan successor lineage and Health evidence indexes; historical prefixes stay fixed.
+        59 // Reasoning: latest adds 0059 recycle bin settings, deletion journal and cleanup commands; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -291,11 +296,15 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     assert_eq!(witness(&after, &queries).await?, data);
     // 0055/56 append columns to these two predecessor tables only. Their exact old DDL was
     // checked above; every other preserved guard/index still compares byte-for-byte.
-    for (name, expected) in admission.into_iter().chain(
-        unchanged
-            .into_iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "series" | "snapshot_imports")),
-    ) {
+    for (name, expected) in admission
+        .into_iter()
+        .map(|(name, sql)| (name, sql.replace(CAPACITY, LATEST_CAPACITY)))
+        .chain(
+            unchanged
+                .into_iter()
+                .filter(|(name, _)| !matches!(name.as_str(), "series" | "snapshot_imports")),
+        )
+    {
         let actual: String = after
             .query("SELECT sql FROM sqlite_schema WHERE name=?", [name.clone()])
             .await?
@@ -322,8 +331,12 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
         2
     );
     assert_eq!(
-        scalar(&after, "SELECT count(*) FROM health_checks").await?,
-        22,
+        scalar(
+            &after,
+            "SELECT count(*) FROM health_checks WHERE check_key!='recycle_bin'"
+        )
+        .await?,
+        22, // Reasoning: 0059 adds recycle_bin identities; 0054's scan itself adds none.
         "scan reuses the existing scoped Health identities"
     );
     assert!(
