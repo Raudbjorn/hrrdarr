@@ -24,12 +24,53 @@ pub(super) struct Facts {
     pub old: Option<OldFile>,
     pub retirement_state: String,
     pub retirement: Option<Retirement>,
+    pub evidence: Option<crate::custom_formats::Evidence>,
+    pub expected_size: u64,
+    pub candidate_id: String,
 }
 pub(super) async fn facts(c: &Connection, operation: &str) -> Result<Option<Facts>> {
-    let Some(r)=c.query("SELECT quality_id,revision_json,edition,old_file_json,retirement_state,retirement_json FROM rss_candidate_imports WHERE operation_id=?",[operation]).await?.next().await? else {return Ok(None)};
+    let Some(r)=c.query("SELECT quality_id,revision_json,edition,old_file_json,retirement_state,retirement_json,provenance_json,(SELECT media_type FROM operations WHERE id=operation_id),candidate_id FROM rss_candidate_imports WHERE operation_id=?",[operation]).await?.next().await? else {return Ok(None)};
+    let provenance: serde_json::Value =
+        serde_json::from_str(&r.get::<String>(6)?).map_err(|_| Error::internal())?;
+    let revision_json: String = r.get(1)?;
+    let revision: crate::media_files::FileRevision =
+        serde_json::from_str(&revision_json).map_err(|_| Error::internal())?;
+    revision.validate().map_err(|_| Error::internal())?;
+    if let Some(binding) = provenance.get("revision_binding") {
+        let binding: crate::search::revision::Binding =
+            serde_json::from_value(binding.clone()).map_err(|_| Error::internal())?;
+        binding.validate().map_err(|_| Error::internal())?;
+        if binding.effective != revision {
+            return Err(Error::internal());
+        }
+    }
+    let expected_size = provenance
+        .get("expected_size")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|size| *size > 0)
+        .ok_or_else(Error::internal)?;
+    let evidence: Option<crate::custom_formats::Evidence> = provenance
+        .get("comparison_facts")
+        .cloned()
+        .map(|v| serde_json::from_value(v).map_err(|_| Error::internal()))
+        .transpose()?;
+    if let Some(evidence) = &evidence {
+        crate::custom_formats::validate_evidence(
+            if r.get::<String>(7)? == "episode" {
+                crate::api::MediaDomain::Tv
+            } else {
+                crate::api::MediaDomain::Movies
+            },
+            evidence,
+        )
+        .map_err(|_| Error::internal())?;
+    }
     Ok(Some(Facts {
+        evidence,
+        expected_size,
+        candidate_id: r.get(8)?,
         quality_id: r.get(0)?,
-        revision_json: r.get(1)?,
+        revision_json,
         edition: r.get(2)?,
         old: r
             .get::<Option<String>>(3)?
@@ -71,7 +112,7 @@ async fn old_record(
         MediaTarget::Episode(_) => ("episode_files", "episode_file_id", "NULL"),
         MediaTarget::Movie(_) => ("movie_files", "movie_file_id", "f.edition"),
     };
-    let r=c.query(&format!("SELECT f.path,json_object('edition',{edition},'quality_id',m.quality_id,'revision_json',m.revision_json,'languages_json',m.languages_json,'media_info_json',m.media_info_json,'size',m.size,'date_added',m.date_added,'season_number',m.season_number,'original_file_path',m.original_file_path,'release_group',m.release_group,'indexer_flags',m.indexer_flags,'release_type',m.release_type) FROM {table} f LEFT JOIN file_metadata m ON m.{column}=f.id WHERE f.id=?"),[fid]).await?.next().await?.ok_or_else(Error::missing)?;
+    let r=c.query(&format!("SELECT f.path,json_object('edition',{edition},'quality_id',m.quality_id,'revision_json',m.revision_json,'languages_json',m.languages_json,'media_info_json',m.media_info_json,'size',m.size,'date_added',m.date_added,'season_number',m.season_number,'original_file_path',m.original_file_path,'original_release_title',m.original_release_title,'release_group',m.release_group,'indexer_flags',m.indexer_flags,'release_type',m.release_type) FROM {table} f LEFT JOIN file_metadata m ON m.{column}=f.id WHERE f.id=?"),[fid]).await?.next().await?.ok_or_else(Error::missing)?;
     let path: String = r.get(0)?;
     let claims:i64=c.query("SELECT count(*) FROM (SELECT path FROM episode_files WHERE path=?1 UNION ALL SELECT path FROM movie_files WHERE path=?1)",[path.clone()]).await?.next().await?.ok_or_else(Error::internal)?.get(0)?;
     if claims != 1 {
@@ -93,6 +134,39 @@ pub(super) async fn before(
     let Some(f) = facts(c, operation).await? else {
         return owner(c, t).await;
     };
+    // Legacy journals lack comparison facts, not authorization to bypass current policy.
+    // Their immutable provenance still supplies size; missing provider facts stay unknown.
+    let source: String = c
+        .query("SELECT source FROM operations WHERE id=?", [operation])
+        .await?
+        .next()
+        .await?
+        .ok_or_else(Error::internal)?
+        .get(0)?;
+    let frozen: crate::media_files::FileRevision =
+        serde_json::from_str(&f.revision_json).map_err(|_| Error::internal())?;
+    frozen.validate().map_err(|_| Error::internal())?;
+    let candidate = uuid::Uuid::parse_str(&f.candidate_id).map_err(|_| Error::internal())?;
+    let context = crate::commands::search::authority(c, candidate)
+        .await
+        .map_err(|_| Error::conflict("preflight_changed", "Release authority changed"))?;
+    let decision = crate::search::downloaded::evaluate_owned(
+        c,
+        t,
+        &source,
+        f.expected_size,
+        f.evidence.clone(),
+        &frozen,
+        context,
+    )
+    .await
+    .map_err(|_| Error::conflict("preflight_changed", "Import policy evaluation failed"))?;
+    if decision.accepted.is_none() {
+        return Err(Error::conflict(
+            "preflight_changed",
+            "Import no longer satisfies current policy",
+        ));
+    }
     let current = ownership(c, t).await?;
     if current.3 != f.old.as_ref().map(|o| o.file_id) {
         return Err(Error::conflict(
@@ -102,7 +176,13 @@ pub(super) async fn before(
     }
     if let Some(old) = f.old {
         let (path, metadata) = old_record(c, t, old.file_id).await?;
-        if path != old.path || metadata != old.metadata {
+        let mut old_metadata = old.metadata.clone();
+        if let Some(fields) = old_metadata.as_object_mut() {
+            fields
+                .entry("original_release_title")
+                .or_insert(serde_json::Value::Null);
+        }
+        if path != old.path || metadata != old_metadata {
             return Err(Error::conflict(
                 "target_changed",
                 "Original file facts changed",
@@ -133,10 +213,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     }
     let revision: crate::media_files::FileRevision = serde_json::from_str(&input.revision_json)
         .map_err(|_| Error::bad("Invalid factual revision"))?;
-    if revision.version < 1
-        || revision.real < 0
-        || input.edition.as_ref().is_some_and(|v| v.len() > 1024)
-    {
+    if revision.validate().is_err() || input.edition.as_ref().is_some_and(|v| v.len() > 1024) {
         return Err(Error::bad("Invalid file facts"));
     }
     let own = ownership(&c, &input.target).await?;
@@ -188,6 +265,46 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         Ok((plan, old))
     })
     .await?;
+    // Compile/match outside the writer lock. The transaction repeats the exact
+    // facts/configuration lookup and requires its already evaluated fingerprint.
+    let preflight = crate::search::downloaded::evaluate_receipt(
+        &c,
+        &input.target,
+        &input.source,
+        input.expected_size,
+        &input.candidate_id,
+    )
+    .await
+    .map_err(|_| {
+        Error::conflict(
+            "preflight_changed",
+            "Downloaded file decision could not be validated",
+        )
+    })?;
+    let preflight = preflight.accepted.ok_or_else(|| {
+        Error::conflict(
+            "preflight_changed",
+            "Downloaded file no longer passes current import policy",
+        )
+    })?;
+    let destination = crate::naming::destination::resolve_owned_destination(
+        &c,
+        &input.target,
+        &preflight.root,
+        &preflight.basename,
+        preflight.quality_id,
+        &preflight.revision_binding.effective,
+        preflight.edition.as_deref(),
+        &preflight.evidence,
+    )
+    .await
+    .map_err(|_| Error::conflict("preflight_changed", "Import naming could not be validated"))?;
+    if destination != input.destination {
+        return Err(Error::conflict(
+            "preflight_changed",
+            "Import naming changed during preflight",
+        ));
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -214,15 +331,20 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             ));
         }
     }
-    let decision =
-        crate::search::downloaded::evaluate(&tx, &input.target, &input.source, input.expected_size)
-            .await
-            .map_err(|_| {
-                Error::conflict(
-                    "preflight_changed",
-                    "Downloaded file decision could not be validated",
-                )
-            })?;
+    let decision = crate::search::downloaded::evaluate_receipt(
+        &tx,
+        &input.target,
+        &input.source,
+        input.expected_size,
+        &input.candidate_id,
+    )
+    .await
+    .map_err(|_| {
+        Error::conflict(
+            "preflight_changed",
+            "Downloaded file decision could not be validated",
+        )
+    })?;
     let accepted = decision.accepted.ok_or_else(|| {
         Error::conflict(
             "preflight_changed",
@@ -240,7 +362,9 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         &accepted.root,
         &accepted.basename,
         accepted.quality_id,
+        &accepted.revision_binding.effective,
         accepted.edition.as_deref(),
+        &accepted.evidence,
     )
     .await
     {
@@ -290,7 +414,10 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         params![operation.clone(), json(&plan)?],
     )
     .await?;
-    let provenance = serde_json::json!({"policy_revision":input.policy_revision,"mapping_id":input.mapping_id,"mapping_revision":input.mapping_revision,"host":input.host,"expected_size":input.expected_size});
+    let provenance = serde_json::json!({"policy_revision":input.policy_revision,"mapping_id":input.mapping_id,"mapping_revision":input.mapping_revision,"host":input.host,"expected_size":input.expected_size,"comparison_facts":accepted.evidence,"revision_binding":accepted.revision_binding});
+    if json(&provenance)?.len() > 16384 {
+        return Err(Error::bad("Import factual provenance exceeds limit"));
+    }
     let old_id = old.as_ref().map(|v| v.file_id);
     tx.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,edition,provenance_json,old_file_json,old_episode_file_id,old_movie_file_id)VALUES(?,?,?,?,?,?,?,?,?)",params![input.candidate_id.clone(),operation.clone(),input.quality_id,input.revision_json,input.edition,json(&provenance)?,old.as_ref().map(json).transpose()?,if episode.is_some(){old_id}else{None},if movie.is_some(){old_id}else{None}]).await?;
     tx.execute("UPDATE download_processing SET status='importing',error_code=NULL,updated_at=unixepoch() WHERE candidate_id=? AND status='checking'",[input.candidate_id]).await?;

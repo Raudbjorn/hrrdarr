@@ -60,7 +60,7 @@ pub struct Policy {
     pub min_upgrade_format_score: i32,
     #[ts(optional = nullable)]
     pub language_id: Option<i32>,
-    pub format_items: [(); 0],
+    pub format_items: Vec<crate::db::custom_formats::FormatScore>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
@@ -109,7 +109,11 @@ pub fn router(db: Arc<Database>) -> Router {
         router = router.merge(
             Router::new()
                 .route(&prefix, get(list).post(create))
-                .route(&format!("{prefix}/{{id}}"), get(read).put(replace))
+                .route(&format!("{prefix}/schema"), get(schema))
+                .route(
+                    &format!("{prefix}/{{id}}"),
+                    get(read).put(replace).delete(delete),
+                )
                 .layer(Extension(media.to_owned()))
                 .layer(DefaultBodyLimit::max(32 * 1024))
                 .with_state(db.clone()),
@@ -122,7 +126,9 @@ pub fn router(db: Arc<Database>) -> Router {
         )
         .route(
             "/api/v1/{media}/quality-profiles/{id}",
-            get(unknown_domain).put(unknown_domain),
+            get(unknown_domain)
+                .put(unknown_domain)
+                .delete(unknown_domain),
         )
 }
 async fn unknown_domain() -> Error {
@@ -142,8 +148,8 @@ fn missing() -> Error {
 fn path_id(raw: &str) -> Result<i64> {
     raw.parse::<i64>()
         .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| invalid("Profile id must be a positive integer"))
+        .filter(|id| (1..=9_007_199_254_740_991).contains(id))
+        .ok_or_else(|| invalid("Profile id must be a positive safe integer"))
 }
 fn validate(input: &ProfileInput, limit: f64) -> Result<()> {
     validate_title(&input.name)?;
@@ -395,10 +401,21 @@ fn validate_policy(input: &ProfileInput, media: &str) -> Result<()> {
     let Some(policy) = &input.policy else {
         return Ok(());
     };
-    if policy.min_format_score > 0 {
-        return Err(invalid(
-            "Minimum format score is unsatisfiable without custom formats",
-        ));
+    let mut ids = BTreeSet::new();
+    if policy.format_items.len() > crate::custom_formats::MAX_FORMATS
+        || policy.format_items.iter().any(|f| {
+            f.format_id <= 0 || f.format_id > 9_007_199_254_740_991 || !ids.insert(f.format_id)
+        })
+    {
+        return Err(invalid("Invalid or duplicate custom format score ids"));
+    }
+    let reachable: i64 = policy
+        .format_items
+        .iter()
+        .map(|f| i64::from(f.score.max(0)))
+        .sum();
+    if i64::from(policy.min_format_score) > reachable {
+        return Err(invalid("Minimum score exceeds configured positive scores"));
     }
     if policy.min_upgrade_format_score < 1 {
         return Err(invalid("Minimum upgrade format score must be at least one"));
@@ -430,6 +447,7 @@ async fn fetch_policy(conn: &Connection, media: &str, id: i64) -> Result<Option<
             position: row.get::<i64>(2)? as usize,
         },
     };
+    let format_items = format_scores(conn, media, id).await?;
     Ok(Some(Policy {
         upgrade_allowed: row.get::<i64>(0)? != 0,
         cutoff,
@@ -437,9 +455,28 @@ async fn fetch_policy(conn: &Connection, media: &str, id: i64) -> Result<Option<
         cutoff_format_score: row.get(4)?,
         min_upgrade_format_score: row.get(5)?,
         language_id: row.get(6)?,
-        format_items: [],
+        format_items,
     }))
 }
+async fn format_scores(
+    conn: &Connection,
+    media: &str,
+    id: i64,
+) -> Result<Vec<crate::db::custom_formats::FormatScore>> {
+    let mut format_items = Vec::new();
+    let mut scores=conn.query("SELECT f.id,COALESCE(s.score,0) FROM custom_formats f LEFT JOIN quality_profile_format_scores s ON s.format_id=f.id AND s.profile_id=? WHERE f.media_type=? ORDER BY f.id LIMIT 129",params![id,media]).await?;
+    while let Some(score) = scores.next().await? {
+        format_items.push(crate::db::custom_formats::FormatScore {
+            format_id: score.get(0)?,
+            score: score.get(1)?,
+        });
+    }
+    if format_items.len() > crate::custom_formats::MAX_FORMATS {
+        return Err(invalid("Custom format score limit"));
+    }
+    Ok(format_items)
+}
+
 async fn insert_policy(conn: &Connection, media: &str, id: i64, policy: Policy) -> Result<()> {
     let (quality, group) = match policy.cutoff {
         Cutoff::Quality { quality_id } => (Some(quality_id), None),
@@ -458,6 +495,9 @@ async fn insert_policy(conn: &Connection, media: &str, id: i64, policy: Policy) 
         }
     };
     conn.execute("INSERT INTO quality_profile_policies(profile_id,media_type,upgrade_allowed,cutoff_quality_id,cutoff_group_id,min_format_score,cutoff_format_score,min_upgrade_format_score,language_id) VALUES(?,?,?,?,?,?,?,?,?)",params![id,media,i64::from(policy.upgrade_allowed),quality,group,policy.min_format_score,policy.cutoff_format_score,policy.min_upgrade_format_score,policy.language_id]).await?;
+    for score in policy.format_items {
+        conn.execute("INSERT INTO quality_profile_format_scores(profile_id,format_id,media_type,score)VALUES(?,?,?,?)",params![id,score.format_id,media,score.score]).await?;
+    }
     Ok(())
 }
 
@@ -465,9 +505,11 @@ fn profile_body(
     payload: std::result::Result<Json<ProfileInput>, JsonRejection>,
 ) -> Result<ProfileInput> {
     body(payload).map_err(|error| {
-        if error.0==StatusCode::BAD_REQUEST {
-            invalid("Expected the documented profile fields and types; nonempty custom format lists are unsupported")
-        } else { error }
+        if error.0 == StatusCode::BAD_REQUEST {
+            invalid("Expected the documented profile fields and types")
+        } else {
+            error
+        }
     })
 }
 
@@ -525,11 +567,34 @@ pub(crate) async fn persist_on_connection(
             ));
         }
     }
+    if let Some(policy) = &input.policy {
+        for score in &policy.format_items {
+            if conn
+                .query(
+                    "SELECT 1 FROM custom_formats WHERE id=? AND media_type=?",
+                    params![score.format_id, media],
+                )
+                .await?
+                .next()
+                .await?
+                .is_none()
+            {
+                return Err(invalid(
+                    "Custom format does not belong to this media domain",
+                ));
+            }
+        }
+    }
     let id = match id {
         Some(id) => {
             conn.execute(
                 "UPDATE quality_profiles SET name=?1 WHERE id=?2",
                 params![input.name, id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM quality_profile_format_scores WHERE profile_id=?",
+                [id],
             )
             .await?;
             conn.execute(
@@ -550,12 +615,22 @@ pub(crate) async fn persist_on_connection(
             id
         }
         None => {
+            // ponytail: historical mappings are scanned per creation; index destination_table/id if archive volume makes this costly.
+            let previous=conn.query("SELECT max(coalesce((SELECT max(id) FROM quality_profiles),0),coalesce((SELECT max(destination_id) FROM snapshot_mappings WHERE destination_table='quality_profiles'),0))",()).await?.next().await?.ok_or_else(||invalid("Profile identity allocation failed"))?.get::<i64>(0)?;
+            let id = previous
+                .checked_add(1)
+                .filter(|id| *id <= 9_007_199_254_740_991)
+                .ok_or(Error(
+                    StatusCode::CONFLICT,
+                    "profile_id_exhausted",
+                    "No safe profile identity remains",
+                ))?;
             conn.execute(
-                "INSERT INTO quality_profiles(media_type,name) VALUES(?1,?2)",
-                params![media, input.name],
+                "INSERT INTO quality_profiles(id,media_type,name) VALUES(?1,?2,?3)",
+                params![id, media, input.name],
             )
             .await?;
-            conn.last_insert_rowid()
+            id
         }
     };
     for (position, item) in input.items.into_iter().enumerate() {
@@ -613,5 +688,218 @@ fn input_leaf(leaf: ProfileLeaf) -> Leaf {
         min_size: leaf.min_size,
         max_size: leaf.max_size,
         preferred_size: leaf.preferred_size,
+    }
+}
+
+/// Unsaved editor schema. Its empty name and disabled cutoff deliberately fail save validation.
+async fn draft(conn: &Connection, media: &str) -> Result<ProfileInput> {
+    let tv = media == "tv";
+    // Immutable weights give the root order. TV WEB groups use Rip/DL; movies use DL/Rip.
+    let mut rows=conn.query("SELECT quality_id,weight,group_name,default_min,default_max,default_preferred FROM quality_definitions WHERE media_type=? ORDER BY weight,CASE WHEN media_type='tv' AND source='webRip' THEN 0 WHEN media_type='movies' AND source='webdl' THEN 0 ELSE 1 END,quality_id LIMIT 65",[media]).await?;
+    let mut groups: BTreeMap<i64, (Option<String>, Vec<Leaf>)> = BTreeMap::new();
+    let mut count = 0;
+    while let Some(row) = rows.next().await? {
+        count += 1;
+        if count > MAX_NODES {
+            return Err(invalid("Quality catalog exceeds profile node limit"));
+        }
+        groups
+            .entry(row.get(1)?)
+            .or_insert((row.get(2)?, Vec::new()))
+            .1
+            .push(Leaf {
+                quality_id: row.get(0)?,
+                allowed: false,
+                min_size: if tv { row.get(3)? } else { None },
+                max_size: if tv { row.get(4)? } else { None },
+                preferred_size: if tv { row.get(5)? } else { None },
+            });
+    }
+    drop(rows);
+    let mut items = Vec::new();
+    for (_, (name, mut leaves)) in groups {
+        if leaves.len() == 1 {
+            items.push(Item::Quality(leaves.remove(0)));
+        } else {
+            count += 1;
+            items.push(Item::Group {
+                name: name.ok_or_else(|| invalid("Quality catalog group is unnamed"))?,
+                allowed: false,
+                items: leaves,
+            });
+        }
+    }
+    if items.is_empty() || count > MAX_NODES {
+        return Err(invalid("Invalid profile quality catalog"));
+    }
+    Ok(ProfileInput {
+        name: String::new(),
+        items,
+        policy: Some(Policy {
+            upgrade_allowed: false,
+            cutoff: Cutoff::Quality { quality_id: 0 },
+            min_format_score: 0,
+            cutoff_format_score: 0,
+            min_upgrade_format_score: 1,
+            language_id: (!tv).then_some(-2),
+            format_items: format_scores(conn, media, 0).await?,
+        }),
+    })
+}
+async fn schema(
+    State(db): State<Arc<Database>>,
+    Extension(media): Extension<String>,
+) -> Result<Json<ProfileInput>> {
+    let conn = db.connect().await?;
+    let tx = conn.transaction().await?;
+    let result = draft(&tx, &media).await;
+    tx.rollback().await?;
+    result.map(Json)
+}
+
+/// Application startup only: preserve any configured domain, seed an entirely empty one.
+pub async fn initialize_defaults(db: &Database) -> std::result::Result<(), crate::db::Error> {
+    let conn = db.connect().await?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let result = async {
+        for media in ["tv", "movies"] {
+            if tx
+                .query(
+                    "SELECT 1 FROM quality_profiles WHERE media_type=? LIMIT 1",
+                    [media],
+                )
+                .await?
+                .next()
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let template = draft(&tx, media).await?;
+            let presets: &[(&str, i64, &[i64])] = if media == "tv" {
+                &[
+                    ("Any", 1, &[1, 12, 8, 2, 13, 22, 4, 9, 14, 5, 15, 3, 6, 7]),
+                    ("SD", 1, &[1, 12, 8, 2, 13, 22]),
+                    ("HD-720p", 4, &[4, 14, 5, 6]),
+                    ("HD-1080p", 9, &[9, 15, 3, 7]),
+                    ("Ultra-HD", 16, &[16, 17, 18, 19]),
+                    ("HD - 720p/1080p", 4, &[4, 9, 14, 5, 15, 3, 6, 7]),
+                ]
+            } else {
+                &[
+                    (
+                        "Any",
+                        20,
+                        &[
+                            24, 25, 26, 27, 29, 28, 1, 2, 23, 8, 12, 20, 21, 4, 5, 14, 6, 9, 3, 15,
+                            7, 30, 16, 18, 17, 19, 31, 22,
+                        ],
+                    ),
+                    ("SD", 20, &[24, 25, 26, 27, 29, 28, 1, 2, 8, 12, 20, 21]),
+                    ("HD-720p", 6, &[4, 5, 14, 6]),
+                    ("HD-1080p", 7, &[9, 3, 15, 7, 30]),
+                    ("Ultra-HD", 31, &[16, 18, 17, 19, 31]),
+                    ("HD - 720p/1080p", 6, &[4, 5, 14, 6, 9, 3, 15, 7, 30]),
+                ]
+            };
+            for (name, cutoff, allowed) in presets {
+                let mut input = template.clone();
+                input.name = (*name).into();
+                for item in &mut input.items {
+                    match item {
+                        Item::Quality(leaf) => leaf.allowed = allowed.contains(&leaf.quality_id),
+                        Item::Group {
+                            allowed: group,
+                            items,
+                            ..
+                        } => {
+                            *group = items.iter().any(|leaf| allowed.contains(&leaf.quality_id));
+                            for leaf in items {
+                                leaf.allowed = *group;
+                            }
+                        }
+                    }
+                }
+                if let Some(policy) = &mut input.policy {
+                    policy.cutoff = Cutoff::Quality {
+                        quality_id: *cutoff,
+                    };
+                }
+                persist_on_connection(&tx, media, None, input).await?;
+            }
+        }
+        Ok::<_, Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error.1.into())
+        }
+    }
+}
+
+async fn delete(
+    State(db): State<Arc<Database>>,
+    Extension(media): Extension<String>,
+    Path(raw): Path<String>,
+) -> Result<StatusCode> {
+    let id = path_id(&raw)?;
+    let conn = db.connect().await?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let result = async {
+        if tx
+            .query(
+                "SELECT 1 FROM quality_profiles WHERE id=? AND media_type=?",
+                params![id, media.clone()],
+            )
+            .await?
+            .next()
+            .await?
+            .is_none()
+        {
+            return Err(missing());
+        }
+        if tx
+            .query(
+                "SELECT 1 FROM library_settings WHERE quality_profile_id=? LIMIT 1",
+                [id],
+            )
+            .await?
+            .next()
+            .await?
+            .is_some()
+        {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "profile_in_use",
+                "Quality profile is assigned to a library item",
+            ));
+        }
+        tx.execute(
+            "DELETE FROM quality_profiles WHERE id=? AND media_type=?",
+            params![id, media],
+        )
+        .await?;
+        Ok(StatusCode::NO_CONTENT)
+    }
+    .await;
+    match result {
+        Ok(status) => {
+            tx.commit().await?;
+            Ok(status)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
     }
 }

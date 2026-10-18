@@ -1,7 +1,11 @@
 //! Native release evaluation shared by interactive search and durable RSS.
 mod decision;
+pub(crate) mod delay;
 pub(crate) mod downloaded;
 pub mod parser;
+mod restrictions;
+pub(crate) use restrictions::operation as operation_evidence;
+pub(crate) mod revision;
 use crate::api::MediaDomain;
 use crate::{
     db::Database,
@@ -19,7 +23,8 @@ use axum::{
 };
 pub use decision::evaluate;
 pub(crate) use decision::target_ranks;
-use libsql::{Connection, params};
+pub(crate) use decision::{evaluate_with_evidence, evaluate_with_pending};
+use libsql::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -54,6 +59,8 @@ pub struct ReleaseDecision {
     pub not_before: Option<i64>,
     pub quality_id: Option<i64>,
     pub parsed: Option<parser::ParsedRelease>,
+    #[serde(default)]
+    pub custom_formats: Option<crate::custom_formats::Score>,
 }
 impl ReleaseDecision {
     fn reject(code: &str) -> Self {
@@ -64,6 +71,7 @@ impl ReleaseDecision {
             not_before: None,
             quality_id: None,
             parsed: None,
+            custom_formats: None,
         }
     }
     pub(crate) fn deny(&mut self, code: &str) {
@@ -78,9 +86,19 @@ impl IntoResponse for SearchError {
         eprintln!("event=release_request_error code={}", self.0);
         (
             match self.0 {
-                "release_storage_error" | "release_profile_error" => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
+                "delay_profile_storage_error"
+                | "revision_policy_storage_error"
+                | "release_profile_storage_error"
+                | "release_term_busy"
+                | "release_term_timeout"
+                | "release_term_worker_failed"
+                | "release_term_state_changed" => StatusCode::SERVICE_UNAVAILABLE,
+                "release_storage_error"
+                | "release_profile_error"
+                | "delay_profile_invariant"
+                | "release_profile_invariant"
+                | "revision_policy_missing"
+                | "revision_policy_invalid" => StatusCode::INTERNAL_SERVER_ERROR,
                 "release_search_timeout" | "release_policy_timeout" => StatusCode::GATEWAY_TIMEOUT,
                 "release_target_missing" => StatusCode::NOT_FOUND,
                 code if code.starts_with("provider_") || code.starts_with("refresh_") => {
@@ -221,14 +239,25 @@ async fn put_policy(
     {
         return Err(SearchError("invalid_release_policy"));
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5),async {
-    let c =
-        s.db.connect()
-            .await
-            .map_err(|_| SearchError("release_storage_error"))?;
-    c.execute("INSERT INTO release_delay_policies(media_type,torrent_delay_minutes,usenet_delay_minutes,availability_delay_days) VALUES(?,?,?,?) ON CONFLICT(media_type) DO UPDATE SET torrent_delay_minutes=excluded.torrent_delay_minutes,usenet_delay_minutes=excluded.usenet_delay_minutes,availability_delay_days=excluded.availability_delay_days",params![domain(m),i64::from(p.torrent_delay_minutes),i64::from(p.usenet_delay_minutes),p.availability_delay_days]).await?;
-    Ok(Json(p))
-    }).await.map_err(|_|SearchError("release_policy_timeout"))?
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let c =
+            s.db.connect()
+                .await
+                .map_err(|_| SearchError("release_storage_error"))?;
+        let tx = c
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        match crate::delay_profiles::write_legacy(&tx, m, &p).await {
+            Ok(()) => tx.commit().await?,
+            Err(_) => {
+                tx.rollback().await?;
+                return Err(SearchError("release_policy_update_failed"));
+            }
+        }
+        Ok(Json(p))
+    })
+    .await
+    .map_err(|_| SearchError("release_policy_timeout"))?
 }
 async fn search(
     State(s): State<SearchState>,
@@ -269,6 +298,7 @@ async fn search(
             .raw_search(
                 &input.provider_id.to_string(),
                 input.provider_revision,
+                crate::providers::IndexerOperation::Interactive,
                 &request,
             )
             .await
@@ -279,8 +309,15 @@ async fn search(
             .as_secs() as i64;
         let mut items = Vec::new();
         for release in page.items {
-            let mut decision =
-                evaluate(&c, media, &release, SearchContext::UserSearch, now).await?;
+            let mut decision = evaluate(
+                &c,
+                media,
+                input.provider_id,
+                &release,
+                SearchContext::UserSearch,
+                now,
+            )
+            .await?;
             let matches = match (&input.target, &decision.target) {
                 (
                     crate::db::MediaTarget::Episode(id),

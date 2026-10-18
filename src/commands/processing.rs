@@ -15,8 +15,20 @@ pub struct ProcessingPolicyInput {
     pub enabled: bool,
     pub mode: ProcessingMode,
 }
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessingPolicyReset {
+    pub provider_revision: i64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub revision: Option<i64>,
+    pub mode: ProcessingMode,
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct ProcessingPolicy {
+    pub observation_suppressed: bool,
+    pub observation_enabled: bool,
+    pub enabled_override: Option<bool>,
+    pub desired_enabled: bool,
     pub provider_id: Uuid,
     pub media_type: MediaDomain,
     pub provider_revision: i64,
@@ -196,11 +208,28 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
+    let provider=c.query("SELECT p.revision,p.enabled FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
-    let stored=c.query("SELECT provider_revision,revision,enabled,mode FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
+    let provider_enabled = provider.get::<i64>(1)? == 1;
+    let stored=c.query("SELECT provider_revision,revision,enabled,mode,enabled_override FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
+    // Mirrors cdh_scope_authority.desired_enabled so reads match reconciliation.
+    let master = provider_enabled
+        && crate::completed_download_handling::read(c, media)
+            .await
+            .map_err(|e| Error(e.0, e.1))?
+            .enabled;
+    let observation=c.query("SELECT intent,enabled FROM download_refresh_schedules WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
+    let (observation_suppressed, observation_enabled) = match observation {
+        Some(r) => (r.get::<String>(0)? == "suppressed", r.get::<i64>(1)? == 1),
+        None => (false, false),
+    };
     if let Some(r) = stored {
+        let enabled_override = r.get::<Option<i64>>(4)?.map(|v| v == 1);
         Ok(ProcessingPolicy {
+            observation_suppressed,
+            observation_enabled,
+            enabled_override,
+            desired_enabled: master && enabled_override.unwrap_or(true),
             provider_id: id,
             media_type: media,
             provider_revision: r.get(0)?,
@@ -210,6 +239,10 @@ async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<Processi
         })
     } else {
         Ok(ProcessingPolicy {
+            observation_suppressed,
+            observation_enabled,
+            enabled_override: None,
+            desired_enabled: master,
             provider_id: id,
             media_type: media,
             provider_revision: revision,
@@ -241,6 +274,10 @@ pub(super) fn router(db: Arc<Database>) -> Router {
             "/api/v1/download-processing/policies/{provider_id}/{media_type}",
             get(get_policy).put(save_policy),
         )
+        .route(
+            "/api/v1/download-processing/policies/{provider_id}/{media_type}/inherit",
+            axum::routing::put(reset_policy),
+        )
         .layer(DefaultBodyLimit::max(8192))
         .layer(axum::middleware::from_fn(deadline))
         .with_state(db)
@@ -257,14 +294,16 @@ async fn get_policy(
     q: std::result::Result<Query<Empty>, QueryRejection>,
 ) -> Result<Json<ProcessingPolicy>> {
     q.map_err(|_| bad())?;
-    bounded(
-        policy(
-            &connection(&db).await?,
-            Uuid::parse_str(&id).map_err(|_| bad())?,
-            MediaDomain::parse(&m).map_err(|_| bad())?,
-        )
-        .await?,
+    let c = connection(&db).await?;
+    let tx = c.transaction().await?;
+    let value = policy(
+        &tx,
+        Uuid::parse_str(&id).map_err(|_| bad())?,
+        MediaDomain::parse(&m).map_err(|_| bad())?,
     )
+    .await?;
+    tx.commit().await?;
+    bounded(value)
 }
 async fn save_policy(
     State(db): State<Arc<Database>>,
@@ -276,20 +315,62 @@ async fn save_policy(
     let input = input.map_err(|_| bad())?.0;
     let id = Uuid::parse_str(&id).map_err(|_| bad())?;
     let m = MediaDomain::parse(&m).map_err(|_| bad())?;
-    positive(input.provider_revision)?;
-    let c = connection(&db).await?;
+    write_policy(
+        &db,
+        id,
+        m,
+        input.provider_revision,
+        input.revision,
+        Some(input.enabled),
+        input.mode,
+    )
+    .await
+}
+async fn reset_policy(
+    State(db): State<Arc<Database>>,
+    Path((id, m)): Path<(String, String)>,
+    q: std::result::Result<Query<Empty>, QueryRejection>,
+    input: std::result::Result<Json<ProcessingPolicyReset>, JsonRejection>,
+) -> Result<Json<ProcessingPolicy>> {
+    q.map_err(|_| bad())?;
+    let input = input.map_err(|_| bad())?.0;
+    write_policy(
+        &db,
+        Uuid::parse_str(&id).map_err(|_| bad())?,
+        MediaDomain::parse(&m).map_err(|_| bad())?,
+        input.provider_revision,
+        input.revision,
+        None,
+        input.mode,
+    )
+    .await
+}
+async fn write_policy(
+    db: &Database,
+    id: Uuid,
+    m: MediaDomain,
+    provider_revision: i64,
+    revision: Option<i64>,
+    enabled: Option<bool>,
+    mode: ProcessingMode,
+) -> Result<Json<ProcessingPolicy>> {
+    positive(provider_revision)?;
+    let c = connection(db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
+    let outcome=async {
         let current=policy(&tx,id,m).await?;
-        if current.revision!=input.revision||input.revision.is_some_and(|v|v>=MAX_REVISION){return Err(conflict())}
-        if tx.query("SELECT 1 FROM providers WHERE id=? AND revision=? AND (?=0 OR enabled=1)",params![id.to_string(),input.provider_revision,i64::from(input.enabled)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
-        tx.execute("INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode)VALUES(?,?,?,1,?,?) ON CONFLICT(provider_id,media_type)DO UPDATE SET provider_revision=excluded.provider_revision,revision=download_processing_policies.revision+1,enabled=excluded.enabled,mode=excluded.mode",params![id.to_string(),domain(m),input.provider_revision,i64::from(input.enabled),input.mode.text()]).await?;
+        if current.revision!=revision || revision.is_some_and(|v| !(1..MAX_REVISION).contains(&v)){return Err(conflict())}
+        if tx.query("SELECT 1 FROM providers WHERE id=? AND revision=? AND (?=0 OR enabled=1)",params![id.to_string(),provider_revision,i64::from(enabled==Some(true))]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
+        // Store intent without temporarily granting authority; the same transaction reconciles it.
+        tx.execute("INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode,enabled_override)VALUES(?,?,?,1,0,?,?) ON CONFLICT(provider_id,media_type)DO UPDATE SET provider_revision=excluded.provider_revision,revision=download_processing_policies.revision+1,enabled=0,mode=excluded.mode,enabled_override=excluded.enabled_override",params![id.to_string(),domain(m),provider_revision,mode.text(),enabled.map(i64::from)]).await?;
+        crate::completed_download_handling::reconcile(&tx,Some(&id.to_string()),Some(m)).await.map_err(|e|Error(e.0,e.1))?;
         bounded(policy(&tx,id,m).await?)
     }.await;
     finish(tx, outcome).await
 }
+
 async fn process(
     State(db): State<Arc<Database>>,
     q: std::result::Result<Query<Empty>, QueryRejection>,
@@ -432,6 +513,17 @@ fn processing_error(code: &str) -> &'static str {
         _ => "import_conflict",
     }
 }
+// Matcher admission, timeouts and storage reads are transient; only a decided rejection blocks.
+fn preflight_evaluation_error(code: &'static str) -> Error {
+    match code {
+        "release_storage_error" => Error(StatusCode::SERVICE_UNAVAILABLE, "storage_error"),
+        "custom_format_busy"
+        | "custom_format_timeout"
+        | "custom_format_worker_failed"
+        | "custom_format_state_changed" => Error(StatusCode::SERVICE_UNAVAILABLE, code),
+        _ => Error(StatusCode::CONFLICT, "quality_rejected"),
+    }
+}
 async fn preflight_failure(
     c: &Connection,
     item: &DownloadProcessing,
@@ -444,7 +536,14 @@ async fn preflight_failure(
     };
     let retry = matches!(
         code,
-        "interrupted" | "storage_error" | "download_timeout" | "download_unavailable"
+        "interrupted"
+            | "storage_error"
+            | "download_timeout"
+            | "download_unavailable"
+            | "custom_format_busy"
+            | "custom_format_timeout"
+            | "custom_format_worker_failed"
+            | "custom_format_state_changed"
     ) && item.preflight_attempts < 3;
     if retry && authorization(c, item).await.is_ok() {
         c.execute("UPDATE download_processing SET status='queued',error_code=?,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='checking'",params![code,serde_json::to_string(&reasons).map_err(|_|bad())?,now()?+(1i64<<item.preflight_attempts),now()?,item.receipt_id.to_string()]).await?;
@@ -525,9 +624,15 @@ async fn preflight(
         {
             return Err(Error(StatusCode::CONFLICT, "invalid_download_files"));
         }
-        let result = crate::search::downloaded::evaluate(&c, &target, &file.name, file.size_bytes)
-            .await
-            .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
+        let result = crate::search::downloaded::evaluate_receipt(
+            &c,
+            &target,
+            &file.name,
+            file.size_bytes,
+            &item.receipt_id.to_string(),
+        )
+        .await
+        .map_err(|e| preflight_evaluation_error(e.0))?;
         if let Some(facts) = result.accepted {
             if accepted.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "ambiguous_files"));
@@ -566,7 +671,9 @@ async fn preflight(
                 &facts.root,
                 &facts.basename,
                 facts.quality_id,
+                &facts.revision_binding.effective,
                 facts.edition.as_deref(),
+                &facts.evidence,
             )
             .await
             {
@@ -692,4 +799,28 @@ async fn advance_import(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preflight_error_tests {
+    use super::*;
+    #[test]
+    fn transient_matcher_and_storage_errors_stay_retryable() {
+        for code in [
+            "custom_format_busy",
+            "custom_format_timeout",
+            "custom_format_worker_failed",
+            "custom_format_state_changed",
+        ] {
+            assert_eq!(preflight_evaluation_error(code).1, code);
+        }
+        assert_eq!(
+            preflight_evaluation_error("release_storage_error").1,
+            "storage_error"
+        );
+        assert_eq!(
+            preflight_evaluation_error("custom_format_regex_invalid").1,
+            "quality_rejected"
+        );
+    }
 }

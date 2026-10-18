@@ -68,6 +68,22 @@ const LANGUAGES: &[(&str, Option<i32>, Option<i32>)] = &[
     ("Any", None, Some(-1)),
 ];
 
+/// Domain-specific identities for native settings controls.
+pub fn language_choices(media: MediaDomain) -> Vec<(i32, &'static str)> {
+    let mut choices: Vec<_> = LANGUAGES
+        .iter()
+        .filter_map(|(name, tv, movies)| {
+            match media {
+                MediaDomain::Tv => *tv,
+                MediaDomain::Movies => *movies,
+            }
+            .map(|id| (id, *name))
+        })
+        .collect();
+    choices.sort_by_key(|(id, _)| *id);
+    choices
+}
+
 pub fn language_id(media: MediaDomain, name: &str) -> Option<i32> {
     let name = match name {
         value

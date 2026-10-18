@@ -123,9 +123,31 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 35); // Latest open adds durable comparison facts; historical migration starts remain unchanged.
+    assert_eq!(version(&c).await?, 49); // Reasoning: latest migration is now 0049 indexer client binding (was 48: indexer operation policy); historical migration prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
-        assert_eq!(rows(&c, table).await?, before[i]);
+        let mut expected = before[i].clone();
+        if *table == "snapshot_imports" {
+            // Migrations36 through41 and45 append seven inactive metadata markers; retain every prior field and assert the new AutoTagging marker is0.
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                    libsql::Value::Integer(0),
+                ]);
+            }
+        }
+        if *table == "download_refresh_schedules" {
+            //0041 appends explicit intent and preserves the old effective bit as requested intent.
+            for row in &mut expected {
+                let enabled = row[3].clone();
+                row.extend([libsql::Value::Text("explicit".into()), enabled]);
+            }
+        }
+        assert_eq!(rows(&c, table).await?, expected);
     }
     assert!(clear(&c, "all").await.is_err());
     let tv = clear(&c, "tv").await?;

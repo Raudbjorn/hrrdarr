@@ -1,8 +1,8 @@
 # Naming configuration API
 
-Only Sonarr's `76c684e097f16ac216e6213845e5cac372774995`
-`Sonarr.Api.V3/Config/NamingConfigController.cs` was opened, for controller/route
-shape only (singleton `GET`, `PUT` guarded by FluentValidation, and a query-driven
+The initial configuration-controller inventory inspected
+`Sonarr.Api.V3/Config/NamingConfigController.cs` at Sonarr commit
+`76c684e097f16ac216e6213845e5cac372774995` for controller/route shape only (singleton `GET`, `PUT` guarded by FluentValidation, and a query-driven
 `GET examples`). Radarr's controller was **not** opened; nothing here claims
 Radarr route parity, only that migration 0029 (built independently) provides
 the movie columns this API serves. The `NamingConfigResource` schema was read
@@ -19,8 +19,9 @@ change.
 The token vocabulary, grammar, sanitization rules and every line of
 implementation below are an independent, clean-room design (see
 [`src/naming/render.rs`](../src/naming/render.rs)) — no upstream filename-
-builder or validator code (`_filenameSampleService`/`_filenameValidationService`,
-in different files, not opened) was read or translated. V3 wire compatibility
+builder or validator code was copied or translated. The later CF naming extension
+inventoried both pinned filename builders for token requirements only; the
+sample/validation services remain outside this inventory. V3 wire compatibility
 is not claimed. Known shape divergences from what the Sonarr controller shows:
 
 - `PUT` here has no `{id}` path segment (this is a domain-scoped singleton, not
@@ -86,16 +87,18 @@ row association (not merely an accepted decision) and that the configured
 `daily_episode_format`/`anime_episode_format` template actually rendered the
 on-disk filename (`"Harbor - 2020-01-01 [WEBDL-1080p].mkv"` from a real air
 date, `"Harbor - 01 [WEBDL-1080p].mkv"` from a real absolute episode number),
-not the raw downloaded basename. Two residual gaps this run does not cover,
-left for whoever owns them next: the fixture's `use_scene_numbering` is
+not the raw downloaded basename. The fixture's `use_scene_numbering` is
 `false`, so this does not exercise the scene-absolute-number-vs-plain-column
 fallback in `downloaded::match_absolute` (which has its own dedicated unit
 coverage in `src/search/downloaded.rs`) or the equivalent fallback this same
 session added to `src/search/decision.rs`'s own `Absolute` arm (which has its
-own dedicated coverage in `tests/release_decisions.rs`); and
-`src/commands/rescan.rs:958` still reports daily/absolute numbering as
-unsupported on its own separate call path, unrelated to and not fixed by
-either change described here. A render failure (for
+own dedicated coverage in `tests/release_decisions.rs`).
+
+Local rescans now support daily and ordinary absolute numbering through their
+separate transactional matcher; see [local rescan contracts](rescan-commands.md).
+Local files intentionally do not use downloaded-release scene-first matching.
+
+A render failure (for
 example `standard_episode_format = "{Episode Title}"` for an episode with no
 title) is a distinct, propagated error -- the automated path blocks the item
 with `error_code="unsupported_download"` and reason token
@@ -194,12 +197,11 @@ convention in this space, not upstream parsing logic. The vocabulary is
 closed and domain-scoped: an unrecognized token is a hard validation error
 naming the offending `{...}` text (`unknown_naming_token`), and a token from
 the other domain is a distinct, separately coded error
-(`cross_domain_naming_token`). `{Quality Title}` is the only token shared by
-both domains.
+(`cross_domain_naming_token`). `{Quality Title}` and custom-format tokens are shared by both domains.
 
 TV tokens: `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`,
-`{Air-Date}`, `{Quality Title}`. Movie tokens: `{Movie Title}`,
-`{Release Year}`, `{Edition Tags}`, `{Quality Title}`.
+`{Air-Date}`, `{Quality Title}`, custom-format tokens. Movie tokens: `{Movie Title}`,
+`{Release Year}`, `{Edition Tags}`, `{Quality Title}`, custom-format tokens.
 
 `{season:00}`/`{episode:00}` zero-pad the number to the number of `0`
 characters after the colon (1–4 digits; anything else, including `0` digits
@@ -213,10 +215,10 @@ mistake in a TV template still surfaces the more specific
 
 | Field | Allowed tokens |
 | --- | --- |
-| `standard_episode_format`, `daily_episode_format`, `anime_episode_format` | `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`, `{Air-Date}`, `{Quality Title}` |
+| `standard_episode_format`, `daily_episode_format`, `anime_episode_format` | `{Series Title}`, `{season:00}`, `{episode:00}`, `{Episode Title}`, `{Air-Date}`, `{Quality Title}`, custom-format tokens |
 | `series_folder_format` | `{Series Title}` |
 | `season_folder_format`, `specials_folder_format` | `{Series Title}`, `{season:00}` |
-| `standard_movie_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}`, `{Quality Title}` |
+| `standard_movie_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}`, `{Quality Title}`, custom-format tokens |
 | `movie_folder_format` | `{Movie Title}`, `{Release Year}`, `{Edition Tags}` |
 
 Rationale: a series/season folder is not per-episode, so episode/quality
@@ -226,6 +228,39 @@ folders that vary by a per-file fact.
 
 An absent optional fact (for example a missing `{Episode Title}` or
 `{Air-Date}`) substitutes an empty string, not an error or a placeholder.
+
+### Custom formats in filenames
+
+Both domains support `{Custom Formats}` (all matching rename-enabled names),
+`{Custom Formats:A,B}` (include exact names), `{Custom Formats:-A,B}` (exclude
+exact names), and `{Custom Format:A}` (one exact name). Names use deterministic Rust ordinal ordering and are joined with spaces; score weights do not affect inclusion.
+Missing matches and a singular token without a selector produce empty text.
+Names and filters are case-sensitive. Token identifiers are case-insensitive;
+`{CUSTOM.FORMATS}` uppercases output and substitutes dots for spaces,
+while `{custom_formats}` lowercases output with underscores. Conditional
+punctuation belongs inside the token: `{[Custom Formats]}` produces brackets
+only when matches exist, and `{-Custom Format:A}` produces its dash only
+when A matches. CF filename rendering collapses repeated identical spaces,
+dots, dashes and underscores and trims those separators at the component edges.
+The existing illegal-character policy and UTF-8 filename/extension byte cap
+still apply. File-specific CF tokens are rejected in folder formats.
+
+Examples use fixed illustrative matching names `Surround Sound` and `x265`;
+they preview syntax, not the user's live catalog. Completed imports instead
+use frozen receipt/file evidence and the current domain catalog, including
+`include_when_renaming`. They reuse the bounded evaluator with no profile score
+weights. Matching is prepared outside the writer transaction; transactional
+revalidation requires an exact cached result and the same rendered destination.
+Cache misses, invalid definitions and render failures are explicit failures;
+processing diagnostics contain static field/class codes, not patterns or names.
+A journaled import resumes to its captured destination even if naming settings
+or CF names/flags change. This adds no existing-library rename command; matching
+existing files for future callers must preserve original release-title/path
+fallback through the existing evidence loader.
+
+Requirements were inventoried from the pinned Sonarr/Radarr
+`Organizer/FileNameBuilder.cs` custom-format token handlers and normalization,
+then implemented independently in the native parser/evaluator flow.
 
 ## Grammar and structural validation (parse time, no facts needed)
 
@@ -327,10 +362,7 @@ PUT round-trip/revision-bump/stale-revision-conflict for both domains called
 directly against the handlers, the examples-endpoint colon-mode-override fix,
 real query-string parsing via `axum::extract::Query::try_from_uri` (enum/bool
 values, cross-domain-field rejection), and that omitting any nullable PUT field
-is a hard error rather than a silent null. **No HTTP contract-test file exists
-yet** — a separate reviewer is expected to add `tests/naming_api.rs` exercising
-the routes end to end over a real listener, the way `tests/provider_config_api.rs`
-exercises `src/providers/mod.rs`; that file was intentionally not created here.
+is a hard error rather than a silent null. `tests/naming_api.rs` exercises real HTTP configuration and examples, including both-domain custom-format token previews.
 
 `src/naming/destination.rs` carries its own in-module unit tests for the
 pure stem/extension-capping logic (`finish_render`): a short stem passed
@@ -344,6 +376,51 @@ exercised only indirectly today, through whichever integration tests cover
 
 Outstanding: folder-format rendering
 (`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
-and the directory-creation it would require; multi-episode rendering; any UI.
+and the directory-creation it would require; multi-episode rendering; full naming
+UI parity. `NamingPanel.svelte` already provides configuration, previews and token help.
 No live services, network calls, or fixed ports are used anywhere in
 this module.
+
+CF naming regression evidence also includes both-domain completed-download imports
+with negative/zero/positive format scores and rename-flag filtering, captured
+path recovery after a CF change, and serial owned-import preflight cases for
+name/flag/definition changes and private invalid filename characters. Those
+preflight cases require no journal or file mutation and preserve the old media.
+These tests use scratch databases/files and loopback fixtures, not live services
+or upstream runtime equivalence. Full rename commands, folder rendering and UI
+parity remain outside this change.
+
+Name-order tests cover ASCII names. The references use their default string
+comparer; culture-specific Unicode collation equivalence is not established.
+
+The current storage contract keeps TV `original_file_path` null. Existing TV
+files with a blank original release title therefore fall back to their current
+basename; movie files also try their nonblank original path basename. Nonblank
+original title text is preserved exactly. Extending TV original-path storage is
+separate from this pending-import naming flow, which uses frozen evidence.
+
+Quality Full accepts the same file-format field scopes as Quality Title. It renders the factual quality name plus Proper for a revision above1 (TV anime uses vN), and REAL when real>0. IsRepack does not change the superiority label. Quality Title continues to render only the quality name. Owned destination calculation receives the validated factual revision directly; it does not reparse renamed destination paths. This addition does not expand folder-token scopes or remove other documented naming limits.
+
+## Stored movie filename previews
+
+`GET /api/v1/movies/rename-preview?movie_ids=1,2` previews the complete selected set of stored movie files. `movie_ids` is required: 1–200 distinct positive decimal JavaScript-safe IDs, comma separated. Leading zeros are accepted; duplicate IDs, empty values, signs, unknown/duplicate query keys, malformed values and raw queries over 4096 bytes return `400 invalid_request`. Missing selected movies return `404 movie_not_found`; none are silently ignored. The current one-file-per-movie constraint bounds the complete response to 200 files; there is no pagination or silent truncation.
+
+The response includes captured `naming_revision`, `rename_enabled`, `standard_movie_format`, sorted `movie_ids`, `files_considered`, `unchanged_count`, `unavailable_count` and `items`. Items identify `movie_id` and `movie_file_id`, relative `existing_path`/`new_path`, `status` (`change` or `unavailable`) and static `reasons`. Valid ordinal-unchanged paths are counted but omitted; case-only changes remain changes. Movies without files contribute zero files. Unavailable files stay visible with null proposed paths, and invalid existing paths are not echoed as trustworthy relative paths.
+
+The request captures settings, selected file facts, original movie language and current custom-format definitions in one read-only transaction. It closes that transaction before bounded cold/current custom-format evaluation. It never consults a changing catalog again during rendering, and does not substitute cached profile score totals or incoming-download facts. Quality Full receives the stored validated revision, not a guessed proper/repack marker. Only facts required by the parsed template are validated: unused malformed revision or unrelated custom-format data does not create a dependency.
+
+With renaming enabled, all currently legal native movie tokens use the same renderer as naming examples/imports: Movie Title, Release Year, Edition Tags, Quality Title/Full and the existing singular/plural/filter/case Custom Format variants. An enabled null or invalid stored template returns `422 naming_configuration_invalid`. Disabled naming bypasses the template even if its stored text is malformed: it prefers nonempty immutable original release title, then the CURRENT file basename without extension, using default illegal-character cleanup and source-default colon replacement (`Scene: Name` becomes `Scene - Name`; `Scene:Name` becomes `Scene-Name`). This disabled fallback is distinct from the accepted enabled native Smart colon policy, which remains unchanged. The movie `original_file_path` fallback belongs to custom-format evidence, not this disabled filename branch. Existing extension is appended once; original release-title text is not heuristically stripped as though it were a path. Automated imports retain their existing disabled basename-preservation behavior unchanged.
+
+Previews retain the existing movie root, validate lexical containment, and never rename its folder. The current native filename grammar rejects nested template paths. An existing nested file can still preview to a filename at the movie root. Unsafe/outside-root paths, unusable extensions, invalid required facts and empty/invalid rendering produce explicit per-file reasons: `invalid_path`, `missing_extension`, `invalid_file_facts`, `naming_render_failed`. Optional absent year/edition/quality values use existing renderer semantics; no year, quality, language or revision is fabricated.
+
+Conflicting rendered destinations are retained with both file identities, as in the source preview. This is not an execution or overwrite check: there are no filesystem probes, directory creation, file writes, commands, journals, metadata refreshes, provider calls or catalog occupancy scans. Untracked files, symlinks and concurrent changes can still make later execution unsafe. Rename execution remains separate work and must require explicit user intent and its own recovery/safety checks.
+
+Snapshot content is limited to 32 MiB, serialized responses to 8 MiB, and the request deadline is eight seconds. The client uses its existing ten-second request bound. Resource exhaustion or bounded evaluation failure returns `503 rename_preview_unavailable`; storage failure returns `500 database_error`. These failures never masquerade as successful empty previews.
+
+Movie detail offers an explicit **Preview filenames** control, then reload and close. Closing invalidates outstanding results and resets the preview. It displays captured configuration, changed/unavailable paths and counts, with separate loading/error/no-file/no-change/disabled states. Leaving the movie/domain invalidates outstanding results. All paths and pattern text are escaped. There is no Apply/Rename button in this read-only feature.
+
+### Remaining naming parity
+
+The verified closed-vocabulary foundation and this preview capability do not claim the full upstream grammar. Required remaining families stay under broader naming/config parity: clean/article/first-character/original/translated/certification/collection titles; IMDb/TMDb tokens; original filename/title/release-group tokens; standalone Quality Proper/Real; media-info codec/depth/channels/language/3D/HDR tokens and filters; general token separator/case/optional punctuation/truncation and nested filename-template behavior. Original/translated/certification/collection metadata authority, certification-country selection, 3D normalization and their producers require separate schema/metadata contracts. Current preview never fabricates those facts or silently treats unsupported stored templates as no change. Future accepted grammar must be shared with this preview rather than implemented in a second parser.
+
+No V3 wire compatibility, full source naming equivalence, TV multi-episode previews, movie-folder moves, rename execution or filesystem safety is claimed. Parent verification evidence, not this documentation, establishes observed coverage; this feature adds no persistent state or dependency.

@@ -31,8 +31,36 @@ pub fn render() -> String {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
     };
+    registry.visit::<crate::host::HostSettings>();
+    registry.visit::<crate::release_profiles::Catalog>();
+    registry.visit::<crate::release_profiles::Detail>();
+    registry.visit::<crate::release_profiles::TvInput>();
+    registry.visit::<crate::release_profiles::MovieInput>();
+    registry.visit::<crate::release_profiles::Write<crate::release_profiles::TvInput>>();
+    registry.visit::<crate::release_profiles::Write<crate::release_profiles::MovieInput>>();
+    registry.visit::<crate::delay_profiles::Catalog>();
+    registry.visit::<crate::delay_profiles::Input>();
+    registry.visit::<crate::delay_profiles::Write>();
+    registry.visit::<crate::delay_profiles::Reorder>();
+    registry.visit::<crate::commands::RefreshScheduleReset>();
+    registry.visit::<crate::completed_download_handling::Settings>();
+    registry.visit::<crate::completed_download_handling::ReconciliationReason>();
+    registry.visit::<crate::completed_download_handling::Update>();
+    registry.visit::<crate::commands::processing::ProcessingPolicyReset>();
+    registry.visit::<crate::revision_policy::Policy>();
+    registry.visit::<crate::revision_policy::Update>();
+    registry.visit::<crate::tags::Input>();
+    registry.visit::<crate::tags::Tag>();
+    registry.visit::<crate::tags::Assignment>();
+    registry.visit::<crate::tags::Detail>();
+    registry.visit::<crate::tags::Owners>();
+    registry.visit::<crate::tags::Page>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::custom_formats::Input,
+        crate::custom_formats::Format,
+        crate::custom_formats::Bulk,
+        crate::custom_formats::Schema,
         crate::commands::search::SearchCommandInput,
         crate::commands::search::SearchCommandQuery,
         crate::api::ApiPage<crate::commands::search::SearchCommand>,
@@ -58,6 +86,11 @@ pub fn render() -> String {
         crate::commands::manual_import::ManualImportBatchInput,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
+        crate::health::HealthCommandInput,
+        crate::health::HealthSnapshot,
+        crate::health::HealthAdmission,
+        crate::health::HealthTransitions,
+        crate::api::ApiPage<crate::health::HealthCommand>,
         crate::commands::quality_reset::QualityResetInput,
         crate::api::ApiPage<crate::commands::quality_reset::QualityResetCommand>,
         crate::commands::rescan::RescanInput,
@@ -121,6 +154,10 @@ pub fn render() -> String {
         crate::providers::ProviderQuery,
         crate::providers::ProviderRevision,
         crate::api::ApiPage<crate::providers::Provider>,
+        crate::naming::movie_preview::MovieRenamePreview,
+        crate::naming::movie_preview::MovieRenamePreviewItem,
+        crate::naming::movie_preview::MovieRenamePreviewStatus,
+        crate::naming::movie_preview::MovieRenamePreviewReason,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,
@@ -138,6 +175,10 @@ pub fn render() -> String {
         crate::metadata::LookupResult,
         crate::metadata::SeriesDetails,
         crate::metadata::MovieDetails,
+        crate::metadata::CreditDetails,
+        crate::credits::CreditQuery,
+        crate::credits::Credit,
+        crate::api::ApiPage<crate::credits::Credit>,
         crate::metadata::EpisodeDetails,
         crate::library::Patch,
         crate::library::Bulk,
