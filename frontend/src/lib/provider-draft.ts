@@ -13,10 +13,10 @@ export function matchesPendingProvider(provider:Provider,pending:PendingProvider
 // Transfer protocol per implementation; mirrors the server's provider_implementations registry.
 // The server remains authoritative: a mismatched grab or binding is rejected with protocol_mismatch.
 export type TransferProtocol='torrent'|'usenet';
-const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',qbittorrent:'torrent',transmission:'torrent',newznab:'usenet',sabnzbd:'usenet'};
+const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',qbittorrent:'torrent',transmission:'torrent',newznab:'usenet',sabnzbd:'usenet',nzbget:'usenet'};
 export const protocolOf=(implementation:ProviderImplementation):TransferProtocol=>protocols[implementation];
 export const isIndexerImplementation=(implementation:ProviderImplementation):implementation is 'torznab'|'newznab'=>implementation==='torznab'||implementation==='newznab';
-export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'transmission'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='transmission';
+export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'nzbget'|'transmission'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='nzbget'||implementation==='transmission';
 export const isIndexer=(provider:Provider)=>isIndexerImplementation(provider.settings.implementation);
 export const isDownloadClient=(provider:Provider)=>isClientImplementation(provider.settings.implementation);
 export function indexerScope(provider:Provider|null,domain:MediaDomain) {

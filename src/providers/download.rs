@@ -5,7 +5,7 @@
 //! `provider_implementations` table with its kind/protocol, and add one arm to each match below
 //! and in `RefreshClient`. Grab, refresh, completed-download processing and health consumers do
 //! not name concrete clients.
-use super::{qbittorrent, sabnzbd, transmission};
+use super::{nzbget, qbittorrent, sabnzbd, transmission};
 
 /// What the grab pipeline hands to a client. The variant must match the client's protocol; a
 /// torrent source is shared by every torrent client (qBittorrent, Transmission).
@@ -31,6 +31,7 @@ impl ReleaseSource {
 pub(crate) enum PreparedSubmission {
     Torrent(qbittorrent::PreparedDownload),
     Usenet(sabnzbd::PreparedNzb),
+    Nzbget(nzbget::PreparedNzb),
     Transmission(transmission::PreparedTorrent),
 }
 impl PreparedSubmission {
@@ -38,6 +39,7 @@ impl PreparedSubmission {
         match self {
             Self::Torrent(prepared) => prepared.identity(),
             Self::Usenet(prepared) => prepared.identity(),
+            Self::Nzbget(prepared) => prepared.identity(),
             Self::Transmission(prepared) => prepared.identity(),
         }
     }
@@ -45,6 +47,7 @@ impl PreparedSubmission {
         match self {
             Self::Torrent(prepared) => prepared.into_identity(),
             Self::Usenet(prepared) => prepared.into_identity(),
+            Self::Nzbget(prepared) => prepared.into_identity(),
             Self::Transmission(prepared) => prepared.into_identity(),
         }
     }

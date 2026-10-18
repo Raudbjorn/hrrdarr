@@ -73,7 +73,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version_of(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+            assert_eq!(version_of(&c).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
             assert_eq!(
                 scalar(&c, "SELECT tag_version FROM snapshot_imports").await?,
                 0
@@ -141,7 +141,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             drop(c);
             drop(db);
             let reopened = Database::open_local(&path).await?;
-            assert_eq!(version_of(&reopened.connect().await?).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+            assert_eq!(version_of(&reopened.connect().await?).await?, 63); // Reasoning: latest is 0063 (0061 upgrade recycle, 0062 transmission registry, 0063 NZBGet registry stored as file 0066); historical prefixes stay fixed.
         }
     }
     Ok(())

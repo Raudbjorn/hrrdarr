@@ -264,6 +264,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "transmission",
         include_str!("../../migrations/0062_transmission.sql"),
     ),
+    // File 0066: versions 0063-0065 belong to other branches and are renumbered at integration.
+    ("nzbget", include_str!("../../migrations/0066_nzbget.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -917,5 +919,7 @@ mod download_client_backoff_tests;
 mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;
+#[cfg(test)]
+mod nzbget_registry_tests;
 #[cfg(test)]
 mod transmission_registry_tests;
