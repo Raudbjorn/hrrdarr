@@ -2,6 +2,7 @@
 //! endpoint. Persists to the `naming_settings` table (migration 0029). Not wired
 //! into any automated import path yet; see docs/naming-api.md.
 pub(crate) mod destination;
+pub mod movie_preview;
 pub mod render;
 use crate::db::Database;
 use axum::{
@@ -255,10 +256,12 @@ fn render_field(
 fn example_episode_facts() -> render::EpisodeNamingFacts {
     render::EpisodeNamingFacts {
         series_title: "Halcyon Vale".into(),
+        anime: false,
         season: 3,
         episode: 7,
         episode_title: Some("The Long Dark".into()),
         quality_title: "WEBDL-1080p".into(),
+        revision: None,
         custom_formats: vec!["Surround Sound".into(), "x265".into()],
         air_date: Some("2024-05-14".into()),
     }
@@ -270,6 +273,7 @@ fn example_movie_facts() -> render::MovieNamingFacts {
         release_year: Some(2023),
         edition: Some("Director's Cut".into()),
         quality_title: "Bluray-1080p".into(),
+        revision: None,
         custom_formats: vec!["Surround Sound".into(), "x265".into()],
     }
 }
@@ -519,6 +523,7 @@ struct Context {
     db: Arc<Database>,
 }
 pub fn router(db: Arc<Database>) -> Router {
+    let previews = movie_preview::router(db.clone());
     let tv = Router::new()
         .route("/api/v1/tv/config/naming", get(get_tv).put(put_tv))
         .route("/api/v1/tv/config/naming/examples", get(examples_tv))
@@ -533,7 +538,9 @@ pub fn router(db: Arc<Database>) -> Router {
             get(examples_movies),
         )
         .with_state(Context { db });
-    tv.merge(movies).layer(DefaultBodyLimit::max(32 * 1024))
+    tv.merge(movies)
+        .merge(previews)
+        .layer(DefaultBodyLimit::max(32 * 1024))
 }
 
 async fn get_tv(State(ctx): State<Context>) -> Result<Json<TvNamingConfig>> {

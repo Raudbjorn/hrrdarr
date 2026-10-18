@@ -38,6 +38,7 @@ struct Remote {
     items: Mutex<Vec<Value>>,
     adds: Mutex<Vec<String>>,
     offsets: Mutex<Vec<u32>>,
+    indexer_requests: Mutex<Vec<String>>,
     endpoint: Mutex<String>,
     mode: AtomicU8,
     started: tokio::sync::Notify,
@@ -66,6 +67,7 @@ async fn remote(
             .into_owned()
             .collect();
     if uri.path() == "/" || uri.path() == "/api" {
+        s.indexer_requests.lock().unwrap().push(uri.to_string());
         if q.get("t").is_some_and(|v| v == "caps") {
             return r#"<caps><limits max="100" default="100"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,tvdbid,season,ep"/><movie-search available="yes" supportedParams="q,tmdbid"/></searching><categories><category id="5000"><subcat id="5030"/></category><category id="2000"><subcat id="2030"/></category></categories></caps>"#.into_response();
         }
@@ -74,6 +76,10 @@ async fn remote(
             .map(|v| v.parse::<u32>().unwrap())
             .unwrap_or(0);
         s.offsets.lock().unwrap().push(offset);
+        if s.mode.load(Ordering::SeqCst) == 9 && offset == 0 {
+            s.started.notify_one();
+            s.release.notified().await;
+        }
         if s.mode.load(Ordering::SeqCst) == 5 && offset > 0 {
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -86,11 +92,13 @@ async fn remote(
         } else {
             "Harbor.2020"
         };
-        let quality = if s.mode.load(Ordering::SeqCst) == 6 {
-            if better {
-                "1080p.Other"
-            } else {
-                "1080p.Preferred"
+        let quality = if matches!(s.mode.load(Ordering::SeqCst), 6..=8) {
+            match (s.mode.load(Ordering::SeqCst), better) {
+                (7, true) => "1080p.Other.PROPER",
+                (8, true) => "1080p.Other.REAL",
+                (8, false) => "1080p.Preferred.PROPER",
+                (_, true) => "1080p.Other",
+                (_, false) => "1080p.Preferred",
             }
         } else if better {
             "1080p"
@@ -225,7 +233,8 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
     let (base, server) = serve(
         router
             .merge(commands::router(db.clone()))
-            .merge(hrrdarr::search::router(db, client.clone())),
+            .merge(hrrdarr::search::router(db.clone(), client.clone()))
+            .merge(hrrdarr::release_profiles::router(db)),
     )
     .await;
     (base, server, client)
@@ -338,6 +347,15 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
         let (base, server, client) = app(db.clone()).await;
         let (indexer, download) = providers(&base, &remote_base).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
+        // Precise release-profile timing replaces the old blanket future-airdate
+        // veto. Keep this search-vs-RSS authority test using the real monitoring
+        // exception; movies still exercise their independent future availability.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE series SET monitored=0", ())
+            .await
+            .unwrap();
         for tv in [true, false] {
             // The same private release was already rejected by background RSS.
             // A user search must retain its exception without weakening RSS rules.
@@ -880,6 +898,16 @@ async fn interrupted_selected_submission_reopens_and_only_reconciles() {
         let (_, page) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
         let receipt = page["items"][0].clone();
         assert_eq!(receipt["status"], "submitting");
+        // A policy change cannot erase an already uncertain send or authorize a resend.
+        policy_flags(
+            &base,
+            &indexer,
+            if tv { "tv" } else { "movies" },
+            false,
+            false,
+            false,
+        )
+        .await;
         runtime.shutdown().await;
         server.stop().await;
         drop(db);
@@ -1051,7 +1079,14 @@ async fn movie_language_policy_is_enforced_at_search_and_grab() {
 #[tokio::test]
 async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_boundary() {
     for tv in [true, false] {
-        for automatic in [true, false] {
+        for (automatic, revision_case) in [
+            (true, None),
+            (false, None),
+            (true, Some((7, "prefer_and_upgrade"))),
+            (true, Some((7, "do_not_upgrade"))),
+            (true, Some((7, "do_not_prefer"))),
+            (true, Some((8, "prefer_and_upgrade"))),
+        ] {
             let scratch = Scratch(
                 std::env::temp_dir().join(format!("hrrdarr-cf-grab-{}", uuid::Uuid::new_v4())),
             );
@@ -1071,7 +1106,18 @@ async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_bounda
             .await
             .unwrap();
             let state = Arc::new(Remote::default());
-            state.mode.store(6, Ordering::SeqCst);
+            state.mode.store(
+                revision_case.map_or(6, |(offer_mode, _)| offer_mode),
+                Ordering::SeqCst,
+            );
+            if let Some((_, mode)) = revision_case {
+                c.execute(
+                    "UPDATE revision_policies SET mode=?,revision=revision+1 WHERE media_type=?",
+                    libsql::params![mode, domain],
+                )
+                .await
+                .unwrap();
+            }
             let (remote_base, remote_server) = serve(
                 axum::Router::new()
                     .fallback(remote)
@@ -1135,10 +1181,466 @@ async fn custom_format_ranking_and_changed_offer_policy_reach_real_client_bounda
                 assert!((200..300).contains(&code), "{receipt}");
                 observed(&base, receipt["id"].as_str().unwrap()).await;
             } else {
-                let receipt = preferred["selected_candidate_id"].as_str().unwrap();
+                let selected = results
+                    .iter()
+                    .find(|offer| offer["selected_candidate_id"].is_string())
+                    .unwrap();
+                let receipt = selected["selected_candidate_id"].as_str().unwrap();
                 observed(&base, receipt).await;
             }
-            assert_eq!(state.adds.lock().unwrap().as_slice(), &[hash(tv, false)]);
+            // Revision preference must beat the higher CF score through the real
+            // automatic caller, including REAL before version. DoNotPrefer omits it;
+            // DoNotUpgrade still ranks newer revisions for explicit user search.
+            let revision_wins = revision_case.is_some_and(|(_, mode)| mode != "do_not_prefer");
+            assert_eq!(
+                state.adds.lock().unwrap().as_slice(),
+                &[hash(tv, revision_wins)],
+                "tv={tv} case={revision_case:?}"
+            );
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn release_profiles_revalidate_search_offers_and_automatic_admission() {
+    for tv in [true, false] {
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "hrrdarr-search-restrictions-{}",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+        seed(&db).await;
+        let state = Arc::new(Remote::default());
+        let (remote_base, _remote) = serve(
+            axum::Router::new()
+                .fallback(remote)
+                .with_state(state.clone()),
+        )
+        .await;
+        let (base, _server, client) = app(db.clone()).await;
+        let (indexer, download) = providers(&base, &remote_base).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&indexer, &download, tv, "interactive"),
+        )
+        .await;
+        assert_eq!(code, 202);
+        assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+        let rows = offers(&base, &command["id"]).await;
+        assert_eq!(rows.len(), 2);
+        let d = if tv { "tv" } else { "movies" };
+        let mut p = json!({"name":"Admission","enabled":true,"required":["NEVER_MATCH_THIS_TITLE"],"ignored":[],"tag_ids":[],"indexers":[{"kind":"provider","id":indexer["id"]}]});
+        if tv {
+            p["excluded_tag_ids"] = json!([]);
+            p["air_date_restriction"] = json!(false);
+            p["air_date_grace_period_days"] = json!(0);
+            p["allow_season_pack_without_all_episodes_aired"] = json!(false);
+        }
+        let (code, value) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/{d}/release-profiles"),
+            json!({"revision":1,"profile":p}),
+        )
+        .await;
+        assert_eq!(code, 201, "{value}");
+        let (code, error) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                rows[0]["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, 409, "{error}");
+        let (code, automatic) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&indexer, &download, tv, "automatic"),
+        )
+        .await;
+        assert_eq!(code, 202);
+        let done = settled(&base, &automatic["id"]).await;
+        assert_eq!(done["status"], "failed");
+        assert_eq!(done["error_code"], "no_eligible_release");
+        let rejected = offers(&base, &automatic["id"]).await;
+        assert_eq!(rejected.len(), 2);
+        for offer in rejected {
+            assert_eq!(
+                offer["decision"]["reasons"],
+                json!(["release_required_term_missing"])
+            );
+        }
+        assert!(state.adds.lock().unwrap().is_empty());
+        let c = db.connect().await.unwrap();
+        assert_eq!(
+            c.query("SELECT count(*) FROM rss_candidates", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        runtime.shutdown().await;
+    }
+}
+
+async fn policy_flags(
+    base: &str,
+    indexer: &Value,
+    media: &str,
+    rss: bool,
+    automatic: bool,
+    interactive: bool,
+) -> Value {
+    let mut settings = indexer["settings"].clone();
+    settings[media]["enable_rss"] = json!(rss);
+    settings[media]["enable_automatic_search"] = json!(automatic);
+    settings[media]["enable_interactive_search"] = json!(interactive);
+    let (code, updated) = request(base, "PUT", &format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap()), json!({"revision":indexer["revision"],"name":"policy fixture","enabled":true,"priority":1,"settings":settings})).await;
+    assert_eq!(code, 200, "{updated}");
+    updated
+}
+
+async fn policy_fixture() -> (
+    Scratch,
+    Arc<Database>,
+    Arc<Remote>,
+    String,
+    Server,
+    Server,
+    providers::RefreshClient,
+    Value,
+    Value,
+) {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-indexer-policy-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    seed(&db).await;
+    let remote_state = Arc::new(Remote::default());
+    let (remote_base, remote_server) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(remote_state.clone()),
+    )
+    .await;
+    *remote_state.endpoint.lock().unwrap() = remote_base.clone();
+    let (base, server, client) = app(db.clone()).await;
+    let (indexer, download) = providers(&base, &remote_base).await;
+    (
+        scratch,
+        db,
+        remote_state,
+        base,
+        server,
+        remote_server,
+        client,
+        indexer,
+        download,
+    )
+}
+
+#[tokio::test]
+async fn indexer_policy_admission_blocks_only_requested_operation_without_http() {
+    let (_scratch, _db, peer, base, server, remote_server, _client, mut indexer, download) =
+        policy_fixture().await;
+    for tv in [true, false] {
+        let media = if tv { "tv" } else { "movies" };
+        for blocked in ["rss", "automatic", "interactive"] {
+            indexer = policy_flags(
+                &base,
+                &indexer,
+                media,
+                blocked != "rss",
+                blocked != "automatic",
+                blocked != "interactive",
+            )
+            .await;
+            let before = peer.indexer_requests.lock().unwrap().len();
+            for mode in ["automatic", "interactive"] {
+                let (code, command) = request(
+                    &base,
+                    "POST",
+                    "/api/v1/search/commands",
+                    input(&indexer, &download, tv, mode),
+                )
+                .await;
+                assert_eq!(code, if blocked == mode { 409 } else { 202 }, "{command}");
+                if code == 202 {
+                    assert_eq!(
+                        request(
+                            &base,
+                            "POST",
+                            &format!(
+                                "/api/v1/search/commands/{}/cancel",
+                                command["id"].as_str().unwrap()
+                            ),
+                            json!({})
+                        )
+                        .await
+                        .0,
+                        200
+                    );
+                }
+            }
+            let target = json!({"media_type":media,"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":download["id"],"client_revision":download["revision"]});
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/rss/commands",
+                json!({"target":target,"priority":"normal"}),
+            )
+            .await;
+            assert_eq!(code, if blocked == "rss" { 409 } else { 202 }, "{command}");
+            if code == 202 {
+                assert_eq!(
+                    request(
+                        &base,
+                        "POST",
+                        &format!(
+                            "/api/v1/rss/commands/{}/cancel",
+                            command["id"].as_str().unwrap()
+                        ),
+                        json!({})
+                    )
+                    .await
+                    .0,
+                    200
+                );
+            }
+            assert_eq!(
+                peer.indexer_requests.lock().unwrap().len(),
+                before,
+                "admission must never make CAPS or query HTTP"
+            );
+            let body = json!({"provider_id":indexer["id"],"provider_revision":indexer["revision"],"target":{"media_type":if tv {"episode"}else{"movie"},"id":1},"offset":0,"query_index":0,"limit":100});
+            let (code, page) = request(&base, "POST", "/api/v1/release-search", body).await;
+            if blocked == "interactive" {
+                assert!(code >= 400, "{page}");
+                assert_eq!(
+                    peer.indexer_requests.lock().unwrap().len(),
+                    before,
+                    "disabled interactive sends neither CAPS nor query"
+                );
+            } else {
+                assert_eq!(code, 200, "{page}");
+                assert!(
+                    peer.indexer_requests.lock().unwrap().len() > before,
+                    "RSS/automatic false cannot block immediate interactive search"
+                );
+            }
+        }
+        indexer = policy_flags(&base, &indexer, media, true, true, true).await;
+    }
+    server.stop().await;
+    remote_server.stop().await;
+}
+
+#[tokio::test]
+async fn indexer_policy_search_candidates_ignore_disabled_rss_and_replay_after_policy_change() {
+    for tv in [true, false] {
+        for mode in ["automatic", "interactive"] {
+            let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+                policy_fixture().await;
+            let media = if tv { "tv" } else { "movies" };
+            let indexer = policy_flags(&base, &indexer, media, false, true, true).await;
+            let runtime = commands::start(db, client).await.unwrap();
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&indexer, &download, tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{command}");
+            let done = settled(&base, &command["id"]).await;
+            assert_eq!(done["status"], "succeeded", "{done}");
+            let rows = offers(&base, &command["id"]).await;
+            let (candidate, selected) = if mode == "interactive" {
+                let selected = rows.last().unwrap();
+                let (code, receipt) = request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/results/{}/grab",
+                        selected["id"].as_str().unwrap()
+                    ),
+                    json!({}),
+                )
+                .await;
+                assert_eq!(code, 202, "{receipt}");
+                (
+                    receipt["id"].as_str().unwrap().to_owned(),
+                    Some(selected["id"].as_str().unwrap().to_owned()),
+                )
+            } else {
+                (
+                    done["selected_candidate_id"].as_str().unwrap().to_owned(),
+                    None,
+                )
+            };
+            observed(&base, &candidate).await;
+            assert_eq!(
+                peer.adds.lock().unwrap().len(),
+                1,
+                "RSS false must not suppress search-origin candidates"
+            );
+            policy_flags(&base, &indexer, media, false, false, false).await;
+            if let Some(selected) = selected {
+                let (code, receipt) = request(
+                    &base,
+                    "POST",
+                    &format!("/api/v1/search/results/{selected}/grab"),
+                    json!({}),
+                )
+                .await;
+                assert_eq!(code, 202, "{receipt}");
+                assert_eq!(
+                    receipt["id"], candidate,
+                    "immutable receipt survives mutable policy"
+                );
+            }
+            assert_eq!(peer.adds.lock().unwrap().len(), 1);
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_queued_and_inflight_searches_fence_revision_before_results_or_post() {
+    for tv in [true, false] {
+        for mode in ["automatic", "interactive"] {
+            for inflight in [false, true] {
+                let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+                    policy_fixture().await;
+                if inflight {
+                    peer.mode.store(9, Ordering::SeqCst);
+                }
+                let (code, command) = request(
+                    &base,
+                    "POST",
+                    "/api/v1/search/commands",
+                    input(&indexer, &download, tv, mode),
+                )
+                .await;
+                assert_eq!(code, 202, "{command}");
+                let mut runtime = None;
+                if inflight {
+                    runtime = Some(commands::start(db.clone(), client.clone()).await.unwrap());
+                    tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+                        .await
+                        .expect("owned first search page held");
+                }
+                policy_flags(
+                    &base,
+                    &indexer,
+                    if tv { "tv" } else { "movies" },
+                    true,
+                    mode != "automatic",
+                    mode != "interactive",
+                )
+                .await;
+                if inflight {
+                    peer.mode.store(0, Ordering::SeqCst);
+                    peer.release.notify_one();
+                } else {
+                    runtime = Some(commands::start(db, client).await.unwrap());
+                }
+                let done = settled(&base, &command["id"]).await;
+                assert_eq!(done["status"], "failed", "{done}");
+                assert!(offers(&base, &command["id"]).await.is_empty());
+                assert!(peer.adds.lock().unwrap().is_empty());
+                assert_eq!(
+                    peer.offsets.lock().unwrap().len(),
+                    usize::from(inflight),
+                    "old revision cannot fetch a continuation or retry"
+                );
+                if !inflight {
+                    assert!(
+                        peer.indexer_requests.lock().unwrap().is_empty(),
+                        "queued stale request cannot even fetch CAPS"
+                    );
+                }
+                runtime.unwrap().shutdown().await;
+                server.stop().await;
+                remote_server.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn indexer_policy_origin_is_rechecked_after_preparation_before_post() {
+    for tv in [true, false] {
+        for mode in ["automatic", "interactive"] {
+            let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+                policy_fixture().await;
+            peer.mode.store(3, Ordering::SeqCst);
+            let runtime = commands::start(db, client).await.unwrap();
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&indexer, &download, tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{command}");
+            let done = settled(&base, &command["id"]).await;
+            assert_eq!(done["status"], "succeeded", "{done}");
+            let id = if mode == "interactive" {
+                let rows = offers(&base, &command["id"]).await;
+                let (code, receipt) = request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/results/{}/grab",
+                        rows[0]["id"].as_str().unwrap()
+                    ),
+                    json!({}),
+                )
+                .await;
+                assert_eq!(code, 202, "{receipt}");
+                receipt["id"].as_str().unwrap().to_owned()
+            } else {
+                done["selected_candidate_id"].as_str().unwrap().to_owned()
+            };
+            tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+                .await
+                .expect("owned torrent preparation held");
+            policy_flags(
+                &base,
+                &indexer,
+                if tv { "tv" } else { "movies" },
+                true,
+                mode != "automatic",
+                mode != "interactive",
+            )
+            .await;
+            peer.mode.store(0, Ordering::SeqCst);
+            peer.release.notify_one();
+            candidate_status(&base, &id, "rejected").await;
+            assert!(
+                peer.adds.lock().unwrap().is_empty(),
+                "changed origin policy must stop irreversible POST"
+            );
             runtime.shutdown().await;
             server.stop().await;
             remote_server.stop().await;

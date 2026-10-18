@@ -140,6 +140,13 @@ pub struct Patch {
         deserialize_with = "change",
         skip_serializing_if = "Change::is_missing"
     )]
+    #[ts(as = "Option<crate::tags::Assignment>", optional)]
+    pub tags: Change<crate::tags::Assignment>,
+    #[serde(
+        default,
+        deserialize_with = "change",
+        skip_serializing_if = "Change::is_missing"
+    )]
     #[ts(as = "Option<bool>", optional)]
     pub monitored: Change<bool>,
     #[serde(
@@ -287,6 +294,7 @@ pub struct Season {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
+    pub tag_ids: Vec<i64>,
     pub id: i64,
     pub media_type: Domain,
     pub metadata_id: Option<i64>,
@@ -575,6 +583,9 @@ async fn fetch(
     let mut bytes = 1024;
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
+            tag_ids: crate::tags::assigned(c, d, r.get(0)?)
+                .await
+                .map_err(tag_error)?,
             id: r.get(0)?,
             media_type: d,
             metadata_id: r.get(1)?,
@@ -741,7 +752,19 @@ fn boolean_value(value: &Change<bool>) -> Option<Value> {
         Change::Value(v) => Some(Value::Integer(i64::from(*v))),
     }
 }
+fn tag_error(e: crate::qualities::Error) -> Error {
+    Error(e.0, e.1, e.2)
+}
 fn patch_fields(d: Domain, p: &Patch) -> Result<Vec<(&'static str, Value)>> {
+    match &p.tags {
+        Change::Null => {
+            return Err(bad(
+                "Tags cannot be null; use replace with an empty ID array",
+            ));
+        }
+        Change::Value(a) => crate::tags::validate(a).map_err(bad)?,
+        Change::Missing => {}
+    }
     if matches!(p.monitored, Change::Null) {
         return Err(bad("Monitoring cannot be null"));
     }
@@ -783,6 +806,25 @@ fn patch_fields(d: Domain, p: &Patch) -> Result<Vec<(&'static str, Value)>> {
 }
 async fn patch(c: &Connection, d: Domain, id: i64, p: &Patch, creating: bool) -> Result<()> {
     let fields = patch_fields(d, p)?;
+    if let Change::Value(a) = &p.tags {
+        crate::tags::assign(c, d, id, a, true)
+            .await
+            .map_err(tag_error)?;
+    } else if creating && matches!(p.tags, Change::Missing) {
+        // Native creation owns its initial empty set, even if an old snapshot mapping reuses an ID.
+        crate::tags::assign(
+            c,
+            d,
+            id,
+            &crate::tags::Assignment {
+                mode: crate::tags::Mode::Replace,
+                ids: vec![],
+            },
+            true,
+        )
+        .await
+        .map_err(tag_error)?;
+    }
     if let Change::Value(profile) = p.quality_profile_id {
         let mut rows = c
             .query(
@@ -797,6 +839,7 @@ async fn patch(c: &Connection, d: Domain, id: i64, p: &Patch, creating: bool) ->
     if !creating
         && fields.is_empty()
         && !changed(&p.monitored)
+        && !changed(&p.tags)
         && p.seasons.as_ref().is_none_or(Vec::is_empty)
     {
         return Err(bad("Update requires a supported setting"));
@@ -1331,19 +1374,22 @@ async fn selected(
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
     let mut movie_facts = None;
-    let mut tv_original_language = None;
+    let mut tv_facts = None;
     match ctx.domain {
         Domain::Tv => {
-            let detail = ctx
+            let mut detail = ctx
                 .client
                 .series(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
-            tv_original_language = detail.original_language;
-            req.title = Some(detail.title);
+            req.title = Some(detail.title.clone());
             req.year = detail.year;
             req.tvdb_id = Some(detail.tvdb_id);
-            monitoring.extend(detail.seasons.into_iter().map(|number| (number, true)));
+            monitoring.extend(
+                std::mem::take(&mut detail.seasons)
+                    .into_iter()
+                    .map(|number| (number, true)),
+            );
             for season in req.settings.seasons.take().unwrap_or_default() {
                 let flag = monitoring.get_mut(&season.number).ok_or_else(|| {
                     bad("Season override is absent from selected catalog").into_response()
@@ -1359,7 +1405,8 @@ async fn selected(
                     })
                     .collect(),
             );
-            episodes = detail.episodes;
+            episodes = std::mem::take(&mut detail.episodes);
+            tv_facts = Some(detail);
         }
         Domain::Movies => {
             let detail = ctx
@@ -1392,8 +1439,8 @@ async fn selected(
             if tx.query(&format!("SELECT 1 FROM episodes WHERE tvdb_id IN ({}) LIMIT 1",placeholders(values.len())),values).await?.next().await?.is_some(){return Err(conflict());}
         }
         let item=create_record(&tx,ctx.domain,&mut req,&path).await?;
-        if let Some(language)=tv_original_language {
-            tx.execute("UPDATE series SET original_language=? WHERE id=?",params![language,item.id]).await?;
+        if let Some(detail)=tv_facts {
+            refresh::series_facts(&tx,item.id,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
         if let Some(detail)=movie_facts {
             refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;

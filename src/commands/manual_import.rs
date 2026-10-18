@@ -162,19 +162,12 @@ async fn validate_admission(tx: &Connection, operation_id: Uuid) -> Result<()> {
             "manual_import_operation_not_found",
         ));
     }
-    let Some(j) = journal(tx, operation_id).await? else {
-        return Err(Error(StatusCode::CONFLICT, "manual_import_not_previewed"));
-    };
-    if j.phase != "preview" || j.error_code.is_some() {
-        return Err(Error(StatusCode::CONFLICT, "manual_import_not_ready"));
-    }
-    if tx.query("SELECT 1 FROM manual_import_commands WHERE operation_id=? AND status IN ('queued','retry_wait','running')",[opstr.clone()]).await?.next().await?.is_some(){
-        return Err(Error(StatusCode::CONFLICT, "manual_import_already_queued"));
-    }
+    // Automated ownership is a permanent admission boundary, independent of journal progress.
+    // A worker may finish between a client's observation and its submission.
     if tx
         .query(
             "SELECT 1 FROM rss_candidate_imports WHERE operation_id=?",
-            [opstr],
+            [opstr.clone()],
         )
         .await?
         .next()
@@ -185,6 +178,15 @@ async fn validate_admission(tx: &Connection, operation_id: Uuid) -> Result<()> {
             StatusCode::CONFLICT,
             "manual_import_owned_by_download",
         ));
+    }
+    let Some(j) = journal(tx, operation_id).await? else {
+        return Err(Error(StatusCode::CONFLICT, "manual_import_not_previewed"));
+    };
+    if j.phase != "preview" || j.error_code.is_some() {
+        return Err(Error(StatusCode::CONFLICT, "manual_import_not_ready"));
+    }
+    if tx.query("SELECT 1 FROM manual_import_commands WHERE operation_id=? AND status IN ('queued','retry_wait','running')",[opstr.clone()]).await?.next().await?.is_some(){
+        return Err(Error(StatusCode::CONFLICT, "manual_import_already_queued"));
     }
     Ok(())
 }

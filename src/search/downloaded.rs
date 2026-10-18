@@ -8,6 +8,7 @@ pub(crate) struct AcceptedFile {
     pub root: String,
     pub quality_id: i64,
     pub revision_json: String,
+    pub revision_binding: super::revision::Binding,
     pub edition: Option<String>,
     pub evidence: crate::custom_formats::Evidence,
 }
@@ -22,21 +23,82 @@ fn rejected(reason: &str) -> DownloadedDecision {
     }
 }
 
+// This retains the existing native scene-policy switch; upstream sceneSource/origin mapping
+// is a separate unfinished contract. Local rescans deliberately do not call this resolver.
+pub(super) async fn absolute_candidates(
+    c: &Connection,
+    series_id: i64,
+    scene: bool,
+    episode: i64,
+) -> super::Result<Vec<i64>> {
+    if scene {
+        let hits = absolute_hits(c, series_id, "scene_absolute_episode_number", episode).await?;
+        if hits.len() == 1 {
+            return Ok(hits);
+        }
+    }
+    absolute_hits(c, series_id, "absolute_episode_number", episode).await
+}
+
 #[cfg(test)]
-pub(crate) async fn evaluate(
+pub(crate) async fn evaluate_fresh_release(
     c: &Connection,
     target: &MediaTarget,
     filename: &str,
     size: u64,
 ) -> super::Result<DownloadedDecision> {
-    evaluate_with_evidence(c, target, filename, size, None).await
+    // These numbering/quality cases model a newly observed release whose title
+    // matches the test file stem. Legacy absent receipt evidence is tested separately.
+    let stem = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .rsplit_once('.')
+        .map_or(filename, |(s, _)| s);
+    let tv = matches!(target, MediaTarget::Episode(_));
+    let receipt = parser::parse(stem, tv)
+        .ok()
+        .map(|parsed| crate::custom_formats::parsed(stem, &parsed, tv, Some(size)));
+    evaluate_with_evidence(c, target, filename, size, receipt).await
 }
+#[cfg(test)]
 pub(crate) async fn evaluate_with_evidence(
     c: &Connection,
     target: &MediaTarget,
     filename: &str,
     size: u64,
     receipt: Option<crate::custom_formats::Evidence>,
+) -> super::Result<DownloadedDecision> {
+    evaluate_bound(
+        c,
+        target,
+        filename,
+        size,
+        receipt,
+        None,
+        super::SearchContext::Rss,
+    )
+    .await
+}
+pub(crate) async fn evaluate_owned(
+    c: &Connection,
+    target: &MediaTarget,
+    filename: &str,
+    size: u64,
+    receipt: Option<crate::custom_formats::Evidence>,
+    frozen: &crate::media_files::FileRevision,
+    context: super::SearchContext,
+) -> super::Result<DownloadedDecision> {
+    evaluate_bound(c, target, filename, size, receipt, Some(frozen), context).await
+}
+async fn evaluate_bound(
+    c: &Connection,
+    target: &MediaTarget,
+    filename: &str,
+    size: u64,
+    receipt: Option<crate::custom_formats::Evidence>,
+    frozen: Option<&crate::media_files::FileRevision>,
+    context: super::SearchContext,
 ) -> super::Result<DownloadedDecision> {
     if filename.is_empty() || filename.len() > 4096 || filename.chars().any(char::is_control) {
         return Ok(rejected("invalid_filename"));
@@ -58,7 +120,7 @@ pub(crate) async fn evaluate_with_evidence(
         return Ok(rejected("sample_file"));
     }
     let tv = matches!(target, MediaTarget::Episode(_));
-    let parsed = match parser::parse(stem, tv) {
+    let mut parsed = match parser::parse(stem, tv) {
         Ok(parsed) => parsed,
         Err(code) => return Ok(rejected(code)),
     };
@@ -89,10 +151,10 @@ pub(crate) async fn evaluate_with_evidence(
                             .then_some("filename_target_mismatch")
                     }
                 }
-                Some(parser::Numbering::Daily { date }) if series_type == "daily" => {
+                Some(parser::Numbering::Daily { date }) if series_type != "standard" => {
                     match_daily(c, series_id, *id, r.get::<Option<String>>(10)?, date).await?
                 }
-                Some(parser::Numbering::Absolute { episode }) if series_type == "anime" => {
+                Some(parser::Numbering::Absolute { episode }) => {
                     match_absolute(
                         c,
                         series_id,
@@ -166,6 +228,31 @@ pub(crate) async fn evaluate_with_evidence(
     if size == 0 {
         return Ok(rejected("empty_file"));
     }
+    let release_observation = receipt.as_ref().and_then(|e| e.revision.as_ref());
+    let revision_binding = if let Some(frozen) = frozen {
+        frozen
+            .validate()
+            .map_err(|_| SearchError("revision_evidence_invalid"))?;
+        let filename =
+            super::revision::Observation::from_parsed(&parsed).filter(|v| v.explicit_marker);
+        if filename.as_ref().is_some_and(|v| v.value != *frozen)
+            || release_observation.is_some_and(|v| v.value != *frozen)
+        {
+            return Ok(rejected("revision_evidence_conflict"));
+        }
+        super::revision::Binding {
+            version: 1,
+            release: release_observation.cloned(),
+            filename,
+            effective: frozen.clone(),
+        }
+    } else {
+        match super::revision::reconcile(release_observation, &parsed) {
+            Ok(binding) => binding,
+            Err(reason) => return Ok(rejected(reason)),
+        }
+    };
+    parsed.revision = Some(revision_binding.effective.clone());
     let mut result = ReleaseDecision {
         target: Some(typed),
         disposition: Disposition::Accept,
@@ -175,9 +262,7 @@ pub(crate) async fn evaluate_with_evidence(
         parsed: Some(parsed.clone()),
         custom_formats: None,
     };
-    if parsed.revision > 1 {
-        result.deny("proper_upgrade_unsupported");
-    }
+
     let mut evidence = crate::custom_formats::parsed(stem, &parsed, tv, Some(size));
     if let Some(receipt) = receipt {
         crate::custom_formats::validate_evidence(
@@ -189,18 +274,15 @@ pub(crate) async fn evaluate_with_evidence(
             &receipt,
         )
         .map_err(SearchError)?;
-        evidence.title = receipt.title;
-        evidence.indexer_flags = receipt.indexer_flags;
-        if evidence.languages.is_none() {
-            evidence.languages = receipt.languages;
-        }
-        if evidence.release_group.is_none() {
-            evidence.release_group = receipt.release_group;
-        }
+        merge_receipt(&mut evidence, receipt);
     }
     crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
         .await?;
     evidence.filename = Some(basename.to_owned());
+    evidence.revision = revision_binding
+        .release
+        .clone()
+        .or_else(|| revision_binding.filename.clone());
     let original = original_language(c, target).await?;
     decision::apply_quality(
         c,
@@ -216,6 +298,8 @@ pub(crate) async fn evaluate_with_evidence(
         &parsed,
         &evidence,
         original,
+        context,
+        chrono::Utc::now().timestamp(),
         &mut result,
     )
     .await?;
@@ -230,7 +314,9 @@ pub(crate) async fn evaluate_with_evidence(
             basename: basename.into(),
             root,
             quality_id: result.quality_id.ok_or(SearchError("quality_unknown"))?,
-            revision_json: "{\"version\":1,\"real\":0,\"is_repack\":false}".into(),
+            revision_json: serde_json::to_string(&revision_binding.effective)
+                .map_err(|_| SearchError("revision_evidence_invalid"))?,
+            revision_binding,
             edition: parsed.edition,
             evidence,
         }),
@@ -258,6 +344,20 @@ async fn match_daily(
     if air_date != date {
         return Ok(Some("filename_target_mismatch"));
     }
+    let candidates = daily_candidates(c, series_id, date).await?;
+    if candidates.len() == 1 {
+        return Ok((candidates[0] != episode_id).then_some("filename_target_mismatch"));
+    }
+    Ok(Some("ambiguous_air_date_match"))
+}
+
+// Shared by release selection and downloaded-target validation. Resolve identity before
+// accumulating monitoring/runtime/file facts, so excluded specials cannot affect policy.
+pub(super) async fn daily_candidates(
+    c: &Connection,
+    series_id: i64,
+    date: &str,
+) -> super::Result<Vec<i64>> {
     let mut rows = c
         .query(
             "SELECT id,season FROM episodes WHERE series_id=? AND air_date=? LIMIT 1001",
@@ -265,27 +365,16 @@ async fn match_daily(
         )
         .await?;
     let mut all = Vec::new();
-    let mut count = 0;
     while let Some(row) = rows.next().await? {
-        count += 1;
-        if count > 1000 {
+        if all.len() == 1000 {
             return Err(SearchError("episode_match_limit"));
         }
         all.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
     }
-    if all.len() <= 1 {
-        // Only the target itself (already confirmed above) has this date.
-        return Ok(None);
+    if all.len() > 1 {
+        all.retain(|(_, season)| *season > 0);
     }
-    let regular: Vec<i64> = all
-        .into_iter()
-        .filter(|(_, season)| *season > 0)
-        .map(|(id, _)| id)
-        .collect();
-    if regular.len() == 1 {
-        return Ok((regular[0] != episode_id).then_some("filename_target_mismatch"));
-    }
-    Ok(Some("ambiguous_air_date_match"))
+    Ok(all.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Counts episodes in a series whose `column` equals `number`, bounded the
@@ -332,13 +421,7 @@ async fn match_absolute(
     target_absolute: Option<i64>,
     episode: i64,
 ) -> super::Result<Option<&'static str>> {
-    if scene {
-        let hits = absolute_hits(c, series_id, "scene_absolute_episode_number", episode).await?;
-        if hits.len() == 1 {
-            return Ok((hits[0] != episode_id).then_some("filename_target_mismatch"));
-        }
-    }
-    let hits = absolute_hits(c, series_id, "absolute_episode_number", episode).await?;
+    let hits = absolute_candidates(c, series_id, scene, episode).await?;
     match hits.len() {
         0 => {
             if target_absolute.is_none() && (!scene || target_scene_absolute.is_none()) {
@@ -355,6 +438,62 @@ async fn match_absolute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_facts_outrank_renamed_path_tokens() {
+        let evidence =
+            |title: &str, languages, group: Option<&str>| crate::custom_formats::Evidence {
+                version: 1,
+                revision: None,
+                title: title.into(),
+                filename: None,
+                languages,
+                release_group: group.map(str::to_owned),
+                indexer_flags: None,
+                release_type: None,
+                size: None,
+                year: Some(2020),
+                edition: None,
+                source: 0,
+                resolution: 0,
+                modifier: 0,
+            };
+        let mut renamed = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(
+            &mut renamed,
+            evidence(
+                "Harbor.2020.French.1080p-GROUP",
+                Some(vec![2]),
+                Some("GROUP"),
+            ),
+        );
+        assert_eq!(renamed.languages, Some(vec![2]));
+        assert_eq!(renamed.release_group.as_deref(), Some("GROUP"));
+        // The path still fills facts the receipt never recorded.
+        let mut sparse = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(&mut sparse, evidence("Harbor.2020.1080p", None, None));
+        assert_eq!(sparse.languages, Some(vec![4]));
+        assert_eq!(sparse.release_group.as_deref(), Some("RENAMED"));
+        assert_eq!(sparse.title, "Harbor.2020.1080p");
+        // A measured empty list must not be refilled from a renamed path's language token.
+        let mut measured = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(
+            &mut measured,
+            evidence("Harbor.2020.1080p", Some(vec![]), None),
+        );
+        assert_eq!(measured.languages, Some(vec![]));
+    }
     struct Scratch(std::path::PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -405,7 +544,9 @@ mod tests {
                 "quality_not_allowed",
             ),
         ] {
-            let result = evaluate(&c, &target, name, 1073741824).await.unwrap();
+            let result = evaluate_fresh_release(&c, &target, name, 1073741824)
+                .await
+                .unwrap();
             assert!(result.accepted.is_none(), "{name}");
             assert!(
                 result.reasons.iter().any(|r| r == reason),
@@ -420,7 +561,7 @@ mod tests {
             ),
             (MediaTarget::Movie(1), "folder/Harbor.2020.1080p.WEB-DL.mkv"),
         ] {
-            let accepted = evaluate(&c, &target, name, 1073741824)
+            let accepted = evaluate_fresh_release(&c, &target, name, 1073741824)
                 .await
                 .unwrap()
                 .accepted
@@ -439,7 +580,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let result = evaluate(
+            let result = evaluate_fresh_release(
                 &c,
                 &MediaTarget::Movie(1),
                 "Harbor.2020.1080p.WEB-DL.mkv",
@@ -453,7 +594,7 @@ mod tests {
                 language != -1
             );
             assert!(
-                evaluate(
+                evaluate_fresh_release(
                     &c,
                     &MediaTarget::Episode(1),
                     "Harbor.S01E01.1080p.WEB-DL.mkv",
@@ -465,7 +606,7 @@ mod tests {
                 .is_some()
             );
         }
-        let tiny = evaluate(
+        let tiny = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(1),
             "Harbor.S01E01.1080p.WEB-DL.mkv",
@@ -479,7 +620,9 @@ mod tests {
             (MediaTarget::Episode(1), "Harbor.S01E01.1080p.WEB-DL.mkv"),
             (MediaTarget::Movie(1), "Harbor.2020.1080p.WEB-DL.mkv"),
         ] {
-            let result = evaluate(&c, &target, name, 1073741824).await.unwrap();
+            let result = evaluate_fresh_release(&c, &target, name, 1073741824)
+                .await
+                .unwrap();
             assert!(
                 result.accepted.is_none(),
                 "existing cutoff file cannot be replaced by same quality"
@@ -535,7 +678,7 @@ mod tests {
 
         // Daily: an exact air-date match succeeds even though a season-0 special
         // shares the same date (upstream excludes specials when disambiguating).
-        let accepted = evaluate(
+        let accepted = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(101),
             "Nightly.2024.05.14.1080p.WEB-DL.mkv",
@@ -549,7 +692,7 @@ mod tests {
 
         // Daily: two regular (non-special) episodes share the same air date, so
         // matching either of them by date alone is ambiguous.
-        let ambiguous = evaluate(
+        let ambiguous = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(102),
             "Nightly.2024.05.15.1080p.WEB-DL.mkv",
@@ -570,7 +713,7 @@ mod tests {
         // Daily: the target episode has no recorded air date, so it can never be
         // verified against a parsed date -- this is a distinct, honest reason
         // from a plain mismatch.
-        let unknown = evaluate(
+        let unknown = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(104),
             "Nightly.2024.01.01.1080p.WEB-DL.mkv",
@@ -592,7 +735,7 @@ mod tests {
         // regular episode. Upstream resolves that collision to the regular
         // episode, so this file belongs to episode 107, not this special --
         // a mismatch, not an ambiguity.
-        let mismatch = evaluate(
+        let mismatch = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(106),
             "Nightly.2024.05.16.1080p.WEB-DL.mkv",
@@ -611,7 +754,7 @@ mod tests {
         );
 
         // Absolute (anime, no scene numbering): a unique absolute number matches.
-        let accepted = evaluate(
+        let accepted = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(201),
             "Aurora - 023 1080p WEB-DL.mkv",
@@ -625,7 +768,7 @@ mod tests {
 
         // Absolute: a parsed number that matches no episode's absolute number is a
         // plain mismatch, not an ambiguous or missing-data condition.
-        let mismatch = evaluate(
+        let mismatch = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(201),
             "Aurora - 999 1080p WEB-DL.mkv",
@@ -645,7 +788,7 @@ mod tests {
 
         // Absolute: two episodes share the same absolute number, so picking
         // either one for that number is ambiguous.
-        let ambiguous = evaluate(
+        let ambiguous = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(202),
             "Aurora - 024 1080p WEB-DL.mkv",
@@ -664,7 +807,7 @@ mod tests {
         );
 
         // Absolute: the target episode has no absolute number recorded.
-        let unknown = evaluate(
+        let unknown = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(204),
             "Aurora - 025 1080p WEB-DL.mkv",
@@ -685,7 +828,7 @@ mod tests {
         // Absolute (anime, scene numbering enabled): matches against
         // scene_absolute_episode_number, not the plain absolute_episode_number
         // (999) recorded on the same row.
-        let accepted = evaluate(
+        let accepted = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(301),
             "Borealis - 050 1080p WEB-DL.mkv",
@@ -702,7 +845,7 @@ mod tests {
         // falls back to the plain absolute_episode_number column, mirroring
         // Sonarr's GetAnimeEpisodes falling back to FindEpisode(series,
         // absoluteEpisodeNumber) when the scene lookup finds nothing.
-        let accepted = evaluate(
+        let accepted = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(302),
             "Borealis - 051 1080p WEB-DL.mkv",
@@ -719,7 +862,7 @@ mod tests {
         // is ambiguous and discarded (not rejected outright); matching retries
         // against absolute_episode_number=60, which only episode 303 has, so
         // the match still resolves.
-        let accepted = evaluate(
+        let accepted = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(303),
             "Borealis - 060 1080p WEB-DL.mkv",
@@ -730,6 +873,97 @@ mod tests {
         .accepted
         .unwrap();
         assert_eq!(accepted.quality_id, 3);
+        // Series type controls query construction, but source admission only excludes daily
+        // numbering on Standard. Daily-on-anime and ordinary absolute on other known types
+        // must reach the same identity/quality/size checks rather than fail at a type gate.
+        for kind in ["daily", "anime", "standard"] {
+            c.execute(
+                "UPDATE library_settings SET series_type=? WHERE series_id=10",
+                [kind],
+            )
+            .await
+            .unwrap();
+            let result = evaluate_fresh_release(
+                &c,
+                &MediaTarget::Episode(101),
+                "Nightly.2024.05.14.1080p.WEB-DL.mkv",
+                1073741824,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.accepted.is_some(),
+                kind != "standard",
+                "{kind}: {:?}",
+                result.reasons
+            );
+            assert!(
+                evaluate_fresh_release(
+                    &c,
+                    &MediaTarget::Episode(105),
+                    "Nightly.2024.05.14.1080p.WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_none()
+            );
+            assert!(
+                evaluate_fresh_release(
+                    &c,
+                    &MediaTarget::Episode(102),
+                    "Nightly.2024.05.15.1080p.WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_none()
+            );
+            c.execute(
+                "UPDATE library_settings SET series_type=? WHERE series_id=20",
+                [kind],
+            )
+            .await
+            .unwrap();
+            assert!(
+                evaluate_fresh_release(
+                    &c,
+                    &MediaTarget::Episode(201),
+                    "Aurora - 023 1080p WEB-DL.mkv",
+                    1073741824
+                )
+                .await
+                .unwrap()
+                .accepted
+                .is_some()
+            );
+            let ambiguous = evaluate_fresh_release(
+                &c,
+                &MediaTarget::Episode(202),
+                "Aurora - 024 1080p WEB-DL.mkv",
+                1073741824,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ambiguous.reasons, vec!["ambiguous_absolute_match"]);
+        }
+        c.execute(
+            "UPDATE episodes SET absolute_episode_number=NULL WHERE id=201",
+            (),
+        )
+        .await
+        .unwrap();
+        let changed = evaluate_fresh_release(
+            &c,
+            &MediaTarget::Episode(201),
+            "Aurora - 023 1080p WEB-DL.mkv",
+            1073741824,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.reasons, vec!["episode_absolute_number_unknown"]);
     }
 
     #[tokio::test]
@@ -761,7 +995,9 @@ mod tests {
             // not gated by series_type, only by use_scene_numbering.
             (MediaTarget::Episode(2), "Comet.S01E01.1080p.WEB-DL.mkv"),
         ] {
-            let result = evaluate(&c, &target, name, 1073741824).await.unwrap();
+            let result = evaluate_fresh_release(&c, &target, name, 1073741824)
+                .await
+                .unwrap();
             assert!(result.accepted.is_none(), "{name}");
             assert!(
                 result.reasons.iter().any(|r| r == "numbering_unsupported"),
@@ -789,7 +1025,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let result = evaluate(
+        let result = evaluate_fresh_release(
             &c,
             &MediaTarget::Episode(1),
             "Harbor.S01E01.1080p.WEB-DL.mkv",
@@ -833,6 +1069,22 @@ pub(crate) async fn original_language(
         .flatten())
 }
 
+/// Facts frozen at submission outrank tokens in a (possibly renamed) downloaded path;
+/// the filename only fills what the receipt did not record. A recorded empty language
+/// list is a measurement, not an absence, so it is kept as-is.
+fn merge_receipt(
+    evidence: &mut crate::custom_formats::Evidence,
+    receipt: crate::custom_formats::Evidence,
+) {
+    evidence.title = receipt.title;
+    evidence.indexer_flags = receipt.indexer_flags;
+    if receipt.languages.is_some() {
+        evidence.languages = receipt.languages;
+    }
+    if receipt.release_group.is_some() {
+        evidence.release_group = receipt.release_group;
+    }
+}
 pub(crate) async fn evaluate_receipt(
     c: &Connection,
     target: &MediaTarget,
@@ -853,5 +1105,9 @@ pub(crate) async fn evaluate_receipt(
         .get::<Option<String>>(0)?
         .map(|s| serde_json::from_str(&s).map_err(|_| SearchError("custom_format_facts_invalid")))
         .transpose()?;
-    evaluate_with_evidence(c, target, filename, size, evidence).await
+    let id = uuid::Uuid::parse_str(candidate).map_err(|_| SearchError("release_target_missing"))?;
+    let context = crate::commands::search::authority(c, id)
+        .await
+        .map_err(|_| SearchError("release_authority_changed"))?;
+    evaluate_bound(c, target, filename, size, evidence, None, context).await
 }

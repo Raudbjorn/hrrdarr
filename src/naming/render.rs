@@ -63,6 +63,7 @@ impl TemplateField {
                     | Token::EpisodeTitle
                     | Token::AirDate
                     | Token::QualityTitle
+                    | Token::QualityFull
                     | Token::CustomFormats { .. }
             ),
             SeriesFolder => matches!(token, Token::SeriesTitle),
@@ -73,6 +74,7 @@ impl TemplateField {
                     | Token::ReleaseYear
                     | Token::EditionTags
                     | Token::QualityTitle
+                    | Token::QualityFull
                     | Token::CustomFormats { .. }
             ),
             MovieFolder => matches!(
@@ -105,6 +107,7 @@ enum Token {
     EpisodeTitle,
     AirDate,
     QualityTitle,
+    QualityFull,
     MovieTitle,
     ReleaseYear,
     EditionTags,
@@ -129,7 +132,7 @@ impl Token {
             Token::MovieTitle | Token::ReleaseYear | Token::EditionTags => {
                 Some(MediaDomain::Movies)
             }
-            Token::QualityTitle | Token::CustomFormats { .. } => None,
+            Token::QualityTitle | Token::QualityFull | Token::CustomFormats { .. } => None,
         }
     }
 }
@@ -206,6 +209,7 @@ fn parse_token(text: &str) -> Result<Token, TemplateError> {
         "Episode Title" => Ok(Token::EpisodeTitle),
         "Air-Date" => Ok(Token::AirDate),
         "Quality Title" => Ok(Token::QualityTitle),
+        "Quality Full" => Ok(Token::QualityFull),
         "Movie Title" => Ok(Token::MovieTitle),
         "Release Year" => Ok(Token::ReleaseYear),
         "Edition Tags" => Ok(Token::EditionTags),
@@ -271,6 +275,36 @@ pub struct Template {
 }
 
 impl Template {
+    pub(super) fn uses_movie_title(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::MovieTitle)))
+    }
+    pub(super) fn uses_year(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::ReleaseYear)))
+    }
+    pub(super) fn uses_edition(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::EditionTags)))
+    }
+    pub(super) fn uses_quality(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::QualityTitle | Token::QualityFull)))
+    }
+    pub(super) fn uses_revision(&self) -> bool {
+        self.components
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Segment::Token(Token::QualityFull)))
+    }
     pub(super) fn uses_custom_formats(&self) -> bool {
         self.components
             .iter()
@@ -374,10 +408,12 @@ pub fn parse(field: TemplateField, raw: &str) -> Result<Template, TemplateError>
 #[derive(Debug, Clone)]
 pub struct EpisodeNamingFacts {
     pub series_title: String,
+    pub anime: bool,
     pub season: i64,
     pub episode: i64,
     pub episode_title: Option<String>,
     pub quality_title: String,
+    pub revision: Option<crate::media_files::FileRevision>,
     /// Already matched, rename-enabled names; selection is independent of profile scores.
     pub custom_formats: Vec<String>,
     pub air_date: Option<String>,
@@ -389,6 +425,7 @@ pub struct MovieNamingFacts {
     pub release_year: Option<i64>,
     pub edition: Option<String>,
     pub quality_title: String,
+    pub revision: Option<crate::media_files::FileRevision>,
     /// Already matched, rename-enabled names; selection is independent of profile scores.
     pub custom_formats: Vec<String>,
 }
@@ -446,6 +483,26 @@ impl fmt::Display for RenderError {
     }
 }
 
+fn quality_full(
+    title: &str,
+    revision: Option<&crate::media_files::FileRevision>,
+    anime: bool,
+) -> String {
+    let mut value = title.to_owned();
+    if let Some(revision) = revision {
+        if revision.version > 1 {
+            if anime {
+                value.push_str(&format!(" v{}", revision.version));
+            } else {
+                value.push_str(" Proper");
+            }
+        }
+        if revision.real > 0 {
+            value.push_str(" REAL");
+        }
+    }
+    value
+}
 fn token_value(token: &Token, facts: RenderFacts<'_>) -> String {
     if let Token::CustomFormats {
         singular,
@@ -510,6 +567,12 @@ fn token_value(token: &Token, facts: RenderFacts<'_>) -> String {
             f.episode_title.clone().unwrap_or_default()
         }
         (Token::AirDate, RenderFacts::Episode(f)) => f.air_date.clone().unwrap_or_default(),
+        (Token::QualityFull, RenderFacts::Episode(f)) => {
+            quality_full(&f.quality_title, f.revision.as_ref(), f.anime)
+        }
+        (Token::QualityFull, RenderFacts::Movie(f)) => {
+            quality_full(&f.quality_title, f.revision.as_ref(), false)
+        }
         (Token::QualityTitle, RenderFacts::Episode(f)) => f.quality_title.clone(),
         (Token::QualityTitle, RenderFacts::Movie(f)) => f.quality_title.clone(),
         (Token::MovieTitle, RenderFacts::Movie(f)) => f.movie_title.clone(),
@@ -583,6 +646,26 @@ pub(super) fn cap_bytes(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+/// Preview's original-name fallback uses the source's default cleanup policy,
+/// independently of the configured enabled-template policy. No I/O.
+pub(super) fn preview_original_stem(raw: &str) -> Result<String, RenderError> {
+    // Source-default original-name cleanup keeps a dash before an existing
+    // space. Enabled native Smart has a different, already accepted contract.
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ':' {
+            if chars.peek() == Some(&' ') {
+                cleaned.push(' ');
+            }
+            cleaned.push('-');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    finish_component(&replace_illegal(&cleaned, true)?)
+}
+
 fn finish_component(raw: &str) -> Result<String, RenderError> {
     let trimmed = trim_edges(raw);
     let capped = cap_bytes(trimmed, MAX_COMPONENT_BYTES);
@@ -653,10 +736,12 @@ mod tests {
     fn episode_facts() -> EpisodeNamingFacts {
         EpisodeNamingFacts {
             series_title: "Halcyon Vale".into(),
+            anime: false,
             season: 3,
             episode: 7,
             episode_title: Some("The Long Dark".into()),
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
             custom_formats: vec![],
             air_date: Some("2024-05-14".into()),
         }
@@ -667,6 +752,7 @@ mod tests {
             release_year: Some(2023),
             edition: Some("Director's Cut".into()),
             quality_title: "Bluray-1080p".into(),
+            revision: None,
             custom_formats: vec![],
         }
     }
@@ -1038,6 +1124,41 @@ mod tests {
         assert_eq!(err, RenderError::DomainMismatch);
     }
 
+    #[test]
+    fn quality_full_revision_does_not_change_quality_title() {
+        let template = parse(
+            TemplateField::StandardEpisode,
+            "{Quality Title} - {Quality Full}",
+        )
+        .unwrap();
+        let mut episode = episode_facts();
+        episode.revision = Some(crate::media_files::FileRevision {
+            version: 3,
+            real: 1,
+            is_repack: true,
+        });
+        assert_eq!(
+            token_value(&Token::QualityTitle, RenderFacts::Episode(&episode)),
+            "WEBDL-1080p"
+        );
+        assert_eq!(
+            token_value(&Token::QualityFull, RenderFacts::Episode(&episode)),
+            "WEBDL-1080p Proper REAL"
+        );
+        episode.anime = true;
+        assert_eq!(
+            token_value(&Token::QualityFull, RenderFacts::Episode(&episode)),
+            "WEBDL-1080p v3 REAL"
+        );
+        let mut movie = movie_facts();
+        movie.revision = episode.revision.clone();
+        assert_eq!(
+            token_value(&Token::QualityFull, RenderFacts::Movie(&movie)),
+            "Bluray-1080p Proper REAL"
+        );
+        assert!(parse(TemplateField::MovieFolder, "{Quality Full}").is_err());
+        assert_eq!(template.domain, MediaDomain::Tv);
+    }
     #[test]
     fn shared_quality_token_works_in_both_domains() {
         let episode = episode_facts();

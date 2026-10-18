@@ -130,7 +130,7 @@ async fn read(
             .ok_or_else(missing)?,
     ))
 }
-async fn validate(media: MediaDomain, input: &Input) -> Result<String> {
+pub(crate) async fn validate(media: MediaDomain, input: &Input) -> Result<String> {
     if input.name.trim().is_empty()
         || input.name.chars().count() > 100
         || input.name.chars().any(char::is_control)
@@ -156,15 +156,7 @@ async fn save(db: &Database, media: MediaDomain, id: Option<i64>, input: Input) 
     let tx = c
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
- let existing=catalog(&tx,media).await?;
- if id.is_some_and(|id|!existing.iter().any(|f|f.id==id)){return Err(missing())}
- if existing.iter().any(|f|Some(f.id)!=id&&f.definition.name==input.name){return Err(Error(StatusCode::CONFLICT,"custom_format_name_conflict","Name already exists"))}
- let bytes:usize=existing.iter().filter(|f|Some(f.id)!=id).map(|f|serde_json::to_string(&f.definition.specifications).map(|s|s.len()).unwrap_or(MAX_CATALOG_BYTES)).sum();
- if (id.is_none()&&existing.len()>=MAX_FORMATS)||bytes+json.len()>MAX_CATALOG_BYTES{return Err(invalid("Custom format catalog exceeds evaluation limits"))}
- let id=if let Some(id)=id {tx.execute("UPDATE custom_formats SET name=?,include_when_renaming=?,specifications_json=? WHERE id=? AND media_type=?",params![input.name.clone(),i64::from(input.include_when_renaming),json,id,crate::search::domain(media)]).await?;id}else{tx.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?)",params![crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;tx.last_insert_rowid()};
- Ok(Format{id,media_type:media,definition:input})
- }.await;
+    let outcome = persist_validated(&tx, media, id, input, json).await;
     match outcome {
         Ok(v) => {
             tx.commit().await?;
@@ -176,6 +168,64 @@ async fn save(db: &Database, media: MediaDomain, id: Option<i64>, input: Input) 
         }
     }
 }
+/// Caller validates/compiles before acquiring its write transaction.
+pub(crate) async fn persist_validated(
+    conn: &Connection,
+    media: MediaDomain,
+    id: Option<i64>,
+    input: Input,
+    json: String,
+) -> Result<Format> {
+    let existing = catalog(conn, media).await?;
+    if id.is_some_and(|id| !existing.iter().any(|f| f.id == id)) {
+        return Err(missing());
+    }
+    if existing
+        .iter()
+        .any(|f| Some(f.id) != id && f.definition.name == input.name)
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "custom_format_name_conflict",
+            "Name already exists",
+        ));
+    }
+    let bytes: usize = existing
+        .iter()
+        .filter(|f| Some(f.id) != id)
+        .map(|f| {
+            serde_json::to_string(&f.definition.specifications)
+                .map(|s| s.len())
+                .unwrap_or(MAX_CATALOG_BYTES)
+        })
+        .sum();
+    if (id.is_none() && existing.len() >= MAX_FORMATS) || bytes + json.len() > MAX_CATALOG_BYTES {
+        return Err(invalid("Custom format catalog exceeds evaluation limits"));
+    }
+    let id = if let Some(id) = id {
+        conn.execute("UPDATE custom_formats SET name=?,include_when_renaming=?,specifications_json=? WHERE id=? AND media_type=?",params![input.name.clone(),i64::from(input.include_when_renaming),json,id,crate::search::domain(media)]).await?;
+        id
+    } else {
+        // ponytail: historical mappings are scanned per creation; index destination_table/id if archive volume makes this costly.
+        let previous=conn.query("SELECT max(coalesce((SELECT max(id) FROM custom_formats),0),coalesce((SELECT max(destination_id) FROM snapshot_mappings WHERE destination_table='custom_formats'),0))",()).await?.next().await?.ok_or_else(||invalid("Custom format identity allocation failed"))?.get::<i64>(0)?;
+        let id = previous
+            .checked_add(1)
+            .filter(|id| *id <= 9_007_199_254_740_991)
+            .ok_or(Error(
+                StatusCode::CONFLICT,
+                "custom_format_id_exhausted",
+                "No safe custom format identity remains",
+            ))?;
+        conn.execute("INSERT INTO custom_formats(id,media_type,name,include_when_renaming,specifications_json)VALUES(?,?,?,?,?)",params![id,crate::search::domain(media),input.name.clone(),i64::from(input.include_when_renaming),json]).await?;
+        id
+    };
+    Ok(Format {
+        id,
+        media_type: media,
+        definition: input,
+    })
+}
+
 async fn create(
     State(db): State<Arc<Database>>,
     Extension(media): Extension<String>,
@@ -242,6 +292,15 @@ async fn mutate(
                 .await?;
             }
         }
+        // Every catalog definition is an implicit profile item, including omitted zero scores.
+        // Reset only when this domain's entire catalog was deleted, in the same transaction.
+        if delete && all.len() == input.ids.len() {
+            tx.execute(
+                "UPDATE quality_profile_policies SET min_format_score=0,cutoff_format_score=0,min_upgrade_format_score=1 WHERE profile_id IN (SELECT id FROM quality_profiles WHERE media_type=?)",
+                [crate::search::domain(media)],
+            )
+            .await?;
+        }
         all.retain(|f| input.ids.contains(&f.id));
         if let Some(value) = input.include_when_renaming {
             for f in &mut all {
@@ -303,17 +362,27 @@ pub struct Choice {
     pub label: String,
 }
 #[derive(Serialize, ts_rs::TS)]
+#[ts(rename = "CustomFormatPreset")]
+pub struct Preset {
+    pub label: String,
+    pub specification: Specification,
+}
+#[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "CustomFormatSchema")]
 pub struct Schema {
     pub version: i32,
     pub media_type: MediaDomain,
     pub conditions: Vec<crate::db::custom_formats::Condition>,
+    pub presets: std::collections::BTreeMap<String, Vec<Preset>>,
     pub choices: std::collections::BTreeMap<String, Vec<Choice>>,
     pub max_formats: usize,
     pub max_specifications: usize,
     pub regex: String,
 }
-async fn schema(Extension(media): Extension<String>) -> Json<Schema> {
+async fn schema(
+    State(db): State<Arc<Database>>,
+    Extension(media): Extension<String>,
+) -> Result<Json<Schema>> {
     use crate::db::custom_formats::Condition as C;
     let movies = media == "movies";
     let domain = if movies {
@@ -460,5 +529,68 @@ async fn schema(Extension(media): Extension<String>) -> Json<Schema> {
         );
     }
     choices.insert("indexer_flag".into(), make(flags));
-    Json(Schema{version:1,media_type:domain,conditions,choices,max_formats:MAX_FORMATS,max_specifications:64,regex:"fancy-regex 0.19.2; case insensitive; bounded AST/backtracking; unsupported syntax rejected".into()})
+    let mut presets = built_in_presets();
+    for format in catalog(&db.connect().await?, domain).await? {
+        for specification in format.definition.specifications {
+            presets
+                .entry(condition_kind(&specification.condition).into())
+                .or_default()
+                .push(Preset {
+                    label: format!("{}: {}", format.definition.name, specification.name),
+                    specification,
+                });
+        }
+    }
+    Ok(Json(Schema{version:1,media_type:domain,conditions,presets,choices,max_formats:MAX_FORMATS,max_specifications:64,regex:"fancy-regex 0.19.2; case insensitive; bounded AST/backtracking; unsupported syntax rejected".into()}))
+}
+
+fn condition_kind(condition: &crate::db::custom_formats::Condition) -> &'static str {
+    use crate::db::custom_formats::Condition as C;
+    match condition {
+        C::ReleaseTitle { .. } => "release_title",
+        C::ReleaseGroup { .. } => "release_group",
+        C::Edition { .. } => "edition",
+        C::Language { .. } => "language",
+        C::Size { .. } => "size",
+        C::Source { .. } => "source",
+        C::Resolution { .. } => "resolution",
+        C::QualityModifier { .. } => "quality_modifier",
+        C::IndexerFlag { .. } => "indexer_flag",
+        C::ReleaseType { .. } => "release_type",
+        C::Year { .. } => "year",
+    }
+}
+
+// Independently authored token patterns. Presets are editable starting points, not parser rules.
+fn built_in_presets() -> std::collections::BTreeMap<String, Vec<Preset>> {
+    // Codec and subtitle presets intentionally search substrings; the word preset does not.
+    let definitions = [
+        ("x264", r"h264|x264|h[.]264|x[.]264"),
+        ("x265", r"hevc|h265|x265|h[.]265|x[.]265"),
+        ("Simple Hardcoded Subs", r"sub"),
+        ("Hardcoded Subs", r"(?:\w+sub(?:s)?|hc|subbed)(?!\w)"),
+        (
+            "Surround Sound",
+            r"atmos|truehd|dts.?hd|dts.?es|dts.?x(?=$|\d)|(?:ddp|dd[+]|eac3).?[56789]",
+        ),
+        ("Preferred Words", r"(?<!\w)(?:framestor|sparks)(?!\w)"),
+    ];
+    [(
+        "release_title".into(),
+        definitions
+            .into_iter()
+            .map(|(name, pattern)| Preset {
+                label: name.into(),
+                specification: Specification {
+                    name: name.into(),
+                    negate: false,
+                    required: false,
+                    condition: crate::db::custom_formats::Condition::ReleaseTitle {
+                        pattern: pattern.into(),
+                    },
+                },
+            })
+            .collect(),
+    )]
+    .into()
 }

@@ -110,7 +110,12 @@ async fn matching_names(
             class: "custom_format_evaluation_failed",
         })
     };
-    let parsed = render::parse(field, template).map_err(|_| fail())?;
+    let parsed = render::parse(field, template).map_err(|_| {
+        DestinationError::Render(RenderFailure {
+            field: field.name(),
+            class: "invalid_template",
+        })
+    })?;
     if !parsed.uses_custom_formats() {
         return Ok(Vec::new());
     }
@@ -151,6 +156,7 @@ pub(crate) async fn resolve_owned_destination(
     root: &str,
     basename: &str,
     quality_id: i64,
+    revision: &crate::media_files::FileRevision,
     edition: Option<&str>,
     evidence: &crate::custom_formats::Evidence,
 ) -> Result<String, DestinationError> {
@@ -212,10 +218,12 @@ pub(crate) async fn resolve_owned_destination(
             let facts = EpisodeNamingFacts {
                 custom_formats,
                 series_title: row.get(0)?,
+                anime: series_type.as_deref() == Some("anime"),
                 season: row.get(1)?,
                 episode: row.get(2)?,
                 episode_title: Some(row.get(3)?),
                 quality_title: quality_title(c, "tv", quality_id).await?,
+                revision: Some(revision.clone()),
                 air_date: row.get(4)?,
             };
             finish_render(
@@ -249,6 +257,7 @@ pub(crate) async fn resolve_owned_destination(
                 release_year: row.get(1)?,
                 edition: edition.map(str::to_owned),
                 quality_title: quality_title(c, "movies", quality_id).await?,
+                revision: Some(revision.clone()),
             };
             finish_render(
                 TemplateField::StandardMovie,
@@ -278,10 +287,12 @@ mod tests {
     fn short_stem_is_untouched_and_joined_with_the_downloaded_files_own_extension() {
         let facts = EpisodeNamingFacts {
             series_title: "Halcyon Vale".into(),
+            anime: false,
             season: 3,
             episode: 7,
             episode_title: Some("The Long Dark".into()),
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
             custom_formats: vec![],
             air_date: None,
         };
@@ -301,10 +312,12 @@ mod tests {
     fn a_very_long_rendered_stem_is_capped_to_leave_room_for_the_extension() {
         let facts = EpisodeNamingFacts {
             series_title: "x".repeat(500),
+            anime: false,
             season: 1,
             episode: 1,
             episode_title: None,
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
             custom_formats: vec![],
             air_date: None,
         };
@@ -348,10 +361,12 @@ mod tests {
     fn a_template_that_renders_empty_is_a_render_error_not_a_silent_fallback() {
         let facts = EpisodeNamingFacts {
             series_title: "Halcyon Vale".into(),
+            anime: false,
             season: 1,
             episode: 1,
             episode_title: None,
             quality_title: "WEBDL-1080p".into(),
+            revision: None,
             custom_formats: vec![],
             air_date: None,
         };
