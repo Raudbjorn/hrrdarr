@@ -24,6 +24,7 @@ use crate::{api::MediaDomain, db::MediaTarget};
 use serde::Serialize;
 use std::{collections::BTreeSet, future::Future};
 
+pub mod aria2;
 pub mod deluge;
 pub mod rtorrent;
 pub mod utorrent;
@@ -772,6 +773,14 @@ macro_rules! with_wire {
             }
             ProviderSettings::Utorrent { endpoint, .. } => {
                 let mut $wire = $crate::providers::label_client::utorrent::UtorrentWire::new(
+                    $operation,
+                    endpoint,
+                    $credentials,
+                )?;
+                $body
+            }
+            ProviderSettings::Aria2 { endpoint, .. } => {
+                let mut $wire = $crate::providers::label_client::aria2::Aria2Wire::new(
                     $operation,
                     endpoint,
                     $credentials,

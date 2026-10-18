@@ -44,10 +44,10 @@ async fn deluge_registry_scope_shape_options_and_labels_are_enforced() -> Result
             (row.get::<String>(0)?, row.get::<String>(1)?),
             ("download_client".into(), "torrent".into())
         );
-        // The rest of the family (rTorrent and uTorrent are registered by 0069 and 0070) is anticipated by the triggers but not registered yet.
+        // The rest of the family (rTorrent, uTorrent and Aria2 are registered by 0069, 0070 and 0071) is anticipated by the triggers but not registered yet.
         let mut rows = c
             .query(
-                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('flood','aria2','downloadstation')",
+                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('flood','downloadstation')",
                 (),
             )
             .await?;

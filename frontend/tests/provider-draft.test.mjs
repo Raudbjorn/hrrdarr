@@ -139,3 +139,12 @@ test('uTorrent is a torrent download client for both domains',()=>{
  assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
  assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
 });
+
+test('Aria2 is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('aria2'),'torrent');
+ assert.equal(isClientImplementation('aria2'),true);
+ const client={id:'a2',enabled:true,settings:{implementation:'aria2',endpoint:'http://127.0.0.1:6800/jsonrpc',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});

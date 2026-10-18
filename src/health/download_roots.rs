@@ -64,6 +64,7 @@ pub(super) async fn evaluate(
                 | "deluge"
                 | "rtorrent"
                 | "utorrent"
+                | "aria2"
         ) {
             failed.get_or_insert("check_failed");
             continue;

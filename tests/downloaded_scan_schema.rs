@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        67 // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        68 // Reasoning: latest is 0071 (0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;

@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 67); // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 68); // Reasoning: latest is 0071 (0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     for (sql, expected) in TABLES[..5].iter().zip(&before) {
         assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
     }
@@ -131,6 +131,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // all appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
     for (name, protocol) in [
+        ("aria2", "torrent"),
         ("deluge", "torrent"),
         ("nzbget", "usenet"),
         ("rtorrent", "torrent"),
@@ -274,6 +275,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 67); // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 68); // Reasoning: latest is 0071 (0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     Ok(())
 }

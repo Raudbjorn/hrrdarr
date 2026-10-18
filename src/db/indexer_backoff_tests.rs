@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 67); // Reasoning: latest is 0070 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 68); // Reasoning: latest is 0071 (0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 18 } // Reasoning: eighteen migrations follow 49 through 67 (0070 utorrent registry, 0069 rtorrent registry, 0068 deluge registry, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 19 } // Reasoning: nineteen migrations follow 49 through 68 (0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge registry, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
                 );
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.

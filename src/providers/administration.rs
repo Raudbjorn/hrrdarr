@@ -33,6 +33,7 @@ impl ProviderKind {
                     | ProviderSettings::Transmission { .. }
                     | ProviderSettings::Deluge { .. }
                     | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Aria2 { .. }
                     | ProviderSettings::Utorrent { .. }
             ) | (
                 Self::Indexer,
@@ -71,6 +72,7 @@ impl ProviderFilter {
                 | ProviderSettings::Transmission { .. }
                 | ProviderSettings::Deluge { .. }
                 | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Aria2 { .. }
                 | ProviderSettings::Utorrent { .. }),
                 media,
             ) => settings.client_scoped(media),
@@ -144,6 +146,7 @@ pub enum ProviderImplementation {
     Deluge,
     Rtorrent,
     Utorrent,
+    Aria2,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -203,6 +206,7 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Transmission
         | ProviderImplementation::Deluge
         | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Aria2
         | ProviderImplementation::Utorrent => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
@@ -437,6 +441,20 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://utorrent.example:8080/gui".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Aria2,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://aria2.example:6800/jsonrpc".into(),
                 },
             },
         ],
