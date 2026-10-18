@@ -50,3 +50,5 @@ pub mod health;
 pub mod health_detectors;
 
 pub mod host;
+
+pub mod collections;

@@ -1443,6 +1443,19 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             }
         }
     }
+    // Scope tags cascade with their scope row; capture them so an accepted edit that
+    // keeps a domain keeps its tags. Bounded by the 64-per-domain trigger.
+    let mut kept_tags = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT media_type,tag_id FROM provider_scope_tags WHERE provider_id=? ORDER BY media_type,tag_id",
+            [id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        kept_tags.push((row.get::<String>(0)?, row.get::<i64>(1)?));
+    }
+    drop(rows);
     conn.execute("DELETE FROM provider_scopes WHERE provider_id=?", [id])
         .await?;
     match settings {
@@ -1510,6 +1523,14 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.imported_category.clone(),i64::from(s.recent_priority),i64::from(s.older_priority),match s.initial_state { DownloadInitialState::Started => "started", DownloadInitialState::Stopped => "stopped", DownloadInitialState::Forced => "forced" },match s.content_layout { DownloadContentLayout::Default => "default", DownloadContentLayout::Original => "original", DownloadContentLayout::Subfolder => "subfolder" },i64::from(s.sequential_order),i64::from(s.first_last_first),i64::from(s.add_tags)]).await?;
             }
         }
+    }
+    // A domain dropped by this edit loses its tags with its scope.
+    for (domain, tag) in kept_tags {
+        conn.execute(
+            "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=?1 AND media_type=?2)",
+            params![id, domain, tag],
+        )
+        .await?;
     }
     Ok(())
 }

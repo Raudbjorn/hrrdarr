@@ -2,6 +2,7 @@
 //! Supported source contracts: Sonarr 233; Radarr 206 (inline metadata), 242 (split).
 //! Raw records (including credentials) are retained privately, never activated or returned.
 mod blocklist;
+mod collections;
 mod completed_download_handling;
 mod custom_formats;
 mod delay_profiles;
@@ -197,7 +198,7 @@ async fn import_inner(
     }
     let fingerprint = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref());
     let (source, _active) = tokio::task::spawn_blocking(move || {
-        let result = tokio::runtime::Handle::current().block_on(read_upload(bytes));
+        let result = tokio::runtime::Handle::current().block_on(read_upload(bytes, app));
         result.map(|source| (source, _active))
     })
     .await
@@ -206,6 +207,7 @@ async fn import_inner(
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,
     };
+    let collection_plan = collections::read(&source, app, &mut plan.unsupported)?;
     let cdh_plan = completed_download_handling::read(&source, &mut plan.unsupported)?;
     let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
     let release_profile_plan = release_profiles::read(&source, app, &mut plan.unsupported).await?;
@@ -231,10 +233,10 @@ async fn import_inner(
         conflicts: 0,
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
-        policy: "Core library and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library, supported Radarr collections/exclusions and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if reconstruct_providers {
-        report.policy = "Supported tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs.";
+        report.policy = "Supported Radarr collections/exclusions, tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed; providers remain disabled and untested, and credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs.";
     }
     let conn = db.connect().await?;
     let tx = conn
@@ -246,6 +248,7 @@ async fn import_inner(
         write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
         profiles::finish(&tx, prepared, &mut report).await?;
         tags::write(&tx, &tag_plan, &mut report).await?;
+        collections::write(&tx, &collection_plan, &mut report).await?;
         revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
@@ -282,7 +285,7 @@ fn identifier(s: &str) -> Result<String> {
     }
     Ok(format!("\"{s}\""))
 }
-async fn read_upload(bytes: Vec<u8>) -> Result<Source> {
+async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
     use std::io::Write;
     let directory = std::env::temp_dir().join(format!("hrrdarr-snapshot-{}", uuid::Uuid::new_v4()));
     let mut builder = std::fs::DirBuilder::new();
@@ -373,6 +376,12 @@ async fn read_upload(bytes: Vec<u8>) -> Result<Source> {
         || integrity.next().await?.is_some()
     {
         return Err(ImportError("snapshot integrity check failed"));
+    }
+    let mut collection_bytes = 0usize;
+    if matches!(app, Application::Radarr) {
+        for name in tables.keys() {
+            collections::preflight(&conn, name, &mut collection_bytes).await?;
+        }
     }
     let mut row_count = 0;
     let mut archive_bytes = 0;
@@ -720,7 +729,7 @@ pub(crate) async fn write_core_snapshot_fixture(
     bytes: Vec<u8>,
 ) -> Result<()> {
     let fingerprint = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref());
-    let source = read_upload(bytes).await?;
+    let source = read_upload(bytes, app).await?;
     let plan = match app {
         Application::Sonarr => readers::sonarr(&source)?,
         Application::Radarr => readers::radarr(&source)?,

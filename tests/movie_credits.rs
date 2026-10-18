@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -221,6 +221,10 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     // enable_* columns, so SQLite refuses to drop those columns until the triggers are dropped, which 0050's
     // DROP TRIGGER IF EXISTS tolerates); otherwise max(version) stays 50 and the runner
     // would re-run ALTER ADD COLUMN against columns that already exist.
+    // Reasoning: collections 0052 and provider authority 0053 now sit above main's 0051, so they
+    // are undone first, newest first, object for object as created by those migration files.
+    c.execute_batch("DROP TRIGGER provider_tags_limit; DROP TRIGGER provider_tags_identity; DROP TRIGGER provider_tags_insert_invalidates_test; DROP TRIGGER provider_tags_delete_invalidates_test; DROP TRIGGER provider_status_insert; DROP TRIGGER provider_status_update; DROP TRIGGER provider_cursor_insert; DROP TRIGGER provider_cursor_update; DROP INDEX provider_scope_tags_tag; DROP TABLE provider_selection_cursors; DROP TABLE provider_status; DROP TABLE provider_scope_tags; ALTER TABLE snapshot_imports DROP COLUMN provider_authority_version; DROP TRIGGER collections_identity_insert; DROP TRIGGER collections_identity_update; DROP TRIGGER collections_generated_id; DROP TRIGGER collections_metadata_revision; DROP TRIGGER collections_images_insert; DROP TRIGGER collections_images_update; DROP TRIGGER collection_settings_root_insert; DROP TRIGGER collection_settings_root_update; DROP TRIGGER collection_root_domain_update; DROP TRIGGER collection_settings_revision; DROP TRIGGER collection_tags_insert; DROP TRIGGER collection_tags_update; DROP TRIGGER collection_tags_revision_insert; DROP TRIGGER collection_tags_revision_delete; DROP TRIGGER collection_members_insert; DROP TRIGGER collection_members_update; DROP TRIGGER movie_collection_intents_revision; DROP TRIGGER movie_collection_intents_retain; DROP TRIGGER movie_import_exclusions_revision; DROP TRIGGER movie_import_exclusions_retain; DROP INDEX movie_collection_tags_tag; DROP TABLE movie_import_exclusions; DROP TABLE movie_collection_intents; DROP TABLE movie_collection_tags; DROP TABLE movie_collection_settings; ALTER TABLE movie_collections DROP COLUMN sort_title; ALTER TABLE movie_collections DROP COLUMN overview; ALTER TABLE movie_collections DROP COLUMN images_json; ALTER TABLE movie_collections DROP COLUMN metadata_revision; ALTER TABLE movie_collections DROP COLUMN graph_complete; ALTER TABLE movie_collections DROP COLUMN added; ALTER TABLE movie_collections DROP COLUMN last_info_sync; ALTER TABLE movie_collection_members DROP COLUMN origin; ALTER TABLE movie_collection_members DROP COLUMN metadata_revision; ALTER TABLE snapshot_imports DROP COLUMN collection_version; DELETE FROM schema_migrations WHERE version IN (52,53);")
+        .await?;
     // Reasoning: 0051 must likewise be undone: its status table, two backoff health rows, appended
     // health_checks/commands columns and command triggers, restoring the 0016 commands_transition body
     // that 0051 replaces (0051 begins with DROP TRIGGER commands_transition).
@@ -247,7 +251,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

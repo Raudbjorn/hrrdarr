@@ -73,7 +73,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version_of(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+            assert_eq!(version_of(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
             assert_eq!(
                 scalar(&c, "SELECT tag_version FROM snapshot_imports").await?,
                 0
@@ -141,7 +141,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             drop(c);
             drop(db);
             let reopened = Database::open_local(&path).await?;
-            assert_eq!(version_of(&reopened.connect().await?).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+            assert_eq!(version_of(&reopened.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
         }
     }
     Ok(())

@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: 0048 seeds four indexer_search/indexer_rss rows, 0049 two indexer_download_client rows and 0051 two download_client_backoff rows (one per domain), so the registry is 16 (was 14 at schema49).
     new_registry(&c).await?;
@@ -181,7 +181,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds two removed-metadata identities; 0048 adds four indexer identities (8 -> 12); 0049 adds two indexer_download_client identities (12 -> 14); 0051 adds two download_client_backoff identities (14 -> 16).
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {

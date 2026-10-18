@@ -494,6 +494,13 @@ async fn delete(
     let tx = c
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
+    // Collection defaults are policy, not library contents: deleting their root
+    // disables the policy instead of blocking on the RESTRICT reference.
+    tx.execute(
+        "UPDATE movie_collection_settings SET root_folder_id=NULL,monitored=0,settings_revision=settings_revision+1 WHERE root_folder_id=?",
+        [key],
+    )
+    .await?;
     if tx
         .execute(
             "DELETE FROM root_folders WHERE media_type=? AND id=?",

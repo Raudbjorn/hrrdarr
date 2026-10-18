@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        51 // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     );
     Ok(())
 }

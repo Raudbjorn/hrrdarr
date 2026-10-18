@@ -106,7 +106,7 @@ async fn backoff_upgrade49_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: backoff is now migration 0051 (was 44) after main landed 0044-0051.
+    assert_eq!(version(&c).await?, 53); // Reasoning: backoff is migration 0051; the runner continues through collections 0052 to latest 0053 (provider authority).
     for i in [0, 1, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

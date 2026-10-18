@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -275,7 +275,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 51); // Reasoning: latest migration is now 0051 download-client backoff (was 50: torrent RSS indexer); historical migration prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
