@@ -2434,15 +2434,61 @@ async fn files(
 
 /// Result of reconciling one archived source provider against destination configurations.
 pub(crate) enum ImportOutcome {
-    /// An equal existing configuration, or a newly created disabled one.
+    /// An exactly equal existing configuration, or a newly created disabled one.
     Mapped {
         id: String,
         revision: i64,
         created: bool,
     },
-    /// Nothing was written. `candidates` counts the destination configurations examined: those
-    /// sharing the reconciliation identity, or the stored mapping's target (0 once deleted).
-    Conflict { candidates: usize },
+    /// Nothing was written. `candidates` counts the destination configurations examined.
+    Conflict {
+        reason: crate::snapshots::ProviderConflictReason,
+        candidates: usize,
+    },
+}
+
+/// The source row being reconciled. Destinations mapped to its sibling rows are never candidates.
+pub(crate) struct ImportSource<'a> {
+    pub application: &'a str,
+    pub fingerprint: &'a str,
+    pub table: &'a str,
+    pub id: i64,
+}
+
+// Candidates compared per source row; a snapshot reconstructs at most this many providers too.
+const IMPORT_CANDIDATES: usize = 256;
+const IMPORT_FAILED: &str = "provider reconstruction failed; transaction not committed";
+const IMPORT_LOCKED: &str = "provider reconstruction requires the matching credential key";
+
+/// Exact equality on every reconstructed field and credential. Enabled state, test observations and
+/// revision are local operation, not configuration, so they never prevent a match.
+/// Plain and credential-presence differences are decided without the key.
+async fn import_matches(
+    conn: &Connection,
+    key: Option<&CredentialKey>,
+    id: &str,
+    input: &ProviderInput,
+    settings: &ProviderSettings,
+    wanted_secret: Option<&Credentials>,
+) -> std::result::Result<Option<i64>, &'static str> {
+    let (existing, cipher) = read(conn, id).await.map_err(|_| IMPORT_FAILED)?;
+    let plain = existing.name == input.name
+        && existing.priority == input.priority
+        && cipher.is_some() == wanted_secret.is_some()
+        && serde_json::to_value(&existing.settings).map_err(|_| IMPORT_FAILED)?
+            == serde_json::to_value(settings).map_err(|_| IMPORT_FAILED)?;
+    let equal = match (plain, &cipher, wanted_secret) {
+        (true, Some(bytes), Some(wanted)) => {
+            let secret = key
+                .ok_or(IMPORT_LOCKED)?
+                .open(id, existing.settings.implementation(), bytes)
+                .map_err(|_| IMPORT_LOCKED)?;
+            serde_json::to_value(&secret).map_err(|_| IMPORT_FAILED)?
+                == serde_json::to_value(wanted).map_err(|_| IMPORT_FAILED)?
+        }
+        (plain, _, _) => plain,
+    };
+    Ok(equal.then_some(existing.revision))
 }
 
 /// Snapshot writer supplies the transaction; no updates, network calls or independent commit.
@@ -2452,11 +2498,13 @@ pub(crate) async fn import_configuration(
     input: &ProviderInput,
     download_client_id: Option<Uuid>,
     changes: &mut HealthConfigurationChanges,
-    mapped: Option<(&str, i64)>,
+    source: &ImportSource<'_>,
+    mapped: Option<&str>,
 ) -> std::result::Result<ImportOutcome, &'static str> {
+    use crate::snapshots::ProviderConflictReason as Reason;
     const INVALID: &str = "invalid source provider configuration";
-    const FAILED: &str = "provider reconstruction failed; transaction not committed";
-    const LOCKED: &str = "provider reconstruction requires the matching credential key";
+    const FAILED: &str = IMPORT_FAILED;
+    const LOCKED: &str = IMPORT_LOCKED;
     validate(input).map_err(|_| INVALID)?;
     let mut settings = input.settings.clone();
     if let ProviderSettings::Torznab { tv, movies, .. }
@@ -2526,60 +2574,53 @@ pub(crate) async fn import_configuration(
         } => "movies",
         _ => return Err(INVALID),
     };
-    // Endpoint + implementation + source domain is a conservative reconciliation identity.
-    // Never merge independent TV/movie configurations or pick among ambiguous candidates.
-    let row = if let Some((id, _)) = mapped {
-        conn.query("SELECT count(*), min(id) FROM providers WHERE id=?", [id])
+    // Implementation + exact endpoint + source domain select candidates; only an exact match binds.
+    // Never merge independent TV/movie configurations or pick among several exact matches.
+    let mut rows = if let Some(id) = mapped {
+        conn.query("SELECT id FROM providers WHERE id=?", [id])
             .await
             .map_err(|_| FAILED)?
     } else {
-        conn.query("SELECT count(DISTINCT p.id), min(p.id) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=?", params![implementation,settings.endpoint(),domain]).await.map_err(|_| FAILED)?
+        // A destination already mapped to another row of this snapshot belongs to that sibling.
+        conn.query("SELECT DISTINCT p.id FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.implementation=? AND p.endpoint=? AND s.media_type=? AND NOT EXISTS (SELECT 1 FROM snapshot_provider_mappings m WHERE m.provider_id=p.id AND m.application=? AND m.fingerprint=? AND NOT (m.source_table=? AND m.source_id=?)) ORDER BY p.id LIMIT ?", params![implementation,settings.endpoint(),domain,source.application,source.fingerprint,source.table,source.id,i64::try_from(IMPORT_CANDIDATES + 1).map_err(|_| FAILED)?]).await.map_err(|_| FAILED)?
+    };
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|_| FAILED)? {
+        ids.push(row.get::<String>(0).map_err(|_| FAILED)?);
     }
-    .next()
-    .await
-    .map_err(|_| FAILED)?
-    .ok_or(FAILED)?;
-    let candidates = usize::try_from(row.get::<i64>(0).map_err(|_| FAILED)?).map_err(|_| FAILED)?;
-    let candidate = row.get::<Option<String>>(1).map_err(|_| FAILED)?;
-    // The row must be fully released before another statement uses the connection.
-    drop(row);
-    if candidates > 1 {
-        return Ok(ImportOutcome::Conflict { candidates });
-    }
-    if let Some(id) = candidate {
-        let (existing, cipher) = read(conn, &id).await.map_err(|_| FAILED)?;
-        // Classify a plain or credential-presence difference without the key; decrypt only to decide equality.
-        let equals = existing.name == input.name
-            && !existing.enabled
-            && existing.priority == input.priority
-            && existing.last_test.is_none()
-            && mapped.is_none_or(|(_, revision)| existing.revision == revision)
-            && cipher.is_some() == wanted_secret.is_some()
-            && serde_json::to_value(&existing.settings).map_err(|_| FAILED)?
-                == serde_json::to_value(&settings).map_err(|_| FAILED)?;
-        let equals = match (equals, &cipher, wanted_secret) {
-            (true, Some(bytes), Some(wanted)) => {
-                let secret = key
-                    .ok_or(LOCKED)?
-                    .open(&id, existing.settings.implementation(), bytes)
-                    .map_err(|_| LOCKED)?;
-                serde_json::to_value(&secret).map_err(|_| FAILED)?
-                    == serde_json::to_value(wanted).map_err(|_| FAILED)?
-            }
-            (equals, _, _) => equals,
-        };
-        return Ok(if equals {
-            ImportOutcome::Mapped {
-                id,
-                revision: existing.revision,
-                created: false,
-            }
-        } else {
-            ImportOutcome::Conflict { candidates }
+    // The statement must be fully released before another statement uses the connection.
+    drop(rows);
+    let candidates = ids.len();
+    if candidates > IMPORT_CANDIDATES {
+        return Ok(ImportOutcome::Conflict {
+            reason: Reason::Ambiguous,
+            candidates,
         });
     }
-    if mapped.is_some() {
-        return Ok(ImportOutcome::Conflict { candidates });
+    let mut equal = Vec::new();
+    for id in ids {
+        if let Some(revision) =
+            import_matches(conn, key, &id, input, &settings, wanted_secret).await?
+        {
+            equal.push((id, revision));
+        }
+    }
+    if let [(id, revision)] = equal.as_slice() {
+        return Ok(ImportOutcome::Mapped {
+            id: id.clone(),
+            revision: *revision,
+            created: false,
+        });
+    }
+    let reason = match (equal.len(), mapped) {
+        // No candidate and no stored mapping: create below.
+        (0, None) if candidates == 0 => None,
+        (0, Some(_)) => Some(Reason::MappingChanged),
+        (0, None) => Some(Reason::Differs),
+        _ => Some(Reason::Ambiguous),
+    };
+    if let Some(reason) = reason {
+        return Ok(ImportOutcome::Conflict { reason, candidates });
     }
     let id = Uuid::new_v4().to_string();
     let encrypted = wanted_secret

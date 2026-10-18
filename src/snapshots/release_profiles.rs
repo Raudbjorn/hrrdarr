@@ -331,10 +331,14 @@ async fn resolve(
                 }
             } else {
                 if definition.enabled {
+                    // Name the source rows (IDs only, never values) so the caller can act on them.
                     issue(
                         &mut report.unsupported,
                         plan.table,
-                        "enabled release profile indexer unavailable; whole catalog inactive",
+                        &format!(
+                            "enabled release profile {} references unavailable indexer {id}; whole catalog inactive",
+                            source.id
+                        ),
                     );
                     return Ok(None);
                 }
