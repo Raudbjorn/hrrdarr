@@ -210,10 +210,11 @@ pub(crate) fn compare(
                 result.reasons.push("not_revision_upgrade");
             }
             if !(prefer && exact_revision_upgrade) {
-                if current.score >= profile.cutoff_score {
-                    result.reasons.push("cutoff_met");
-                } else if candidate.score <= current.score {
+                // A non-improving score is reported before the format cutoff, as in Radarr.
+                if candidate.score <= current.score {
                     result.reasons.push("custom_format_not_upgrade");
+                } else if current.score >= profile.cutoff_score {
+                    result.reasons.push("cutoff_met");
                 } else if candidate.score.saturating_sub(current.score) < profile.minimum_increment
                 {
                     result.reasons.push("custom_format_upgrade_increment");
@@ -434,10 +435,18 @@ mod tests {
                 .contains(&"anime_revision_group_mismatch")
         );
         context.mode = Mode::DoNotPrefer;
+        // Candidate 0 <= current 100 is not an upgrade regardless of the format cutoff (also met);
+        // Radarr reports the score rejection first, so cutoff_met no longer masks it.
+        assert_eq!(
+            compare(&candidate, &current, &policy, &context).reasons,
+            vec!["custom_format_not_upgrade"]
+        );
+        candidate.score = 101;
         assert_eq!(
             compare(&candidate, &current, &policy, &context).reasons,
             vec!["cutoff_met"]
         );
+        candidate.score = 0;
         policy.upgrade_allowed = false;
         assert!(
             compare(&candidate, &current, &policy, &context)

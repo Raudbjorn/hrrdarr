@@ -33,8 +33,8 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Migration46 adds removed metadata per domain; wait for all fourteen current checks (0048 adds the indexer pair and 0049 the binding check per domain).
-            if v["summary"]["current"] == 14 {
+            // Migration46 adds removed metadata per domain; wait for all sixteen current checks (0048 adds the indexer pair, 0050 the backoff check and 0049 the binding check per domain).
+            if v["summary"]["current"] == 16 {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -65,8 +65,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
     // Migration46 adds removed metadata to CDH, communication and roots in each domain.
-    // Reasoning: 0048 adds indexer_search and indexer_rss and 0049 indexer_download_client per domain, so the fresh registry has fourteen identities (was 12 at schema48, 8 before).
-    assert_eq!(fresh["summary"]["never_run"], 14);
+    // Reasoning: 0048 adds indexer_search and indexer_rss and 0049 indexer_download_client per domain, so the fresh registry has sixteen identities (0050 adds download_client_backoff per domain; was fourteen) (was 12 at schema48, 8 before).
+    assert_eq!(fresh["summary"]["never_run"], 16);
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -82,8 +82,10 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let expected = ["tv", "movies"]
         .into_iter()
         .flat_map(|scope| {
+            // Reasoning: 0050 registers download_client_backoff per domain.
             [
                 "completed_download_handling",
+                "download_client_backoff",
                 "download_client_communication",
                 "download_client_root_folder",
                 "indexer_download_client",
@@ -166,8 +168,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     )
     .await;
     // Admission includes all four identities per domain, not only a larger count.
-    // Reasoning: seven identities per domain after 0049 (indexer_search/indexer_rss from 0048 and indexer_download_client); the union is fourteen.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 14);
+    // Reasoning: seven identities per domain after 0049 (indexer_search/indexer_rss from 0048 and indexer_download_client); 0050 adds download_client_backoff, so eight per domain and the union is sixteen.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 16);
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -549,7 +551,7 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            if v["summary"]["current"] == 14 && issues(&v).is_empty() {
+            if v["summary"]["current"] == 16 && issues(&v).is_empty() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

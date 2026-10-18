@@ -283,7 +283,13 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
         // Reasoning: migration 0049 likewise appends the nullable download_client_id column, so it joins the exclusion list.
         "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id') ORDER BY cid",
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits') AND NOT (type='table' AND name='provider_scopes') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // Reasoning: migration 0050 adds download_client_status (table + triggers), appends next_expiry_at to
+        // health_checks and origin/manual_bypass to commands (rewriting those two CREATE TABLE texts), recreates
+        // commands_transition and adds commands_backoff_identity. Predecessor columns of both altered tables are
+        // compared exactly below; backoff objects are covered by src/db/backoff_tests.rs.
+        "SELECT * FROM pragma_table_info('health_checks') WHERE name!='next_expiry_at' ORDER BY cid",
+        "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','download_client_status') AND NOT (type='table' AND name IN ('provider_scopes','health_checks','commands')) AND NOT (type='trigger' AND name IN ('commands_transition','commands_backoff_identity')) AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",

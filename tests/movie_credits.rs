@@ -218,6 +218,16 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     // columns, four indexer health rows and history row) and 0049 (its download_client_id column, two
     // indexer_download_client health rows and history row); otherwise max(version) stays 49 and the runner
     // would re-run ALTER ADD COLUMN against columns that already exist.
+    // Reasoning: 0050 must likewise be undone: its status table, two backoff health rows, appended
+    // health_checks/commands columns and command triggers, restoring the 0016 commands_transition body
+    // that 0050 replaces (0050 begins with DROP TRIGGER commands_transition).
+    let migration16 = include_str!("../migrations/0016_download_refresh.sql");
+    let start = migration16
+        .find("CREATE TRIGGER commands_transition")
+        .expect("0016 defines commands_transition");
+    let end = start + migration16[start..].find("\nEND;").expect("trigger end") + 5;
+    c.execute_batch(&format!("DROP TABLE download_client_status; DROP TRIGGER commands_backoff_identity; DROP TRIGGER commands_transition; ALTER TABLE commands DROP COLUMN manual_bypass; ALTER TABLE commands DROP COLUMN origin; {} DELETE FROM health_checks WHERE check_key='download_client_backoff'; ALTER TABLE health_checks DROP COLUMN next_expiry_at; DELETE FROM schema_migrations WHERE version=50;", &migration16[start..end]))
+        .await?;
     c.execute_batch("DROP TABLE movie_credits; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); DELETE FROM schema_migrations WHERE version IN (47,48,49);")
         .await?;
     assert_eq!(
