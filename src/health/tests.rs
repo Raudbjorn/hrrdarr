@@ -1450,7 +1450,7 @@ async fn removed_metadata_scheduled_dispatch_and_invalid_identity_preserve_prior
             if timestamp == 21700 {
                 assert_ne!(member.captured_reasons.unwrap() & SCHEDULED, 0);
             }
-            results.push(evaluate(&db, &client, member).await);
+            results.push(evaluate(&db, &client, member).await.0);
         }
         publish_outcomes(&c, &cmd, results, timestamp + 1)
             .await
@@ -1821,4 +1821,138 @@ async fn indexer_client_marker_exhaustion_rolls_back_binding_authority() {
         );
         assert_eq!(count(&c, "SELECT revision FROM providers").await, 1);
     }
+}
+
+#[tokio::test]
+async fn communication_cooldown_defers_config_recheck_to_cooldown_boundary() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    let baseline = admit(&c, HealthScope::All, 100).await;
+    let cmd = take(&c, baseline, 100).await;
+    publish(
+        &c,
+        &cmd,
+        Ok(cmd.members.iter().map(|_| None).collect()),
+        101,
+    )
+    .await
+    .unwrap();
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    communication_status_at(&tx, MediaDomain::Tv, 200)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    tick(&c, 205).await;
+    let id = active(&c).await.unwrap().unwrap().id;
+    let cmd = take(&c, id, 205).await;
+    assert!(!cmd.is_grace);
+    let outcomes = cmd.members.iter().map(|_| Err(PROVIDER_COOLDOWN)).collect();
+    let cooldowns = cmd.members.iter().map(|_| Some(600)).collect();
+    publish_deferred(&c, &cmd, outcomes, cooldowns, 206)
+        .await
+        .unwrap();
+    let command = read(&c, id).await.unwrap();
+    // Retrying cannot dispatch inside a cooldown: settle at once instead of burning attempts.
+    assert!(matches!(command.status, CommandStatus::Failed));
+    assert_eq!(command.attempts, 1);
+    // The internal cooldown code never reaches persisted, CHECK-constrained columns.
+    assert_eq!(command.error_code.as_deref(), Some("check_failed"));
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND last_error='check_failed' AND pending_reasons=8").await,1);
+    // The CONFIG recheck is re-armed at the cached cooldown boundary, not dropped.
+    assert_eq!(count(&c,"SELECT due_at FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'").await,806);
+    tick(&c, 805).await;
+    assert!(active(&c).await.unwrap().is_none());
+    tick(&c, 806).await;
+    let next = take(&c, active(&c).await.unwrap().unwrap().id, 806).await;
+    assert!(
+        next.members
+            .iter()
+            .any(|m| m.identity.check_key == "download_client_communication")
+    );
+    // A cooldown without its deadline is an ordinary failure and keeps the retry budget.
+    let outcomes = next
+        .members
+        .iter()
+        .map(|_| Err(PROVIDER_COOLDOWN))
+        .collect();
+    let cooldowns = next.members.iter().map(|_| None).collect();
+    publish_deferred(&c, &next, outcomes, cooldowns, 807)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read(&c, next.id).await.unwrap().status,
+        CommandStatus::RetryWait
+    ));
+}
+
+#[tokio::test]
+async fn communication_cooldown_keeps_scheduled_marker_and_defers_grace() {
+    let (_scratch, _db, c) = fixture_all().await;
+    init(&c, 100).await;
+    // Grace batch: only the communication checks hit a 600s cooldown.
+    tick(&c, 1000).await;
+    let grace = take(&c, active(&c).await.unwrap().unwrap().id, 1000).await;
+    assert!(grace.is_grace);
+    let comm = |m: &HealthMember| m.identity.check_key == "download_client_communication";
+    let outcomes = grace
+        .members
+        .iter()
+        .map(|m| {
+            if comm(m) {
+                Err(PROVIDER_COOLDOWN)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect();
+    let cooldowns = grace
+        .members
+        .iter()
+        .map(|m| comm(m).then_some(600))
+        .collect();
+    publish_deferred(&c, &grace, outcomes, cooldowns, 1001)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read(&c, grace.id).await.unwrap().status,
+        CommandStatus::Failed
+    ));
+    // Grace is re-armed at the cooldown boundary, not every 60s.
+    let life = lifecycle(&c).await.unwrap();
+    assert_eq!(life.grace_phase, "pending");
+    assert_eq!(life.grace_due_at, 1601);
+    // Scheduled-only marker: a cooldown keeps it pending until the boundary.
+    c.execute("UPDATE health_checks SET pending_reasons=2,due_at=1700 WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();
+    c.execute(
+        "UPDATE health_lifecycle SET grace_phase='expired',last_batch_completed_at=grace_due_at WHERE id=1",
+        (),
+    )
+    .await
+    .unwrap();
+    tick(&c, 1700).await;
+    let scheduled = take(&c, active(&c).await.unwrap().unwrap().id, 1700).await;
+    assert!(!scheduled.is_grace);
+    let outcomes = scheduled
+        .members
+        .iter()
+        .map(|m| {
+            if comm(m) {
+                Err(PROVIDER_COOLDOWN)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect();
+    let cooldowns = scheduled
+        .members
+        .iter()
+        .map(|m| comm(m).then_some(300))
+        .collect();
+    publish_deferred(&c, &scheduled, outcomes, cooldowns, 1701)
+        .await
+        .unwrap();
+    assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE scope='tv' AND check_key='download_client_communication' AND pending_reasons=2 AND due_at=2001").await,1);
 }
