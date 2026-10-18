@@ -682,6 +682,42 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
         c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision)SELECT ?,?,'snapshot',metadata_revision FROM movie_collections WHERE id=?",params![*collection,metadata,*collection]).await?;
         report.mapped += 1;
     }
+    // A movie this backup maps but lists in no collection had its association cleared at the
+    // source: drop its snapshot-origin memberships. Native origins are never touched.
+    let mut catalog = c
+        .query(
+            "SELECT source_id,destination_id FROM snapshot_mappings WHERE application='radarr' AND fingerprint=? AND destination_table='movie_metadata'",
+            [report.fingerprint.clone()],
+        )
+        .await?;
+    let mut cleared = Vec::new();
+    while let Some(r) = catalog.next().await? {
+        if !listed.contains_key(&r.get::<i64>(0)?) {
+            cleared.push(r.get::<i64>(1)?);
+        }
+    }
+    drop(catalog);
+    for metadata in cleared {
+        let mut rows = c
+            .query(
+                "SELECT collection_id FROM movie_collection_members WHERE metadata_id=? AND origin='snapshot'",
+                [metadata],
+            )
+            .await?;
+        let mut stale = Vec::new();
+        while let Some(r) = rows.next().await? {
+            stale.push(r.get::<i64>(0)?);
+        }
+        drop(rows);
+        for old in stale {
+            c.execute(
+                "DELETE FROM movie_collection_members WHERE collection_id=? AND metadata_id=? AND origin='snapshot'",
+                params![old, metadata],
+            )
+            .await?;
+            vacated.insert(old);
+        }
+    }
     // Deferred so a collection this snapshot is still populating is never retired mid-loop.
     let populated: BTreeSet<i64> = owners.values().copied().collect();
     for old in vacated.difference(&populated) {

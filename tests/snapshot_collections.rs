@@ -480,5 +480,26 @@ async fn newer_backup_replaces_snapshot_membership_and_tolerates_title_drift() {
         )
         .await,
         1
+    ); // A newer backup that clears one movie's collection removes only that snapshot membership.
+    let cleared = format!(
+        "{moved} UPDATE MovieMetadata SET CollectionTmdbId=NULL,CollectionTitle=NULL WHERE Id=1;"
+    );
+    let fourth = source(&s, MODERN, &cleared, None).await;
+    let report = snapshots::import(&db, Application::Radarr, fourth, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collection_members m JOIN movie_metadata d ON d.id=m.metadata_id WHERE d.tmdb_id=101"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=950").await,
+        1
     );
 }
