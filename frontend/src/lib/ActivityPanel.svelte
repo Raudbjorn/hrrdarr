@@ -29,7 +29,7 @@
   let writeReadback=$state(false);
   let reading = $state(false), mutating = $state(false), uncertain = $state(false), error = $state(''), readError = $state(''), notice = $state(''), confirmDelete = $state<'command' | 'schedule' | null>(null);
   const locked=$derived(mutating||writeReadback||uncertain||relatedWrite!=='idle'||childWrite!=='idle');
-  let alive = true, version = 0, timer: ReturnType<typeof setTimeout> | undefined;
+  let alive = true, version = 0, timer: ReturnType<typeof setTimeout> | undefined, settingsRead = false;
   const target: RefreshTarget | null = $derived.by(() => provider ? {provider_id:provider.id,media_type:media} : null);
   const currentSchedule = $derived.by(() => schedules.find(item => item.target.provider_id === provider?.id && item.target.media_type === media));
   const canRefresh = $derived.by(() => !!provider && !providerMissing && provider.enabled && provider.settings.implementation === 'qbittorrent' && !!provider.settings[media]);
@@ -39,7 +39,7 @@
   function editSchedule() {scheduleRevision = currentSchedule?.revision ?? null; scheduleEnabled = currentSchedule?.requested_enabled ?? currentSchedule?.enabled ?? false; interval = currentSchedule?.interval_seconds ?? 300; scheduleDirty = false; scheduleStale=false; scheduleProviderRevision=provider?.revision??null; scheduleReady = true; confirmDelete = null;}
   async function read(reconcile = false, resetSchedule = false) {
     if (!alive || !active || document.hidden || reading || mutating || relatedWrite==='busy') return false;
-    const token = version; reading = true; clearTimeout(timer); readError = ''; let failed = false;
+    const token = version; reading = true; clearTimeout(timer); readError = ''; let failed = false; settingsRead = false;
     const history = await listCommands({limit:25,offset:commandOffset,...(mediaFilter ? {media_type:mediaFilter as MediaDomain} : {}),...(statusFilter ? {status:statusFilter as CommandStatus} : {})});
     if (!alive || token !== version || document.hidden) {reading = false; schedulePoll(); return false;}
     if (history.ok) commands = history.data; else {readError = history.error; failed = true;}
@@ -47,6 +47,7 @@
     if (!alive || token !== version || document.hidden) {reading=false;schedulePoll();return false;}
     if(available.ok)providers=available.data;else{readError+=` ${available.error}`;failed=true;}
     if(saved.ok){
+      settingsRead=true;
       settings=saved.data.settings;schedules=saved.data.schedules;policies=saved.data.policies;
       if(provider){providerMissing=saved.data.provider===null;if(saved.data.provider)provider=saved.data.provider;}
       if(masterDirty||masterStale||uncertain){if(master && master.revision!==settings[media]?.revision)masterStale=true;}else masterBaseline();
@@ -81,8 +82,8 @@
     reading = false; error = ''; notice = ''; confirmDelete = null; scheduleReady = false; snapshot = null; queueOffset = 0;
     if (result.ok) {provider = result.data;providerMissing=false; media = domain; masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false; await read(false, true);} else {readError = result.error; schedulePoll();}
   }
-  // A failed readback leaves no baseline for the new domain: drop the previous domain's master so it cannot be shown or submitted; the next poll restores it.
-  async function changeScope(next:MediaDomain):Promise<'declined'|'failed'|'opened'> {if(reading||!keepDrafts())return 'declined';media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; if(await read(false,true))return 'opened';master=null;return 'failed';}
+  // A failed settings readback leaves no baseline for the new domain: drop the previous domain's master so it cannot be shown or submitted; the next poll restores it. Other read failures surface through readError.
+  async function changeScope(next:MediaDomain):Promise<'declined'|'failed'|'opened'> {if(reading||!keepDrafts())return 'declined';media=next;masterDirty=false;masterStale=false;scheduleDirty=false;scheduleStale=false;childDirty=false;++version; snapshot = null; queueOffset = 0; scheduleReady = false; confirmDelete = null; await read(false,true);if(settingsRead)return 'opened';master=null;return 'failed';}
   let navigationSeen=$state<number|null>(null),navigationNotice=$state('');
   $effect(()=>{
     const next=request,shown=active,busy=reading||mutating||writeReadback||relatedWrite==='busy'||childWrite==='busy',blocked=uncertain||relatedWrite==='uncertain'||childWrite==='uncertain';
