@@ -38,8 +38,10 @@
   function schedulePoll() {clearTimeout(timer); if (alive && active && !document.hidden) timer = setTimeout(() => void read(), 5000);}
   function editSchedule() {scheduleRevision = currentSchedule?.revision ?? null; scheduleEnabled = currentSchedule?.requested_enabled ?? currentSchedule?.enabled ?? false; interval = currentSchedule?.interval_seconds ?? 300; scheduleDirty = false; scheduleStale=false; scheduleProviderRevision=provider?.revision??null; scheduleReady = true; confirmDelete = null;}
   // A child policy write owns the readback slot; only its onreload (owned) may read until it settles.
+  // A deferred read re-arms the poll: a failed child write never calls onreload to restart it.
   async function read(reconcile = false, resetSchedule = false, owned = false) {
-    if (!alive || !active || document.hidden || reading || mutating || relatedWrite==='busy' || (childWrite==='busy' && !owned)) return false;
+    if (!alive || !active || document.hidden || reading || mutating || relatedWrite==='busy') return false;
+    if (childWrite==='busy' && !owned) {schedulePoll(); return false;}
     const token = version; reading = true; clearTimeout(timer); readError = ''; let failed = false;
     const history = await listCommands({limit:25,offset:commandOffset,...(mediaFilter ? {media_type:mediaFilter as MediaDomain} : {}),...(statusFilter ? {status:statusFilter as CommandStatus} : {})});
     if (!alive || token !== version || document.hidden) {reading = false; schedulePoll(); return false;}
