@@ -19,6 +19,7 @@ pub struct ProcessingPolicyInput {
 #[serde(deny_unknown_fields)]
 pub struct ProcessingPolicyReset {
     pub provider_revision: i64,
+    #[serde(deserialize_with = "required_nullable")]
     pub revision: Option<i64>,
     pub mode: ProcessingMode,
 }
@@ -207,13 +208,16 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
+    let provider=c.query("SELECT p.revision,p.enabled FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
+    let provider_enabled = provider.get::<i64>(1)? == 1;
     let stored=c.query("SELECT provider_revision,revision,enabled,mode,enabled_override FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
-    let master = crate::completed_download_handling::read(c, media)
-        .await
-        .map_err(|e| Error(e.0, e.1))?
-        .enabled;
+    // Mirrors cdh_scope_authority.desired_enabled so reads match reconciliation.
+    let master = provider_enabled
+        && crate::completed_download_handling::read(c, media)
+            .await
+            .map_err(|e| Error(e.0, e.1))?
+            .enabled;
     let observation=c.query("SELECT intent,enabled FROM download_refresh_schedules WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
     let (observation_suppressed, observation_enabled) = match observation {
         Some(r) => (r.get::<String>(0)? == "suppressed", r.get::<i64>(1)? == 1),
@@ -509,6 +513,17 @@ fn processing_error(code: &str) -> &'static str {
         _ => "import_conflict",
     }
 }
+// Matcher admission, timeouts and storage reads are transient; only a decided rejection blocks.
+fn preflight_evaluation_error(code: &'static str) -> Error {
+    match code {
+        "release_storage_error" => Error(StatusCode::SERVICE_UNAVAILABLE, "storage_error"),
+        "custom_format_busy"
+        | "custom_format_timeout"
+        | "custom_format_worker_failed"
+        | "custom_format_state_changed" => Error(StatusCode::SERVICE_UNAVAILABLE, code),
+        _ => Error(StatusCode::CONFLICT, "quality_rejected"),
+    }
+}
 async fn preflight_failure(
     c: &Connection,
     item: &DownloadProcessing,
@@ -521,7 +536,14 @@ async fn preflight_failure(
     };
     let retry = matches!(
         code,
-        "interrupted" | "storage_error" | "download_timeout" | "download_unavailable"
+        "interrupted"
+            | "storage_error"
+            | "download_timeout"
+            | "download_unavailable"
+            | "custom_format_busy"
+            | "custom_format_timeout"
+            | "custom_format_worker_failed"
+            | "custom_format_state_changed"
     ) && item.preflight_attempts < 3;
     if retry && authorization(c, item).await.is_ok() {
         c.execute("UPDATE download_processing SET status='queued',error_code=?,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='checking'",params![code,serde_json::to_string(&reasons).map_err(|_|bad())?,now()?+(1i64<<item.preflight_attempts),now()?,item.receipt_id.to_string()]).await?;
@@ -610,7 +632,7 @@ async fn preflight(
             &item.receipt_id.to_string(),
         )
         .await
-        .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
+        .map_err(|e| preflight_evaluation_error(e.0))?;
         if let Some(facts) = result.accepted {
             if accepted.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "ambiguous_files"));
@@ -777,4 +799,28 @@ async fn advance_import(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preflight_error_tests {
+    use super::*;
+    #[test]
+    fn transient_matcher_and_storage_errors_stay_retryable() {
+        for code in [
+            "custom_format_busy",
+            "custom_format_timeout",
+            "custom_format_worker_failed",
+            "custom_format_state_changed",
+        ] {
+            assert_eq!(preflight_evaluation_error(code).1, code);
+        }
+        assert_eq!(
+            preflight_evaluation_error("release_storage_error").1,
+            "storage_error"
+        );
+        assert_eq!(
+            preflight_evaluation_error("custom_format_regex_invalid").1,
+            "quality_rejected"
+        );
+    }
 }
