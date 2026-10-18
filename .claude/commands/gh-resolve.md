@@ -6,35 +6,42 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash
 # PR review triage: $ARGUMENTS
 
 Work the unresolved review threads on **$ARGUMENTS** (PR number or URL; if empty,
-ask which PR) using `gh-resolve` (`~/.local/bin/gh-resolve`).
+ask which PR) using `gh-resolve` (`.claude/bin/gh-resolve`, committed to this
+repo).
 
 ## Command surface
 
 ```
-~/.local/bin/gh-resolve [list] <PR>            # unresolved threads, full bodies
-~/.local/bin/gh-resolve -f <PR>                # entire conversation of each thread
-~/.local/bin/gh-resolve --resolved <PR>        # audit what was already closed
-~/.local/bin/gh-resolve -o <PR>                # outdated threads only
-~/.local/bin/gh-resolve agent <PR>             # self-contained bundle: hunks + threads + line ranges
-~/.local/bin/gh-resolve agent -j <PR>          # same, JSON
-~/.local/bin/gh-resolve suggestions <PR>       # review ```suggestion blocks
-~/.local/bin/gh-resolve suggestions --apply <PR>       # splice them into the local checkout
-~/.local/bin/gh-resolve suggestions --apply -n <PR>    # dry run: show the splice plan
-~/.local/bin/gh-resolve checks <PR>            # CI status, failures first
-~/.local/bin/gh-resolve reply <ID> -m "text"   # comment in a thread; -m - reads stdin
-~/.local/bin/gh-resolve reply <ID> -m "text" --resolve
-~/.local/bin/gh-resolve resolve <ID> | --all <PR> | --outdated <PR>
-~/.local/bin/gh-resolve unresolve <ID>
+.claude/bin/gh-resolve [list] <PR>            # unresolved threads, full bodies
+.claude/bin/gh-resolve -f <PR>                # entire conversation of each thread
+.claude/bin/gh-resolve --resolved <PR>        # audit what was already closed
+.claude/bin/gh-resolve -o <PR>                # outdated threads only
+.claude/bin/gh-resolve agent <PR>             # self-contained bundle: hunks + threads + line ranges
+.claude/bin/gh-resolve agent -j <PR>          # same, JSON
+.claude/bin/gh-resolve suggestions <PR>       # review ```suggestion blocks
+.claude/bin/gh-resolve suggestions --apply <PR>       # splice them into the local checkout
+.claude/bin/gh-resolve suggestions --apply -n <PR>    # dry run: show the splice plan
+.claude/bin/gh-resolve checks <PR>            # CI status, failures first
+.claude/bin/gh-resolve reply <ID> -m "text"   # comment in a thread; -m - reads stdin
+.claude/bin/gh-resolve reply <ID> -m "text" --resolve
+.claude/bin/gh-resolve resolve <ID> | --all <PR> | --outdated <PR>
+.claude/bin/gh-resolve unresolve <ID>
 ```
 
-Invoke it by that absolute path — `~/.local/bin` is not on the PATH of a
-non-interactive shell.
+Invoke it by that path from the repository root; it is not on the PATH.
 
 Any command takes `-r owner/repo`, `-j`, `-q`, `-n` (dry run).
 
-## Related: gh-comment
+Backend: in Claude Code cloud sessions (`CLAUDE_CODE_REMOTE=true`) the proxy
+blocks GraphQL, so the script switches to REST plus the proxy's `/ccr/`
+review-thread routes. Thread IDs then look like `RT_<pr>_<comment id>` instead
+of `PRRT_…`; the two are not interchangeable, so take IDs from a listing in the
+same environment. Force either with `GH_RESOLVE_BACKEND=graphql|rest`.
 
-`gh-resolve` operates on GitHub's own thread-resolution state (GraphQL). For
+## Related: gh-comment (local only)
+
+`gh-comment` is not committed here and is absent in cloud sessions; skip this
+section there. `gh-resolve` operates on GitHub's own thread-resolution state (GraphQL). For
 marking one specific comment's TEXT as addressed/moot — useful when a thread
 has several comments and only one needs flagging, or the repo doesn't lean on
 thread resolution — use `~/.local/bin/gh-comment` instead:
@@ -52,15 +59,17 @@ bot reviews — broken down by who said what before diving into `gh-resolve agen
 
 ## Workflow
 
-1. `~/.local/bin/gh-resolve checks <PR>` — CI failures usually explain half the
+1. `.claude/bin/gh-resolve checks <PR>` — CI failures usually explain half the
    review comments.
-2. `~/.local/bin/gh-resolve agent <PR>` — read the bundle. It pins line numbers to the head
+2. `.claude/bin/gh-resolve agent <PR>` — read the bundle. It pins line numbers to the head
    commit and gives each thread's ID, diff hunk, and full conversation.
-3. Check out the PR branch (`gh pr checkout <PR>`) before editing. Line numbers
-   are only valid at the PR head.
+3. Check out the PR branch before editing: `git fetch origin <branch> && git
+   checkout <branch>`, with the branch from the bundle header (`gh pr checkout`
+   needs GraphQL, which cloud sessions block). Line numbers are only valid at
+   the PR head.
 4. For each thread, decide: fix, push back, or defer. Fix the code yourself —
    the bundle is context, not a patch to apply blindly.
-5. `~/.local/bin/gh-resolve reply <ID> -m "..." --resolve` once a fix is committed.
+5. `.claude/bin/gh-resolve reply <ID> -m "..." --resolve` once a fix is committed.
 
 ## Rules
 
