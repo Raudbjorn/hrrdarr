@@ -67,7 +67,8 @@ async fn serve(
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = providers::router(db, key);
+    let app =
+        providers::router(db.clone(), key).merge(hrrdarr::completed_download_handling::router(db));
     (
         address,
         tokio::spawn(async move {
@@ -727,6 +728,24 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
         .0,
         204
     );
+    // Isolate provider-test batch capacity from the independent 64-schedule CDH cap:
+    // 33 enabled dual-domain clients would otherwise require 66 inherited schedules.
+    // Disable only domain import intent through the public CAS API; provider enablement,
+    // scopes, the testall limit and its no-upstream-call assertion remain unchanged.
+    for domain in ["tv", "movies"] {
+        let path = format!("/api/v1/{domain}/completed-download-handling");
+        let (code, settings) = request(address, "GET", &path, "").await;
+        assert_eq!(code, 200, "{settings}");
+        let (code, disabled) = request(
+            address,
+            "PUT",
+            &path,
+            &json!({"enabled":false,"revision":settings["revision"]}).to_string(),
+        )
+        .await;
+        assert_eq!(code, 200, "{disabled}");
+        assert_eq!(disabled["enabled"], false);
+    }
     // Overflow is determined before the first upstream call, rather than silently testing a prefix.
     for n in 0..29 {
         create(

@@ -163,3 +163,5 @@ title) over a real `axum::serve` listener via `reqwest`, the same pattern
   `parser::parse` call the rest of the pipeline uses, a deliberate simplification for a
   single diagnostic endpoint.
 - This endpoint is not wired into any UI; it is an HTTP contract only.
+
+`ParsedRelease.revision` is a structured `FileRevision` (`version`, `real`, `is_repack`) or null for a decoded historical lossy numeric revision; `revision_marker` records explicit recognition. Fresh recognized release titles without markers have baseline version1/real0/non-repack. The bounded grammar handles PROPER, REPACK/RERIP numbered forms, repeated REAL and TV version suffixes. Revision-like text before identity or in a hyphenated release group is not revision evidence. Ambiguous trailing bracketed revision-like groups are rejected explicitly; exhaustive upstream parser equivalence is not claimed. File-import provenance applies stricter rules to unmarked filenames than title inspection.

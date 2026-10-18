@@ -104,8 +104,10 @@ pub(super) async fn fixture(
     )
     .await
     .unwrap();
+    // Migration 0041 adds inheritance; this recovery fixture intentionally owns
+    // explicit-on copy authority at revision 1, rather than inheriting a default.
     c.execute(
-        "INSERT INTO download_processing_policies VALUES(?,?,1,1,1,'copy')",
+        "INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode,enabled_override) VALUES(?,?,1,1,1,'copy',1)",
         params![client, domain],
     )
     .await
@@ -135,9 +137,11 @@ pub(super) async fn fixture(
 }
 
 pub(super) async fn replacements() {
+    custom_format_naming_changes_reject_before_journaling().await;
     // Keep execute() regressions within the shared serial recovery test: its permit is global.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
+    legacy_revision_marker_conflict_preserves_sources().await;
     // Real owned producer and journal transitions, not fabricated replacement sidecars.
     for (movie, shared) in [(false, false), (true, false), (false, true)] {
         let dir = Scratch::new();
@@ -706,7 +710,8 @@ async fn legacy_owned_journals_revalidate_current_policy_before_recovery() {
 }
 
 async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, invalid_size: bool) {
-    // Fixture-only historical shape: old journals had expected_size but no comparison facts.
+    // Fixture-only historical shape: old journals had expected_size but no comparison
+    // facts or revision binding. Preserve this genuinely legacy coverage as new journals evolve.
     // Temporarily relax immutable guards in this scratch transaction, restore the exact
     // trigger definitions, and only then invoke application recovery. No migration changes.
     let tx = c.transaction().await.unwrap();
@@ -734,7 +739,7 @@ async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, inv
             .unwrap();
         triggers.push(sql);
     }
-    tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_remove(provenance_json,'$.comparison_facts') WHERE operation_id=?",[operation]).await.unwrap();
+    tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_remove(provenance_json,'$.comparison_facts','$.revision_binding') WHERE operation_id=?",[operation]).await.unwrap();
     if invalid_size {
         tx.execute("UPDATE rss_candidate_imports SET provenance_json=json_set(provenance_json,'$.expected_size',0) WHERE operation_id=?",[operation]).await.unwrap();
     }
@@ -757,4 +762,262 @@ async fn legacy_provenance(c: &Connection, operation: &str, candidate: &str, inv
         .is_err(),
         "Historical fixture must restore immutability"
     );
+}
+
+// Kept in the existing serial import test, which owns the process-wide execution permit.
+async fn custom_format_naming_changes_reject_before_journaling() {
+    for movie in [false, true] {
+        for change in ["name", "include", "definition", "illegal"] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            let mut input = fixture(&dir, &db, movie, false).await;
+            let c = db.connect().await.unwrap();
+            let media = if movie { "movies" } else { "tv" };
+            let column = if movie {
+                "standard_movie_format"
+            } else {
+                "standard_episode_format"
+            };
+            c.execute(&format!("UPDATE naming_settings SET revision=revision+1,rename_enabled=1,replace_illegal_characters=0,{column}='CF-{{Custom Formats}}' WHERE domain=?"), [media]).await.unwrap();
+            let specs = serde_json::json!([{"name":"Title","negate":false,"required":false,"condition":{"kind":"release_title","pattern":"WEB-DL"}}]).to_string();
+            c.execute("INSERT INTO custom_formats(media_type,name,include_when_renaming,specifications_json)VALUES(?,'Before',1,?)",params![media,specs]).await.unwrap();
+            let accepted = crate::search::downloaded::evaluate_receipt(
+                &c,
+                &input.target,
+                &input.source,
+                input.expected_size,
+                &input.candidate_id,
+            )
+            .await
+            .unwrap()
+            .accepted
+            .unwrap();
+            input.destination = crate::naming::destination::resolve_owned_destination(
+                &c,
+                &input.target,
+                &accepted.root,
+                &accepted.basename,
+                accepted.quality_id,
+                &accepted.revision_binding.effective,
+                accepted.edition.as_deref(),
+                &accepted.evidence,
+            )
+            .await
+            .unwrap();
+            assert!(input.destination.ends_with("CF-Before.mkv"));
+            match change {
+                "name" => {
+                    c.execute("UPDATE custom_formats SET name='After'", ())
+                        .await
+                        .unwrap();
+                }
+                "include" => {
+                    c.execute("UPDATE custom_formats SET include_when_renaming=0", ())
+                        .await
+                        .unwrap();
+                }
+                "definition" => {
+                    c.execute("UPDATE custom_formats SET specifications_json=replace(specifications_json,'WEB-DL','impossible')",()).await.unwrap();
+                }
+                _ => {
+                    c.execute("UPDATE custom_formats SET name='private/secret'", ())
+                        .await
+                        .unwrap();
+                }
+            }
+            // Exact-input miss inside the writer must fail, never run regex work there.
+            let tx = c
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .unwrap();
+            let outcome = crate::naming::destination::resolve_owned_destination(
+                &tx,
+                &input.target,
+                &accepted.root,
+                &accepted.basename,
+                accepted.quality_id,
+                &accepted.revision_binding.effective,
+                accepted.edition.as_deref(),
+                &accepted.evidence,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                Err(crate::naming::destination::DestinationError::Render(_))
+            ));
+            tx.rollback().await.unwrap();
+            let source = input.source.clone();
+            let error = prepare_owned(db.clone(), input).await.unwrap_err();
+            assert_eq!(error.code(), "preflight_changed", "{change}");
+            assert!(!format!("{error:?}").contains("private/secret"));
+            assert_eq!(
+                std::fs::read(dir.path(&format!("{media}/old.mkv"))).unwrap(),
+                b"original-media"
+            );
+            assert_eq!(std::fs::read(source).unwrap(), b"new-media-content");
+            assert_eq!(count(&db, "operations").await, 0);
+        }
+    }
+}
+
+async fn legacy_revision_marker_conflict_preserves_sources() {
+    for movie in [false, true] {
+        for published in [false, true] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            let mut input = fixture(&dir, &db, movie, false).await;
+            let stem = if movie {
+                "Movie.2020.1080p.WEB-DL.RERIP2"
+            } else {
+                "TV.S01E01.1080p.WEB-DL.RERIP2"
+            };
+            let source = dir.path(&format!("downloads/{stem}.mkv"));
+            std::fs::copy(&input.source, &source).unwrap();
+            input.source = source.clone();
+            input.destination = dir.path(&format!(
+                "{}/{stem}.mkv",
+                if movie { "movies" } else { "tv" }
+            ));
+            let factual = serde_json::json!({"version":3,"real":0,"is_repack":true});
+            input.revision_json = serde_json::to_string(&crate::media_files::FileRevision {
+                version: 3,
+                real: 0,
+                is_repack: true,
+            })
+            .unwrap();
+            let candidate = input.candidate_id.clone();
+            let c = db.connect().await.unwrap();
+            // Construct the modern valid preparation first. This scratch-only rewrite
+            // restores trigger definitions before the application is ever invoked.
+            let tx = c.transaction().await.unwrap();
+            let mut triggers = Vec::new();
+            for name in ["rss_candidate_transition", "rss_comparison_facts_update"] {
+                let sql: String = tx
+                    .query("SELECT sql FROM sqlite_master WHERE name=?", [name])
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get(0)
+                    .unwrap();
+                tx.execute_batch(&format!("DROP TRIGGER {name}"))
+                    .await
+                    .unwrap();
+                triggers.push(sql);
+            }
+            let raw: String = tx
+                .query(
+                    "SELECT comparison_facts_json FROM rss_candidates WHERE id=?",
+                    [candidate.clone()],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            let mut evidence: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            evidence["title"] = serde_json::json!(stem);
+            evidence["revision"] =
+                serde_json::json!({"parser_version":1,"value":factual,"explicit_marker":true});
+            tx.execute(
+                "UPDATE rss_candidates SET comparison_facts_json=? WHERE id=?",
+                params![evidence.to_string(), candidate.clone()],
+            )
+            .await
+            .unwrap();
+            for sql in triggers {
+                tx.execute_batch(&sql).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+            let operation = prepare_owned(db.clone(), input)
+                .await
+                .unwrap()
+                .id
+                .to_string();
+            if published {
+                stage_and_publish(&db, &operation, true).await;
+            }
+            legacy_provenance(&c, &operation, &candidate, false).await;
+            // Historical parser missed RERIP2 and accepted baseline. Represent its
+            // immutable journal exactly; new parsing must block, not rewrite history.
+            let tx = c.transaction().await.unwrap();
+            let sql: String = tx
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE name='candidate_import_immutable'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            tx.execute_batch("DROP TRIGGER candidate_import_immutable")
+                .await
+                .unwrap();
+            tx.execute(
+                "UPDATE rss_candidate_imports SET revision_json=? WHERE operation_id=?",
+                params![
+                    serde_json::json!({"version":1,"real":0,"is_repack":false}).to_string(),
+                    operation.clone()
+                ],
+            )
+            .await
+            .unwrap();
+            tx.execute_batch(&sql).await.unwrap();
+            tx.commit().await.unwrap();
+            let row=c.query("SELECT revision_json,provenance_json FROM rss_candidate_imports WHERE operation_id=?",[operation.clone()]).await.unwrap().next().await.unwrap().unwrap();
+            let frozen = (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap());
+            // Release the retained query row as well as its connection before reopening;
+            // the fixture must not hold the old database read lock during recovery.
+            drop(row);
+            drop(c);
+            drop(db);
+            let db = dir.database().await;
+            let error = execute(db.clone(), &operation).await.unwrap_err();
+            assert_eq!(
+                error.code(),
+                "preflight_changed",
+                "movie={movie} published={published}: {error:?}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), b"new-media-content");
+            assert_eq!(
+                std::fs::read(dir.path(if movie {
+                    "movies/old.mkv"
+                } else {
+                    "tv/old.mkv"
+                }))
+                .unwrap(),
+                b"original-media"
+            );
+            assert_eq!(count(&db, "import_history").await, 0);
+            let c = db.connect().await.unwrap();
+            let persisted: String = c
+                .query(
+                    "SELECT error_code FROM import_journal WHERE operation_id=?",
+                    [operation.clone()],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(persisted, "preflight_changed");
+            let row=c.query("SELECT revision_json,provenance_json FROM rss_candidate_imports WHERE operation_id=?",[operation]).await.unwrap().next().await.unwrap().unwrap();
+            assert_eq!(
+                (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()),
+                frozen
+            );
+        }
+    }
 }

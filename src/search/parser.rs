@@ -16,9 +16,111 @@ pub struct ParsedRelease {
     pub numbering: Option<Numbering>,
     pub quality_name: Option<String>,
     pub edition: Option<String>,
-    pub revision: u8,
+    #[serde(default, deserialize_with = "revision_field")]
+    pub revision: Option<crate::media_files::FileRevision>,
+    #[serde(default)]
+    pub revision_marker: bool,
     #[serde(default)]
     pub technical_start: Option<usize>,
+}
+fn revision_field<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::media_files::FileRevision>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() || matches!(value.as_u64(), Some(1 | 2)) {
+        // Historical numeric facts cannot distinguish PROPER from REPACK or REAL.
+        return Ok(None);
+    }
+    let revision: crate::media_files::FileRevision =
+        serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    revision.validate().map_err(serde::de::Error::custom)?;
+    Ok(Some(revision))
+}
+fn version_suffix(token: &str) -> (&str, Option<&str>) {
+    match token.rsplit_once('v') {
+        Some((base, version))
+            if base.bytes().last().is_some_and(|c| c.is_ascii_digit())
+                && !version.is_empty()
+                && version.bytes().all(|c| c.is_ascii_digit()) =>
+        {
+            (base, Some(version))
+        }
+        _ => (token, None),
+    }
+}
+fn revision_tokens(
+    tokens: &[String],
+    attached: Option<&str>,
+    tv: bool,
+) -> Result<(crate::media_files::FileRevision, bool), &'static str> {
+    let mut value = crate::media_files::FileRevision {
+        version: 1,
+        real: 0,
+        is_repack: false,
+    };
+    let mut marker = false;
+    let positive = |s: &str| {
+        s.parse::<i64>()
+            .ok()
+            .filter(|v| (1..=i64::from(i32::MAX)).contains(v))
+            .ok_or("invalid_revision")
+    };
+    if let Some(version) = attached {
+        value.version = positive(version)?;
+        marker = true;
+    }
+    for token in tokens {
+        if token == "-" {
+            break;
+        }
+        // Preserve recognized source compounds, then stop at the group suffix.
+        // Dotted words inside that suffix cannot become technical revision facts.
+        let source_compound = ["web-dl", "blu-ray"]
+            .into_iter()
+            .find(|source| token.as_str() == *source || token.starts_with(&format!("{source}-")));
+        let (token, group_follows) = if let Some(source) = source_compound {
+            (source, token.len() > source.len())
+        } else {
+            token
+                .split_once('-')
+                .map_or((token.as_str(), false), |(head, _)| (head, true))
+        };
+        if token == "proper" {
+            value.version = value.version.max(2);
+            marker = true;
+        } else if token == "real" {
+            value.real += 1;
+            marker = true;
+        } else if let Some(n) = token
+            .strip_prefix("repack")
+            .or_else(|| token.strip_prefix("rerip"))
+        {
+            if n.is_empty() || n.bytes().all(|c| c.is_ascii_digit()) {
+                let number = if n.is_empty() { 1 } else { positive(n)? };
+                value.version = value.version.max(
+                    number
+                        .checked_add(1)
+                        .filter(|v| *v <= i64::from(i32::MAX))
+                        .ok_or("invalid_revision")?,
+                );
+                value.is_repack = true;
+                marker = true;
+            }
+        } else if tv {
+            if let Some(n) = token
+                .strip_prefix('v')
+                .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+            {
+                value.version = value.version.max(positive(n)?);
+                marker = true;
+            }
+        }
+        if group_follows {
+            break;
+        }
+    }
+    value.validate().map_err(|_| "invalid_revision")?;
+    Ok((value, marker))
 }
 pub fn normalize(value: &str) -> String {
     value
@@ -34,6 +136,7 @@ fn number(value: &str) -> Option<i64> {
 }
 fn numbering(value: &str) -> Option<Numbering> {
     let value = value.to_ascii_lowercase();
+    let (value, _) = version_suffix(&value);
     let tail = value.strip_prefix('s')?;
     let mut parts = tail.split('e');
     let season = number(parts.next()?)?;
@@ -88,7 +191,7 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
         }
         if parsed_numbering.is_none() {
             if let Some(i) = tokens.iter().position(|s| *s == "-") {
-                if let Some(episode) = tokens.get(i + 1).and_then(|s| number(s)) {
+                if let Some(episode) = lower.get(i + 1).and_then(|s| number(version_suffix(s).0)) {
                     boundary = i;
                     parsed_numbering = Some(Numbering::Absolute { episode });
                 }
@@ -193,6 +296,27 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
                 token.as_ptr() as usize - value.as_ptr() as usize
             }),
     );
+    let attached = if tv {
+        lower
+            .get(boundary + identity_tokens - 1)
+            .and_then(|token| version_suffix(token).1)
+    } else {
+        None
+    };
+    for (index, token) in tokens.iter().enumerate().skip(boundary + identity_tokens) {
+        let start = token.as_ptr() as usize - value.as_ptr() as usize;
+        let end = start + token.len();
+        if value.as_bytes().get(start.wrapping_sub(1)) == Some(&b'[')
+            && value.as_bytes().get(end) == Some(&b']')
+            && revision_tokens(&lower[index..index + 1], None, tv)?.1
+        {
+            // A bracketed revision-like group and a bracketed revision marker are
+            // indistinguishable in this bounded grammar. Never assert either fact.
+            return Err("ambiguous_revision_marker");
+        }
+    }
+    let (revision, revision_marker) =
+        revision_tokens(&lower[boundary + identity_tokens..], attached, tv)?;
     Ok(ParsedRelease {
         technical_start,
         title,
@@ -200,13 +324,96 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
         numbering: parsed_numbering,
         quality_name,
         edition,
-        revision: if has("proper") || has("repack") { 2 } else { 1 },
+        revision: Some(revision),
+        revision_marker,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn revision_facts_and_legacy_decode() {
+        for (suffix, version, real, repack) in [
+            ("", 1, 0, false),
+            ("PROPER", 2, 0, false),
+            ("REPACK", 2, 0, true),
+            ("RERIP2", 3, 0, true),
+            ("REAL.REAL.PROPER", 2, 2, false),
+            ("v3", 3, 0, false),
+        ] {
+            let parsed = parse(
+                &format!("Real.Proper.Harbor.S01E02.1080p.WEB-DL.{suffix}"),
+                true,
+            )
+            .unwrap();
+            let revision = parsed.revision.as_ref().unwrap();
+            assert_eq!(
+                (revision.version, revision.real, revision.is_repack),
+                (version, real, repack)
+            );
+            assert_eq!(parsed.revision_marker, !suffix.is_empty());
+        }
+        let parsed = parse("Harbor - 023v4 1080p WEB-DL-GROUP", true).unwrap();
+        assert_eq!(parsed.numbering, Some(Numbering::Absolute { episode: 23 }));
+        assert_eq!(parsed.revision.unwrap().version, 4);
+        assert!(
+            !parse("Proper.2020.1080p.WEB-DL-PROPER", false)
+                .unwrap()
+                .revision_marker
+        );
+        for suffix in [
+            "WEB-DL-GROUP.PROPER",
+            "Blu-Ray-REAL.REPACK2",
+            "HDTV-TEAM.v3",
+        ] {
+            assert!(
+                !parse(&format!("Harbor.S01E02.1080p.{suffix}"), true)
+                    .unwrap()
+                    .revision_marker,
+                "{suffix}"
+            );
+        }
+        for source in ["WEB-DL", "Blu-Ray"] {
+            assert!(
+                parse(
+                    &format!("Harbor.S01E02.1080p.{source}.PROPER-GROUP.REAL"),
+                    true
+                )
+                .unwrap()
+                .revision_marker
+            );
+            assert_eq!(
+                parse(
+                    &format!("Harbor.S01E02.1080p.{source}.PROPER-GROUP.REAL"),
+                    true
+                )
+                .unwrap()
+                .revision
+                .unwrap()
+                .real,
+                0
+            );
+        }
+        assert!(parse("Harbor.S01E02.REPACK2147483647", true).is_err());
+        assert!(
+            !parse("[REAL] Harbor.S01E02.1080p.WEB-DL - PROPER", true)
+                .unwrap()
+                .revision_marker
+        );
+        assert_eq!(
+            parse("Harbor.S01E02.1080p.WEB-DL.[REPACK]", true).unwrap_err(),
+            "ambiguous_revision_marker"
+        );
+
+        let mut old =
+            serde_json::to_value(parse("Harbor.2020.1080p.WEB-DL", false).unwrap()).unwrap();
+        old["revision"] = serde_json::json!(2);
+        old.as_object_mut().unwrap().remove("revision_marker");
+        let decoded: ParsedRelease = serde_json::from_value(old).unwrap();
+        assert!(decoded.revision.is_none());
+        assert!(!decoded.revision_marker);
+    }
     #[test]
     fn independent_tv_and_movie_corpora() {
         for name in [

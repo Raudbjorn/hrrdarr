@@ -325,6 +325,17 @@ async fn end_to_end_success_and_equal_ids() {
     )
     .await;
     assert_eq!(status_movie["status"], "complete");
+    // Ordinary completed manual operations still fail readiness; ownership precedence must
+    // not weaken the existing journal guard or create another command.
+    for operation in [&op_tv, &op_movie] {
+        let (code, rejected) = submit_batch(&ctx.base, vec![operation.clone()], "normal").await;
+        assert_eq!(code, 409, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"], "manual_import_not_ready",
+            "{rejected}"
+        );
+    }
+
     let (_, list) = request(
         &ctx.base,
         "GET",
@@ -401,11 +412,6 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         ),
     ];
 
-    let (_, client) = providers::router_with_refresh(db.clone(), Some(credential_key()));
-    let runtime = commands::start_with_metadata(db.clone(), client, metadata.clone())
-        .await
-        .unwrap();
-
     let operation_ids: Vec<String> = entries.iter().map(|(op, _, _)| op.clone()).collect();
     let (code, created) = submit_batch(&base, operation_ids, "normal").await;
     assert_eq!(code, 202, "{created}");
@@ -415,6 +421,25 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         .iter()
         .map(|c| c["id"].as_str().unwrap().to_owned())
         .collect();
+
+    // A future queued rescan excludes this movie's import from worker claims. Polling
+    // alone can miss the entire two-completed/one-queued window. Use this existing
+    // eligibility gate without bypassing the immutable manual-command transition guard.
+    let held_rescan_id = Uuid::new_v4().to_string();
+    db.connect()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO rescan_commands(id,media_type,movie_id,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'movies',?,0,'queued',0,9007199254740991,0)",
+            libsql::params![held_rescan_id.clone(), mid],
+        )
+        .await
+        .unwrap();
+
+    let (_, client) = providers::router_with_refresh(db.clone(), Some(credential_key()));
+    let runtime = commands::start_with_metadata(db.clone(), client, metadata.clone())
+        .await
+        .unwrap();
 
     let settled = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -447,7 +472,7 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
         }
     })
     .await
-    .expect("did not observe a 2-succeeded/1-still-queued window before the batch finished");
+    .expect("first two commands did not complete while the third was held ineligible");
     let (succeeded, pending_command_id) = settled;
 
     let mut before = std::collections::HashMap::new();
@@ -478,6 +503,17 @@ async fn restart_mid_batch_preserves_completed_and_resumes_rest() {
     drop(db);
 
     let db2 = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    // Clear the persisted eligibility gate after reopening, before worker restart.
+    // Queued -> cancelled is a normal legal rescan transition; the import remains queued.
+    db2.connect()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE rescan_commands SET status='cancelled',completed_at=0 WHERE id=? AND status='queued'",
+            [held_rescan_id],
+        )
+        .await
+        .unwrap();
     let (base2, api2) = serve(manual_import_router(db2.clone(), metadata.clone())).await;
     let (_, client2) = providers::router_with_refresh(db2.clone(), Some(credential_key()));
     let runtime2 = commands::start_with_metadata(db2.clone(), client2, metadata.clone())
@@ -880,11 +916,22 @@ async fn operation_owned_by_download_rejected_at_submission() {
     )
     .await;
     assert_eq!(code, 201, "{v}");
+    // Provider creation now installs an inherited policy. Preserve this scenario's
+    // explicit policy edit, using its current CAS revision instead of claiming absence.
+    let policy_path = format!(
+        "/api/v1/download-processing/policies/{}/tv",
+        download["id"].as_str().unwrap()
+    );
+    let (code, policy) = request(&base, "GET", &policy_path, Value::Null).await;
+    assert_eq!(code, 200, "{policy}");
+    assert_eq!(policy["enabled_override"], Value::Null);
+    assert_eq!(policy["enabled"], true);
+    assert_eq!(policy["mode"], "copy");
     let (code, v) = request(
         &base,
         "PUT",
-        &format!("/api/v1/download-processing/policies/{}/tv", download["id"].as_str().unwrap()),
-        json!({"provider_revision":download["revision"],"revision":null,"enabled":true,"mode":"copy"}),
+        &policy_path,
+        json!({"provider_revision":download["revision"],"revision":policy["revision"],"enabled":true,"mode":"copy"}),
     )
     .await;
     assert_eq!(code, 200, "{v}");
@@ -960,11 +1007,45 @@ async fn operation_owned_by_download_rejected_at_submission() {
     .expect("owned import never produced an operation");
     let operation_id = owned["operation_id"].as_str().unwrap().to_owned();
 
-    let (code, rejected) = submit_batch(&base, vec![operation_id], "normal").await;
+    let (code, rejected) = submit_batch(&base, vec![operation_id.clone()], "normal").await;
     assert_eq!(code, 409, "{rejected}");
     assert_eq!(
         rejected["error"]["code"], "manual_import_owned_by_download",
         "{rejected}"
+    );
+    // Ownership remains the rejection reason after the automated worker leaves preview.
+    // Waiting for a terminal journal makes this regression independent of polling speed.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (_, value) = request(&base, "GET", &path, Value::Null).await;
+            if value["import_phase"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("owned import did not complete");
+    let (code, rejected) = submit_batch(&base, vec![operation_id.clone()], "normal").await;
+    assert_eq!(code, 409, "{rejected}");
+    assert_eq!(
+        rejected["error"]["code"], "manual_import_owned_by_download",
+        "{rejected}"
+    );
+    assert_eq!(
+        c.query(
+            "SELECT count(*) FROM manual_import_commands WHERE operation_id=?",
+            [operation_id]
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap(),
+        0
     );
 
     drop(c);

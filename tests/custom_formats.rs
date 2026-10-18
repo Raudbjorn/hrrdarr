@@ -61,11 +61,13 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
     std::fs::create_dir(&scratch.0).unwrap();
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let c = db.connect().await.unwrap();
+    let fixture_indexer_id = fixture_indexer(&c).await;
     c.execute_batch("INSERT INTO series(id,title,path,original_language)VALUES(1,'Harbor','/tv',1);INSERT INTO seasons(series_id,number)VALUES(1,1);INSERT INTO episodes(id,series_id,season,number,title,runtime,air_date_utc)VALUES(1,1,1,1,'Pilot',45,'2020-01-01 00:00:00');INSERT INTO movie_metadata(id,title,year,runtime,original_language,digital_release)VALUES(1,'Harbor',2020,100,1,'2020-01-01 00:00:00');INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies');INSERT INTO release_delay_policies VALUES('tv',0,0,0),('movies',0,0,0);").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = hrrdarr::custom_formats::router(db.clone())
-        .merge(hrrdarr::quality_profiles::router(db.clone()));
+        .merge(hrrdarr::quality_profiles::router(db.clone()))
+        .merge(hrrdarr::revision_policy::router(db.clone()));
     let _server = Server(tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap()
     }));
@@ -116,10 +118,59 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             MediaDomain::Movies
         };
         let candidate = release(tv, "Preferred");
+        // These historical file rows genuinely lack revision facts. Default
+        // revision preference must not invent baseline facts from their old titles.
+        // Explicit DoNotPrefer then isolates the original CF-only upgrade checks.
         for context in [SearchContext::UserSearch, SearchContext::Rss] {
-            let d = search::evaluate(&c, domain, &candidate, context, 1800000000)
-                .await
-                .unwrap();
+            let decision = search::evaluate(
+                &c,
+                domain,
+                fixture_indexer_id,
+                &candidate,
+                context,
+                1800000000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(decision.disposition, Disposition::Reject);
+            assert_eq!(decision.reasons, vec!["revision_unknown"]);
+        }
+        let policy_path = format!("/api/v1/{media}/revision-policy");
+        let (code, policy) = request(&base, "GET", &policy_path, Value::Null).await;
+        assert_eq!(code, 200);
+        let (code, result) = request(
+            &base,
+            "PUT",
+            &policy_path,
+            json!({"mode":"do_not_prefer","revision":policy["revision"]}),
+        )
+        .await;
+        assert_eq!(code, 200, "{result}");
+        let unchanged: i64 = c
+            .query(
+                "SELECT count(*) FROM file_metadata WHERE media_type=? AND revision_json IS NULL",
+                [media],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(unchanged, 1);
+        for context in [SearchContext::UserSearch, SearchContext::Rss] {
+            let d = search::evaluate(
+                &c,
+                domain,
+                fixture_indexer_id,
+                &candidate,
+                context,
+                1800000000,
+            )
+            .await
+            .unwrap();
             assert_eq!(d.disposition, Disposition::Accept, "{:?}", d.reasons);
             assert_eq!(d.custom_formats.unwrap().score, 10);
         }
@@ -133,6 +184,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -147,6 +199,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -164,6 +217,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000
@@ -184,6 +238,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000
@@ -211,6 +266,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
         let d = search::evaluate(
             &c,
             domain,
+            fixture_indexer_id,
             &candidate,
             SearchContext::UserSearch,
             1800000000,
@@ -235,6 +291,7 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             let decision = search::evaluate(
                 &c,
                 domain,
+                fixture_indexer_id,
                 &candidate,
                 SearchContext::UserSearch,
                 1800000000,
@@ -302,4 +359,352 @@ async fn native_crud_scores_atomicity_and_current_file_recomputation() {
             0
         );
     }
+}
+
+#[tokio::test]
+async fn schema_presets_are_valid_scoped_copies_with_independent_patterns() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-format-presets-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, hrrdarr::custom_formats::router(db))
+            .await
+            .unwrap()
+    }));
+    // Independently chosen release tokens and counterexamples, not upstream expression fixtures.
+    let cases = [
+        ("x264", "Film.H.264-GRP", "Film.x263-GRP"),
+        ("x265", "Film.HEVC-GRP", "Film.AVC-GRP"),
+        ("Simple Hardcoded Subs", "Film.Subs.1080p", "Film.HDR.1080p"),
+        ("Hardcoded Subs", "Film.ENGsub.1080p", "Film.Subs.1080p"),
+        ("Surround Sound", "Film.DDP5.1-GRP", "Film.AAC2.0-GRP"),
+        (
+            "Preferred Words",
+            "Film.Framestor-GRP",
+            "Film.Unpreferred-GRP",
+        ),
+    ];
+    for media in ["tv", "movies"] {
+        let prefix = format!("/api/v1/{media}/custom-formats");
+        let (code, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        assert_eq!(code, 200);
+        let presets = schema["presets"]["release_title"].as_array().unwrap();
+        assert_eq!(presets.len(), 6);
+        for (preset, (name, yes, no)) in presets.iter().zip(cases) {
+            assert_eq!(preset["label"], name);
+            let pattern = preset["specification"]["condition"]["pattern"]
+                .as_str()
+                .unwrap();
+            let re = fancy_regex::Regex::new(&format!("(?i){pattern}")).unwrap();
+            assert!(re.is_match(yes).unwrap(), "{name}: {yes}");
+            assert!(!re.is_match(no).unwrap(), "{name}: {no}");
+            let (positive, negative): (&[&str], &[&str]) = match name {
+                "x264" => (
+                    &["ax264z", "h264", "X.264", "x2640"],
+                    &["x 264", "x-264", "x263"],
+                ),
+                "x265" => (
+                    &["h.265", "x265suffix", "WHEVC", "H265"],
+                    &["h 265", "h-265", "h264"],
+                ),
+                "Simple Hardcoded Subs" => {
+                    (&["SUB", "subs", "submarine", "ENGsubs"], &["HC", "caption"])
+                }
+                "Hardcoded Subs" => (
+                    &["ENGsub", "FRENCHSUBS", "HC", "SUBBED", "prefixHC"],
+                    &["SUB", "SUBS", "HCA", "SUBBEDextra"],
+                ),
+                "Surround Sound" => (
+                    &[
+                        "ATMOS", "TRUEHD", "DTS-HD", "DTSES", "DTS-X7", "DTSX", "DD+5.1",
+                        "DDP 7.1", "EAC3.9",
+                    ],
+                    &["DTS", "DTS-Xfoo", "AAC5.1", "AC3.5.1", "DD5.1", "DDP2.0"],
+                ),
+                "Preferred Words" => (
+                    &["SPARKS", "Film-Framestor", "[sparks]"],
+                    &["Framestory", "XSparks", "preferred", "favorite"],
+                ),
+                _ => unreachable!(),
+            };
+            for text in positive {
+                assert!(re.is_match(text).unwrap(), "{name}: {text}");
+            }
+            for text in negative {
+                assert!(!re.is_match(text).unwrap(), "{name}: {text}");
+            }
+            let input = json!({"name":name,"include_when_renaming":false,"specifications":[preset["specification"].clone()]});
+            assert_eq!(request(&base, "POST", &prefix, input).await.0, 201);
+        }
+        for (pattern, status) in [
+            (r"(?<=Harbor\.)WEB", 201),
+            (r"\b([a-z]+)-\1\b", 201),
+            ("(", 400),
+            ("(?0)", 400),
+            ("((?=a)){1000000000}", 400),
+        ] {
+            assert_eq!(
+                request(&base, "POST", &prefix, definition(pattern, pattern))
+                    .await
+                    .0,
+                status,
+                "{media}: {pattern}"
+            );
+        }
+        let name = "界".repeat(100);
+        let mut input = definition(&name, "original");
+        input["specifications"][0]["name"] = json!(name);
+        input["specifications"][0]["required"] = json!(true);
+        input["specifications"][0]["negate"] = json!(true);
+        input["specifications"].as_array_mut().unwrap().push(json!({"name":"Group","negate":false,"required":true,"condition":{"kind":"release_group","pattern":"group"}}));
+        let (code, original) = request(&base, "POST", &prefix, input.clone()).await;
+        assert_eq!(code, 201);
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        let saved = schema["presets"]["release_title"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["label"].as_str().unwrap().chars().count() == 202)
+            .unwrap();
+        assert_eq!(saved["specification"], input["specifications"][0]);
+        assert!(
+            schema["presets"]["release_group"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["label"] == format!("{name}: Group"))
+        );
+        let clone = json!({"name":format!("Clone {media}"),"include_when_renaming":false,"specifications":[saved["specification"].clone()]});
+        assert_eq!(request(&base, "POST", &prefix, clone).await.0, 201);
+        input["specifications"][0]["condition"]["pattern"] = json!("changed");
+        let id = original["id"].as_i64().unwrap();
+        assert_eq!(
+            request(&base, "PUT", &format!("{prefix}/{id}"), input)
+                .await
+                .0,
+            200
+        );
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        let copied = schema["presets"]["release_title"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["label"] == format!("Clone {media}: {name}"))
+            .unwrap();
+        assert_eq!(copied["specification"]["condition"]["pattern"], "original");
+        let other = if media == "tv" { "movies" } else { "tv" };
+        assert!(!schema.to_string().contains(&format!("Clone {other}:")));
+        assert_eq!(
+            request(&base, "DELETE", &format!("{prefix}/{id}"), Value::Null)
+                .await
+                .0,
+            204
+        );
+        let (_, schema) = request(&base, "GET", &format!("{prefix}/schema"), Value::Null).await;
+        assert!(
+            !schema["presets"]["release_title"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["label"] == format!("{name}: {name}"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_format_delete_resets_only_its_domain_atomically_and_survives_reopen() {
+    for media in ["tv", "movies"] {
+        for bulk in [false, true] {
+            let scratch = Scratch(
+                std::env::temp_dir()
+                    .join(format!("hrrdarr-format-delete-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let path = scratch.0.join("db");
+            let db = Arc::new(Database::open_local(&path).await.unwrap());
+            let c = db.connect().await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = hrrdarr::custom_formats::router(db.clone())
+                .merge(hrrdarr::quality_profiles::router(db.clone()));
+            let mut server = Server(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let mut profiles = Vec::new();
+            let mut ids = Vec::new();
+            for domain in [media, if media == "tv" { "movies" } else { "tv" }] {
+                let prefix = format!("/api/v1/{domain}");
+                let (status, first) = request(
+                    &base,
+                    "POST",
+                    &format!("{prefix}/custom-formats"),
+                    definition("Scored", "Scored"),
+                )
+                .await;
+                assert_eq!(status, 201);
+                let fid = first["id"].as_i64().unwrap();
+                let (status, zero) = request(
+                    &base,
+                    "POST",
+                    &format!("{prefix}/custom-formats"),
+                    definition("Zero", "Zero"),
+                )
+                .await;
+                assert_eq!(status, 201);
+                let zid = zero["id"].as_i64().unwrap();
+                let (status, profile) = request(&base, "POST", &format!("{prefix}/quality-profiles"), json!({"name":"Policy","items":[{"kind":"quality","quality_id":3,"allowed":true}],"policy":{"upgrade_allowed":true,"cutoff":{"kind":"quality","quality_id":3},"min_format_score":-5,"cutoff_format_score":100,"min_upgrade_format_score":10,"language_id":if domain=="tv"{Value::Null}else{json!(-2)},"format_items":[{"format_id":fid,"score":10},{"format_id":zid,"score":0}]}})).await;
+                assert_eq!(status, 201, "{profile}");
+                c.execute(
+                    "INSERT INTO quality_profiles(media_type,name)VALUES(?,'No policy')",
+                    [domain],
+                )
+                .await
+                .unwrap();
+                profiles.push(profile);
+                ids.push((fid, zid));
+            }
+            let prefix = format!("/api/v1/{media}/custom-formats");
+            let profile_path = format!("/api/v1/{media}/quality-profiles/{}", profiles[0]["id"]);
+            let (fid, zid) = ids[0];
+            // Invalid mixed batches must preserve the definitions and the original policy.
+            for (bad, status) in [
+                (json!([fid, 0]), 400),
+                (json!([fid, 999999]), 404),
+                (json!([fid, ids[1].0]), 404),
+            ] {
+                assert_eq!(
+                    request(
+                        &base,
+                        "DELETE",
+                        &format!("{prefix}/bulk"),
+                        json!({"ids":bad})
+                    )
+                    .await
+                    .0,
+                    status
+                );
+                assert_eq!(
+                    request(&base, "GET", &profile_path, Value::Null).await.1,
+                    profiles[0]
+                );
+                assert_eq!(
+                    request(&base, "GET", &format!("{prefix}/{fid}"), Value::Null)
+                        .await
+                        .0,
+                    200
+                );
+            }
+            if !bulk {
+                assert_eq!(
+                    request(&base, "DELETE", &format!("{prefix}/{fid}"), Value::Null)
+                        .await
+                        .0,
+                    204
+                );
+                // An implicit zero item remains even though the sparse score table is now empty.
+                profiles[0]["policy"]["format_items"] = json!([{"format_id":zid,"score":0}]);
+                assert_eq!(
+                    request(&base, "GET", &profile_path, Value::Null).await.1,
+                    profiles[0]
+                );
+            }
+            let delete_path = if bulk {
+                format!("{prefix}/bulk")
+            } else {
+                format!("{prefix}/{zid}")
+            };
+            let body = if bulk {
+                json!({"ids":[fid,zid]})
+            } else {
+                Value::Null
+            };
+            c.execute_batch("CREATE TRIGGER reject_format_reset BEFORE UPDATE OF min_format_score ON quality_profile_policies BEGIN SELECT RAISE(ABORT,'injected reset failure'); END;").await.unwrap();
+            assert_eq!(
+                request(&base, "DELETE", &delete_path, body.clone()).await.0,
+                500
+            );
+            assert_eq!(
+                request(&base, "GET", &profile_path, Value::Null).await.1,
+                profiles[0]
+            );
+            assert_eq!(
+                request(&base, "GET", &format!("{prefix}/{zid}"), Value::Null)
+                    .await
+                    .0,
+                200
+            );
+            c.execute_batch("DROP TRIGGER reject_format_reset")
+                .await
+                .unwrap();
+            assert_eq!(request(&base, "DELETE", &delete_path, body).await.0, 204);
+            let expected = &mut profiles[0];
+            expected["policy"]["format_items"] = json!([]);
+            expected["policy"]["min_format_score"] = json!(0);
+            expected["policy"]["cutoff_format_score"] = json!(0);
+            expected["policy"]["min_upgrade_format_score"] = json!(1);
+            assert_eq!(
+                request(&base, "GET", &profile_path, Value::Null).await.1,
+                *expected
+            );
+            server.0.abort();
+            // Await cancellation before reopening: the router owns the database lock.
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), &mut server.0)
+                .await
+                .unwrap();
+            assert!(stopped.unwrap_err().is_cancelled());
+            drop(server);
+            drop(c);
+            drop(db);
+            let reopened = Arc::new(Database::open_local(&path).await.unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = hrrdarr::quality_profiles::router(reopened.clone());
+            let _server = Server(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            for (i, domain) in [media, if media == "tv" { "movies" } else { "tv" }]
+                .into_iter()
+                .enumerate()
+            {
+                let (status, all) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/{domain}/quality-profiles"),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(status, 200);
+                let all = all["items"].as_array().unwrap();
+                for name in ["Policy", "No policy"] {
+                    let id = &all.iter().find(|p| p["name"] == name).unwrap()["id"];
+                    let (status, detail) = request(
+                        &base,
+                        "GET",
+                        &format!("/api/v1/{domain}/quality-profiles/{id}"),
+                        Value::Null,
+                    )
+                    .await;
+                    assert_eq!(status, 200);
+                    if name == "Policy" {
+                        assert_eq!(detail, profiles[i]);
+                    } else {
+                        assert!(detail["policy"].is_null());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn fixture_indexer(c: &libsql::Connection) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'torznab','Decision fixture',1,1,1,1,'http://fixture.invalid')", [id.to_string()]).await.unwrap();
+    for media in ["tv", "movies"] {
+        c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year)VALUES(?,'torznab',?,'[2000,5000]','[]',?,?)", libsql::params![id.to_string(),media,(media=="tv").then_some(0),(media=="movies").then_some(0)]).await.unwrap();
+    }
+    id
 }

@@ -208,17 +208,18 @@
   <details class="token-reference">
     <summary>Naming token reference</summary>
     <h2>TV tokens</h2>
-    <p>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}. {'{season:0}'}–{'{season:0000}'} zero-pad to 1–4 digits.</p>
+    <p>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}. {'{season:0}'}–{'{season:0000}'} zero-pad to 1–4 digits.</p>
     <h2>Movie tokens</h2>
-    <p>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}, {'{Quality Title}'}. {'{Quality Title}'} is the only token shared by both domains.</p>
+    <p>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}. Quality and custom-format tokens work in both domains.</p>
+    <p>Custom formats include matching names marked for renaming, regardless of score. Use {'{Custom Formats:A,B}'} to include exact names or {'{Custom Formats:-A,B}'} to exclude them. {'{[Custom Formats]}'} adds brackets only when matches exist. {'{CUSTOM.FORMATS}'} uses uppercase names and dots. Examples use the sample names Surround Sound and x265.</p>
     <h2>Allowed tokens per field</h2>
     <table>
       <thead><tr><th scope="col">Field</th><th scope="col">Allowed tokens</th></tr></thead>
       <tbody>
-        <tr><td>Standard / daily / anime episode format</td><td>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}</td></tr>
+        <tr><td>Standard / daily / anime episode format</td><td>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}</td></tr>
         <tr><td>Series folder format</td><td>{'{Series Title}'}</td></tr>
         <tr><td>Season / specials folder format</td><td>{'{Series Title}'}, {'{season:00}'}</td></tr>
-        <tr><td>Standard movie format</td><td>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}, {'{Quality Title}'}</td></tr>
+        <tr><td>Standard movie format</td><td>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}</td></tr>
         <tr><td>Movie folder format</td><td>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}</td></tr>
       </tbody>
     </table>

@@ -1,24 +1,89 @@
 <script lang="ts">
+  import MovieRenamePreviewPanel from './lib/MovieRenamePreviewPanel.svelte';
+  import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
+  import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
+  import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
+  import TagsPanel from './lib/TagsPanel.svelte';
+  import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
+  import CreateTags from './lib/CreateTags.svelte';
+  import { findLibraryByExternalId } from './lib/api';
+  import { unknownTagWrite } from './lib/tag-draft';
   import { onMount } from 'svelte';
+  import SettingsIndex from './lib/SettingsIndex.svelte';
+  import NotFound from './lib/NotFound.svelte';
+  import { parseHash, hashFor, SETTINGS_INDEX_HASH, type ViewId } from './lib/routes';
   import type { QualityProfilePage, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, MediaDomain, MediaTarget, SeriesType, MinimumAvailability } from './lib/api.generated';
+  import type { SettingsWriteState } from './lib/api';
   import { listQualityProfiles, listLibrary, getLibrary, lookupLibrary, addLibrary, updateLibrary, listEpisodes, monitorEpisode } from './lib/api';
   import RssPanel from './lib/RssPanel.svelte';
   import ReleaseSearchPanel from './lib/ReleaseSearchPanel.svelte';
   import ImportPanel from './lib/ImportPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
+  import HealthPanel from './lib/HealthPanel.svelte';
+  import GeneralSettingsPanel from './lib/GeneralSettingsPanel.svelte';
+  import HistoryPanel from './lib/HistoryPanel.svelte';
   import ActivityPanel from './lib/ActivityPanel.svelte';
   import BlocklistPanel from './lib/BlocklistPanel.svelte';
   import MetadataRefreshPanel from './lib/MetadataRefreshPanel.svelte';
+  import QualityDefinitionsPanel from './lib/QualityDefinitionsPanel.svelte';
+  import QualityProfilesPanel from './lib/QualityProfilesPanel.svelte';
   import NamingPanel from './lib/NamingPanel.svelte';
+  import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
+  let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
+  function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;navigate('activity');}
+  let activityVisited=$state(false),providersVisited=$state(false),providerVersion=$state(0);
+  let activityWrite=$state<SettingsWriteState>('idle'),providerWrite=$state<SettingsWriteState>('idle');
   let searchTarget: MediaTarget | null = $state(null);
-  let view = $state<'library' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'naming' | 'import-existing'>('library');
+  let view = $state<ViewId | 'settings-index' | 'not-found'>('library'), notFoundPath = $state('');
+  // Hash routing: the URL is the source of truth. showView is idempotent so the hashchange after navigate() is harmless.
+  function showView(next: ViewId | 'settings-index' | 'not-found') {
+    if (next === 'providers') providersVisited = true; else if (next === 'activity') activityVisited = true;
+    else if (next === 'health') healthVisited = true; else if (next === 'tags') tagsVisited = true;
+    else if (next === 'custom-formats') customFormatsVisited = true; else if (next === 'qualities') qualitiesVisited = true;
+    else if (next === 'profiles') profilesVisited = true; else if (next === 'media-management') revisionVisited = true;
+    else if (next === 'history') historyVisited = true; else if (next === 'general') generalVisited = true;
+    else if (next === 'import-existing') importVisited = true;
+    view = next;
+  }
+  function applyHash() {
+    const route = parseHash(location.hash);
+    if (route.kind === 'view') showView(route.view);
+    else if (route.kind === 'settings-index') showView('settings-index');
+    else { notFoundPath = route.path; showView('not-found'); }
+  }
+  function navigate(next: ViewId | 'settings-index') {
+    const target = next === 'settings-index' ? SETTINGS_INDEX_HASH : hashFor(next);
+    if (location.hash !== target) location.hash = target;
+    showView(next);
+  }
+  let historyVisited=$state(false);
+  let generalVisited=$state(false);
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
-  let importVisited = $state(false);
+  let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
+  let delayVisited=$state(false), revisionVisited=$state(false), profileSection=$state<'quality'|'delay'|'release'>('quality');
+  let delayWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}),delayUsageVersion=$state({tv:0,movies:0});
+  let delayRequest=$state<{domain:MediaDomain;id?:number;nonce:number}|null>(null),delayNonce=0;
+  function openDelay(scope:MediaDomain,id?:number){delayVisited=true;profilesVisited=true;profileSection='delay';view='profiles';delayRequest={domain:scope,id,nonce:++delayNonce};}
+  let releaseVisited=$state(false),releaseWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}),releaseUsageVersion=$state({tv:0,movies:0});
+  let releaseRequest=$state<{domain:MediaDomain;id?:number;nonce:number}|null>(null),releaseNonce=0;
+  function openRelease(scope:MediaDomain,id?:number){releaseVisited=true;profilesVisited=true;profileSection='release';view='profiles';releaseRequest={domain:scope,id,nonce:++releaseNonce};}
+  let tagsVisited=$state(false), tagVersions=$state({tv:0,movies:0});
+  let tagWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), assignmentWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
+  let creationIds=$state<number[]>([]), creationReady=$state(true), creationUncertain=$state(false);
+  function tagsSaved(items:LibraryItem[]){if(page)page={...page,items:page.items.map(item=>items.find(saved=>saved.id===item.id)??item)};if(selected){const updated=items.find(item=>item.id===selected!.id);if(updated)selected={...selected,tag_ids:updated.tag_ids};}}
+  async function reconcileCreation(){if(!choice||saving)return;saving=true;const result=await findLibraryByExternalId(domain,choice.external_id);saving=false;if(!result.ok){error=result.error;return;}creationUncertain=false;if(result.data.items.length){adding=false;choice=null;await load();await select(result.data.items[0].id);notice='Existing library item loaded. Review its tags before changing them.';}else notice='No matching library item found. Review the retained creation draft before retrying.';}
+  let qualityCatalogVersions = $state({tv:0,movies:0});
+  let profileWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), qualityWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
   let episodes: Episode[] = $state([]), episodeTotal = $state(0), episodeOffset = $state(0), episodeId: number | null = $state(null);
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
+  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle');
+  const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
+  const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
+  const tagRelatedWithProfiles=$derived<Record<MediaDomain,SettingsWriteState>>({tv:releaseWrites.tv!=='idle'?releaseWrites.tv:tagRelatedWithDelay.tv,movies:releaseWrites.movies!=='idle'?releaseWrites.movies:tagRelatedWithDelay.movies});
+  const profileUsageVersion=$derived({tv:delayUsageVersion.tv+releaseUsageVersion.tv,movies:delayUsageVersion.movies+releaseUsageVersion.movies});
   let adding = $state(false), term = $state(''), results: LookupResult[] = $state([]), choice: LookupResult | null = $state(null), path = $state(''), searching = $state(false), searched = $state(false);
   let seriesType = $state(''), seasonFolder = $state(''), sceneNumbering = $state(''), newItems = $state(''), availability = $state('');
   let profiles: QualityProfilePage | null = $state(null), profileId: number | null = $state(null), profilesLoading = $state(false), profilesError = $state('');
@@ -41,10 +106,10 @@
     if (result.ok) profiles = result.data; else profilesError = result.error;
   }
   function changeDomain(next: MediaDomain) {
-    searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
+    if(libraryLocked)return;creationIds=[];creationReady=true;searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
   }
   async function select(id: number, offset = 0) {
-    searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
+    if(libraryLocked)return;searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
     const result = await getLibrary(scope, id);
     if (!alive || version !== detailVersion) return;
     if (!result.ok) { detailLoading = false; selected = null; error = result.error; return; }
@@ -57,23 +122,23 @@
     detailLoading = false;
   }
   async function search() {
-    const version = ++searchVersion, scope = domain; searching = true; searched = false; results = []; choice = null; error = '';
+    if(libraryLocked)return;const version = ++searchVersion, scope = domain; searching = true; searched = false; results = []; choice = null; error = '';
     const result = await lookupLibrary(scope, term);
     if (!alive || version !== searchVersion) return;
     searching = false; searched = true;
     if (result.ok) results = result.data.filter(item => item.media_type === scope); else error = result.error;
   }
   async function add() {
-    if (!choice || saving) return;
+    if (!choice || libraryLocked || !creationReady || tagWrites[domain]!=='idle') return;
     const scope = domain, externalId = choice.external_id, version = searchVersion; saving = true; error = '';
-    const result = await addLibrary(scope, externalId, path);
+    const result = await addLibrary(scope, externalId, path,{tags:{mode:'replace',ids:creationIds}});
     saving = false;
     if (!alive || scope !== domain || version !== searchVersion) return;
     if (result.ok) { adding = false; choice = null; notice = 'Added to library.'; await load(); if (alive && scope === domain && version === searchVersion) await select(result.data.id); }
-    else { error = `${result.error} If the response was lost, refresh the library before trying again.`; }
+    else { creationUncertain=unknownTagWrite(result);error = result.error; }
   }
   async function patch(patch: LibraryPatch) {
-    if (!selected || saving) return;
+    if (!selected || libraryLocked) return;
     const item = selected, version = detailVersion; saving = true; error = ''; notice = '';
     const result = await updateLibrary(item.media_type, item.id, patch); saving = false;
     if (!alive || version !== detailVersion) return;
@@ -92,34 +157,47 @@
     void patch(domain === 'tv' ? {quality_profile_id: profileId, series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {quality_profile_id: profileId, minimum_availability: (availability || null) as MinimumAvailability | null});
   }
   function refreshAfterImport() { void load(page?.offset ?? 0); if (selected) void select(selected.id, episodeOffset); }
-  onMount(() => { alive = true; void load(); return () => {alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
+  onMount(() => { alive = true; applyHash(); window.addEventListener('hashchange', applyHash); void load(); return () => {window.removeEventListener('hashchange', applyHash); alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
 </script>
 
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
-<header class="masthead"><a href="#library" class="brand">hrrdarr</a><span>Media library</span></header>
+<header class="masthead"><a href="#/" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view === 'library'} onclick={() => view = 'library'}>Library</button><button aria-pressed={view === 'providers'} onclick={() => view = 'providers'}>Providers</button><button aria-pressed={view === 'activity'} onclick={() => view = 'activity'}>Activity</button><button aria-pressed={view === 'blocklist'} onclick={() => view = 'blocklist'}>Blocklist</button><button aria-pressed={view === 'rss'} onclick={() => view = 'rss'}>RSS</button><button aria-pressed={view === 'naming'} onclick={() => view = 'naming'}>Naming</button><button aria-pressed={view === 'import-existing'} onclick={() => {importVisited = true; view = 'import-existing';}}>Import existing</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
+  {#if view === 'settings-index'}<SettingsIndex />{/if}
+  {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
-  {#if view === 'providers'}<ProviderPanel />{/if}
-  {#if view === 'activity'}<ActivityPanel />{/if}
+  {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={activityWrite} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
+  {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
+  {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
+  {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
+  {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button><button aria-pressed={profileSection==='release'} onclick={()=>{releaseVisited=true;profileSection='release';}}>Release profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}{#if releaseVisited}<div hidden={profileSection!=='release'}><ReleaseProfilesPanel request={releaseRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>releaseWrites={...releaseWrites,[scope]:state}} onchange={scope=>releaseUsageVersion={...releaseUsageVersion,[scope]:releaseUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
+  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /></div>{/if}
+  {#if historyVisited}<div hidden={view!=='history'}><HistoryPanel /></div>{/if}
+  {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
+  {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProfiles} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
-  <div class="toolbar"><nav aria-label="Library type"><button aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" onclick={() => {adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
-  {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}
+  <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
+  {#if error}<p role="alert" class="error">{error}</p>{/if}{#if notice}<p role="status">{notice}</p>{/if}{#if saving}<p role="status">Saving library changes…</p>{/if}
   {#if adding}
     <section class="add-section" aria-labelledby="add-heading"><h1 id="add-heading">{domain === 'tv' ? 'Add series' : 'Add movie'}</h1>
-      <form onsubmit={(event) => {event.preventDefault(); void search();}}><label>Search catalogue<input bind:value={term} required maxlength="256" placeholder={domain === 'tv' ? 'Title or tvdb:123' : 'Title, tmdb:123 or imdb:tt1234567'} /></label><button disabled={searching}>Search</button></form>
+      <form onsubmit={(event) => {event.preventDefault(); void search();}}><label>Search catalogue<input bind:value={term} required maxlength="256" placeholder={domain === 'tv' ? 'Title or tvdb:123' : 'Title, tmdb:123 or imdb:tt1234567'} /></label><button disabled={searching||libraryLocked}>Search</button></form>
       {#if searching}<p role="status">Searching catalogue…</p>{:else if searched && !results.length}<p>No matches. Try a different title or catalogue ID.</p>{/if}
-      <ul class="lookup-results">{#each results as result (`${result.media_type}:${result.external_id}`)}<li><button aria-pressed={choice?.external_id === result.external_id} onclick={() => {choice = result; path = '';}}>{result.title} {result.year ?? ''}<small>{domain === 'tv' ? 'TVDB' : 'TMDB'} {result.external_id}</small></button></li>{/each}</ul>
-      {#if choice}<form onsubmit={(event) => {event.preventDefault(); void add();}}><h2>{choice.title}</h2><label>Existing library directory<input bind:value={path} required placeholder="/library/title" /></label><p>Choose a directory that already exists. Adding does not create folders, search for downloads or import files. Monitoring starts enabled; edit it below after adding.</p><button class="primary" disabled={saving}>Add to library</button></form>{/if}
+      <ul class="lookup-results">{#each results as result (`${result.media_type}:${result.external_id}`)}<li><button disabled={libraryLocked} aria-pressed={choice?.external_id === result.external_id} onclick={() => {choice = result; path = '';creationIds=[];creationReady=true;}}>{result.title} {result.year ?? ''}<small>{domain === 'tv' ? 'TVDB' : 'TMDB'} {result.external_id}</small></button></li>{/each}</ul>
+      {#if choice}<form onsubmit={(event) => {event.preventDefault(); void add();}}><h2>{choice.title}</h2><label>Existing library directory<input bind:value={path} required placeholder="/library/title" /></label><p>Choose a directory that already exists. Adding does not create folders, search for downloads or import files. Monitoring starts enabled; edit it below after adding.</p>{#key `${domain}:${choice.external_id}`}<CreateTags {domain} catalogVersion={tagVersions[domain]} disabled={libraryLocked||tagWrites[domain]!=='idle'} onchange={(ids,ready)=>{creationIds=ids;creationReady=ready;}} />{/key}<button class="primary" disabled={libraryLocked||!creationReady||tagWrites[domain]!=='idle'}>Add to library</button></form>{/if}
+    {#if creationUncertain}<p role="alert">Add outcome unknown. Check for the created item before retrying.</p><button disabled={saving} onclick={reconcileCreation}>Check creation outcome</button>{/if}
     </section>
   {/if}
+  <LibraryTagsPanel {domain} items={page?.items??[]} {selected} catalogVersion={tagVersions[domain]} relatedWrite={tagWrites[domain]!=='idle'?tagWrites[domain]:saving?'busy':creationUncertain?'uncertain':'idle'} onwrite={(scope,state)=>assignmentWrites={...assignmentWrites,[scope]:state}} onsaved={tagsSaved} />
   <div class="workspace">
     <aside aria-label="Library collection"><div class="section-heading"><h1>{domain === 'tv' ? 'Series' : 'Movies'}</h1><button disabled={loading} onclick={() => load(page?.offset ?? 0)}>Refresh library</button></div>
       {#if loading}<p role="status">Loading library…</p>{/if}
-      {#if page}<p class="muted">{page.total} in library</p><ul class="collection">{#each page.items as item (`${item.media_type}:${item.id}`)}<li><button aria-current={selected?.id === item.id ? 'true' : undefined} onclick={() => {adding = false; void select(item.id);}}><span>{item.title}<small>{item.year ?? 'Year unknown'}</small></span><span class="count">{item.statistics.file_count} files</span></button></li>{:else}<li class="empty">No {domain === 'tv' ? 'series' : 'movies'} yet. Use {domain === 'tv' ? 'Add series' : 'Add movie'} to search the catalogue.</li>{/each}</ul>
+      {#if page}<p class="muted">{page.total} in library</p><ul class="collection">{#each page.items as item (`${item.media_type}:${item.id}`)}<li><button disabled={libraryLocked} aria-current={selected?.id === item.id ? 'true' : undefined} onclick={() => {adding = false; void select(item.id);}}><span>{item.title}<small>{item.year ?? 'Year unknown'}</small></span><span class="count">{item.statistics.file_count} files</span></button></li>{:else}<li class="empty">No {domain === 'tv' ? 'series' : 'movies'} yet. Use {domain === 'tv' ? 'Add series' : 'Add movie'} to search the catalogue.</li>{/each}</ul>
         <div class="pagination"><button disabled={loading || page.offset === 0} onclick={() => load(Math.max(0, page!.offset - 25))}>Previous library page</button><button disabled={loading || page.offset + page.limit >= page.total} onclick={() => load(page!.offset + page!.limit)}>Next library page</button></div>
       {/if}
     </aside>
@@ -141,13 +219,16 @@
           {#if profilesError}<p role="alert" class="error">{profilesError}</p><button type="button" onclick={() => loadProfiles()}>Retry quality profiles</button>{/if}
           {#if profiles}<div class="actions"><button type="button" disabled={profilesLoading || profiles.offset === 0} onclick={() => loadProfiles(Math.max(0, profiles!.offset - 50))}>Previous profiles</button><button type="button" disabled={profilesLoading || profiles.offset + profiles.limit >= profiles.total} onclick={() => loadProfiles(profiles!.offset + profiles!.limit)}>Next profiles</button></div>{/if}
           <button disabled={saving || profilesLoading}>Save settings</button></form></details>
+        {#if domain === 'movies'}
+          {#key selected.id}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+        {/if}
         {#if domain === 'tv'}
           <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={saving} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
           <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={saving} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
           <div class="pagination"><button disabled={episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>
         {:else if selected.statistics.file_count > 0}<p>This movie already has a file association. Initial import will not replace it.</p>{/if}
         {#if domain === 'movies'}<button onclick={() => searchTarget = {media_type:'movie',id:selected!.id}}>Search movie releases</button>{/if}
-        {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} />{/key}{/if}
+        {#if searchTarget && view === 'library'}{#key `${searchTarget.media_type}:${searchTarget.id}`}<ReleaseSearchPanel target={searchTarget} onsettings={openDelay} />{/key}{/if}
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
     </article>
   </div>

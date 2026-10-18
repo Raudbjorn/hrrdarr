@@ -463,3 +463,23 @@ async fn examples_renders_episode_title_only_template_against_fixture_with_title
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn custom_format_examples_are_available_in_both_domains() {
+    let (_scratch, db) = open_db().await;
+    let (address, server) = serve(db).await;
+    for (route, field, mut body) in [
+        (TV_ROUTE, "standard_episode_format", fresh_tv_body(1)),
+        (MOVIES_ROUTE, "standard_movie_format", fresh_movie_body(1)),
+    ] {
+        body[field] =
+            json!("title {[Custom Formats:-x265]} {CUSTOM.FORMAT:x265} {-Custom Format:absent}");
+        let (status, result) = request(address, "PUT", route, &body.to_string()).await;
+        assert_eq!(status, 200, "{result}");
+        let (status, result) = request(address, "GET", &format!("{route}/examples"), "").await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result[field], "title [Surround Sound] X265");
+    }
+    server.abort();
+    let _ = server.await;
+}

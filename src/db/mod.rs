@@ -159,6 +159,59 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "candidate_comparison_facts",
         include_str!("../../migrations/0035_candidate_comparison_facts.sql"),
     ),
+    (
+        "snapshot_custom_formats",
+        include_str!("../../migrations/0036_snapshot_custom_formats.sql"),
+    ),
+    ("tags", include_str!("../../migrations/0037_tags.sql")),
+    (
+        "revision_policy",
+        include_str!("../../migrations/0038_revision_policy.sql"),
+    ),
+    (
+        "delay_profiles",
+        include_str!("../../migrations/0039_delay_profiles.sql"),
+    ),
+    (
+        "release_profiles",
+        include_str!("../../migrations/0040_release_profiles.sql"),
+    ),
+    (
+        "completed_download_handling",
+        include_str!("../../migrations/0041_completed_download_handling.sql"),
+    ),
+    (
+        "health_checks",
+        include_str!("../../migrations/0042_health_checks.sql"),
+    ),
+    (
+        "health_communication",
+        include_str!("../../migrations/0043_health_communication.sql"),
+    ),
+    (
+        "health_download_client_roots",
+        include_str!("../../migrations/0044_health_download_client_roots.sql"),
+    ),
+    (
+        "autotagging_metadata",
+        include_str!("../../migrations/0045_autotagging_metadata.sql"),
+    ),
+    (
+        "removed_metadata_health",
+        include_str!("../../migrations/0046_removed_metadata_health.sql"),
+    ),
+    (
+        "movie_credits",
+        include_str!("../../migrations/0047_movie_credits.sql"),
+    ),
+    (
+        "indexer_operation_policy",
+        include_str!("../../migrations/0048_indexer_operation_policy.sql"),
+    ),
+    (
+        "indexer_client_binding",
+        include_str!("../../migrations/0049_indexer_client_binding.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -691,3 +744,31 @@ mod custom_format_tests;
 
 #[cfg(test)]
 mod candidate_fact_tests;
+
+#[cfg(test)]
+mod tag_tests;
+
+#[cfg(test)]
+mod revision_policy_tests;
+
+#[cfg(test)]
+mod delay_profile_tests;
+
+#[cfg(test)]
+mod cdh_tests;
+#[cfg(test)]
+mod health_tests;
+#[cfg(test)]
+mod release_profile_tests;
+
+#[cfg(test)]
+mod download_root_health_tests;
+
+#[cfg(test)]
+mod removed_metadata_health_tests;
+
+#[cfg(test)]
+mod indexer_policy_tests;
+
+#[cfg(test)]
+mod indexer_client_tests;

@@ -6,7 +6,7 @@ use axum::{
     routing::post,
 };
 use hrrdarr::{db::Database, snapshots};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, sync::Arc};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -75,6 +75,9 @@ impl ProcessFailure {
 }
 
 async fn run() -> Result<(), ProcessFailure> {
+    // Validate host inputs before database migration or worker side effects.
+    let host = hrrdarr::host::HostConfig::from_env()
+        .map_err(|e| ProcessFailure::at("host_configuration", e))?;
     let db = if let (Ok(url), Ok(token)) =
         (env::var("TURSO_DATABASE_URL"), env::var("TURSO_AUTH_TOKEN"))
     {
@@ -87,6 +90,9 @@ async fn run() -> Result<(), ProcessFailure> {
             .await
             .map_err(|e| ProcessFailure::at("database_open", e))?
     };
+    hrrdarr::quality_profiles::initialize_defaults(&db)
+        .await
+        .map_err(|e| ProcessFailure::at("quality_profile_defaults", e))?;
     let db = Arc::new(db);
     if db.migration_backup().is_some() {
         println!("event=migration_backup_created");
@@ -114,18 +120,13 @@ async fn run() -> Result<(), ProcessFailure> {
         metadata,
     });
     let (app, refresh) = router_parts(state.clone());
-    let addr: SocketAddr = env::var("HRRDARR_BIND")
-        // 8787 collides with a live Readarr instance on hosts running the rest of the *arr
-        // family alongside hrrdarr; 8760 avoids the whole 76xx-97xx range those apps use.
-        .unwrap_or_else(|_| "127.0.0.1:8760".into())
-        .parse()
-        .map_err(|e| ProcessFailure::at("bind_address", e))?;
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind(host.bind_address())
         .await
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     let bound = listener
         .local_addr()
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
+    let app = host.apply(app, bound);
     println!("hrrdarr listening on http://{bound}");
     let runtime = if state.db.permits_local_imports() {
         Some(
@@ -141,7 +142,11 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -167,8 +172,16 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
+        .merge(hrrdarr::tags::router(state.db.clone()))
+        .merge(hrrdarr::revision_policy::router(state.db.clone()))
+        .merge(hrrdarr::completed_download_handling::router(
+            state.db.clone(),
+        ))
+        .merge(hrrdarr::delay_profiles::router(state.db.clone()))
+        .merge(hrrdarr::release_profiles::router(state.db.clone()))
         .merge(hrrdarr::episodes::router(state.db.clone()))
         .merge(hrrdarr::media_files::router(state.db.clone()))
+        .merge(hrrdarr::credits::router(state.db.clone()))
         .merge(hrrdarr::library::router(state.db.clone()))
         .merge(hrrdarr::library::metadata_router(
             state.db.clone(),
@@ -180,6 +193,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
         .merge(hrrdarr::commands::router(state.db.clone()))
+        .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))
         .merge(hrrdarr::blocklist::router(state.db.clone()))
         .merge(hrrdarr::naming::router(state.db.clone()))
@@ -210,9 +224,7 @@ async fn migrate(
         )
         .await
     };
-    result
-        .map(Json)
-        .map_err(|error| ApiError::bad_request(error.to_string()))
+    result.map(Json).map_err(ApiError::from)
 }
 
 #[derive(Debug)]
@@ -220,11 +232,15 @@ struct ApiError {
     status: StatusCode,
     message: String,
 }
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+impl From<snapshots::ImportError> for ApiError {
+    fn from(error: snapshots::ImportError) -> Self {
         Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
+            status: if error.retryable() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message: error.to_string(),
         }
     }
 }
@@ -251,6 +267,37 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_handler_error_mapping_preserves_matcher_retryability() {
+        // Exact migrate conversion; this does not simulate runtime saturation.
+        for code in [
+            "release_term_busy",
+            "release_term_timeout",
+            "release_term_worker_failed",
+            "release_term_state_changed",
+        ] {
+            assert_eq!(
+                ApiError::from(snapshots::ImportError(code))
+                    .into_response()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        for code in [
+            "release_term_invalid_syntax",
+            "release_term_unsupported_dialect",
+            "release_term_limit_exceeded",
+            "invalid snapshot",
+        ] {
+            assert_eq!(
+                ApiError::from(snapshots::ImportError(code))
+                    .into_response()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_handler_previews_then_applies_uploaded_core_library() {
