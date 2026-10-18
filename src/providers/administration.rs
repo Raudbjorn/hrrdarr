@@ -27,7 +27,9 @@ impl ProviderKind {
             (self, settings),
             (
                 Self::DownloadClient,
-                ProviderSettings::Qbittorrent { .. } | ProviderSettings::Sabnzbd { .. }
+                ProviderSettings::Qbittorrent { .. }
+                    | ProviderSettings::Sabnzbd { .. }
+                    | ProviderSettings::Transmission { .. }
             ) | (
                 Self::Indexer,
                 ProviderSettings::Torznab { .. } | ProviderSettings::Newznab { .. }
@@ -59,8 +61,9 @@ impl ProviderFilter {
                 MediaDomain::Movies,
             ) => movies.is_some(),
             (
-                settings
-                @ (ProviderSettings::Qbittorrent { .. } | ProviderSettings::Sabnzbd { .. }),
+                settings @ (ProviderSettings::Qbittorrent { .. }
+                | ProviderSettings::Sabnzbd { .. }
+                | ProviderSettings::Transmission { .. }),
                 media,
             ) => settings.client_scoped(media),
         };
@@ -96,6 +99,14 @@ pub enum ProviderDefaults {
         older_priority: UsenetPriority,
         tags: Vec<i64>,
     },
+    TransmissionClient {
+        recent_priority: TorrentQueuePriority,
+        older_priority: TorrentQueuePriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the RPC path `/rpc` is appended to it.
+        endpoint_hint: String,
+    },
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +115,7 @@ pub enum ProviderImplementation {
     Qbittorrent,
     Sabnzbd,
     Torznab,
+    Transmission,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -157,7 +169,9 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
 // Historical catalog metadata from both pinned references. No endpoint is contacted here.
 fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<ProviderPreset> {
     match implementation {
-        ProviderImplementation::Qbittorrent | ProviderImplementation::Sabnzbd => vec![],
+        ProviderImplementation::Qbittorrent
+        | ProviderImplementation::Sabnzbd
+        | ProviderImplementation::Transmission => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -317,6 +331,22 @@ pub(super) async fn schema(
                     recent_priority: UsenetPriority::Default,
                     older_priority: UsenetPriority::Default,
                     tags: vec![],
+                },
+            },
+            // Placement has no safe default on a shared client; the user names each domain's
+            // category or directory.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Transmission,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::TransmissionClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://transmission.example:9091/transmission".into(),
                 },
             },
         ],

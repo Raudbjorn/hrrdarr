@@ -260,6 +260,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "upgrade_recycle",
         include_str!("../../migrations/0061_upgrade_recycle.sql"),
     ),
+    (
+        "transmission",
+        include_str!("../../migrations/0062_transmission.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -913,3 +917,5 @@ mod download_client_backoff_tests;
 mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;
+#[cfg(test)]
+mod transmission_registry_tests;
