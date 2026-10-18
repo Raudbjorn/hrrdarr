@@ -102,6 +102,7 @@ async fn peer(State(p): State<Peer>, OriginalUri(uri): OriginalUri) -> Response 
                     }
                 }
                 11 => vec![b'x'; providers::http::MAX_BODY_BYTES+1].into_response(),
+                13 => StatusCode::NOT_FOUND.into_response(),
                 _ => axum::Json(json!([])).into_response(),
             }
         }
@@ -236,7 +237,8 @@ async fn scoped_items_remote_failures_and_cached_cooldown_are_distinct() {
             .0,
         200
     );
-    for mode in [0, 7, 1, 2, 4] {
+    // Mode 13: a 404 from the item-list route is a rejected remote route, not unevaluated.
+    for mode in [0, 7, 1, 2, 4, 13] {
         p.mode.store(mode, Ordering::SeqCst);
         for domain in [MediaDomain::Tv, MediaDomain::Movies] {
             let before = generations(&db).await;
@@ -266,9 +268,11 @@ async fn scoped_items_remote_failures_and_cached_cooldown_are_distinct() {
         HealthSeverity::Error
     );
     let before = p.items.load(Ordering::SeqCst);
+    // A cached cooldown is distinguished so the engine defers (not exhausts) the recheck;
+    // it is still persisted as check_failed.
     assert_eq!(
         evaluate_communication(&db, &client, MediaDomain::Tv).await,
-        Err("check_failed")
+        Err("provider_cooldown")
     );
     assert_eq!(
         p.items.load(Ordering::SeqCst),

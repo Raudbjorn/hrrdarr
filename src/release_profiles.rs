@@ -488,7 +488,7 @@ async fn validate_references(c: &Connection, m: MediaDomain, v: &Definition) -> 
     }
     for reference in &v.indexers {
         if let IndexerReference::Provider { id } = reference {
-            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
+            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab','torrentrss')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
         }
     }
     Ok(())
@@ -722,6 +722,13 @@ pub(crate) async fn provider_scopes_allowed(
         let supported = match settings {
             Some(crate::providers::ProviderSettings::Torznab { tv, movies, .. })
             | Some(crate::providers::ProviderSettings::Newznab { tv, movies, .. }) => {
+                match media.as_str() {
+                    "tv" => tv.is_some(),
+                    "movies" => movies.is_some(),
+                    _ => false,
+                }
+            }
+            Some(crate::providers::ProviderSettings::Torrentrss { tv, movies, .. }) => {
                 match media.as_str() {
                     "tv" => tv.is_some(),
                     "movies" => movies.is_some(),

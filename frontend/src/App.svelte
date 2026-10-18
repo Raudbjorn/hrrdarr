@@ -168,7 +168,7 @@
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={activityWrite} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
-  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined or its readback failed. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
   {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
   {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}

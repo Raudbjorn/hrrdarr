@@ -509,6 +509,17 @@ fn processing_error(code: &str) -> &'static str {
         _ => "import_conflict",
     }
 }
+// Matcher admission, timeouts and storage reads are transient; only a decided rejection blocks.
+fn preflight_evaluation_error(code: &'static str) -> Error {
+    match code {
+        "release_storage_error" => Error(StatusCode::SERVICE_UNAVAILABLE, "storage_error"),
+        "custom_format_busy"
+        | "custom_format_timeout"
+        | "custom_format_worker_failed"
+        | "custom_format_state_changed" => Error(StatusCode::SERVICE_UNAVAILABLE, code),
+        _ => Error(StatusCode::CONFLICT, "quality_rejected"),
+    }
+}
 async fn preflight_failure(
     c: &Connection,
     item: &DownloadProcessing,
@@ -521,7 +532,14 @@ async fn preflight_failure(
     };
     let retry = matches!(
         code,
-        "interrupted" | "storage_error" | "download_timeout" | "download_unavailable"
+        "interrupted"
+            | "storage_error"
+            | "download_timeout"
+            | "download_unavailable"
+            | "custom_format_busy"
+            | "custom_format_timeout"
+            | "custom_format_worker_failed"
+            | "custom_format_state_changed"
     ) && item.preflight_attempts < 3;
     if retry && authorization(c, item).await.is_ok() {
         c.execute("UPDATE download_processing SET status='queued',error_code=?,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='checking'",params![code,serde_json::to_string(&reasons).map_err(|_|bad())?,now()?+(1i64<<item.preflight_attempts),now()?,item.receipt_id.to_string()]).await?;
@@ -610,7 +628,7 @@ async fn preflight(
             &item.receipt_id.to_string(),
         )
         .await
-        .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
+        .map_err(|e| preflight_evaluation_error(e.0))?;
         if let Some(facts) = result.accepted {
             if accepted.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "ambiguous_files"));
@@ -777,4 +795,28 @@ async fn advance_import(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preflight_error_tests {
+    use super::*;
+    #[test]
+    fn transient_matcher_and_storage_errors_stay_retryable() {
+        for code in [
+            "custom_format_busy",
+            "custom_format_timeout",
+            "custom_format_worker_failed",
+            "custom_format_state_changed",
+        ] {
+            assert_eq!(preflight_evaluation_error(code).1, code);
+        }
+        assert_eq!(
+            preflight_evaluation_error("release_storage_error").1,
+            "storage_error"
+        );
+        assert_eq!(
+            preflight_evaluation_error("custom_format_regex_invalid").1,
+            "quality_rejected"
+        );
+    }
 }

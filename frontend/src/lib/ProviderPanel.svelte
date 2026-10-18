@@ -23,6 +23,7 @@
     if (item) {
       implementation = item.settings.implementation; name = item.name; endpoint = item.settings.endpoint; enabled = item.enabled; priority = item.priority; tv = !!item.settings.tv; movies = !!item.settings.movies;
       if (item.settings.implementation === 'qbittorrent') {tvCategory = item.settings.tv?.category ?? ''; movieCategory = item.settings.movies?.category ?? ''; tvCategories = ''; animeCategories = ''; movieCategories = '';}
+      else if (item.settings.implementation === 'torrentrss') {tvCategories = ''; animeCategories = ''; movieCategories = ''; tvCategory = ''; movieCategory = '';}
       else {tvCategories = item.settings.tv?.categories.join(', ') ?? ''; animeCategories = item.settings.tv?.anime_categories.join(', ') ?? ''; movieCategories = item.settings.movies?.categories.join(', ') ?? ''; tvCategory = ''; movieCategory = '';}
     } else {name = ''; endpoint = ''; tv = true; movies = false; tvCategory = ''; movieCategory = ''; defaults();}
     credentialKind = implementation === 'qbittorrent' ? 'username_password' : 'api_key';
@@ -66,6 +67,9 @@
     return {...defaults, category};
   }
   function input(): ProviderInput | null {
+    // Feeds are summarised, tested and deleted here; their editor is not part of this panel, so a
+    // save can never rewrite (or erase) a feed's scopes or sealed credentials.
+    if (implementation === 'torrentrss') {error = 'Torrent RSS feeds are managed through the API.'; return null;}
     if (!tv && !movies) {error = 'Enable at least one media scope.'; return null;}
     let settings: ProviderSettings;
     if (implementation === 'qbittorrent') {
@@ -76,7 +80,7 @@
     } else {
       const tvIds = categories(tvCategories), animeIds = categories(animeCategories), movieIds = categories(movieCategories);
       if ((tv && (!tvIds || !animeIds)) || (movies && !movieIds)) {error = 'Categories must be distinct positive numeric IDs separated by commas (maximum 64 per field).'; return null;}
-      const saved = selected && selected.settings.implementation !== 'qbittorrent' ? selected.settings : null;
+      const saved = selected && (selected.settings.implementation === 'torznab' || selected.settings.implementation === 'newznab') ? selected.settings : null;
       const defaults = template?.defaults.kind === 'indexer' ? template.defaults : null;
       if ((!saved?.tv && tv || !saved?.movies && movies) && !defaults) {error = 'Provider defaults are unavailable. Reload provider settings.'; return null;}
       settings = {implementation, endpoint, tv:tv ? {...(saved?.tv ?? defaults!.tv), categories:tvIds!, anime_categories:animeIds!} : null, movies:movies ? {...(saved?.movies ?? defaults!.movies), categories:movieIds!} : null};
@@ -149,6 +153,9 @@
       {#if editing}
         <h2>{selected ? selected.name : 'New provider'}</h2>
         {#if selected}<p>Saved revision {selected.revision}. Credentials: {selected.has_credentials ? 'stored (write-only)' : 'none stored'}.</p><p>Saved test: {selected.test_status.replaceAll('_',' ')}{selected.last_test ? ` at ${new Date(selected.last_test.tested_at * 1000).toLocaleString()} (revision ${selected.last_test.revision})` : ''}{selected.last_test?.error_code ? `: ${selected.last_test.error_code}` : ''}.</p><button disabled={busy || relatedWrite!=='idle'} onclick={() => select(selected!.id)}>Reload saved provider</button>{/if}
+        {#if selected?.settings.implementation === 'torrentrss'}
+          <section aria-label="Torrent RSS feed summary"><h3>Torrent RSS feed</h3><p>Feed URL: {selected.settings.endpoint}</p><p>TV: {selected.settings.tv ? `RSS ${selected.settings.tv.enable_rss ? 'on' : 'off'}${selected.settings.tv.minimum_seeders != null ? `, minimum seeders ${selected.settings.tv.minimum_seeders}` : ''}` : 'not configured'}. Movies: {selected.settings.movies ? `RSS ${selected.settings.movies.enable_rss ? 'on' : 'off'}${selected.settings.movies.minimum_seeders != null ? `, minimum seeders ${selected.settings.movies.minimum_seeders}` : ''}` : 'not configured'}.</p><p>Feeds only support RSS sync; they have no search. Edit this provider through the API: saving from this panel is disabled so stored scopes and credentials are never rewritten.</p></section>
+        {:else}
         <form onsubmit={(event) => {event.preventDefault(); void save();}} oninput={() => dirty = true} onchange={() => {dirty = true; confirmingDelete = false; testResult = null;}}>
           <fieldset disabled={locked || conflict}><legend>Connection</legend>
             <label>Provider type<select bind:value={implementation} disabled={!!selected} onchange={changeImplementation}><option value="torznab">Torznab</option><option value="newznab">Newznab</option><option value="qbittorrent">qBittorrent</option></select></label>
@@ -170,9 +177,10 @@
           </fieldset>
           <button class="primary" disabled={locked || conflict || !dirty || (!selected && !template)}>Save provider</button>
         </form>
+        {/if}
         {#if selected}<div class="actions"><button disabled={locked || dirty || conflict || !selected.test_supported} onclick={test}>Test saved provider</button><button disabled={locked || conflict} onclick={() => confirmingDelete = !confirmingDelete}>Delete provider</button></div>{#if dirty}<p>Save or reload changes before testing. Tests always use the saved configuration.</p>{/if}{/if}
         {#if confirmingDelete}<div class="delete-confirm"><p>Delete configuration for {selected?.name}? This removes both saved scopes and credentials. It does not delete media or remote downloads.</p><button disabled={busy} onclick={remove}>Confirm delete configuration</button><button disabled={busy} onclick={() => confirmingDelete = false}>Cancel delete</button></div>{/if}
-        {#if testResult}<div role="status"><h3>Connection test result</h3><p>Tested revision {testResult.revision}: {testResult.result.domains.join(', ')}.</p>{#if 'missing_categories' in testResult.result}<p>qBittorrent {testResult.result.application_version}; API {testResult.result.api_version}. Queueing {testResult.result.queueing_enabled ? 'enabled' : 'disabled'}.</p><p>{testResult.result.missing_categories.length ? `Missing categories: ${testResult.result.missing_categories.join(', ')}. These were not created by this test.` : 'Configured categories exist.'}</p>{:else}<p>Indexer capabilities and scoped feed probes passed.</p>{/if}<p>This is a connection observation, not proof that downloads or imports work.</p></div>{/if}
+        {#if testResult}<div role="status"><h3>Connection test result</h3><p>Tested revision {testResult.revision}: {testResult.result.domains.map(domain => typeof domain === 'string' ? domain : `${domain.media_type} (${domain.parsed} items, ${domain.rejected} rejected${domain.below_minimum_seeders ? `, ${domain.below_minimum_seeders} below minimum seeders` : ''})`).join(', ')}.</p>{#if 'missing_categories' in testResult.result}<p>qBittorrent {testResult.result.application_version}; API {testResult.result.api_version}. Queueing {testResult.result.queueing_enabled ? 'enabled' : 'disabled'}.</p><p>{testResult.result.missing_categories.length ? `Missing categories: ${testResult.result.missing_categories.join(', ')}. These were not created by this test.` : 'Configured categories exist.'}</p>{:else if testResult.result.domains.some(domain => typeof domain !== 'string')}<p>Feed fetched and parsed for every configured scope.</p>{:else}<p>Indexer capabilities and scoped feed probes passed.</p>{/if}<p>This is a connection observation, not proof that downloads or imports work.</p></div>{/if}
       {:else}<h2>Select a provider</h2><p>Review saved settings or add Torznab, Newznab or qBittorrent.</p>{/if}
     </article>
   </div>
