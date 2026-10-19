@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -372,7 +372,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     }
     // Reasoning: preserve predecessor (version<=45) health rows; exclude later registrations,
     // including the two 0053 path diagnostics and two 0060 recycle_bin identities covered by their migration tests.
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?);
+    // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -436,7 +437,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
     // 0055/56 append runtime=NULL (series) and inactive activation markers. Keep the
     // complete row witness; rollback and backup above still compare unmodified45.
     let mut upgraded = before.clone();

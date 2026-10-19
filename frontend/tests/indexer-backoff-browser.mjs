@@ -2,6 +2,8 @@
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
+// Reasoning: 0082 registers root_folder and mount_read_only per domain plus movies collection_root_folder, so scoped registries differ (tv 14, movies 15).
+const scopedChecks=domain=>domain==='tv'?14:15;
 const origin=process.env.UI_URL,remote=process.env.UI_PROVIDER_ORIGIN;
 for(const value of [origin,remote])assert.equal(new URL(value).hostname,'127.0.0.1');
 const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});
@@ -39,8 +41,9 @@ async function runHealth(domain){
  await health.getByRole('button',{name:`Run ${domain} health checks`,exact:true}).click();
  const reply=await response;assert.equal(reply.status(),202);const admission=await reply.json();
  // Reasoning: migration 0053 added remote_path_mapping, so each domain registers 11 checks.
-assert.equal(admission.selection.length,12); // Reasoning: 0059 adds recycle_bin per domain (11 -> 12). // Schema0051 adds client backoff to nine existing identities.
- const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===12&&!s.active_command&&admission.selection.every(token=>s.checks.some(check=>check.identity.check_key===token.identity.check_key&&check.observed_generation>=token.generation)),'Requested health observations did not settle');
+assert.equal(admission.selection.length,scopedChecks(domain)); // Reasoning: 0082 adds root_folder and mount_read_only per domain and movies-only collection_root_folder (tv 12 -> 14, movies 12 -> 15).
+ // Reasoning: 0059 adds recycle_bin per domain (11 -> 12). // Schema0051 adds client backoff to nine existing identities.
+ const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===scopedChecks(domain)&&!s.active_command&&admission.selection.every(token=>s.checks.some(check=>check.identity.check_key===token.identity.check_key&&check.observed_generation>=token.generation)),'Requested health observations did not settle');
  await health.getByRole('button',{name:'Refresh health',exact:true}).click();await idle();return snapshot;
 }
 try{
@@ -70,7 +73,8 @@ try{
  await health.getByLabel('Health scope').selectOption('all');await idle();
  const admitted=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await health.getByRole('button',{name:'Run all health checks',exact:true}).click();
- const admissionResponse=await admitted;assert.equal(admissionResponse.status(),202);assert.equal((await admissionResponse.json()).selection.length,24);
+ const admissionResponse=await admitted;assert.equal(admissionResponse.status(),202);assert.equal((await admissionResponse.json()).selection.length,29);// Reasoning: 0082 adds five identities to the all-scope registry (24 -> 29).
+
  const allRequest=health.getByRole('region',{name:'Manual health requests'}).getByRole('article').filter({has:page.getByRole('heading',{name:/Request \d+: all —/})});
  await allRequest.getByText('Requested generations observed in the current epoch.',{exact:true}).waitFor();
  assert.equal(await health.getByRole('region',{name:'Registered check coverage'}).getByRole('article').count(),16);

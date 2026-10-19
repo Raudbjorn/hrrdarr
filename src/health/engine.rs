@@ -570,6 +570,10 @@ async fn evaluate_check(
         }
         "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "recycle_bin" => recycle_bin::evaluate(db, &member.identity).await,
+        "root_folder" | "collection_root_folder" => {
+            library_roots::evaluate(db, &member.identity).await
+        }
+        "mount_read_only" => mounts::evaluate(db, &member.identity).await,
         "remote_path_mapping" => path_diagnostics::evaluate(db, client, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
         "indexer_status" | "indexer_failures" => {

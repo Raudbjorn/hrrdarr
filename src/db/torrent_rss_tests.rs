@@ -266,8 +266,8 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76
-    ); // Reasoning: the latest migration is 0076 wanted_last_search at position 76; 0068 (torrent RSS) and 0069 (collection snapshot) precede the label-torrent client migrations 0070-0075.
+        77
+    ); // Reasoning: the latest migration is 0077 library_root_health at position 77; 0068 (torrent RSS) and 0069 (collection snapshot) precede the label-torrent client migrations 0070-0075.
     assert_eq!(
         text(&c, "SELECT name FROM schema_migrations WHERE version=68").await?,
         "torrent_rss_indexer"
@@ -335,8 +335,8 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            76
-        ); // Reasoning: the runner applies 0068 (torrent RSS), 0069 (collection snapshot), the label-torrent client migrations 0070-0075 and 0076 wanted_last_search on top of 67.
+            77
+        ); // Reasoning: the runner applies 0068 (torrent RSS), 0069 (collection snapshot), the label-torrent client migrations 0070-0075 and 0076 wanted_last_search and 0077 library_root_health on top of 67.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -348,7 +348,7 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..67], before[4].as_slice());
-        assert_eq!(history.len(), 76); // Reasoning: 0068 and 0069, the label-torrent client migrations 0070-0075 and 0076 wanted_last_search add exactly 9 history rows on top of 67.
+        assert_eq!(history.len(), 77); // Reasoning: 0068 and 0069, the label-torrent client migrations 0070-0075, 0076 wanted_last_search and 0077 library_root_health add exactly 10 history rows on top of 67.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,

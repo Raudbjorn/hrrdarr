@@ -320,6 +320,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "wanted_last_search",
         include_str!("../../migrations/0076_wanted_last_search.sql"),
     ),
+    // hc.034/hc.035 library root and read-only mount health identities, appended at position 77
+    // after 0076 wanted_last_search.
+    (
+        "library_root_health",
+        include_str!("../../migrations/0077_library_root_health.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

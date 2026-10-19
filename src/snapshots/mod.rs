@@ -819,6 +819,10 @@ async fn write(
         crate::health::download_roots_changed(conn, if roots_changed { None } else { Some(media) })
             .await
             .map_err(|_| ImportError("snapshot health invalidation failed"))?;
+        // Imported library items and roots change hc.034 root derivation for both domains.
+        crate::health::library_roots_changed(conn)
+            .await
+            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
     }
     for (table, data) in &source.tables {
         for (i, row) in data.rows.iter().enumerate() {

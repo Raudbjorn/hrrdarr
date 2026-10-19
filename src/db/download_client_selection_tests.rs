@@ -173,14 +173,15 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {
                 " WHERE version<=51"
             } else if *table == "health_checks" {
                 // 0053 and 0059 add two identities each; all schema51 observations remain exact.
-                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin')"
+                // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only')"
             } else {
                 ""
             };

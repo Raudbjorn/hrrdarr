@@ -109,7 +109,8 @@ async fn witness_queries(c: &Connection) -> Result<Vec<String>, Error> {
             " WHERE version<=53"
         } else if name == "health_checks" {
             // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
-            " WHERE check_key!='recycle_bin'"
+            // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            " WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         } else {
             ""
         };
@@ -205,7 +206,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        77 // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -381,7 +382,8 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     assert_eq!(
         scalar(
             &after,
-            "SELECT count(*) FROM health_checks WHERE check_key!='recycle_bin'"
+            // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            "SELECT count(*) FROM health_checks WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         )
         .await?,
         22, // Reasoning: 0060 adds recycle_bin identities; 0054's scan itself adds none.

@@ -145,7 +145,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     ] {
         // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
         let filter = if table == "health_checks" {
-            " WHERE check_key!='recycle_bin'"
+            // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            " WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         } else {
             ""
         };
@@ -183,7 +184,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        77 // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

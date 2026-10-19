@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -128,7 +128,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO root_folders(media_type,path)VALUES('tv','/unused/tv'),('movies','/unused/movies');").await?;
     // Exclude later registrations, including the two 0053 path diagnostics identities.
     let queries = [
-        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
+        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
         "SELECT * FROM health_lifecycle",
         "SELECT * FROM health_commands ORDER BY id",
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
@@ -181,8 +181,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
+        assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");
