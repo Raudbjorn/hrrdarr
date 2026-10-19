@@ -261,7 +261,7 @@ pub(super) async fn valid_target(
         IndexerOperation::Automatic => "enable_automatic_search",
         IndexerOperation::Interactive => "enable_interactive_search",
     };
-    let indexer_valid = c.query(&format!("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss') AND s.media_type=? AND (?!='legacy_fixed' OR s.download_client_id IS NULL OR s.download_client_id=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.selection_kind.text(),t.client_id.map(|v|v.to_string())]).await?.next().await?.is_some();
+    let indexer_valid = c.query(&format!("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato') AND s.media_type=? AND (?!='legacy_fixed' OR s.download_client_id IS NULL OR s.download_client_id=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.selection_kind.text(),t.client_id.map(|v|v.to_string())]).await?.next().await?.is_some();
     if !indexer_valid {
         return Ok(false);
     }
@@ -549,7 +549,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
     let feed = connection(db)
         .await?
         .query(
-            "SELECT 1 FROM providers WHERE id=? AND implementation='torrentrss'",
+            "SELECT 1 FROM providers WHERE id=? AND implementation IN ('torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
             [t.indexer_id.to_string()],
         )
         .await?

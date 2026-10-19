@@ -315,6 +315,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "downloadstation",
         include_str!("../../migrations/0075_downloadstation.sql"),
     ),
+    // Indexer breadth (nine tracker implementations). The file is numbered 0090 (reserved range);
+    // it occupies array position 76 because the runner requires a contiguous history.
+    (
+        "indexer_breadth",
+        include_str!("../../migrations/0090_indexer_breadth.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -976,6 +982,8 @@ mod download_client_selection_tests;
 mod downloadstation_registry_tests;
 #[cfg(test)]
 mod flood_registry_tests;
+#[cfg(test)]
+mod indexer_breadth_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
 mod rtorrent_registry_tests;

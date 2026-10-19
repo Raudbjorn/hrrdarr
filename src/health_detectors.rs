@@ -328,7 +328,7 @@ pub async fn evaluate_indexer_client(
          CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
           AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
           AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
-          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation')
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation')
           AND typeof(p.settings_version)='integer' AND p.settings_version=1
           AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
           AND typeof(s.implementation)='text' AND s.implementation=p.implementation

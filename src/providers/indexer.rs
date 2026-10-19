@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod feed;
+mod tracker;
 pub use feed::{FeedDomainTest, FeedTest};
 
 const XML_BYTES: usize = 1024 * 1024;
@@ -2032,7 +2033,27 @@ fn private_parameters(
     parameters.extend(private.iter().map(|p| (p.name.clone(), p.value.clone())));
     parameters
 }
-pub use feed::test as test_feed;
+/// Test of a feed-like indexer: the generic feed or a tracker, as the settings dictate.
+pub async fn test_feed(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> Result<FeedTest> {
+    if settings.tracker_parts().is_some() {
+        return tracker::test(operation, settings, access)
+            .await
+            .map_err(|(error, _)| error);
+    }
+    feed::test(operation, settings, access).await
+}
+/// A tracker test that names the failing domain so backoff stays scoped to it.
+pub(crate) async fn test_tracker_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<FeedTest, (IndexerError, Option<MediaDomain>)> {
+    tracker::test(operation, settings, access).await
+}
 pub async fn test(
     operation: &super::http::HttpOperation<'_>,
     settings: &ProviderSettings,
@@ -2109,6 +2130,9 @@ pub(crate) async fn raw_search(
 ) -> Result<RawIndexerPage> {
     if matches!(settings, ProviderSettings::Torrentrss { .. }) {
         return raw_feed(operation, settings, access, request).await;
+    }
+    if settings.tracker_parts().is_some() {
+        return tracker::raw_search(operation, settings, access, request).await;
     }
     if !access.validate() {
         return Err(IndexerError::InvalidRequest);
@@ -2188,6 +2212,7 @@ fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
         .api_key
         .into_iter()
         .chain(access.cookie)
+        .chain(access.password)
         .chain(cookie_values)
         .chain(
             access

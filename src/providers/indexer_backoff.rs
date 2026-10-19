@@ -56,7 +56,12 @@ pub(super) fn has_scope(settings: &ProviderSettings, media: MediaDomain) -> bool
             ProviderSettings::Torznab { movies, .. } | ProviderSettings::Newznab { movies, .. },
             MediaDomain::Movies,
         ) => movies.is_some(),
-        _ => false,
+        // Trackers share the durable backoff with Torznab/Newznab, scoped per configured domain.
+        (settings, media) => match (settings.tracker_parts(), media) {
+            (Some((_, tv, _)), MediaDomain::Tv) => tv.is_some(),
+            (Some((_, _, movies)), MediaDomain::Movies) => movies.is_some(),
+            _ => false,
+        },
     }
 }
 

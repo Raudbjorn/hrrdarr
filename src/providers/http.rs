@@ -298,7 +298,13 @@ impl HttpOperation<'_> {
                 .map_err(|_| HttpError::InvalidRequest)?;
             if !matches!(
                 name.as_str(),
-                "cookie" | "referer" | "origin" | "authorization" | SESSION_HEADER
+                "cookie"
+                    | "referer"
+                    | "origin"
+                    | "authorization"
+                    | "apiuser"
+                    | "apikey"
+                    | SESSION_HEADER
             ) || header_map.contains_key(&name)
                 || value.len() > 4096
             {
