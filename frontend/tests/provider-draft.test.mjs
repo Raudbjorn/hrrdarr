@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
+import {parseParameters,trackerCredentials,trackerDraft,trackerScope,TRACKERS,isTrackerImplementation,clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
 test('unknown creation adoption compares all submitted public settings without equating unrelated records',()=>{
  const pending={name:'shared',enabled:true,priority:3,settings:{implementation:'qbittorrent',endpoint:'http://127.0.0.1:1234',tv:{category:'tv'},movies:{category:'movies'}}};
  const stored={id:'new',revision:1,has_credentials:true,...pending,settings:{movies:{category:'movies'},tv:{category:'tv'},endpoint:pending.settings.endpoint,implementation:'qbittorrent'}};
@@ -165,4 +165,61 @@ test('Download Station is a torrent download client for both domains',()=>{
  assert.equal(isDownloadClient(client),true);
  assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
  assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});
+
+test('tracker table mirrors the server: domains, search capability, protocol and indexer membership',()=>{
+ assert.deepEqual(Object.keys(TRACKERS).sort(),['broadcasthenet','fanzub','filelist','hdbits','iptorrents','nyaa','passthepopcorn','torrentleech','torrentpotato']);
+ assert.deepEqual(Object.entries(TRACKERS).filter(([,i])=>!i.searchable).map(([k])=>k).sort(),['iptorrents','torrentleech']);
+ assert.deepEqual(Object.entries(TRACKERS).filter(([,i])=>i.categorised).map(([k])=>k).sort(),['filelist','hdbits']);
+ for(const [kind,tv,movies] of [['broadcasthenet',true,false],['fanzub',true,false],['torrentleech',true,false],['passthepopcorn',false,true],['torrentpotato',false,true],['nyaa',true,true]])assert.deepEqual([TRACKERS[kind].tv,TRACKERS[kind].movies],[tv,movies],kind);
+ assert.equal(protocolOf('fanzub'),'usenet');
+ assert.equal(protocolOf('nyaa'),'torrent');
+ assert.equal(isTrackerImplementation('hdbits'),true);
+ assert.equal(isTrackerImplementation('torznab'),false);
+ for(const kind of Object.keys(TRACKERS))assert.equal(isIndexer({settings:{implementation:kind}}),true,kind);
+ assert.equal(isIndexer({settings:{implementation:'torrentrss'}}),true);
+ assert.equal(isIndexer({settings:{implementation:'qbittorrent'}}),false);
+});
+
+test('tracker scopes resolve the operation policy for the shared RSS and search panels',()=>{
+ const provider=(implementation,scope)=>({settings:{implementation,tv:scope,movies:null}});
+ assert.deepEqual(indexerScope(provider('hdbits',{enable_rss:true,enable_automatic_search:true,enable_interactive_search:false}),'tv'),{enable_rss:true,enable_automatic_search:true,enable_interactive_search:false,download_client_id:null});
+ assert.equal(indexerScope(provider('hdbits',{enable_rss:true}),'movies'),null);
+ // Feeds and RSS-only trackers never offer a search; a tracker never carries a client binding.
+ assert.deepEqual(indexerScope(provider('torrentrss',{enable_rss:true,minimum_seeders:null}),'tv'),{enable_rss:true,enable_automatic_search:false,enable_interactive_search:false,download_client_id:null});
+ assert.equal(indexerScope(provider('iptorrents',{enable_rss:true,enable_automatic_search:false,enable_interactive_search:false}),'tv').enable_interactive_search,false);
+ assert.equal(indexerScope(provider('qbittorrent',{category:'tv'}),'tv'),null);
+ assert.equal(indexerScope(provider('torznab',{enable_rss:true,enable_automatic_search:true,enable_interactive_search:true,download_client_id:'c1',categories:[5000],anime_categories:[]}),'tv').download_client_id,'c1');
+ // A usenet tracker only pairs with usenet clients.
+ const client=(implementation)=>({id:implementation,enabled:true,settings:{implementation,tv:{category:'tv'},movies:null}});
+ assert.equal(eligibleDownloadClient(client('sabnzbd'),'tv','fanzub'),true);
+ assert.equal(eligibleDownloadClient(client('qbittorrent'),'tv','fanzub'),false);
+ assert.equal(eligibleDownloadClient(client('qbittorrent'),'tv','nyaa'),true);
+});
+
+test('tracker drafts validate scopes before anything is sent',()=>{
+ const hdbits=TRACKERS.hdbits,nyaa=TRACKERS.nyaa,ipt=TRACKERS.iptorrents;
+ const draft=(over={})=>({rss:true,automatic:true,interactive:true,minimum:'',categories:'',...over});
+ assert.deepEqual(trackerScope(draft({minimum:'5',categories:'2, 7'}),hdbits),{scope:{enable_rss:true,enable_automatic_search:true,enable_interactive_search:true,minimum_seeders:5,categories:[2,7]}});
+ for(const bad of [{minimum:'-1'},{minimum:'1000001'},{minimum:'x'},{categories:'0'},{categories:'2,2'},{categories:'a'}])assert.ok('problem' in trackerScope(draft(bad),hdbits),JSON.stringify(bad));
+ assert.ok('problem' in trackerScope(draft({categories:'1'}),nyaa),'categories only where the tracker has them');
+ // An RSS-only tracker can never send a search flag, whatever the draft says.
+ assert.deepEqual(trackerScope(draft(),ipt),{scope:{enable_rss:true,enable_automatic_search:false,enable_interactive_search:false,minimum_seeders:null,categories:[]}});
+ assert.deepEqual(trackerDraft(null,ipt),{rss:true,automatic:false,interactive:false,minimum:'',categories:''});
+ assert.deepEqual(trackerDraft({enable_rss:false,enable_automatic_search:false,enable_interactive_search:true,minimum_seeders:3,categories:[21,23]},TRACKERS.filelist),{rss:false,automatic:false,interactive:true,minimum:'3',categories:'21, 23'});
+});
+
+test('tracker credentials are built from write-only fields only',()=>{
+ const secrets=(over={})=>({apiKey:'',username:'',password:'',cookie:'',tvParameters:'',movieParameters:'',...over});
+ assert.deepEqual(trackerCredentials(TRACKERS.fanzub,secrets()),{credentials:null});
+ assert.deepEqual(trackerCredentials(TRACKERS.broadcasthenet,secrets({apiKey:' key '})),{credentials:{kind:'api_key',api_key:'key'}});
+ assert.ok('problem' in trackerCredentials(TRACKERS.broadcasthenet,secrets()));
+ assert.deepEqual(trackerCredentials(TRACKERS.filelist,secrets({username:'u',password:'p'})),{credentials:{kind:'username_password',username:'u',password:'p'}});
+ assert.ok('problem' in trackerCredentials(TRACKERS.hdbits,secrets({username:'u'})));
+ assert.deepEqual(trackerCredentials(TRACKERS.iptorrents,secrets({cookie:'uid=7',tvParameters:'u=7\ntp=abc\n48'})),{credentials:{kind:'feed',cookie:'uid=7',tv_parameters:[{name:'u',value:'7'},{name:'tp',value:'abc'},{name:'48',value:''}],movie_parameters:[]}});
+ assert.deepEqual(trackerCredentials(TRACKERS.nyaa,secrets()),{credentials:null});
+ assert.ok('problem' in trackerCredentials(TRACKERS.nyaa,secrets({tvParameters:'bad name=1'})));
+ assert.equal(parseParameters('a=1\nA=2'),null,'names are case-insensitively distinct');
+ assert.equal(parseParameters(Array.from({length:17},(_,i)=>`p${i}=1`).join('\n')),null);
+ assert.deepEqual(parseParameters(''),[]);
 });
