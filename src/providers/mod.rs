@@ -549,8 +549,14 @@ pub(crate) enum Protocol {
     Usenet,
 }
 /// Implementations on the shared label-torrent engine, in registry order.
-pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 5] =
-    ["deluge", "rtorrent", "utorrent", "aria2", "flood"];
+pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 6] = [
+    "deluge",
+    "rtorrent",
+    "utorrent",
+    "aria2",
+    "flood",
+    "downloadstation",
+];
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
@@ -663,6 +669,15 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    /// Endpoint is the Synology DSM base URL (for example `https://nas.example:5001`). Basic
+    /// credentials are required; a domain is the destination folder `<default>/<label>/<hash>`.
+    Downloadstation {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -679,6 +694,7 @@ impl ProviderSettings {
             Self::Utorrent { .. } => "utorrent",
             Self::Aria2 { .. } => "aria2",
             Self::Flood { .. } => "flood",
+            Self::Downloadstation { .. } => "downloadstation",
         }
     }
     fn endpoint(&self) -> &str {
@@ -692,6 +708,7 @@ impl ProviderSettings {
             | Self::Torrentrss { endpoint, .. }
             | Self::Deluge { endpoint, .. }
             | Self::Rtorrent { endpoint, .. }
+            | Self::Downloadstation { endpoint, .. }
             | Self::Flood { endpoint, .. }
             | Self::Aria2 { endpoint, .. }
             | Self::Utorrent { endpoint, .. } => endpoint,
@@ -705,6 +722,7 @@ impl ProviderSettings {
             | Self::Transmission { .. }
             | Self::Deluge { .. }
             | Self::Rtorrent { .. }
+            | Self::Downloadstation { .. }
             | Self::Flood { .. }
             | Self::Aria2 { .. }
             | Self::Utorrent { .. } => Protocol::Torrent,
@@ -725,6 +743,7 @@ impl ProviderSettings {
         match self {
             Self::Deluge { tv, movies, .. }
             | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
             | Self::Flood { tv, movies, .. }
             | Self::Aria2 { tv, movies, .. }
             | Self::Utorrent { tv, movies, .. } => Some((tv, movies)),
@@ -764,6 +783,11 @@ impl ProviderSettings {
                 tv,
                 movies,
             },
+            "downloadstation" => Self::Downloadstation {
+                endpoint,
+                tv,
+                movies,
+            },
             _ => return None,
         })
     }
@@ -795,6 +819,11 @@ impl ProviderSettings {
                 movies,
             }),
             Self::Flood { endpoint, .. } => Some(Self::Flood {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Downloadstation { endpoint, .. } => Some(Self::Downloadstation {
                 endpoint: endpoint.clone(),
                 tv,
                 movies,
@@ -999,6 +1028,7 @@ impl ProviderSettings {
             }
             Self::Deluge { tv, movies, .. }
             | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
             | Self::Flood { tv, movies, .. }
             | Self::Aria2 { tv, movies, .. }
             | Self::Utorrent { tv, movies, .. } => {
@@ -2759,6 +2789,7 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         ],
         ProviderSettings::Deluge { tv, movies, .. }
         | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
         | ProviderSettings::Flood { tv, movies, .. }
         | ProviderSettings::Aria2 { tv, movies, .. }
         | ProviderSettings::Utorrent { tv, movies, .. } => [
@@ -2873,6 +2904,7 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         }
         ProviderSettings::Deluge { tv, movies, .. }
         | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
         | ProviderSettings::Flood { tv, movies, .. }
         | ProviderSettings::Aria2 { tv, movies, .. }
         | ProviderSettings::Utorrent { tv, movies, .. } => {
@@ -2993,6 +3025,7 @@ impl HealthConfigurationChanges {
                 }
                 ProviderSettings::Deluge { tv, movies, .. }
                 | ProviderSettings::Rtorrent { tv, movies, .. }
+                | ProviderSettings::Downloadstation { tv, movies, .. }
                 | ProviderSettings::Flood { tv, movies, .. }
                 | ProviderSettings::Aria2 { tv, movies, .. }
                 | ProviderSettings::Utorrent { tv, movies, .. } => {

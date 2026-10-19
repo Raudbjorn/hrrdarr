@@ -66,6 +66,7 @@ pub(super) async fn evaluate(
                 | "utorrent"
                 | "aria2"
                 | "flood"
+                | "downloadstation"
         ) {
             failed.get_or_insert("check_failed");
             continue;

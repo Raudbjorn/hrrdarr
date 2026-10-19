@@ -157,3 +157,12 @@ test('Flood is a torrent download client for both domains',()=>{
  assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
  assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
 });
+
+test('Download Station is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('downloadstation'),'torrent');
+ assert.equal(isClientImplementation('downloadstation'),true);
+ const client={id:'ds',enabled:true,settings:{implementation:'downloadstation',endpoint:'https://127.0.0.1:5001',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});

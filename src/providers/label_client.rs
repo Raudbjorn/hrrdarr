@@ -26,6 +26,7 @@ use std::{collections::BTreeSet, future::Future};
 
 pub mod aria2;
 pub mod deluge;
+pub mod downloadstation;
 pub mod flood;
 pub mod rtorrent;
 pub mod utorrent;
@@ -125,6 +126,10 @@ pub(crate) trait Wire {
         label: &str,
         first: bool,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// Called once after an operation, successful or not, to release a client session.
+    fn finish(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 #[derive(Serialize, ts_rs::TS, Clone, Copy, Debug, PartialEq, Eq)]
@@ -805,6 +810,17 @@ macro_rules! with_wire {
                     labels,
                 )?;
                 $body
+            }
+            ProviderSettings::Downloadstation { endpoint, .. } => {
+                let mut $wire =
+                    $crate::providers::label_client::downloadstation::DownloadStationWire::new(
+                        $operation,
+                        endpoint,
+                        $credentials,
+                    )?;
+                let result = $body;
+                $wire.finish().await;
+                result
             }
             _ => Err(QbitError::ScopeConflict),
         }
