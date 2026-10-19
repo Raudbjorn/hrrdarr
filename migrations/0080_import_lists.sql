@@ -17,9 +17,9 @@ CREATE TABLE import_lists (
  -- Defaults applied to items this list adds. NULL profile or root disables adding until configured.
  quality_profile_id INTEGER CHECK(quality_profile_id IS NULL OR typeof(quality_profile_id)='integer'),
  root_folder_id INTEGER CHECK(root_folder_id IS NULL OR typeof(root_folder_id)='integer'),
- minimum_availability TEXT CHECK((media_type='movies' AND minimum_availability IN ('tba','announced','in_cinemas','released')) OR (media_type='tv' AND minimum_availability IS NULL)),
- series_type TEXT CHECK((media_type='tv' AND series_type IN ('standard','daily','anime')) OR (media_type='movies' AND series_type IS NULL)),
- season_folder INTEGER CHECK((media_type='tv' AND season_folder IN (0,1)) OR (media_type='movies' AND season_folder IS NULL)),
+ minimum_availability TEXT CHECK((media_type='movies' AND coalesce(minimum_availability,'') IN ('tba','announced','in_cinemas','released')) OR (media_type='tv' AND minimum_availability IS NULL)),
+ series_type TEXT CHECK((media_type='tv' AND coalesce(series_type,'') IN ('standard','daily','anime')) OR (media_type='movies' AND series_type IS NULL)),
+ season_folder INTEGER CHECK((media_type='tv' AND coalesce(season_folder,-1) IN (0,1)) OR (media_type='movies' AND season_folder IS NULL)),
  interval_minutes INTEGER NOT NULL DEFAULT 1440 CHECK(typeof(interval_minutes)='integer' AND interval_minutes BETWEEN 5 AND 43200),
  revision INTEGER NOT NULL DEFAULT 1 CHECK(typeof(revision)='integer' AND revision BETWEEN 1 AND 9007199254740991),
  settings_json TEXT NOT NULL CHECK(typeof(settings_json)='text' AND length(CAST(settings_json AS BLOB))<=16384 AND json_valid(settings_json) AND json_type(settings_json)='object'),

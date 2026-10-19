@@ -518,3 +518,26 @@ async fn rss_list_parses_release_titles_years_and_imdb_ids_and_rejects_non_feeds
         assert_eq!((run["status"].as_str(), run["error_code"].as_str()), (Some("failed"), Some("invalid_response")), "{label}: {run}");
     }
 }
+
+#[tokio::test]
+async fn background_scheduler_syncs_due_lists_without_a_manual_trigger_and_shuts_down() {
+    let h = Harness::new().await;
+    h.meta.show(8001, "Background", None);
+    h.feed.json("/bg.json", json!([{"tvdb_id": 8001, "title": "Background"}]));
+    let id = h.create(h.input("BG", "custom", "tv", json!({"url": format!("{}/bg.json", h.feed_base)}))).await;
+    let key = Some(std::sync::Arc::new(hrrdarr::providers::CredentialKey::from_hex(import_lists_support::KEY_HEX).unwrap()));
+    let worker = hrrdarr::import_lists::start(h.db.clone(), key, h.deps.clone());
+    let mut done = false;
+    for _ in 0..60 {
+        if h.count("SELECT count(*) FROM series").await == 1 && h.count("SELECT count(*) FROM import_list_runs WHERE status='succeeded'").await == 1 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    worker.shutdown().await;
+    assert!(done, "the scheduler synced the new list on its own");
+    let (_, runs) = h.call("GET", &format!("/api/v1/importlist/{id}/runs"), Value::Null).await;
+    assert_eq!(runs["items"][0]["origin"], "scheduled");
+    assert_eq!(h.call("GET", &format!("/api/v1/importlist/{id}"), Value::Null).await.1["last_error"], Value::Null);
+}

@@ -983,6 +983,8 @@ mod downloadstation_registry_tests;
 #[cfg(test)]
 mod flood_registry_tests;
 #[cfg(test)]
+mod import_list_tests;
+#[cfg(test)]
 mod nzbget_registry_tests;
 mod rtorrent_registry_tests;
 #[cfg(test)]

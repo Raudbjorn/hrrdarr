@@ -215,6 +215,7 @@ pub struct Harness {
     pub dir: std::path::PathBuf,
     pub db: Arc<Database>,
     pub engine: Arc<Engine>,
+    pub deps: Deps,
     pub feed: Feed,
     pub feed_base: String,
     pub meta: Meta,
@@ -264,7 +265,7 @@ impl Harness {
             metadata,
         };
         let key = Some(Arc::new(CredentialKey::from_hex(KEY_HEX).unwrap()));
-        let engine = Arc::new(import_lists::engine(db.clone(), key, deps));
+        let engine = Arc::new(import_lists::engine(db.clone(), key, deps.clone()));
         let (api_base, t3) = serve(import_lists::api::router(engine.clone())).await;
         let c = db.connect().await.unwrap();
         let mut ids = [0i64; 2];
@@ -289,6 +290,7 @@ impl Harness {
             dir,
             db,
             engine,
+            deps,
             feed,
             feed_base,
             meta,
