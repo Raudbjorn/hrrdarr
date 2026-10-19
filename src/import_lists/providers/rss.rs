@@ -23,7 +23,16 @@ pub fn implementation() -> Implementation {
     }
 }
 fn fields() -> Vec<Field> {
-    vec![field("url", "Feed URL", FieldKind::Url, "An RSS 2.0 or Atom feed.").required().max_length(2048)]
+    vec![
+        field(
+            "url",
+            "Feed URL",
+            FieldKind::Url,
+            "An RSS 2.0 or Atom feed.",
+        )
+        .required()
+        .max_length(2048),
+    ]
 }
 
 fn depth_ok(input: &str) -> bool {
@@ -53,7 +62,12 @@ fn depth_ok(input: &str) -> bool {
 fn child_text<'a>(node: Node<'a, 'a>, name: &str) -> Option<String> {
     node.children()
         .find(|c| c.is_element() && c.tag_name().name() == name)
-        .map(|c| c.descendants().filter(|d| d.is_text()).filter_map(|d| d.text()).collect::<String>())
+        .map(|c| {
+            c.descendants()
+                .filter(|d| d.is_text())
+                .filter_map(|d| d.text())
+                .collect::<String>()
+        })
 }
 fn atom_link(node: Node<'_, '_>) -> Option<String> {
     node.children()
@@ -66,8 +80,14 @@ fn find_imdb(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i + 3 < bytes.len() {
-        if bytes[i] == b't' && bytes[i + 1] == b't' && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
-            let digits = bytes[i + 2..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if bytes[i] == b't'
+            && bytes[i + 1] == b't'
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let digits = bytes[i + 2..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
             let after = bytes.get(i + 2 + digits);
             if (6..=12).contains(&digits) && after.is_none_or(|b| !b.is_ascii_alphanumeric()) {
                 return Some(text[i..i + 2 + digits].to_owned());
@@ -116,16 +136,25 @@ pub fn parse(media: MediaDomain, input: &str) -> Fetched {
         nodes_limit: 200_000,
         ..roxmltree::ParsingOptions::default()
     };
-    let doc = Document::parse_with_options(input, options).map_err(|_| FetchError::InvalidResponse)?;
+    let doc =
+        Document::parse_with_options(input, options).map_err(|_| FetchError::InvalidResponse)?;
     let root = doc.root_element();
     let entries: Vec<Node<'_, '_>> = match root.tag_name().name() {
-        "rss" | "RDF" => doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "item").collect(),
-        "feed" => root.children().filter(|n| n.is_element() && n.tag_name().name() == "entry").collect(),
+        "rss" | "RDF" => doc
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name() == "item")
+            .collect(),
+        "feed" => root
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "entry")
+            .collect(),
         _ => return Err(FetchError::InvalidResponse),
     };
     let mut items = Vec::with_capacity(entries.len().min(1024));
     for entry in entries {
-        let Some(title) = child_text(entry, "title") else { continue };
+        let Some(title) = child_text(entry, "title") else {
+            continue;
+        };
         let (name, year) = name_and_year(media, &title);
         let mut imdb = None;
         for candidate in [

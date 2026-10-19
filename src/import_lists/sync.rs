@@ -61,13 +61,25 @@ struct PendingItem {
 }
 
 pub fn backoff_seconds(attempts: i64) -> i64 {
-    let exp = u32::try_from(attempts.saturating_sub(1)).unwrap_or(0).min(6);
-    BACKOFF_BASE_SECONDS.saturating_mul(4i64.saturating_pow(exp)).min(6 * 3600)
+    let exp = u32::try_from(attempts.saturating_sub(1))
+        .unwrap_or(0)
+        .min(6);
+    BACKOFF_BASE_SECONDS
+        .saturating_mul(4i64.saturating_pow(exp))
+        .min(6 * 3600)
 }
 
 impl Engine {
-    pub fn new(store: Arc<Store>, transport: Arc<Transport>, metadata: Arc<MetadataClient>) -> Self {
-        Self { store, transport, metadata }
+    pub fn new(
+        store: Arc<Store>,
+        transport: Arc<Transport>,
+        metadata: Arc<MetadataClient>,
+    ) -> Self {
+        Self {
+            store,
+            transport,
+            metadata,
+        }
     }
 
     /// Queues a sync of one list. An already active run is returned as is (`false`).
@@ -76,15 +88,29 @@ impl Engine {
             .map_err(|_| ApiError::invalid("Import list ID must be a UUID"))?
             .to_string();
         let c = self.store.db.connect().await?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
-        let media = {
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let (media, enabled) = {
             let mut rows = tx
-                .query("SELECT media_type FROM import_lists WHERE id=?", [id.clone()])
+                .query(
+                    "SELECT media_type,enabled FROM import_lists WHERE id=?",
+                    [id.clone()],
+                )
                 .await?;
-            rows.next().await?.ok_or_else(ApiError::not_found)?.get::<String>(0)?
+            let row = rows.next().await?.ok_or_else(ApiError::not_found)?;
+            (row.get::<String>(0)?, row.get::<i64>(1)? == 1)
         };
+        if !enabled {
+            return Err(ApiError::conflict(
+                "import_list_disabled",
+                "Enable the import list before syncing it",
+            ));
+        }
         if let Some(active) = active_run(&tx, &id).await? {
-            let run = read_run(&tx, &active).await?.ok_or_else(ApiError::not_found)?;
+            let run = read_run(&tx, &active)
+                .await?
+                .ok_or_else(ApiError::not_found)?;
             tx.commit().await?;
             return Ok((run, false));
         }
@@ -95,7 +121,9 @@ impl Engine {
             params![run_id.clone(), id, media, origin, t, t],
         )
         .await?;
-        let run = read_run(&tx, &run_id).await?.ok_or_else(ApiError::not_found)?;
+        let run = read_run(&tx, &run_id)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
         tx.commit().await?;
         Ok((run, true))
     }
@@ -106,7 +134,10 @@ impl Engine {
         let mut ids = Vec::new();
         let mut skipped = 0;
         let mut rows = c
-            .query("SELECT id,enabled FROM import_lists ORDER BY created_at,id", ())
+            .query(
+                "SELECT id,enabled FROM import_lists ORDER BY created_at,id",
+                (),
+            )
             .await?;
         while let Some(r) = rows.next().await? {
             if r.get::<i64>(1)? == 1 {
@@ -121,7 +152,11 @@ impl Engine {
             match self.enqueue(&id, origin).await {
                 Ok((run, true)) => runs.push(run),
                 Ok((_, false)) => skipped += 1,
-                Err(e) if e.status == axum::http::StatusCode::NOT_FOUND => {}
+                Err(e)
+                    if matches!(
+                        e.status,
+                        axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::CONFLICT
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -157,7 +192,9 @@ impl Engine {
     /// Claims one runnable run: queued and due, or running with an expired lease (a crashed claim).
     async fn claim(&self) -> Result<Option<(String, String, bool)>> {
         let c = self.store.db.connect().await?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
         let t = now();
         let found = {
             let mut rows = tx
@@ -167,7 +204,11 @@ impl Engine {
                 )
                 .await?;
             match rows.next().await? {
-                Some(r) => Some((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?.is_some())),
+                Some(r) => Some((
+                    r.get::<String>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<Option<i64>>(2)?.is_some(),
+                )),
                 None => None,
             }
         };
@@ -187,7 +228,9 @@ impl Engine {
         self.schedule_due().await?;
         let mut done = 0;
         while done < limit {
-            let Some((run_id, list_id, fetched)) = self.claim().await? else { break };
+            let Some((run_id, list_id, fetched)) = self.claim().await? else {
+                break;
+            };
             self.process(&run_id, &list_id, fetched).await?;
             done += 1;
         }
@@ -214,7 +257,11 @@ impl Engine {
             Ok(None) => return Ok(()),
             Err(e) => {
                 // Locked credentials cannot succeed by retrying.
-                let code = if e.code == "import_list_key_unavailable" { "key_unavailable" } else { "credentials_locked" };
+                let code = if e.code == "import_list_key_unavailable" {
+                    "key_unavailable"
+                } else {
+                    "credentials_locked"
+                };
                 return finish(&c, run_id, list_id, Err(code)).await;
             }
         };
@@ -257,7 +304,13 @@ impl Engine {
         finish(&c, run_id, list_id, Ok(())).await
     }
 
-    async fn process_item(&self, list: &ImportList, target: &AddTarget, run_id: &str, item: &PendingItem) -> Outcome {
+    async fn process_item(
+        &self,
+        list: &ImportList,
+        target: &AddTarget,
+        run_id: &str,
+        item: &PendingItem,
+    ) -> Outcome {
         let media = list.media_type;
         // 1. Library identity: the list's own id, else exact-match metadata resolution.
         let external = match media {
@@ -272,7 +325,9 @@ impl Engine {
                 Err(code) => return Outcome::Failed(code),
             },
         };
-        let Ok(c) = self.store.db.connect().await else { return Outcome::Failed("storage_unavailable") };
+        let Ok(c) = self.store.db.connect().await else {
+            return Outcome::Failed("storage_unavailable");
+        };
         // 2. Exclusions and existing membership are cheap local checks.
         match super::excluded(&c, media, external).await {
             Ok(true) => return Outcome::Excluded,
@@ -298,7 +353,11 @@ impl Engine {
             },
             search_requested: search,
         };
-        let path = format!("{}/{}", target.root_path, folder_name(&item.title, item.year));
+        let path = format!(
+            "{}/{}",
+            target.root_path,
+            folder_name(&item.title, item.year)
+        );
         match library::add_from_catalog(
             &self.store.db,
             &self.metadata,
@@ -323,19 +382,34 @@ impl Engine {
 
     /// Exact normalised-title (and, when both sides know it, year) match against the metadata
     /// service; ambiguity is left unresolved rather than guessed.
-    async fn resolve(&self, media: MediaDomain, item: &PendingItem) -> std::result::Result<Option<i64>, &'static str> {
+    async fn resolve(
+        &self,
+        media: MediaDomain,
+        item: &PendingItem,
+    ) -> std::result::Result<Option<i64>, &'static str> {
         let unavailable = |_| "metadata_unavailable";
         let results = match media {
             MediaDomain::Movies => {
                 if let Some(imdb) = &item.imdb_id {
-                    let by_id = self.metadata.lookup_movie(&format!("imdb:{imdb}")).await.map_err(unavailable)?;
+                    let by_id = self
+                        .metadata
+                        .lookup_movie(&format!("imdb:{imdb}"))
+                        .await
+                        .map_err(unavailable)?;
                     if by_id.len() == 1 {
                         return Ok(Some(by_id[0].external_id));
                     }
                 }
-                self.metadata.lookup_movie(&item.title).await.map_err(unavailable)?
+                self.metadata
+                    .lookup_movie(&item.title)
+                    .await
+                    .map_err(unavailable)?
             }
-            MediaDomain::Tv => self.metadata.lookup_tv(&item.title).await.map_err(unavailable)?,
+            MediaDomain::Tv => self
+                .metadata
+                .lookup_tv(&item.title)
+                .await
+                .map_err(unavailable)?,
         };
         let wanted = normalize(&item.title);
         let mut matches: Vec<&crate::metadata::LookupResult> = results
@@ -370,8 +444,13 @@ impl AddTarget {
                 params![root, domain_name(list.media_type)],
             )
             .await?;
-        let Some(row) = rows.next().await? else { return Ok(None) };
-        Ok(Some(Self { root_path: row.get(0)?, quality_profile_id: profile }))
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            root_path: row.get(0)?,
+            quality_profile_id: profile,
+        }))
     }
     fn patch(&self, list: &ImportList) -> Patch {
         let tags = (!list.tag_ids.is_empty()).then(|| crate::tags::Assignment {
@@ -413,7 +492,9 @@ pub fn folder_name(title: &str, year: Option<i64>) -> String {
         })
         .collect();
     name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-    name = name.trim_matches(|c: char| c == '.' || c == ' ' || c == '-').to_owned();
+    name = name
+        .trim_matches(|c: char| c == '.' || c == ' ' || c == '-')
+        .to_owned();
     if name.is_empty() {
         name = "untitled".into();
     }
@@ -426,10 +507,16 @@ pub fn folder_name(title: &str, year: Option<i64>) -> String {
     }
 }
 
-async fn existing_library_id(c: &Connection, media: MediaDomain, external: i64) -> Result<Option<i64>> {
+async fn existing_library_id(
+    c: &Connection,
+    media: MediaDomain,
+    external: i64,
+) -> Result<Option<i64>> {
     let sql = match media {
         MediaDomain::Tv => "SELECT id FROM series WHERE tvdb_id=?",
-        MediaDomain::Movies => "SELECT m.id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE d.tmdb_id=?",
+        MediaDomain::Movies => {
+            "SELECT m.id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE d.tmdb_id=?"
+        }
     };
     let mut rows = c.query(sql, [external]).await?;
     Ok(match rows.next().await? {
@@ -470,10 +557,17 @@ async fn count_pending(c: &Connection, list_id: &str) -> Result<i64> {
 /// Replaces the list's membership with a complete fetch, atomically. Finished items keep their
 /// state; items that left the list are dropped; failed and unresolved items are retried after a
 /// cool-down rather than on every run.
-async fn persist_snapshot(c: &Connection, run_id: &str, list: &ImportList, items: &[ListItem]) -> Result<()> {
+async fn persist_snapshot(
+    c: &Connection,
+    run_id: &str,
+    list: &ImportList,
+    items: &[ListItem],
+) -> Result<()> {
     let list_id = list.id.to_string();
     let t = now();
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
     let mut existing: BTreeMap<String, (String, i64)> = BTreeMap::new();
     {
         let mut rows = tx
@@ -533,7 +627,13 @@ async fn persist_snapshot(c: &Connection, run_id: &str, list: &ImportList, items
     Ok(())
 }
 
-async fn settle(c: &Connection, run_id: &str, list_id: &str, key: &str, outcome: &Outcome) -> Result<()> {
+async fn settle(
+    c: &Connection,
+    run_id: &str,
+    list_id: &str,
+    key: &str,
+    outcome: &Outcome,
+) -> Result<()> {
     let (state, error, library, counter) = match outcome {
         Outcome::Added(id) => ("added", None, Some(*id), "added"),
         Outcome::Existing(id) => ("existing", None, Some(*id), "existing"),
@@ -541,7 +641,9 @@ async fn settle(c: &Connection, run_id: &str, list_id: &str, key: &str, outcome:
         Outcome::Unresolved => ("unresolved", None, None, "unresolved"),
         Outcome::Failed(code) => ("failed", Some(*code), None, "failed"),
     };
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
     tx.execute(
         "UPDATE import_list_items SET state=?,error_code=?,library_id=?,updated_at=? WHERE list_id=? AND key=?",
         params![state, error, library, now(), list_id, key],
@@ -556,9 +658,16 @@ async fn settle(c: &Connection, run_id: &str, list_id: &str, key: &str, outcome:
     Ok(())
 }
 
-async fn finish(c: &Connection, run_id: &str, list_id: &str, result: std::result::Result<(), &'static str>) -> Result<()> {
+async fn finish(
+    c: &Connection,
+    run_id: &str,
+    list_id: &str,
+    result: std::result::Result<(), &'static str>,
+) -> Result<()> {
     let t = now();
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
     match result {
         Ok(()) => {
             tx.execute(
@@ -589,8 +698,19 @@ async fn finish(c: &Connection, run_id: &str, list_id: &str, result: std::result
     Ok(())
 }
 
-async fn fail_or_retry(c: &Connection, run_id: &str, list_id: &str, error: FetchError) -> Result<()> {
-    let attempts = super::store::scalar(c, "SELECT attempts FROM import_list_runs WHERE id=?", [run_id.to_owned()]).await? + 1;
+async fn fail_or_retry(
+    c: &Connection,
+    run_id: &str,
+    list_id: &str,
+    error: FetchError,
+) -> Result<()> {
+    let attempts = super::store::scalar(
+        c,
+        "SELECT attempts FROM import_list_runs WHERE id=?",
+        [run_id.to_owned()],
+    )
+    .await?
+        + 1;
     if error.retryable() && attempts < MAX_ATTEMPTS {
         c.execute(
             "UPDATE import_list_runs SET status='queued',lease_until=0,attempts=?,next_attempt_at=?,error_code=? WHERE id=?",
@@ -599,7 +719,11 @@ async fn fail_or_retry(c: &Connection, run_id: &str, list_id: &str, error: Fetch
         .await?;
         return Ok(());
     }
-    c.execute("UPDATE import_list_runs SET attempts=? WHERE id=?", params![attempts, run_id]).await?;
+    c.execute(
+        "UPDATE import_list_runs SET attempts=? WHERE id=?",
+        params![attempts, run_id],
+    )
+    .await?;
     finish(c, run_id, list_id, Err(error.code())).await
 }
 

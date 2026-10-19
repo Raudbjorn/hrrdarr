@@ -113,7 +113,10 @@ impl ListRuntime {
         matches!(self.settings.get(name), Some(SettingValue::Bool(true)))
     }
     pub fn secret(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(String::as_str).filter(|s| !s.is_empty())
+        self.secrets
+            .get(name)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
     }
     /// Setting or secret required for the request; absence is a configuration failure.
     pub fn need_text(&self, name: &str) -> Result<&str, FetchError> {
@@ -137,7 +140,12 @@ pub struct Implementation {
     pub available: bool,
 }
 
-pub fn field(name: &'static str, label: &'static str, kind: FieldKind, help: &'static str) -> Field {
+pub fn field(
+    name: &'static str,
+    label: &'static str,
+    kind: FieldKind,
+    help: &'static str,
+) -> Field {
     Field {
         name,
         label,
@@ -192,7 +200,11 @@ pub fn encode(value: &str) -> String {
 /// Joins a configured base URL and a path, preserving a URL-base prefix and trimming the trailing
 /// slash, so `http://host/sonarr/` + `api/v3/series` never drops `/sonarr`.
 pub fn join(base: &str, path: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 /// One bounded GET. Returns the body only for a success status.
@@ -201,7 +213,10 @@ pub async fn get(
     url: String,
     headers: &[(&str, &str)],
 ) -> Result<Vec<u8>, FetchError> {
-    let mut out = Outgoing::get(url).header("accept", "application/json, application/xml, text/xml, text/csv, */*");
+    let mut out = Outgoing::get(url).header(
+        "accept",
+        "application/json, application/xml, text/xml, text/csv, */*",
+    );
     for (name, value) in headers {
         out = out.header(name, *value);
     }
@@ -260,7 +275,9 @@ pub fn imdb_of(value: Option<&Value>) -> Result<Option<String>, FetchError> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.is_empty() => Ok(None),
-        Some(Value::String(s)) => valid_imdb(s).map(|s| Some(s.to_owned())).ok_or(FetchError::InvalidResponse),
+        Some(Value::String(s)) => valid_imdb(s)
+            .map(|s| Some(s.to_owned()))
+            .ok_or(FetchError::InvalidResponse),
         _ => Err(FetchError::InvalidResponse),
     }
 }
@@ -360,6 +377,11 @@ pub fn int_list(raw: Option<&str>) -> Result<Vec<i64>, FetchError> {
     let Some(raw) = raw else { return Ok(vec![]) };
     raw.split([',', ' '])
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<i64>().ok().filter(|n| *n >= 0).ok_or(FetchError::InvalidSettings))
+        .map(|s| {
+            s.parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or(FetchError::InvalidSettings)
+        })
         .collect()
 }

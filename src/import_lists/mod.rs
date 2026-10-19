@@ -10,7 +10,10 @@ pub mod providers;
 pub mod store;
 pub mod sync;
 
-use crate::{api::MediaDomain, db::Database, metadata::MetadataClient, notifications::transport::Transport, providers::CredentialKey};
+use crate::{
+    api::MediaDomain, db::Database, metadata::MetadataClient, notifications::transport::Transport,
+    providers::CredentialKey,
+};
 use libsql::{Connection, params};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -32,7 +35,11 @@ impl Deps {
 }
 
 pub fn engine(db: Arc<Database>, key: Option<Arc<CredentialKey>>, deps: Deps) -> sync::Engine {
-    sync::Engine::new(Arc::new(store::Store { db, key }), deps.transport, deps.metadata)
+    sync::Engine::new(
+        Arc::new(store::Store { db, key }),
+        deps.transport,
+        deps.metadata,
+    )
 }
 
 /// Registry, exclusion, run and test routes only; scheduled synchronisation runs in [`start`].
@@ -41,7 +48,11 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>, deps: Deps) ->
 }
 
 /// Whether the domain's exclusion list contains this external id (TVDB for TV, TMDb for movies).
-pub async fn excluded(c: &Connection, media: MediaDomain, external_id: i64) -> Result<bool, libsql::Error> {
+pub async fn excluded(
+    c: &Connection,
+    media: MediaDomain,
+    external_id: i64,
+) -> Result<bool, libsql::Error> {
     let mut rows = c
         .query(
             "SELECT 1 FROM import_list_exclusions WHERE media_type=? AND external_id=?",

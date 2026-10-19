@@ -21,12 +21,29 @@ pub fn implementation() -> Implementation {
 }
 fn fields() -> Vec<Field> {
     vec![
-        field("url", "List URL", FieldKind::Url, "Returns a JSON array of items.").required().max_length(2048),
-        field("bearer_token", "Bearer token", FieldKind::Text, "Optional; sent as Authorization: Bearer.").secret(),
+        field(
+            "url",
+            "List URL",
+            FieldKind::Url,
+            "Returns a JSON array of items.",
+        )
+        .required()
+        .max_length(2048),
+        field(
+            "bearer_token",
+            "Bearer token",
+            FieldKind::Text,
+            "Optional; sent as Authorization: Bearer.",
+        )
+        .secret(),
     ]
 }
 
-fn pick<'a>(object: &'a serde_json::Map<String, Value>, snake: &str, camel: &str) -> Option<&'a Value> {
+fn pick<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    snake: &str,
+    camel: &str,
+) -> Option<&'a Value> {
     object.get(snake).or_else(|| object.get(camel))
 }
 

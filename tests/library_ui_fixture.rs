@@ -1363,7 +1363,8 @@ async fn library_ui_fixture() {
             .unwrap(),
     );
     let (provider_origin, _providers) = serve(provider_router()).await;
-    let (list_origin, _list_feeds) = serve(Router::new().route("/feed/{name}", get(list_feed))).await;
+    let (list_origin, _list_feeds) =
+        serve(Router::new().route("/feed/{name}", get(list_feed))).await;
     let (alternate_provider_origin, alternate_providers) = serve(provider_router()).await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key.clone()));

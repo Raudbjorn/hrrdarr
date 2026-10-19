@@ -62,10 +62,10 @@ pub struct Feed {
 }
 impl Feed {
     pub fn set(&self, target: &str, status: u16, content_type: &str, body: impl Into<Vec<u8>>) {
-        self.routes
-            .lock()
-            .unwrap()
-            .insert(target.to_owned(), (status, content_type.to_owned(), body.into()));
+        self.routes.lock().unwrap().insert(
+            target.to_owned(),
+            (status, content_type.to_owned(), body.into()),
+        );
     }
     pub fn json(&self, target: &str, body: Value) {
         self.set(target, 200, "application/json", body.to_string());
@@ -118,7 +118,10 @@ pub struct Meta {
 }
 impl Meta {
     pub fn show(&self, tvdb: i64, title: &str, year: Option<i64>) {
-        self.shows.lock().unwrap().insert(tvdb, (title.to_owned(), year));
+        self.shows
+            .lock()
+            .unwrap()
+            .insert(tvdb, (title.to_owned(), year));
     }
     pub fn movie(&self, tmdb: i64, title: &str, year: Option<i64>, imdb: Option<&str>) {
         self.movies
@@ -169,12 +172,21 @@ async fn meta_movie_imdb(State(m): State<Meta>, Path(imdb): Path<String>) -> Res
     if m.down.load(std::sync::atomic::Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match m.movies.lock().unwrap().iter().find(|(_, (_, _, i))| i.as_deref() == Some(imdb.as_str())) {
+    match m
+        .movies
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, (_, _, i))| i.as_deref() == Some(imdb.as_str()))
+    {
         Some((id, (t, y, i))) => Json(movie_json(*id, t, *y, i)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
-async fn meta_search_tv(State(m): State<Meta>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn meta_search_tv(
+    State(m): State<Meta>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let term = q.get("term").cloned().unwrap_or_default();
     m.lookups.lock().unwrap().push(format!("tv-search:{term}"));
     if m.down.load(std::sync::atomic::Ordering::SeqCst) {
@@ -192,9 +204,15 @@ async fn meta_search_tv(State(m): State<Meta>, Query(q): Query<HashMap<String, S
     )
     .into_response()
 }
-async fn meta_search_movie(State(m): State<Meta>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn meta_search_movie(
+    State(m): State<Meta>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let term = q.get("q").cloned().unwrap_or_default();
-    m.lookups.lock().unwrap().push(format!("movie-search:{term}"));
+    m.lookups
+        .lock()
+        .unwrap()
+        .push(format!("movie-search:{term}"));
     if m.down.load(std::sync::atomic::Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -237,7 +255,10 @@ impl Drop for Harness {
 async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
-    (base, tokio::spawn(async move { axum::serve(l, router).await.unwrap() }))
+    (
+        base,
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() }),
+    )
 }
 impl Harness {
     pub async fn new() -> Self {
@@ -246,7 +267,12 @@ impl Harness {
         let db = Arc::new(Database::open_local(dir.join("db")).await.unwrap());
         quality_profiles::initialize_defaults(&db).await.unwrap();
         let feed = Feed::default();
-        let (feed_base, t1) = serve(Router::new().fallback(feed_handler).with_state(feed.clone())).await;
+        let (feed_base, t1) = serve(
+            Router::new()
+                .fallback(feed_handler)
+                .with_state(feed.clone()),
+        )
+        .await;
         let meta = Meta::default();
         let (meta_base, t2) = serve(
             Router::new()
@@ -258,8 +284,14 @@ impl Harness {
                 .with_state(meta.clone()),
         )
         .await;
-        let metadata = Arc::new(MetadataClient::with_origins(&format!("{meta_base}/"), &format!("{meta_base}/")).unwrap());
-        let map = FIXED_ORIGINS.iter().map(|o| ((*o).to_owned(), feed_base.clone())).collect();
+        let metadata = Arc::new(
+            MetadataClient::with_origins(&format!("{meta_base}/"), &format!("{meta_base}/"))
+                .unwrap(),
+        );
+        let map = FIXED_ORIGINS
+            .iter()
+            .map(|o| ((*o).to_owned(), feed_base.clone()))
+            .collect();
         let deps = Deps {
             transport: Arc::new(Transport::new().unwrap().with_origin_map(map)),
             metadata,
@@ -271,7 +303,10 @@ impl Harness {
         let mut ids = [0i64; 2];
         for (i, media) in ["tv", "movies"].iter().enumerate() {
             let mut rows = c
-                .query("SELECT min(id) FROM quality_profiles WHERE media_type=?", [*media])
+                .query(
+                    "SELECT min(id) FROM quality_profiles WHERE media_type=?",
+                    [*media],
+                )
                 .await
                 .unwrap();
             ids[i] = rows.next().await.unwrap().unwrap().get(0).unwrap();
@@ -283,7 +318,10 @@ impl Harness {
             .await
             .unwrap();
         }
-        let mut rows = c.query("SELECT id FROM root_folders ORDER BY media_type DESC", ()).await.unwrap();
+        let mut rows = c
+            .query("SELECT id FROM root_folders ORDER BY media_type DESC", ())
+            .await
+            .unwrap();
         let tv_root: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         let movie_root: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         Self {
@@ -310,7 +348,9 @@ impl Harness {
             .unwrap()
             .request(method.parse().unwrap(), format!("{}{path}", self.api_base));
         if !body.is_null() {
-            request = request.header("content-type", "application/json").body(body.to_string());
+            request = request
+                .header("content-type", "application/json")
+                .body(body.to_string());
         }
         let r = request.send().await.unwrap();
         let status = r.status().as_u16();
@@ -332,15 +372,31 @@ impl Harness {
     }
     /// Queues a manual sync and runs every runnable pass to completion; returns the final run.
     pub async fn sync(&self, id: &str) -> Value {
-        let (status, run) = self.call("POST", &format!("/api/v1/importlist/{id}/sync"), Value::Null).await;
+        let (status, run) = self
+            .call(
+                "POST",
+                &format!("/api/v1/importlist/{id}/sync"),
+                Value::Null,
+            )
+            .await;
         assert_eq!(status, 202, "{run}");
         self.engine.drain().await.unwrap();
-        let (_, runs) = self.call("GET", &format!("/api/v1/importlist/{id}/runs?limit=1"), Value::Null).await;
+        let (_, runs) = self
+            .call(
+                "GET",
+                &format!("/api/v1/importlist/{id}/runs?limit=1"),
+                Value::Null,
+            )
+            .await;
         runs["items"][0].clone()
     }
     pub async fn items(&self, id: &str, state: &str) -> Vec<Value> {
         let (status, page) = self
-            .call("GET", &format!("/api/v1/importlist/{id}/items?limit=500&state={state}"), Value::Null)
+            .call(
+                "GET",
+                &format!("/api/v1/importlist/{id}/items?limit=500&state={state}"),
+                Value::Null,
+            )
             .await;
         assert_eq!(status, 200, "{page}");
         page["items"].as_array().unwrap().clone()
@@ -351,6 +407,12 @@ impl Harness {
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     }
     pub async fn sql(&self, sql: &str) {
-        self.db.connect().await.unwrap().execute_batch(sql).await.unwrap();
+        self.db
+            .connect()
+            .await
+            .unwrap()
+            .execute_batch(sql)
+            .await
+            .unwrap();
     }
 }

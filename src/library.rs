@@ -1372,8 +1372,16 @@ async fn selected(
     rawpath: String,
     settings: Patch,
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
-    match add_from_catalog(&ctx.db, &ctx.client, ctx.domain, external_id, rawpath, settings, None)
-        .await
+    match add_from_catalog(
+        &ctx.db,
+        &ctx.client,
+        ctx.domain,
+        external_id,
+        rawpath,
+        settings,
+        None,
+    )
+    .await
     {
         Ok(item) => Ok((StatusCode::CREATED, Json(item))),
         Err(AddFailure::Response(response)) => Err(response),

@@ -135,24 +135,36 @@ pub fn validate(input: &ImportListInput, stored_secrets: &BTreeSet<String>) -> R
         return Err(ApiError::invalid("Movie lists monitor either all or none"));
     }
     if tv && input.minimum_availability.is_some() {
-        return Err(ApiError::invalid("Minimum availability applies to movie lists"));
+        return Err(ApiError::invalid(
+            "Minimum availability applies to movie lists",
+        ));
     }
     if !tv && (input.series_type.is_some() || input.season_folder.is_some()) {
-        return Err(ApiError::invalid("Series type and season folder apply to TV lists"));
+        return Err(ApiError::invalid(
+            "Series type and season folder apply to TV lists",
+        ));
     }
-    let interval = input.interval_minutes.unwrap_or(implementation.default_interval_minutes);
+    let interval = input
+        .interval_minutes
+        .unwrap_or(implementation.default_interval_minutes);
     if !(implementation.min_interval_minutes..=MAX_INTERVAL_MINUTES).contains(&interval) {
         return Err(ApiError::invalid(format!(
             "Interval must be {} to {MAX_INTERVAL_MINUTES} minutes",
             implementation.min_interval_minutes
         )));
     }
-    for id in [input.quality_profile_id, input.root_folder_id].into_iter().flatten() {
+    for id in [input.quality_profile_id, input.root_folder_id]
+        .into_iter()
+        .flatten()
+    {
         if !(1..=MAX_SAFE).contains(&id) {
-            return Err(ApiError::invalid("Profile and root folder IDs must be positive"));
+            return Err(ApiError::invalid(
+                "Profile and root folder IDs must be positive",
+            ));
         }
     }
-    if input.enabled && input.enable_automatic_add
+    if input.enabled
+        && input.enable_automatic_add
         && (input.quality_profile_id.is_none() || input.root_folder_id.is_none())
     {
         return Err(ApiError::invalid(
@@ -204,11 +216,18 @@ pub fn validate(input: &ImportListInput, stored_secrets: &BTreeSet<String>) -> R
     }
     let mut settings = BTreeMap::new();
     for field in fields.iter().filter(|f| !f.secret) {
-        let value = input.settings.get(field.name).cloned().or_else(|| field.default.clone());
+        let value = input
+            .settings
+            .get(field.name)
+            .cloned()
+            .or_else(|| field.default.clone());
         match value {
             Some(SettingValue::Text(t)) if t.is_empty() && field.kind != FieldKind::Select => {
                 if field.required {
-                    return Err(ApiError::invalid(format!("Setting {} is required", field.name)));
+                    return Err(ApiError::invalid(format!(
+                        "Setting {} is required",
+                        field.name
+                    )));
                 }
             }
             Some(value) => {
@@ -216,7 +235,10 @@ pub fn validate(input: &ImportListInput, stored_secrets: &BTreeSet<String>) -> R
                 settings.insert(field.name.to_owned(), value);
             }
             None if field.required => {
-                return Err(ApiError::invalid(format!("Setting {} is required", field.name)));
+                return Err(ApiError::invalid(format!(
+                    "Setting {} is required",
+                    field.name
+                )));
             }
             None => {}
         }
@@ -232,7 +254,10 @@ pub fn validate(input: &ImportListInput, stored_secrets: &BTreeSet<String>) -> R
             None => stored_secrets.contains(field.name),
         };
         if !after {
-            return Err(ApiError::invalid(format!("Secret {} is required", field.name)));
+            return Err(ApiError::invalid(format!(
+                "Secret {} is required",
+                field.name
+            )));
         }
     }
     Ok(Validated {
@@ -248,9 +273,15 @@ pub fn validate(input: &ImportListInput, stored_secrets: &BTreeSet<String>) -> R
         minimum_availability: if tv {
             None
         } else {
-            Some(enum_text(&input.minimum_availability.clone().unwrap_or(Availability::Released)))
+            Some(enum_text(
+                &input
+                    .minimum_availability
+                    .clone()
+                    .unwrap_or(Availability::Released),
+            ))
         },
-        series_type: tv.then(|| enum_text(&input.series_type.clone().unwrap_or(SeriesType::Standard))),
+        series_type: tv
+            .then(|| enum_text(&input.series_type.clone().unwrap_or(SeriesType::Standard))),
         season_folder: tv.then(|| input.season_folder.unwrap_or(true)),
         interval_minutes: interval,
         tag_ids: input.tag_ids.clone(),
@@ -286,7 +317,10 @@ impl Store {
         let c = self.db.connect().await?;
         let mut ids = Vec::new();
         let mut rows = c
-            .query("SELECT id FROM import_lists ORDER BY media_type,lower(name),id", ())
+            .query(
+                "SELECT id FROM import_lists ORDER BY media_type,lower(name),id",
+                (),
+            )
             .await?;
         while let Some(r) = rows.next().await? {
             ids.push(r.get::<String>(0)?);
@@ -310,7 +344,9 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let sealed = self.seal(&id, &v, &BTreeMap::new())?;
         let c = self.db.connect().await?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
         let count = scalar(&tx, "SELECT count(*) FROM import_lists", ()).await?;
         if count >= MAX_LISTS {
             return Err(ApiError::conflict(
@@ -362,7 +398,9 @@ impl Store {
     pub async fn update(&self, id: &str, input: &ImportListInput) -> Result<ImportList> {
         let id = parse_id(id)?.to_string();
         let c = self.db.connect().await?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
         let (implementation, media, revision, names_json, blob) = {
             let mut rows = tx
                 .query(
@@ -441,7 +479,8 @@ impl Store {
             ],
         )
         .await?;
-        tx.execute("DELETE FROM import_list_tags WHERE list_id=?", [id.clone()]).await?;
+        tx.execute("DELETE FROM import_list_tags WHERE list_id=?", [id.clone()])
+            .await?;
         write_tags(&tx, &id, &v).await?;
         tx.commit().await?;
         read(&c, &id).await?.ok_or_else(ApiError::not_found)
@@ -450,7 +489,9 @@ impl Store {
     pub async fn delete(&self, id: &str) -> Result<()> {
         let id = parse_id(id)?.to_string();
         let c = self.db.connect().await?;
-        let n = c.execute("DELETE FROM import_lists WHERE id=?", [id]).await?;
+        let n = c
+            .execute("DELETE FROM import_lists WHERE id=?", [id])
+            .await?;
         if n == 0 {
             return Err(ApiError::not_found());
         }
@@ -458,12 +499,19 @@ impl Store {
     }
 
     /// Stored definition with decrypted secrets, for fetching.
-    pub async fn runtime(&self, c: &Connection, id: &str) -> Result<Option<(ImportList, ListRuntime)>> {
+    pub async fn runtime(
+        &self,
+        c: &Connection,
+        id: &str,
+    ) -> Result<Option<(ImportList, ListRuntime)>> {
         let Some(list) = read(c, id).await? else {
             return Ok(None);
         };
         let mut rows = c
-            .query("SELECT credentials FROM import_lists WHERE id=?", [id.to_owned()])
+            .query(
+                "SELECT credentials FROM import_lists WHERE id=?",
+                [id.to_owned()],
+            )
             .await?;
         let blob = match rows.next().await? {
             Some(r) => r.get::<Option<Vec<u8>>>(0)?,
@@ -484,7 +532,11 @@ impl Store {
     }
 
     /// A draft merged with the stored secrets of `existing` (for test-before-save).
-    pub async fn draft_runtime(&self, input: &ImportListInput, existing: Option<Uuid>) -> Result<ListRuntime> {
+    pub async fn draft_runtime(
+        &self,
+        input: &ImportListInput,
+        existing: Option<Uuid>,
+    ) -> Result<ListRuntime> {
         let c = self.db.connect().await?;
         let (mut secrets, stored, id) = match existing {
             Some(id) => {
@@ -492,7 +544,9 @@ impl Store {
                     .runtime(&c, &id.to_string())
                     .await?
                     .ok_or_else(ApiError::not_found)?;
-                if list.implementation != input.implementation || list.media_type != input.media_type {
+                if list.implementation != input.implementation
+                    || list.media_type != input.media_type
+                {
                     return Err(ApiError::invalid(
                         "The implementation and media domain of an import list cannot change",
                     ));
@@ -539,13 +593,22 @@ impl Store {
             return Ok(Sealed { names, blob: None });
         }
         let key = self.key.as_ref().ok_or_else(ApiError::key_unavailable)?;
-        let plain = serde_json::to_vec(&merged).map_err(|_| ApiError::invalid("Secrets cannot be encoded"))?;
+        let plain = serde_json::to_vec(&merged)
+            .map_err(|_| ApiError::invalid("Secrets cannot be encoded"))?;
         let blob = key
             .seal_import_list(id, v.implementation, &plain)
             .map_err(|_| ApiError::key_unavailable())?;
-        Ok(Sealed { names, blob: Some(blob) })
+        Ok(Sealed {
+            names,
+            blob: Some(blob),
+        })
     }
-    fn open(&self, id: &str, implementation: &str, blob: &[u8]) -> Result<BTreeMap<String, String>> {
+    fn open(
+        &self,
+        id: &str,
+        implementation: &str,
+        blob: &[u8],
+    ) -> Result<BTreeMap<String, String>> {
         let key = self.key.as_ref().ok_or_else(ApiError::key_unavailable)?;
         let plain = key
             .open_import_list(id, implementation, blob)
