@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 77); // Reasoning: latest is migration file 0077 library_root_health at position 77, appended after 0076 wanted_last_search; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 15 } else { 28 } // Reasoning: 0077 library_root_health adds five health identities (root_folder and mount_read_only per domain, movies collection_root_folder) beyond the ten counted before; the 0069 collection snapshot, the six label-torrent client migrations 0070 to 0075, 0076 wanted_last_search and 0077 library_root_health add nine schema_migrations rows beyond the nineteen previously asserted after the fifteen migrations from 49 through 64 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 15 } else { 29 } // Reasoning: 0077 library_root_health adds five health identities (root_folder and mount_read_only per domain, movies collection_root_folder) beyond the ten counted before; the 0069 collection snapshot, the six label-torrent client migrations 0070 to 0075, 0076 wanted_last_search, 0077 library_root_health and 0078 backups add ten schema_migrations rows beyond the nineteen previously asserted after the fifteen migrations from 49 through 64 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.

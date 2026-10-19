@@ -1477,6 +1477,7 @@ async fn library_ui_fixture() {
             .merge(import::router(db.clone()))
             .merge(provider_routes)
             .merge(commands::router(db.clone()))
+            .merge(hrrdarr::backup::router(db.clone()))
             .merge(hrrdarr::health::router(db.clone()))
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh.clone()))

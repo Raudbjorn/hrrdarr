@@ -36,6 +36,30 @@ export type AutoTagSpecificationInput = { name: string, negate: boolean, require
 
 export type AutoTagTextValues = { values: Array<string>, };
 
+export type BackupCommand = { id: string, name: BackupCommandName, backup_type: BackupCommandType, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, backup_id: string | null, backup_name: string | null, size_bytes: number | null, pruned: number, };
+
+export type BackupCommandInput = Record<symbol, never>;
+
+export type BackupCommandName = "backup";
+
+export type BackupCommandQuery = { limit?: number, offset?: number, };
+
+export type BackupCommandType = "manual" | "scheduled";
+
+export type BackupDetail = { backup: BackupFile, manifest: BackupManifest, };
+
+export type BackupFile = { id: string, name: string, backup_type: BackupType, size_bytes: number, created_at: number, };
+
+export type BackupManifest = { format: number, application: string, application_version: string, backup_type: BackupType, created_at: number, backend: string, sqlite_version: string, schema_version: number, migrations: Array<ManifestMigration>, files: Array<ManifestFile>, includes: Array<string>, excludes: Array<string>, secrets: ManifestSecrets, };
+
+export type BackupQuery = { limit?: number, offset?: number, backup_type?: BackupType, };
+
+export type BackupSettings = { revision: number, folder: string | null, effective_folder: string | null, interval_days: number, retention_days: number, next_backup_at: number | null, };
+
+export type BackupSettingsUpdate = { revision: number, folder: string | null, interval_days: number, retention_days: number, };
+
+export type BackupType = "scheduled" | "manual" | "update";
+
 export type BlocklistClearCommand = { id: string, name: BlocklistClearName, target: BlocklistClearTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_removed: number, };
 
 export type BlocklistClearInput = { target: BlocklistClearTarget, priority: CommandPriority, };
@@ -430,6 +454,12 @@ export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
 export type LookupResult = { media_type: MediaDomain, external_id: number, title: string, year: number | null, imdb_id: string | null, };
 
+export type ManifestFile = { name: string, size: number, sha256: string, };
+
+export type ManifestMigration = { version: number, name: string, checksum: string, };
+
+export type ManifestSecrets = { encrypted_credentials: number, key_included: boolean, key_source: string, };
+
 export type ManualImportBatchInput = { operation_ids: Array<string>, priority: CommandPriority, };
 
 export type ManualImportCommand = { id: string, batch_id: string, operation_id: string, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, };
@@ -629,6 +659,8 @@ export type Operation = { id: string, target: MediaTarget, status: string, messa
 export type ParseQuery = { title: string, };
 
 export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: FileRevision | null, revision_marker: boolean, technical_start: number | null, };
+
+export type PendingRestore = { source: RestoreSource, backup_id: string | null, backup_name: string | null, backup_type: BackupType, backup_created_at: number, schema_version: number, application_version: string, staged_at: number, database_sha256: string, database_bytes: number, restart_required: boolean, };
 
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
 
@@ -859,6 +891,10 @@ export type RescanStatus = "queued" | "running" | "retry_wait" | "succeeded" | "
 export type Resolution = { input: string, output: string, mapping_id: number | null, mapping_revision: number | null, lexical_only: boolean, };
 
 export type ResolveInput = { host: string, path: string, direction: Direction, };
+
+export type RestoreSource = "backup" | "upload";
+
+export type RestoreStatus = { pending: PendingRestore | null, };
 
 export type RevisionPolicy = { media_type: MediaDomain, mode: RevisionPolicyMode, revision: number, };
 
