@@ -147,6 +147,16 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
         ("nzbget", "download_client", "usenet"),
         ("transmission", "download_client", "torrent"),
         ("torrentrss", "indexer", "torrent"),
+        // Reasoning: 0090 (indexer breadth) registers the nine tracker indexers; Fanzub is Usenet.
+        ("nyaa", "indexer", "torrent"),
+        ("fanzub", "indexer", "usenet"),
+        ("iptorrents", "indexer", "torrent"),
+        ("torrentleech", "indexer", "torrent"),
+        ("broadcasthenet", "indexer", "torrent"),
+        ("filelist", "indexer", "torrent"),
+        ("hdbits", "indexer", "torrent"),
+        ("passthepopcorn", "indexer", "torrent"),
+        ("torrentpotato", "indexer", "torrent"),
     ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),

@@ -186,9 +186,19 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         let actual = actual
             .replace("p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)", "p.implementation='qbittorrent'")
             .replace("p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')", "p.implementation='qbittorrent'");
+        // Reasoning: 0090 (indexer breadth) widens the same list with the nine tracker implementations; reverse that first.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            "p.implementation IN ('torznab','newznab','torrentrss')",
+        );
         // 0068 widens only the RSS admission trigger's indexer list to torrentrss; reverse that one exact edit.
         let actual = actual.replace(
             "p.implementation IN ('torznab','newznab','torrentrss')",
+            "p.implementation IN ('torznab','newznab')",
+        );
+        // Reasoning: 0090 widens the search admission list with the searchable tracker implementations; reverse it first.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
             "p.implementation IN ('torznab','newznab')",
         );
         // 0054 adds exactly one scan-parent capacity contribution to each old guard.
