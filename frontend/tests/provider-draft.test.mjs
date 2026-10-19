@@ -80,6 +80,12 @@ test('Transmission endpoint composes from host, port, SSL and URL base and parse
   assert.equal(transmissionEndpoint({useSsl:false,urlBase:'',...bad}),null,JSON.stringify(bad));
  for(const bad of ['ftp://h/x','http://u:p@h/x','http://h/x?y','http://h/x#f','not a url'])assert.equal(parseTransmissionEndpoint(bad),null,bad);
  assert.equal(normalizeUrlBase('///'),'');
+ // Encoded bases survive a save/reopen round trip; a malformed escape is data, not an exception.
+ for(const endpoint of ['http://h:9091/my%20base','http://h:9091/a%zz/b']){
+  const parsed=parseTransmissionEndpoint(endpoint);
+  assert.notEqual(parsed,null,endpoint);
+  assert.equal(transmissionEndpoint(parsed),endpoint,endpoint);
+ }
 });
 test('Transmission placements mirror the server rules and keep domains apart',()=>{
  for(const ok of ['tv','tv-sonarr','Movies_4K','a.b'])assert.equal(validTransmissionCategory(ok),true,ok);

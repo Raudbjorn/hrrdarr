@@ -622,9 +622,11 @@ struct Cleanup<'a> {
     report: CleanupReport,
 }
 impl Cleanup<'_> {
+    /// Removal and time bounds end the run. The entry bound only limits how many names are read;
+    /// names already read are still processed, so a directory larger than the bound makes progress
+    /// instead of being enumerated and abandoned on every run.
     fn stop(&mut self) -> bool {
-        if self.visited >= self.limits.max_entries
-            || self.report.files_removed + self.report.folders_removed >= self.limits.max_removals
+        if self.report.files_removed + self.report.folders_removed >= self.limits.max_removals
             || Instant::now() >= self.limits.deadline
         {
             self.report.bounded = true;
@@ -648,10 +650,16 @@ impl Cleanup<'_> {
             if matches!(name, "." | "..") {
                 continue;
             }
-            self.visited += 1;
+            if self.visited >= self.limits.max_entries {
+                // Unread names are kept for a later run; this directory is not known to be empty.
+                self.report.bounded = true;
+                empty = false;
+                break;
+            }
             if self.stop() {
                 return Ok(false);
             }
+            self.visited += 1;
             names.push(name.to_owned());
         }
         for name in names {
@@ -913,6 +921,32 @@ mod tests {
         assert!(report.bounded);
         assert_eq!(report.files_removed, 2);
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 3);
+    }
+    #[test]
+    fn cleanup_processes_names_read_before_the_entry_bound() {
+        let s = scratch();
+        let nested = s.0.join("season");
+        std::fs::create_dir(&nested).unwrap();
+        for i in 0..5 {
+            let path = nested.join(format!("{i}.mkv"));
+            std::fs::write(&path, b"x").unwrap();
+            age(&path, 30);
+        }
+        let mut bounded = limits();
+        // Reasoning: the bin root and three of the five files fit in the entry bound. Before the
+        // fix, reaching the bound while reading `season` abandoned it with nothing removed, on
+        // every run; now the names already read are removed and the rest wait for the next run.
+        bounded.max_entries = 4;
+        let report = cleanup(s.0.to_str().unwrap(), 1, SystemTime::now(), &bounded).unwrap();
+        assert!(report.bounded);
+        assert_eq!(report.files_removed, 3);
+        assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 2);
+        let report = cleanup(s.0.to_str().unwrap(), 1, SystemTime::now(), &bounded).unwrap();
+        assert_eq!(
+            report.files_removed, 2,
+            "the next run finishes the directory"
+        );
+        assert!(!nested.exists(), "then removes it once empty");
     }
     #[test]
     fn writability_probe_leaves_no_artifact() {

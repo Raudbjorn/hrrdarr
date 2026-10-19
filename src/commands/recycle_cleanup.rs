@@ -8,7 +8,9 @@ use crate::recycle_bin::fsops;
 const MAX_DEPTH: usize = 32;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_REMOVALS: u64 = 10_000;
-const RUN_SECONDS: u64 = 60;
+/// Below the worker's 45 s step timeout, so the blocking walk finishes before its command can be
+/// recovered and retried underneath it.
+const RUN_SECONDS: u64 = 30;
 const BUSY_RETRY_SECONDS: i64 = 30;
 
 #[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]

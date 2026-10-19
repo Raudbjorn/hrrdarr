@@ -496,7 +496,8 @@ export async function deleteMediaFile(domain: MediaDomain, fileId: number, mode:
 export async function deleteMediaFiles(domain: MediaDomain, fileIds: number[], mode: FileDeletionMode): Promise<Result<FileDeletionBatch>> {
   if (!fileDomain(domain) || !validFileIds(fileIds) || fileIds.length > MAX_DELETE_FILES || (mode !== 'recycle' && mode !== 'permanent')) return invalidFiles();
   const ids = [...fileIds];
-  const result = await request<FileDeletionBatch>(`/api/v1/${domain}/files/bulk`, { file_ids: ids, mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS);
+  // The server recycles the batch one file at a time, each copy bounded separately.
+  const result = await request<FileDeletionBatch>(`/api/v1/${domain}/files/bulk`, { file_ids: ids, mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS * ids.length);
   if (!result.ok) return result;
   const deleted = result.data?.deletions;
   return Array.isArray(deleted) && deleted.length === ids.length && deleted.every((d, i) => d?.file_id === ids[i] && d.media_type === domain) ? result : invalidFiles('Invalid bulk deletion response; reload the file list.');

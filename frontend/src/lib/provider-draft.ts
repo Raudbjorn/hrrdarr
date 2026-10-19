@@ -60,7 +60,9 @@ export function parseTransmissionEndpoint(endpoint:string):TransmissionAddress|n
   try{url=new URL(endpoint);}catch{return null;}
   if((url.protocol!=='http:'&&url.protocol!=='https:')||url.username||url.password||url.search||url.hash||!url.hostname)return null;
   const useSsl=url.protocol==='https:';
-  const base=normalizeUrlBase(decodeURI(url.pathname));
+  // The pathname is already in the encoded form the base was saved (and the server sends) in;
+  // decoding it would reject a valid %20 on reopen and throw on a malformed escape.
+  const base=normalizeUrlBase(url.pathname);
   if(base===null)return null;
   return {host:url.hostname,port:url.port?Number(url.port):useSsl?443:80,useSsl,urlBase:base};
 }
