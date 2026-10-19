@@ -3,7 +3,8 @@
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-const origin=process.env.UI_URL;assert.equal(new URL(origin).hostname,'127.0.0.1');
+const origin=process.env.UI_URL,remote=process.env.UI_PROVIDER_ORIGIN;
+for(const value of [origin,remote])assert.equal(new URL(value).hostname,'127.0.0.1');
 const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});
 try {
   const page=await browser.newPage();page.setDefaultTimeout(20000);
@@ -17,9 +18,8 @@ try {
     const response=await page.request[method](origin+path,{...(data===undefined?{}:{data}),timeout:10000});
     assert.equal(response.status(),status,await response.text());return response.json();
   };
-  const providers=await api('get','/api/v1/providers?limit=100');
-  const client=providers.items.find(p=>['qbittorrent','sabnzbd','transmission'].includes(p.settings.implementation)&&p.enabled&&p.settings.tv);
-  assert.ok(client,'fixture must provide an enabled TV download client');
+  const scope=category=>({category,imported_category:null,recent_priority:0,older_priority:0});
+  const client=await api('post','/api/v1/providers',{name:'Related write client',enabled:true,priority:1,settings:{implementation:'qbittorrent',endpoint:remote,tv:scope('tv'),movies:scope('movies')},credentials:{kind:'username_password',username:'fixture-user',password:'fixture-good'}},201);
   await page.goto(origin);
   // Visit Activity once so it is mounted, then leave it hidden.
   await nav.getByRole('button',{name:'Activity',exact:true}).click();
