@@ -28,3 +28,12 @@ Remote authentication, connection refusal, dispatched request timeout, rejected 
 Configuration writes select communication and completed-download checks for the old/new domain union. Authoritative provider-test writes compare normalized `(status, error_code)` at the current configuration revision: the first or changed result marks communication dirty for its configured domains in the same transaction, while repeated identical results only update the test timestamp. Indexer tests do not mark download health. Marker due times are not postponed by repeated changes. Ordinary marker failure rolls back the test write; the engine helper handles exact generation exhaustion by retaining the authoritative outcome and recording `health_invariant`. Direct health probes do not write provider-test outcomes or recursively mark themselves dirty. Repeated download-client failure/backoff health (`hc.018`) is outside this change.
 
 Reference requirements are the same pinned Sonarr/Radarr revisions above, `HealthCheck/Checks/DownloadClientCheck.cs`; native implementation retains both no-client and communication-failure outcomes. `tests/health_client_communication.rs` contains owned-loopback fixtures for domain selection, empty/nonempty items, actual remote failures versus cached cooldown, configuration revision changes/deletion, cancellation and permit release, normalized status-marker deduplication/rollback/exhaustion, local credential/configuration failures, enumeration/item/body limits, and safe attribution among multiple clients. Transport unit tests separately distinguish pre-dispatch pacing from dispatched timeout. These test cases describe the verification scope, not a claim that an unrecorded run passed. Engine tests own aggregate deadlines, mixed evaluated/unevaluated publication and generation rejection. No live client, SABnzbd/NZBGet transport, root-folder/path detector, full health catalog, notification delivery or failure-backoff closure is established here.
+
+## Recycling bin
+
+Scoped `recycle_bin` (`RecyclingBinCheck`, migration 0060) is healthy when the domain has no
+recycle bin. A configured bin that does not exist reports error `recycle_bin_missing`; a bin that
+traverses a symlink, is not a directory or fails a create/remove write probe reports error
+`recycle_bin_unwritable`. Saving recycle bin settings marks the check for re-evaluation. File
+deletion and cleanup refuse a missing bin independently of Health. See
+[recycle-bin.md](recycle-bin.md).

@@ -374,6 +374,29 @@ test('release and RSS clients preserve explicit scopes, revisions, targets and u
   assert.equal(calls,1,'The client must not automatically repeat an uncertain RSS mutation');
 });
 
+test('RSS and search accept default or explicit intent and reject mixed or incomplete client authority',async()=>{
+ const indexer_id='00000000-0000-0000-0000-000000000001',client_id='00000000-0000-0000-0000-000000000002';
+ const seen=[];
+ await withFetch(async(path,options)=>{seen.push([path,JSON.parse(options.body)]);return json({});},async()=>{
+  for(const media_type of ['tv','movies'])for(const client_selection of [{kind:'default'},{kind:'explicit',provider_id:client_id,provider_revision:2}]){
+   const source={media_type,indexer_id,indexer_revision:1,client_selection};
+   assert.equal((await createRssCommand({target:source,priority:'normal'})).ok,true);
+   assert.equal((await saveRssSchedule({target:source,interval_seconds:900,enabled:false})).ok,true);
+   assert.equal((await createSearchCommand({...source,request_id:client_id,target:{media_type:media_type==='tv'?'episode':'movie',id:1},mode:'automatic',priority:'normal'})).ok,true);
+  }
+  const accepted=seen.length;
+  for(const invalid of [{},{client_id},{client_revision:2},{client_selection:null},{client_selection:{kind:'other'}},{client_selection:{kind:'explicit',provider_id:client_id,provider_revision:0}},{client_selection:{kind:'default'},client_id},{client_selection:{kind:'default'},client_revision:2}]){
+   const source={media_type:'tv',indexer_id,indexer_revision:1,...invalid};
+   assert.equal((await createRssCommand({target:source,priority:'normal'})).ok,false);
+   assert.equal((await saveRssSchedule({target:source,interval_seconds:900,enabled:false})).ok,false);
+   assert.equal((await createSearchCommand({...source,request_id:client_id,target:{media_type:'episode',id:1},mode:'automatic',priority:'normal'})).ok,false);
+  }
+  assert.equal(seen.length,accepted,'Invalid authority never reaches the network');
+ });
+ assert.equal(seen.length,12);
+ for(const [path,body] of seen){const source=path.startsWith('/api/v1/rss/')?body.target:body;assert.equal('client_id' in source,false);assert.ok(['default','explicit'].includes(source.client_selection.kind));}
+});
+
 test('processing policy and receipt requests retain domains, revisions and uncertain outcomes',async()=>{
   const provider='00000000-0000-0000-0000-000000000001',receipt='00000000-0000-0000-0000-000000000002';
   const seen=[];
@@ -480,5 +503,76 @@ test('naming examples query builders allowlist domain-scoped fields and drop the
     await getTvNamingExamples({ standard_movie_format: 'x', multi_episode_style: 1, revision: 2 });
     await getMovieNamingExamples({ standard_episode_format: 'x', multi_episode_style: 1, revision: 2 });
   });
-  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples', '/api/v1/movies/config/naming/examples']);
+  // TV multi-episode previews now consume this existing setting; movies still reject it.
+  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples?multi_episode_style=1', '/api/v1/movies/config/naming/examples']);
+});
+
+test('multi-episode draft preview distinguishes cleared style from saved settings and preserves zero', async () => {
+  const calls = [];
+  await withFetch(async (path) => { calls.push(path); return json({}); }, async () => {
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: true });
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: false, multi_episode_style: 0 });
+    await getTvNamingExamples({ multi_episode_draft: false });
+  });
+  assert.deepEqual(calls, [
+    '/api/v1/tv/config/naming/examples?rename_enabled=true&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?rename_enabled=false&multi_episode_style=0&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?multi_episode_draft=false',
+  ]);
+});
+
+const fileApi = await import('../src/lib/api.ts');
+const metadataFile = (domain, id=1, owner=9) => ({id,path:'/file.mkv',relative_path:'file.mkv',quality:null,languages:null,size:null,date_added:null,release_group:null,indexer_flags:null,scene_name:null,media_info:null,custom_formats:null,custom_format_score:null,quality_cutoff_not_met:null,...(domain==='tv'?{series_id:owner,season_number:null,release_type:null}:{movie_id:owner,edition:null,original_file_path:null})});
+const filePage = (items, total=items.length, offset=0) => ({items,total,offset,limit:25});
+test('file transport scopes owners, preserves exact patch intentions and uses single atomic editor request',async()=>{
+ for(const domain of ['tv','movies']) {
+  const seen=[];
+  const one=metadataFile(domain),two=metadataFile(domain,2);
+  await withFetch(async(path,options)=>{
+   seen.push({path,options});
+   if(options.method==='PUT') return json(path.endsWith('/editor')?[one,two]:one);
+   if(path.endsWith('/1')) return json(one);
+   return json(filePage([one,two]));
+  },async()=>{
+   assert.equal((await fileApi.listMediaFiles(domain,9)).ok,true);
+   assert.deepEqual(await fileApi.getMediaFile(domain,1),{ok:true,data:one});
+   const patch={quality:{quality_id:7,revision:null},languages:[],release_group:'',indexer_flags:0};
+   assert.equal((await fileApi.updateMediaFile(domain,1,patch)).ok,true);
+   assert.equal((await fileApi.editMediaFiles(domain,[1,2],patch)).ok,true);
+   assert.deepEqual(await fileApi.readMediaFiles(domain,9,[1,2]),{ok:true,data:[one,two]});
+   assert.deepEqual(JSON.parse(seen[2].options.body),patch);
+   assert.deepEqual(JSON.parse(seen[3].options.body),{...patch,file_ids:[1,2]});
+  });
+  assert.equal(seen[0].path,`/api/v1/${domain}/files?${domain==='tv'?'series_id':'movie_ids'}=9&limit=25&offset=0`);
+  assert.equal(seen[2].options.method,'PUT');
+  assert.equal(seen[3].path,`/api/v1/${domain}/files/editor`);
+  assert.equal(seen[4].path,`/api/v1/${domain}/files?file_ids=1%2C2&limit=25&offset=0`);
+ }
+});
+test('invalid file request identities, offsets and selections never reach transport',async()=>{
+ await withFetch(async()=>{assert.fail('invalid file request reached fetch');},async()=>{
+  for(const call of [()=>fileApi.listMediaFiles('tv',0),()=>fileApi.listMediaFiles('tv',1,-1),()=>fileApi.listMediaFiles('tv',1,4294967296),()=>fileApi.getMediaFile('other',1),()=>fileApi.getMediaFile('movies',NaN),()=>fileApi.updateMediaFile('tv',1,{}),()=>fileApi.editMediaFiles('tv',[1,1],{release_group:null}),()=>fileApi.readMediaFiles('tv',1,[]),()=>fileApi.readMediaFiles('movies',1,Array.from({length:26},(_,i)=>i+1))]) assert.equal((await call()).ok,false);
+ });
+});
+test('file readback rejects missing, duplicate, foreign and malformed success responses',async()=>{
+ const one=metadataFile('tv'),two=metadataFile('tv',2);
+ for(const body of [filePage([one]),filePage([one,one]),filePage([one,{...two,series_id:10}]),filePage([one,metadataFile('movies',2)]),filePage([one,two],3),{...filePage([one,two]),offset:1},{...filePage([one,two]),limit:100},filePage([one,{...two,quality:{quality_id:7}}]),{items:[one,two]}]) {
+  await withFetch(async()=>json(body),async()=>assert.equal((await fileApi.readMediaFiles('tv',9,[1,2])).ok,false));
+ }
+ await withFetch(async()=>json(filePage([metadataFile('movies')])),async()=>assert.equal((await fileApi.listMediaFiles('tv',9)).ok,false));
+ await withFetch(async()=>json(two),async()=>assert.equal((await fileApi.updateMediaFile('tv',1,{release_group:null})).ok,false));
+ await withFetch(async()=>json([one]),async()=>assert.equal((await fileApi.editMediaFiles('tv',[1,2],{release_group:null})).ok,false));
+});
+test('file writes retain structured errors and do not automatically retry lost responses',async()=>{
+ for(const status of [404,409,500]) {
+  await withFetch(async()=>json({error:{code:'file_conflict',message:'File changed'}},status),async()=>{
+   assert.deepEqual(await fileApi.updateMediaFile('movies',1,{edition:null}),{ok:false,error:'File changed',code:'file_conflict',status});
+  });
+ }
+ let requests=0;
+ await withFetch(async()=>{requests++;throw new Error('Response lost');},async()=>{
+  const result=await fileApi.editMediaFiles('tv',[1,2],{languages:null});
+  assert.deepEqual(result,{ok:false,error:'Response lost'});
+ });
+ assert.equal(requests,1);
 });

@@ -194,6 +194,8 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
         let context = Context {
+            backoff_started: std::time::Instant::now(),
+            selection_cursor: Arc::new(std::sync::Mutex::new([None, None])),
             db: db.clone(),
             key: None,
             transport: Arc::new(http::HttpClient::new()),

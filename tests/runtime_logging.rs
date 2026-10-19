@@ -434,9 +434,10 @@ async fn exercise() {
             "blocked",
         )
         .await;
+        // 0053 retains Admission evidence first; the ordinary naming failure remains exact.
         assert_eq!(
             blocked["reasons"],
-            json!(["naming_render_failed"]),
+            json!(["hc021_unresolved_attempt", "naming_render_failed"]),
             "{blocked}"
         );
     }

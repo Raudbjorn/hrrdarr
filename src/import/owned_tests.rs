@@ -130,6 +130,7 @@ pub(super) async fn fixture(
         revision_json: "{\"version\":1,\"real\":0,\"is_repack\":false}".into(),
         edition: None,
         policy_revision: 1,
+        total_preflight_attempts: 1,
         mapping_id: c.last_insert_rowid(),
         mapping_revision: 1,
         host: "fixture.invalid".into(),
@@ -137,6 +138,7 @@ pub(super) async fn fixture(
 }
 
 pub(super) async fn replacements() {
+    linked_preview_retains_prior_path_diagnosis().await;
     custom_format_naming_changes_reject_before_journaling().await;
     // Keep execute() regressions within the shared serial recovery test: its permit is global.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
@@ -165,6 +167,7 @@ pub(super) async fn replacements() {
             revision_json: input.revision_json.clone(),
             edition: None,
             policy_revision: input.policy_revision,
+            total_preflight_attempts: input.total_preflight_attempts,
             mapping_id: input.mapping_id,
             mapping_revision: input.mapping_revision,
             host: input.host.clone(),
@@ -401,9 +404,11 @@ pub(super) async fn replacements() {
         .await
         .unwrap();
     std::fs::write(dir.path("movies/old.mkv"), b"changed-original-preserved").unwrap();
+    let retirement_error = execute(db.clone(), &op).await.unwrap_err();
+    assert_eq!(retirement_error.code(), "identity_changed");
     assert_eq!(
-        execute(db.clone(), &op).await.unwrap_err().code(),
-        "identity_changed"
+        retirement_error.path_failure_code(),
+        Some("retirement_changed_cleanup")
     );
     assert_eq!(
         start_owned(db.clone(), &op).await.unwrap_err().code(),
@@ -1017,6 +1022,71 @@ async fn legacy_revision_marker_conflict_preserves_sources() {
             assert_eq!(
                 (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()),
                 frozen
+            );
+        }
+    }
+}
+
+async fn linked_preview_retains_prior_path_diagnosis() {
+    for movie in [false, true] {
+        for marker in ["hc021_source_missing_prepare", "hc021_unresolved_attempt"] {
+            let dir = Scratch::new();
+            let db = dir.database().await;
+            let mut input = fixture(&dir, &db, movie, false).await;
+            let candidate = input.candidate_id.clone();
+            let domain = if movie {
+                crate::api::MediaDomain::Movies
+            } else {
+                crate::api::MediaDomain::Tv
+            };
+            let c = db.connect().await.unwrap();
+            // This older fixture has a checking attempt without a marker. It is unknown,
+            // not proof that a current client output or source is healthy.
+            assert_eq!(
+                crate::health::retained_path_diagnostic(&db, domain).await,
+                Err("check_failed")
+            );
+            let reasons = serde_json::to_string(&[marker]).unwrap();
+            let error = if marker == "hc021_source_missing_prepare" {
+                "source_unavailable"
+            } else {
+                "interrupted"
+            };
+            c.execute("UPDATE download_processing SET status='blocked',error_code=?,reasons_json=? WHERE candidate_id=? AND status='checking'", params![error,reasons.clone(),candidate.clone()]).await.unwrap();
+            let expected = if marker == "hc021_source_missing_prepare" {
+                Ok(Some("path_import_unavailable"))
+            } else {
+                Err("check_failed")
+            };
+            assert_eq!(
+                crate::health::retained_path_diagnostic(&db, domain).await,
+                expected
+            );
+            c.execute("UPDATE download_processing SET status='queued',preflight_attempts=0,error_code=NULL WHERE candidate_id=? AND status='blocked'", [candidate.clone()]).await.unwrap();
+            c.execute("UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=2 WHERE candidate_id=? AND status='queued'", [candidate.clone()]).await.unwrap();
+            // Explicit retry resets the round counter, but the new claim is lifetime attempt 2;
+            // preparation must capture that attempt so its stale-claim fence remains meaningful.
+            input.total_preflight_attempts = 2;
+            assert_eq!(
+                crate::health::retained_path_diagnostic(&db, domain).await,
+                expected
+            );
+            // Real preparation validates current source/old file identities and atomically links
+            // the receipt. It has not executed, committed associations, or repaired the prior failure.
+            let operation = prepare_owned(db.clone(), input).await.unwrap();
+            assert_eq!(operation.status, "preview");
+            assert!(operation.error_code.is_none());
+            assert!(operation.path_failure_code.is_none());
+            let row = c.query("SELECT j.phase,j.error_code,j.path_failure_code,d.reasons_json,d.status FROM import_journal j JOIN rss_candidate_imports i ON i.operation_id=j.operation_id JOIN download_processing d ON d.candidate_id=i.candidate_id WHERE j.operation_id=?", [operation.id.to_string()]).await.unwrap().next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "preview");
+            assert!(row.get::<Option<String>>(1).unwrap().is_none());
+            assert!(row.get::<Option<String>>(2).unwrap().is_none());
+            assert_eq!(row.get::<String>(3).unwrap(), reasons);
+            assert_eq!(row.get::<String>(4).unwrap(), "importing");
+            assert_eq!(count(&db, "import_history").await, 0);
+            assert_eq!(
+                crate::health::retained_path_diagnostic(&db, domain).await,
+                expected
             );
         }
     }

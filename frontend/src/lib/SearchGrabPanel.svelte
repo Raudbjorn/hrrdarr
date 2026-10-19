@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import {clientAttemptLabel,eligibleDownloadClient,indexerScope,isIndexer} from './provider-draft';
   import type { ApiPage, MediaTarget, Provider, SearchCommand, SearchCommandInput, SearchMode, SearchResult } from './api.generated';
   import { listProviders, listSearchCommands, getSearchCommand, deleteSearchCommand, createSearchCommand, cancelSearchCommand, listSearchResults, grabSearchResult } from './api';
   let { target }: {target:MediaTarget} = $props();
@@ -10,6 +11,8 @@
   let commandOffset=$state(0), resultOffset=$state(0), reading=$state(false), saving=$state(false), uncertain=$state(false);
   let pending:SearchCommandInput|null=$state(null), retryMissing=$state(false), error=$state(''), notice=$state('');
   let alive=true, timer:ReturnType<typeof setTimeout>|undefined;
+  const boundClientId=$derived(indexerScope(indexer,domain)?.download_client_id);
+  const selectionReady=$derived.by(()=>!!indexer?.enabled&&!!indexerScope(indexer,domain)&&(!clientId||eligibleDownloadClient(client,domain,indexer)));
   const active=(c:SearchCommand)=>['queued','running','retry_wait'].includes(c.status);
   const eligible=(p:Provider)=>p.enabled && p.settings[domain]!==null;
   function poll(){clearTimeout(timer);if(alive&&!document.hidden)timer=setTimeout(()=>void read(),5000);}
@@ -18,6 +21,7 @@
     const response=await listProviders(offset);if(!alive)return;providerBusy=false;
     if(response.ok)providers=response.data;else error=response.error;
   }
+  function chooseIndexer(){indexer=providers?.items.find(p=>p.id===indexerId)??null;}
   async function read(reconcile=false){
     if(!alive||reading||saving||document.hidden)return;
     reading=true;clearTimeout(timer);let ok=true;
@@ -42,8 +46,8 @@
   async function start(mode:SearchMode,retry=false){
     if(reading||saving||uncertain||providerBusy)return;
     if(!retry){
-      if(!indexer||!client||pending)return;
-      pending={request_id:crypto.randomUUID(),mode,target,indexer_id:indexer.id,indexer_revision:indexer.revision,client_id:client.id,client_revision:client.revision,priority:'normal'};
+      if(!indexer||pending||!selectionReady||indexerScope(indexer,domain)?.[mode==='interactive'?'enable_interactive_search':'enable_automatic_search']===false)return;
+      pending={request_id:crypto.randomUUID(),mode,target,indexer_id:indexer.id,indexer_revision:indexer.revision,client_selection:clientId?{kind:'explicit',provider_id:client!.id,provider_revision:client!.revision}:{kind:'default'},priority:'normal'};
     }
     if(!pending)return;
     saving=true;clearTimeout(timer);error='';notice='';
@@ -82,11 +86,14 @@
   <button disabled={reading||saving} onclick={()=>read(true)}>Check search status</button>
   <fieldset disabled={providerBusy||reading||saving||uncertain||pending!==null}>
     <legend>Search providers</legend>
-    <label>Download search indexer<select bind:value={indexerId} onchange={()=>{indexer=providers?.items.find(p=>p.id===indexerId)??null;}}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&(p.settings.implementation==='torznab'||p.settings.implementation==='newznab'))??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
-    <label>Search download client<select bind:value={clientId} onchange={()=>{client=providers?.items.find(p=>p.id===clientId)??null;}}><option value="">Choose a client</option>{#if client&&!providers?.items.some(p=>p.id===client!.id)}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&p.settings.implementation==='qbittorrent')??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
+    <label>Download search indexer<select bind:value={indexerId} onchange={chooseIndexer}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&isIndexer(p))??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
+    <label>Search download client<select bind:value={clientId} onchange={()=>{client=providers?.items.find(p=>p.id===clientId)??null;}}><option value="">Default — choose from eligible clients</option>{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain,indexer))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligibleDownloadClient(p,domain,indexer))??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
     {#if providers}<div class="actions"><button disabled={providers.offset===0} onclick={()=>loadProviders(Math.max(0,providers!.offset-25))}>Previous download search providers</button><button disabled={providers.offset+providers.limit>=providers.total} onclick={()=>loadProviders(providers!.offset+providers!.limit)}>Next download search providers</button><button onclick={()=>{indexer=null;client=null;indexerId='';clientId='';void loadProviders();}}>Reload download search providers</button></div>{/if}
-    <button disabled={!indexer||!client} onclick={()=>start('interactive')}>Search to choose a download</button>
-    <button disabled={!indexer||!client} onclick={()=>start('automatic')}>Search and download best match</button>
+    {#if boundClientId}<p>Default selection uses this indexer’s {domain} client preference: {boundClientId}. Selecting a client above overrides that preference.</p>{/if}
+    {#if indexerScope(indexer,domain)?.enable_interactive_search===false}<p>Interactive search is disabled for this indexer’s {domain} scope.</p>{/if}
+    {#if indexerScope(indexer,domain)?.enable_automatic_search===false}<p>Automatic search is disabled for this indexer’s {domain} scope.</p>{/if}
+    <button disabled={!selectionReady||indexerScope(indexer,domain)?.enable_interactive_search===false} onclick={()=>start('interactive')}>Search to choose a download</button>
+    <button disabled={!selectionReady||indexerScope(indexer,domain)?.enable_automatic_search===false} onclick={()=>start('automatic')}>Search and download best match</button>
   </fieldset>
   {#if pending}<p>Request {pending.request_id}</p>{#if retryMissing}<button disabled={reading||saving||uncertain} onclick={()=>start(pending!.mode,true)}>Retry same search request</button>{/if}{/if}
   <h4>Search history</h4>
@@ -96,6 +103,8 @@
     {#if selected.error_code}<p role="alert">{selected.error_code}</p>{/if}
     {#if selected.selected_candidate_error_code||selected.selected_candidate_reasons.length}<p role="alert">{selected.selected_candidate_error_code??''} {selected.selected_candidate_reasons.join(', ')}</p>{/if}
     {#if selected.selected_candidate_id}<p>Download {selected.selected_candidate_id}: {selected.selected_candidate_status??'Awaiting status'}. Inspect Activity for download and import progress.</p>{/if}
+    {#if selected.selected_client_id}<p>Selected client {selected.selected_client_id}</p>{/if}
+    {#if selected.selected_client_attempts.length}<ol aria-label="Selected download client attempts">{#each selected.selected_client_attempts as attempt(attempt.ordinal)}<li>Client {attempt.client_id}: {clientAttemptLabel(attempt.state)} · Round {attempt.selection_round}{attempt.error_code?` · ${attempt.error_code}`:''}</li>{/each}</ol>{/if}
     {#if active(selected)}<button disabled={reading||saving||uncertain||pending!==null} onclick={()=>act('cancel',selected!.id)}>Cancel selected search</button>{/if}
     {#if !active(selected)&&!selected.selected_candidate_id}<button disabled={reading||saving||uncertain||pending!==null} onclick={()=>act('delete',selected!.id)}>Remove unused search history</button>{/if}
     {#if results}<ul>{#each results.items as result (result.id)}<li><strong>{result.metadata.title??'Untitled release'}</strong><p>{result.decision.disposition}: {result.decision.reasons.join(', ')||'No rejection reasons'}</p>

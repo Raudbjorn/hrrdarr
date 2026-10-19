@@ -58,7 +58,7 @@ async fn dump(c: &libsql::Connection, sql: &str) -> String {
     out
 }
 fn credit(id: &str, person: i64, name: &str, kind: &str, order: i64) -> Value {
-    json!({"creditId":id,"personTmdbId":person,"name":name,"type":kind,"order":order,
+    json!({"creditId":id,"tmdbId":person,"name":name,"order":order,
         "character": if kind=="cast" {json!("Role")} else {Value::Null},
         "department": if kind=="crew" {json!("Directing")} else {Value::Null},
         "job": if kind=="crew" {json!("Director")} else {Value::Null},
@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        69 // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
     );
     assert_eq!(
         count(
@@ -213,36 +213,48 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     assert!(c.execute("INSERT INTO movie_credits(metadata_id,credit_tmdb_id,person_tmdb_id,person_name,credit_order,credit_type) VALUES(2,'over',1,'N',0,'cast')", ()).await.is_err());
     c.execute("DELETE FROM movie_credits WHERE metadata_id=2", ())
         .await?;
-    // Upgrade from 0046: drop the 0047 objects and history row, then reopen through the real runner.
-    // Reasoning: 0048 now sits above 0047, so a faithful 0046 state must also undo 0048 (its three provider_scopes
-    // columns, four indexer health rows and history row) and 0049 (its download_client_id column, two
-    // indexer_download_client health rows and history row) and 0050 (its minimum_seeders column and history row; the widened
-    // CHECK/trigger edits are idempotent on rerun; the two scope-option triggers 0050 rewrote now name the
-    // enable_* columns, so SQLite refuses to drop those columns until the triggers are dropped, which 0050's
-    // DROP TRIGGER IF EXISTS tolerates); otherwise max(version) stays 50 and the runner
-    // would re-run ALTER ADD COLUMN against columns that already exist.
-    // Reasoning: collections 0052 and provider authority 0053 now sit above main's 0051, so they
-    // are undone first, newest first, object for object as created by those migration files.
-    c.execute_batch("DROP TRIGGER provider_tags_limit; DROP TRIGGER provider_tags_identity; DROP TRIGGER provider_tags_insert_invalidates_test; DROP TRIGGER provider_tags_delete_invalidates_test; DROP TRIGGER provider_status_insert; DROP TRIGGER provider_status_update; DROP TRIGGER provider_cursor_insert; DROP TRIGGER provider_cursor_update; DROP INDEX provider_scope_tags_tag; DROP TABLE provider_selection_cursors; DROP TABLE provider_status; DROP TABLE provider_scope_tags; ALTER TABLE snapshot_imports DROP COLUMN provider_authority_version; DROP TRIGGER collections_identity_insert; DROP TRIGGER collections_identity_update; DROP TRIGGER collections_generated_id; DROP TRIGGER collections_metadata_revision; DROP TRIGGER collections_images_insert; DROP TRIGGER collections_images_update; DROP TRIGGER collection_settings_root_insert; DROP TRIGGER collection_settings_root_update; DROP TRIGGER collection_root_domain_update; DROP TRIGGER collection_settings_revision; DROP TRIGGER collection_tags_insert; DROP TRIGGER collection_tags_update; DROP TRIGGER collection_tags_revision_insert; DROP TRIGGER collection_tags_revision_delete; DROP TRIGGER collection_members_insert; DROP TRIGGER collection_members_update; DROP TRIGGER movie_collection_intents_revision; DROP TRIGGER movie_collection_intents_retain; DROP TRIGGER movie_import_exclusions_revision; DROP TRIGGER movie_import_exclusions_retain; DROP INDEX movie_collection_tags_tag; DROP TABLE movie_import_exclusions; DROP TABLE movie_collection_intents; DROP TABLE movie_collection_tags; DROP TABLE movie_collection_settings; ALTER TABLE movie_collections DROP COLUMN sort_title; ALTER TABLE movie_collections DROP COLUMN overview; ALTER TABLE movie_collections DROP COLUMN images_json; ALTER TABLE movie_collections DROP COLUMN metadata_revision; ALTER TABLE movie_collections DROP COLUMN graph_complete; ALTER TABLE movie_collections DROP COLUMN added; ALTER TABLE movie_collections DROP COLUMN last_info_sync; ALTER TABLE movie_collection_members DROP COLUMN origin; ALTER TABLE movie_collection_members DROP COLUMN metadata_revision; ALTER TABLE snapshot_imports DROP COLUMN collection_version; DELETE FROM schema_migrations WHERE version IN (52,53);")
+    // Reasoning: replay the fixed 0046 prefix; undoing latest DDL leaves later rebuilds behind.
+    let path = files.0.join("upgrade-db");
+    let old = libsql::Builder::new_local(&path).build().await?;
+    let predecessor = old.connect()?;
+    predecessor.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    let tx = predecessor.transaction().await?;
+    let mut migrations = c
+        .query(
+            "SELECT version,name,checksum,sql FROM schema_migrations WHERE version<=46 ORDER BY version",
+            (),
+        )
         .await?;
-    // Reasoning: 0051 must likewise be undone: its status table, two backoff health rows, appended
-    // health_checks/commands columns and command triggers, restoring the 0016 commands_transition body
-    // that 0051 replaces (0051 begins with DROP TRIGGER commands_transition).
-    let migration16 = include_str!("../migrations/0016_download_refresh.sql");
-    let start = migration16
-        .find("CREATE TRIGGER commands_transition")
-        .expect("0016 defines commands_transition");
-    let end = start + migration16[start..].find("\nEND;").expect("trigger end") + 5;
-    c.execute_batch(&format!("DROP TABLE download_client_status; DROP TRIGGER commands_backoff_identity; DROP TRIGGER commands_transition; ALTER TABLE commands DROP COLUMN manual_bypass; ALTER TABLE commands DROP COLUMN origin; {} DELETE FROM health_checks WHERE check_key='download_client_backoff'; ALTER TABLE health_checks DROP COLUMN next_expiry_at; DELETE FROM schema_migrations WHERE version=51;", &migration16[start..end]))
+    let mut applied = 0;
+    while let Some(row) = migrations.next().await? {
+        let version = row.get::<i64>(0)?;
+        let name = row.get::<String>(1)?;
+        let checksum = row.get::<String>(2)?;
+        let sql = row.get::<String>(3)?;
+        tx.execute_batch(&sql).await?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            libsql::params![version, name, checksum, sql],
+        )
         .await?;
-    c.execute_batch("DROP TABLE movie_credits; DROP TRIGGER provider_scope_options_insert; DROP TRIGGER provider_scope_options_update; ALTER TABLE provider_scopes DROP COLUMN download_client_id; ALTER TABLE provider_scopes DROP COLUMN enable_rss; ALTER TABLE provider_scopes DROP COLUMN enable_automatic_search; ALTER TABLE provider_scopes DROP COLUMN enable_interactive_search; DELETE FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss','indexer_download_client'); ALTER TABLE provider_scopes DROP COLUMN minimum_seeders; DELETE FROM schema_migrations WHERE version IN (47,48,49,50);")
-        .await?;
+        applied += 1;
+    }
+    assert_eq!(
+        applied, 46,
+        "the upgrade fixture must contain the complete 0046 prefix"
+    );
+    tx.commit().await?;
+    drop(migrations);
+    drop(c);
+    drop(db);
+    let c = predecessor;
+    c.execute_batch("INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,10,'Film'),(2,20,'Other'); INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/m/Film');").await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
         46
     );
     drop(c);
-    drop(db);
+    drop(old);
     let db = Database::open_local(&path).await?;
     assert!(
         db.migration_backup().is_some(),
@@ -251,7 +263,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        69 // Reasoning: latest is migration file 0069 collection_snapshot at position 69, appended after 0068 torrent_rss_indexer; historical prefixes stay fixed.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(
@@ -273,11 +285,10 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
 
 #[tokio::test]
 async fn add_persists_credits_and_native_read_routes_filter_page_and_404() -> Result<(), Error> {
-    let credits = json!([
-        credit("crew1", 11, "Dir", "crew", 0),
-        credit("cast2", 12, "Second", "cast", 1),
-        credit("cast1", 13, "First", "cast", 0),
-    ]);
+    let credits = json!({
+        "cast": [credit("cast2", 12, "Second", "cast", 1), credit("cast1", 13, "First", "cast", 0)],
+        "crew": [credit("crew1", 11, "Dir", "crew", 0)],
+    });
     let h = harness(movie(credits)).await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
@@ -384,12 +395,57 @@ async fn add_persists_credits_and_native_read_routes_filter_page_and_404() -> Re
 }
 
 #[tokio::test]
+async fn grouped_credits_preserve_namesakes_roles_defaults_and_combined_limit() -> Result<(), Error>
+{
+    let mut cast: Vec<Value> = (0..498)
+        .map(|i| credit(&format!("cast{i}"), i + 1, "Same Name", "cast", i))
+        .collect();
+    // Identity is the credit ID: one person can have multiple roles, and names are not unique.
+    cast[1]["tmdbId"] = json!(1);
+    cast[1]["character"] = json!("Other Role");
+    cast[0] = json!({"creditId":"cast0","tmdbId":1,"name":"Same Name"});
+    let h = harness(movie(json!({
+        "cast": cast,
+        "crew": [credit("crew0", 1, "Same Name", "crew", 0), credit("crew1", 499, "Same Name", "crew", 1)]
+    }))).await?;
+    assert_eq!(h.add().await, 201);
+    let (status, page) = h.get("/api/v1/movies/credits?movie_id=1&limit=500").await;
+    assert_eq!(status, 200);
+    assert_eq!(page["total"], 500);
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 500);
+    assert_eq!(
+        items.iter().filter(|item| item["type"] == "cast").count(),
+        498
+    );
+    assert_eq!(
+        items.iter().filter(|item| item["type"] == "crew").count(),
+        2
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["person_tmdb_id"] == 1)
+            .count(),
+        3
+    );
+    assert!(items.iter().all(|item| item["person_name"] == "Same Name"));
+    assert_eq!(items[0]["credit_tmdb_id"], "cast0");
+    assert_eq!(items[0]["order"], 0);
+    assert_eq!(items[0]["images"], json!([]));
+    assert!(items[0]["character"].is_null());
+    assert_eq!(items[1]["character"], "Other Role");
+    assert_eq!(items[498]["job"], "Director");
+    Ok(())
+}
+
+#[tokio::test]
 async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_ids()
 -> Result<(), Error> {
-    let h = harness(movie(json!([
-        credit("keep", 1, "Keep", "cast", 0),
-        credit("drop", 2, "Drop", "crew", 0)
-    ])))
+    let h = harness(movie(json!({
+        "cast": [credit("keep", 1, "Keep", "cast", 0)],
+        "crew": [credit("drop", 2, "Drop", "crew", 0)]
+    })))
     .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
@@ -414,10 +470,10 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
     // Changed set: update one, drop one, add one.
     h.set(
         200,
-        movie(json!([
+        movie(json!({"cast": [
             credit("keep", 1, "Keep Renamed", "cast", 3),
             credit("new", 3, "New", "cast", 1)
-        ])),
+        ], "crew": []})),
     );
     assert_eq!(h.refresh().await, Ok(1));
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
@@ -435,14 +491,17 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
         before_state,
         "refresh must not touch user settings, files or tags"
     );
-    // Absent credits preserve; an explicit empty array clears.
+    // Absent/null credits preserve; two explicitly empty groups clear.
     h.set(
         200,
         json!({"tmdbId":101,"title":"Film","year":2020,"imdbId":"tt1234567","runtime":120}),
     );
     h.refresh().await.unwrap();
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
-    h.set(200, movie(json!([])));
+    h.set(200, movie(Value::Null));
+    h.refresh().await.unwrap();
+    assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 2);
+    h.set(200, movie(json!({"cast": [], "crew": []})));
     assert_eq!(h.refresh().await, Ok(1));
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(user_state().await, before_state);
@@ -452,48 +511,66 @@ async fn refresh_replaces_credits_atomically_and_preserves_settings_files_and_id
 #[tokio::test]
 async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits_intact()
 -> Result<(), Error> {
-    let h = harness(movie(json!([
-        credit("a", 1, "A", "cast", 0),
-        credit("b", 2, "B", "crew", 0)
-    ])))
+    let h = harness(movie(json!({
+        "cast": [credit("a", 1, "A", "cast", 0)],
+        "crew": [credit("b", 2, "B", "crew", 0)]
+    })))
     .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
     let before = dump(&c, "SELECT * FROM movie_credits ORDER BY id").await;
+    let metadata_before = dump(&c, "SELECT * FROM movie_metadata ORDER BY id").await;
     // Upstream failure.
     h.set(500, json!({}));
     assert!(h.refresh().await.is_err());
     h.set(404, json!({}));
     assert!(h.refresh().await.is_err());
     // Invalid payloads are rejected as a whole before any transaction opens.
-    let many: Vec<Value> = (0..501)
+    let many: Vec<Value> = (0..500)
         .map(|i| credit(&format!("m{i}"), 1, "N", "cast", i))
         .collect();
+    let cast = |credit: Value| json!({"cast": [credit], "crew": []});
     let mut bad_cases: Vec<(&str, Value)> = vec![
-        ("type", json!([credit("z", 1, "N", "guest", 0)])),
+        ("obsolete array shape", json!([])),
+        ("missing groups", json!({})),
+        ("missing cast", json!({"crew": []})),
+        ("missing crew", json!({"cast": []})),
+        ("null group", json!({"cast": null, "crew": []})),
+        ("wrong group type", json!({"cast": [], "crew": {}})),
         (
-            "duplicate",
-            json!([
-                credit("z", 1, "N", "cast", 0),
-                credit("z", 2, "N", "cast", 1)
-            ]),
+            "obsolete person field",
+            cast(json!({"creditId":"z","personTmdbId":1,"name":"N"})),
         ),
-        ("count", json!(many)),
-        ("person", json!([credit("z", 0, "N", "cast", 0)])),
-        ("order", json!([credit("z", 1, "N", "cast", -1)])),
-        ("name", json!([credit("z", 1, "  ", "cast", 0)])),
-        ("id charset", json!([credit("z/../", 1, "N", "cast", 0)])),
+        (
+            "duplicate across groups",
+            json!({
+                "cast": [credit("z", 1, "N", "cast", 0)],
+                "crew": [credit("z", 2, "N", "crew", 1)]
+            }),
+        ),
+        (
+            "combined count",
+            json!({"cast": many, "crew": [credit("overflow", 1, "N", "crew", 0)]}),
+        ),
+        ("person", cast(credit("z", 0, "N", "cast", 0))),
+        ("order", cast(credit("z", 1, "N", "cast", -1))),
+        ("name", cast(credit("z", 1, "  ", "cast", 0))),
+        ("id charset", cast(credit("z/../", 1, "N", "cast", 0))),
         (
             "long job",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"crew","job":"j".repeat(257)}]),
+            json!({"cast": [], "crew": [{"creditId":"z","tmdbId":1,"name":"N","job":"j".repeat(257)}]}),
         ),
         (
             "cover type",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":[{"coverType":"nope","url":"https://image.tmdb.org/a.jpg"}]}]),
+            cast(
+                json!({"creditId":"z","tmdbId":1,"name":"N","images":[{"coverType":"nope","url":"https://image.tmdb.org/a.jpg"}]}),
+            ),
         ),
         (
             "too many images",
-            json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":(0..9).map(|i| json!({"coverType":"poster","url":format!("https://image.tmdb.org/{i}.jpg")})).collect::<Vec<_>>()}]),
+            cast(
+                json!({"creditId":"z","tmdbId":1,"name":"N","images":(0..9).map(|i| json!({"coverType":"poster","url":format!("https://image.tmdb.org/{i}.jpg")})).collect::<Vec<_>>()}),
+            ),
         ),
     ];
     for url in [
@@ -511,12 +588,24 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
         "/local/cover.jpg",
         "https://image.tmdb.org/a b.jpg",
     ] {
-        bad_cases.push((url, json!([{"creditId":"z","personTmdbId":1,"name":"N","type":"cast","images":[{"coverType":"headshot","url":url}]}])));
+        bad_cases.push((url, cast(json!({"creditId":"z","tmdbId":1,"name":"N","images":[{"coverType":"headshot","url":url}]}))));
     }
     for (label, credits) in bad_cases {
-        h.set(200, movie(credits));
+        let mut payload = movie(credits);
+        payload["title"] = json!("Must not partially refresh");
+        h.set(200, payload);
         assert!(h.client.movie(101).await.is_err(), "accepted {label}");
         assert!(h.refresh().await.is_err(), "refreshed {label}");
+        assert_eq!(
+            dump(&c, "SELECT * FROM movie_credits ORDER BY id").await,
+            before,
+            "{label}"
+        );
+        assert_eq!(
+            dump(&c, "SELECT * FROM movie_metadata ORDER BY id").await,
+            metadata_before,
+            "{label}"
+        );
     }
     assert_eq!(
         dump(&c, "SELECT * FROM movie_credits ORDER BY id").await,
@@ -525,10 +614,10 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
     // Storage failure inside the replacement transaction rolls back every credit change.
     h.set(
         200,
-        movie(json!([
+        movie(json!({"cast": [
             credit("a", 1, "A changed", "cast", 0),
             credit("n", 9, "N", "cast", 5)
-        ])),
+        ], "crew": []})),
     );
     c.execute_batch("CREATE TRIGGER reject_credit BEFORE INSERT ON movie_credits BEGIN SELECT RAISE(ABORT,'fixture'); END;").await?;
     assert_eq!(h.refresh().await, Err("metadata storage failed".into()));
@@ -541,7 +630,10 @@ async fn failed_fetch_invalid_payload_or_storage_failure_leaves_existing_credits
 
 #[tokio::test]
 async fn credits_are_movie_domain_scoped_and_tv_ids_never_match() -> Result<(), Error> {
-    let h = harness(movie(json!([credit("a", 1, "A", "cast", 0)]))).await?;
+    let h = harness(movie(
+        json!({"cast": [credit("a", 1, "A", "cast", 0)], "crew": []}),
+    ))
+    .await?;
     assert_eq!(h.add().await, 201);
     let c = h.db.connect().await?;
     // Series 5 / episode id equal to the credit id and to the movie id; none of them may resolve credits.

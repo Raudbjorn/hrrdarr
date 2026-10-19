@@ -55,7 +55,10 @@ pub(super) async fn evaluate(
     let mut conflict = false;
     let mut failed = None;
     for (id, revision, implementation) in providers {
-        if implementation != "qbittorrent" {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget"
+        ) {
             failed.get_or_insert("check_failed");
             continue;
         }

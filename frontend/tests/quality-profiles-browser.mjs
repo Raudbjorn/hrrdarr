@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE || '/usr/lib/node_modules/playwright/index.mjs').href);
 const origin=process.env.UI_URL;assert.ok(origin);assert.equal(new URL(origin).hostname,'127.0.0.1');
-const browser=await chromium.launch({headless:true});
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});
 const page=await browser.newPage();page.setDefaultTimeout(15000);
 const roots={tv:process.env.UI_TV_ROOT,movies:process.env.UI_MOVIE_ROOT};assert.ok(roots.tv && roots.movies,'Use roots printed by the owned fixture');
 const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());

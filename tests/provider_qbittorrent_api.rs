@@ -94,7 +94,8 @@ async fn upstream(
     headers: HeaderMap,
 ) -> Response {
     assert_eq!(headers["authorization"], format!("Bearer {SECRET}"));
-    if state.mode.load(Ordering::SeqCst) == 1 {
+    // Reject the authenticated API request; a support-probe 401 is a generic transport failure.
+    if state.mode.load(Ordering::SeqCst) == 1 && uri.path() != "/api/v2/app/webapiVersion" {
         return (StatusCode::UNAUTHORIZED, SECRET).into_response();
     }
     let args: std::collections::HashMap<String, String> =
@@ -125,6 +126,17 @@ async fn upstream(
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
+// Materialize every row before issuing another HTTP mutation: retained SQLite rows hold read cursors.
+async fn client_backoff(db: &Database, id: &str) -> Vec<Value> {
+    let c = db.connect().await.unwrap();
+    let mut rows = c.query("SELECT media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until FROM download_client_status WHERE provider_id=? ORDER BY media_type", [id]).await.unwrap();
+    let mut result = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        result.push(json!({"media":row.get::<String>(0).unwrap(),"revision":row.get::<i64>(1).unwrap(),"level":row.get::<i64>(2).unwrap(),"initial":row.get::<Option<i64>>(3).unwrap(),"last":row.get::<Option<i64>>(4).unwrap(),"until":row.get::<Option<i64>>(5).unwrap()}));
+    }
+    result
+}
+
 #[tokio::test]
 async fn shared_client_api_scopes_defaults_tests_reads_and_stale_results() -> Result<(), Error> {
     let sandbox = Sandbox::new();
@@ -152,7 +164,8 @@ async fn shared_client_api_scopes_defaults_tests_reads_and_stale_results() -> Re
     assert_eq!(created["settings"]["movies"]["initial_state"], "started");
     assert_eq!(created["settings"]["movies"]["add_tags"], false);
     assert_eq!(created["settings"]["tv"]["initial_state"], "forced");
-    let route = format!("/api/v1/providers/{}", created["id"].as_str().unwrap());
+    let provider_id = created["id"].as_str().unwrap();
+    let route = format!("/api/v1/providers/{provider_id}");
     let (status, result) = request(address, "POST", &format!("{route}/test"), "").await;
     assert_eq!(status, 200, "{result}");
     assert_eq!(result["result"]["domains"], json!(["tv", "movies"]));
@@ -244,12 +257,40 @@ async fn shared_client_api_scopes_defaults_tests_reads_and_stale_results() -> Re
     );
     assert_eq!(unsafe_status["last_test"]["revision"], 1);
     assert!(!unsafe_status.to_string().contains(SECRET));
+    assert!(
+        client_backoff(&db, provider_id).await.is_empty(),
+        "unsafe retention is configuration failure, not a remote client outage"
+    );
     state.mode.store(1, Ordering::SeqCst);
     let (status, error) = request(address, "POST", &format!("{route}/test"), "").await;
     assert_eq!(status, 502);
     assert!(!error.to_string().contains(SECRET));
     let (_, failed) = request(other, "GET", &route, "").await;
     assert_eq!(failed["last_test"]["error_code"], "authentication");
+    let first_failure = client_backoff(&db, provider_id).await;
+    assert_eq!(first_failure.len(), 2);
+    for (row, media) in first_failure.iter().zip(["movies", "tv"]) {
+        assert_eq!(row["media"], media);
+        assert_eq!(row["level"], 1);
+        assert_eq!(row["initial"], row["last"]);
+        assert!(
+            row["until"].is_null(),
+            "the initial five-minute grace does not block"
+        );
+    }
+    // Advance the incident age, retaining a coherent last failure. Startup grace suppresses
+    // escalation but must still allow a block once the initial five-minute grace has elapsed.
+    db.connect().await?.execute("UPDATE download_client_status SET initial_failure_at=last_failure_at-300 WHERE provider_id=?", [provider_id]).await?;
+    let (status, _) = request(address, "POST", &format!("{route}/test"), "").await;
+    assert_eq!(status, 502);
+    let mut history = client_backoff(&db, provider_id).await;
+    for row in &history {
+        assert_eq!(row["level"], 1);
+        assert_eq!(
+            row["until"].as_i64().unwrap() - row["last"].as_i64().unwrap(),
+            60
+        );
+    }
     state.mode.store(2, Ordering::SeqCst);
     let test_route = format!("{route}/test");
     let pending = tokio::spawn(async move { request(address, "POST", &test_route, "").await });
@@ -270,6 +311,17 @@ async fn shared_client_api_scopes_defaults_tests_reads_and_stale_results() -> Re
     assert_eq!(status, 409);
     let (_, current) = request(other, "GET", &route, "").await;
     assert_eq!(current["test_status"], "never_tested");
+    // Config edits rebind existing incident history; the obsolete successful Test cannot recover it.
+    for row in &mut history {
+        row["revision"] = json!(2);
+    }
+    assert_eq!(client_backoff(&db, provider_id).await, history);
+    let (status, bulk) = request(address, "PUT", "/api/v1/providers/bulk", &json!({"media_type":"tv","kind":"download_client","items":[{"id":provider_id,"revision":2}],"changes":{"priority":2}}).to_string()).await;
+    assert_eq!(status, 200, "{bulk}");
+    for row in &mut history {
+        row["revision"] = json!(3);
+    }
+    assert_eq!(client_backoff(&db, provider_id).await, history);
     let mut invalid = input.clone();
     invalid.as_object_mut().unwrap().remove("revision");
     invalid["settings"]["movies"]["category"] = json!("tv/child");
@@ -289,12 +341,19 @@ async fn shared_client_api_scopes_defaults_tests_reads_and_stale_results() -> Re
     );
     let (status, result) = request(address, "POST", &format!("{route}/test"), "").await;
     assert_eq!(status, 200, "{result}");
+    // An explicit successful Test bypasses the active block and recovers both configured scopes.
+    for row in &mut history {
+        row["level"] = json!(0);
+        row["until"] = Value::Null;
+    }
+    assert_eq!(client_backoff(&db, provider_id).await, history);
     for task in [server, other_server, upstream_server] {
         task.abort();
         let _ = task.await;
     }
     drop(db);
     let reopened = Arc::new(Database::open_local(&path).await?);
+    assert_eq!(client_backoff(&reopened, provider_id).await, history);
     let (address, server) = serve(reopened, Some(key)).await;
     let (_, persisted) = request(address, "GET", &route, "").await;
     assert_eq!(persisted["test_status"], "success");

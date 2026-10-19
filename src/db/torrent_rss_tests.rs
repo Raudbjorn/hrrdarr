@@ -1,5 +1,6 @@
-//! Migration 0050 (generic torrent RSS feed implementation): widened storage guards on fresh and
-//! upgraded databases, data preservation, rollback, and the guards that stay deliberately narrow.
+//! Migration 0068 (generic torrent RSS feed implementation, authored on origin/main as 0050):
+//! registry row plus replaced scope/admission triggers on fresh and upgraded databases, data
+//! preservation, rollback, and the guards that stay deliberately narrow.
 use super::*;
 
 struct Scratch(PathBuf);
@@ -21,6 +22,23 @@ impl Drop for Scratch {
 async fn rows(c: &Connection, table: &str) -> Result<Vec<Vec<libsql::Value>>, Error> {
     let mut cursor = c
         .query(&format!("SELECT * FROM {table} ORDER BY rowid"), ())
+        .await?;
+    let mut result = Vec::new();
+    while let Some(row) = cursor.next().await? {
+        result.push(
+            (0..row.column_count())
+                .map(|i| row.get_value(i))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(result)
+}
+async fn registry(c: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
+    let mut cursor = c
+        .query(
+            "SELECT * FROM provider_implementations ORDER BY implementation",
+            (),
+        )
         .await?;
     let mut result = Vec::new();
     while let Some(row) = cursor.next().await? {
@@ -54,12 +72,14 @@ async fn indexer(c: &Connection, implementation: &str) -> Result<String, Error> 
     }
     Ok(id)
 }
-async fn at_49(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+const FEED_MIGRATION: usize = 67;
+async fn at_67(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let raw = libsql::Builder::new_local(path).build().await?;
     let c = raw.connect()?;
-    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    // Like the runner, registry rebuild migrations execute with foreign keys off.
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(49).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(FEED_MIGRATION).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
@@ -67,6 +87,7 @@ async fn at_49(path: &Path) -> Result<(libsql::Database, Connection), Error> {
         )
         .await?;
     }
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
     Ok((raw, c))
 }
 async fn rejects(c: &Connection, sql: &str, args: impl libsql::params::IntoParams) -> bool {
@@ -209,8 +230,8 @@ async fn assert_feed_contract(c: &Connection) -> Result<(), Error> {
     );
     // Every other widened trigger names the new implementation.
     for name in [
-        "provider_test_insert_owner",
-        "provider_test_update_owner",
+        "provider_scope_shape_insert",
+        "provider_scope_shape_update",
         "provider_scope_options_insert",
         "provider_scope_options_update",
         "provider_client_options_insert",
@@ -245,11 +266,20 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53
-    ); // Reasoning: 0050 is the torrent RSS indexer migration; a fresh database continues past 0051 (download-client backoff) through collections 0052 to latest 0053 (provider authority).
+        69
+    ); // Reasoning: 0069 collection snapshot is the latest on a fresh database; 0068 (torrent RSS) precedes it.
     assert_eq!(
-        text(&c, "SELECT name FROM schema_migrations WHERE version=50").await?,
+        text(&c, "SELECT name FROM schema_migrations WHERE version=68").await?,
         "torrent_rss_indexer"
+    );
+    // provider_test_*_owner resolve implementations through the registry, so they need no edit.
+    assert_eq!(
+        text(
+            &c,
+            "SELECT kind||'/'||protocol FROM provider_implementations WHERE implementation='torrentrss'"
+        )
+        .await?,
+        "indexer/torrent"
     );
     assert_feed_contract(&c).await?;
     // A pre-existing guard kept as is: download_client_id stays native-indexer only.
@@ -266,18 +296,20 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
 }
 
 #[tokio::test]
-async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() -> Result<(), Error> {
+async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
-    let (raw, c) = at_49(&path).await?;
+    let (raw, c) = at_67(&path).await?;
     let torznab = indexer(&c, "torznab").await?;
     let newznab = indexer(&c, "newznab").await?;
+    // Registry protocol matching (0059) pairs a torrent client only with a torrent indexer.
+    let torznab_b = indexer(&c, "torznab").await?;
     let client = super::refresh_tests::provider(&c).await?;
     c.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) VALUES(?,1,100,'success',NULL)", [torznab.clone()]).await?;
     c.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) VALUES(?,1,101,'failure','timeout')", [client.clone()]).await?;
     c.execute("INSERT INTO rss_schedules(id,media_type,indexer_id,indexer_revision,client_id,client_revision,interval_seconds,enabled,next_run_at,created_at) VALUES(?,'tv',?,1,?,1,600,1,0,0)",params![uuid::Uuid::new_v4().to_string(),torznab.clone(),client.clone()]).await?;
-    c.execute("INSERT INTO rss_schedules(id,media_type,indexer_id,indexer_revision,client_id,client_revision,interval_seconds,enabled,next_run_at,created_at) VALUES(?,'movies',?,1,?,1,900,0,5,1)",params![uuid::Uuid::new_v4().to_string(),newznab.clone(),client.clone()]).await?;
-    assert!(rejects(&c, "INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('11111111-1111-4111-8111-111111111111','torrentrss','x',1,1,1,1,'http://127.0.0.1:9')", ()).await, "49 has no feed implementation");
+    c.execute("INSERT INTO rss_schedules(id,media_type,indexer_id,indexer_revision,client_id,client_revision,interval_seconds,enabled,next_run_at,created_at) VALUES(?,'movies',?,1,?,1,900,0,5,1)",params![uuid::Uuid::new_v4().to_string(),torznab_b.clone(),client.clone()]).await?;
+    assert!(rejects(&c, "INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES('11111111-1111-4111-8111-111111111111','torrentrss','x',1,1,1,1,'http://127.0.0.1:9')", ()).await, "67 has no feed implementation");
     let tables = [
         "providers",
         "provider_scopes",
@@ -289,7 +321,7 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
     for table in tables {
         before.push(rows(&c, table).await?);
     }
-    assert_eq!(count(&c, "SELECT count(*) FROM provider_scopes").await?, 6);
+    assert_eq!(count(&c, "SELECT count(*) FROM provider_scopes").await?, 8);
     drop(c);
     drop(raw);
     for round in 0..2 {
@@ -303,8 +335,8 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            53
-        ); // Reasoning: 0050 is the torrent RSS indexer migration; the runner continues past 0051 (download-client backoff) through collections 0052 to latest 0053 (provider authority).
+            69
+        ); // Reasoning: the runner applies 0068 (torrent RSS) and 0069 (collection snapshot) on top of 67.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -315,15 +347,15 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "provider_tests").await?, before[2]);
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
-        assert_eq!(&history[..49], before[4].as_slice());
-        assert_eq!(history.len(), 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        assert_eq!(&history[..67], before[4].as_slice());
+        assert_eq!(history.len(), 69); // Reasoning: 0068 and 0069 add exactly two history rows on top of 67.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,
             0
         );
         if round == 0 {
-            // Old children still enforce the old guards after the in-place CHECK widening.
+            // Old children still enforce the old guards after the registry/trigger replacement.
             assert!(rejects(&c, "INSERT INTO provider_scopes(provider_id,implementation,media_type) VALUES(?,'newznab','tv')", [uuid::Uuid::new_v4().to_string()]).await);
         }
     }
@@ -334,35 +366,32 @@ async fn upgrade_from_49_preserves_populated_rows_children_and_foreign_keys() ->
 }
 
 #[tokio::test]
-async fn failed_or_unapplied_widening_rolls_the_whole_migration_back() -> Result<(), Error> {
+async fn failed_or_conflicting_migration_rolls_the_whole_migration_back() -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
-    let (raw, c) = at_49(&path).await?;
+    let (raw, c) = at_67(&path).await?;
     let torznab = indexer(&c, "torznab").await?;
     let before_schema = schema_text(&c).await?;
     let before_providers = rows(&c, "providers").await?;
-    // A schema whose CHECK text differs from the shipped history: the guard table must abort the
-    // migration instead of leaving a half-widened database.
-    c.execute_batch(
-        "PRAGMA writable_schema=ON;
-         UPDATE sqlite_schema SET sql=replace(sql,'''newznab'',''qbittorrent''))','''newznab'',''qbittorrent'' ))') WHERE name='providers';
-         PRAGMA writable_schema=RESET;",
-    )
-    .await?;
-    let tampered_schema = schema_text(&c).await?;
-    assert_ne!(tampered_schema, before_schema);
+    let before_registry = registry(&c).await?;
+    // A late failure after the registry row, column and every trigger replacement leaves schema 67 intact.
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let error = tx.execute_batch(MIGRATIONS[49].1).await.unwrap_err();
+    tx.execute_batch(MIGRATIONS[FEED_MIGRATION].1).await?;
+    assert_eq!(MIGRATIONS[FEED_MIGRATION].0, "torrent_rss_indexer");
     assert!(
-        error.to_string().contains("CHECK constraint failed"),
-        "{error}"
+        tx.execute("INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('torrentrss','indexer','torrent')", ())
+            .await
+            .is_err(),
+        "the registry row already exists inside the transaction"
     );
     tx.rollback().await?;
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
     assert_eq!(
         schema_text(&c).await?,
-        tampered_schema,
+        before_schema,
         "DDL, trigger and column changes roll back together"
     );
     assert_eq!(
@@ -374,6 +403,7 @@ async fn failed_or_unapplied_widening_rolls_the_whole_migration_back() -> Result
         0
     );
     assert_eq!(rows(&c, "providers").await?, before_providers);
+    assert_eq!(registry(&c).await?, before_registry);
     assert_eq!(
         count(
             &c,
@@ -382,7 +412,9 @@ async fn failed_or_unapplied_widening_rolls_the_whole_migration_back() -> Result
         .await?,
         2
     );
-    // The real runner refuses the tampered database too and leaves it at 49 with a recovery backup.
+    // A database that already carries the registry row makes the real runner refuse 0068
+    // atomically: it stays at 67 with its schema intact and a recovery backup is taken.
+    c.execute("INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('torrentrss','indexer','torrent')", ()).await?;
     drop(c);
     drop(raw);
     assert!(Database::open_local(&path).await.is_err());
@@ -390,9 +422,17 @@ async fn failed_or_unapplied_widening_rolls_the_whole_migration_back() -> Result
     let c = raw.connect()?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        49
+        67
     );
-    // Re-applying 0050 to an already migrated database also fails atomically (duplicate column).
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM pragma_table_info('provider_scopes') WHERE name='minimum_seeders'"
+        )
+        .await?,
+        0
+    );
+    // Re-applying 0068 to an already migrated database also fails atomically.
     let fresh = Scratch::new();
     let db = Database::open_local(fresh.0.join("db")).await?;
     let c = db.connect().await?;
@@ -400,7 +440,11 @@ async fn failed_or_unapplied_widening_rolls_the_whole_migration_back() -> Result
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    assert!(tx.execute_batch(MIGRATIONS[49].1).await.is_err());
+    assert!(
+        tx.execute_batch(MIGRATIONS[FEED_MIGRATION].1)
+            .await
+            .is_err()
+    );
     tx.rollback().await?;
     assert_eq!(schema_text(&c).await?, schema);
     Ok(())

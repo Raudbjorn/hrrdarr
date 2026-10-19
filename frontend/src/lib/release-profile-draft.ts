@@ -1,7 +1,7 @@
 import type {MediaDomain,MovieReleaseProfileInput,TvReleaseProfileInput,ReleaseProfile,ReleaseProfileIndexer,Provider,Tag} from './api.generated';
 export type Input=MovieReleaseProfileInput|TvReleaseProfileInput;
 export type Draft={domain:MediaDomain;value:Input;unnamed:boolean;name:string;grace:string};
-export const eligible=(p:Provider,d:MediaDomain)=>p.settings.implementation!=='qbittorrent'&&p.settings[d]!==null;
+export const eligible=(p:Provider,d:MediaDomain)=>(p.settings.implementation==='torznab'||p.settings.implementation==='newznab')&&p.settings[d]!==null;
 export const referenceKey=(r:ReleaseProfileIndexer)=>r.kind==='provider'?`provider:${r.id}`:`source:${r.application}:${r.fingerprint}:${r.source_id}`;
 export function fromInput(domain:MediaDomain,input:Input|ReleaseProfile):Draft {
  const v:Input={name:input.name,enabled:input.enabled,required:[...input.required],ignored:[...input.ignored],tag_ids:[...input.tag_ids],indexers:input.indexers.map(r=>({...r}))};

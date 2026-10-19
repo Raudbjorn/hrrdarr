@@ -4,7 +4,7 @@ import {mkdir} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
 const origin=process.env.UI_URL,scratch=process.env.UI_SCRATCH;assert.ok(origin&&scratch);assert.equal(new URL(origin).hostname,'127.0.0.1');
-const browser=await chromium.launch({headless:true});const page=await browser.newPage();page.setDefaultTimeout(15000);
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});const page=await browser.newPage();page.setDefaultTimeout(15000);
 const errors=[];page.on('pageerror',error=>errors.push(error.message));
 const tags=page.getByRole('region',{name:'Tags settings',exact:true}),assign=page.getByRole('region',{name:'Library tags',exact:true}),nav=page.getByRole('navigation',{name:'Workspace',exact:true});
 const root=d=>d==='tv'?'tv/series':'movies';

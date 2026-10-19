@@ -131,7 +131,7 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
         .await,
         1
     );
-    assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_settings WHERE monitored=1 AND minimum_availability='released' AND search_on_add=1 AND root_folder_id IS NOT NULL AND quality_profile_id IS NOT NULL").await,1);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collections WHERE monitored=1 AND minimum_availability='released' AND search_on_add=1 AND root_folder_id IS NOT NULL AND quality_profile_id IS NOT NULL").await,1);
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM movie_collection_tags").await,
         1
@@ -147,7 +147,7 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
     assert_eq!(
         scalar(
             &c,
-            "SELECT count(*) FROM movie_collections WHERE graph_complete=0 AND metadata_revision=0"
+            "SELECT count(*) FROM movie_collections WHERE metadata_revision=0 AND local_edit=0 AND snapshot_owned=1"
         )
         .await,
         1
@@ -164,7 +164,7 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
             .contains("PRIVATE_COLLECTION_SENTINEL")
     );
     // Persist actual native local-intent markers; replay must not infer absent policy is pristine.
-    c.execute_batch("UPDATE movie_collection_settings SET monitored=0,local_edit=1,settings_revision=settings_revision+1;UPDATE movie_collection_intents SET local_edit=1,revision=revision+1;UPDATE movie_import_exclusions SET excluded=0,local_edit=1,revision=revision+1 WHERE tmdb_id=102;").await.unwrap();
+    c.execute_batch("UPDATE movie_collections SET monitored=0,local_edit=1;UPDATE movie_import_exclusions SET excluded=0,local_edit=1,revision=revision+1 WHERE tmdb_id=102;").await.unwrap();
     assert!(
         snapshots::import(&db, Application::Radarr, bytes, false)
             .await
@@ -185,7 +185,7 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
             .applied
     );
     assert_eq!(
-        scalar(&c, "SELECT monitored FROM movie_collection_settings").await,
+        scalar(&c, "SELECT monitored FROM movie_collections").await,
         0
     );
     assert_eq!(
@@ -196,7 +196,7 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
         .await,
         0
     );
-    c.execute_batch("DELETE FROM movie_collection_tags;DELETE FROM movie_collection_settings;DELETE FROM movie_collection_members;DELETE FROM movie_collections;UPDATE movie_collection_intents SET removed=1,removal_reason='metadata_missing',revision=revision+1;").await.unwrap();
+    c.execute_batch("DELETE FROM movie_collection_tags;DELETE FROM movie_collection_members;DELETE FROM movie_collections;").await.unwrap();
     let changed = source(
         &s,
         MODERN,
@@ -210,9 +210,12 @@ async fn modern_dry_run_catalog_defaults_exclusions_and_native_replay_intent() {
             .unwrap()
             .applied
     );
+    // Reasoning: this branch has no collection deletion or tombstone (collections are catalog
+    // entities, migration 0066), so a distinct later backup legitimately recreates the collection;
+    // library movies are untouched either way.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM movie_collections").await,
-        0
+        1
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM movies").await, 1);
 }
@@ -263,7 +266,7 @@ async fn inline_and_unresolved_modern_preserve_both_domains_after_reopen() {
     assert_eq!(
         scalar(
             &c,
-            "SELECT count(*) FROM movie_collection_settings WHERE monitored=0"
+            "SELECT count(*) FROM movie_collections WHERE monitored=0"
         )
         .await,
         2
@@ -379,7 +382,7 @@ async fn late_failure_rolls_back_core_archive_and_collection_activation() {
         "snapshot_imports",
         "snapshot_mappings",
         "movie_collections",
-        "movie_collection_settings",
+        "movie_import_exclusions",
         "movie_collection_members",
         "movies",
         "movie_metadata",
@@ -455,22 +458,23 @@ async fn newer_backup_replaces_snapshot_membership_and_tolerates_title_drift() {
         scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=950").await,
         2
     );
-    // Snapshot-origin 900 membership was replaced and its emptied collection retired.
+    // Snapshot-origin 900 membership was replaced. The emptied collection stays a catalog entity
+    // (unlike origin/main's adoption-only model, which retired it).
     assert_eq!(
         scalar(
             &c,
             "SELECT count(*) FROM movie_collections WHERE tmdb_id=900"
         )
         .await,
-        0
+        1
     );
     assert_eq!(
         scalar(
             &c,
-            "SELECT removed FROM movie_collection_intents WHERE tmdb_id=900"
+            "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=900"
         )
         .await,
-        1
+        0
     );
     // Spelling drift on the same TMDB identity is a diagnostic, not an import-wide conflict.
     let renamed = format!(
@@ -525,13 +529,8 @@ async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved
             .unwrap()
             .applied
     );
-    let revision = scalar(
-        &c,
-        "SELECT settings_revision FROM movie_collection_settings",
-    )
-    .await;
     assert_eq!(
-        scalar(&c, "SELECT count(*) FROM movie_collection_settings WHERE monitored=1 AND search_on_add=1 AND snapshot_owned=1 AND local_edit=0").await,
+        scalar(&c, "SELECT count(*) FROM movie_collections WHERE monitored=1 AND search_on_add=1 AND snapshot_owned=1 AND local_edit=0").await,
         1
     );
     // A native tombstone on 102 must outlive any backup that omits it.
@@ -555,16 +554,8 @@ async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved
     assert!(report.applied);
     assert_eq!(report.conflicts, 0);
     assert_eq!(
-        scalar(&c, "SELECT count(*) FROM movie_collection_settings WHERE monitored=0 AND search_on_add=0 AND snapshot_owned=1").await,
+        scalar(&c, "SELECT count(*) FROM movie_collections WHERE monitored=0 AND search_on_add=0 AND snapshot_owned=1").await,
         1
-    );
-    assert!(
-        scalar(
-            &c,
-            "SELECT settings_revision FROM movie_collection_settings"
-        )
-        .await
-            > revision
     );
     assert_eq!(
         scalar(
@@ -600,4 +591,72 @@ async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved
         scalar(&c, "SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=900 AND m.origin='snapshot'").await,
         2
     );
+}
+#[tokio::test]
+async fn api_policy_edit_is_sticky_against_a_newer_backup() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = std::sync::Arc::new(Database::open_local(s.0.join("native.db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let first = source(&s, MODERN, "", None).await;
+    assert!(
+        snapshots::import(&db, Application::Radarr, first, false)
+            .await
+            .unwrap()
+            .applied
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collections WHERE monitored=1 AND snapshot_owned=1 AND local_edit=0"
+        )
+        .await,
+        1
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = hrrdarr::collections::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let id = scalar(&c, "SELECT id FROM movie_collections").await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // Reasoning: the user turns search_on_add off through the API; that is a native policy edit.
+    let status = client
+        .put(format!("{base}/api/v1/movies/collections/{id}"))
+        .header("content-type", "application/json")
+        .body(r#"{"search_on_add":false}"#)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    server.abort();
+    assert_eq!(
+        scalar(&c, "SELECT local_edit FROM movie_collections").await,
+        1
+    );
+    // A newer backup that would turn monitoring off must not override the native edit.
+    let newer = source(
+        &s,
+        MODERN,
+        "UPDATE Collections SET Monitored=0,SearchOnAdd=1;",
+        None,
+    )
+    .await;
+    let report = snapshots::import(&db, Application::Radarr, newer, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collections WHERE monitored=1 AND search_on_add=0 AND local_edit=1"
+        )
+        .await,
+        1
+    );
+    assert!(report.unsupported.iter().any(|u| {
+        u.columns
+            .iter()
+            .any(|m| m.contains("newer native collection retained"))
+    }));
 }
