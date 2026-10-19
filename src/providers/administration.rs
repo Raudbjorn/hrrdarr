@@ -33,6 +33,7 @@ impl ProviderKind {
                     | ProviderSettings::Transmission { .. }
                     | ProviderSettings::Deluge { .. }
                     | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Flood { .. }
                     | ProviderSettings::Aria2 { .. }
                     | ProviderSettings::Utorrent { .. }
             ) | (
@@ -76,6 +77,7 @@ impl ProviderFilter {
                 | ProviderSettings::Transmission { .. }
                 | ProviderSettings::Deluge { .. }
                 | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Flood { .. }
                 | ProviderSettings::Aria2 { .. }
                 | ProviderSettings::Utorrent { .. }),
                 media,
@@ -156,6 +158,7 @@ pub enum ProviderImplementation {
     Rtorrent,
     Utorrent,
     Aria2,
+    Flood,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -216,6 +219,7 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Torrentrss
         | ProviderImplementation::Deluge
         | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Flood
         | ProviderImplementation::Aria2
         | ProviderImplementation::Utorrent => vec![],
         ProviderImplementation::Torznab => {
@@ -482,6 +486,20 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://aria2.example:6800/jsonrpc".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Flood,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://flood.example:3000".into(),
                 },
             },
         ],

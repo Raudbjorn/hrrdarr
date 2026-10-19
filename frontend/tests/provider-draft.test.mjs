@@ -148,3 +148,12 @@ test('Aria2 is a torrent download client for both domains',()=>{
  assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
  assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
 });
+
+test('Flood is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('flood'),'torrent');
+ assert.equal(isClientImplementation('flood'),true);
+ const client={id:'fl',enabled:true,settings:{implementation:'flood',endpoint:'http://127.0.0.1:3000',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});

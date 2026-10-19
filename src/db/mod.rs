@@ -308,6 +308,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     // Aria2 registry row, file 0073.
     ("aria2", include_str!("../../migrations/0073_aria2.sql")),
+    // Flood registry, file 0074.
+    ("flood", include_str!("../../migrations/0074_flood.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -965,6 +967,8 @@ mod download_client_backoff_tests;
 mod download_client_registry_tests;
 #[cfg(test)]
 mod download_client_selection_tests;
+#[cfg(test)]
+mod flood_registry_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
 mod rtorrent_registry_tests;

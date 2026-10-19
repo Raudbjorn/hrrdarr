@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        73 // Reasoning: latest is migration file 0073 aria2 at position 73, appended after 0072 utorrent; historical prefixes stay fixed.
+        74 // Reasoning: latest is migration file 0074 flood at position 74, appended after 0073 aria2; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;

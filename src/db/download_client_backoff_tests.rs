@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 73); // Reasoning: latest is migration file 0073 aria2 at position 73, appended after 0072 utorrent; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 74); // Reasoning: latest is migration file 0074 flood at position 74, appended after 0073 aria2; historical prefixes stay fixed.
     for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

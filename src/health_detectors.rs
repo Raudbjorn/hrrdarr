@@ -132,6 +132,7 @@ pub async fn evaluate_current(
                 | "rtorrent"
                 | "utorrent"
                 | "aria2"
+                | "flood"
         ) {
             return Err("check_failed");
         }
@@ -242,6 +243,7 @@ async fn evaluate_communication_inner(
                 | "rtorrent"
                 | "utorrent"
                 | "aria2"
+                | "flood"
         ) {
             return Err("check_failed");
         }
@@ -324,7 +326,7 @@ pub async fn evaluate_indexer_client(
          CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
           AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
           AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
-          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2')
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood')
           AND typeof(p.settings_version)='integer' AND p.settings_version=1
           AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
           AND typeof(s.implementation)='text' AND s.implementation=p.implementation
@@ -332,7 +334,7 @@ pub async fn evaluate_indexer_client(
            AND length(CAST(s.download_client_id AS BLOB))=36 AND instr(s.download_client_id,char(0))=0))
          THEN 1 ELSE 0 END,
          t.id IS NOT NULL,
-         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2') AND typeof(t.implementation)='text'
+         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood') AND typeof(t.implementation)='text'
           AND typeof(t.settings_version)='integer' AND t.settings_version=1
           AND typeof(t.enabled)='integer' AND t.enabled IN (0,1)
          THEN 1 ELSE 0 END,
@@ -375,6 +377,7 @@ pub async fn evaluate_indexer_client(
                     | "rtorrent"
                     | "utorrent"
                     | "aria2"
+                    | "flood"
             ) && binding.is_some())
         {
             return Err("check_failed");
@@ -389,6 +392,7 @@ pub async fn evaluate_indexer_client(
                 | "rtorrent"
                 | "utorrent"
                 | "aria2"
+                | "flood"
         ) || row.get::<i64>(3).map_err(|_| "check_failed")? == 0
         {
             continue;

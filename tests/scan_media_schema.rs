@@ -182,7 +182,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        73 // Reasoning: latest is migration file 0073 aria2 at position 73, appended after 0072 utorrent; historical prefixes stay fixed.
+        74 // Reasoning: latest is migration file 0074 flood at position 74, appended after 0073 aria2; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

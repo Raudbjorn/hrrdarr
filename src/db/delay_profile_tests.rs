@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 73); // Reasoning: latest is migration file 0073 aria2 at position 73, appended after 0072 utorrent; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 74); // Reasoning: latest is migration file 0074 flood at position 74, appended after 0073 aria2; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 73); // Reasoning: latest is migration file 0073 aria2 at position 73, appended after 0072 utorrent; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 74); // Reasoning: latest is migration file 0074 flood at position 74, appended after 0073 aria2; historical prefixes stay fixed.
     Ok(())
 }

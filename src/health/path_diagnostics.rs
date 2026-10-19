@@ -652,6 +652,7 @@ pub(super) async fn evaluate(
                 | "rtorrent"
                 | "utorrent"
                 | "aria2"
+                | "flood"
         ) {
             evidence.record(Err("check_failed"));
             continue;
