@@ -79,9 +79,21 @@ impl Outgoing {
         self.headers.push((name.to_owned(), value.into()));
         self
     }
-    /// Stable 64-bit identity of the whole request (method, URL, headers, body), recorded once
-    /// it is acknowledged so a retried delivery skips it. A digest, so no secret is stored.
-    pub fn fingerprint(&self) -> String {
+    /// Stable 64-bit identity of the whole request (method, URL, headers, body), recorded once it
+    /// is acknowledged so a retried delivery skips it. With the credential key it is an HMAC, so
+    /// the stored identity cannot be used to check guessed secrets offline. Without a key no
+    /// secret field can be stored, so a plain digest reveals nothing the database lacks.
+    pub fn part_id(&self, key: Option<&crate::providers::CredentialKey>) -> String {
+        let bytes = self.identity_bytes();
+        if let Some(key) = key {
+            return key.delivery_part_id(&bytes);
+        }
+        let mut hex = crate::providers::qbittorrent::digest_hex(&ring::digest::SHA256, &bytes);
+        hex.truncate(16);
+        hex
+    }
+    /// Length-prefixed fields, so bytes cannot move between fields without changing the identity.
+    fn identity_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut field = |part: &[u8]| {
             bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
@@ -116,9 +128,7 @@ impl Outgoing {
                 field(text.as_bytes());
             }
         }
-        let mut hex = crate::providers::qbittorrent::digest_hex(&ring::digest::SHA256, &bytes);
-        hex.truncate(16);
-        hex
+        bytes
     }
 }
 
@@ -434,21 +444,41 @@ pub use crate::providers::http::basic_auth;
 mod tests {
     use super::*;
     #[test]
-    fn fingerprint_separates_requests_and_is_stable() {
+    fn part_ids_separate_requests_and_are_stable() {
         let a = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"a"}));
         let b = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"b"}));
-        assert_eq!(a.fingerprint(), a.clone().fingerprint());
-        assert_eq!(a.fingerprint().len(), 16);
-        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.part_id(None), a.clone().part_id(None));
+        assert_eq!(a.part_id(None).len(), 16);
+        assert_ne!(a.part_id(None), b.part_id(None));
         assert_ne!(
-            a.fingerprint(),
-            a.clone().header("Authorization", "Bearer x").fingerprint()
+            a.part_id(None),
+            a.clone().header("Authorization", "Bearer x").part_id(None)
         );
         // Length-prefixed fields: moving bytes between URL and header cannot collide.
         assert_ne!(
-            Outgoing::get("http://h/ab").header("c", "d").fingerprint(),
-            Outgoing::get("http://h/a").header("bc", "d").fingerprint()
+            Outgoing::get("http://h/ab").header("c", "d").part_id(None),
+            Outgoing::get("http://h/a").header("bc", "d").part_id(None)
         );
+    }
+    #[test]
+    fn keyed_part_ids_cannot_be_recomputed_without_the_key() {
+        use crate::providers::CredentialKey;
+        let key = CredentialKey::from_hex(&"0f".repeat(32)).unwrap();
+        let other = CredentialKey::from_hex(&"1e".repeat(32)).unwrap();
+        let request = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"a"}))
+            .header("Authorization", basic_auth("user", "guessable"));
+        let keyed = request.part_id(Some(&key));
+        assert_eq!(keyed.len(), 16);
+        assert_eq!(
+            keyed,
+            request.clone().part_id(Some(&key)),
+            "stable under one key"
+        );
+        // Reasoning: someone reading the database has the request content except the secret. A
+        // plain digest would let them confirm a guessed password; the keyed one matches neither
+        // the plain digest nor the same request under another key.
+        assert_ne!(keyed, request.part_id(None));
+        assert_ne!(keyed, request.part_id(Some(&other)));
     }
     #[test]
     fn basic_auth_matches_rfc7617_example() {

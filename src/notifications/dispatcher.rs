@@ -160,7 +160,7 @@ impl Dispatcher {
                         self.transport.send(request).await?;
                         continue;
                     };
-                    let part = request.fingerprint();
+                    let part = request.part_id(self.store.key.as_deref());
                     if progress.sent.contains(&part) {
                         continue;
                     }
@@ -186,15 +186,21 @@ impl Dispatcher {
                 let path = config.text("path").to_owned();
                 let args = config.text("arguments").to_owned();
                 let env = msg.env.clone();
-                let _permit = self
+                let permit = self
                     .scripts
-                    .acquire()
+                    .clone()
+                    .acquire_owned()
                     .await
                     .map_err(|_| permanent("script_unavailable"))?;
-                tokio::task::spawn_blocking(move || script::run_blocking(&path, &args, &env))
-                    .await
-                    .map_err(|_| permanent("script_failed"))?
-                    .map_err(DeliveryError::from)?;
+                // The permit moves into the blocking task: a caller's timeout drops this future
+                // but cannot stop the script, so the slot stays taken until the script exits.
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    script::run_blocking(&path, &args, &env)
+                })
+                .await
+                .map_err(|_| permanent("script_failed"))?
+                .map_err(DeliveryError::from)?;
                 Ok(true)
             }
         }

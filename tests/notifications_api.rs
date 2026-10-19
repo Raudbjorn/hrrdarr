@@ -1321,6 +1321,14 @@ async fn system_health_event_uses_the_matching_scope() {
         1,
         "the delivery records the movies scope that matched"
     );
+    let (code, deliveries) = h
+        .call("GET", "/api/v1/notifications/deliveries", json!(null))
+        .await;
+    assert_eq!(code, 200, "{deliveries}");
+    assert_eq!(
+        deliveries["items"][0]["media_type"], "movies",
+        "the delivery API reports the matched domain, not the event's system scope"
+    );
     let env = std::fs::read_to_string(&out).unwrap();
     assert!(env.contains("radarr_eventtype=HealthIssue"), "{env}");
     assert!(
