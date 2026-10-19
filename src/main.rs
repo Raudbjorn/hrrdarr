@@ -146,6 +146,13 @@ async fn run() -> Result<(), ProcessFailure> {
         .db
         .permits_local_imports()
         .then(|| hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone()));
+    let list_sync = state.db.permits_local_imports().then(|| {
+        hrrdarr::import_lists::start(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
+        )
+    });
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -153,6 +160,9 @@ async fn run() -> Result<(), ProcessFailure> {
     .await;
     if let Some(notifier) = notifier {
         notifier.shutdown().await;
+    }
+    if let Some(list_sync) = list_sync {
+        list_sync.shutdown().await;
     }
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
@@ -208,6 +218,11 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::notifications::router(
             state.db.clone(),
             state.provider_key.clone(),
+        ))
+        .merge(hrrdarr::import_lists::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
         ))
         .merge(hrrdarr::commands::router(state.db.clone()))
         .merge(hrrdarr::health::router(state.db.clone()))

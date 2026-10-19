@@ -348,7 +348,7 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..67], before[4].as_slice());
-        assert_eq!(history.len(), 75); // Reasoning: 0068 and 0069 plus the label-torrent client migrations up to position 75 add exactly 8 history rows on top of 67.
+        assert_eq!(history.len(), 76); // Reasoning: 0068 and 0069 plus the label-torrent client migrations and 0080 import lists (position 76) up to position 76 add exactly 9 history rows on top of 67.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,

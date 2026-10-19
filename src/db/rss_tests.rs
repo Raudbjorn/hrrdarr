@@ -87,7 +87,7 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

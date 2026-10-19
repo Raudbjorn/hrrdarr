@@ -315,6 +315,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "downloadstation",
         include_str!("../../migrations/0075_downloadstation.sql"),
     ),
+    // Import lists, file 0080 (position 76: 0076-0079 are reserved by other sessions; the parent
+    // renumbers at integration).
+    (
+        "import_lists",
+        include_str!("../../migrations/0080_import_lists.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

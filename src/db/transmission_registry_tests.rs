@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -285,6 +285,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     Ok(())
 }

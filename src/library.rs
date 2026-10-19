@@ -1372,6 +1372,74 @@ async fn selected(
     rawpath: String,
     settings: Patch,
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
+    match add_from_catalog(&ctx.db, &ctx.client, ctx.domain, external_id, rawpath, settings, None)
+        .await
+    {
+        Ok(item) => Ok((StatusCode::CREATED, Json(item))),
+        Err(AddFailure::Response(response)) => Err(response),
+        Err(AddFailure::Excluded) => Err(conflict().into_response()),
+    }
+}
+
+/// Which seasons start monitored when a list adds a series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeasonMonitor {
+    All,
+    None,
+    FirstSeason,
+    LastSeason,
+}
+
+/// Provenance and list policy for an add that originates from an import list. The exclusion check
+/// and the provenance row run inside the same write transaction as the library insert.
+pub struct ListAdd {
+    pub list_id: String,
+    pub list_name: String,
+    pub run_id: String,
+    pub season_monitor: SeasonMonitor,
+    pub search_requested: bool,
+}
+
+pub enum AddFailure {
+    /// The item is on the domain's import-list exclusion list.
+    Excluded,
+    /// Any other failure, already shaped as the HTTP response the manual add would return.
+    Response(Response),
+}
+
+/// The one catalog-backed add path: manual "add selected result" and import-list sync both land
+/// here. Every external request completes before the write transaction opens.
+pub async fn add_from_catalog(
+    db: &Arc<Database>,
+    client: &crate::metadata::MetadataClient,
+    domain: Domain,
+    external_id: i64,
+    rawpath: String,
+    settings: Patch,
+    list: Option<&ListAdd>,
+) -> std::result::Result<LibraryItem, AddFailure> {
+    add_inner(db, client, domain, external_id, rawpath, settings, list)
+        .await
+        .map_err(AddFailure::from)
+}
+impl From<Response> for AddFailure {
+    fn from(response: Response) -> Self {
+        if response.status() == StatusCode::LOCKED {
+            Self::Excluded
+        } else {
+            Self::Response(response)
+        }
+    }
+}
+async fn add_inner(
+    db: &Arc<Database>,
+    client: &crate::metadata::MetadataClient,
+    domain: Domain,
+    external_id: i64,
+    rawpath: String,
+    settings: Patch,
+    list: Option<&ListAdd>,
+) -> LookupHttp<LibraryItem> {
     if !(1..=9007199254740991).contains(&external_id) {
         return Err(bad("Invalid selected metadata identity").into_response());
     }
@@ -1385,16 +1453,15 @@ async fn selected(
         path: rawpath,
         settings,
     };
-    let path = validate_create(ctx.domain, &req).map_err(IntoResponse::into_response)?;
+    let path = validate_create(domain, &req).map_err(IntoResponse::into_response)?;
     // Every external request completes before opening the write transaction.
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
     let mut movie_facts = None;
     let mut tv_facts = None;
-    match ctx.domain {
+    match domain {
         Domain::Tv => {
-            let mut detail = ctx
-                .client
+            let mut detail = client
                 .series(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -1412,6 +1479,9 @@ async fn selected(
                 })?;
                 *flag = season.monitored;
             }
+            if let Some(list) = list {
+                apply_season_monitor(&mut monitoring, list.season_monitor);
+            }
             req.settings.seasons = Some(
                 monitoring
                     .iter()
@@ -1425,8 +1495,7 @@ async fn selected(
             tv_facts = Some(detail);
         }
         Domain::Movies => {
-            let detail = ctx
-                .client
+            let detail = client
                 .movie(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
@@ -1437,9 +1506,8 @@ async fn selected(
             movie_facts = Some(detail);
         }
     }
-    validate_create(ctx.domain, &req).map_err(IntoResponse::into_response)?;
-    let c = ctx
-        .db
+    validate_create(domain, &req).map_err(IntoResponse::into_response)?;
+    let c = db
         .connect()
         .await
         .map_err(|error| Error::from(error).into_response())?;
@@ -1454,7 +1522,13 @@ async fn selected(
             let values=chunk.iter().map(|episode|Value::Integer(episode.tvdb_id)).collect::<Vec<_>>();
             if tx.query(&format!("SELECT 1 FROM episodes WHERE tvdb_id IN ({}) LIMIT 1",placeholders(values.len())),values).await?.next().await?.is_some(){return Err(conflict());}
         }
-        let item=create_record(&tx,ctx.domain,&mut req,&path).await?;
+        if list.is_some() {
+            if crate::import_lists::excluded(&tx,domain,external_id).await? { return Err(Error(StatusCode::LOCKED,"import_list_excluded","Item is on the import list exclusion list")); }
+        }
+        let item=create_record(&tx,domain,&mut req,&path).await?;
+        if let Some(list)=list {
+            crate::import_lists::record_addition(&tx,domain,item.id,external_id,list).await?;
+        }
         if let Some(detail)=tv_facts {
             refresh::series_facts(&tx,item.id,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
@@ -1462,20 +1536,20 @@ async fn selected(
             refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
         // Catalog facts now exist, so rules that depend on them can be evaluated for the new item.
-        crate::autotagging::apply_item(&tx,ctx.domain,item.id).await.map_err(tag_error)?;
+        crate::autotagging::apply_item(&tx,domain,item.id).await.map_err(tag_error)?;
         for episode in episodes {
             let monitored=monitoring.get(&episode.season).ok_or_else(||bad("Episode season is absent from selected catalog"))?;
             tx.execute("INSERT INTO episodes(series_id,season,number,title,monitored,tvdb_id,air_date,air_date_utc,absolute_episode_number,runtime,overview,finale_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![item.id,episode.season,episode.number,episode.title,i64::from(*monitored),episode.tvdb_id,episode.air_date,episode.air_date_utc,episode.absolute_episode_number,episode.runtime,episode.overview,episode.finale_type]).await?;
         }
         // Refresh association-based counts only after every episode has been inserted.
-        fetch(&tx,ctx.domain,"r.id=?",vec![item.id.into()],1,0,true).await?.pop().ok_or_else(missing)
+        fetch(&tx,domain,"r.id=?",vec![item.id.into()],1,0,true).await?.pop().ok_or_else(missing)
     }.await;
     match outcome {
         Ok(item) => {
             tx.commit()
                 .await
                 .map_err(|error| Error::from(error).into_response())?;
-            Ok((StatusCode::CREATED, Json(item)))
+            Ok(item)
         }
         Err(error) => {
             tx.rollback()
@@ -1483,5 +1557,17 @@ async fn selected(
                 .map_err(|error| Error::from(error).into_response())?;
             Err(error.into_response())
         }
+    }
+}
+fn apply_season_monitor(monitoring: &mut BTreeMap<i64, bool>, mode: SeasonMonitor) {
+    let regular: Vec<i64> = monitoring.keys().copied().filter(|n| *n >= 1).collect();
+    let keep = match mode {
+        SeasonMonitor::All => return,
+        SeasonMonitor::None => None,
+        SeasonMonitor::FirstSeason => regular.first().copied(),
+        SeasonMonitor::LastSeason => regular.last().copied(),
+    };
+    for (number, flag) in monitoring.iter_mut() {
+        *flag = Some(*number) == keep;
     }
 }
