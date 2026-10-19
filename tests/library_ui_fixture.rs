@@ -708,6 +708,29 @@ async fn seed_wanted(
     )
     .await
     .unwrap();
+    // Last-search facts for the column and sort (the producer itself is covered by the
+    // wanted_api/search_commands worker tests): a native TV fact, an imported Sonarr snapshot
+    // value, a native movie fact; every other target was never searched.
+    let id =
+        |map: &serde_json::Map<String, serde_json::Value>, key: &str| map[key].as_i64().unwrap();
+    tx.execute(
+        "UPDATE episodes SET native_last_search_at=1700000000 WHERE id=?",
+        [id(&episodes, "pilot")],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE episodes SET last_search_time='2024-01-01 00:00:00Z' WHERE id=?",
+        [id(&episodes, "low")],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE movies SET native_last_search_at=1750000000 WHERE id=?",
+        [id(&movie_ids, "alpha")],
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     Json(json!({"series_id":series,"episodes":episodes,"movies":movie_ids})).into_response()
 }

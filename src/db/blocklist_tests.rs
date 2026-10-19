@@ -100,7 +100,7 @@ async fn blocklist_schema21_backfill_rollback_reopen_and_complete_target_constra
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

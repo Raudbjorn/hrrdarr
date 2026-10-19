@@ -2254,6 +2254,23 @@ impl RefreshClient {
         operation: IndexerOperation,
         request: &indexer::IndexerSearch,
     ) -> std::result::Result<indexer::RawIndexerPage, AutomationError> {
+        let issued = std::sync::atomic::AtomicBool::new(false);
+        self.raw_search_observed(provider_id, revision, operation, request, &issued)
+            .await
+    }
+    /// `raw_search` that also reports dispatch: `issued` becomes true only after provider
+    /// revision, operation policy, transport and indexer backoff admission all passed, right
+    /// before the indexer request is sent. It stays true whatever the outcome (success, caught
+    /// indexer/network failure or the operation deadline), so callers can tell an actual
+    /// eligible indexer query from a pre-dispatch refusal. It never resets to false.
+    pub(crate) async fn raw_search_observed(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        operation: IndexerOperation,
+        request: &indexer::IndexerSearch,
+        issued: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<indexer::RawIndexerPage, AutomationError> {
         let context = &self.0;
         let (provider, credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2284,6 +2301,7 @@ impl RefreshClient {
             indexer_backoff::admit(&context.db, &provider, indexer_backoff::domain(request))
                 .await
                 .map_err(refresh_error)?;
+            issued.store(true, std::sync::atomic::Ordering::SeqCst);
             let result = indexer::raw_search(
                 &operation,
                 &provider.settings,

@@ -315,6 +315,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "downloadstation",
         include_str!("../../migrations/0075_downloadstation.sql"),
     ),
+    // Native Wanted last-search facts, appended at position 76 after 0075 downloadstation.
+    (
+        "wanted_last_search",
+        include_str!("../../migrations/0076_wanted_last_search.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

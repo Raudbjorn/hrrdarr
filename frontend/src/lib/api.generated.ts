@@ -536,7 +536,7 @@ export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "i
 
 export type MovieRenamePreviewStatus = "change" | "unavailable";
 
-export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, last_search_time: string | null, last_search_source: WantedLastSearchSource | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
 
 export type MultiEpisodeExampleStatus = "rendered" | "preserved" | "needs_policy" | "invalid";
 
@@ -942,7 +942,7 @@ export type Score = { format_ids: Array<number>, score: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
-export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_client_id: string | null, selected_client_attempts: Array<ClientAttempt>, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, };
+export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_client_id: string | null, selected_client_attempts: Array<ClientAttempt>, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, dispatch_completed_at: number | null, };
 
 export type SearchCommandInput = { request_id: string, mode: SearchMode, target: MediaTarget, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, priority: CommandPriority, };
 
@@ -1042,7 +1042,7 @@ export type TvRenamePreviewItem = { series_id: number, episode_file_id: number, 
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
-export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, last_search_source: WantedLastSearchSource | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
 
 export type UnmappedFolder = { name: string, path: string, relative_path: string, };
 
@@ -1064,6 +1064,8 @@ export type WantedFile = { id: number, path: string, quality_id: number | null, 
 
 export type WantedKind = "missing" | "cutoff";
 
+export type WantedLastSearchSource = "native" | "imported";
+
 export type WantedMonitored = "monitored" | "unmonitored" | "all";
 
 export type WantedMovieAvailability = "available" | "unavailable" | "ungated";
@@ -1080,4 +1082,4 @@ export type WantedSearchReceipt = { request_id: string, media_type: MediaDomain,
 
 export type WantedSelection = { "kind": "ids", ids: Array<number>, } | { "kind": "all", monitored: WantedMonitored, availability?: WantedAvailability, };
 
-export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality";
+export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality" | "last_search";

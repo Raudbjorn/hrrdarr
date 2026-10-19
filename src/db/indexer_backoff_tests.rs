@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 26 } // Reasoning: the 0069 collection snapshot and the six label-torrent client migrations 0070 to 0075 add seven schema_migrations rows beyond the nineteen previously asserted after the fifteen migrations from 49 through 64 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 27 } // Reasoning: the 0069 collection snapshot, the six label-torrent client migrations 0070 to 0075 and 0076 wanted_last_search add eight schema_migrations rows beyond the nineteen previously asserted after the fifteen migrations from 49 through 64 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
@@ -112,8 +112,9 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
                     row.push(libsql::Value::Null);
                 }
                 assert_eq!(actual, expected);
-            } else if *table == "series" {
-                // 0055 appends unknown runtime; every predecessor value remains exact.
+            } else if matches!(*table, "series" | "episodes" | "movies") {
+                // 0055 appends unknown runtime and 0076 a NULL episode/movie
+                // native_last_search_at; every predecessor value remains exact.
                 let mut expected = expected.clone();
                 for row in &mut expected {
                     row.push(libsql::Value::Null);

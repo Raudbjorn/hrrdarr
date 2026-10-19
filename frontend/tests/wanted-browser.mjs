@@ -61,6 +61,20 @@ try{
  assert.ok(rows[2].includes('Wanted second'));
  assert.ok(!rows.join('\n').includes('Wanted future'),'Future episodes are not missing');
  await wanted.getByText('Showing 1–2 of 2 missing episodes.',{exact:false}).waitFor();
+ // Last searched column: native fact in UTC, never-searched explicit; the time is machine-readable.
+ assert.ok(rows[0].includes('Last searched'),rows[0]);
+ assert.ok(rows[1].includes('2023-11-14 22:13 UTC'),rows[1]);
+ assert.ok(rows[2].includes('Never searched'),rows[2]);
+ assert.equal(await table('Missing episodes').locator('time[datetime="2023-11-14T22:13:20Z"]').count(),1);
+ const sortBy=wanted.getByLabel('Sort by',{exact:true}),direction=wanted.getByLabel('Sort direction',{exact:true});
+ await sortBy.selectOption('last_search');
+ await until(async()=>(await rowsOf('Missing episodes')).slice(1).map(r=>r.includes('Wanted second')?'second':'pilot').join(),v=>v==='second,pilot','Never searched first ascending');
+ const tvSorted=await api('get','/api/v1/tv/wanted/missing?sort=last_search');
+ assert.deepEqual(tvSorted.items.map(i=>[i.target.id,i.last_search_time,i.last_search_source]),[[episodes.second,null,null],[episodes.pilot,'2023-11-14T22:13:20Z','native']]);
+ await direction.selectOption('desc');
+ await until(async()=>(await rowsOf('Missing episodes')).slice(1).map(r=>r.includes('Wanted second')?'second':'pilot').join(),v=>v==='pilot,second','Never searched last descending');
+ await direction.selectOption('asc');await sortBy.selectOption('air_date');
+ rows=await until(()=>rowsOf('Missing episodes'),r=>r.length===3&&r[1].includes('Wanted pilot'),'Air date sort restored');
  if(artifacts)await page.screenshot({path:join(artifacts,'wanted-tv-missing-desktop.png'),fullPage:true});
 
  // Keyboard selection, then search selected with default client selection.
@@ -97,6 +111,7 @@ try{
  rows=await rowsOf('Cutoff unmet episodes');
  assert.equal(rows.length,2,rows.join('\n'));
  assert.ok(rows[1].includes('Wanted low quality')&&rows[1].includes('HDTV-720p'),rows[1]);
+ assert.ok(rows[1].includes('2024-01-01 00:00 UTC (imported)'),'Imported snapshot value is labelled as imported: '+rows[1]);
  assert.ok(!rows.join('\n').includes('Wanted good quality'));
  await wanted.getByLabel('Monitoring filter',{exact:true}).selectOption('unmonitored');
  await wanted.getByText('No cutoff unmet episodes for this filter.',{exact:false}).waitFor();
@@ -126,6 +141,15 @@ try{
  await until(async()=>(await rowsOf('Missing movies')).length,n=>n===2,'Availability filter');
  await wanted.getByLabel('Availability filter',{exact:true}).selectOption('all');
  await until(async()=>(await rowsOf('Missing movies')).length,n=>n===3,'Availability reset');
+ rows=await rowsOf('Missing movies');
+ assert.ok(rows[1].includes('2025-06-15 15:06 UTC'),'Movie fact is its own, not the equal-numbered episode\'s: '+rows[1]);
+ assert.ok(rows[2].includes('Never searched'),rows[2]);
+ await wanted.getByLabel('Sort by',{exact:true}).selectOption('last_search');
+ await until(async()=>(await rowsOf('Missing movies')).slice(1).map(r=>r.includes('Wanted Bravo')?'bravo':'alpha').join(),v=>v==='bravo,alpha','Movies: never searched first');
+ const sorted=await api('get','/api/v1/movies/wanted/missing?sort=last_search');
+ assert.deepEqual(sorted.items.map(i=>[i.target.id,i.last_search_source]),[[movies.bravo,null],[movies.alpha,'native']]);
+ await wanted.getByLabel('Sort by',{exact:true}).selectOption('title');
+ await until(async()=>(await rowsOf('Missing movies')).slice(1).map(r=>r.includes('Wanted Bravo')?'bravo':'alpha').join(),v=>v==='alpha,bravo','Title sort restored');
 
  // Selection actions use the existing monitoring writes and refresh membership.
  await table('Missing movies').getByRole('checkbox',{name:'Select Wanted Bravo (2099)',exact:true}).check();

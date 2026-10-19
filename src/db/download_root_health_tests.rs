@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     new_registry(&c).await?;
@@ -136,8 +136,9 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
         "SELECT * FROM sqlite_sequence ORDER BY name,seq",
         // Metadata45 appends nullable facts; preserve every predecessor series column by name.
         "SELECT id,tvdb_id,title,year,path,poster,monitored,original_language FROM series ORDER BY id",
-        "SELECT * FROM episodes ORDER BY id",
-        "SELECT * FROM movies ORDER BY id",
+        // 0076 wanted_last_search appends native_last_search_at; preserve predecessor columns by name.
+        "SELECT id,series_id,season,number,title,episode_file_id,monitored,tvdb_id,air_date,air_date_utc,last_search_time,runtime,finale_type,overview,absolute_episode_number,scene_absolute_episode_number,scene_episode_number,scene_season_number,unverified_scene_numbering,images_json FROM episodes ORDER BY id",
+        "SELECT id,metadata_id,path,monitored FROM movies ORDER BY id",
         "SELECT * FROM root_folders ORDER BY id",
     ];
     let mut before = vec![];
@@ -180,7 +181,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {

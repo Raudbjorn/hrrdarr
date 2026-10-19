@@ -1,7 +1,8 @@
 //! Wanted missing/cutoff lists and Wanted search admission over a real owned HTTP server.
 //! Library rows are seeded in SQL (no metadata provider); profiles, providers and every
-//! search command are created through the production HTTP routes. No command worker runs,
-//! so admitted searches stay queued and no provider request is ever made.
+//! search command are created through the production HTTP routes. Only the last-search
+//! producer test starts the command worker, and its indexer is an owned 127.0.0.1 peer that
+//! answers 404 (a caught, classified indexer failure); no other test makes a provider request.
 use hrrdarr::{db::Database, providers};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -75,6 +76,7 @@ fn targets(page: &Value, kind: &str) -> bool {
 struct App {
     base: String,
     db: Arc<Database>,
+    client: providers::RefreshClient,
     _server: Server,
     _remote: Server,
     remote: String,
@@ -91,7 +93,7 @@ async fn app() -> App {
         router
             .merge(hrrdarr::commands::router(db.clone()))
             .merge(hrrdarr::search::router(db.clone(), client.clone()))
-            .merge(hrrdarr::wanted::router(db.clone(), client))
+            .merge(hrrdarr::wanted::router(db.clone(), client.clone()))
             .merge(hrrdarr::quality_profiles::router(db.clone()))
             .merge(hrrdarr::episodes::router(db.clone())),
     )
@@ -101,6 +103,7 @@ async fn app() -> App {
     App {
         base,
         db,
+        client,
         _server: server,
         _remote: remote_server,
         remote,
@@ -827,9 +830,13 @@ async fn search_all_refuses_whole_requests_over_target_or_pool_capacity() {
         "over-bound capture admits nothing"
     );
 
-    c.execute(
-        "UPDATE episodes SET monitored=0 WHERE id IN (1024,1025)",
-        (),
+    // Oldest-searched-first under the bound: the capture order is total (never searched, then
+    // oldest instant, then ID), so a bounded read and the admission order are deterministic.
+    c.execute_batch(
+        "UPDATE episodes SET monitored=0 WHERE id IN (1024,1025);
+         UPDATE episodes SET native_last_search_at=10 WHERE id=3;
+         UPDATE episodes SET native_last_search_at=5 WHERE id=1000;
+         UPDATE episodes SET last_search_time='1970-01-01 00:00:07Z' WHERE id=500;",
     )
     .await
     .unwrap();
@@ -843,6 +850,12 @@ async fn search_all_refuses_whole_requests_over_target_or_pool_capacity() {
     assert_eq!(status, 202, "{receipt}");
     assert_eq!(receipt["admitted"], 1023);
     assert_eq!(search_rows(&c).await, 1023);
+    let order: Vec<i64> = command_targets(&receipt)
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(&order[..3], [1, 2, 4], "never searched first, by ID");
+    assert_eq!(&order[1020..], [1000, 500, 3], "then oldest instant first");
 
     // One slot remains in the shared active pool: two targets are refused as a whole.
     let ids = |list: Vec<i64>| {
@@ -892,4 +905,399 @@ async fn search_all_refuses_whole_requests_over_target_or_pool_capacity() {
         ),
         (Some(1023), Some(1023), Some(0))
     );
+}
+
+fn item_by_id(page: &Value, id: i64) -> Value {
+    page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["target"]["id"] == id)
+        .unwrap_or_else(|| panic!("{id} missing from {page}"))
+        .clone()
+}
+fn command_ids(receipt: &Value) -> Vec<String> {
+    receipt["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["command_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+async fn native_count(c: &libsql::Connection, table: &str) -> i64 {
+    c.query(
+        &format!("SELECT count(*) FROM {table} WHERE native_last_search_at IS NOT NULL"),
+        (),
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get(0)
+    .unwrap()
+}
+async fn native_at(c: &libsql::Connection, table: &str, id: i64) -> Option<i64> {
+    c.query(
+        &format!("SELECT native_last_search_at FROM {table} WHERE id=?"),
+        [id],
+    )
+    .await
+    .unwrap()
+    .next()
+    .await
+    .unwrap()
+    .unwrap()
+    .get(0)
+    .unwrap()
+}
+
+#[tokio::test]
+async fn last_search_sort_and_oldest_first_admission_in_both_domains() {
+    let app = app().await;
+    seed(&app).await;
+    let base = &app.base;
+    let c = app.db.connect().await.unwrap();
+    // Native dispatch facts and imported snapshot text compete by instant; equal instants tie
+    // by typed ID; an unparseable import counts as never searched. Episode 1 and movie 1 carry
+    // different facts although their numeric IDs collide.
+    c.execute_batch(
+        "UPDATE episodes SET native_last_search_at=1700000000 WHERE id=1;
+         UPDATE episodes SET last_search_time='2023-11-14 22:13:20Z' WHERE id=5;
+         UPDATE episodes SET native_last_search_at=1600000000,last_search_time='2024-01-01T00:00:00Z' WHERE id=7;
+         UPDATE episodes SET native_last_search_at=1800000000,last_search_time='2020-01-01 00:00:00' WHERE id=8;
+         UPDATE episodes SET last_search_time='not a time' WHERE id=18;
+         UPDATE movies SET native_last_search_at=1750000000 WHERE id=1;
+         UPDATE movies SET native_last_search_at=1700000000 WHERE id=4;
+         UPDATE movies SET native_last_search_at=1650000000 WHERE id IN (5,8);",
+    )
+    .await
+    .unwrap();
+
+    let tv = get(
+        base,
+        "/api/v1/tv/wanted/missing?monitored=all&sort=last_search",
+    )
+    .await;
+    assert_eq!(tv["sort"], "last_search");
+    assert_eq!(
+        ids(&tv),
+        [18, 1, 5, 7, 8],
+        "never searched first, then oldest; 1 and 5 tie by ID: {tv}"
+    );
+    for (id, time, source) in [
+        (18, Value::Null, Value::Null),
+        (1, json!("2023-11-14T22:13:20Z"), json!("native")),
+        (5, json!("2023-11-14T22:13:20Z"), json!("imported")),
+        (7, json!("2024-01-01T00:00:00Z"), json!("imported")),
+        (8, json!("2027-01-15T08:00:00Z"), json!("native")),
+    ] {
+        let item = item_by_id(&tv, id);
+        assert_eq!(
+            (&item["last_search_time"], &item["last_search_source"]),
+            (&time, &source),
+            "{item}"
+        );
+    }
+    assert_eq!(
+        ids(&get(
+            base,
+            "/api/v1/tv/wanted/missing?monitored=all&sort=last_search&direction=desc"
+        )
+        .await),
+        [8, 7, 1, 5, 18],
+        "never searched trails descending; equal instants stay ascending by ID"
+    );
+    assert_eq!(
+        ids(&get(base, "/api/v1/tv/wanted/cutoff?sort=last_search").await),
+        [2, 3, 13, 15],
+        "all never searched: typed-ID ties"
+    );
+    let first = get(
+        base,
+        "/api/v1/tv/wanted/missing?monitored=all&sort=last_search&limit=2&offset=1",
+    )
+    .await;
+    assert_eq!(
+        (ids(&first), first["total"].as_i64()),
+        (vec![1, 5], Some(5))
+    );
+
+    let movies = get(
+        base,
+        "/api/v1/movies/wanted/missing?monitored=all&sort=last_search",
+    )
+    .await;
+    assert_eq!(ids(&movies), [2, 4, 1], "{movies}");
+    assert_eq!(
+        item_by_id(&movies, 1)["last_search_time"],
+        "2025-06-15T15:06:40Z",
+        "movie 1 has its own fact, not episode 1's"
+    );
+    assert_eq!(item_by_id(&movies, 1)["last_search_source"], "native");
+    assert!(item_by_id(&movies, 2)["last_search_time"].is_null());
+    assert_eq!(
+        ids(&get(
+            base,
+            "/api/v1/movies/wanted/missing?monitored=all&sort=last_search&direction=desc"
+        )
+        .await),
+        [1, 4, 2]
+    );
+    for direction in ["asc", "desc"] {
+        assert_eq!(
+            ids(&get(
+                base,
+                &format!("/api/v1/movies/wanted/cutoff?sort=last_search&direction={direction}")
+            )
+            .await),
+            [5, 8],
+            "equal instants keep ascending movie IDs ({direction})"
+        );
+    }
+    assert_eq!(
+        ids(&get(
+            base,
+            "/api/v1/movies/wanted/missing?sort=last_search&availability=all"
+        )
+        .await),
+        [2, 1]
+    );
+
+    // Search all captures and admits oldest-searched-first; child IDs sort in admission order,
+    // so the worker's (priority, created_at, id) claim order follows it. Replay keeps it.
+    let (indexer, client) = providers(&app).await;
+    let all = search_body(
+        &uuid::Uuid::new_v4().to_string(),
+        "missing",
+        json!({"kind":"all","monitored":"all"}),
+        &indexer,
+        &client,
+    );
+    let (status, receipt) =
+        request(base, "POST", "/api/v1/tv/wanted/search", Some(all.clone())).await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(
+        command_targets(&receipt),
+        [18, 1, 5, 7, 8].map(|id| ("episode".to_owned(), id)),
+        "{receipt}"
+    );
+    let order = command_ids(&receipt);
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(sorted, order, "claim order equals admission order");
+    let (status, replay) = request(base, "POST", "/api/v1/tv/wanted/search", Some(all)).await;
+    assert_eq!((status, &replay["replayed"]), (202, &json!(true)));
+    assert_eq!(replay["commands"], receipt["commands"]);
+    assert_eq!(
+        native_count(&c, "episodes").await,
+        3,
+        "admission writes no fact (only the three seeded native facts exist)"
+    );
+
+    // Explicit selections are ordered the same way (active targets are not skipped for IDs).
+    let explicit = search_body(
+        &uuid::Uuid::new_v4().to_string(),
+        "missing",
+        json!({"kind":"ids","ids":[8,1,18,8]}),
+        &indexer,
+        &client,
+    );
+    let (status, receipt) = request(base, "POST", "/api/v1/tv/wanted/search", Some(explicit)).await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(
+        command_targets(&receipt),
+        [18, 1, 8].map(|id| ("episode".to_owned(), id))
+    );
+
+    let movie_all = search_body(
+        &uuid::Uuid::new_v4().to_string(),
+        "missing",
+        json!({"kind":"all","monitored":"all"}),
+        &indexer,
+        &client,
+    );
+    let (status, receipt) = request(
+        base,
+        "POST",
+        "/api/v1/movies/wanted/search",
+        Some(movie_all),
+    )
+    .await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(
+        command_targets(&receipt),
+        [2, 4, 1].map(|id| ("movie".to_owned(), id))
+    );
+    let order = command_ids(&receipt);
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(sorted, order);
+    let available = search_body(
+        &uuid::Uuid::new_v4().to_string(),
+        "missing",
+        json!({"kind":"all","monitored":"all","availability":"available"}),
+        &indexer,
+        &client,
+    );
+    let (status, receipt) = request(
+        base,
+        "POST",
+        "/api/v1/movies/wanted/search",
+        Some(available),
+    )
+    .await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(
+        (
+            receipt["matched"].as_i64(),
+            receipt["skipped_active"].as_i64()
+        ),
+        (Some(2), Some(2)),
+        "availability-filtered capture uses the same order: {receipt}"
+    );
+}
+
+#[tokio::test]
+async fn native_last_search_records_dispatch_with_caught_failure_never_admission_or_cancel() {
+    let app = app().await;
+    seed(&app).await;
+    let base = &app.base;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    let admit = async |path: &str, ids: Value| {
+        let (status, receipt) = request(
+            base,
+            "POST",
+            path,
+            Some(search_body(
+                &uuid::Uuid::new_v4().to_string(),
+                "missing",
+                json!({"kind":"ids","ids":ids}),
+                &indexer,
+                &client,
+            )),
+        )
+        .await;
+        assert_eq!(status, 202, "{receipt}");
+        receipt["commands"][0]["command_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Equal numeric targets in both domains, plus an episode whose search is cancelled before
+    // any worker exists. Admission alone writes nothing.
+    let episode = admit("/api/v1/tv/wanted/search", json!([1])).await;
+    let movie = admit("/api/v1/movies/wanted/search", json!([1])).await;
+    let cancelled = admit("/api/v1/tv/wanted/search", json!([18])).await;
+    let (status, row) = request(
+        base,
+        "POST",
+        &format!("/api/v1/search/commands/{cancelled}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, &row["status"]),
+        (200, &json!("cancelled")),
+        "{row}"
+    );
+    assert_eq!(native_count(&c, "episodes").await, 0);
+    assert_eq!(native_count(&c, "movies").await, 0);
+    assert!(
+        item_by_id(&get(base, "/api/v1/tv/wanted/missing").await, 1)["last_search_time"].is_null()
+    );
+
+    // The owned indexer peer answers 404: the dispatch completes with a caught, classified
+    // indexer failure, which still records the fact before the command settles.
+    let runtime = hrrdarr::commands::start(app.db.clone(), app.client.clone())
+        .await
+        .unwrap();
+    let read = async |id: &str| {
+        let (status, row) =
+            request(base, "GET", &format!("/api/v1/search/commands/{id}"), None).await;
+        assert_eq!(status, 200, "{row}");
+        row
+    };
+    let mut rows = Vec::new();
+    for id in [&episode, &movie] {
+        let row = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let row = read(id).await;
+                if !row["dispatch_completed_at"].is_null()
+                    && row["status"] != "running"
+                    && row["status"] != "queued"
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("dispatch completion deadline");
+        assert!(
+            matches!(row["status"].as_str(), Some("retry_wait" | "failed")),
+            "{row}"
+        );
+        // An indexer-side classification, not a pre-dispatch refusal or local failure.
+        assert!(
+            !matches!(
+                row["error_code"].as_str(),
+                None | Some("provider_changed" | "target_changed" | "storage_error")
+            ),
+            "{row}"
+        );
+        eprintln!("wanted_dispatch_failure_code={}", row["error_code"]);
+        assert_eq!(row["fetch_complete"], false, "{row}");
+        // Stop retries; a later attempt may still be in flight, so ignore a 409 here.
+        request(
+            base,
+            "POST",
+            &format!("/api/v1/search/commands/{id}/cancel"),
+            None,
+        )
+        .await;
+        rows.push(row);
+    }
+    runtime.shutdown().await;
+    let episode_row = read(&episode).await;
+    let movie_row = read(&movie).await;
+    let episode_at = native_at(&c, "episodes", 1).await.expect("episode fact");
+    let movie_at = native_at(&c, "movies", 1).await.expect("movie fact");
+    assert_eq!(
+        Some(episode_at),
+        episode_row["dispatch_completed_at"].as_i64(),
+        "fact and command progress commit together"
+    );
+    assert_eq!(Some(movie_at), movie_row["dispatch_completed_at"].as_i64());
+    assert!(rows[0]["dispatch_completed_at"].as_i64().unwrap() <= episode_at);
+    assert!(
+        episode_row["started_at"].as_i64().unwrap() <= episode_at
+            && episode_at >= episode_row["created_at"].as_i64().unwrap()
+    );
+    assert_eq!(
+        (
+            native_count(&c, "episodes").await,
+            native_count(&c, "movies").await
+        ),
+        (1, 1),
+        "only the dispatched typed targets"
+    );
+    let cancelled_row = read(&cancelled).await;
+    assert!(cancelled_row["dispatch_completed_at"].is_null());
+    assert!(cancelled_row["started_at"].is_null(), "{cancelled_row}");
+    assert_eq!(native_at(&c, "episodes", 18).await, None);
+
+    let expected = chrono::DateTime::from_timestamp(episode_at, 0)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let tv = get(base, "/api/v1/tv/wanted/missing?sort=last_search").await;
+    assert_eq!(ids(&tv), [5, 18, 1], "{tv}");
+    assert_eq!(item_by_id(&tv, 1)["last_search_time"], expected);
+    assert_eq!(item_by_id(&tv, 1)["last_search_source"], "native");
+    let movies = get(base, "/api/v1/movies/wanted/missing?sort=last_search").await;
+    assert_eq!(ids(&movies), [2, 1], "{movies}");
+    assert!(item_by_id(&movies, 1)["last_search_time"].is_string());
 }

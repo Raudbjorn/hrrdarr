@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {defaultOptions,sortChoices,wantedQuery,episodeLabel,formatDate,searchBody,selectedIds,receiptSummary,retainVisible,cutoffLabel,monitoredLabel,availabilityLabel} from '../src/lib/wanted-view.ts';
+import {defaultOptions,sortChoices,wantedQuery,episodeLabel,formatDate,formatDateTime,lastSearchLabel,searchBody,selectedIds,receiptSummary,retainVisible,cutoffLabel,monitoredLabel,availabilityLabel} from '../src/lib/wanted-view.ts';
 
-const episode={target:{media_type:'episode',id:7},series_id:1,series_title:'Harbor',series_monitored:true,series_type:'standard',season:1,season_monitored:true,number:2,absolute_episode_number:14,scene_season_number:null,scene_episode_number:null,scene_absolute_episode_number:null,title:'Pilot',monitored:true,effective_monitored:true,air_date:null,air_date_utc:'2020-01-01T00:00:00Z',aired_end_at:1577838600,last_search_time:null,profile_id:1,file:null,cutoff:null};
+const episode={target:{media_type:'episode',id:7},series_id:1,series_title:'Harbor',series_monitored:true,series_type:'standard',season:1,season_monitored:true,number:2,absolute_episode_number:14,scene_season_number:null,scene_episode_number:null,scene_absolute_episode_number:null,title:'Pilot',monitored:true,effective_monitored:true,air_date:null,air_date_utc:'2020-01-01T00:00:00Z',aired_end_at:1577838600,last_search_time:null,last_search_source:null,profile_id:1,file:null,cutoff:null};
 
 test('defaults differ by domain and match the server',()=>{
   assert.deepEqual(defaultOptions('tv'),{limit:50,offset:0,monitored:'monitored',sort:'air_date',direction:'asc',availability:'all'});
@@ -10,7 +10,9 @@ test('defaults differ by domain and match the server',()=>{
 });
 
 test('sort choices only include server-supported keys',()=>{
-  assert.deepEqual(sortChoices('tv','missing').map(c=>c.value),['air_date','series_title']);
+  assert.deepEqual(sortChoices('tv','missing').map(c=>c.value),['air_date','series_title','last_search']);
+  assert.deepEqual(sortChoices('movies','cutoff').map(c=>c.value),['title','year','in_cinemas','digital_release','physical_release','last_search','quality']);
+  for(const domain of ['tv','movies'])for(const kind of ['missing','cutoff'])assert.ok(sortChoices(domain,kind).some(c=>c.value==='last_search'&&c.label==='Last searched'));
   assert.ok(sortChoices('tv','cutoff').some(c=>c.value==='quality'));
   assert.ok(!sortChoices('movies','missing').some(c=>c.value==='quality'||c.value==='air_date'));
 });
@@ -55,4 +57,13 @@ test('search bodies and selections are canonical',()=>{
 test('receipt summaries state counts and replay honestly',()=>{
   assert.equal(receiptSummary({request_id:'r',media_type:'tv',kind:'missing',replayed:false,matched:3,skipped_active:1,admitted:2,commands:[]}),'Queued 2 episodes for automatic search; 3 matched; 1 skipped because a search is already active.');
   assert.equal(receiptSummary({request_id:'r',media_type:'movies',kind:'cutoff',replayed:true,matched:null,skipped_active:null,admitted:1,commands:[]}),'Earlier identical request read back: 1 movie already queued for search.');
+});
+
+test('last search labels distinguish never, native and imported facts in UTC',()=>{
+  assert.equal(lastSearchLabel(episode),'Never searched');
+  assert.equal(lastSearchLabel({...episode,last_search_time:'2023-11-14T22:13:20Z',last_search_source:'native'}),'2023-11-14 22:13 UTC');
+  assert.equal(lastSearchLabel({...episode,last_search_time:'2024-01-01T00:00:00Z',last_search_source:'imported'}),'2024-01-01 00:00 UTC (imported)');
+  assert.equal(lastSearchLabel({...episode,last_search_time:'garbage',last_search_source:'native'}),'Never searched');
+  assert.equal(formatDateTime(null),null);
+  assert.equal(new URLSearchParams(wantedQuery('movies','cutoff',{...defaultOptions('movies'),sort:'last_search',direction:'desc'})).get('sort'),'last_search');
 });

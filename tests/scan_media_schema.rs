@@ -149,12 +149,13 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         } else {
             ""
         };
-        // Reasoning: 0069 appends snapshot_imports.collection_version after this predecessor; every
-        // predecessor column stays in the witness and the new inactive marker is excluded.
-        let columns = if table == "snapshot_imports" {
+        // Reasoning: 0069 appends snapshot_imports.collection_version and 0076 appends
+        // episodes/movies.native_last_search_at after this predecessor; every predecessor column
+        // stays in the witness and only those appended columns are excluded.
+        let columns = if matches!(table, "snapshot_imports" | "episodes" | "movies") {
             let mut names = Vec::new();
             let mut rows = c
-                .query("SELECT name FROM pragma_table_info('snapshot_imports') WHERE name!='collection_version' ORDER BY cid", ())
+                .query(&format!("SELECT name FROM pragma_table_info('{table}') WHERE name NOT IN ('collection_version','native_last_search_at') ORDER BY cid"), ())
                 .await?;
             while let Some(row) = rows.next().await? {
                 names.push(row.get::<String>(0)?);
@@ -182,7 +183,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        75 // Reasoning: latest is migration file 0075 downloadstation at position 75, appended after 0074 flood; historical prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0076 wanted_last_search at position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;
