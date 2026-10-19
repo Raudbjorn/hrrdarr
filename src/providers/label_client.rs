@@ -25,6 +25,7 @@ use serde::Serialize;
 use std::{collections::BTreeSet, future::Future};
 
 pub mod deluge;
+pub mod rtorrent;
 
 pub type LabelError = QbitError;
 type Result<T> = std::result::Result<T, LabelError>;
@@ -719,6 +720,7 @@ pub(crate) async fn control_with<W: Wire>(
     wire.control(&expected, &action)
         .await
         .map_err(|error| match error {
+            QbitError::UnsupportedFeature | QbitError::InvalidRequest => error,
             QbitError::Http(
                 HttpError::Authentication
                 | HttpError::RateLimited { .. }
@@ -753,6 +755,14 @@ macro_rules! with_wire {
         match $settings {
             ProviderSettings::Deluge { endpoint, .. } => {
                 let mut $wire = $crate::providers::label_client::deluge::DelugeWire::new(
+                    $operation,
+                    endpoint,
+                    $credentials,
+                )?;
+                $body
+            }
+            ProviderSettings::Rtorrent { endpoint, .. } => {
+                let mut $wire = $crate::providers::label_client::rtorrent::RtorrentWire::new(
                     $operation,
                     endpoint,
                     $credentials,

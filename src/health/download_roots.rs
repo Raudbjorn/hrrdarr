@@ -57,7 +57,7 @@ pub(super) async fn evaluate(
     for (id, revision, implementation) in providers {
         if !matches!(
             implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget" | "deluge"
+            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget" | "deluge" | "rtorrent"
         ) {
             failed.get_or_insert("check_failed");
             continue;

@@ -350,8 +350,10 @@ impl Credentials {
         match self {
             // Transmission, NZBGet and the cookie-based torrent feed do not take an API key.
             Self::ApiKey { api_key } => {
-                !matches!(implementation, "transmission" | "nzbget" | "torrentrss")
-                    && valid(api_key)
+                !matches!(
+                    implementation,
+                    "transmission" | "nzbget" | "torrentrss" | "rtorrent"
+                ) && valid(api_key)
             }
             Self::Feed {
                 cookie,
@@ -380,8 +382,10 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                matches!(implementation, "qbittorrent" | "transmission" | "nzbget")
-                    && valid(username)
+                matches!(
+                    implementation,
+                    "qbittorrent" | "transmission" | "nzbget" | "rtorrent"
+                ) && valid(username)
                     && valid(password)
             }
         }
