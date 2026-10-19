@@ -599,3 +599,48 @@ export const testAllNotifications = () => request<NotificationTestAllResult>('/a
 export const listNotificationDeliveries = (limit = 20) => Number.isInteger(limit) && limit >= 1 && limit <= 200
   ? request<NotificationDeliveryList>(`/api/v1/notifications/deliveries?limit=${limit}`, undefined, undefined, true)
   : Promise.resolve<Result<NotificationDeliveryList>>({ ok: false, error: 'Limit must be 1 to 200.' });
+
+// Import lists: schema-driven forms, test, sync runs, per-list items and exclusions.
+import type { ImportList, ImportListInput, ImportListCollection, ImportListImplementationCollection, ImportListTestInput, ImportListTestResult, ImportListRun, ImportListRunCollection, ImportListSyncAll, ImportListItemPage, ImportListExclusion, ImportListExclusionInput, ImportListExclusionPage } from './api.generated';
+export const IMPORT_LIST_ITEM_STATES = ['pending', 'added', 'existing', 'excluded', 'unresolved', 'failed'] as const;
+export const IMPORT_LIST_MAX_BULK_DELETE = 500;
+const IL = '/api/v1/importlist';
+const badListId = <T>(): Promise<Result<T>> => Promise.resolve({ ok: false, error: 'Import list ID must be a UUID.' });
+const badIlArg = <T>(error: string): Promise<Result<T>> => Promise.resolve({ ok: false, error });
+const ilPage = (limit: number, offset: number, max: number) => Number.isInteger(limit) && limit >= 1 && limit <= max && Number.isInteger(offset) && offset >= 0 && offset <= 1_000_000;
+export const listImportLists = () => request<ImportListCollection>(IL, undefined, undefined, true);
+export const getImportListSchema = () => request<ImportListImplementationCollection>(`${IL}/schema`, undefined, undefined, true);
+export const createImportList = (input: ImportListInput) => request<ImportList>(IL, input, 'POST', true);
+export const updateImportList = (id: string, input: ImportListInput) => validUuid(id) ? request<ImportList>(`${IL}/${id}`, input, 'PUT', true) : badListId<ImportList>();
+export const deleteImportList = (id: string) => validUuid(id) ? request<void>(`${IL}/${id}`, undefined, 'DELETE', true) : badListId<void>();
+export const testImportListDraft = (input: ImportListTestInput) => input.existing_id !== undefined && !validUuid(input.existing_id) ? badListId<ImportListTestResult>() : request<ImportListTestResult>(`${IL}/test`, input, 'POST', true, 60_000);
+export const testSavedImportList = (id: string) => validUuid(id) ? request<ImportListTestResult>(`${IL}/${id}/test`, undefined, 'POST', true, 60_000) : badListId<ImportListTestResult>();
+export const syncImportList = (id: string) => validUuid(id) ? request<ImportListRun>(`${IL}/${id}/sync`, undefined, 'POST', true, 60_000) : badListId<ImportListRun>();
+export const syncAllImportLists = () => request<ImportListSyncAll>(`${IL}/sync`, undefined, 'POST', true, 60_000);
+export const listImportListRuns = (id: string, limit = 10) => !validUuid(id) ? badListId<ImportListRunCollection>()
+  : Number.isInteger(limit) && limit >= 1 && limit <= 32 ? request<ImportListRunCollection>(`${IL}/${id}/runs?limit=${limit}`, undefined, undefined, true)
+  : badIlArg<ImportListRunCollection>('Limit must be 1 to 32.');
+export const listImportListItems = (id: string, query: { state?: string; limit?: number; offset?: number } = {}) => {
+  const { state, limit = 50, offset = 0 } = query;
+  if (!validUuid(id)) return badListId<ImportListItemPage>();
+  if (state !== undefined && !(IMPORT_LIST_ITEM_STATES as readonly string[]).includes(state)) return badIlArg<ImportListItemPage>('Unknown item state.');
+  if (!ilPage(limit, offset, 500)) return badIlArg<ImportListItemPage>('Limit must be 1 to 500 and offset a non-negative integer.');
+  const params = new URLSearchParams();
+  if (state !== undefined) params.set('state', state);
+  params.set('limit', String(limit)); params.set('offset', String(offset));
+  return request<ImportListItemPage>(`${IL}/${id}/items?${params}`, undefined, undefined, true);
+};
+export const listImportListExclusions = (query: { media_type?: MediaDomain; limit?: number; offset?: number } = {}) => {
+  const { media_type, limit = 50, offset = 0 } = query;
+  if (media_type !== undefined && media_type !== 'tv' && media_type !== 'movies') return badIlArg<ImportListExclusionPage>('Unknown media type.');
+  if (!ilPage(limit, offset, 500)) return badIlArg<ImportListExclusionPage>('Limit must be 1 to 500 and offset a non-negative integer.');
+  const params = new URLSearchParams();
+  if (media_type !== undefined) params.set('media_type', media_type);
+  params.set('limit', String(limit)); params.set('offset', String(offset));
+  return request<ImportListExclusionPage>(`${IL}/exclusions?${params}`, undefined, undefined, true);
+};
+export const addImportListExclusion = (input: ImportListExclusionInput) => request<ImportListExclusion>(`${IL}/exclusions`, input, 'POST', true);
+export const deleteImportListExclusion = (id: number) => validId(id) ? request<void>(`${IL}/exclusions/${id}`, undefined, 'DELETE', true) : invalid<void>();
+export const bulkDeleteImportListExclusions = (ids: number[]) => Array.isArray(ids) && ids.length >= 1 && ids.length <= IMPORT_LIST_MAX_BULK_DELETE && ids.every(validId) && new Set(ids).size === ids.length
+  ? request<void>(`${IL}/exclusions/bulk`, { ids }, 'DELETE', true)
+  : badIlArg<void>(`Choose 1 to ${IMPORT_LIST_MAX_BULK_DELETE} distinct exclusions.`);
