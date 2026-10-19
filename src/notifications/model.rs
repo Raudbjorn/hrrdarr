@@ -270,6 +270,7 @@ pub struct Delivery {
     pub event_sequence: i64,
     pub notification_id: Uuid,
     pub event_kind: String,
+    // The scope that matched at fan-out; a system event reports the domain it was sent for.
     pub media_type: Option<MediaDomain>,
     pub state: String,
     pub attempts: i64,

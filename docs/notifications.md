@@ -76,8 +76,11 @@ attempts; permanent failures (4xx, 401/403, redirect, invalid config, script fai
 Custom scripts are never retried automatically (they may not be idempotent).
 
 A delivery that is several requests (ntfy topics, Pushbullet devices and channels, Emby/Jellyfin
-notify plus library update) records a fingerprint of each acknowledged request in `sent_parts`, so
-a retry sends only the requests that were not acknowledged. A request that timed out may still have
+notify plus library update) records a 64-bit identity of each acknowledged request in `sent_parts`,
+so a retry sends only the requests that were not acknowledged. Requests can carry secrets, so the
+identity is an HMAC under a sub-key derived from the credential key: reading the database does not
+allow checking guessed secrets against it. Without a credential key no secret can be stored, and a
+plain digest is used. Rotating the key re-sends parts of a delivery still being retried. A request that timed out may still have
 arrived, so this narrows duplicates rather than excluding them. Plex refreshes are not tracked: they
 follow a fresh section listing and repeating one is harmless.
 

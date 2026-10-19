@@ -208,7 +208,7 @@ async fn deliveries(
     let c = d.store.db.connect().await?;
     let mut rows = c
         .query(
-            "SELECT d.id,d.event_sequence,d.notification_id,e.kind,e.scope,d.state,d.attempts,d.next_attempt_at,d.last_error,d.created_at,d.completed_at FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence ORDER BY d.id DESC LIMIT ?",
+            "SELECT d.id,d.event_sequence,d.notification_id,e.kind,d.media_type,d.state,d.attempts,d.next_attempt_at,d.last_error,d.created_at,d.completed_at FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence ORDER BY d.id DESC LIMIT ?",
             [limit],
         )
         .await?;
