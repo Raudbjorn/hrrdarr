@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     for op in &operations {
         let r = c
             .query(

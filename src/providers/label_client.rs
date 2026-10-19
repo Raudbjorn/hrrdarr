@@ -26,6 +26,7 @@ use std::{collections::BTreeSet, future::Future};
 
 pub mod deluge;
 pub mod rtorrent;
+pub mod utorrent;
 
 pub type LabelError = QbitError;
 type Result<T> = std::result::Result<T, LabelError>;
@@ -763,6 +764,14 @@ macro_rules! with_wire {
             }
             ProviderSettings::Rtorrent { endpoint, .. } => {
                 let mut $wire = $crate::providers::label_client::rtorrent::RtorrentWire::new(
+                    $operation,
+                    endpoint,
+                    $credentials,
+                )?;
+                $body
+            }
+            ProviderSettings::Utorrent { endpoint, .. } => {
+                let mut $wire = $crate::providers::label_client::utorrent::UtorrentWire::new(
                     $operation,
                     endpoint,
                     $credentials,

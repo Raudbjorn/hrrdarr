@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,

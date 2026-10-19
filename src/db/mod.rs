@@ -301,6 +301,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "rtorrent",
         include_str!("../../migrations/0071_rtorrent.sql"),
     ),
+    // uTorrent registry row, file 0072.
+    (
+        "utorrent",
+        include_str!("../../migrations/0072_utorrent.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -963,3 +968,5 @@ mod rtorrent_registry_tests;
 mod torrent_rss_tests;
 #[cfg(test)]
 mod transmission_registry_tests;
+#[cfg(test)]
+mod utorrent_registry_tests;

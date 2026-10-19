@@ -352,7 +352,7 @@ impl Credentials {
             Self::ApiKey { api_key } => {
                 !matches!(
                     implementation,
-                    "transmission" | "nzbget" | "torrentrss" | "rtorrent"
+                    "transmission" | "nzbget" | "torrentrss" | "rtorrent" | "utorrent"
                 ) && valid(api_key)
             }
             Self::Feed {
@@ -384,7 +384,7 @@ impl Credentials {
             Self::UsernamePassword { username, password } => {
                 matches!(
                     implementation,
-                    "qbittorrent" | "transmission" | "nzbget" | "rtorrent"
+                    "qbittorrent" | "transmission" | "nzbget" | "rtorrent" | "utorrent"
                 ) && valid(username)
                     && valid(password)
             }

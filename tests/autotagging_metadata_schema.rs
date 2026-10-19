@@ -557,7 +557,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        71 // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+        72 // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -699,7 +699,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        71 // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+        72 // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        71 // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+        72 // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     );
     Ok(())
 }

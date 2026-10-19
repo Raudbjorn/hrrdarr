@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

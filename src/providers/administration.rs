@@ -33,6 +33,7 @@ impl ProviderKind {
                     | ProviderSettings::Transmission { .. }
                     | ProviderSettings::Deluge { .. }
                     | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Utorrent { .. }
             ) | (
                 Self::Indexer,
                 ProviderSettings::Torznab { .. }
@@ -73,7 +74,8 @@ impl ProviderFilter {
                 | ProviderSettings::Nzbget { .. }
                 | ProviderSettings::Transmission { .. }
                 | ProviderSettings::Deluge { .. }
-                | ProviderSettings::Rtorrent { .. }),
+                | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Utorrent { .. }),
                 media,
             ) => settings.client_scoped(media),
         };
@@ -150,6 +152,7 @@ pub enum ProviderImplementation {
     Transmission,
     Deluge,
     Rtorrent,
+    Utorrent,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -209,7 +212,8 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Transmission
         | ProviderImplementation::Torrentrss
         | ProviderImplementation::Deluge
-        | ProviderImplementation::Rtorrent => vec![],
+        | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Utorrent => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -446,6 +450,20 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://rtorrent.example/RPC2".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Utorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://utorrent.example:8080/gui".into(),
                 },
             },
         ],

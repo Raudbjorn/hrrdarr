@@ -173,7 +173,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {

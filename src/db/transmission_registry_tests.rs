@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -140,6 +140,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     for (name, kind, protocol) in [
         ("deluge", "download_client", "torrent"),
         ("rtorrent", "download_client", "torrent"),
+        ("utorrent", "download_client", "torrent"),
         ("nzbget", "download_client", "usenet"),
         ("transmission", "download_client", "torrent"),
         ("torrentrss", "indexer", "torrent"),
@@ -281,6 +282,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     Ok(())
 }

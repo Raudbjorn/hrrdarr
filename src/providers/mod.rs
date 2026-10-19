@@ -548,12 +548,13 @@ pub(crate) enum Protocol {
     Torrent,
     Usenet,
 }
+/// Implementations on the shared label-torrent engine, in registry order.
+pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 3] = ["deluge", "rtorrent", "utorrent"];
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
-            "torznab" | "torrentrss" | "qbittorrent" | "transmission" | "deluge" | "rtorrent" => {
-                Some(Self::Torrent)
-            }
+            "torznab" | "torrentrss" | "qbittorrent" | "transmission" => Some(Self::Torrent),
+            label if LABEL_IMPLEMENTATIONS.contains(&label) => Some(Self::Torrent),
             "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
             _ => None,
         }
@@ -634,6 +635,15 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    /// Endpoint is the uTorrent Web UI base (for example `http://host:8080/gui`). Basic
+    /// credentials are required; torrents are labelled with uTorrent labels.
+    Utorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -647,6 +657,7 @@ impl ProviderSettings {
             Self::Torrentrss { .. } => "torrentrss",
             Self::Deluge { .. } => "deluge",
             Self::Rtorrent { .. } => "rtorrent",
+            Self::Utorrent { .. } => "utorrent",
         }
     }
     fn endpoint(&self) -> &str {
@@ -659,7 +670,8 @@ impl ProviderSettings {
             | Self::Transmission { endpoint, .. }
             | Self::Torrentrss { endpoint, .. }
             | Self::Deluge { endpoint, .. }
-            | Self::Rtorrent { endpoint, .. } => endpoint,
+            | Self::Rtorrent { endpoint, .. }
+            | Self::Utorrent { endpoint, .. } => endpoint,
         }
     }
     pub(crate) fn protocol(&self) -> Protocol {
@@ -669,7 +681,8 @@ impl ProviderSettings {
             | Self::Qbittorrent { .. }
             | Self::Transmission { .. }
             | Self::Deluge { .. }
-            | Self::Rtorrent { .. } => Protocol::Torrent,
+            | Self::Rtorrent { .. }
+            | Self::Utorrent { .. } => Protocol::Torrent,
             Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
@@ -685,11 +698,37 @@ impl ProviderSettings {
     /// The TV and movie scopes of a label-torrent client (one arm per client of the family).
     fn label_pair(&self) -> Option<(&Option<TorrentLabelScope>, &Option<TorrentLabelScope>)> {
         match self {
-            Self::Deluge { tv, movies, .. } | Self::Rtorrent { tv, movies, .. } => {
-                Some((tv, movies))
-            }
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => Some((tv, movies)),
             _ => None,
         }
+    }
+    /// A label-torrent client by registry name (one arm per client of the family).
+    fn from_label_parts(
+        implementation: &str,
+        endpoint: String,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        Some(match implementation {
+            "deluge" => Self::Deluge {
+                endpoint,
+                tv,
+                movies,
+            },
+            "rtorrent" => Self::Rtorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            "utorrent" => Self::Utorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            _ => return None,
+        })
     }
     /// The same client with other label scopes (one arm per client of the family).
     fn relabelled(
@@ -704,6 +743,11 @@ impl ProviderSettings {
                 movies,
             }),
             Self::Rtorrent { endpoint, .. } => Some(Self::Rtorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Utorrent { endpoint, .. } => Some(Self::Utorrent {
                 endpoint: endpoint.clone(),
                 tv,
                 movies,
@@ -906,7 +950,9 @@ impl ProviderSettings {
                     }
                 }
             }
-            Self::Deluge { tv, movies, .. } | Self::Rtorrent { tv, movies, .. } => {
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
                     return Err(bad());
                 }
@@ -2454,7 +2500,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             } else {
                 movie_torrent = Some(item)
             }
-        } else if implementation == "deluge" || implementation == "rtorrent" {
+        } else if LABEL_IMPLEMENTATIONS.contains(&implementation.as_str()) {
             let item = TorrentLabelScope {
                 category: scope.get(3)?,
                 recent_priority: TorrentQueuePriority::stored(scope.get::<i64>(5)?)?,
@@ -2596,17 +2642,8 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_torrent,
             movies: movie_torrent,
         },
-        "deluge" => ProviderSettings::Deluge {
-            endpoint,
-            tv: tv_label,
-            movies: movie_label,
-        },
-        "rtorrent" => ProviderSettings::Rtorrent {
-            endpoint,
-            tv: tv_label,
-            movies: movie_label,
-        },
-        _ => return Err(corrupt()),
+        label => ProviderSettings::from_label_parts(label, endpoint, tv_label, movie_label)
+            .ok_or_else(corrupt)?,
     };
     settings.validate().map_err(|_| corrupt())?;
     let credentials: Option<Vec<u8>> = row.get(6)?;
@@ -2672,7 +2709,8 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
         ProviderSettings::Deluge { tv, movies, .. }
-        | ProviderSettings::Rtorrent { tv, movies, .. } => [
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => [
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
@@ -2783,7 +2821,8 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             }
         }
         ProviderSettings::Deluge { tv, movies, .. }
-        | ProviderSettings::Rtorrent { tv, movies, .. } => {
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
                 .map(|s| ("tv", s))
@@ -2900,7 +2939,8 @@ impl HealthConfigurationChanges {
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Deluge { tv, movies, .. }
-                | ProviderSettings::Rtorrent { tv, movies, .. } => {
+                | ProviderSettings::Rtorrent { tv, movies, .. }
+                | ProviderSettings::Utorrent { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }

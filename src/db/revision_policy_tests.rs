@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 71); // Reasoning: latest is migration file 0071 rtorrent at position 71, appended after 0070 deluge; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 72); // Reasoning: latest is migration file 0072 utorrent at position 72, appended after 0071 rtorrent; historical prefixes stay fixed.
     Ok(())
 }
