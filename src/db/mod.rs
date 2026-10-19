@@ -306,6 +306,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "utorrent",
         include_str!("../../migrations/0072_utorrent.sql"),
     ),
+    // Aria2 registry row, file 0073.
+    ("aria2", include_str!("../../migrations/0073_aria2.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -953,6 +955,8 @@ mod indexer_client_tests;
 #[cfg(test)]
 mod indexer_backoff_tests;
 
+#[cfg(test)]
+mod aria2_registry_tests;
 #[cfg(test)]
 mod deluge_registry_tests;
 #[cfg(test)]

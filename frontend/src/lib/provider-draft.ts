@@ -13,10 +13,10 @@ export function matchesPendingProvider(provider:Provider,pending:PendingProvider
 // Transfer protocol per implementation; mirrors the server's provider_implementations registry.
 // The server remains authoritative: a mismatched grab or binding is rejected with protocol_mismatch.
 export type TransferProtocol='torrent'|'usenet';
-const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',torrentrss:'torrent',qbittorrent:'torrent',transmission:'torrent',deluge:'torrent',rtorrent:'torrent',utorrent:'torrent',newznab:'usenet',sabnzbd:'usenet',nzbget:'usenet'};
+const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',torrentrss:'torrent',qbittorrent:'torrent',transmission:'torrent',deluge:'torrent',rtorrent:'torrent',utorrent:'torrent',aria2:'torrent',newznab:'usenet',sabnzbd:'usenet',nzbget:'usenet'};
 export const protocolOf=(implementation:ProviderImplementation):TransferProtocol=>protocols[implementation];
 export const isIndexerImplementation=(implementation:ProviderImplementation):implementation is 'torznab'|'newznab'=>implementation==='torznab'||implementation==='newznab';
-export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'nzbget'|'transmission'|'deluge'|'rtorrent'|'utorrent'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='nzbget'||implementation==='transmission'||implementation==='deluge'||implementation==='rtorrent'||implementation==='utorrent';
+export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'nzbget'|'transmission'|'deluge'|'rtorrent'|'utorrent'|'aria2'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='nzbget'||implementation==='transmission'||implementation==='deluge'||implementation==='rtorrent'||implementation==='utorrent'||implementation==='aria2';
 export const isIndexer=(provider:Provider)=>isIndexerImplementation(provider.settings.implementation);
 export const isDownloadClient=(provider:Provider)=>isClientImplementation(provider.settings.implementation);
 export function indexerScope(provider:Provider|null,domain:MediaDomain) {

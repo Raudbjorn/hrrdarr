@@ -549,7 +549,7 @@ pub(crate) enum Protocol {
     Usenet,
 }
 /// Implementations on the shared label-torrent engine, in registry order.
-pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 3] = ["deluge", "rtorrent", "utorrent"];
+pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 4] = ["deluge", "rtorrent", "utorrent", "aria2"];
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
@@ -644,6 +644,15 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    /// Endpoint is the aria2 JSON-RPC URL (usually `http://host:6800/jsonrpc`). The optional RPC
+    /// secret is an API-key credential. A domain is the subfolder `<default dir>/<label>`.
+    Aria2 {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -658,6 +667,7 @@ impl ProviderSettings {
             Self::Deluge { .. } => "deluge",
             Self::Rtorrent { .. } => "rtorrent",
             Self::Utorrent { .. } => "utorrent",
+            Self::Aria2 { .. } => "aria2",
         }
     }
     fn endpoint(&self) -> &str {
@@ -671,6 +681,7 @@ impl ProviderSettings {
             | Self::Torrentrss { endpoint, .. }
             | Self::Deluge { endpoint, .. }
             | Self::Rtorrent { endpoint, .. }
+            | Self::Aria2 { endpoint, .. }
             | Self::Utorrent { endpoint, .. } => endpoint,
         }
     }
@@ -682,6 +693,7 @@ impl ProviderSettings {
             | Self::Transmission { .. }
             | Self::Deluge { .. }
             | Self::Rtorrent { .. }
+            | Self::Aria2 { .. }
             | Self::Utorrent { .. } => Protocol::Torrent,
             Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
@@ -700,6 +712,7 @@ impl ProviderSettings {
         match self {
             Self::Deluge { tv, movies, .. }
             | Self::Rtorrent { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
             | Self::Utorrent { tv, movies, .. } => Some((tv, movies)),
             _ => None,
         }
@@ -727,6 +740,11 @@ impl ProviderSettings {
                 tv,
                 movies,
             },
+            "aria2" => Self::Aria2 {
+                endpoint,
+                tv,
+                movies,
+            },
             _ => return None,
         })
     }
@@ -748,6 +766,11 @@ impl ProviderSettings {
                 movies,
             }),
             Self::Utorrent { endpoint, .. } => Some(Self::Utorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Aria2 { endpoint, .. } => Some(Self::Aria2 {
                 endpoint: endpoint.clone(),
                 tv,
                 movies,
@@ -952,6 +975,7 @@ impl ProviderSettings {
             }
             Self::Deluge { tv, movies, .. }
             | Self::Rtorrent { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
             | Self::Utorrent { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
                     return Err(bad());
@@ -2710,6 +2734,7 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         ],
         ProviderSettings::Deluge { tv, movies, .. }
         | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
         | ProviderSettings::Utorrent { tv, movies, .. } => [
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
@@ -2822,6 +2847,7 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         }
         ProviderSettings::Deluge { tv, movies, .. }
         | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
         | ProviderSettings::Utorrent { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
@@ -2940,6 +2966,7 @@ impl HealthConfigurationChanges {
                 }
                 ProviderSettings::Deluge { tv, movies, .. }
                 | ProviderSettings::Rtorrent { tv, movies, .. }
+                | ProviderSettings::Aria2 { tv, movies, .. }
                 | ProviderSettings::Utorrent { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
