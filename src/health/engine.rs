@@ -155,6 +155,8 @@ pub(crate) async fn sweep(c: &Connection, timestamp: i64) -> Result<()> {
     if life.started_at == 0 {
         return Ok(());
     }
+    indexer_status_expiry(c, timestamp).await?;
+    client_backoff_expiry(c, timestamp).await?;
     let scheduled = if life.next_scheduled_at <= timestamp {
         selection(c, HealthScope::All, "scheduled=1").await?
     } else {
@@ -200,25 +202,6 @@ pub(crate) async fn sweep(c: &Connection, timestamp: i64) -> Result<()> {
         )
         .await?;
         mark(c, &grace, GRACE, timestamp).await?;
-    }
-    // A persisted cooldown expiry is consumed once and re-observes only its own identity;
-    // publication rearms it from the stored status, independent of other pending work.
-    let expired = selection(c, HealthScope::All, &format!("next_expiry_at<={timestamp}")).await?;
-    if !expired.is_empty() {
-        if expired.iter().any(|key| key.generation >= MAX_INTEGER) {
-            c.execute(
-                "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1",
-                (),
-            )
-            .await?;
-            return Ok(());
-        }
-        c.execute(
-            "UPDATE health_checks SET next_expiry_at=NULL WHERE next_expiry_at<=?",
-            [timestamp],
-        )
-        .await?;
-        mark(c, &expired, SCHEDULED, timestamp).await?;
     }
     let keys = selection(c, HealthScope::All, &format!("due_at<={timestamp}")).await?;
     match enqueue(c, &keys, CommandPriority::Normal, false, timestamp).await {
@@ -411,7 +394,7 @@ async fn publish_outcomes(
 async fn publish_deferred(
     c: &Connection,
     cmd: &HealthCommand,
-    results: Vec<CheckOutcome>,
+    mut results: Vec<CheckOutcome>,
     cooldowns: Vec<Option<u32>>,
     timestamp: i64,
 ) -> Result<()> {
@@ -420,10 +403,17 @@ async fn publish_deferred(
         .await?;
     let outcome = async {
         if !still_running(&tx, cmd).await? { return Ok(()); }
+        // A retry delay can expire while other members await network probes.
+        client_backoff_expiry(&tx, timestamp).await?;
         // A changed input invalidates this whole attempt, including completed observations.
         let stale = tx.query("SELECT 1 FROM health_command_checks m JOIN health_checks h ON h.scope=m.scope AND h.check_key=m.check_key WHERE m.command_id=? AND (m.captured_generation IS NULL OR m.captured_generation!=h.generation) LIMIT 1", [cmd.id.to_string()]).await?.next().await?.is_some();
         if stale { return fail(&tx,cmd,timestamp,"stale_inputs").await; }
         if results.len() != cmd.members.len() || cooldowns.len() != cmd.members.len() { return Err(invariant()); }
+        for (member, result) in cmd.members.iter().zip(results.iter_mut()) {
+            if member.identity.check_key == "download_client_backoff" {
+                *result = client_backoff::evaluate(&tx, &member.identity, timestamp).await;
+            }
+        }
         let error = results.iter().find_map(|v| v.as_ref().err().copied()).map(stored_code);
         // Retrying cannot dispatch inside a cooldown; only another failure earns the retry budget.
         let deferred = |r: &CheckOutcome, s: &Option<u32>| s.is_some() && r.as_ref().err() == Some(&PROVIDER_COOLDOWN);
@@ -444,7 +434,6 @@ async fn publish_deferred(
                         _ => {}
                     }
                     tx.execute("UPDATE health_checks SET observed_generation=generation,observed_epoch=?,checked_at=?,last_error=NULL,severity=?,reason=?,message=?,wiki_url=? WHERE scope=? AND check_key=?",params![cmd.epoch.to_string(),timestamp,new.as_ref().map_or(0,|v|v.severity.number()),new.as_ref().map(|v|v.reason.clone()),new.as_ref().map(|v|v.message.clone()),new.as_ref().map(|v|v.wiki_url.clone()),member.identity.scope.text(),member.identity.check_key.clone()]).await?;
-                    backoff::rearm(&tx,&member.identity,timestamp).await?;
                 }
                 Err(code) => {
                     // Only the failed member's error changes; its observed payload remains intact.
@@ -575,11 +564,18 @@ async fn evaluate_check(
         _ => return Err("check_failed"),
     };
     match member.identity.check_key.as_str() {
-        "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
         "download_client_backoff" => {
-            backoff::evaluate(db, &member.identity, now().map_err(|_| "check_failed")?).await
+            let c = db.connect().await.map_err(|_| "storage_error")?;
+            client_backoff::evaluate(&c, &member.identity, now().map_err(|_| "check_failed")?).await
         }
+        "removed_metadata" => removed_metadata::evaluate(db, &member.identity).await,
+        "recycle_bin" => recycle_bin::evaluate(db, &member.identity).await,
+        "remote_path_mapping" => path_diagnostics::evaluate(db, client, &member.identity).await,
         "indexer_search" | "indexer_rss" => indexers::evaluate(db, &member.identity).await,
+        "indexer_status" | "indexer_failures" => {
+            indexers::evaluate_status(db, &member.identity, now().map_err(|_| "check_failed")?)
+                .await
+        }
         "indexer_download_client" => {
             Ok(crate::health_detectors::evaluate_indexer_client(db, domain)
                 .await?

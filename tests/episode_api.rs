@@ -60,6 +60,7 @@ async fn episode_http_selectors_projections_atomic_monitoring_and_budgets() -> R
     let db = Arc::new(Database::open_local(files.0.join("library.db")).await?);
     let conn = db.connect().await?;
     conn.execute_batch(r#"INSERT INTO series(id,title,path,monitored) VALUES(1,'TV','/tv',1),(2,'Other','/other',1);
+        UPDATE series SET runtime=0 WHERE id=1;
         INSERT INTO seasons VALUES(1,0,1),(1,1,1),(2,1,1);
         INSERT INTO episode_files VALUES(7,1,'/tv/pack.mkv');
         INSERT INTO episodes(id,series_id,season,number,title,episode_file_id,monitored) VALUES
@@ -130,6 +131,7 @@ async fn episode_http_selectors_projections_atomic_monitoring_and_budgets() -> R
         assert_eq!(detail[field], expected, "{field}");
     }
     assert_eq!(detail["series"]["id"], 1);
+    assert_eq!(detail["series"]["runtime"], 0);
     assert_eq!(detail["episode_file"]["path"], "/tv/pack.mkv");
     assert_eq!(detail["images"][0]["coverType"], "screenshot");
     let (_,included)=request(address,"GET","/api/v1/episodes?episode_ids=1&include_series=true&include_episode_file=true&include_images=true","").await;
@@ -138,6 +140,8 @@ async fn episode_http_selectors_projections_atomic_monitoring_and_budgets() -> R
     assert_eq!(absent["has_file"], false);
     assert!(absent["file_path"].is_null());
     assert!(absent["runtime"].is_null());
+    let (_, other) = request(address, "GET", "/api/v1/episodes/4", "").await;
+    assert!(other["series"]["runtime"].is_null());
     let (_, legacy) = request(address, "GET", "/api/v1/series/1/episodes", "").await;
     assert_eq!(legacy.as_array().unwrap().len(), 3);
     assert_eq!(

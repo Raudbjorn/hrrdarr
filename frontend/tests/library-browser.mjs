@@ -7,7 +7,7 @@ const origin = process.env.UI_URL;
 const scratch = process.env.UI_SCRATCH;
 assert.ok(origin && scratch, 'Set UI_URL and UI_SCRATCH from your owned fixture');
 assert.equal(new URL(origin).hostname, '127.0.0.1');
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_EXECUTABLE ? {executablePath: process.env.PLAYWRIGHT_EXECUTABLE} : {}) });
 const page = await browser.newPage();
 page.setDefaultTimeout(10000);
 page.on('dialog', dialog=>dialog.accept());
@@ -37,13 +37,34 @@ async function add(domain, title, path, query = 'Fixture') {
   await page.getByRole('button', {name:'Add to library', exact:true}).click();
   await page.getByRole('article').getByRole('heading', {name:title, exact:true}).waitFor();
 }
-async function prepare(source, destination) {
-  await page.getByLabel('Source file', {exact:true}).fill(source);
-  await page.getByLabel('Destination file', {exact:true}).fill(destination);
-  await page.getByRole('button', {name:'Preview import', exact:true}).click();
-  await page.getByRole('button', {name:'Execute import', exact:true}).waitFor();
+const manual = page.getByRole('region', {name:'Manual import', exact:true});
+const manualRow = id => manual.getByRole('article').filter({has:page.getByText(id,{exact:true})});
+async function receipt(id) {
+  await page.waitForFunction(id => {
+    const saved=JSON.parse(localStorage.getItem('hrrdarr.import.collection.v2')||'null');
+    return saved?.version===2 && saved.entries.some(entry=>!id || entry.operationId===id);
+  },id);
+  const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('hrrdarr.import.collection.v2')));
+  assert.equal(saved.version,2);
+  if(!id)assert.equal(saved.entries.length,1,'This scenario retains exactly its current import');
+  const entry=id?saved.entries.find(value=>value.operationId===id):saved.entries[0];
+  assert.ok(entry);assert.equal(Object.hasOwn(entry,'operation'),false,'V2 retains identity, never a cached operation observation');
+  return entry;
 }
-const receipt = () => page.evaluate(() => JSON.parse(localStorage.getItem('hrrdarr.import.receipt.v1')));
+async function actualOperation(entry) {
+  const response=await page.request.get(`${origin}/api/v1/imports/${entry.operationId}`);
+  assert.equal(response.status(),200);const operation=await response.json();
+  assert.equal(operation.id,entry.operationId);assert.deepEqual(operation.target,entry.request.target);
+  return operation;
+}
+async function prepare(source, destination) {
+  await manual.getByLabel('Source file', {exact:true}).fill(source);
+  await manual.getByLabel('Destination file', {exact:true}).fill(destination);
+  await manual.getByRole('button', {name:'Preview import', exact:true}).click();
+  const entry=await receipt();
+  await manualRow(entry.operationId).getByRole('button', {name:'Execute import', exact:true}).waitFor();
+  return entry;
+}
 async function verifyProviders() {
   const providerOrigin=process.env.UI_PROVIDER_ORIGIN;
   assert.ok(providerOrigin,'Set UI_PROVIDER_ORIGIN from the owned fixture');
@@ -72,8 +93,18 @@ async function verifyProviders() {
     if(type==='qbittorrent'){update.settings.tv.initial_state='forced';update.settings.movies.content_layout='subfolder';}
     else{update.settings.tv.anime_standard_format_search=true;update.settings.movies.remove_year=true;update.credentials={kind:'indexer',api_key:'fixture-good',tv_parameters:[{name:'private_tv',value:'fixture-tv'}],movie_parameters:[{name:'private_movie',value:'fixture-movie'}]};}
     let response=await page.request.put(`${origin}/api/v1/providers/${before.id}`,{data:update});assert.equal(response.status(),200,await response.text());
+    const independentlyUpdated = await response.json();
+    assert.equal(independentlyUpdated.revision, before.revision + 1);
+    await editor.getByText(new RegExp(`^Saved revision ${before.revision}\\.`)).waitFor();
     await page.getByLabel('Priority',{exact:true}).fill('2');
-    await page.getByRole('button',{name:'Save provider',exact:true}).click();
+    // Blurring Priority must not remove test results mid-click and move Save away from the pointer.
+    const [staleReply] = await Promise.all([
+      page.waitForResponse(reply => reply.request().method() === 'PUT' && new URL(reply.url()).pathname === `/api/v1/providers/${before.id}`),
+      page.getByRole('button',{name:'Save provider',exact:true}).click(),
+    ]);
+    assert.equal(staleReply.request().postDataJSON().revision, before.revision);
+    assert.equal(staleReply.status(), 409, 'The stale editor must receive a revision conflict');
+    assert.equal((await staleReply.json()).error.code, 'provider_revision_conflict');
     await page.getByRole('alert').filter({hasText:/changed|revision|conflict/i}).waitFor();
     assert.equal(await page.getByRole('button',{name:'Save provider',exact:true}).isDisabled(),true);
     await page.getByRole('button',{name:'Reload saved provider',exact:true}).click();
@@ -702,15 +733,16 @@ try {
   await page.getByRole('button', {name:'Monitor Pilot', exact:true}).click();
   await page.getByRole('button', {name:'Unmonitor Pilot', exact:true}).waitFor();
   await page.getByRole('button', {name:'Import Pilot', exact:true}).click();
-  await prepare(`${scratch}/incoming/episode.mkv`, `${scratch}/tv/pilot.mkv`);
-  await page.getByRole('button', {name:'Edit unexecuted preview', exact:true}).click();
-  await page.getByRole('button', {name:'Preview import', exact:true}).click();
-  await page.getByRole('button', {name:'Execute import', exact:true}).waitFor();
+  const unexecuted=await prepare(`${scratch}/incoming/episode.mkv`, `${scratch}/tv/pilot.mkv`);
+  await manualRow(unexecuted.operationId).getByRole('button', {name:'Edit unexecuted preview', exact:true}).click();
+  await manual.getByRole('button', {name:'Preview import', exact:true}).click();
   const confirmed = await receipt();
+  await manualRow(confirmed.operationId).getByRole('button', {name:'Execute import', exact:true}).waitFor();
+  assert.notEqual(confirmed.operationId,unexecuted.operationId,'Editing captures a new immutable preview identity');
   assert.equal(confirmed.request.target.media_type, 'episode');
   await page.reload();
-  await page.getByRole('button', {name:'Execute import', exact:true}).waitFor();
-  assert.equal((await receipt()).operation.id, confirmed.operation.id);
+  await manualRow(confirmed.operationId).getByRole('button', {name:'Execute import', exact:true}).waitFor();
+  assert.equal((await receipt()).operationId, confirmed.operationId);
   let executions = 0;
   await page.route('**/api/v1/imports/*/execute', async route => {
     executions++;
@@ -718,15 +750,17 @@ try {
     assert.equal(response.status(), 200);
     await route.abort('failed');
   });
-  await page.getByRole('button', {name:'Execute import', exact:true}).click();
-  await page.getByRole('button', {name:'Prepare another import', exact:true}).waitFor();
+  await manualRow(confirmed.operationId).getByRole('button', {name:'Execute import', exact:true}).click();
+  await manualRow(confirmed.operationId).getByRole('button', {name:'Prepare another import', exact:true}).waitFor();
   assert.equal(executions, 1, 'Lost response must reconcile, never submit another execution automatically');
-  assert.equal((await receipt()).operation.id, confirmed.operation.id);
-  assert.equal((await receipt()).operation.status, 'complete');
+  assert.equal((await receipt()).operationId, confirmed.operationId);
+  assert.equal((await actualOperation(confirmed)).status, 'complete');
   await page.unroute('**/api/v1/imports/*/execute');
   assert.equal(await readFile(`${scratch}/tv/pilot.mkv`, 'utf8'), 'scratch episode media');
   assert.equal(await readFile(`${scratch}/incoming/episode.mkv`, 'utf8'), 'scratch episode media');
-  await page.getByRole('button', {name:'Prepare another import', exact:true}).click();
+  // Completed identities are explicitly forgotten before unrelated library/settings flows.
+  await manualRow(confirmed.operationId).getByRole('button', {name:'Prepare another import', exact:true}).click();
+  assert.equal(await manualRow(confirmed.operationId).count(),0);
   // A late TV lookup must not render in the movie scope.
   await page.getByRole('button', {name:'Add series', exact:true}).click();
   await page.getByLabel('Search catalogue').fill('slow');
@@ -743,16 +777,19 @@ try {
   assert.equal(movieReceipt.request.target.id, confirmed.request.target.id);
   // Simulate a request lost before delivery: retain the same preview for explicit resume.
   await page.route('**/api/v1/imports/*/execute', route => route.abort('failed'));
-  await page.getByRole('button', {name:'Execute import', exact:true}).click();
-  await page.getByRole('button', {name:'Resume import', exact:true}).waitFor();
-  await page.waitForFunction(() => !document.querySelector('.import-panel button')?.disabled);
-  assert.equal((await receipt()).operation.id, movieReceipt.operation.id);
+  await manualRow(movieReceipt.operationId).getByRole('button', {name:'Execute import', exact:true}).click();
+  await manualRow(movieReceipt.operationId).getByRole('button', {name:'Resume import', exact:true}).waitFor();
+  // The row-scoped click below waits for fresh reconciliation and enabled recovery.
+  assert.equal((await receipt()).operationId, movieReceipt.operationId);
   await page.unroute('**/api/v1/imports/*/execute');
   await page.reload();
-  await page.getByRole('button', {name:'Resume import', exact:true}).click();
-  await page.getByRole('button', {name:'Prepare another import', exact:true}).waitFor();
-  assert.equal((await receipt()).operation.id, movieReceipt.operation.id);
+  await manualRow(movieReceipt.operationId).getByRole('button', {name:'Resume import', exact:true}).click();
+  await manualRow(movieReceipt.operationId).getByRole('button', {name:'Prepare another import', exact:true}).waitFor();
+  assert.equal((await receipt()).operationId, movieReceipt.operationId);
+  assert.equal((await actualOperation(movieReceipt)).status,'complete');
   assert.equal(await readFile(`${scratch}/movies/movie.mkv`, 'utf8'), 'scratch movie media');
+  await manualRow(movieReceipt.operationId).getByRole('button',{name:'Prepare another import',exact:true}).click();
+  assert.equal(await manualRow(movieReceipt.operationId).count(),0);
   await page.reload();
   await page.getByRole('button', {name:'Movies', exact:true}).click();
   await page.getByRole('button', {name:/Fixture movie.*1 files/}).click();

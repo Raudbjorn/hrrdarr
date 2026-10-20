@@ -72,6 +72,59 @@ impl CredentialKey {
         body.truncate(length);
         Ok(body)
     }
+    /// Notification secrets: a distinct AEAD purpose bound to the notification identity, so an
+    /// envelope cannot be replayed onto another notification or into the provider registry.
+    pub(crate) fn seal_notification(
+        &self,
+        id: &str,
+        implementation: &str,
+        plain: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if plain.len() > 8192 {
+            return Err("Notification credentials are too large");
+        }
+        let mut nonce = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "Credential encryption failed")?;
+        let mut body = plain.to_vec();
+        self.0
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(notification_context(id, implementation)),
+                &mut body,
+            )
+            .map_err(|_| "Credential encryption failed")?;
+        let mut envelope = vec![1];
+        envelope.extend_from_slice(&nonce);
+        envelope.extend(body);
+        Ok(envelope)
+    }
+    pub(crate) fn open_notification(
+        &self,
+        id: &str,
+        implementation: &str,
+        value: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if !(29..=16384).contains(&value.len()) || value[0] != 1 {
+            return Err("Notification credentials cannot be unlocked");
+        }
+        let nonce: [u8; 12] = value[1..13]
+            .try_into()
+            .map_err(|_| "Notification credentials cannot be unlocked")?;
+        let mut body = value[13..].to_vec();
+        let length = self
+            .0
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(notification_context(id, implementation)),
+                &mut body,
+            )
+            .map_err(|_| "Notification credentials cannot be unlocked")?
+            .len();
+        body.truncate(length);
+        Ok(body)
+    }
     pub(super) fn seal(
         &self,
         id: &str,
@@ -121,6 +174,9 @@ impl CredentialKey {
         body.fill(0);
         result
     }
+}
+fn notification_context(id: &str, implementation: &str) -> String {
+    format!("hrrdarr/notification-credentials/v1/{implementation}/{id}")
 }
 fn context(id: &str, implementation: &str) -> String {
     format!("hrrdarr/provider-credentials/v1/{implementation}/{id}")
@@ -178,6 +234,10 @@ pub struct IndexerAccess<'a> {
     pub cookie: Option<&'a str>,
     pub tv_parameters: &'a [IndexerParameter],
     pub movie_parameters: &'a [IndexerParameter],
+    /// Tracker API account (`filelist`, `hdbits`, `passthepopcorn`, `torrentpotato`): the user name and
+    /// the passkey / API key. Never logged, echoed or stored in releases.
+    pub username: Option<&'a str>,
+    pub password: Option<&'a str>,
 }
 impl<'a> IndexerAccess<'a> {
     pub(super) fn validate(&self) -> bool {
@@ -186,6 +246,18 @@ impl<'a> IndexerAccess<'a> {
         }) && self.cookie.is_none_or(valid_cookie)
             && valid_parameters(self.tv_parameters)
             && valid_parameters(self.movie_parameters)
+    }
+
+    /// Tracker requests: an API key (BroadcastheNet, Torrentleech), an account pair, a cookie and
+    /// feed-style parameters (numeric names allowed: IPTorrents selects categories with them).
+    pub(super) fn validate_tracker(&self) -> bool {
+        let text = |s: &str| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control);
+        self.api_key.is_none_or(text)
+            && self.username.is_none_or(text)
+            && self.password.is_none_or(text)
+            && self.cookie.is_none_or(valid_cookie)
+            && valid_tracker_parameters(self.tv_parameters)
+            && valid_tracker_parameters(self.movie_parameters)
     }
 
     /// Feed requests use the generic parameter rules and never an API key.
@@ -222,7 +294,12 @@ impl<'a> IndexerAccess<'a> {
                 movie_parameters,
                 ..Self::default()
             },
-            _ => Self::default(),
+            Some(Credentials::UsernamePassword { username, password }) => Self {
+                username: Some(username),
+                password: Some(password),
+                ..Self::default()
+            },
+            None => Self::default(),
         }
     }
 }
@@ -268,14 +345,26 @@ const TORZNAB_RESERVED: &[&str] = &[
     "id",
     "r",
 ];
+/// Tracker feeds additionally accept names that start with a digit (category selectors).
+fn valid_tracker_parameters(parameters: &[IndexerParameter]) -> bool {
+    valid_named_parameters(parameters, &[], true)
+}
 fn valid_parameters_except(parameters: &[IndexerParameter], reserved: &[&str]) -> bool {
+    valid_named_parameters(parameters, reserved, false)
+}
+fn valid_named_parameters(
+    parameters: &[IndexerParameter],
+    reserved: &[&str],
+    digit_first: bool,
+) -> bool {
     let mut names = std::collections::BTreeSet::new();
     parameters.len() <= 16
         && parameters.iter().all(|p| {
             let name = p.name.to_ascii_lowercase();
             !name.is_empty()
                 && name.len() <= 64
-                && name.as_bytes()[0].is_ascii_alphabetic()
+                && (name.as_bytes()[0].is_ascii_alphabetic()
+                    || (digit_first && name.as_bytes()[0].is_ascii_digit()))
                 && name
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
@@ -292,19 +381,45 @@ impl Credentials {
             return false;
         }
         match self {
-            Self::ApiKey { api_key } => implementation != "torrentrss" && valid(api_key),
+            // Transmission, NZBGet and the cookie-based torrent feed do not take an API key.
+            Self::ApiKey { api_key } => {
+                !matches!(
+                    implementation,
+                    "transmission"
+                        | "nzbget"
+                        | "torrentrss"
+                        | "nyaa"
+                        | "fanzub"
+                        | "iptorrents"
+                        | "filelist"
+                        | "hdbits"
+                        | "passthepopcorn"
+                        | "torrentpotato"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(api_key)
+            }
             Self::Feed {
                 cookie,
                 tv_parameters,
                 movie_parameters,
             } => {
-                implementation == "torrentrss"
-                    && cookie.as_deref().is_none_or(valid_cookie)
+                matches!(
+                    implementation,
+                    "torrentrss" | "nyaa" | "fanzub" | "iptorrents"
+                ) && cookie.as_deref().is_none_or(valid_cookie)
                     && (cookie.is_some()
                         || !tv_parameters.is_empty()
                         || !movie_parameters.is_empty())
-                    && valid_feed_parameters(tv_parameters)
-                    && valid_feed_parameters(movie_parameters)
+                    && if implementation == "iptorrents" {
+                        valid_tracker_parameters(tv_parameters)
+                            && valid_tracker_parameters(movie_parameters)
+                    } else {
+                        valid_feed_parameters(tv_parameters)
+                            && valid_feed_parameters(movie_parameters)
+                    }
             }
             Self::Indexer {
                 api_key,
@@ -320,7 +435,21 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                implementation == "qbittorrent" && valid(username) && valid(password)
+                matches!(
+                    implementation,
+                    "qbittorrent"
+                        | "transmission"
+                        | "nzbget"
+                        | "filelist"
+                        | "hdbits"
+                        | "passthepopcorn"
+                        | "torrentpotato"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(username)
+                    && valid(password)
             }
         }
     }

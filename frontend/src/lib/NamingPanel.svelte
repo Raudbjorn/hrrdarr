@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { ColonReplacement, MediaDomain, MovieNamingConfig, MovieNamingUpdate, TvNamingConfig, TvNamingUpdate } from './api.generated';
+  import type { ColonReplacement, MediaDomain, MovieNamingConfig, MovieNamingUpdate, TvNamingConfig, TvNamingUpdate, TvNamingExamples, MultiEpisodeNamingExample } from './api.generated';
   import { getTvNaming, updateTvNaming, getTvNamingExamples, getMovieNaming, updateMovieNaming, getMovieNamingExamples } from './api';
   let domain: MediaDomain = $state('tv');
   let config: TvNamingConfig | MovieNamingConfig | null = $state(null);
@@ -9,6 +9,7 @@
   let standardEpisode = $state(''), dailyEpisode = $state(''), animeEpisode = $state(''), seriesFolder = $state(''), seasonFolder = $state(''), specialsFolder = $state(''), multiEpisodeStyle = $state('');
   let standardMovie = $state(''), movieFolder = $state('');
   let examples: Record<string, string | null> | null = $state(null);
+  let multiExamples: MultiEpisodeNamingExample[] = $state([]);
   let previewLoading = $state(false), previewError = $state(''), previewSkipped = $state(false);
   let loading = $state(false), busy = $state(false), dirty = $state(false), conflict = $state(false), uncertain = $state(false);
   let error = $state(''), notice = $state('');
@@ -48,7 +49,7 @@
   async function load() {
     const version = ++loadVersion, scope = domain;
     loading = true; error = ''; notice = ''; conflict = false; uncertain = false; config = null; examples = null; previewError = ''; previewSkipped = false; previewLoading = false;
-    clearTimeout(previewTimer); ++previewVersion;
+    clearTimeout(previewTimer); ++previewVersion; multiExamples = [];
     const result = scope === 'tv' ? await getTvNaming() : await getMovieNaming();
     if (!alive || version !== loadVersion) return;
     loading = false;
@@ -63,7 +64,7 @@
     domain = next; void load();
   }
 
-  function schedulePreview() { clearTimeout(previewTimer); previewTimer = setTimeout(() => void loadPreview(), 400); }
+  function schedulePreview() { clearTimeout(previewTimer); ++previewVersion; multiExamples = []; previewTimer = setTimeout(() => void loadPreview(), 400); }
   async function loadPreview() {
     const version = ++previewVersion, scope = domain;
     if (colonReplacement === 'custom' && normalizeCustom(customColon) === null) {
@@ -81,6 +82,8 @@
       blanked = Object.entries(fields).filter(([, value]) => value === null).map(([key]) => key);
       result = await getTvNamingExamples({
         ...common,
+        multi_episode_draft: true,
+        ...(multiEpisodeStyle !== '' ? { multi_episode_style: Number(multiEpisodeStyle) } : {}),
         ...(fields.standard_episode_format !== null ? { standard_episode_format: fields.standard_episode_format } : {}),
         ...(fields.daily_episode_format !== null ? { daily_episode_format: fields.daily_episode_format } : {}),
         ...(fields.anime_episode_format !== null ? { anime_episode_format: fields.anime_episode_format } : {}),
@@ -100,7 +103,15 @@
     if (!alive || version !== previewVersion || scope !== domain) return;
     previewLoading = false;
     if (result.ok) {
-      const data: Record<string, string | null> = { ...result.data };
+      let data: Record<string, string | null>;
+      if (scope === 'tv') {
+        const { multi_episode_examples, ...singleExamples } = result.data as TvNamingExamples;
+        multiExamples = multi_episode_examples;
+        data = singleExamples;
+      } else {
+        multiExamples = [];
+        data = { ...result.data } as Record<string, string | null>;
+      }
       for (const key of blanked) data[key] = null;
       examples = data;
     } else previewError = result.error;
@@ -156,7 +167,7 @@
     <form onsubmit={(event) => { event.preventDefault(); void save(); }} oninput={() => { dirty = true; schedulePreview(); }} onchange={() => { dirty = true; schedulePreview(); }}>
       <fieldset disabled={busy || conflict || uncertain}><legend>Behavior</legend>
         <label class="check"><input type="checkbox" bind:checked={renameEnabled} />Rename on automated import</label>
-        <p>This only gates the automated import path; the preview below always renders regardless of this setting.</p>
+        <p>Single-episode and movie examples render the configured template. Multi-episode examples retain the original filename when renaming is disabled.</p>
         <label class="check"><input type="checkbox" bind:checked={replaceIllegal} />Replace illegal filename characters</label>
         <label>Colon replacement<select bind:value={colonReplacement}>
           <option value="delete">Delete</option><option value="dash">Dash ( - )</option><option value="space_dash">Space + dash ( -)</option><option value="space_dash_space">Space + dash + space ( - )</option><option value="smart">Smart</option><option value="custom">Custom</option>
@@ -172,12 +183,28 @@
           <p class="preview" id="preview-standard_episode_format">{previewLabel('standard_episode_format')}</p>
           <label>Daily episode format<input bind:value={dailyEpisode} maxlength="1024" aria-describedby="preview-daily_episode_format" placeholder="{'{Series Title} - {Air-Date} - {Episode Title} [{Quality Title}]'}" /></label>
           <p class="preview" id="preview-daily_episode_format">{previewLabel('daily_episode_format')}</p>
-          <p class="muted">Daily-typed series cannot yet complete an automated download; this format is saved and previewed but currently unreachable from the automated pipeline.</p>
+          <p class="muted">Daily formats use the actual episode air dates.</p>
           <label>Anime episode format<input bind:value={animeEpisode} maxlength="1024" aria-describedby="preview-anime_episode_format" placeholder="{'{Series Title} - S{season:00}E{episode:00} - {Episode Title} [{Quality Title}]'}" /></label>
           <p class="preview" id="preview-anime_episode_format">{previewLabel('anime_episode_format')}</p>
-          <p class="muted">Anime-typed series cannot yet complete an automated download; this format is saved and previewed but currently unreachable from the automated pipeline.</p>
-          <label>Multi-episode style<select bind:value={multiEpisodeStyle}><option value="">Not set</option><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label>
-          <p class="muted">Reserved for future multi-episode rendering; no multi-episode template is applied yet.</p>
+          <p class="muted">Anime formats also accept {'{absolute:000}'} when complete absolute numbering is available.</p>
+          <label>Multi-episode style<select bind:value={multiEpisodeStyle}><option value="">Not set</option><option value="0">Extend</option><option value="1">Duplicate</option><option value="2">Repeat</option><option value="3">Scene</option><option value="4">Range</option><option value="5">Prefixed range</option></select></label>
+          <p class="muted">Choose how a filename represents several episodes. When renaming needs this setting, an unset style requires a choice before import.</p>
+          {#if multiExamples.length && !previewLoading && !previewError && !previewSkipped}
+            <div aria-labelledby="multi-episode-examples-heading" aria-live="polite">
+              <h2 id="multi-episode-examples-heading">Multi-episode examples</h2>
+              <dl class="multi-examples">
+                {#each multiExamples as example}
+                  <dt>{example.field === 'standard_episode_format' ? 'Standard' : example.field === 'daily_episode_format' ? 'Daily' : 'Anime'} — {example.contiguous ? 'consecutive' : 'nonconsecutive'} episodes {example.episodes.join(', ')}</dt>
+                  <dd>
+                    {#if example.status === 'rendered'}{example.filename}
+                    {:else if example.status === 'preserved'}Original filename retained: {example.filename}
+                    {:else if example.status === 'needs_policy'}Choose a multi-episode style to preview this filename.
+                    {:else}Cannot render this example{example.reason ? `: ${example.reason.replaceAll('_', ' ')}` : '.'}{/if}
+                  </dd>
+                {/each}
+              </dl>
+            </div>
+          {/if}
         </fieldset>
         <fieldset disabled={busy || conflict || uncertain}><legend>TV folder formats</legend>
           <p class="muted">Folder templates are validated and previewed here but not yet used to create directories during automated import; imports still land in the existing library root.</p>
@@ -208,7 +235,7 @@
   <details class="token-reference">
     <summary>Naming token reference</summary>
     <h2>TV tokens</h2>
-    <p>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}. {'{season:0}'}–{'{season:0000}'} zero-pad to 1–4 digits.</p>
+    <p>{'{Series Title}'}, {'{season:00}'}, {'{episode:00}'}, {'{Episode Title}'}, {'{Air-Date}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}. {'{season:0}'}–{'{season:0000}'} zero-pad to 1–4 digits. Anime filename formats also support {'{absolute:0}'}–{'{absolute:0000}'}.</p>
     <h2>Movie tokens</h2>
     <p>{'{Movie Title}'}, {'{Release Year}'}, {'{Edition Tags}'}, {'{Quality Title}'}, {'{Custom Formats}'}, {'{Custom Format:A}'}. Quality and custom-format tokens work in both domains.</p>
     <p>Custom formats include matching names marked for renaming, regardless of score. Use {'{Custom Formats:A,B}'} to include exact names or {'{Custom Formats:-A,B}'} to exclude them. {'{[Custom Formats]}'} adds brackets only when matches exist. {'{CUSTOM.FORMATS}'} uses uppercase names and dots. Examples use the sample names Surround Sound and x265.</p>
@@ -232,6 +259,8 @@
   .conflict button{margin-top:.5rem}
   .preview{margin:0 0 .8rem;font-size:.85rem;color:#245ba8;min-height:1.2em}
   .preview-status{font-size:.85rem;color:#596b7b;min-height:1.2em}
+  .multi-examples dt{font-weight:600;margin-top:.6rem;font-size:.85rem}
+  .multi-examples dd{margin:.2rem 0 .8rem;overflow-wrap:anywhere;font-size:.85rem}
   .muted{font-size:.85rem;color:#596b7b}
   .token-reference{margin-top:2rem;background:#fff;border:1px solid #cbd5de;padding:1rem}
   .token-reference summary{cursor:pointer;font-weight:600}

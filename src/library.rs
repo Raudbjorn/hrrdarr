@@ -294,6 +294,7 @@ pub struct Season {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
+    pub runtime: Option<i64>,
     pub tag_ids: Vec<i64>,
     pub id: i64,
     pub media_type: Domain,
@@ -565,8 +566,13 @@ async fn fetch(
     } else {
         "r.id,r.metadata_id,m.title,m.year,NULL,m.tmdb_id,m.imdb_id,r.path,NULL,r.monitored"
     };
+    let runtime = if d == Domain::Tv {
+        "r.runtime"
+    } else {
+        "m.runtime"
+    };
     let sql = format!(
-        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
+        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added,{runtime} FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
         d.table(),
         if d == Domain::Movies {
             "JOIN movie_metadata m ON m.id=r.metadata_id"
@@ -583,6 +589,7 @@ async fn fetch(
     let mut bytes = 1024;
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
+            runtime: r.get(18)?,
             tag_ids: crate::tags::assigned(c, d, r.get(0)?)
                 .await
                 .map_err(tag_error)?,
@@ -970,6 +977,12 @@ async fn persist(ctx: &Context, items: Vec<Update>) -> Result<Vec<LibraryItem>> 
             }
             drop(rows);
             patch(&tx, ctx.domain, item.id, &item.patch, false).await?;
+            // An explicit tag assignment in the same request is the user's decision for that request.
+            if !changed(&item.patch.tags) {
+                crate::autotagging::apply_item(&tx, ctx.domain, item.id)
+                    .await
+                    .map_err(tag_error)?;
+            }
         }
         let include = selected.len() == 1;
         fetch(
@@ -1209,6 +1222,9 @@ async fn create_record(
         [id],
     )
     .await?;
+    crate::autotagging::apply_item(c, d, id)
+        .await
+        .map_err(tag_error)?;
     fetch(c, d, "r.id=?", vec![Value::Integer(id)], 1, 0, true)
         .await?
         .pop()
@@ -1262,11 +1278,6 @@ pub struct MovieLookupAdd {
     #[serde(default)]
     #[ts(as = "Option<Patch>", optional)]
     pub settings: Patch,
-    #[serde(default)]
-    #[ts(as = "Option<crate::collections::CollectionMonitoring>", optional)]
-    pub monitor: crate::collections::CollectionMonitoring,
-    #[ts(optional = nullable)]
-    pub collection_expected_revision: Option<i64>,
 }
 
 type LookupHttp<T> = std::result::Result<T, Response>;
@@ -1344,7 +1355,7 @@ async fn selected_tv(
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     no_query(query).map_err(IntoResponse::into_response)?;
     let input = body(payload).map_err(IntoResponse::into_response)?;
-    selected(ctx, input.tvdb_id, input.path, input.settings, None).await
+    selected(ctx, input.tvdb_id, input.path, input.settings).await
 }
 async fn selected_movie(
     State(ctx): State<MetadataContext>,
@@ -1353,44 +1364,13 @@ async fn selected_movie(
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     no_query(query).map_err(IntoResponse::into_response)?;
     let input = body(payload).map_err(IntoResponse::into_response)?;
-    let mut settings = input.settings;
-    let enable = match input.monitor {
-        crate::collections::CollectionMonitoring::MovieAndCollection => {
-            settings.monitored = Change::Value(true);
-            Some(input.collection_expected_revision)
-        }
-        crate::collections::CollectionMonitoring::None => {
-            if input.collection_expected_revision.is_some() {
-                return Err(
-                    bad("Collection revision requires collection monitoring").into_response()
-                );
-            }
-            settings.monitored = Change::Value(false);
-            None
-        }
-        crate::collections::CollectionMonitoring::MovieOnly => {
-            if input.collection_expected_revision.is_some() {
-                return Err(
-                    bad("Collection revision requires collection monitoring").into_response()
-                );
-            }
-            None
-        }
-    };
-    if input
-        .collection_expected_revision
-        .is_some_and(|r| !(1..=9007199254740991).contains(&r))
-    {
-        return Err(bad("Invalid collection revision").into_response());
-    }
-    selected(ctx, input.tmdb_id, input.path, settings, enable).await
+    selected(ctx, input.tmdb_id, input.path, input.settings).await
 }
 async fn selected(
     ctx: MetadataContext,
     external_id: i64,
     rawpath: String,
     settings: Patch,
-    collection_enable: Option<Option<i64>>,
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     if !(1..=9007199254740991).contains(&external_id) {
         return Err(bad("Invalid selected metadata identity").into_response());
@@ -1410,7 +1390,6 @@ async fn selected(
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
     let mut movie_facts = None;
-    let mut collection = crate::metadata::CollectionAssociation::Absent;
     let mut tv_facts = None;
     match ctx.domain {
         Domain::Tv => {
@@ -1448,11 +1427,9 @@ async fn selected(
         Domain::Movies => {
             let detail = ctx
                 .client
-                .movie_with_collection(external_id)
+                .movie(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
-            collection = detail.collection;
-            let detail = detail.movie;
             req.title = Some(detail.title.clone());
             req.year = detail.year;
             req.tmdb_id = Some(detail.tmdb_id);
@@ -1484,9 +1461,8 @@ async fn selected(
         if let Some(detail)=movie_facts {
             refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
-        if ctx.domain == Domain::Movies {
-            crate::collections::repository::adopt(&tx,item.id,item.metadata_id.ok_or_else(conflict)?,collection,collection_enable).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
-        }
+        // Catalog facts now exist, so rules that depend on them can be evaluated for the new item.
+        crate::autotagging::apply_item(&tx,ctx.domain,item.id).await.map_err(tag_error)?;
         for episode in episodes {
             let monitored=monitoring.get(&episode.season).ok_or_else(||bad("Episode season is absent from selected catalog"))?;
             tx.execute("INSERT INTO episodes(series_id,season,number,title,monitored,tvdb_id,air_date,air_date_utc,absolute_episode_number,runtime,overview,finale_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![item.id,episode.season,episode.number,episode.title,i64::from(*monitored),episode.tvdb_id,episode.air_date,episode.air_date_utc,episode.absolute_episode_number,episode.runtime,episode.overview,episode.finale_type]).await?;

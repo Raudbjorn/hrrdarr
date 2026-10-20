@@ -23,6 +23,7 @@ use axum::{
 };
 pub use decision::evaluate;
 pub(crate) use decision::target_ranks;
+pub(crate) use decision::{MovieReleaseFacts, movie_availability_delay, movie_available};
 pub(crate) use decision::{evaluate_with_evidence, evaluate_with_pending};
 use libsql::Connection;
 use serde::{Deserialize, Serialize};

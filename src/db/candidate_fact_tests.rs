@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &c,

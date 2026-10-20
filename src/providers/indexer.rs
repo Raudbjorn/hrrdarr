@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod feed;
+mod tracker;
 pub use feed::{FeedDomainTest, FeedTest};
 
 const XML_BYTES: usize = 1024 * 1024;
@@ -2032,50 +2033,88 @@ fn private_parameters(
     parameters.extend(private.iter().map(|p| (p.name.clone(), p.value.clone())));
     parameters
 }
-pub use feed::test as test_feed;
+/// Test of a feed-like indexer: the generic feed or a tracker, as the settings dictate.
+pub async fn test_feed(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> Result<FeedTest> {
+    if settings.tracker_parts().is_some() {
+        return tracker::test(operation, settings, access)
+            .await
+            .map_err(|(error, _)| error);
+    }
+    feed::test(operation, settings, access).await
+}
+/// A tracker test that names the failing domain so backoff stays scoped to it.
+pub(crate) async fn test_tracker_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<FeedTest, (IndexerError, Option<MediaDomain>)> {
+    tracker::test(operation, settings, access).await
+}
 pub async fn test(
     operation: &super::http::HttpOperation<'_>,
     settings: &ProviderSettings,
     access: &IndexerAccess<'_>,
 ) -> Result<IndexerTest> {
+    test_with_scope(operation, settings, access)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// A shared caps failure applies to all configured scopes; a feed failure belongs to its domain.
+pub(crate) async fn test_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<IndexerTest, (IndexerError, Option<MediaDomain>)> {
     if !access.validate() {
-        return Err(IndexerError::InvalidRequest);
+        return Err((IndexerError::InvalidRequest, None));
     }
-    let (endpoint, torrent) = endpoint(settings)?;
-    let caps = capabilities(operation, endpoint, access.api_key).await?;
-    let (tv, movies) = scopes(settings)?;
+    let (endpoint, torrent) = endpoint(settings).map_err(|e| (e, None))?;
+    let caps = capabilities(operation, endpoint, access.api_key)
+        .await
+        .map_err(|e| (e, None))?;
+    let (tv, movies) = scopes(settings).map_err(|e| (e, None))?;
     let mut domains = vec![];
     for domain in tv
         .map(|_| MediaDomain::Tv)
         .into_iter()
         .chain(movies.map(|_| MediaDomain::Movies))
     {
-        let plan = plan_search(
-            settings,
-            &caps,
-            &IndexerSearch::Rss {
-                media_type: domain,
-                offset: 0,
-                query_index: 0,
-                limit: 1,
-            },
-        )?;
-        cooldown(
-            operation,
-            parse_page(
-                &fetch(
-                    operation,
-                    endpoint,
-                    access.api_key,
-                    private_parameters(access, domain, plan.parameters),
-                )
-                .await?,
-                0,
-                plan.limit,
-                torrent,
-                domain,
-            ),
-        )?;
+        let result: Result<()> = async {
+            let plan = plan_search(
+                settings,
+                &caps,
+                &IndexerSearch::Rss {
+                    media_type: domain,
+                    offset: 0,
+                    query_index: 0,
+                    limit: 1,
+                },
+            )?;
+            cooldown(
+                operation,
+                parse_page(
+                    &fetch(
+                        operation,
+                        endpoint,
+                        access.api_key,
+                        private_parameters(access, domain, plan.parameters),
+                    )
+                    .await?,
+                    0,
+                    plan.limit,
+                    torrent,
+                    domain,
+                ),
+            )?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error| (error, Some(domain)))?;
         domains.push(domain);
     }
     Ok(IndexerTest {
@@ -2091,6 +2130,9 @@ pub(crate) async fn raw_search(
 ) -> Result<RawIndexerPage> {
     if matches!(settings, ProviderSettings::Torrentrss { .. }) {
         return raw_feed(operation, settings, access, request).await;
+    }
+    if settings.tracker_parts().is_some() {
+        return tracker::raw_search(operation, settings, access, request).await;
     }
     if !access.validate() {
         return Err(IndexerError::InvalidRequest);
@@ -2170,6 +2212,7 @@ fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
         .api_key
         .into_iter()
         .chain(access.cookie)
+        .chain(access.password)
         .chain(cookie_values)
         .chain(
             access

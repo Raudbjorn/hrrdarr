@@ -340,7 +340,7 @@ pub(super) async fn prepare(
     // Empty-catalog profiles were already supported: never resurrect their deleted mappings.
     let backfill_cf = prior == Some(1) && !cf_activated && !profiles.catalog.definitions.is_empty();
     let old = prior == Some(0) || backfill_cf;
-    conn.execute("INSERT INTO snapshot_imports(application,fingerprint,schema_version,episode_metadata_version) VALUES(?,?,?,1) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),report.schema_version]).await?;
+    conn.execute("INSERT INTO snapshot_imports(application,fingerprint,schema_version,episode_metadata_version,series_runtime_version) VALUES(?,?,?,1,1) ON CONFLICT DO NOTHING",params![app,report.fingerprint.clone(),report.schema_version]).await?;
     let format_ids =
         super::custom_formats::write(conn, &profiles.catalog, report, cf_activated).await?;
     let mut available = std::collections::BTreeSet::new();

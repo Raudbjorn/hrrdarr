@@ -13,6 +13,7 @@ pub(crate) struct OwnedImport {
     pub revision_json: String,
     pub edition: Option<String>,
     pub policy_revision: i64,
+    pub total_preflight_attempts: i64,
     pub mapping_id: i64,
     pub mapping_revision: i64,
     pub host: String,
@@ -103,7 +104,7 @@ pub(super) async fn ownership(
         .ok_or_else(Error::missing)?;
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
 }
-async fn old_record(
+pub(super) async fn old_record(
     c: &Connection,
     t: &MediaTarget,
     fid: i64,
@@ -131,6 +132,9 @@ pub(super) async fn before(
     operation: &str,
     t: &MediaTarget,
 ) -> Result<(i64, String, Option<i64>)> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::before(c, operation, t).await;
+    }
     let Some(f) = facts(c, operation).await? else {
         return owner(c, t).await;
     };
@@ -254,10 +258,9 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             if same_path { old.as_ref() } else { None },
         )?;
         if plan.source_size() != expected {
-            return Err(Error::conflict(
-                "source_changed",
-                "Downloaded file size changed",
-            ));
+            let mut error = Error::conflict("source_changed", "Downloaded file size changed");
+            error.path_kind = Some(PathKind::Changed);
+            return Err(error.at(PathRole::Source));
         }
         if let Some(old) = &old {
             old.recovery_path()?;
@@ -420,7 +423,7 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         MediaTarget::Episode(_) => "tv",
         MediaTarget::Movie(_) => "movies",
     };
-    let guard=tx.query("SELECT 1 FROM rss_candidates r JOIN download_processing d ON d.candidate_id=r.id JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type JOIN providers v ON v.id=r.client_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=r.media_type JOIN remote_path_mappings m ON m.id=? AND m.media_type=r.media_type WHERE r.id=? AND r.status='observed' AND r.media_type=? AND d.status='checking' AND d.policy_revision=? AND p.revision=d.policy_revision AND p.provider_revision=r.client_revision AND p.enabled=1 AND p.mode=? AND v.revision=r.client_revision AND v.enabled=1 AND m.revision=? AND m.host=?",params![input.mapping_id,input.candidate_id.clone(),domain,input.policy_revision,input.mode.name(),input.mapping_revision,input.host.clone()]).await?.next().await?;
+    let guard=tx.query("SELECT 1 FROM rss_candidates r JOIN download_processing d ON d.candidate_id=r.id JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type JOIN providers v ON v.id=r.client_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=r.media_type JOIN remote_path_mappings m ON m.id=? AND m.media_type=r.media_type WHERE r.id=? AND r.status='observed' AND r.media_type=? AND d.status='checking' AND d.policy_revision=? AND d.total_preflight_attempts=? AND p.revision=d.policy_revision AND p.provider_revision=r.client_revision AND p.enabled=1 AND p.mode=? AND v.revision=r.client_revision AND v.enabled=1 AND m.revision=? AND m.host=?",params![input.mapping_id,input.candidate_id.clone(),domain,input.policy_revision,input.total_preflight_attempts,input.mode.name(),input.mapping_revision,input.host.clone()]).await?.next().await?;
     if guard.is_none() {
         return Err(Error::conflict(
             "preflight_changed",
@@ -441,6 +444,13 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
     let old_id = old.as_ref().map(|v| v.file_id);
     tx.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,edition,provenance_json,old_file_json,old_episode_file_id,old_movie_file_id)VALUES(?,?,?,?,?,?,?,?,?)",params![input.candidate_id.clone(),operation.clone(),input.quality_id,input.revision_json,input.edition,json(&provenance)?,old.as_ref().map(json).transpose()?,if episode.is_some(){old_id}else{None},if movie.is_some(){old_id}else{None}]).await?;
     tx.execute("UPDATE download_processing SET status='importing',error_code=NULL,updated_at=unixepoch() WHERE candidate_id=? AND status='checking'",[input.candidate_id]).await?;
+    crate::health::path_diagnostics_changed(
+        &tx,
+        super::media(&input.target),
+        crate::health::PathDiagnosticChange::Progress,
+    )
+    .await
+    .map_err(|_| Error::internal())?;
     tx.commit().await?;
     status(db, &operation).await
 }
@@ -453,6 +463,9 @@ pub(super) async fn retire(
     stage: &Stage,
     lease: &Arc<Permit>,
 ) -> Result<()> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::retire(c, operation, target, plan, stage, lease).await;
+    }
     let Some(mut facts) = facts(c, operation).await? else {
         return Ok(());
     };
@@ -545,6 +558,31 @@ pub(super) async fn retire(
     Ok(())
 }
 
+/// Originals this operation moved into their private recovery artifact, each with the targets
+/// it served before the commit detached it. Shared or pending originals are not included.
+pub(super) async fn quarantined(
+    c: &Connection,
+    operation: &str,
+    target: &MediaTarget,
+) -> Result<Vec<super::recycle::Retired>> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::quarantined(c, operation, target).await;
+    }
+    let Some(facts) = facts(c, operation).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(match facts.old {
+        Some(old) if facts.retirement_state == "quarantined" => vec![super::recycle::Retired {
+            old,
+            targets: vec![match target {
+                MediaTarget::Episode(id) => MediaTarget::Episode(*id),
+                MediaTarget::Movie(id) => MediaTarget::Movie(*id),
+            }],
+        }],
+        _ => Vec::new(),
+    })
+}
+
 pub(super) async fn destination_available(
     c: &Connection,
     target: &MediaTarget,
@@ -588,6 +626,9 @@ pub(super) async fn placement_old(
     operation: &str,
     plan: &Plan,
 ) -> Result<Option<OldFile>> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::placement_old(c, operation, plan).await;
+    }
     Ok(facts(c, operation)
         .await?
         .and_then(|v| v.old)
@@ -599,6 +640,9 @@ pub(super) async fn available(
     target: &MediaTarget,
     plan: &Plan,
 ) -> Result<()> {
+    if super::scan_owned::is_scan(c, operation).await? {
+        return super::scan_owned::available(c, operation, target, plan).await;
+    }
     let old = placement_old(c, operation, plan).await?;
     destination_available(
         c,

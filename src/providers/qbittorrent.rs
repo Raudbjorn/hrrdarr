@@ -1,12 +1,15 @@
 //! qBittorrent protocol operations. No scheduler, automatic retry, or local filesystem access.
 use super::{
-    Credentials, DownloadScope, ProviderSettings,
+    ClientRetryKind, Credentials, DownloadScope, ProviderSettings,
     http::{HttpError, HttpOperation, HttpRequestBody, HttpResponse},
 };
 use crate::{api::MediaDomain, db::MediaTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QbitError {
@@ -102,6 +105,14 @@ pub enum DownloadDiagnostic {
     Metadata,
     DhtDisabled,
     UnknownState,
+    /// Usenet post-processing stages; the download itself has finished transferring.
+    Verifying,
+    Repairing,
+    Extracting,
+    Moving,
+    PostProcessing,
+    /// Unpacking stopped because the client reported a write error or full disk.
+    DiskFull,
 }
 #[derive(Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -465,14 +476,14 @@ fn scope(settings: &ProviderSettings, domain: MediaDomain) -> Result<&DownloadSc
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
+pub(crate) fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
     match target {
         MediaTarget::Episode(id) if *id > 0 => Ok(MediaDomain::Tv),
         MediaTarget::Movie(id) if *id > 0 => Ok(MediaDomain::Movies),
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn hash(value: &str) -> Result<String> {
+pub(crate) fn hash(value: &str) -> Result<String> {
     if ![40, 64].contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(QbitError::InvalidRequest);
     }
@@ -547,6 +558,33 @@ fn apply_metadata_preferences(item: &mut DownloadItem, preferences: &Value) -> R
     }
     Ok(())
 }
+#[derive(Clone, Copy)]
+enum RequestContext {
+    Probe,
+    InitialLogin,
+    Reauthentication,
+    Api,
+}
+
+fn retry_kind(
+    context: RequestContext,
+    api_key: bool,
+    legacy: bool,
+    status: Option<u16>,
+    error: Option<HttpError>,
+) -> ClientRetryKind {
+    use ClientRetryKind::{Authentication, Other, Unavailable};
+    match context {
+        RequestContext::InitialLogin => match (status, error) {
+            (Some(403), _) | (Some(401), _) if !legacy || status == Some(403) => Authentication,
+            (None, Some(HttpError::Transport | HttpError::Timeout)) => Unavailable,
+            _ => Other,
+        },
+        RequestContext::Api if api_key && matches!(status, Some(401 | 403)) => Authentication,
+        _ => Other,
+    }
+}
+
 struct Session<'a, 'b> {
     operation: &'a HttpOperation<'b>,
     settings: &'a ProviderSettings,
@@ -555,12 +593,22 @@ struct Session<'a, 'b> {
     observed_sids: Vec<String>,
     version: Version,
     legacy: bool,
+    authenticated: bool,
+    retry_evidence: Option<&'a AtomicU8>,
 }
 impl<'a, 'b> Session<'a, 'b> {
     async fn connect(
         operation: &'a HttpOperation<'b>,
         settings: &'a ProviderSettings,
         credentials: Option<&'a Credentials>,
+    ) -> Result<Self> {
+        Self::connect_classified(operation, settings, credentials, None).await
+    }
+    async fn connect_classified(
+        operation: &'a HttpOperation<'b>,
+        settings: &'a ProviderSettings,
+        credentials: Option<&'a Credentials>,
+        retry_evidence: Option<&'a AtomicU8>,
     ) -> Result<Self> {
         settings.validate().map_err(|_| QbitError::InvalidRequest)?;
         if !matches!(settings, ProviderSettings::Qbittorrent { .. }) {
@@ -581,6 +629,8 @@ impl<'a, 'b> Session<'a, 'b> {
             observed_sids: Vec::new(),
             version: Version(2, 0, 0),
             legacy: false,
+            authenticated: false,
+            retry_evidence,
         };
         if let Some(Credentials::ApiKey { api_key }) = credentials {
             if api_key.is_empty() || api_key.len() > 4096 || api_key.chars().any(char::is_control) {
@@ -593,7 +643,14 @@ impl<'a, 'b> Session<'a, 'b> {
             return Err(QbitError::InvalidRequest);
         }
         // Only an unsupported endpoint permits protocol fallback, never authentication or network failure.
-        let probe = session.get_raw("api/v2/app/webapiVersion", &[]).await;
+        let probe = session
+            .request_client(
+                "api/v2/app/webapiVersion",
+                &[],
+                HttpRequestBody::Empty,
+                RequestContext::Probe,
+            )
+            .await;
         let response = match probe {
             Err(QbitError::Http(HttpError::Authentication))
                 if matches!(credentials, Some(Credentials::UsernamePassword { .. })) =>
@@ -601,12 +658,25 @@ impl<'a, 'b> Session<'a, 'b> {
                 session.login().await?;
                 session.get_raw("api/v2/app/webapiVersion", &[]).await?
             }
+            Err(QbitError::Http(HttpError::Authentication))
+                if matches!(credentials, Some(Credentials::ApiKey { .. })) =>
+            {
+                session.get_raw("api/v2/app/webapiVersion", &[]).await?
+            }
             other => other?,
         };
         let response = if response.status == 404 {
             session.legacy = true;
             session.headers.retain(|(k, _)| k != "Cookie");
-            match session.get_raw("version/api", &[]).await {
+            match session
+                .request_client(
+                    "version/api",
+                    &[],
+                    HttpRequestBody::Empty,
+                    RequestContext::Probe,
+                )
+                .await
+            {
                 Err(QbitError::Http(HttpError::Authentication))
                     if matches!(credentials, Some(Credentials::UsernamePassword { .. })) =>
                 {
@@ -638,16 +708,63 @@ impl<'a, 'b> Session<'a, 'b> {
             path
         )
     }
-    async fn get_raw(&self, path: &str, query: &[(String, String)]) -> Result<HttpResponse> {
-        Ok(self
+    fn record_retry(&self, kind: ClientRetryKind) {
+        if let Some(evidence) = self.retry_evidence {
+            evidence.store(kind as u8, Ordering::Relaxed);
+        }
+    }
+    async fn request_client(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        body: HttpRequestBody,
+        context: RequestContext,
+    ) -> Result<HttpResponse> {
+        self.record_retry(ClientRetryKind::Other);
+        let api_key = matches!(self.credentials, Some(Credentials::ApiKey { .. }));
+        let certificate_trust_failure = AtomicBool::new(false);
+        let response = self
             .operation
-            .request(
+            .request_with_auth_status(
                 &self.endpoint(path),
                 query,
                 &self.headers,
-                HttpRequestBody::Empty,
+                body,
+                &certificate_trust_failure,
             )
-            .await?)
+            .await
+            .map_err(|error| {
+                self.record_retry(
+                    if matches!(context, RequestContext::Probe)
+                        && !self.legacy
+                        && certificate_trust_failure.load(Ordering::Relaxed)
+                    {
+                        ClientRetryKind::Unavailable
+                    } else {
+                        retry_kind(context, api_key, self.legacy, None, Some(error))
+                    },
+                );
+                QbitError::Http(error)
+            })?;
+        self.record_retry(retry_kind(
+            context,
+            api_key,
+            self.legacy,
+            Some(response.status),
+            None,
+        ));
+        // The support probe's 401 is a generic client error, not an authentication challenge.
+        if matches!(context, RequestContext::Probe) && response.status == 401 {
+            return Err(QbitError::Http(HttpError::Transport));
+        }
+        if matches!(response.status, 401 | 403) {
+            return Err(QbitError::Http(HttpError::Authentication));
+        }
+        Ok(response)
+    }
+    async fn get_raw(&self, path: &str, query: &[(String, String)]) -> Result<HttpResponse> {
+        self.request_client(path, query, HttpRequestBody::Empty, RequestContext::Api)
+            .await
     }
     async fn login(&mut self) -> Result<()> {
         let Some(Credentials::UsernamePassword { username, password }) = self.credentials else {
@@ -666,20 +783,34 @@ impl<'a, 'b> Session<'a, 'b> {
         } else {
             "api/v2/auth/login"
         };
+        let initial = !self.authenticated;
         let response = self
-            .operation
-            .request(
-                &self.endpoint(path),
+            .request_client(
+                path,
                 &[],
-                &self.headers,
                 HttpRequestBody::Form(vec![
                     ("username".into(), username.clone()),
                     ("password".into(), password.clone()),
                 ]),
+                if initial {
+                    RequestContext::InitialLogin
+                } else {
+                    RequestContext::Reauthentication
+                },
             )
             .await?;
         check_status(response.status)?;
+        if response.body.is_empty() {
+            // A successful but empty login response supplies no authentication rejection.
+            self.record_retry(ClientRetryKind::Other);
+            return Err(QbitError::InvalidResponse);
+        }
         if response.body != b"Ok." {
+            self.record_retry(if initial {
+                ClientRetryKind::Authentication
+            } else {
+                ClientRetryKind::Other
+            });
             return Err(QbitError::Http(HttpError::Authentication));
         }
         let mut cookies = response
@@ -707,6 +838,7 @@ impl<'a, 'b> Session<'a, 'b> {
             self.observed_sids.push(sid.to_owned());
         }
         self.headers.push(("Cookie".into(), format!("SID={sid}")));
+        self.authenticated = true;
         Ok(())
     }
     async fn get(
@@ -732,13 +864,17 @@ impl<'a, 'b> Session<'a, 'b> {
         let path = if self.legacy { legacy } else { modern };
         // No reauthentication/replay of a mutation: transport failure does not prove it was not applied.
         let response = self
-            .operation
-            .request(&self.endpoint(path), &[], &self.headers, body)
+            .request_client(path, &[], body, RequestContext::Api)
             .await
             .map_err(|e| match e {
-                HttpError::InvalidRequest => QbitError::InvalidRequest,
-                HttpError::Authentication => QbitError::Http(e),
-                HttpError::RateLimited { .. } => QbitError::Http(e),
+                QbitError::Http(HttpError::InvalidRequest) => QbitError::InvalidRequest,
+                QbitError::Http(
+                    HttpError::Authentication
+                    | HttpError::RateLimited { .. }
+                    | HttpError::LocalUnavailable { .. }
+                    | HttpError::Busy
+                    | HttpError::ResponseTooLarge,
+                ) => e,
                 _ => QbitError::MutationUnknown,
             })?;
         if response.status >= 500 {
@@ -1389,6 +1525,19 @@ pub struct ClientStatus {
     pub locality: EndpointLocality,
     pub removes_completed_downloads: bool,
 }
+pub(crate) enum ClientStatusSnapshot {
+    Status(ClientStatus),
+    OutputMissing(EndpointLocality),
+    OutputInvalid(EndpointLocality),
+}
+impl ClientStatusSnapshot {
+    fn into_status(self) -> Result<ClientStatus> {
+        match self {
+            Self::Status(status) => Ok(status),
+            Self::OutputMissing(_) | Self::OutputInvalid(_) => Err(QbitError::InvalidResponse),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootSource {
     Default,
@@ -1399,7 +1548,7 @@ pub enum EndpointLocality {
     Loopback,
     Unknown,
 }
-fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
+pub(crate) fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
     let url = url::Url::parse(endpoint).map_err(|_| QbitError::InvalidRequest)?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -1415,7 +1564,7 @@ fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
         EndpointLocality::Unknown
     })
 }
-fn validate_remote_path(path: &str) -> Result<()> {
+pub(crate) fn validate_remote_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.len() > 4096
         || path.chars().any(char::is_control)
@@ -1448,7 +1597,7 @@ fn validate_remote_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
-fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
+pub(crate) fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
     validate_remote_path(default)?;
     let rooted = |p: &str| {
         p.starts_with('/') || p.starts_with("\\\\") || (p.len() >= 3 && p.as_bytes()[1] == b':')
@@ -1479,29 +1628,66 @@ pub async fn client_status(
     credentials: Option<&Credentials>,
     domain: MediaDomain,
 ) -> Result<ClientStatus> {
+    client_status_snapshot(operation, settings, credentials, domain)
+        .await?
+        .into_status()
+}
+pub(crate) async fn client_status_snapshot(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    domain: MediaDomain,
+) -> Result<ClientStatusSnapshot> {
     let configured = scope(settings, domain)?;
     let mut session = Session::connect(operation, settings, credentials).await?;
     let preferences = session
         .get("api/v2/app/preferences", "query/preferences", &[])
         .await?;
-    let removes_completed_downloads = removes_completed_downloads(session.version, &preferences)?;
-    let default = text(&preferences, "save_path", 4096)?;
     let categories = if session.legacy {
         BTreeMap::new()
     } else {
         session.categories().await?
     };
-    let (remote_root, root_source) = remote_root(
-        &default,
+    status_from_preferences(
+        session.version,
+        &preferences,
         categories.get(&configured.category).map(String::as_str),
-    )?;
-    Ok(ClientStatus {
+        domain,
+        endpoint_locality(settings.endpoint())?,
+    )
+}
+fn status_from_preferences(
+    version: Version,
+    preferences: &Value,
+    category: Option<&str>,
+    domain: MediaDomain,
+    locality: EndpointLocality,
+) -> Result<ClientStatusSnapshot> {
+    if !preferences.is_object() {
+        return Err(QbitError::InvalidResponse);
+    }
+    // Unrelated malformed protocol fields must not become a path diagnosis.
+    let removes_completed_downloads = removes_completed_downloads(version, preferences)?;
+    match preferences.get("save_path") {
+        None | Some(Value::Null) => return Ok(ClientStatusSnapshot::OutputMissing(locality)),
+        Some(Value::String(value)) if value.is_empty() => {
+            return Ok(ClientStatusSnapshot::OutputMissing(locality));
+        }
+        _ => {}
+    }
+    let Ok(default) = text(preferences, "save_path", 4096) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    let Ok((remote_root, root_source)) = remote_root(&default, category) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    Ok(ClientStatusSnapshot::Status(ClientStatus {
         domain,
         remote_root,
         root_source,
-        locality: endpoint_locality(settings.endpoint())?,
+        locality,
         removes_completed_downloads,
-    })
+    }))
 }
 fn verify_tags(torrent: &Value, requested: &[String]) -> Result<()> {
     let raw = text(torrent, "tags", 16_384)?;
@@ -1862,14 +2048,14 @@ pub enum AddOutcome {
         hashes: Vec<String>,
     },
 }
-fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
+pub(crate) fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
     ring::digest::digest(algorithm, data)
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn magnet_hashes(value: &str) -> Result<Vec<String>> {
+pub(crate) fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     if value.len() > 16384 || value.chars().any(char::is_control) {
         return Err(QbitError::InvalidRequest);
     }
@@ -1922,7 +2108,7 @@ fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     Ok(identities.into_iter().collect())
 }
 /// Walk bencode without reserializing: info hashes cover the original byte slice.
-fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
     struct Decoder<'a> {
         bytes: &'a [u8],
         position: usize,
@@ -2200,7 +2386,15 @@ impl Session<'_, '_> {
         if !self
             .categories()
             .await
-            .map_err(|_| QbitError::MutationUnknown)?
+            .map_err(|error| {
+                // Category creation cannot establish that torrent add ran. Preserve local
+                // verification failures so they cannot grant client retry authority.
+                if local_submission_failure(error) {
+                    error
+                } else {
+                    QbitError::MutationUnknown
+                }
+            })?
             .contains_key(name)
         {
             return Err(QbitError::MutationUnknown);
@@ -2220,9 +2414,12 @@ impl PreparedDownload {
     pub fn identity(&self) -> &SubmissionIdentity {
         &self.identity
     }
+    pub(crate) fn into_identity(self) -> SubmissionIdentity {
+        self.identity
+    }
 }
 /// Safe journal data: excludes URLs, torrent contents and credentials. This is not a durable journal.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmissionIdentity {
     version: u8,
@@ -2240,6 +2437,27 @@ impl SubmissionIdentity {
     }
     pub fn payload_sha256(&self) -> &str {
         &self.payload_sha256
+    }
+    pub(crate) fn settings_fingerprint(&self) -> &str {
+        &self.settings_fingerprint
+    }
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+    /// Shared journal shape for client protocols whose identity is a caller-derived token.
+    pub(crate) fn tokenized(
+        target: MediaTarget,
+        token: String,
+        settings_fingerprint: String,
+        payload_sha256: String,
+    ) -> Self {
+        Self {
+            version: 1,
+            target,
+            hashes: vec![token],
+            settings_fingerprint,
+            payload_sha256,
+        }
     }
     fn validate(&self, settings: &ProviderSettings) -> Result<MediaDomain> {
         let domain = target_domain(&self.target)?;
@@ -2262,7 +2480,14 @@ impl SubmissionIdentity {
     }
 }
 fn settings_fingerprint(settings: &ProviderSettings) -> Result<String> {
-    let bytes = serde_json::to_vec(settings).map_err(|_| QbitError::InvalidRequest)?;
+    // Eligibility tags are not remote payload settings; preserve existing prepared identity hashes.
+    let mut settings = settings.clone();
+    if let ProviderSettings::Qbittorrent { tv, movies, .. } = &mut settings {
+        for scope in tv.iter_mut().chain(movies.iter_mut()) {
+            scope.tags = None;
+        }
+    }
+    let bytes = serde_json::to_vec(&settings).map_err(|_| QbitError::InvalidRequest)?;
     Ok(digest_hex(&ring::digest::SHA256, &bytes))
 }
 /// Presence only: neither variant proves option follow-ups completed or permits retrying add.
@@ -2286,38 +2511,12 @@ pub async fn reconcile(
         },
     )
 }
-pub async fn prepare(
+/// Fetches a release URL into `.torrent` bytes (no redirects; bounded transport) and derives the
+/// info-hash identities of a magnet or metainfo payload. Shared by every torrent client.
+pub(crate) async fn resolve_source(
     operation: &HttpOperation<'_>,
-    settings: &ProviderSettings,
-    target: MediaTarget,
     source: AddSource,
-    recent: bool,
-    options: QbitOptions,
-) -> Result<PreparedDownload> {
-    let domain = target_domain(&target)?;
-    scope(settings, domain)?;
-    if options.tags.len() > 64
-        || options.tags.iter().any(|tag| {
-            tag.is_empty()
-                || tag.trim() != tag
-                || tag.len() > 64
-                || tag.contains(',')
-                || tag.chars().any(char::is_control)
-        })
-        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
-    {
-        return Err(QbitError::InvalidRequest);
-    }
-    if options
-        .ratio_limit
-        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
-        || [options.seeding_minutes, options.inactive_seeding_minutes]
-            .into_iter()
-            .flatten()
-            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
-    {
-        return Err(QbitError::InvalidRequest);
-    }
+) -> Result<(AddSource, Vec<String>)> {
     let source = match source {
         AddSource::Url(value) => {
             if value.len() > 16384 || value.chars().any(char::is_control) {
@@ -2359,6 +2558,41 @@ pub async fn prepare(
         }
         AddSource::Url(_) => return Err(QbitError::InvalidRequest),
     };
+    Ok((source, identities))
+}
+pub async fn prepare(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    target: MediaTarget,
+    source: AddSource,
+    recent: bool,
+    options: QbitOptions,
+) -> Result<PreparedDownload> {
+    let domain = target_domain(&target)?;
+    scope(settings, domain)?;
+    if options.tags.len() > 64
+        || options.tags.iter().any(|tag| {
+            tag.is_empty()
+                || tag.trim() != tag
+                || tag.len() > 64
+                || tag.contains(',')
+                || tag.chars().any(char::is_control)
+        })
+        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    if options
+        .ratio_limit
+        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
+        || [options.seeding_minutes, options.inactive_seeding_minutes]
+            .into_iter()
+            .flatten()
+            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    let (source, identities) = resolve_source(operation, source).await?;
     let payload = match &source {
         AddSource::Magnet(value) => value.as_bytes(),
         AddSource::Torrent { bytes, .. } => bytes,
@@ -2386,6 +2620,68 @@ pub async fn submit(
     credentials: Option<&Credentials>,
     prepared: PreparedDownload,
 ) -> Result<AddOutcome> {
+    submit_classified(operation, settings, credentials, prepared)
+        .await
+        .map_err(|e| e.error)
+}
+fn local_submission_failure(error: QbitError) -> bool {
+    matches!(
+        error,
+        QbitError::InvalidRequest
+            | QbitError::Http(
+                HttpError::InvalidRequest
+                    | HttpError::LocalUnavailable { .. }
+                    | HttpError::Busy
+                    | HttpError::ResponseTooLarge
+            )
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct SubmissionError {
+    pub error: QbitError,
+    pub definitely_not_submitted: bool,
+    pub client_retry_kind: ClientRetryKind,
+    pub client_retry_eligible: bool,
+}
+pub(crate) async fn submit_classified(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    prepared: PreparedDownload,
+) -> std::result::Result<AddOutcome, SubmissionError> {
+    let mut add_started = false;
+    let retry_evidence = AtomicU8::new(ClientRetryKind::Other as u8);
+    submit_inner(
+        operation,
+        settings,
+        credentials,
+        prepared,
+        &mut add_started,
+        &retry_evidence,
+    )
+    .await
+    .map_err(|error| SubmissionError {
+        error,
+        definitely_not_submitted: !add_started,
+        client_retry_kind: match retry_evidence.load(Ordering::Relaxed) {
+            value if value == ClientRetryKind::Unavailable as u8 => ClientRetryKind::Unavailable,
+            value if value == ClientRetryKind::Authentication as u8 => {
+                ClientRetryKind::Authentication
+            }
+            _ => ClientRetryKind::Other,
+        },
+        client_retry_eligible: !local_submission_failure(error),
+    })
+}
+async fn submit_inner(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    prepared: PreparedDownload,
+    add_started: &mut bool,
+    retry_evidence: &AtomicU8,
+) -> Result<AddOutcome> {
     let domain = prepared.identity.validate(settings)?;
     let configured = scope(settings, domain)?;
     let PreparedDownload {
@@ -2395,7 +2691,8 @@ pub async fn submit(
         options,
     } = prepared;
     let identities = identity.hashes;
-    let mut session = Session::connect(operation, settings, credentials).await?;
+    let mut session =
+        Session::connect_classified(operation, settings, credentials, Some(retry_evidence)).await?;
     let first = if recent {
         configured.recent_priority
     } else {
@@ -2507,6 +2804,8 @@ pub async fn submit(
     if let Some(remote) = session.find_identities(domain, &identities).await? {
         return Ok(AddOutcome::AlreadyPresent { hash: remote });
     }
+    // Once add begins, even rejection-shaped failures cannot authorize another client.
+    *add_started = true;
     session.mutate("api/v2/torrents/add", legacy, body).await?;
     let Some(remote) = session
         .find_identities(domain, &identities)
@@ -2644,6 +2943,516 @@ pub async fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn retry_settings(endpoint: &str) -> ProviderSettings {
+        serde_json::from_value(serde_json::json!({"implementation":"qbittorrent","endpoint":endpoint,"tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":null})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn submission_retry_classification_preserves_http_phase_and_auth_context() {
+        use axum::{
+            Router,
+            extract::{Request, State},
+            http::StatusCode,
+            response::IntoResponse,
+        };
+        use std::sync::{Arc, atomic::AtomicUsize};
+        // Each failure occurs before torrent add. The same authentication response has
+        // different retry authority at the support probe, initial login and reauthentication.
+        for (case, expected) in [
+            (0, ClientRetryKind::Other),          // probe 503
+            (1, ClientRetryKind::Other),          // login 503
+            (2, ClientRetryKind::Authentication), // initial login rejection
+            (3, ClientRetryKind::Other),          // probe 401, not an auth challenge
+            (4, ClientRetryKind::Authentication), // API-key authenticated request
+            (5, ClientRetryKind::Other),          // reauthentication rejection
+            (6, ClientRetryKind::Other),          // empty successful login response
+            (7, ClientRetryKind::Authentication), // nonempty Fails. login response
+        ] {
+            let adds = Arc::new(AtomicUsize::new(0));
+            let logins = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let settings = retry_settings(&format!("http://{}", listener.local_addr().unwrap()));
+            let app = Router::new()
+                .fallback(
+                    |State((case, adds, logins)): State<(
+                        u8,
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                    )>,
+                     request: Request| async move {
+                        let response = match request.uri().path() {
+                            "/api/v2/app/webapiVersion" if case == 0 => {
+                                (StatusCode::SERVICE_UNAVAILABLE, "")
+                            }
+                            "/api/v2/app/webapiVersion" if case == 3 => {
+                                (StatusCode::UNAUTHORIZED, "")
+                            }
+                            "/api/v2/app/webapiVersion"
+                                if case == 4 || !request.headers().contains_key("cookie") =>
+                            {
+                                (StatusCode::FORBIDDEN, "")
+                            }
+                            "/api/v2/app/webapiVersion" => (StatusCode::OK, "2.8.0"),
+                            "/api/v2/auth/login" => {
+                                let n = logins.fetch_add(1, Ordering::SeqCst);
+                                if case == 1 {
+                                    (StatusCode::SERVICE_UNAVAILABLE, "")
+                                } else if case == 6 {
+                                    (StatusCode::OK, "")
+                                } else if case == 7 {
+                                    (StatusCode::OK, "Fails.")
+                                } else if case == 2 || n > 0 {
+                                    (StatusCode::FORBIDDEN, "")
+                                } else {
+                                    return ([("set-cookie", "SID=test")], "Ok.").into_response();
+                                }
+                            }
+                            "/api/v2/torrents/add" => {
+                                adds.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::OK, "Ok.")
+                            }
+                            _ => (StatusCode::FORBIDDEN, ""),
+                        };
+                        response.into_response()
+                    },
+                )
+                .with_state((case, adds.clone(), logins.clone()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let transport = super::super::http::HttpClient::new().unwrap();
+            let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+            let credentials = if case == 4 {
+                Credentials::ApiKey {
+                    api_key: "test".into(),
+                }
+            } else {
+                Credentials::UsernamePassword {
+                    username: "test".into(),
+                    password: "test".into(),
+                }
+            };
+            let prepared = prepare(
+                &operation,
+                &settings,
+                MediaTarget::Episode(1),
+                AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "1".repeat(40))),
+                false,
+                QbitOptions::default(),
+            )
+            .await
+            .unwrap();
+            let failure = submit_classified(&operation, &settings, Some(&credentials), prepared)
+                .await
+                .unwrap_err();
+            assert!(failure.definitely_not_submitted, "case {case}");
+            assert!(failure.client_retry_eligible, "case {case}");
+            assert_eq!(failure.client_retry_kind, expected, "case {case}");
+            if case == 6 {
+                assert_eq!(failure.error, QbitError::InvalidResponse);
+            }
+            assert_eq!(adds.load(Ordering::SeqCst), 0);
+            if case == 3 {
+                assert_eq!(logins.load(Ordering::SeqCst), 0);
+            }
+            if case == 5 {
+                assert_eq!(logins.load(Ordering::SeqCst), 2);
+            }
+            if case == 2 {
+                let release_operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+                let error = prepare(
+                    &release_operation,
+                    &settings,
+                    MediaTarget::Episode(1),
+                    AddSource::Url(format!("{}/release", settings.endpoint())),
+                    false,
+                    QbitOptions::default(),
+                )
+                .await
+                .err()
+                .unwrap();
+                assert_eq!(error, QbitError::Http(HttpError::Authentication));
+                let failure = super::super::preparation_error(error);
+                assert_eq!(failure.error.code, "refresh_failed");
+                assert_eq!(failure.error.client_retry_kind, ClientRetryKind::Other);
+                assert!(
+                    !failure.client_changed
+                        && !failure.error.client_failure
+                        && !failure.error.client_retry_eligible
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_login_transport_failure_is_unavailable_but_release_fetch_is_not() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = retry_settings(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(
+                std::str::from_utf8(&request[..count])
+                    .unwrap()
+                    .starts_with("GET /api/v2/app/webapiVersion")
+            );
+            // Closing the listener before responding deterministically refuses the next login.
+            drop(listener);
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let transport = super::super::http::HttpClient::new().unwrap();
+        let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+        let prepared = prepare(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "1".repeat(40))),
+            false,
+            QbitOptions::default(),
+        )
+        .await
+        .unwrap();
+        let credentials = Credentials::UsernamePassword {
+            username: "test".into(),
+            password: "test".into(),
+        };
+        let failure = submit_classified(&operation, &settings, Some(&credentials), prepared)
+            .await
+            .unwrap_err();
+        assert!(failure.definitely_not_submitted && failure.client_retry_eligible);
+        assert_eq!(failure.client_retry_kind, ClientRetryKind::Unavailable);
+        server.await.unwrap();
+        let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+        let error = prepare(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            AddSource::Url(format!("{}/release", settings.endpoint())),
+            false,
+            QbitOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let failure = super::super::preparation_error(error);
+        assert!(
+            !failure.client_changed
+                && !failure.error.client_failure
+                && !failure.error.client_retry_eligible
+        );
+        assert_eq!(failure.error.client_retry_kind, ClientRetryKind::Other);
+        let error = prepare(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            AddSource::Torrent {
+                filename: "bad.torrent".into(),
+                bytes: b"invalid torrent".to_vec(),
+            },
+            false,
+            QbitOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            super::super::preparation_error(error).error.code,
+            "invalid_release"
+        );
+    }
+
+    #[test]
+    fn retry_categories_do_not_promote_local_failures_or_legacy_login_401() {
+        for error in [
+            HttpError::Busy,
+            HttpError::LocalUnavailable { timeout: false },
+            HttpError::LocalUnavailable { timeout: true },
+            HttpError::InvalidRequest,
+        ] {
+            assert_eq!(
+                retry_kind(
+                    RequestContext::InitialLogin,
+                    false,
+                    false,
+                    None,
+                    Some(error)
+                ),
+                ClientRetryKind::Other
+            );
+        }
+        assert_eq!(
+            retry_kind(RequestContext::InitialLogin, false, true, Some(401), None),
+            ClientRetryKind::Other
+        );
+        assert_eq!(
+            retry_kind(RequestContext::InitialLogin, false, true, Some(403), None),
+            ClientRetryKind::Authentication
+        );
+        assert_eq!(
+            retry_kind(
+                RequestContext::Reauthentication,
+                false,
+                false,
+                None,
+                Some(HttpError::Transport)
+            ),
+            ClientRetryKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_tls_certificate_is_unavailable_before_add() {
+        // Independently generated, deliberately untrusted loopback-only certificate/key.
+        const CERT: &[u8] = &[
+            48, 130, 1, 78, 48, 130, 1, 0, 160, 3, 2, 1, 2, 2, 20, 42, 111, 64, 91, 179, 190, 89,
+            5, 157, 46, 29, 101, 131, 34, 127, 106, 95, 247, 175, 231, 48, 5, 6, 3, 43, 101, 112,
+            48, 20, 49, 18, 48, 16, 6, 3, 85, 4, 3, 12, 9, 108, 111, 99, 97, 108, 104, 111, 115,
+            116, 48, 30, 23, 13, 50, 54, 49, 48, 49, 54, 50, 51, 53, 49, 49, 52, 90, 23, 13, 51,
+            54, 49, 48, 49, 51, 50, 51, 53, 49, 49, 52, 90, 48, 20, 49, 18, 48, 16, 6, 3, 85, 4, 3,
+            12, 9, 108, 111, 99, 97, 108, 104, 111, 115, 116, 48, 42, 48, 5, 6, 3, 43, 101, 112, 3,
+            33, 0, 165, 16, 188, 81, 220, 219, 146, 47, 68, 239, 54, 69, 68, 200, 60, 202, 151, 7,
+            180, 242, 101, 238, 51, 35, 55, 208, 241, 120, 253, 235, 185, 86, 163, 100, 48, 98, 48,
+            29, 6, 3, 85, 29, 14, 4, 22, 4, 20, 232, 109, 146, 93, 17, 77, 51, 51, 107, 151, 15,
+            94, 222, 181, 45, 178, 159, 133, 246, 199, 48, 31, 6, 3, 85, 29, 35, 4, 24, 48, 22,
+            128, 20, 232, 109, 146, 93, 17, 77, 51, 51, 107, 151, 15, 94, 222, 181, 45, 178, 159,
+            133, 246, 199, 48, 15, 6, 3, 85, 29, 19, 1, 1, 255, 4, 5, 48, 3, 1, 1, 255, 48, 15, 6,
+            3, 85, 29, 17, 4, 8, 48, 6, 135, 4, 127, 0, 0, 1, 48, 5, 6, 3, 43, 101, 112, 3, 65, 0,
+            226, 25, 45, 103, 196, 123, 183, 166, 184, 108, 212, 65, 117, 244, 46, 15, 60, 53, 184,
+            138, 229, 1, 37, 14, 120, 175, 253, 61, 218, 68, 118, 213, 203, 181, 224, 188, 130,
+            193, 82, 90, 130, 44, 216, 233, 140, 232, 186, 40, 49, 39, 77, 52, 76, 228, 80, 161,
+            151, 235, 25, 241, 148, 127, 184, 4,
+        ];
+        const KEY: &[u8] = &[
+            48, 46, 2, 1, 0, 48, 5, 6, 3, 43, 101, 112, 4, 34, 4, 32, 61, 172, 170, 47, 123, 220,
+            190, 250, 95, 43, 13, 197, 154, 112, 124, 20, 135, 108, 187, 142, 107, 9, 60, 245, 20,
+            194, 106, 169, 232, 21, 89, 202,
+        ];
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(CERT.to_vec())],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(KEY.to_vec()).into(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = retry_settings(&format!("https://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut stream = stream.into_std().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            tokio::task::spawn_blocking(move || {
+                let mut connection =
+                    rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
+                assert!(
+                    connection.complete_io(&mut stream).is_err(),
+                    "client must reject the untrusted certificate before HTTP"
+                );
+            })
+            .await
+            .unwrap();
+        });
+        let transport = super::super::http::HttpClient::new().unwrap();
+        let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+        let prepared = prepare(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "1".repeat(40))),
+            false,
+            QbitOptions::default(),
+        )
+        .await
+        .unwrap();
+        let failure = submit_classified(&operation, &settings, None, prepared)
+            .await
+            .unwrap_err();
+        assert!(failure.definitely_not_submitted && failure.client_retry_eligible);
+        assert_eq!(failure.client_retry_kind, ClientRetryKind::Unavailable);
+        assert_eq!(failure.error, QbitError::Http(HttpError::Transport));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn category_verification_limit_is_safe_but_cannot_authorize_client_retry() {
+        use axum::{
+            Router,
+            extract::{Request, State},
+            response::IntoResponse,
+        };
+        use std::sync::{Arc, atomic::AtomicUsize};
+        let categories = Arc::new(AtomicUsize::new(0));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let adds = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = retry_settings(&format!("http://{}", listener.local_addr().unwrap()));
+        let app = Router::new()
+            .fallback(
+                |State((categories, creates, adds)): State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 request: Request| async move {
+                    match request.uri().path() {
+                        "/api/v2/app/webapiVersion" => "2.8.0".into_response(),
+                        "/api/v2/torrents/info" => "[]".into_response(),
+                        "/api/v2/app/preferences" => r#"{"dht":true}"#.into_response(),
+                        "/api/v2/torrents/categories" => {
+                            if categories.fetch_add(1, Ordering::SeqCst) == 0 {
+                                "{}".into_response()
+                            } else {
+                                vec![b'x'; super::super::http::MAX_BODY_BYTES + 1].into_response()
+                            }
+                        }
+                        "/api/v2/torrents/createCategory" => {
+                            creates.fetch_add(1, Ordering::SeqCst);
+                            "Ok.".into_response()
+                        }
+                        "/api/v2/torrents/add" => {
+                            adds.fetch_add(1, Ordering::SeqCst);
+                            "Ok.".into_response()
+                        }
+                        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                },
+            )
+            .with_state((categories.clone(), creates.clone(), adds.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport = super::super::http::HttpClient::new().unwrap();
+        let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+        let prepared = prepare(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "1".repeat(40))),
+            false,
+            QbitOptions::default(),
+        )
+        .await
+        .unwrap();
+        let failure = submit_classified(&operation, &settings, None, prepared)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, QbitError::Http(HttpError::ResponseTooLarge));
+        assert!(failure.definitely_not_submitted);
+        assert!(!failure.client_retry_eligible);
+        assert_eq!(failure.client_retry_kind, ClientRetryKind::Other);
+        assert_eq!(categories.load(Ordering::SeqCst), 2);
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(adds.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn eligibility_tags_preserve_legacy_submission_fingerprint() {
+        let mut settings:ProviderSettings=serde_json::from_value(serde_json::json!({"implementation":"qbittorrent","endpoint":"http://127.0.0.1:1","tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":null})).unwrap();
+        let legacy = digest_hex(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&settings).unwrap(),
+        );
+        if let ProviderSettings::Qbittorrent {
+            tv: Some(scope), ..
+        } = &mut settings
+        {
+            scope.tags = Some(vec![1, 2]);
+        }
+        assert_eq!(settings_fingerprint(&settings).unwrap(), legacy);
+    }
+    #[tokio::test]
+    async fn rejected_before_add_is_safe_but_same_error_after_add_is_unknown() {
+        use axum::{
+            Router,
+            extract::{Request, State},
+            http::StatusCode,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for pre_add in [true, false] {
+            let adds = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app =
+                Router::new()
+                    .fallback(
+                        |State((pre_add, adds)): State<(bool, Arc<AtomicUsize>)>,
+                         request: Request| async move {
+                            match request.uri().path() {
+                                "/api/v2/app/webapiVersion" => (StatusCode::OK, "2.8.0"),
+                                "/api/v2/torrents/info" => (StatusCode::OK, "[]"),
+                                "/api/v2/app/preferences" => (
+                                    StatusCode::OK,
+                                    if pre_add {
+                                        r#"{"dht":false}"#
+                                    } else {
+                                        r#"{"dht":true}"#
+                                    },
+                                ),
+                                "/api/v2/torrents/categories" => (
+                                    StatusCode::OK,
+                                    r#"{"tv":{"savePath":""},"movies":{"savePath":""}}"#,
+                                ),
+                                "/api/v2/torrents/add" => {
+                                    adds.fetch_add(1, Ordering::SeqCst);
+                                    (StatusCode::OK, "Fails.")
+                                }
+                                _ => (StatusCode::NOT_FOUND, ""),
+                            }
+                        },
+                    )
+                    .with_state((pre_add, adds.clone()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let settings:ProviderSettings=serde_json::from_value(serde_json::json!({"implementation":"qbittorrent","endpoint":endpoint,"tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0},"movies":{"category":"movies","imported_category":null,"recent_priority":0,"older_priority":0}})).unwrap();
+            let transport = super::super::http::HttpClient::new().unwrap();
+            for target in [MediaTarget::Episode(1), MediaTarget::Movie(1)] {
+                let operation = transport.operation(uuid::Uuid::new_v4()).unwrap();
+                let prepared = prepare(
+                    &operation,
+                    &settings,
+                    target,
+                    AddSource::Magnet(format!("magnet:?xt=urn:btih:{}", "1".repeat(40))),
+                    false,
+                    QbitOptions::default(),
+                )
+                .await
+                .unwrap();
+                let error = submit_classified(&operation, &settings, None, prepared)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.error, QbitError::Rejected);
+                assert_eq!(error.definitely_not_submitted, pre_add);
+            }
+            assert_eq!(adds.load(Ordering::SeqCst), if pre_add { 0 } else { 2 });
+            server.abort();
+        }
+    }
     #[test]
     fn legacy_seed_provenance_keeps_absence_distinct_from_unavailable_and_effective() {
         let torrent = serde_json::json!({"state":"pausedUP","ratio":1.6,"ratio_limit":1.5});
@@ -2737,6 +3546,94 @@ mod tests {
                 endpoint_locality(endpoint).unwrap(),
                 EndpointLocality::Unknown
             );
+        }
+    }
+
+    #[test]
+    fn output_diagnosis_requires_exact_path_evidence() {
+        let valid = serde_json::json!({"save_path":"/downloads", "max_ratio_enabled":false,
+            "max_seeding_time_enabled":false, "max_seeding_time":-1, "max_ratio_act":0});
+        for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+            let decode = |prefs: &Value, category: Option<&str>| {
+                status_from_preferences(
+                    Version(2, 11, 0),
+                    prefs,
+                    category,
+                    domain,
+                    EndpointLocality::Unknown,
+                )
+            };
+            for value in [Value::Null, Value::String(String::new())] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputMissing(EndpointLocality::Unknown)
+                ));
+                assert!(matches!(
+                    decode(&prefs, None).unwrap().into_status(),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut absent = valid.clone();
+            absent.as_object_mut().unwrap().remove("save_path");
+            assert!(matches!(
+                decode(&absent, None).unwrap(),
+                ClientStatusSnapshot::OutputMissing(_)
+            ));
+            for value in [
+                serde_json::json!(42),
+                serde_json::json!("relative"),
+                serde_json::json!("/private\u{0}path"),
+                serde_json::json!("/../escape"),
+                serde_json::json!(format!("/{}", "x".repeat(4096))),
+            ] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputInvalid(_)
+                ));
+            }
+            assert!(matches!(
+                decode(&valid, Some("../escape")).unwrap(),
+                ClientStatusSnapshot::OutputInvalid(_)
+            ));
+            for category in [
+                None,
+                Some("movies/new"),
+                Some(r"C:\downloads"),
+                Some(r"\\server\share"),
+            ] {
+                let status = decode(&valid, category).unwrap().into_status().unwrap();
+                assert_eq!(status.domain, domain);
+                assert_eq!(status.locality, EndpointLocality::Unknown);
+            }
+            for key in [
+                "max_ratio_enabled",
+                "max_seeding_time_enabled",
+                "max_seeding_time",
+                "max_ratio_act",
+            ] {
+                let mut prefs = valid.clone();
+                // The time value is required only when its policy is enabled.
+                prefs["max_seeding_time_enabled"] = serde_json::json!(true);
+                prefs.as_object_mut().unwrap().remove(key);
+                assert!(matches!(
+                    decode(&prefs, None),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut disabled_time = valid.clone();
+            disabled_time
+                .as_object_mut()
+                .unwrap()
+                .remove("max_seeding_time");
+            assert!(decode(&disabled_time, None).unwrap().into_status().is_ok());
+            assert!(matches!(
+                decode(&Value::Null, None),
+                Err(QbitError::InvalidResponse)
+            ));
         }
     }
 
@@ -2939,6 +3836,8 @@ mod tests {
             observed_sids: Vec::new(),
             version: Version(2, 11, 0),
             legacy: false,
+            authenticated: false,
+            retry_evidence: None,
         };
         let mut value = serde_json::json!({"hash":"1111111111111111111111111111111111111111","category":"tv","name":"item","state":"downloading","progress":0.5,"size":100,"amount_left":50,"dlspeed":1,"upspeed":0,"ratio":0.0});
         assert_eq!(

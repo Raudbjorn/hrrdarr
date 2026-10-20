@@ -17,6 +17,17 @@ pub struct ManualImportBatchInput {
     pub operation_ids: Vec<Uuid>,
     pub priority: CommandPriority,
 }
+#[derive(Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct ManualImportReconcileInput {
+    pub operation_ids: Vec<Uuid>,
+}
+#[derive(Serialize, ts_rs::TS)]
+pub struct ManualImportReconciliation {
+    pub operation_id: Uuid,
+    pub operation: Option<crate::api::Operation>,
+    pub active_command: Option<ManualImportCommand>,
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct ManualImportCommand {
     pub id: Uuid,
@@ -90,11 +101,12 @@ async fn retained(c: &Connection, id: Uuid) -> Result<Option<ManualImportCommand
 struct Journal {
     phase: String,
     error_code: Option<String>,
+    path_failure_code: Option<String>,
 }
 async fn journal(c: &Connection, operation_id: Uuid) -> Result<Option<Journal>> {
     let Some(r) = c
         .query(
-            "SELECT phase,error_code FROM import_journal WHERE operation_id=?",
+            "SELECT phase,error_code,CASE WHEN path_failure_code IS NULL THEN NULL WHEN typeof(path_failure_code)='text' THEN substr(CAST(path_failure_code AS BLOB),1,65) ELSE x'00' END FROM import_journal WHERE operation_id=?",
             [operation_id.to_string()],
         )
         .await?
@@ -106,6 +118,12 @@ async fn journal(c: &Connection, operation_id: Uuid) -> Result<Option<Journal>> 
     Ok(Some(Journal {
         phase: r.get(0)?,
         error_code: r.get(1)?,
+        path_failure_code: crate::import::checked_path_failure(&r, 2).map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "manual_import_journal_unavailable",
+            )
+        })?,
     }))
 }
 // The DB CHECK on error_code is structural ([a-z0-9_]{1,64}), not a closed enum, so any
@@ -127,11 +145,55 @@ fn normalize(code: &str) -> &str {
 pub(super) fn router(db: Arc<Database>) -> Router {
     Router::new()
         .route("/api/v1/manual-import/commands", get(list).post(create))
+        .route("/api/v1/manual-import/commands/reconcile", post(reconcile))
         .route("/api/v1/manual-import/commands/{id}", get(detail))
         .route("/api/v1/manual-import/commands/{id}/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(8192))
         .layer(axum::middleware::from_fn(deadline))
         .with_state(db)
+}
+async fn reconcile(
+    State(db): State<Arc<Database>>,
+    q: std::result::Result<Query<Empty>, QueryRejection>,
+    input: std::result::Result<Json<ManualImportReconcileInput>, JsonRejection>,
+) -> Result<Json<Vec<ManualImportReconciliation>>> {
+    q.map_err(|_| bad())?;
+    let ids = input.map_err(|_| bad())?.0.operation_ids;
+    if ids.is_empty()
+        || ids.len() > BATCH_CAP
+        || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+    {
+        return Err(bad());
+    }
+    let c = connection(&db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::ReadOnly)
+        .await?;
+    let outcome = async {
+        let mut result = Vec::with_capacity(ids.len());
+        for operation_id in ids {
+            let key = operation_id.to_string();
+            // Missing operations are explicit; other canonical projection failures fail the
+            // whole snapshot rather than silently presenting partial reconciliation as complete.
+            let operation = match crate::import::status_in(&tx, &key).await {
+                Ok(operation) => Some(operation),
+                Err(error) if error.code() == "not_found" => None,
+                Err(_) => return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable")),
+            };
+            let active_command = if operation.is_some() {
+                // The partial unique index bounds this lookup independently of retained history.
+                // Read a second row defensively; corrupted uniqueness must not select an arbitrary owner.
+                let mut rows = tx.query(&format!("SELECT {COLUMNS} FROM manual_import_commands WHERE operation_id=? AND status IN ('queued','retry_wait','running') LIMIT 2"), [key]).await?;
+                let command = rows.next().await?.map(row).transpose()?;
+                if rows.next().await?.is_some() { return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable")); }
+                command
+            } else { None };
+            result.push(ManualImportReconciliation { operation_id, operation, active_command });
+        }
+        bounded(result)
+    }.await;
+    // This snapshot neither settles an earlier HTTP request nor reserves future admission.
+    finish(tx, outcome).await
 }
 async fn deadline(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     match tokio::time::timeout(std::time::Duration::from_secs(5), next.run(request)).await {
@@ -179,10 +241,24 @@ async fn validate_admission(tx: &Connection, operation_id: Uuid) -> Result<()> {
             "manual_import_owned_by_download",
         ));
     }
+    // A downloaded-folder scan is a distinct producer: its child link, cancellation and
+    // resume generations are the only start authority, so it is never a manual command.
+    if tx
+        .query(
+            "SELECT 1 FROM scan_import_facts WHERE operation_id=?",
+            [opstr.clone()],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some()
+    {
+        return Err(Error(StatusCode::CONFLICT, "manual_import_owned_by_scan"));
+    }
     let Some(j) = journal(tx, operation_id).await? else {
         return Err(Error(StatusCode::CONFLICT, "manual_import_not_previewed"));
     };
-    if j.phase != "preview" || j.error_code.is_some() {
+    if j.phase != "preview" || j.error_code.is_some() || j.path_failure_code.is_some() {
         return Err(Error(StatusCode::CONFLICT, "manual_import_not_ready"));
     }
     if tx.query("SELECT 1 FROM manual_import_commands WHERE operation_id=? AND status IN ('queued','retry_wait','running')",[opstr.clone()]).await?.next().await?.is_some(){
@@ -294,10 +370,10 @@ async fn cancel(
         let Some(j) = journal(&tx, current.operation_id).await? else {
             return Err(bad());
         };
-        if j.phase != "preview" {
+        if j.phase != "preview" || j.path_failure_code.is_some() || crate::import::operation_active(&current.operation_id.to_string()).map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "manual_import_journal_unavailable"))? {
             return Err(conflict());
         }
-        tx.execute("UPDATE manual_import_commands SET status='cancelled',completed_at=? WHERE id=? AND status IN ('queued','retry_wait')",params![now()?,id.to_string()]).await?;
+        tx.execute("UPDATE manual_import_commands SET status='cancelled',completed_at=?,error_code=NULL WHERE id=? AND status IN ('queued','retry_wait')",params![now()?,id.to_string()]).await?;
         bounded(read(&tx, id).await?)
     }
     .await;
@@ -341,8 +417,27 @@ pub(super) async fn run(db: &Arc<Database>, command: ManualImportCommand) -> Res
     let Some(j) = journal(&c, command.operation_id).await? else {
         return settle_failed(db, command.id, "manual_import_journal_missing").await;
     };
+    run_after_journal(db, command, j).await
+}
+// Keep the continuation explicit so tests can deterministically exercise a stale journal read.
+async fn run_after_journal(
+    db: &Arc<Database>,
+    command: ManualImportCommand,
+    j: Journal,
+) -> Result<()> {
     if j.phase == "complete" {
         return settle_succeeded(db, command.id).await;
+    }
+    if crate::import::operation_active(&command.operation_id.to_string()).map_err(|_| {
+        Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "manual_import_journal_unavailable",
+        )
+    })? {
+        return Ok(());
+    }
+    if j.path_failure_code.is_some() && j.error_code.is_none() {
+        return settle_failed(db, command.id, "resume_required").await;
     }
     if let Some(code) = j.error_code {
         // Already a durable terminal failure (for example the direct execute endpoint raced
@@ -352,7 +447,8 @@ pub(super) async fn run(db: &Arc<Database>, command: ManualImportCommand) -> Res
         // contract.
         return settle_failed(db, command.id, &code).await;
     }
-    let result = crate::import::execute(Arc::clone(db), &command.operation_id.to_string()).await;
+    let result =
+        crate::import::execute_command(Arc::clone(db), &command.operation_id.to_string()).await;
     let c = connection(db).await?;
     let Some(j) = journal(&c, command.operation_id).await? else {
         return settle_failed(db, command.id, "manual_import_journal_missing").await;
@@ -360,14 +456,26 @@ pub(super) async fn run(db: &Arc<Database>, command: ManualImportCommand) -> Res
     if j.phase == "complete" {
         return settle_succeeded(db, command.id).await;
     }
+    if crate::import::operation_active(&command.operation_id.to_string()).map_err(|_| {
+        Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "manual_import_journal_unavailable",
+        )
+    })? {
+        return Ok(());
+    }
+    if j.path_failure_code.is_some() && j.error_code.is_none() {
+        return settle_failed(db, command.id, "resume_required").await;
+    }
     if let Some(code) = j.error_code {
         return settle_failed(db, command.id, &code).await;
     }
-    // Journal untouched: execute() bailed before starting (import_busy from the global execution
-    // permit, or another pre-launch condition). The operation itself was never touched, so this is
-    // always safe to retry within this command's own budget.
+    // Only confirmed pre-admission contention may use the command's automatic retry budget.
     match result {
-        Err(e) => settle_retry(db, command.id, command.attempts, e.code()).await,
+        Err(e) if !e.started_attempt() && matches!(e.code(), "import_busy" | "rescan_active") => {
+            settle_retry(db, command.id, command.attempts, e.code()).await
+        }
+        Err(e) => settle_failed(db, command.id, e.code()).await,
         Ok(_) => {
             // Per this module's own reading of run_inner, a single execute() call always drains to
             // a terminal journal phase or a persisted error; this should be unreachable. Treat it
@@ -376,33 +484,17 @@ pub(super) async fn run(db: &Arc<Database>, command: ManualImportCommand) -> Res
                 "{}",
                 serde_json::json!({"level":"ERROR","component":"manual_import_command","command_id":command.id.to_string(),"operation_id":command.operation_id.to_string(),"condition":"execute_ok_without_terminal_journal"})
             );
-            settle_retry(db, command.id, command.attempts, "import_incomplete").await
+            settle_failed(db, command.id, "import_incomplete").await
         }
     }
 }
-// Called every worker tick (`code="storage_error"`) and once when the worker starts
-// (`code="interrupted"`, from start_with_metadata). A 'running' row's transfer has its own durable
-// authority in import_journal: crate::import::execute spawns a detached task that owns the single
-// global execution permit independently of this worker's step() future, so a step timeout leaves
-// the transfer running in the background, not aborted. Settling from a blind timestamp/attempt
-// heuristic (like blocklist::recover) would desync the command from an operation that is still
-// legitimately mid-copy or has already committed. Only two actions are ever safe:
-//   1. (every call) A journal that has already reached an unambiguous terminal state -- phase
-//      'complete', or a persisted error_code -- is settled accordingly. This can never happen to a
-//      row whose transfer is still genuinely in flight, since only checkpoint()/the error path
-//      write those facts, and both are terminal by construction.
-//   2. (interrupted only) A 'running' row with a non-terminal, error-free journal is treated as
-//      orphaned by a prior crash, exactly like every other command table's blind startup sweep, and
-//      is recovered the same way (attempt-counted retry_wait/failed). This is sound for the one
-//      worker main.rs starts per OS process -- a fresh process is the only way this branch runs
-//      again -- but the detached launch() task (and the permit it holds) is not tied to the
-//      worker's own task and outlives Runtime::shutdown aborting it, so an in-process worker
-//      restart (calling start/start_with_metadata again without the process exiting) could still
-//      find a transfer genuinely in flight and reset it anyway; see docs/manual-import-commands.md.
+// A detached transfer outlives its awaiting command. Settle completed work, retain active
+// leases, and require explicit recovery for abandoned admitted work even if error writes failed.
+// Only legacy unmarked journals use the old startup retry budget.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
     let mut rows = c
         .query(
-            "SELECT m.id,m.attempts,j.phase,j.error_code FROM manual_import_commands m JOIN import_journal j ON j.operation_id=m.operation_id WHERE m.status='running'",
+            "SELECT m.id,m.attempts,j.phase,j.error_code,m.operation_id,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' THEN substr(CAST(j.path_failure_code AS BLOB),1,65) ELSE x'00' END FROM manual_import_commands m JOIN import_journal j ON j.operation_id=m.operation_id WHERE m.status='running'",
             (),
         )
         .await?;
@@ -413,12 +505,28 @@ pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Resul
             r.get::<i64>(1)? as u8,
             r.get::<String>(2)?,
             r.get::<Option<String>>(3)?,
+            r.get::<String>(4)?,
+            crate::import::checked_path_failure(&r, 5).map_err(|_| {
+                Error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "manual_import_journal_unavailable",
+                )
+            })?,
         ));
     }
     drop(rows);
-    for (id, attempts, phase, error) in pending {
+    for (id, attempts, phase, error, operation, marker) in pending {
         if phase == "complete" {
             c.execute("UPDATE manual_import_commands SET status='succeeded',completed_at=? WHERE id=? AND status='running'",params![timestamp,id.to_string()]).await?;
+        } else if crate::import::operation_active(&operation).map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "manual_import_journal_unavailable",
+            )
+        })? {
+            continue;
+        } else if marker.is_some() && error.is_none() {
+            c.execute("UPDATE manual_import_commands SET status='failed',completed_at=?,error_code='resume_required' WHERE id=? AND status='running'", params![timestamp,id.to_string()]).await?;
         } else if let Some(journal_code) = error {
             c.execute("UPDATE manual_import_commands SET status='failed',completed_at=?,error_code=? WHERE id=? AND status='running'",params![timestamp,normalize(&journal_code),id.to_string()]).await?;
         } else if code == "interrupted" {
@@ -757,5 +865,255 @@ mod tests {
         let settled = read(&c, id).await.unwrap();
         assert!(matches!(settled.status, CommandStatus::Failed));
         assert_eq!(settled.error_code.as_deref(), Some("storage_error"));
+    }
+    // SQLite waits synchronously for the held writer; a second worker lets the observer
+    // see the real import lease and release that barrier before the busy timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_uncertainty_requires_recovery_but_active_transfer_survives_worker_restart() {
+        stale_worker_snapshot_cannot_resume_a_direct_failure().await;
+        let scratch = Scratch::new();
+        let db = scratch.database().await;
+        scratch.setup(&db).await;
+        let operation = scratch.preview(db.clone()).await;
+        let created = create(
+            State(db.clone()),
+            Ok(Query(Empty {})),
+            Ok(Json(input(vec![operation]))),
+        )
+        .await
+        .unwrap()
+        .1
+        .0;
+        let c = connection(&db).await.unwrap();
+        let id = created[0].id;
+        claim(&c, id, now().unwrap()).await.unwrap();
+        c.execute(
+            "UPDATE import_journal SET path_failure_code='unresolved_attempt' WHERE operation_id=?",
+            [operation.to_string()],
+        )
+        .await
+        .unwrap();
+        // Hold the writer before execute acquires its real lease, so no sleep or transfer-size
+        // guess is needed to observe a still-owned detached invocation.
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        let executing_db = db.clone();
+        let execution = tokio::spawn(async move {
+            crate::import::execute(executing_db, &operation.to_string()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !crate::import::operation_active(&operation.to_string()).unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        recover(&tx, now().unwrap(), "interrupted").await.unwrap();
+        assert!(matches!(
+            read(&tx, id).await.unwrap().status,
+            CommandStatus::Running
+        ));
+        tx.rollback().await.unwrap();
+        assert_eq!(execution.await.unwrap().unwrap().status, "complete");
+        recover(&c, now().unwrap(), "storage_error").await.unwrap();
+        assert!(matches!(
+            read(&c, id).await.unwrap().status,
+            CommandStatus::Succeeded
+        ));
+
+        let scratch = Scratch::new();
+        let db = scratch.database().await;
+        scratch.setup(&db).await;
+        let c = connection(&db).await.unwrap();
+        let operation = scratch.preview(db.clone()).await;
+        let created = create(
+            State(db.clone()),
+            Ok(Query(Empty {})),
+            Ok(Json(input(vec![operation]))),
+        )
+        .await
+        .unwrap()
+        .1
+        .0;
+        let id = created[0].id;
+        let command = claim(&c, id, now().unwrap()).await.unwrap();
+        c.execute(
+            "UPDATE import_journal SET path_failure_code='unresolved_attempt' WHERE operation_id=?",
+            [operation.to_string()],
+        )
+        .await
+        .unwrap();
+        run(&db, command).await.unwrap();
+        let failed = read(&c, id).await.unwrap();
+        assert!(matches!(failed.status, CommandStatus::Failed));
+        assert_eq!(failed.error_code.as_deref(), Some("resume_required"));
+        assert_eq!(
+            journal(&c, operation).await.unwrap().unwrap().phase,
+            "preview"
+        );
+    }
+    async fn stale_worker_snapshot_cannot_resume_a_direct_failure() {
+        use std::os::unix::fs::MetadataExt;
+        for movie in [false, true] {
+            for lose_error_write in [false, true] {
+                let scratch = Scratch::new();
+                let db = scratch.database().await;
+                scratch.setup(&db).await;
+                let source = scratch.path("downloads/media");
+                let destination = scratch.path(if movie {
+                    "movies/media.mkv"
+                } else {
+                    "tv/media.mkv"
+                });
+                std::fs::write(&source, b"stale-command-source").unwrap();
+                let original = std::fs::metadata(&source).unwrap();
+                let operation = crate::import::preview(
+                    db.clone(),
+                    crate::import::ImportInput::Typed(crate::import::ManualImportRequest {
+                        target: if movie {
+                            crate::db::MediaTarget::Movie(1)
+                        } else {
+                            crate::db::MediaTarget::Episode(1)
+                        },
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        mode: crate::import::Mode::Copy,
+                    }),
+                )
+                .await
+                .unwrap()
+                .id;
+                let created = create(
+                    State(db.clone()),
+                    Ok(Query(Empty {})),
+                    Ok(Json(input(vec![operation]))),
+                )
+                .await
+                .unwrap()
+                .1
+                .0;
+                let c = connection(&db).await.unwrap();
+                let command = claim(&c, created[0].id, now().unwrap()).await.unwrap();
+                let captured = journal(&c, operation).await.unwrap().unwrap();
+                assert_eq!(captured.phase, "preview");
+                assert!(captured.error_code.is_none() && captured.path_failure_code.is_none());
+                if lose_error_write {
+                    c.execute_batch("CREATE TRIGGER lose_direct_error BEFORE UPDATE OF error_code ON import_journal WHEN NEW.error_code IS NOT NULL BEGIN SELECT RAISE(ABORT,'test error persistence failure'); END;").await.unwrap();
+                }
+                // Move the parent, not the file: restoring it preserves even the source ctime,
+                // so an incorrect implicit retry would really succeed instead of failing identity checks.
+                std::fs::rename(scratch.path("downloads"), scratch.path("held-downloads")).unwrap();
+                let failure = crate::import::execute(db.clone(), &operation.to_string())
+                    .await
+                    .unwrap_err();
+                assert_eq!(failure.code(), "filesystem_error");
+                assert!(!crate::import::operation_active(&operation.to_string()).unwrap());
+                std::fs::rename(scratch.path("held-downloads"), scratch.path("downloads")).unwrap();
+                let restored = std::fs::metadata(&source).unwrap();
+                assert_eq!(
+                    (
+                        restored.dev(),
+                        restored.ino(),
+                        restored.mtime(),
+                        restored.mtime_nsec(),
+                        restored.ctime(),
+                        restored.ctime_nsec()
+                    ),
+                    (
+                        original.dev(),
+                        original.ino(),
+                        original.mtime(),
+                        original.mtime_nsec(),
+                        original.ctime(),
+                        original.ctime_nsec()
+                    )
+                );
+                if lose_error_write {
+                    c.execute_batch("DROP TRIGGER lose_direct_error;")
+                        .await
+                        .unwrap();
+                }
+                let failed_journal = journal(&c, operation).await.unwrap().unwrap();
+                assert_eq!(failed_journal.phase, "staging");
+                assert_eq!(failed_journal.error_code.is_none(), lose_error_write);
+                assert_eq!(
+                    failed_journal.path_failure_code.as_deref(),
+                    Some(if lose_error_write {
+                        "unresolved_attempt"
+                    } else {
+                        "source_missing_precommit"
+                    })
+                );
+                // This is the actual worker continuation with its captured clean snapshot, not a
+                // fresh run() call that would trivially notice the newer failure before starting.
+                let command_id = command.id;
+                run_after_journal(&db, command, captured).await.unwrap();
+                let settled = read(&c, command_id).await.unwrap();
+                assert!(matches!(settled.status, CommandStatus::Failed));
+                assert_eq!(
+                    settled.error_code.as_deref(),
+                    Some(if lose_error_write {
+                        "resume_required"
+                    } else {
+                        "filesystem_error"
+                    })
+                );
+                let retained = journal(&c, operation).await.unwrap().unwrap();
+                assert_eq!(retained.phase, failed_journal.phase);
+                assert_eq!(retained.error_code, failed_journal.error_code);
+                assert_eq!(retained.path_failure_code, failed_journal.path_failure_code);
+                assert!(!std::path::Path::new(&destination).exists());
+                assert_eq!(
+                    c.query(
+                        "SELECT count(*) FROM import_history WHERE operation_id=?",
+                        [operation.to_string()]
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<i64>(0)
+                    .unwrap(),
+                    0
+                );
+                let complete = crate::import::execute(db.clone(), &operation.to_string())
+                    .await
+                    .unwrap();
+                assert_eq!(complete.status, "complete");
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    b"stale-command-source"
+                );
+                assert_eq!(std::fs::read(&source).unwrap(), b"stale-command-source");
+                assert!(complete.path_failure_code.is_none());
+                // Command-only entry still treats a completed operation as an idempotent no-op.
+                assert_eq!(
+                    crate::import::execute_command(db.clone(), &operation.to_string())
+                        .await
+                        .unwrap()
+                        .status,
+                    "complete"
+                );
+                assert_eq!(
+                    c.query(
+                        "SELECT count(*) FROM import_history WHERE operation_id=?",
+                        [operation.to_string()]
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<i64>(0)
+                    .unwrap(),
+                    1
+                );
+            }
+        }
     }
 }

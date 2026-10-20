@@ -9,7 +9,7 @@ pub enum Numbering {
     Daily { date: String },
     Absolute { episode: i64 },
 }
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ParsedRelease {
     pub title: String,
     pub year: Option<i64>,
@@ -59,14 +59,15 @@ fn revision_tokens(
         is_repack: false,
     };
     let mut marker = false;
-    let positive = |s: &str| {
+    let mut version_specified = attached.is_some();
+    let revision_number = |s: &str, minimum: i64| {
         s.parse::<i64>()
             .ok()
-            .filter(|v| (1..=i64::from(i32::MAX)).contains(v))
+            .filter(|v| (minimum..=i64::from(i32::MAX)).contains(v))
             .ok_or("invalid_revision")
     };
     if let Some(version) = attached {
-        value.version = positive(version)?;
+        value.version = revision_number(version, 0)?;
         marker = true;
     }
     for token in tokens {
@@ -87,6 +88,7 @@ fn revision_tokens(
         };
         if token == "proper" {
             value.version = value.version.max(2);
+            version_specified = true;
             marker = true;
         } else if token == "real" {
             value.real += 1;
@@ -96,7 +98,11 @@ fn revision_tokens(
             .or_else(|| token.strip_prefix("rerip"))
         {
             if n.is_empty() || n.bytes().all(|c| c.is_ascii_digit()) {
-                let number = if n.is_empty() { 1 } else { positive(n)? };
+                let number = if n.is_empty() {
+                    1
+                } else {
+                    revision_number(n, 1)?
+                };
                 value.version = value.version.max(
                     number
                         .checked_add(1)
@@ -104,6 +110,7 @@ fn revision_tokens(
                         .ok_or("invalid_revision")?,
                 );
                 value.is_repack = true;
+                version_specified = true;
                 marker = true;
             }
         } else if tv {
@@ -111,7 +118,14 @@ fn revision_tokens(
                 .strip_prefix('v')
                 .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
             {
-                value.version = value.version.max(positive(n)?);
+                let version = revision_number(n, 0)?;
+                // An explicit v0 replaces the implicit baseline, but never a higher marker.
+                value.version = if version_specified {
+                    value.version.max(version)
+                } else {
+                    version
+                };
+                version_specified = true;
                 marker = true;
             }
         }
@@ -232,7 +246,30 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
             return Err("missing_movie_year");
         }
     }
-    if boundary == 0 {
+    finish_parse(
+        value,
+        tv,
+        tokens,
+        lower,
+        boundary,
+        parsed_numbering,
+        year,
+        None,
+        false,
+    )
+}
+fn finish_parse(
+    value: &str,
+    tv: bool,
+    tokens: Vec<&str>,
+    lower: Vec<String>,
+    boundary: usize,
+    parsed_numbering: Option<Numbering>,
+    year: Option<i64>,
+    end: Option<usize>,
+    allow_missing_title: bool,
+) -> Result<ParsedRelease, &'static str> {
+    if boundary == 0 && !allow_missing_title {
         return Err("missing_release_title");
     }
     let title = tokens[..boundary].join(" ");
@@ -284,11 +321,13 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
     } else {
         None
     };
-    let identity_tokens = match &parsed_numbering {
-        Some(Numbering::Daily { .. }) => 3,
-        Some(Numbering::Absolute { .. }) => 2,
-        _ => 1,
-    };
+    let identity_tokens =
+        end.map(|end| end - boundary)
+            .unwrap_or_else(|| match &parsed_numbering {
+                Some(Numbering::Daily { .. }) => 3,
+                Some(Numbering::Absolute { .. }) => 2,
+                _ => 1,
+            });
     let technical_start = Some(
         tokens
             .get(boundary + identity_tokens)
@@ -298,7 +337,7 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
     );
     let attached = if tv {
         lower
-            .get(boundary + identity_tokens - 1)
+            .get((boundary + identity_tokens).saturating_sub(1))
             .and_then(|token| version_suffix(token).1)
     } else {
         None
@@ -329,6 +368,365 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
     })
 }
 
+/// Complete downloaded-file numbering. Release search/rescan keep their existing
+/// public grammar; this internal representation cannot be mistaken for one anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DownloadedNumbering {
+    Episodes { season: i64, episodes: Vec<i64> },
+    Daily { dates: Vec<String> },
+    Absolute { episodes: Vec<i64> },
+    Season { season: i64 },
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParsedFile {
+    pub parsed: ParsedRelease,
+    pub numbering: Option<DownloadedNumbering>,
+}
+pub(crate) const MAX_DOWNLOADED_MEMBERS: usize = 20_000;
+fn scan_number(s: &str) -> Result<i64, &'static str> {
+    if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid_numbering");
+    }
+    s.parse::<i64>()
+        .ok()
+        .filter(|n| *n <= i64::from(i32::MAX))
+        .ok_or("invalid_numbering")
+}
+/// `-` is an inclusive range, `+` and repeated E/x are explicit list boundaries.
+fn scan_numbers(raw: &str) -> Result<Vec<i64>, &'static str> {
+    let mut values = std::collections::BTreeSet::new();
+    let raw = raw.to_ascii_lowercase();
+    let (raw, _) = version_suffix(&raw);
+    let bytes = raw.as_bytes();
+    let mut cursor = 0;
+    let mut previous = None;
+    let mut range = false;
+    while cursor < bytes.len() {
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if start == cursor {
+            return Err("invalid_numbering");
+        }
+        let current = scan_number(&raw[start..cursor])?;
+        if range {
+            let first = previous.ok_or("invalid_numbering")?;
+            if current < first || current - first >= MAX_DOWNLOADED_MEMBERS as i64 {
+                return Err("numbering_limit");
+            }
+            for number in first..=current {
+                values.insert(number);
+            }
+        } else {
+            values.insert(current);
+        }
+        if values.len() > MAX_DOWNLOADED_MEMBERS {
+            return Err("numbering_limit");
+        }
+        previous = Some(current);
+        if cursor == bytes.len() {
+            break;
+        }
+        range = match bytes[cursor] {
+            b'-' => true,
+            b'+' | b'e' | b'x' => false,
+            _ => return Err("invalid_numbering"),
+        };
+        cursor += 1;
+        if cursor < bytes.len() && matches!(bytes[cursor], b'e' | b'x') {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            return Err("invalid_numbering");
+        }
+    }
+    if values.is_empty() {
+        return Err("invalid_numbering");
+    }
+    Ok(values.into_iter().collect())
+}
+fn scan_coordinate(raw: &str) -> Result<Option<(i64, Option<Vec<i64>>)>, &'static str> {
+    let lower = raw.to_ascii_lowercase();
+    let (raw, _) = version_suffix(&lower);
+    if let Some(rest) = raw
+        .strip_prefix('s')
+        .filter(|s| s.as_bytes().first().is_some_and(u8::is_ascii_digit))
+    {
+        if let Some((season, episodes)) = rest.split_once('e') {
+            return Ok(Some((scan_number(season)?, Some(scan_numbers(episodes)?))));
+        }
+        return Ok(Some((scan_number(rest)?, None)));
+    }
+    if let Some((season, episodes)) = raw
+        .split_once('x')
+        .filter(|(s, _)| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Ok(Some((scan_number(season)?, Some(scan_numbers(episodes)?))));
+    }
+    Ok(None)
+}
+/// Reuses the release parser's technical fact parser without prepending an invented
+/// owner title. Missing filename identity remains explicit for folder/receipt matching.
+pub(crate) fn parse_downloaded(value: &str, tv: bool) -> Result<ParsedFile, &'static str> {
+    if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+        return Err("invalid_release_title");
+    }
+    let tokens: Vec<&str> = value
+        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '(' | ')' | '[' | ']'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let lower = tokens
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if !tv {
+        // Preserve ordinary movie parsing; downloaded folder/receipt identity can
+        // supply an absent year/title, but never overwrite a contradictory one.
+        if let Ok(parsed) = parse(value, false) {
+            return Ok(ParsedFile {
+                parsed,
+                numbering: None,
+            });
+        }
+        for token in &lower {
+            if scan_coordinate(token)?.is_some() {
+                return Err("wrong_media_numbering");
+            }
+        }
+        let technical = lower
+            .iter()
+            .position(|s| {
+                matches!(
+                    s.as_str(),
+                    "480p"
+                        | "576p"
+                        | "720p"
+                        | "1080p"
+                        | "2160p"
+                        | "web-dl"
+                        | "webdl"
+                        | "webrip"
+                        | "bluray"
+                        | "hdtv"
+                )
+            })
+            .unwrap_or(tokens.len());
+        let year = (0..technical).rev().find_map(|i| {
+            scan_number(tokens[i])
+                .ok()
+                .filter(|y| (1870..=2199).contains(y))
+                .map(|y| (i, y))
+        });
+        let boundary = year.map_or(technical, |(i, _)| i);
+        let end = year.map_or(technical, |(i, _)| i + 1);
+        let parsed = finish_parse(
+            value,
+            false,
+            tokens,
+            lower,
+            boundary,
+            None,
+            year.map(|(_, y)| y),
+            Some(end),
+            true,
+        )?;
+        return Ok(ParsedFile {
+            parsed,
+            numbering: None,
+        });
+    }
+    let mut boundary = None;
+    let mut end = 0;
+    let mut season = None;
+    let mut episodes = std::collections::BTreeSet::new();
+    let mut pack = false;
+    for (i, token) in lower.iter().enumerate() {
+        if let Some((s, numbers)) = scan_coordinate(token)? {
+            if season.is_some_and(|old| old != s) {
+                return Err("cross_season_numbering");
+            }
+            season = Some(s);
+            boundary.get_or_insert(i);
+            end = i + 1;
+            if let Some(numbers) = numbers {
+                episodes.extend(numbers);
+            } else {
+                pack = true;
+            }
+        } else if season.is_some()
+            && i == end
+            && token.starts_with('e')
+            && token.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+        {
+            episodes.extend(scan_numbers(&token[1..])?);
+            end = i + 1;
+        }
+        if episodes.len() > MAX_DOWNLOADED_MEMBERS {
+            return Err("numbering_limit");
+        }
+    }
+    if let Some(s) = season {
+        if pack && !episodes.is_empty() {
+            return Err("ambiguous_numbering");
+        }
+        let complete = if pack {
+            DownloadedNumbering::Season { season: s }
+        } else {
+            DownloadedNumbering::Episodes {
+                season: s,
+                episodes: episodes.iter().copied().collect(),
+            }
+        };
+        let compatible = if pack {
+            Numbering::Season { season: s }
+        } else {
+            Numbering::Episodes {
+                season: s,
+                episodes: episodes.into_iter().collect(),
+            }
+        };
+        let parsed = finish_parse(
+            value,
+            true,
+            tokens,
+            lower,
+            boundary.unwrap(),
+            Some(compatible),
+            None,
+            Some(end),
+            true,
+        )?;
+        return Ok(ParsedFile {
+            parsed,
+            numbering: Some(complete),
+        });
+    }
+    let mut dates = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let (date, consumed) = if tokens[i].len() == 10
+            && chrono::NaiveDate::parse_from_str(tokens[i], "%Y-%m-%d").is_ok()
+        {
+            (Some(tokens[i].to_owned()), 1)
+        } else if i + 2 < tokens.len() && tokens[i].len() == 4 {
+            let date = format!("{}-{}-{}", tokens[i], tokens[i + 1], tokens[i + 2]);
+            if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_ok() {
+                (Some(date), 3)
+            } else {
+                (None, 1)
+            }
+        } else {
+            (None, 1)
+        };
+        if let Some(date) = date {
+            boundary.get_or_insert(i);
+            end = i + consumed;
+            dates.insert(date);
+        }
+        i += consumed;
+    }
+    if !dates.is_empty() {
+        let compatible = if dates.len() == 1 {
+            Some(Numbering::Daily {
+                date: dates.first().unwrap().clone(),
+            })
+        } else {
+            None
+        };
+        let parsed = finish_parse(
+            value,
+            true,
+            tokens,
+            lower,
+            boundary.unwrap(),
+            compatible,
+            None,
+            Some(end),
+            true,
+        )?;
+        return Ok(ParsedFile {
+            parsed,
+            numbering: Some(DownloadedNumbering::Daily {
+                dates: dates.into_iter().collect(),
+            }),
+        });
+    }
+    // Absolute syntax explicitly separates the title and numeric span with ` - `;
+    // a number-only filename is also identifiable using a trusted folder/receipt.
+    let start = if let Some(i) = tokens.iter().position(|s| *s == "-") {
+        i + 1
+    } else {
+        0
+    };
+    if let Some(raw) = lower
+        .get(start)
+        .filter(|s| s.as_bytes().first().is_some_and(u8::is_ascii_digit) && !s.ends_with('p'))
+    {
+        let numbers = scan_numbers(raw)?;
+        let compatible = if numbers.len() == 1 {
+            Some(Numbering::Absolute {
+                episode: numbers[0],
+            })
+        } else {
+            None
+        };
+        let title_end = if start > 0 { start - 1 } else { 0 };
+        let parsed = finish_parse(
+            value,
+            true,
+            tokens,
+            lower,
+            title_end,
+            compatible,
+            None,
+            Some(start + 1),
+            true,
+        )?;
+        return Ok(ParsedFile {
+            parsed,
+            numbering: Some(DownloadedNumbering::Absolute { episodes: numbers }),
+        });
+    }
+    // A folder may carry identity or technical facts without numbering. Keep that
+    // absence explicit; the complete-file resolver must obtain a real member set.
+    let boundary = lower
+        .iter()
+        .position(|s| {
+            matches!(
+                s.as_str(),
+                "480p"
+                    | "576p"
+                    | "720p"
+                    | "1080p"
+                    | "2160p"
+                    | "web-dl"
+                    | "webdl"
+                    | "webrip"
+                    | "bluray"
+                    | "hdtv"
+            )
+        })
+        .unwrap_or(tokens.len());
+    let parsed = finish_parse(
+        value,
+        true,
+        tokens,
+        lower,
+        boundary,
+        None,
+        None,
+        Some(boundary),
+        true,
+    )?;
+    Ok(ParsedFile {
+        parsed,
+        numbering: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +739,14 @@ mod tests {
             ("RERIP2", 3, 0, true),
             ("REAL.REAL.PROPER", 2, 2, false),
             ("v3", 3, 0, false),
+            ("v0", 0, 0, false),
+            ("REAL.v0", 0, 1, false),
+            ("v0.PROPER", 2, 0, false),
+            ("PROPER.v0", 2, 0, false),
+            ("v0.REPACK", 2, 0, true),
+            ("REPACK.v0", 2, 0, true),
+            ("v1.v0", 1, 0, false),
+            ("v0.v1", 1, 0, false),
         ] {
             let parsed = parse(
                 &format!("Real.Proper.Harbor.S01E02.1080p.WEB-DL.{suffix}"),
@@ -357,6 +763,20 @@ mod tests {
         let parsed = parse("Harbor - 023v4 1080p WEB-DL-GROUP", true).unwrap();
         assert_eq!(parsed.numbering, Some(Numbering::Absolute { episode: 23 }));
         assert_eq!(parsed.revision.unwrap().version, 4);
+        for title in [
+            "Harbor - 023v0 1080p WEB-DL-GROUP",
+            "Harbor.S01E02v0.1080p.WEB-DL",
+        ] {
+            let parsed = parse(title, true).unwrap();
+            assert_eq!(parsed.revision.unwrap().version, 0);
+            assert!(parsed.revision_marker);
+        }
+        for suffix in ["v2147483648", "REPACK0"] {
+            assert_eq!(
+                parse(&format!("Harbor.S01E02.1080p.{suffix}"), true).unwrap_err(),
+                "invalid_revision"
+            );
+        }
         assert!(
             !parse("Proper.2020.1080p.WEB-DL-PROPER", false)
                 .unwrap()
@@ -475,5 +895,86 @@ mod tests {
             parse("Harbor.S01E02.1080p.720p.WEB-DL", true).unwrap_err(),
             "ambiguous_quality"
         );
+    }
+}
+
+#[cfg(test)]
+mod downloaded_tests {
+    use super::*;
+    #[test]
+    fn downloaded_complete_sets_do_not_change_release_grammar() {
+        for (input, expected) in [
+            ("Harbor.S01E01-E03.1080p.WEB-DL", vec![1, 2, 3]),
+            ("Harbor.S01E03E01E03.1080p.WEB-DL", vec![1, 3]),
+            ("Harbor.S01E01-02+E04.1080p.WEB-DL", vec![1, 2, 4]),
+            ("Harbor.1x01-03.1080p.WEB-DL", vec![1, 2, 3]),
+            ("Harbor S01E01 - S01E03 1080p WEB-DL", vec![1, 3]),
+        ] {
+            let p = parse_downloaded(input, true).unwrap();
+            assert_eq!(
+                p.numbering,
+                Some(DownloadedNumbering::Episodes {
+                    season: 1,
+                    episodes: expected
+                }),
+                "{input}"
+            );
+            assert_eq!(p.parsed.title, "Harbor");
+            assert_eq!(p.parsed.quality_name.as_deref(), Some("WEBDL-1080p"));
+        }
+        assert!(parse("Harbor.S01E01-E03.1080p.WEB-DL", true).is_err());
+        for input in [
+            "Harbor.S01E03-01",
+            "Harbor.S01E01-20002",
+            "Harbor.S01E01.S02E01",
+            "Harbor.S01E01+",
+            "Harbor.S01E2147483648",
+        ] {
+            assert!(parse_downloaded(input, true).is_err(), "{input}");
+        }
+    }
+    #[test]
+    fn downloaded_daily_absolute_and_missing_identity_are_explicit() {
+        let p = parse_downloaded("Harbor.2026.09.24.2026.09.25.720p.HDTV", true).unwrap();
+        assert_eq!(
+            p.numbering,
+            Some(DownloadedNumbering::Daily {
+                dates: vec!["2026-09-24".into(), "2026-09-25".into()]
+            })
+        );
+        assert!(p.parsed.numbering.is_none()); // Never collapse an extended set to one public member.
+        let p = parse_downloaded("Harbor - 047-049v0 1080p WEB-DL", true).unwrap();
+        assert_eq!(
+            p.numbering,
+            Some(DownloadedNumbering::Absolute {
+                episodes: vec![47, 48, 49]
+            })
+        );
+        assert_eq!(p.parsed.revision.unwrap().version, 0);
+        assert!(
+            parse_downloaded("S01E01.1080p.WEB-DL", true)
+                .unwrap()
+                .parsed
+                .title
+                .is_empty()
+        );
+        assert!(
+            parse_downloaded("Harbor", true)
+                .unwrap()
+                .numbering
+                .is_none()
+        );
+        assert_eq!(
+            parse_downloaded("Harbor.1080p.WEB-DL", false)
+                .unwrap()
+                .parsed
+                .year,
+            None
+        );
+        assert_eq!(
+            parse_downloaded("Harbor.S01E01", false).unwrap_err(),
+            "wrong_media_numbering"
+        );
+        assert!(parse_downloaded("Harbor.S01Ebad", false).is_err());
     }
 }

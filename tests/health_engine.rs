@@ -33,8 +33,24 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Migration46 adds removed metadata per domain; wait for all sixteen current checks (0048 adds the indexer pair, 0051 the backoff check and 0049 the binding check per domain).
-            if v["summary"]["current"] == 16 {
+            // Reasoning: 0053 adds remote_path_mapping and 0060 recycle_bin per domain; all 24 checks must settle.
+            if v["summary"]["current"] == 24 {
+                // Reasoning: twenty-four checks span two pages; issue assertions cover both complete domains.
+                let (_, second) = request(
+                    client,
+                    base,
+                    reqwest::Method::GET,
+                    "/api/v1/health?offset=16",
+                    None,
+                )
+                .await;
+                let mut v = v;
+                for key in ["checks", "issues"] {
+                    v[key]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(second[key].as_array().unwrap().iter().cloned());
+                }
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -64,9 +80,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
     let (status, fresh) =
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
-    // Migration46 adds removed metadata to CDH, communication and roots in each domain.
-    // Reasoning: 0048 adds indexer_search and indexer_rss and 0049 indexer_download_client per domain, so the fresh registry has sixteen identities (0051 adds download_client_backoff per domain; was fourteen) (was 12 at schema48, 8 before).
-    assert_eq!(fresh["summary"]["never_run"], 16);
+    // Reasoning: 0051 adds download_client_backoff per domain to the eighteen existing identities.
+    assert_eq!(fresh["summary"]["never_run"], 24); // Reasoning:0053 and 0059 each add two initially unobserved checks.
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -89,15 +104,32 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
                 "download_client_communication",
                 "download_client_root_folder",
                 "indexer_download_client",
+                "indexer_failures",
                 "indexer_rss",
                 "indexer_search",
+                "indexer_status",
+                "recycle_bin",
+                "remote_path_mapping",
                 "removed_metadata",
             ]
             .into_iter()
             .map(move |key| (scope.to_owned(), key.to_owned()))
         })
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(identities(&fresh["checks"]), expected);
+    // Reasoning: 0053 and 0059 give twenty-four identities across two sixteen-row API pages.
+    let (_, second_page) = request(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/api/v1/health?offset=16",
+        None,
+    )
+    .await;
+    assert_eq!(fresh["checks"].as_array().unwrap().len(), 16);
+    assert_eq!(second_page["checks"].as_array().unwrap().len(), 8);
+    let mut actual = identities(&fresh["checks"]);
+    actual.extend(identities(&second_page["checks"]));
+    assert_eq!(actual, expected);
     assert_eq!(fresh["summary"]["current"], 0);
     assert_eq!(fresh["coverage"]["registered_only"], true);
     for query in ["?limit=0", "?offset=128", "?scope=episode", "?unknown=true"] {
@@ -167,9 +199,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Admission includes all four identities per domain, not only a larger count.
-    // Reasoning: seven identities per domain after 0049 (indexer_search/indexer_rss from 0048 and indexer_download_client); 0051 adds download_client_backoff, so eight per domain and the union is sixteen.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 16);
+    // Reasoning: 0053 and 0059 each add one identity per domain; compare all twenty-four members exactly.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 24); // Reasoning:0053 and 0059 each add two selected identities.
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -358,17 +389,39 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(pending["summary"]["stale"], 1);
-    let cdh = |snapshot: &Value| {
+    // Reasoning: 0053 makes an equal-value CDH save invalidate exactly these two TV checks.
+    assert_eq!(pending["summary"]["stale"], 2);
+    // Evaluation can be pending/running while stale; compare the previously current generations.
+    let stale = Value::Array(
+        pending["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["observed_generation"] != row["generation"])
+            .cloned()
+            .collect(),
+    );
+    assert_eq!(
+        identities(&stale),
+        ["completed_download_handling", "remote_path_mapping"]
+            .into_iter()
+            .map(|key| ("tv".to_owned(), key.to_owned()))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let generations = |snapshot: &Value| {
         snapshot["checks"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|v| v["identity"]["check_key"] == "completed_download_handling")
-            .unwrap()["generation"]
-            .clone()
+            .map(|row| {
+                (
+                    row["identity"]["check_key"].as_str().unwrap().to_owned(),
+                    row["generation"].as_u64().unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
     };
-    let generation = cdh(&pending);
+    let pending_generations = generations(&pending);
     assert_eq!(
         request(
             &client,
@@ -389,7 +442,9 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    assert_eq!(cdh(&unchanged), generation);
+    // A rejected revision must not advance either invalidated check or any unrelated TV generation.
+    // Worker observations may settle concurrently, so compare generations rather than freshness.
+    assert_eq!(generations(&unchanged), pending_generations);
     let healthy = wait_current(&client, &base).await;
     // Reasoning: the fixture has no indexer, so after the CDH warning is restored the remaining issues are the two
     // communication warnings plus each domain's none-enabled indexer_search Error (0048): 2 + 2 = 4. Intent is kept
@@ -551,7 +606,8 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            if v["summary"]["current"] == 16 && issues(&v).is_empty() {
+            // Reasoning: 0060 recycle_bin identities are healthy while no bin is configured.
+            if v["summary"]["current"] == 24 && issues(&v).is_empty() {
                 return v;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

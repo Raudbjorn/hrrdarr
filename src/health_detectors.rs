@@ -106,7 +106,7 @@ pub async fn evaluate_current(
     if domain == MediaDomain::Tv {
         // ponytail: serial probing is bounded to 256 clients and the worker's 30s batch;
         // add resumable batches if measured deployments exceed that budget.
-        let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type='tv' AND p.implementation='qbittorrent' ORDER BY p.id LIMIT ?", [(MAX_HEALTH_CLIENTS + 1) as i64]).await.map_err(|_| "storage_error")?;
+        let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type='tv' AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') ORDER BY p.id LIMIT ?", [(MAX_HEALTH_CLIENTS + 1) as i64]).await.map_err(|_| "storage_error")?;
         while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
             if providers.len() == MAX_HEALTH_CLIENTS {
                 return Err("check_failed");
@@ -122,7 +122,19 @@ pub async fn evaluate_current(
     let mut observations = Vec::with_capacity(providers.len());
     for (id, revision, implementation) in providers {
         // Do not silently treat a future unsupported client as a successful status.
-        if implementation != "qbittorrent" {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
+        ) {
             return Err("check_failed");
         }
         let locality = client
@@ -202,7 +214,7 @@ async fn evaluate_communication_inner(
         MediaDomain::Tv => "tv",
         MediaDomain::Movies => "movies",
     };
-    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation,p.name FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation='qbittorrent' ORDER BY p.id LIMIT ?", libsql::params![media,(MAX_HEALTH_CLIENTS+1) as i64]).await.map_err(|_| "storage_error")?;
+    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation,p.name FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') ORDER BY p.id LIMIT ?", libsql::params![media,(MAX_HEALTH_CLIENTS+1) as i64]).await.map_err(|_| "storage_error")?;
     while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
         if providers.len() == MAX_HEALTH_CLIENTS {
             return Err("check_failed");
@@ -222,7 +234,19 @@ async fn evaluate_communication_inner(
         if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
             return Err("check_failed");
         }
-        if implementation != "qbittorrent" {
+        if !matches!(
+            implementation.as_str(),
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
+        ) {
             return Err("check_failed");
         }
         match client
@@ -304,7 +328,7 @@ pub async fn evaluate_indexer_client(
          CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
           AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
           AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
-          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','qbittorrent','torrentrss')
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation')
           AND typeof(p.settings_version)='integer' AND p.settings_version=1
           AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
           AND typeof(s.implementation)='text' AND s.implementation=p.implementation
@@ -312,7 +336,7 @@ pub async fn evaluate_indexer_client(
            AND length(CAST(s.download_client_id AS BLOB))=36 AND instr(s.download_client_id,char(0))=0))
          THEN 1 ELSE 0 END,
          t.id IS NOT NULL,
-         CASE WHEN t.implementation='qbittorrent' AND typeof(t.implementation)='text'
+         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation') AND typeof(t.implementation)='text'
           AND typeof(t.settings_version)='integer' AND t.settings_version=1
           AND typeof(t.enabled)='integer' AND t.enabled IN (0,1)
          THEN 1 ELSE 0 END,
@@ -345,11 +369,36 @@ pub async fn evaluate_indexer_client(
         let implementation = row.get::<String>(2).map_err(|_| "check_failed")?;
         let binding = row.get::<Option<String>>(4).map_err(|_| "check_failed")?;
         if binding.as_deref().is_some_and(|id| !canonical_uuid(id))
-            || (implementation == "qbittorrent" && binding.is_some())
+            || (matches!(
+                implementation.as_str(),
+                "qbittorrent"
+                    | "sabnzbd"
+                    | "transmission"
+                    | "nzbget"
+                    | "deluge"
+                    | "rtorrent"
+                    | "utorrent"
+                    | "aria2"
+                    | "flood"
+                    | "downloadstation"
+            ) && binding.is_some())
         {
             return Err("check_failed");
         }
-        if implementation == "qbittorrent" || row.get::<i64>(3).map_err(|_| "check_failed")? == 0 {
+        if matches!(
+            implementation.as_str(),
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
+        ) || row.get::<i64>(3).map_err(|_| "check_failed")? == 0
+        {
             continue;
         }
         if binding.is_none() {

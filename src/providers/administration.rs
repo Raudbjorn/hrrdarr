@@ -1,4 +1,4 @@
-//! Native administration for the three delivered providers. Media filters select whole providers.
+//! Native administration for the delivered providers. Media filters select whole providers.
 use super::*;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -15,7 +15,7 @@ const PREFLIGHT_SECONDS: u64 = 5;
 // ponytail: One process-wide batch avoids queued fan-out; replace with the durable command scheduler when it owns provider testing.
 static BATCH_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
-#[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Indexer,
@@ -23,15 +23,29 @@ pub enum ProviderKind {
 }
 impl ProviderKind {
     fn matches(self, settings: &ProviderSettings) -> bool {
+        if settings.tracker_parts().is_some() {
+            return self == Self::Indexer;
+        }
         matches!(
             (self, settings),
-            (Self::DownloadClient, ProviderSettings::Qbittorrent { .. })
-                | (
-                    Self::Indexer,
-                    ProviderSettings::Torznab { .. }
-                        | ProviderSettings::Newznab { .. }
-                        | ProviderSettings::Torrentrss { .. }
-                )
+            (
+                Self::DownloadClient,
+                ProviderSettings::Qbittorrent { .. }
+                    | ProviderSettings::Sabnzbd { .. }
+                    | ProviderSettings::Nzbget { .. }
+                    | ProviderSettings::Transmission { .. }
+                    | ProviderSettings::Deluge { .. }
+                    | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Downloadstation { .. }
+                    | ProviderSettings::Flood { .. }
+                    | ProviderSettings::Aria2 { .. }
+                    | ProviderSettings::Utorrent { .. }
+            ) | (
+                Self::Indexer,
+                ProviderSettings::Torznab { .. }
+                    | ProviderSettings::Newznab { .. }
+                    | ProviderSettings::Torrentrss { .. }
+            )
         )
     }
     fn database(self) -> &'static str {
@@ -60,8 +74,35 @@ impl ProviderFilter {
             ) => movies.is_some(),
             (ProviderSettings::Torrentrss { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (ProviderSettings::Torrentrss { movies, .. }, MediaDomain::Movies) => movies.is_some(),
-            (ProviderSettings::Qbittorrent { tv, .. }, MediaDomain::Tv) => tv.is_some(),
-            (ProviderSettings::Qbittorrent { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (
+                settings @ (ProviderSettings::Nyaa { .. }
+                | ProviderSettings::Fanzub { .. }
+                | ProviderSettings::Iptorrents { .. }
+                | ProviderSettings::Torrentleech { .. }
+                | ProviderSettings::Broadcasthenet { .. }
+                | ProviderSettings::Filelist { .. }
+                | ProviderSettings::Hdbits { .. }
+                | ProviderSettings::Passthepopcorn { .. }
+                | ProviderSettings::Torrentpotato { .. }),
+                media,
+            ) => match (settings.tracker_parts(), media) {
+                (Some((_, tv, _)), MediaDomain::Tv) => tv.is_some(),
+                (Some((_, _, movies)), MediaDomain::Movies) => movies.is_some(),
+                _ => false,
+            },
+            (
+                settings @ (ProviderSettings::Qbittorrent { .. }
+                | ProviderSettings::Sabnzbd { .. }
+                | ProviderSettings::Nzbget { .. }
+                | ProviderSettings::Transmission { .. }
+                | ProviderSettings::Deluge { .. }
+                | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Downloadstation { .. }
+                | ProviderSettings::Flood { .. }
+                | ProviderSettings::Aria2 { .. }
+                | ProviderSettings::Utorrent { .. }),
+                media,
+            ) => settings.client_scoped(media),
         };
         media && self.kind.matches(&provider.settings)
     }
@@ -83,6 +124,12 @@ pub enum ProviderDefaults {
         tv: FeedScope,
         movies: FeedScope,
     },
+    /// A tracker of the indexer-breadth family with the suggested endpoint shape.
+    Tracker {
+        tv: TrackerScope,
+        movies: TrackerScope,
+        endpoint_hint: String,
+    },
     DownloadClient {
         imported_category: Option<String>,
         recent_priority: i8,
@@ -92,15 +139,63 @@ pub enum ProviderDefaults {
         sequential_order: bool,
         first_last_first: bool,
         add_tags: bool,
+        tags: Vec<i64>,
+    },
+    UsenetClient {
+        recent_priority: UsenetPriority,
+        older_priority: UsenetPriority,
+        tags: Vec<i64>,
+    },
+    NzbgetClient {
+        recent_priority: NzbgetPriority,
+        older_priority: NzbgetPriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the API path `/jsonrpc` is appended to it.
+        endpoint_hint: String,
+    },
+    TransmissionClient {
+        recent_priority: TorrentQueuePriority,
+        older_priority: TorrentQueuePriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the RPC path `/rpc` is appended to it.
+        endpoint_hint: String,
+    },
+    LabelTorrentClient {
+        recent_priority: TorrentQueuePriority,
+        older_priority: TorrentQueuePriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the API path `/json` is appended to it.
+        endpoint_hint: String,
     },
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderImplementation {
     Newznab,
+    Nzbget,
     Qbittorrent,
+    Sabnzbd,
     Torrentrss,
+    Nyaa,
+    Fanzub,
+    Iptorrents,
+    Torrentleech,
+    Broadcasthenet,
+    Filelist,
+    Hdbits,
+    Passthepopcorn,
+    Torrentpotato,
     Torznab,
+    Transmission,
+    Deluge,
+    Rtorrent,
+    Utorrent,
+    Aria2,
+    Flood,
+    Downloadstation,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -151,10 +246,82 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
         },
     }
 }
+fn tracker_template(kind: TrackerKind) -> ProviderTemplate {
+    let implementation = match kind {
+        TrackerKind::Nyaa => ProviderImplementation::Nyaa,
+        TrackerKind::Fanzub => ProviderImplementation::Fanzub,
+        TrackerKind::Iptorrents => ProviderImplementation::Iptorrents,
+        TrackerKind::Torrentleech => ProviderImplementation::Torrentleech,
+        TrackerKind::Broadcasthenet => ProviderImplementation::Broadcasthenet,
+        TrackerKind::Filelist => ProviderImplementation::Filelist,
+        TrackerKind::Hdbits => ProviderImplementation::Hdbits,
+        TrackerKind::Passthepopcorn => ProviderImplementation::Passthepopcorn,
+        TrackerKind::Torrentpotato => ProviderImplementation::Torrentpotato,
+    };
+    let (tv, movies) = kind.domains();
+    let scope = |media: MediaDomain| TrackerScope {
+        enable_rss: true,
+        enable_automatic_search: Some(kind.searchable()),
+        enable_interactive_search: Some(kind.searchable()),
+        minimum_seeders: None,
+        categories: match (kind, media) {
+            (TrackerKind::Filelist, MediaDomain::Tv) => vec![21, 23, 27],
+            (TrackerKind::Filelist, MediaDomain::Movies) => vec![1, 4, 6, 19],
+            (TrackerKind::Hdbits, MediaDomain::Tv) => vec![2],
+            (TrackerKind::Hdbits, MediaDomain::Movies) => vec![1],
+            _ => vec![],
+        },
+    };
+    let endpoint_hint = match kind {
+        TrackerKind::Nyaa => "https://nyaa.si/",
+        TrackerKind::Fanzub => "https://fanzub.com/rss",
+        TrackerKind::Iptorrents => "https://iptorrents.com/t.rss",
+        TrackerKind::Torrentleech => "https://rss.torrentleech.org",
+        TrackerKind::Broadcasthenet => "https://api.broadcasthe.net/",
+        TrackerKind::Filelist => "https://filelist.io/api.php",
+        TrackerKind::Hdbits => "https://hdbits.org/api/torrents",
+        TrackerKind::Passthepopcorn => "https://passthepopcorn.me/torrents.php",
+        TrackerKind::Torrentpotato => "https://tracker.example/potato",
+    };
+    ProviderTemplate {
+        implementation,
+        presets: vec![],
+        supported_media: [(MediaDomain::Tv, tv), (MediaDomain::Movies, movies)]
+            .into_iter()
+            .filter_map(|(media, served)| served.then_some(media))
+            .collect(),
+        enabled: false,
+        priority: 1,
+        defaults: ProviderDefaults::Tracker {
+            tv: scope(MediaDomain::Tv),
+            movies: scope(MediaDomain::Movies),
+            endpoint_hint: endpoint_hint.into(),
+        },
+    }
+}
 // Historical catalog metadata from both pinned references. No endpoint is contacted here.
 fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<ProviderPreset> {
     match implementation {
-        ProviderImplementation::Qbittorrent | ProviderImplementation::Torrentrss => vec![],
+        ProviderImplementation::Qbittorrent
+        | ProviderImplementation::Sabnzbd
+        | ProviderImplementation::Nzbget
+        | ProviderImplementation::Transmission
+        | ProviderImplementation::Torrentrss
+        | ProviderImplementation::Nyaa
+        | ProviderImplementation::Fanzub
+        | ProviderImplementation::Iptorrents
+        | ProviderImplementation::Torrentleech
+        | ProviderImplementation::Broadcasthenet
+        | ProviderImplementation::Filelist
+        | ProviderImplementation::Hdbits
+        | ProviderImplementation::Passthepopcorn
+        | ProviderImplementation::Torrentpotato
+        | ProviderImplementation::Deluge
+        | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Downloadstation
+        | ProviderImplementation::Flood
+        | ProviderImplementation::Aria2
+        | ProviderImplementation::Utorrent => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {
@@ -300,24 +467,157 @@ pub(super) async fn schema(
                 },
             },
         }))
+        .chain(TrackerKind::ALL.into_iter().map(tracker_template))
         .collect(),
-        ProviderKind::DownloadClient => vec![ProviderTemplate {
-            implementation: ProviderImplementation::Qbittorrent,
-            presets: vec![],
-            supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
-            enabled: false,
-            priority: 1,
-            defaults: ProviderDefaults::DownloadClient {
-                imported_category: None,
-                recent_priority: 0,
-                older_priority: 0,
-                initial_state: DownloadInitialState::default(),
-                content_layout: DownloadContentLayout::default(),
-                sequential_order: false,
-                first_last_first: false,
-                add_tags: false,
+        ProviderKind::DownloadClient => vec![
+            ProviderTemplate {
+                implementation: ProviderImplementation::Qbittorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::DownloadClient {
+                    imported_category: None,
+                    recent_priority: 0,
+                    older_priority: 0,
+                    initial_state: DownloadInitialState::default(),
+                    content_layout: DownloadContentLayout::default(),
+                    sequential_order: false,
+                    first_last_first: false,
+                    add_tags: false,
+                    tags: vec![],
+                },
             },
-        }],
+            // Domain categories have no safe default; the user names an existing SABnzbd category.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Sabnzbd,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::UsenetClient {
+                    recent_priority: UsenetPriority::Default,
+                    older_priority: UsenetPriority::Default,
+                    tags: vec![],
+                },
+            },
+            // Categories have no safe default; the user names an existing NZBGet category.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Nzbget,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::NzbgetClient {
+                    recent_priority: NzbgetPriority::Normal,
+                    older_priority: NzbgetPriority::Normal,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://nzbget.example:6789".into(),
+                },
+            },
+            // Placement has no safe default on a shared client; the user names each domain's
+            // category or directory.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Transmission,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::TransmissionClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://transmission.example:9091/transmission".into(),
+                },
+            },
+            // The label has no safe default on a shared client; the user names each domain's label.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Deluge,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://deluge.example:8112".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Rtorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://rtorrent.example/RPC2".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Utorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://utorrent.example:8080/gui".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Aria2,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://aria2.example:6800/jsonrpc".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Flood,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://flood.example:3000".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Downloadstation,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "https://nas.example:5001".into(),
+                },
+            },
+        ],
     };
     bounded(ProviderSchema { templates })
 }
@@ -437,7 +737,7 @@ pub(super) async fn update(
         let mut items=Vec::with_capacity(providers.len());
         for provider in providers {
             if tx.execute("UPDATE providers SET enabled=?,priority=?,revision=revision+1 WHERE id=? AND revision=?",params![i64::from(input.changes.enabled.unwrap_or(provider.enabled)),i64::from(input.changes.priority.unwrap_or(provider.priority)),provider.id.to_string(),provider.revision]).await?!=1 {return Err(conflict());}
-            super::reconcile_download_client_status(&tx,&provider.id.to_string()).await.map_err(super::status_reconciliation)?;
+            backoff::reconcile(&tx,&provider.id.to_string()).await?;
             items.push(read(&tx,&provider.id.to_string()).await?.0);
         }
         changes.mark(&tx).await?;
@@ -534,7 +834,7 @@ struct Candidate {
 async fn snapshots(context: &Context, filter: ProviderFilter) -> Result<Vec<Candidate>> {
     let conn = context.db.connect().await?;
     let tx = conn.transaction().await?;
-    let mut rows=tx.query("SELECT p.id,p.revision FROM providers p WHERE p.enabled=1 AND ((?='download_client' AND p.implementation='qbittorrent') OR (?='indexer' AND p.implementation IN('torznab','newznab','torrentrss'))) AND EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?) ORDER BY p.priority,p.name,p.id LIMIT ?",params![filter.kind.database(),filter.kind.database(),filter.media(),(MAX_TESTS+1) as i64]).await?;
+    let mut rows=tx.query("SELECT p.id,p.revision FROM providers p WHERE p.enabled=1 AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind=?) AND EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?) ORDER BY p.priority,p.name,p.id LIMIT ?",params![filter.kind.database(),filter.media(),(MAX_TESTS+1) as i64]).await?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next().await? {
         ids.push((row.get::<String>(0)?, row.get::<i64>(1)?));
@@ -687,6 +987,8 @@ mod tests {
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let context = Context {
+            backoff_started: std::time::Instant::now(),
+            selection_cursor: Arc::new(std::sync::Mutex::new([None, None])),
             db: db.clone(),
             key: None,
             transport: Arc::new(http::HttpClient::new()),

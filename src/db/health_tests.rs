@@ -126,14 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
-    // Migration51 appends honest provenance defaults; every historical field stays exact.
-    for row in &mut before[2] {
-        row.extend([
-            libsql::Value::Text("legacy_unknown".into()),
-            libsql::Value::Integer(0),
-        ]);
-    }
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -147,11 +140,24 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
                 row.push(libsql::Value::Null);
             }
         }
+        if *table == "commands" {
+            // Reasoning: 0051 appends explicit legacy provenance without inferring manual intent.
+            for row in &mut expected {
+                row.extend([
+                    libsql::Value::Text("legacy_unknown".into()),
+                    libsql::Value::Integer(0),
+                ]);
+            }
+        }
         assert_eq!(&rows(&c, table).await?, &expected);
     }
-    // Exact removal of the one new count must recover every original predicate.
+    // Remove only the later selection-default exception and exact Health/scan
+    // capacity terms to recover every predecessor admission predicate.
     let added =
         "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))";
+    let scan_added = "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))";
+    // Reasoning: 0060 appends the recycle-bin cleanup pool term to every existing guard.
+    let recycle_added = "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))";
     for (name, sql) in &triggers {
         let actual = c
             .query("SELECT sql FROM sqlite_schema WHERE name=?", [name.clone()])
@@ -160,13 +166,51 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             .await?
             .unwrap()
             .get::<String>(0)?;
-        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
-        // indexer implementation list to torrentrss; reversing that one exact edit must recover the predecessor.
+        // 0052 adds a default-only bypass of concrete client admission, retaining the complete legacy predicate.
+        let actual = if matches!(
+            name.as_str(),
+            "rss_commands_admit" | "search_commands_admit"
+        ) {
+            actual.replace(
+                "AND (NEW.selection_kind='default' OR EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+                "AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+            ).replace(
+                "p.enabled=1))) THEN RAISE(ABORT,'invalid RSS provider",
+                "p.enabled=1)) THEN RAISE(ABORT,'invalid RSS provider",
+            )
+        } else {
+            actual
+        };
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // map only that predicate back to the 41-era qBittorrent literal.
+        let actual = actual
+            .replace("p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)", "p.implementation='qbittorrent'")
+            .replace("p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')", "p.implementation='qbittorrent'");
+        // Reasoning: 0090 (indexer breadth) widens the same list with the nine tracker implementations; reverse that first.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            "p.implementation IN ('torznab','newznab','torrentrss')",
+        );
+        // 0068 widens only the RSS admission trigger's indexer list to torrentrss; reverse that one exact edit.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','torrentrss')",
+            "p.implementation IN ('torznab','newznab')",
+        );
+        // Reasoning: 0090 widens the search admission list with the searchable tracker implementations; reverse it first.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            "p.implementation IN ('torznab','newznab')",
+        );
+        // 0054 adds exactly one scan-parent capacity contribution to each old guard.
+        // Reasoning: 0067 appends the rename command term to every pool guard; strip it to compare the 41-era predicate.
+        let actual = actual.replace("+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))", "");
+        assert_eq!(actual.matches(scan_added).count(), 1);
+        assert_eq!(actual.matches(recycle_added).count(), 1);
         assert_eq!(
-            actual.replace(added, "").replace(
-                "p.implementation IN ('torznab','newznab','torrentrss')",
-                "p.implementation IN ('torznab','newznab')"
-            ),
+            actual
+                .replace(added, "")
+                .replace(scan_added, "")
+                .replace(recycle_added, ""),
             *sql
         );
     }
@@ -201,7 +245,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -245,10 +289,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Migration46 adds a fourth TV identity; 0048 adds tv indexer_search/indexer_rss, 0049 indexer_download_client and 0051 download_client_backoff, so eight TV identities (was seven); Reasoning: registry growth, intent unchanged.
+    // Reasoning: 0053 and 0059 give twelve TV identities; every admission retains generation1.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        8
+        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
     );
     assert_eq!(
         scalar(
@@ -256,7 +300,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        8, // Reasoning: migrations 46/48/49/50 grew the scoped TV registry to eight identities; admission generation stays fixed.
+        12, // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -419,7 +463,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        8 // Reasoning: migrations 46/48/49 added five movie checks and 0051 adds download_client_backoff; publication still covers the full scope.
+        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
     );
     assert!(
         c.execute(
@@ -430,8 +474,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Reasoning: 0050 raises the registry to sixteen identities, leaving 112 slots within the unchanged 128 ceiling.
-    for i in 0..112 {
+    // Reasoning: 0053 and 0059 give 24 registry rows, leaving 104 slots within the 128 cap.
+    for i in 0..104 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -450,7 +494,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        1024 // Reasoning: 0050 gives eight TV identities per admitted command (was seven): 128 retained commands * 8.
+        1536 // Reasoning: 0053 and 0059 give twelve TV identities: 128 retained commands * 12.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -633,18 +677,13 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
-    // Existing states are unchanged; communication43, root-health44 and backoff51 append their scoped registry pairs.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
     let registry = rows(&c, "health_checks").await?;
-    // Migration44 appends NULL expiry authority; all historical values remain exact.
-    let mut expected_registry = original[0].clone();
-    for row in &mut expected_registry {
-        row.push(libsql::Value::Null);
-    }
-    assert_eq!(&registry[..2], &expected_registry);
+    assert_eq!(&registry[..2], &original[0]);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND check_key='download_client_communication' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='DownloadClientCheck'").await?, 2);
     let migrated = rows(&c, "health_transitions").await?;
     assert_eq!(migrated.len(), 1);
@@ -723,10 +762,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds removed metadata; 0048 adds four indexer identities; 0049 adds two indexer_download_client identities; 0051 adds two download_client_backoff identities (14 -> 16).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     }
     Ok(())
 }

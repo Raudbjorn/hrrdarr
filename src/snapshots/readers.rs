@@ -96,6 +96,14 @@ fn unsupported(source: &Source, used: &[(&str, &[&str])]) -> Vec<Unsupported> {
         .collect()
 }
 
+fn series_runtime(row: &Record) -> Result<Field> {
+    match row.get("Runtime") {
+        None | Some(Value::Null) => Ok(Field::Value(Value::Null)),
+        Some(Value::Integer(n)) if (0..=i64::from(i32::MAX)).contains(n) => Ok(val(*n)),
+        _ => Err(ImportError("invalid series runtime")),
+    }
+}
+
 pub(super) fn sonarr(source: &Source) -> Result<Plan> {
     if source.version != 233 {
         return Err(ImportError(
@@ -125,6 +133,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
     let episodes = table(source, "Episodes", EPISODES)?;
     let files = table(source, "EpisodeFiles", FILES)?;
     let mut series_columns = SERIES.to_vec();
+    series_columns.push("Runtime");
     series_columns.extend(TV_SETTINGS.iter().map(|(source, _)| *source));
     let mut file_columns = FILES.to_vec();
     file_columns.extend(FILE_METADATA.iter().map(|(source, _)| *source));
@@ -154,6 +163,7 @@ pub(super) fn sonarr(source: &Source) -> Result<Plan> {
             source_id: id,
             fields: vec![
                 ("tvdb_id", val(positive(row, "TvdbId")?)),
+                ("runtime", series_runtime(row)?),
                 ("title", val(text(row, "Title")?)),
                 ("year", nullable(row, "Year")?),
                 ("path", val(path)),

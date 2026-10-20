@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: 0048 seeds four indexer_search/indexer_rss rows, 0049 two indexer_download_client rows and 0051 two download_client_backoff rows (one per domain), so the registry is 16 (was 14 at schema49).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -126,10 +126,9 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     )
     .await?;
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO root_folders(media_type,path)VALUES('tv','/unused/tv'),('movies','/unused/movies');").await?;
-    // Compare every predecessor check; only migration44, 46, 48 and 49 registrations are new (Reasoning: 0048 indexer_search/indexer_rss and 0049 indexer_download_client rows are excluded from the predecessor witness like the earlier additions).
+    // Exclude later registrations, including the two 0053 path diagnostics identities.
     let queries = [
-        // Reasoning: 0051 appends next_expiry_at and download_client_backoff rows; project predecessor columns only.
-        "SELECT scope,check_key,startup,scheduled,generation,due_at,pending_reasons,observed_generation,observed_epoch,checked_at,last_error,severity,reason,message,wiki_url,compatibility_type FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','download_client_backoff') ORDER BY scope,check_key",
+        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
         "SELECT * FROM health_lifecycle",
         "SELECT * FROM health_commands ORDER BY id",
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
@@ -181,8 +180,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Migration46 adds two removed-metadata identities; 0048 adds four indexer identities (8 -> 12); 0049 adds two indexer_download_client identities (12 -> 14); 0051 adds two download_client_backoff identities (14 -> 16).
+        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");
