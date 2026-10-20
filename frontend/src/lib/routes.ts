@@ -1,7 +1,8 @@
 // Pure hash-route table. No DOM access: callers pass in `location.hash`.
 export type ViewId =
   | 'library' | 'health' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles'
-  | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history';
+  | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'
+  | 'wanted-missing' | 'wanted-cutoff' | 'calendar' | 'collections' | 'autotagging' | 'notifications' | 'backup';
 
 export type Route =
   | { kind: 'view'; view: ViewId }
@@ -16,10 +17,16 @@ export const SETTINGS_INDEX_PATH = '/settings';
 export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   library: '/',
   health: '/system/health',
+  backup: '/system/backup',
   rss: '/system/rss',
   activity: '/activity/queue',
   blocklist: '/activity/blocklist',
   history: '/activity/history',
+  'wanted-missing': '/wanted/missing',
+  'wanted-cutoff': '/wanted/cutoffunmet',
+  calendar: '/calendar',
+  collections: '/collections',
+  autotagging: '/settings/autotagging',
   providers: '/settings/providers',
   qualities: '/settings/quality',
   profiles: '/settings/profiles',
@@ -28,6 +35,7 @@ export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   'custom-formats': '/settings/customformats',
   tags: '/settings/tags',
   general: '/settings/general',
+  notifications: '/settings/connect',
   'import-existing': '/add/import',
 };
 
@@ -41,15 +49,17 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { view: 'qualities', label: 'Quality', description: 'Quality definitions' },
   { view: 'profiles', label: 'Profiles', description: 'Quality, delay and release profiles' },
   { view: 'naming', label: 'Naming', description: 'Episode and movie file naming' },
-  { view: 'media-management', label: 'Media management', description: 'Revision and upgrade policy' },
+  { view: 'media-management', label: 'Media management', description: 'Revision, import policy and recycle bin' },
   { view: 'custom-formats', label: 'Custom formats', description: 'Release matching formats' },
   { view: 'tags', label: 'Tags', description: 'Tags shared by library items and settings' },
+  { view: 'autotagging', label: 'Auto tagging', description: 'Rules that apply tags from catalog facts' },
+  { view: 'notifications', label: 'Connect', description: 'Notifications and media server updates' },
   { view: 'general', label: 'General', description: 'Host and general settings' },
 ];
 
 /** Listed as text only, never as links. */
 export const UNAVAILABLE_SECTIONS: readonly string[] = [
-  'Import lists', 'Metadata', 'Connect (notifications)', 'UI settings', 'Backup', 'Updates', 'Logs',
+  'Import lists', 'Metadata', 'UI settings', 'Updates', 'Logs',
 ];
 
 const PATH_TO_VIEW = new Map<string, ViewId>(VIEW_IDS.map((v) => [VIEW_PATHS[v], v]));

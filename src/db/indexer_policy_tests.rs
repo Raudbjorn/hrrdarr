@@ -118,12 +118,20 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
+            let mut expected = expected.clone();
+            // 0055 adds a NULL series runtime and 0076 a NULL episode/movie
+            // native_last_search_at only; retain all preceding column values.
+            if matches!(*table, "series" | "episodes" | "movies") {
+                for row in &mut expected {
+                    row.push(libsql::Value::Null);
+                }
+            }
             assert_eq!(
-                &rows(&c, &format!("SELECT * FROM {table} ORDER BY rowid")).await?,
+                rows(&c, &format!("SELECT * FROM {table} ORDER BY rowid")).await?,
                 expected
             );
         }
@@ -150,16 +158,11 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
             ]
         );
     }
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: schema47 predecessor holds 8 health_checks rows; 0048 adds 4 indexer search/rss checks, 0049 adds 2 indexer_download_client checks and 0051 adds 2 download_client_backoff checks.
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
-    // Reasoning: 0051 appends the NULL next_expiry_at column; every predecessor value stays exact.
-    let mut predecessor = before[2].clone();
-    for row in &mut predecessor {
-        row.push(libsql::Value::Null);
-    }
     assert_eq!(
         rows(&c, "SELECT * FROM health_checks ORDER BY rowid LIMIT 8").await?,
-        predecessor
+        before[2]
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND ((check_key='indexer_search' AND compatibility_type='IndexerSearchCheck') OR (check_key='indexer_rss' AND compatibility_type='IndexerRssCheck')) AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL").await?,4);
     provider(&c, "torznab").await?;
@@ -244,9 +247,8 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
     }
     let tx = c.transaction().await?;
-    for i in 0..112
-    /* Reasoning: 16 registry rows exist at schema51 (was 14 at schema50), so 112 fixtures fill the 128 cap */
-    {
+    // Reasoning: 0077 brings the registry to 29 rows, so 99 fixtures reach the 128-row cap.
+    for i in 0..99 {
         tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'fixture')",[format!("fixture_{i}")]).await?;
     }
     assert!(tx.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'fixture')",()).await.is_err());
@@ -257,7 +259,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
     assert_eq!(rows(&c, policy_sql).await?, policies);
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 16); // Reasoning: 16 health rows at schema51 (was 14 at schema50).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     c.execute("DELETE FROM providers WHERE id=?", [torznab.clone()])
         .await?;
     assert_eq!(
@@ -275,14 +277,14 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,
             "SELECT count(*) FROM health_checks"
         )
         .await?,
-        16 // Reasoning: fresh schema51 registry has 16 rows (14 at schema50).
+        29 // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     );
     Ok(())
 }

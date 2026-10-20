@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     Ok(())
 }

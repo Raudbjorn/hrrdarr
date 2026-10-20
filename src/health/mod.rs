@@ -13,10 +13,16 @@ use libsql::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 mod api;
-mod backoff;
+mod client_backoff;
 mod download_roots;
 mod engine;
 mod indexers;
+mod library_roots;
+mod mounts;
+mod path_diagnostics;
+#[cfg(test)]
+pub(crate) use path_diagnostics::retained_path_diagnostic;
+mod recycle_bin;
 mod removed_metadata;
 pub use api::{
     HealthCheckState, HealthCoverage, HealthEvaluation, HealthSnapshot, HealthSummary,
@@ -324,7 +330,37 @@ pub(crate) async fn configuration_changed(c: &Connection, media: MediaDomain) ->
         MediaDomain::Tv => HealthScope::Tv,
         MediaDomain::Movies => HealthScope::Movies,
     };
-    let keys = selection(c, scope, "check_key='completed_download_handling'").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('completed_download_handling','remote_path_mapping')",
+    )
+    .await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Recycle-bin settings writes re-evaluate hc.036 for that domain in the same transaction.
+pub(crate) async fn recycle_bin_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let keys = selection(c, scope, "check_key='recycle_bin'").await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Root folder declarations change hc.034 best-root derivation and collection roots, both domains.
+/// Shares the authoritative root mutation's transaction; marking never touches the filesystem.
+pub(crate) async fn library_roots_changed(c: &Connection) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let keys = selection(
+        c,
+        HealthScope::All,
+        "check_key IN ('root_folder','collection_root_folder')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 
@@ -340,7 +376,7 @@ pub(crate) async fn provider_configuration_changed(
     let keys = selection(
         c,
         scope,
-        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder')",
+        "check_key IN ('completed_download_handling','download_client_communication','download_client_root_folder','download_client_backoff','remote_path_mapping')",
     )
     .await?;
     mark(c, &keys, CONFIG, now()?).await
@@ -357,8 +393,105 @@ pub(crate) async fn indexer_configuration_changed(
         MediaDomain::Tv => HealthScope::Tv,
         MediaDomain::Movies => HealthScope::Movies,
     };
-    let keys = selection(c, scope, "check_key IN ('indexer_search','indexer_rss')").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('indexer_search','indexer_rss','indexer_status','indexer_failures')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
+}
+/// Backoff authority and its invalidation commit together; repeated failures cannot postpone work.
+pub(crate) async fn indexer_status_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    indexer_status_at(c, scope, now()?).await.map(|_| ())
+}
+async fn indexer_status_at(c: &Connection, scope: HealthScope, timestamp: i64) -> Result<bool> {
+    status_at(
+        c,
+        scope,
+        timestamp,
+        "check_key IN ('indexer_status','indexer_failures')",
+        2,
+    )
+    .await
+}
+pub(crate) async fn client_backoff_changed(c: &Connection, media: MediaDomain) -> Result<()> {
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    status_at(c, scope, now()?, "check_key='download_client_backoff'", 1)
+        .await
+        .map(|_| ())
+}
+async fn status_at(
+    c: &Connection,
+    scope: HealthScope,
+    timestamp: i64,
+    predicate: &str,
+    expected: usize,
+) -> Result<bool> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let keys = selection(c, scope, predicate).await?;
+    if keys.len() != expected {
+        return Err(invariant());
+    }
+    if keys.iter().any(|key| key.generation >= MAX_INTEGER) {
+        c.execute(
+            "UPDATE health_lifecycle SET schedule_error='health_invariant' WHERE id=1",
+            (),
+        )
+        .await?;
+        return Ok(false);
+    }
+    for key in keys {
+        if c.execute("UPDATE health_checks SET generation=generation+1,due_at=CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END,pending_reasons=pending_reasons|8 WHERE scope=? AND check_key=? AND generation=?",params![timestamp,timestamp,scope.text(),key.identity.check_key,key.generation]).await? != 1 { return Err(invariant()); }
+    }
+    Ok(true)
+}
+
+async fn client_backoff_expiry(c: &Connection, timestamp: i64) -> Result<()> {
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        let due = c.query("SELECT 1 FROM download_client_status WHERE media_type=? AND next_health_at<=? LIMIT 1",params![scope.text(),timestamp]).await?.next().await?.is_some();
+        if due
+            && status_at(
+                c,
+                scope,
+                timestamp,
+                "check_key='download_client_backoff'",
+                1,
+            )
+            .await?
+        {
+            c.execute("UPDATE download_client_status SET next_health_at=NULL WHERE media_type=? AND next_health_at<=?",params![scope.text(),timestamp]).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Consume each time boundary once, independently of health batch cancellation/publication.
+async fn indexer_status_expiry(c: &Connection, timestamp: i64) -> Result<()> {
+    for scope in [HealthScope::Tv, HealthScope::Movies] {
+        let due = c
+            .query(
+                "SELECT 1 FROM indexer_status WHERE media_type=? AND next_health_at<=? LIMIT 1",
+                params![scope.text(), timestamp],
+            )
+            .await?
+            .next()
+            .await?
+            .is_some();
+        if due && indexer_status_at(c, scope, timestamp).await? {
+            c.execute("UPDATE indexer_status SET next_health_at=CASE WHEN disabled_until>? THEN disabled_until ELSE NULL END WHERE media_type=? AND next_health_at<=?",params![timestamp,scope.text(),timestamp]).await?;
+        }
+    }
+    Ok(())
 }
 /// Indexer download-client bindings are evaluated separately from search/RSS capability checks.
 /// The caller deduplicates affected referencing domains in the authoritative mutation transaction.
@@ -420,6 +553,44 @@ pub(crate) async fn download_roots_changed(
         Some(MediaDomain::Movies) => HealthScope::Movies,
         None => HealthScope::All,
     };
-    let keys = selection(c, scope, "check_key='download_client_root_folder'").await?;
+    let keys = selection(
+        c,
+        scope,
+        "check_key IN ('download_client_root_folder','remote_path_mapping')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Durable path evidence and its observation fence share the caller's write transaction.
+#[derive(Clone, Copy)]
+pub(crate) enum PathDiagnosticChange {
+    Admission,
+    Failure,
+    Progress,
+    Completion,
+}
+pub(crate) async fn path_diagnostics_changed(
+    c: &Connection,
+    media: MediaDomain,
+    change: PathDiagnosticChange,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let scope = match media {
+        MediaDomain::Tv => HealthScope::Tv,
+        MediaDomain::Movies => HealthScope::Movies,
+    };
+    let row = c.query("SELECT generation,checked_at IS NOT NULL AND observed_generation IS NOT NULL AND severity=0 FROM health_checks WHERE scope=? AND check_key='remote_path_mapping'", [scope.text()]).await?.next().await?.ok_or_else(invariant)?;
+    let generation: i64 = row.get(0)?;
+    if generation >= MAX_INTEGER {
+        return Err(Error(StatusCode::CONFLICT, "health_generation_exhausted"));
+    }
+    // Admission may already have made the last successful observation stale.
+    let schedule = matches!(change, PathDiagnosticChange::Completion)
+        || (matches!(change, PathDiagnosticChange::Failure) && row.get::<i64>(1)? == 1);
+    let timestamp = now()?;
+    if c.execute("UPDATE health_checks SET generation=generation+1,pending_reasons=CASE WHEN ? THEN pending_reasons|8 ELSE pending_reasons END,due_at=CASE WHEN ? THEN CASE WHEN due_at IS NULL THEN ? ELSE min(due_at,?) END ELSE due_at END WHERE scope=? AND check_key='remote_path_mapping' AND generation=?", params![schedule,schedule,timestamp,timestamp,scope.text(),generation]).await? != 1 { return Err(invariant()); }
+    Ok(())
 }

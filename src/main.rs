@@ -86,6 +86,28 @@ async fn run() -> Result<(), ProcessFailure> {
             .map_err(|e| ProcessFailure::at("database_open", e))?
     } else {
         let path = env::var("HRRDARR_DATABASE_PATH").unwrap_or_else(|_| "hrrdarr.db".into());
+        // A validated pending restore replaces the database before it is opened; the replaced
+        // database is retained beside it.
+        match hrrdarr::backup::apply_pending_restore(std::path::Path::new(&path))
+            .await
+            .map_err(|e| ProcessFailure::at("backup_restore", e))?
+        {
+            hrrdarr::backup::RestoreOutcome::None => {}
+            hrrdarr::backup::RestoreOutcome::Applied { original } => println!(
+                "event=backup_restore_applied original={}",
+                original.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            ),
+            hrrdarr::backup::RestoreOutcome::Rejected {
+                quarantined,
+                reason,
+            } => eprintln!(
+                "event=backup_restore_rejected code={reason} quarantined={}",
+                quarantined
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+            ),
+        }
         Database::open_local(path)
             .await
             .map_err(|e| ProcessFailure::at("database_open", e))?
@@ -94,8 +116,11 @@ async fn run() -> Result<(), ProcessFailure> {
         .await
         .map_err(|e| ProcessFailure::at("quality_profile_defaults", e))?;
     let db = Arc::new(db);
-    if db.migration_backup().is_some() {
+    if let Some(snapshot) = db.migration_backup() {
         println!("event=migration_backup_created");
+        // The recovery directory stays; this also publishes it as a typed `update` backup.
+        // Failure is logged by the engine and does not block startup.
+        let _ = hrrdarr::backup::publish_update(&db, snapshot).await;
     }
     let provider_key = match env::var("HRRDARR_PROVIDER_KEY") {
         Ok(value) => Some(Arc::new(
@@ -142,11 +167,18 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
+    let notifier = state
+        .db
+        .permits_local_imports()
+        .then(|| hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone()));
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
+    if let Some(notifier) = notifier {
+        notifier.shutdown().await;
+    }
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -169,11 +201,17 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         )
         .with_state(state.clone())
         .merge(hrrdarr::search::router(state.db.clone(), refresh.clone()))
+        .merge(hrrdarr::wanted::router(state.db.clone(), refresh.clone()))
+        .merge(hrrdarr::calendar::router(state.db.clone()))
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
         .merge(hrrdarr::tags::router(state.db.clone()))
+        .merge(hrrdarr::autotagging::router(state.db.clone()))
+        .merge(hrrdarr::collections::router(state.db.clone()))
         .merge(hrrdarr::revision_policy::router(state.db.clone()))
+        .merge(hrrdarr::import_policy::router(state.db.clone()))
+        .merge(hrrdarr::recycle_bin::router(state.db.clone()))
         .merge(hrrdarr::completed_download_handling::router(
             state.db.clone(),
         ))
@@ -192,7 +230,12 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
+        .merge(hrrdarr::notifications::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+        ))
         .merge(hrrdarr::commands::router(state.db.clone()))
+        .merge(hrrdarr::backup::router(state.db.clone()))
         .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))
         .merge(hrrdarr::blocklist::router(state.db.clone()))

@@ -1,5 +1,7 @@
-//! Native, domain-scoped file metadata. No endpoint here changes the filesystem.
+//! Native, domain-scoped file metadata. Only the explicit DELETE routes (implemented in
+//! `recycle_bin::deletion`) change the filesystem; metadata routes never do.
 pub(crate) mod media_info;
+pub(crate) mod probe;
 use crate::db::Database;
 use axum::{
     Extension, Json, Router,
@@ -91,9 +93,17 @@ pub fn router(db: Arc<Database>) -> Router {
         router = router.merge(
             Router::new()
                 .route(&format!("{prefix}"), get(list))
-                .route(&format!("{prefix}/bulk"), put(bulk))
+                .route(
+                    &format!("{prefix}/bulk"),
+                    put(bulk).delete(crate::recycle_bin::deletion::delete_bulk),
+                )
                 .route(&format!("{prefix}/editor"), put(editor))
-                .route(&format!("{prefix}/{{id}}"), get(detail).put(update))
+                .route(
+                    &format!("{prefix}/{{id}}"),
+                    get(detail)
+                        .put(update)
+                        .delete(crate::recycle_bin::deletion::delete_one),
+                )
                 .layer(Extension(media.to_owned()))
                 .layer(DefaultBodyLimit::max(256 * 1024))
                 .with_state(db.clone()),
@@ -102,11 +112,16 @@ pub fn router(db: Arc<Database>) -> Router {
     // Keep documented JSON errors for unsupported domains; real domains use static prefixes.
     router
         .route("/api/v1/{media}/files", get(unknown_domain))
-        .route("/api/v1/{media}/files/bulk", put(unknown_domain))
+        .route(
+            "/api/v1/{media}/files/bulk",
+            put(unknown_domain).delete(unknown_domain),
+        )
         .route("/api/v1/{media}/files/editor", put(unknown_domain))
         .route(
             "/api/v1/{media}/files/{id}",
-            get(unknown_domain).put(unknown_domain),
+            get(unknown_domain)
+                .put(unknown_domain)
+                .delete(unknown_domain),
         )
 }
 #[derive(Deserialize, ts_rs::TS)]
@@ -603,7 +618,7 @@ pub struct FileRevision {
 }
 impl FileRevision {
     pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
-        if !(1..=i64::from(i32::MAX)).contains(&self.version)
+        if !(0..=i64::from(i32::MAX)).contains(&self.version)
             || !(0..=i64::from(i32::MAX)).contains(&self.real)
         {
             return Err("Invalid quality revision");

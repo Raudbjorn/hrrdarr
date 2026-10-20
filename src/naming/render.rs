@@ -54,12 +54,16 @@ impl TemplateField {
     }
     fn allows(self, token: &Token) -> bool {
         use TemplateField::*;
+        if matches!(token, Token::Absolute(_)) {
+            return self == AnimeEpisode;
+        }
         match self {
             StandardEpisode | DailyEpisode | AnimeEpisode => matches!(
                 token,
                 Token::SeriesTitle
                     | Token::Season(_)
                     | Token::Episode(_)
+                    | Token::Absolute(_)
                     | Token::EpisodeTitle
                     | Token::AirDate
                     | Token::QualityTitle
@@ -104,6 +108,7 @@ enum Token {
     SeriesTitle,
     Season(u8),
     Episode(u8),
+    Absolute(u8),
     EpisodeTitle,
     AirDate,
     QualityTitle,
@@ -127,6 +132,7 @@ impl Token {
             Token::SeriesTitle
             | Token::Season(_)
             | Token::Episode(_)
+            | Token::Absolute(_)
             | Token::EpisodeTitle
             | Token::AirDate => Some(MediaDomain::Tv),
             Token::MovieTitle | Token::ReleaseYear | Token::EditionTags => {
@@ -240,6 +246,11 @@ fn parse_token(text: &str) -> Result<Token, TemplateError> {
             if let Some(digits) = text.strip_prefix("episode:") {
                 return parse_pad(digits)
                     .map(Token::Episode)
+                    .ok_or_else(|| TemplateError::InvalidPadding(format!("{{{text}}}")));
+            }
+            if let Some(digits) = text.strip_prefix("absolute:") {
+                return parse_pad(digits)
+                    .map(Token::Absolute)
                     .ok_or_else(|| TemplateError::InvalidPadding(format!("{{{text}}}")));
             }
             Err(TemplateError::UnknownToken(format!("{{{text}}}")))
@@ -487,6 +498,12 @@ pub enum RenderError {
     IllegalCharacter,
     /// After sanitization a path component was empty, or only dots/spaces.
     EmptyComponent,
+    InvalidEpisodeSet,
+    NeedsPolicy,
+    MissingAbsoluteNumber,
+    MissingAirDate,
+    MissingMembershipToken,
+    ComponentTooLong,
 }
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -497,6 +514,20 @@ impl fmt::Display for RenderError {
                 "a substituted value contained an illegal character and replace_illegal_characters is disabled"
             ),
             Self::EmptyComponent => write!(f, "rendering produced an empty path component"),
+            Self::InvalidEpisodeSet => {
+                write!(f, "episode set is empty, inconsistent or exceeds its bound")
+            }
+            Self::NeedsPolicy => write!(f, "choose a multi-episode naming style"),
+            Self::MissingAbsoluteNumber => {
+                write!(f, "complete unique absolute numbering is required")
+            }
+            Self::MissingAirDate => write!(f, "complete air dates are required"),
+            Self::MissingMembershipToken => {
+                write!(f, "multi-episode template must identify every member")
+            }
+            Self::ComponentTooLong => {
+                write!(f, "complete episode name exceeds the component byte limit")
+            }
         }
     }
 }
@@ -703,6 +734,14 @@ pub fn render(
     facts: RenderFacts<'_>,
     config: &RenderConfig<'_>,
 ) -> Result<String, RenderError> {
+    if template
+        .components
+        .iter()
+        .flatten()
+        .any(|s| matches!(s, Segment::Token(Token::Absolute(_))))
+    {
+        return Err(RenderError::MissingAbsoluteNumber);
+    }
     if template.domain != facts.domain() {
         return Err(RenderError::DomainMismatch);
     }
@@ -747,6 +786,389 @@ pub fn render(
         parts.push(finish_component(&buf)?);
     }
     Ok(parts.join("/"))
+}
+
+/// Maximum facts accepted for one physical file, before sorting or allocating output.
+pub const MAX_EPISODE_MEMBERS: usize = 20_000;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum MultiEpisodeStyle {
+    Extend = 0,
+    Duplicate = 1,
+    Repeat = 2,
+    Scene = 3,
+    Range = 4,
+    PrefixedRange = 5,
+}
+impl TryFrom<i64> for MultiEpisodeStyle {
+    type Error = RenderError;
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Extend),
+            1 => Ok(Self::Duplicate),
+            2 => Ok(Self::Repeat),
+            3 => Ok(Self::Scene),
+            4 => Ok(Self::Range),
+            5 => Ok(Self::PrefixedRange),
+            _ => Err(RenderError::NeedsPolicy),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeMemberNamingFacts {
+    pub episode_id: i64,
+    pub season: i64,
+    pub episode: i64,
+    pub title: Option<String>,
+    pub air_date: Option<String>,
+    pub absolute_episode_number: Option<i64>,
+}
+/// One physical file, one series, complete member facts. No member acts as naming authority.
+#[derive(Debug, Clone)]
+pub struct EpisodeSetNamingFacts {
+    pub series_title: String,
+    pub anime: bool,
+    pub members: Vec<EpisodeMemberNamingFacts>,
+    pub quality_title: String,
+    pub revision: Option<crate::media_files::FileRevision>,
+    pub custom_formats: Vec<String>,
+}
+impl EpisodeSetNamingFacts {
+    pub fn from_single(f: &EpisodeNamingFacts, absolute_episode_number: Option<i64>) -> Self {
+        Self {
+            series_title: f.series_title.clone(),
+            anime: f.anime,
+            members: vec![EpisodeMemberNamingFacts {
+                episode_id: 1,
+                season: f.season,
+                episode: f.episode,
+                title: f.episode_title.clone(),
+                air_date: f.air_date.clone(),
+                absolute_episode_number,
+            }],
+            quality_title: f.quality_title.clone(),
+            revision: f.revision.clone(),
+            custom_formats: f.custom_formats.clone(),
+        }
+    }
+    fn ordered(&self) -> Result<Vec<&EpisodeMemberNamingFacts>, RenderError> {
+        if self.members.is_empty()
+            || self.members.len() > MAX_EPISODE_MEMBERS
+            || self.series_title.len() > 4096
+            || self.quality_title.len() > 4096
+            || self.custom_formats.len() > 256
+            || self.custom_formats.iter().any(|s| s.len() > 4096)
+        {
+            return Err(RenderError::InvalidEpisodeSet);
+        }
+        let mut ids = std::collections::BTreeMap::new();
+        for member in &self.members {
+            if member.episode_id <= 0
+                || member.season < 0
+                || member.episode < 0
+                || member.title.as_ref().is_some_and(|s| s.len() > 4096)
+                || member.air_date.as_ref().is_some_and(|s| s.len() > 32)
+            {
+                return Err(RenderError::InvalidEpisodeSet);
+            }
+            if let Some(previous) = ids.insert(member.episode_id, member) {
+                if previous != member {
+                    return Err(RenderError::InvalidEpisodeSet);
+                }
+            }
+        }
+        let mut members = ids.into_values().collect::<Vec<_>>();
+        members.sort_by_key(|m| (m.season, m.episode, m.episode_id));
+        if members
+            .windows(2)
+            .any(|w| w[0].season != w[1].season || w[0].episode == w[1].episode)
+        {
+            return Err(RenderError::InvalidEpisodeSet);
+        }
+        Ok(members)
+    }
+}
+fn bounded_push(out: &mut String, value: &str) -> Result<(), RenderError> {
+    if out.len().saturating_add(value.len()) > MAX_COMPONENT_BYTES {
+        return Err(RenderError::ComponentTooLong);
+    }
+    out.push_str(value);
+    Ok(())
+}
+fn member_numbers(
+    values: &[i64],
+    pad: u8,
+    prefix: &str,
+    style: MultiEpisodeStyle,
+    duplicate_separator: &str,
+) -> Result<String, RenderError> {
+    let number = |v: i64| format!("{v:0width$}", width = pad as usize);
+    let mut out = number(values[0]);
+    let mut i = 1;
+    while i < values.len() {
+        let adjacent = values[i - 1].checked_add(1) == Some(values[i]);
+        if matches!(
+            style,
+            MultiEpisodeStyle::Range | MultiEpisodeStyle::PrefixedRange
+        ) && adjacent
+        {
+            let mut end = i;
+            while end + 1 < values.len() && values[end].checked_add(1) == Some(values[end + 1]) {
+                end += 1;
+            }
+            bounded_push(&mut out, "-")?;
+            if style == MultiEpisodeStyle::PrefixedRange {
+                bounded_push(&mut out, prefix)?;
+            }
+            bounded_push(&mut out, &number(values[end]))?;
+            i = end + 1;
+            continue;
+        }
+        let separator = match style {
+            MultiEpisodeStyle::Duplicate => duplicate_separator,
+            MultiEpisodeStyle::Repeat if !prefix.is_empty() => "",
+            MultiEpisodeStyle::Scene => "-",
+            _ if !adjacent => "+",
+            _ => "-",
+        };
+        bounded_push(&mut out, separator)?;
+        if matches!(
+            style,
+            MultiEpisodeStyle::Repeat | MultiEpisodeStyle::Scene | MultiEpisodeStyle::PrefixedRange
+        ) {
+            bounded_push(&mut out, prefix)?;
+        }
+        bounded_push(&mut out, &number(values[i]))?;
+        i += 1;
+    }
+    Ok(out)
+}
+/// Complete set rendering never truncates identity. Gaps separate runs with `+`; a
+/// range never claims a missing episode. Existing singleton render remains unchanged.
+pub fn render_episode_set(
+    template: &Template,
+    facts: &EpisodeSetNamingFacts,
+    style: Option<MultiEpisodeStyle>,
+    config: &RenderConfig<'_>,
+) -> Result<String, RenderError> {
+    if template.domain != MediaDomain::Tv || template.components.len() != 1 {
+        return Err(RenderError::DomainMismatch);
+    }
+    let members = facts.ordered()?;
+    let multi = members.len() > 1;
+    let style = if multi {
+        style.ok_or(RenderError::NeedsPolicy)?
+    } else {
+        MultiEpisodeStyle::Extend
+    };
+    let component = &template.components[0];
+    if multi
+        && !component.iter().any(|s| {
+            matches!(
+                s,
+                Segment::Token(Token::Episode(_) | Token::Absolute(_) | Token::AirDate)
+            )
+        })
+    {
+        return Err(RenderError::MissingMembershipToken);
+    }
+    let first = members[0];
+    let single = EpisodeNamingFacts {
+        series_title: facts.series_title.clone(),
+        anime: facts.anime,
+        season: first.season,
+        episode: first.episode,
+        episode_title: first.title.clone(),
+        quality_title: facts.quality_title.clone(),
+        revision: facts.revision.clone(),
+        custom_formats: facts.custom_formats.clone(),
+        air_date: first.air_date.clone(),
+    };
+    if !multi
+        && !component
+            .iter()
+            .any(|s| matches!(s, Segment::Token(Token::Absolute(_))))
+    {
+        return render(template, RenderFacts::Episode(&single), config);
+    }
+    let mut expanded = component.clone();
+    // Duplicate the bounded season/episode block, including its alphabetic season
+    // prefix and the separator before it. Parsing supplied the structural boundary.
+    if multi && style == MultiEpisodeStyle::Duplicate {
+        let mut i = 0;
+        while i + 2 < expanded.len() {
+            let block = match (&expanded[i], &expanded[i + 1], &expanded[i + 2]) {
+                (
+                    Segment::Token(Token::Season(sp)),
+                    Segment::Literal(join),
+                    Segment::Token(Token::Episode(ep)),
+                ) => Some((*sp, join.clone(), *ep)),
+                _ => None,
+            };
+            if let Some((sp, join, ep)) = block {
+                let (prefix, separator) = if i > 0 {
+                    if let Segment::Literal(before) = &mut expanded[i - 1] {
+                        let cut = before
+                            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                            .len();
+                        let prefix = before[cut..].to_owned();
+                        before.truncate(cut);
+                        let sep = before
+                            .chars()
+                            .rev()
+                            .take_while(|c| matches!(c, ' ' | '.' | '-' | '_'))
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>();
+                        (prefix, if sep.is_empty() { "-".into() } else { sep })
+                    } else {
+                        (String::new(), "-".into())
+                    }
+                } else {
+                    (String::new(), "-".into())
+                };
+                let mut block = String::new();
+                for (n, m) in members.iter().enumerate() {
+                    if n > 0 {
+                        bounded_push(&mut block, &separator)?;
+                    }
+                    bounded_push(
+                        &mut block,
+                        &format!(
+                            "{prefix}{:0sw$}{join}{:0ew$}",
+                            m.season,
+                            m.episode,
+                            sw = sp as usize,
+                            ew = ep as usize
+                        ),
+                    )?;
+                }
+                expanded.splice(i..=i + 2, [Segment::Literal(block)]);
+            }
+            i += 1;
+        }
+    }
+    let mut out = String::new();
+    for (i, segment) in expanded.iter().enumerate() {
+        let (value, conditional) = match segment {
+            Segment::Literal(text) => (text.clone(), None),
+            Segment::Token(token) => {
+                let prefix = if i > 0 {
+                    if let Segment::Literal(text) = &expanded[i - 1] {
+                        let cut = text
+                            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                            .len();
+                        &text[cut..]
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                };
+                let value = match token {
+                    Token::Episode(pad) => member_numbers(
+                        &members.iter().map(|m| m.episode).collect::<Vec<_>>(),
+                        *pad,
+                        prefix,
+                        style,
+                        "-",
+                    )?,
+                    Token::Absolute(pad) => {
+                        let values = members
+                            .iter()
+                            .map(|m| {
+                                m.absolute_episode_number
+                                    .filter(|n| *n >= 0)
+                                    .ok_or(RenderError::MissingAbsoluteNumber)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if values.windows(2).any(|w| w[0] >= w[1]) {
+                            return Err(RenderError::MissingAbsoluteNumber);
+                        }
+                        let separator = if i > 0 {
+                            if let Segment::Literal(text) = &expanded[i - 1] {
+                                if text.ends_with(" - ") { " - " } else { "-" }
+                            } else {
+                                "-"
+                            }
+                        } else {
+                            "-"
+                        };
+                        member_numbers(&values, *pad, prefix, style, separator)?
+                    }
+                    Token::EpisodeTitle | Token::AirDate => {
+                        let mut values = std::collections::BTreeSet::new();
+                        let mut joined = String::new();
+                        for m in &members {
+                            let value = if matches!(token, Token::AirDate) {
+                                m.air_date
+                                    .as_deref()
+                                    .filter(|s| valid_air_date(s))
+                                    .ok_or(RenderError::MissingAirDate)?
+                            } else {
+                                m.title.as_deref().unwrap_or("")
+                            };
+                            if !value.is_empty() && values.insert(value) {
+                                if !joined.is_empty() {
+                                    bounded_push(&mut joined, " + ")?;
+                                }
+                                bounded_push(&mut joined, value)?;
+                            }
+                        }
+                        // A date-only template cannot distinguish two episodes aired the
+                        // same day; require an episode/absolute token in that case.
+                        if matches!(token, Token::AirDate)
+                            && values.len() != members.len()
+                            && !component.iter().any(|s| {
+                                matches!(s, Segment::Token(Token::Episode(_) | Token::Absolute(_)))
+                            })
+                        {
+                            return Err(RenderError::MissingMembershipToken);
+                        }
+                        joined
+                    }
+                    _ => token_value(token, RenderFacts::Episode(&single)),
+                };
+                let value = replace_illegal(
+                    &replace_colons(&value, config.colon),
+                    config.replace_illegal_characters,
+                )?;
+                let conditional = if let Token::CustomFormats { prefix, suffix, .. } = token {
+                    Some((prefix, suffix))
+                } else {
+                    None
+                };
+                (value, conditional)
+            }
+        };
+        if let Some((prefix, suffix)) = conditional {
+            if !value.trim().is_empty() {
+                bounded_push(&mut out, prefix)?;
+                bounded_push(&mut out, value.trim())?;
+                bounded_push(&mut out, suffix)?;
+            }
+        } else {
+            bounded_push(&mut out, &value)?;
+        }
+    }
+    if expanded
+        .iter()
+        .any(|s| matches!(s, Segment::Token(Token::CustomFormats { .. })))
+    {
+        let mut previous = None;
+        out.retain(|c| {
+            let keep = previous != Some(c) || !matches!(c, ' ' | '.' | '-' | '_');
+            previous = Some(c);
+            keep
+        });
+        out = out.trim_matches([' ', '.', '-', '_']).to_owned();
+    }
+    let out = replace_illegal(&out, config.replace_illegal_characters)?;
+    finish_component(&out)
+}
+fn valid_air_date(value: &str) -> bool {
+    value.len() == 10 && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
 }
 
 #[cfg(test)]

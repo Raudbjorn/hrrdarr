@@ -490,55 +490,86 @@ async fn provider_config_http_secrets_scopes_revisions_and_reopen() -> Result<()
     let _ = server.await;
     Ok(())
 }
+
 #[tokio::test]
-async fn provider_update_keeps_scope_tags_for_retained_domains() -> Result<(), Error> {
+async fn download_client_tags_are_scoped_retained_and_revision_guarded() {
     let scratch = Sandbox::new();
-    let db = Arc::new(Database::open_local(&scratch.0.join("db")).await?);
-    let c = db.connect().await?;
-    let key = Arc::new(providers::CredentialKey::from_hex(&"12".repeat(32)).unwrap());
-    let (address, server) = serve(db.clone(), Some(key)).await;
-    let route = "/api/v1/providers";
-    let base = json!({"name":"Tagged indexer","enabled":true,"priority":10,"settings":{"implementation":"torznab","endpoint":format!("http://{address}/not-provider-api"),"tv":{"categories":[5030],"anime_categories":[5070]},"movies":{"categories":[2000]}},"credentials":{"kind":"api_key","api_key":"tag-key"}});
-    let (status, created) = request(address, "POST", route, &base.to_string()).await;
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    c.execute_batch(
+        "INSERT INTO tags(id,media_type,label) VALUES(1,'tv','tv-tag'),(2,'movies','movie-tag')",
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = providers::router(db.clone(), None).merge(hrrdarr::tags::router(db.clone()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = json!({"name":"tagged","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":format!("http://{address}/unused"),"tv":{"category":"tv","imported_category":null,"recent_priority":0,"older_priority":0,"tags":[1]},"movies":{"category":"movies","imported_category":null,"recent_priority":0,"older_priority":0,"tags":[2]}}});
+    let (status, created) =
+        request(address, "POST", "/api/v1/providers", &config.to_string()).await;
     assert_eq!(status, 201, "{created}");
-    let id = created["id"].as_str().unwrap().to_owned();
-    let detail = format!("{route}/{id}");
-    c.execute_batch(&format!(
-        "INSERT INTO tags(id,media_type,label) VALUES(1,'tv','tv-tag'),(2,'movies','movie-tag');
-         INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES('{id}','tv',1),('{id}','movies',2);"
-    ))
-    .await?;
-    let tags = |c: libsql::Connection, id: String| async move {
-        let mut rows = c
-            .query(
-                "SELECT media_type,tag_id FROM provider_scope_tags WHERE provider_id=? ORDER BY media_type",
-                [id],
+    let id = created["id"].as_str().unwrap();
+    let route = format!("/api/v1/providers/{id}");
+    for (media, tag) in [("tv", 1), ("movies", 2)] {
+        assert_eq!(created["settings"][media]["tags"], json!([tag]));
+        // Reverse references belong to the detail endpoint, not the tag record.
+        let (status, detail) = request(
+            address,
+            "GET",
+            &format!("/api/v1/{media}/tags/detail/{tag}"),
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(detail["download_client_ids"], json!([id]));
+        assert_eq!(
+            request(
+                address,
+                "DELETE",
+                &format!("/api/v1/{media}/tags/{tag}"),
+                ""
             )
             .await
-            .unwrap();
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            out.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
-        }
-        out
-    };
-    // A name-only edit rebuilds every scope row; tags must survive the rebuild.
-    let mut update = base.clone();
-    update.as_object_mut().unwrap().remove("credentials");
-    update["revision"] = json!(1);
-    update["name"] = json!("Renamed");
-    let (status, changed) = request(address, "PUT", &detail, &update.to_string()).await;
-    assert_eq!(status, 200, "{changed}");
+            .0,
+            409
+        );
+    }
+    config["revision"] = json!(1);
+    config["settings"]["tv"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tags");
+    config["settings"]["movies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tags");
+    let (status, retained) = request(address, "PUT", &route, &config.to_string()).await;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained["settings"]["tv"]["tags"], json!([1]));
+    assert_eq!(retained["settings"]["movies"]["tags"], json!([2]));
     assert_eq!(
-        tags(c.clone(), id.clone()).await,
-        [("movies".to_owned(), 2), ("tv".to_owned(), 1)]
+        request(address, "PUT", &route, &config.to_string()).await.0,
+        409
     );
-    // Dropping a domain drops that domain's tags with its scope, and only those.
-    update["revision"] = json!(2);
-    update["settings"]["movies"] = Value::Null;
-    let (status, changed) = request(address, "PUT", &detail, &update.to_string()).await;
-    assert_eq!(status, 200, "{changed}");
-    assert_eq!(tags(c.clone(), id.clone()).await, [("tv".to_owned(), 1)]);
+    config["revision"] = json!(2);
+    for invalid in [json!([2]), json!([1, 1]), json!(null), json!([999])] {
+        config["settings"]["tv"]["tags"] = invalid;
+        assert_eq!(
+            request(address, "PUT", &route, &config.to_string()).await.0,
+            400
+        );
+    }
+    config["settings"]["tv"]["tags"] = json!([]);
+    let (status, cleared) = request(address, "PUT", &route, &config.to_string()).await;
+    assert_eq!(status, 200, "{cleared}");
+    assert_eq!(cleared["settings"]["tv"]["tags"], json!([]));
+    assert_eq!(cleared["settings"]["movies"]["tags"], json!([2]));
+    assert_eq!(
+        request(address, "DELETE", "/api/v1/tv/tags/1", "").await.0,
+        204
+    );
     server.abort();
-    Ok(())
 }

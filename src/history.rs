@@ -1,4 +1,5 @@
-//! Native import receipts and provenance-tagged source events; neither proves completed cleanup.
+//! Native import receipts, explicit file-deletion events and provenance-tagged source events;
+//! none of them proves completed cleanup.
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::{Database, MediaTarget},
@@ -84,10 +85,40 @@ pub struct NativeHistoryEvent {
     pub imported_at: String,
 }
 #[derive(Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionEventType {
+    FileDeleted,
+}
+#[derive(Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionReason {
+    // An explicit file deletion request.
+    Manual,
+    // An import replaced the file and moved the original into the domain's recycle bin.
+    Upgrade,
+}
+/// One explicit file deletion (reason `manual`) or upgrade recycle (reason `upgrade`) as it
+/// affected one target; a shared multi-episode file yields one event per detached episode, all
+/// with the same `deletion_id` (the upgrade recycle journal ID for reason `upgrade`).
+#[derive(Serialize, ts_rs::TS)]
+pub struct NativeDeletionEvent {
+    pub id: Uuid,
+    pub deletion_id: Uuid,
+    pub event_type: DeletionEventType,
+    pub reason: DeletionReason,
+    pub target: MediaTarget,
+    pub file: HistoricalFile,
+    pub path: String,
+    // Where the file was moved; null for permanent deletion or an already-missing file.
+    pub recycle_path: Option<String>,
+    pub deleted_at: String,
+}
+#[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "origin", rename_all = "snake_case")]
 pub enum HistoryEvent {
     NativeImport(NativeHistoryEvent),
     SourceSnapshot(SourceHistoryEvent),
+    NativeDeletion(NativeDeletionEvent),
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct SourceHistoryIdentity {
@@ -320,10 +351,50 @@ fn source_event(row: libsql::Row) -> Result<SourceHistoryEvent> {
         languages,
     })
 }
+fn deletion_event(row: libsql::Row, reason: DeletionReason) -> Result<NativeDeletionEvent> {
+    let id = Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| storage())?;
+    let (target, media_type) = match row.get::<String>(1)?.as_str() {
+        "episode" => (
+            MediaTarget::Episode(positive(row.get(2)?)?),
+            MediaDomain::Tv,
+        ),
+        "movie" => (
+            MediaTarget::Movie(positive(row.get(3)?)?),
+            MediaDomain::Movies,
+        ),
+        _ => return Err(storage()),
+    };
+    let raw = row.get::<String>(10)?;
+    let timestamp =
+        NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S").map_err(|_| storage())?;
+    if !(0..=9999).contains(&timestamp.year())
+        || timestamp.format("%Y-%m-%d %H:%M:%S").to_string() != raw
+    {
+        return Err(storage());
+    }
+    Ok(NativeDeletionEvent {
+        id,
+        deletion_id: Uuid::parse_str(&row.get::<String>(22)?).map_err(|_| storage())?,
+        event_type: DeletionEventType::FileDeleted,
+        reason,
+        target,
+        file: HistoricalFile {
+            media_type,
+            id: positive(row.get(23)?)?,
+        },
+        path: row.get(24)?,
+        recycle_path: row.get(25)?,
+        deleted_at: timestamp
+            .and_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
+}
 fn event(row: libsql::Row) -> Result<HistoryEvent> {
     match row.get::<i64>(11)? {
         0 => native_event(row).map(HistoryEvent::NativeImport),
         1 => source_event(row).map(HistoryEvent::SourceSnapshot),
+        2 => deletion_event(row, DeletionReason::Manual).map(HistoryEvent::NativeDeletion),
+        3 => deletion_event(row, DeletionReason::Upgrade).map(HistoryEvent::NativeDeletion),
         _ => Err(storage()),
     }
 }
@@ -331,9 +402,16 @@ fn event(row: libsql::Row) -> Result<HistoryEvent> {
 // made SQLite materialize and sort the entire historical payload in the measured union plan.
 pub(crate) fn page_sql(predicate: &str) -> String {
     let source_predicate = predicate.replace("h.imported_at", "h.occurred_at");
+    let deletion_predicate = predicate.replace("h.imported_at", "h.deleted_at");
     format!("WITH native_keys AS (
         SELECT h.operation_id AS native_id,h.imported_at AS event_at FROM import_history h {predicate}
         ORDER BY h.imported_at DESC,h.operation_id DESC LIMIT ?
+    ), deletion_keys AS (
+        SELECT h.id AS native_id,h.deleted_at AS event_at FROM file_deletion_history h {deletion_predicate}
+        ORDER BY h.deleted_at DESC,h.id DESC LIMIT ?
+    ), recycle_keys AS (
+        SELECT h.id AS native_id,h.deleted_at AS event_at FROM upgrade_recycle_history h {deletion_predicate}
+        ORDER BY h.deleted_at DESC,h.id DESC LIMIT ?
     ), source_keys AS (
         SELECT h.application,h.fingerprint,h.source_id,h.occurred_at AS event_at FROM snapshot_history_events h {source_predicate}
         ORDER BY h.occurred_at DESC,h.application ASC,h.fingerprint ASC,h.source_id DESC LIMIT ?
@@ -342,19 +420,27 @@ pub(crate) fn page_sql(predicate: &str) -> String {
             SELECT 0 AS origin_rank,native_id,event_at,NULL AS application,NULL AS fingerprint,NULL AS source_id FROM native_keys
             UNION ALL
             SELECT 1,NULL,event_at,application,fingerprint,source_id FROM source_keys
+            UNION ALL
+            SELECT 2,native_id,event_at,NULL,NULL,NULL FROM deletion_keys
+            UNION ALL
+            SELECT 3,native_id,event_at,NULL,NULL,NULL FROM recycle_keys
         ) ORDER BY event_at DESC,origin_rank ASC,native_id DESC,application ASC,fingerprint ASC,source_id DESC LIMIT ? OFFSET ?
-    ) SELECT n.operation_id,COALESCE(n.media_type,e.media_type),COALESCE(n.episode_id,e.episode_id),COALESCE(n.movie_id,e.movie_id),
+    ) SELECT COALESCE(n.operation_id,d.id,u.id),COALESCE(n.media_type,e.media_type,d.media_type,u.media_type),COALESCE(n.episode_id,e.episode_id,d.episode_id,u.episode_id),COALESCE(n.movie_id,e.movie_id,d.movie_id,u.movie_id),
         n.episode_file_id,n.movie_file_id,n.source,n.destination,n.size,n.sha256,s.event_at,s.origin_rank,
-        e.application,e.fingerprint,e.source_id,e.event_type,e.source_event_type,e.source_title,e.download_id,e.quality_id,e.quality_revision_json,e.languages_json
+        e.application,e.fingerprint,e.source_id,e.event_type,e.source_event_type,e.source_title,e.download_id,e.quality_id,e.quality_revision_json,e.languages_json,
+        COALESCE(d.deletion_id,u.recycle_id),COALESCE(d.file_id,u.file_id),COALESCE(d.path,u.path),COALESCE(d.recycle_path,u.recycle_path)
     FROM selected s
     LEFT JOIN import_history n ON s.origin_rank=0 AND n.operation_id=s.native_id
     LEFT JOIN snapshot_history_events e ON s.origin_rank=1 AND e.application=s.application AND e.fingerprint=s.fingerprint AND e.source_id=s.source_id
+    LEFT JOIN file_deletion_history d ON s.origin_rank=2 AND d.id=s.native_id
+    LEFT JOIN upgrade_recycle_history u ON s.origin_rank=3 AND u.id=s.native_id
     ORDER BY s.event_at DESC,s.origin_rank ASC,s.native_id DESC,s.application ASC,s.fingerprint ASC,s.source_id DESC")
 }
 fn count_sql(predicate: &str) -> String {
     let source_predicate = predicate.replace("h.imported_at", "h.occurred_at");
+    let deletion_predicate = predicate.replace("h.imported_at", "h.deleted_at");
     format!(
-        "SELECT (SELECT count(*) FROM import_history h {predicate}) + (SELECT count(*) FROM snapshot_history_events h {source_predicate})"
+        "SELECT (SELECT count(*) FROM import_history h {predicate}) + (SELECT count(*) FROM snapshot_history_events h {source_predicate}) + (SELECT count(*) FROM file_deletion_history h {deletion_predicate}) + (SELECT count(*) FROM upgrade_recycle_history h {deletion_predicate})"
     )
 }
 pub fn router(db: Arc<Database>) -> Router {
@@ -377,6 +463,8 @@ async fn list(
             let count_values = values
                 .iter()
                 .chain(values.iter())
+                .chain(values.iter())
+                .chain(values.iter())
                 .cloned()
                 .collect::<Vec<_>>();
             let total = tx
@@ -390,7 +478,12 @@ async fn list(
                 return Err(storage());
             }
             let candidate_limit = i64::from(q.offset) + i64::from(q.limit);
+            // Parameter order follows the CTEs: native, deletion, upgrade recycle, then source keys.
             let mut page_values = values.clone();
+            page_values.push(Value::Integer(candidate_limit));
+            page_values.extend(values.clone());
+            page_values.push(Value::Integer(candidate_limit));
+            page_values.extend(values.clone());
             page_values.push(Value::Integer(candidate_limit));
             page_values.extend(values);
             page_values.push(Value::Integer(candidate_limit));

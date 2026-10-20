@@ -1,10 +1,12 @@
 <script lang="ts">
   import {onMount,untrack} from 'svelte';
-  import {getHealth,listHealthCommands,getHealthCommand,createHealthCommand,cancelHealthCommand,getHealthTransitions} from './api';
+  import {getHealth,getHealthRequestObservation,healthRequestObserved,listHealthCommands,getHealthCommand,createHealthCommand,cancelHealthCommand,getHealthTransitions} from './api';
+  import type {HealthRequestObservation} from './api';
   import type {ApiPage,HealthSnapshot,HealthCommand,HealthAdmission,HealthTransitions,HealthScope,HealthIdentity,CommandStatus,MediaDomain} from './api.generated';
   let {active=true,onsettings=()=>{}}:{active?:boolean;onsettings?:(domain:MediaDomain)=>void}=$props();
   let scope=$state<HealthScope>('all'),offset=$state(0),historyOffset=$state(0),status=$state<CommandStatus|''>('');
   let snapshot=$state<HealthSnapshot|null>(null),history=$state<ApiPage<HealthCommand>|null>(null),detail=$state<HealthCommand|null>(null),detailId=$state('');
+  let requestObservation=$state<HealthRequestObservation|null>(null),requestReadError=$state('');
   let transitions=$state<HealthTransitions|null>(null),cursor=$state(0),gap=$state(false);
   let snapshotError=$state(''),historyError=$state(''),detailError=$state(''),transitionError=$state(''),mutationError=$state(''),notice=$state('');
   let reading=$state(false),mutating=$state(false),unknown=$state<'admission'|'cancel'|null>(null),unknownId=$state('');
@@ -18,18 +20,21 @@
   const issueFor=(key:HealthIdentity)=>snapshot?.issues.find(issue=>identity(issue.identity)===identity(key));
   function tokenStatus(admission:HealthAdmission){
     if(!snapshot||snapshotError)return 'Unverified — refresh the requested checks.';
-    return admission.selection.every(token=>snapshot!.checks.some(check=>identity(check.identity)===identity(token.identity)&&check.observed_generation!==null&&check.observed_generation>=token.generation&&check.observed_epoch===snapshot!.lifecycle.epoch&&check.evaluation==='current'&&!check.last_error))
-      ? 'Requested generations observed in the current epoch.' : 'Not yet verified on this page — pending, stale, failed, or outside this scope/page.';
+    if(requestReadError)return `Unverified — ${requestReadError}`;
+    return healthRequestObserved(admission,requestObservation,snapshot.lifecycle.epoch)
+      ? 'Requested generations observed in the current epoch.' : 'Not yet verified — requested checks are pending, stale, failed, or not yet observed.';
   }
   function schedule(){clearTimeout(timer);if(alive&&active&&!document.hidden)timer=setTimeout(()=>void refresh(),5000);}
   async function refresh(){
     if(!alive||!active||document.hidden||reading||mutating)return;
     clearTimeout(timer);reading=true;const ticket=version,id=detailId;
     const [health,commands,events,selected]=await Promise.all([getHealth(scope,offset),listHealthCommands(scope,historyOffset,status),getHealthTransitions(cursor),id?getHealthCommand(id):Promise.resolve(null)]);
+    const observed=requests.length&&health.ok?await getHealthRequestObservation(scope==='all'&&offset===0?health.data:undefined):null;
     reading=false;
     if(!alive)return;
     if(ticket!==version||!active||document.hidden){if(active&&!document.hidden)void refresh();return;}
     if(health.ok){snapshot=health.data;snapshotError='';}else snapshotError=health.error;
+    requestObservation=observed?.ok?observed.data:null;requestReadError=observed&&!observed.ok?observed.error:'';
     if(commands.ok){history=commands.data;historyError='';}else historyError=commands.error;
     if(events.ok){transitions=events.data;gap=gap||events.data.gap;transitionError='';}else transitionError=events.error;
     if(selected){
@@ -70,7 +75,7 @@
   {#if notice}<p role="status">{notice}</p>{/if}
   {#if mutationError}<p role="alert">{mutationError}</p>{/if}
   {#if unknown}<div role="alert"><p>Outcome unknown; inspect recorded work before requesting again. No automatic mutation retry is performed.</p>{#if unknown==='admission'}<p>The lost response had no confirmed generation tokens; later snapshots cannot identify that request.</p>{/if}<button disabled={reading||mutating} onclick={()=>void refresh()}>Inspect recorded work</button><button disabled={reading||mutating} onclick={()=>{unknown=null;unknownId='';notice='A further manual request will be new work, not a retry of the unknown request.';}}>I reviewed recorded work; allow a new request</button></div>{/if}
-  {#if requests.length}<section aria-label="Manual health requests"><h2>Manual requests</h2><p>Tracking survives workspace navigation, but ends when this page is reloaded. Batch success alone does not establish that a later request was covered.</p>{#each requests as request (request.number)}<article><h3>Request {request.number}: {request.admission.requested_scope} — {request.admission.outcome.replaceAll('_',' ')}</h3><p>{tokenStatus(request.admission)}</p><ul>{#each request.admission.selection as token (identity(token.identity))}<li>{identity(token.identity)}: requested generation {token.generation}</li>{/each}</ul><button onclick={()=>requests=requests.filter(item=>item.number!==request.number)}>Dismiss request {request.number} tracking</button></article>{/each}<p>Dismissing tracking does not cancel any work.</p></section>{/if}
+  {#if requests.length}<section aria-label="Manual health requests"><h2>Manual requests</h2><p>Tracking survives workspace navigation, but ends when this page is reloaded. Requested checks are read across pages; these observations are not an atomic system snapshot. Batch success alone does not establish that a later request was covered.</p>{#each requests as request (request.number)}<article><h3>Request {request.number}: {request.admission.requested_scope} — {request.admission.outcome.replaceAll('_',' ')}</h3><p>{tokenStatus(request.admission)}</p><ul>{#each request.admission.selection as token (identity(token.identity))}<li>{identity(token.identity)}: requested generation {token.generation}</li>{/each}</ul><button onclick={()=>requests=requests.filter(item=>item.number!==request.number)}>Dismiss request {request.number} tracking</button></article>{/each}<p>Dismissing tracking does not cancel any work.</p></section>{/if}
   {#if snapshotError}<p role="alert">Health read failed: {snapshotError}. Retained observations may be stale.</p>{/if}
   {#if !snapshot}<p>{reading?'Reading health…':'No health snapshot loaded.'}</p>{:else}
     <section aria-label="Registered check coverage"><h2>{scope} coverage</h2><p>{snapshot.summary.total} registered; {snapshot.summary.current} current; {snapshot.summary.never_run} never evaluated; {snapshot.summary.stale} stale; {snapshot.summary.failed} failed; {snapshot.summary.non_ok} cached non-OK observations. Counters overlap.</p>

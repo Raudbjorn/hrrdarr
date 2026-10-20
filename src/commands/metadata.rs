@@ -339,9 +339,9 @@ pub(super) async fn run(
                 .await
                 .map(refresh::Details::Series),
             MetadataRefreshTarget::Movies { .. } => client
-                .movie_with_collection(command.external_id)
+                .movie(command.external_id)
                 .await
-                .map(refresh::Details::MovieWithCollection),
+                .map(refresh::Details::Movie),
         }
     };
     tokio::pin!(probe);

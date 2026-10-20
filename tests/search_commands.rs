@@ -261,6 +261,16 @@ async fn providers(base: &str, remote: &str) -> (Value, Value) {
     }
     (values.remove(0), values.remove(0))
 }
+async fn bind_client(base: &str, indexer: &Value, media: &str, client: &Value) -> Value {
+    let mut settings = indexer["settings"].clone();
+    settings[media]["download_client_id"] = client["id"].clone();
+    let (code, updated) = request(
+        base, "PUT", &format!("/api/v1/providers/{}", indexer["id"].as_str().unwrap()),
+        json!({"revision":indexer["revision"],"name":"bound indexer","enabled":true,"priority":1,"settings":settings}),
+    ).await;
+    assert_eq!(code, 200, "{updated}");
+    updated
+}
 fn input(indexer: &Value, client: &Value, tv: bool, mode: &str) -> Value {
     json!({"request_id":uuid::Uuid::new_v4(),"mode":mode,"target":{"media_type":if tv {"episode"}else{"movie"},"id":1},"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":client["id"],"client_revision":client["revision"],"priority":"normal"})
 }
@@ -331,7 +341,14 @@ async fn offers(base: &str, id: &Value) -> Vec<Value> {
 // are seeded; neither a candidate nor an observed submission is fabricated in SQL.
 #[tokio::test]
 async fn automatic_and_interactive_search_preserve_context_targets_and_replay() {
-    for interactive in [false, true] {
+    for (interactive, selection) in [
+        (false, "legacy_fixed"),
+        (true, "legacy_fixed"),
+        (false, "default"),
+        (true, "default"),
+        (false, "explicit"),
+        (true, "explicit"),
+    ] {
         let scratch =
             Scratch(std::env::temp_dir().join(format!("hrrdarr-search-{}", uuid::Uuid::new_v4())));
         std::fs::create_dir(&scratch.0).unwrap();
@@ -406,7 +423,7 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                 remote_state.adds.lock().unwrap().len(),
                 if tv { 0 } else { 1 }
             );
-            let intent = input(
+            let mut intent = input(
                 &indexer,
                 &download,
                 tv,
@@ -416,6 +433,12 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                     "automatic"
                 },
             );
+            if selection != "legacy_fixed" {
+                let object = intent.as_object_mut().unwrap();
+                object.remove("client_id");
+                object.remove("client_revision");
+                object.insert("client_selection".into(), if selection == "default" { json!({"kind":"default"}) } else { json!({"kind":"explicit","provider_id":download["id"],"provider_revision":download["revision"]}) });
+            }
             let (code, command) =
                 request(&base, "POST", "/api/v1/search/commands", intent.clone()).await;
             assert_eq!(code, 202, "{command}");
@@ -472,6 +495,29 @@ async fn automatic_and_interactive_search_preserve_context_targets_and_replay() 
                 done["selected_candidate_id"].as_str().unwrap().to_owned()
             };
             let receipt = observed(&base, &candidate_id).await;
+            assert_eq!(receipt["source"]["selection_kind"], selection);
+            assert_eq!(receipt["source"]["client_id"], download["id"]);
+            let (_, selected) = request(
+                &base,
+                "GET",
+                &format!(
+                    "/api/v1/search/commands/{}",
+                    command["id"].as_str().unwrap()
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(selected["selected_client_id"], download["id"]);
+            assert_eq!(
+                selected["selected_client_attempts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                usize::from(selection != "legacy_fixed")
+            );
+            if selection != "legacy_fixed" {
+                assert_eq!(selected["selected_client_attempts"][0]["state"], "observed");
+            }
             assert_eq!(
                 receipt["target"]["media_type"],
                 if tv { "tv" } else { "movies" }
@@ -899,6 +945,8 @@ async fn interrupted_selected_submission_reopens_and_only_reconciles() {
         let receipt = page["items"][0].clone();
         assert_eq!(receipt["status"], "submitting");
         // A policy change cannot erase an already uncertain send or authorize a resend.
+        let (_, other) = providers(&base, &remote_base).await;
+        let indexer = bind_client(&base, &indexer, if tv { "tv" } else { "movies" }, &other).await;
         policy_flags(
             &base,
             &indexer,
@@ -958,7 +1006,12 @@ async fn failed_continuation_never_exposes_or_selects_partial_results() {
     let (base, server, client) = app(db.clone()).await;
     let (indexer, download) = providers(&base, &remote_base).await;
     let runtime = commands::start(db, client).await.unwrap();
+    let test_route = format!("/api/v1/providers/{}/test", indexer["id"].as_str().unwrap());
     for mode in ["automatic", "interactive"] {
+        // Durable backoff now gates retries; a successful real Test on page zero recovers
+        // the provider while continuation requests still fail, preserving this test's intent.
+        let (status, tested) = request(&base, "POST", &test_route, Value::Null).await;
+        assert_eq!(status, 200, "{tested}");
         let (code, command) = request(
             &base,
             "POST",
@@ -967,7 +1020,57 @@ async fn failed_continuation_never_exposes_or_selects_partial_results() {
         )
         .await;
         assert_eq!(code, 202, "{command}");
-        let done = settled(&base, &command["id"]).await;
+        let mut recovered_attempt = 0;
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (status, row) = request(
+                    &base,
+                    "GET",
+                    &format!(
+                        "/api/v1/search/commands/{}",
+                        command["id"].as_str().unwrap()
+                    ),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(status, 200, "{row}");
+                if matches!(
+                    row["status"].as_str(),
+                    Some("succeeded" | "failed" | "cancelled")
+                ) {
+                    break row;
+                }
+                let attempt = row["attempts"].as_u64().unwrap();
+                if row["status"] == "retry_wait" && attempt > recovered_attempt {
+                    assert_eq!(
+                        attempt,
+                        recovered_attempt + 1,
+                        "every failed attempt is observed"
+                    );
+                    assert_eq!(row["error_code"], "provider_unavailable", "{row}");
+                    assert_eq!(row["fetch_complete"], false);
+                    assert!(row["selected_candidate_id"].is_null());
+                    assert!(
+                        offers(&base, &command["id"]).await.is_empty(),
+                        "partial results stay private during retries"
+                    );
+                    let (status, tested) = request(&base, "POST", &test_route, Value::Null).await;
+                    assert_eq!(status, 200, "{tested}");
+                    recovered_attempt = attempt;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("continuation failures settle after bounded Test recovery");
+        assert_eq!(
+            recovered_attempt, 2,
+            "both retries recovered through saved Test"
+        );
+        assert_eq!(
+            done["attempts"], 3,
+            "original bounded search retry policy is unchanged"
+        );
         assert_eq!(done["status"], "failed", "{done}");
         assert_eq!(
             done["error_code"], "provider_unavailable",
@@ -1460,6 +1563,7 @@ async fn indexer_policy_search_candidates_ignore_disabled_rss_and_replay_after_p
                 policy_fixture().await;
             let media = if tv { "tv" } else { "movies" };
             let indexer = policy_flags(&base, &indexer, media, false, true, true).await;
+            let indexer = bind_client(&base, &indexer, media, &download).await;
             let runtime = commands::start(db, client).await.unwrap();
             let (code, command) = request(
                 &base,
@@ -1645,5 +1749,532 @@ async fn indexer_policy_origin_is_rechecked_after_preparation_before_post() {
             server.stop().await;
             remote_server.stop().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn client_binding_fences_search_admission_and_retained_offer_selection() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let remote_base = peer.endpoint.lock().unwrap().clone();
+        let (_, other) = providers(&base, &remote_base).await;
+        let media = if tv { "tv" } else { "movies" };
+        let bound = bind_client(&base, &indexer, media, &download).await;
+        for mode in ["automatic", "interactive"] {
+            for invalid in [
+                input(&bound, &other, tv, mode),
+                input(&indexer, &download, tv, mode),
+            ] {
+                let (code, error) =
+                    request(&base, "POST", "/api/v1/search/commands", invalid).await;
+                assert_eq!(code, 409, "{error}");
+                assert_eq!(error["error"]["code"], "provider_changed");
+            }
+            // Binding one domain must leave the other domain's explicit choice intact.
+            let (code, unbound) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&bound, &other, !tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{unbound}");
+            assert_eq!(
+                request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/commands/{}/cancel",
+                        unbound["id"].as_str().unwrap()
+                    ),
+                    json!({})
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        assert!(peer.indexer_requests.lock().unwrap().is_empty());
+        let runtime = commands::start(db, client).await.unwrap();
+        let (code, command) = request(
+            &base,
+            "POST",
+            "/api/v1/search/commands",
+            input(&bound, &download, tv, "interactive"),
+        )
+        .await;
+        assert_eq!(code, 202, "{command}");
+        assert_eq!(settled(&base, &command["id"]).await["status"], "succeeded");
+        let rows = offers(&base, &command["id"]).await;
+        bind_client(&base, &bound, media, &other).await;
+        let (code, error) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                rows[0]["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, 409, "{error}");
+        assert_eq!(error["error"]["code"], "provider_changed");
+        assert!(peer.adds.lock().unwrap().is_empty());
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn client_binding_change_during_search_preparation_never_reroutes_or_posts() {
+    for tv in [true, false] {
+        for mode in ["automatic", "interactive"] {
+            let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+                policy_fixture().await;
+            let remote_base = peer.endpoint.lock().unwrap().clone();
+            let (_, other) = providers(&base, &remote_base).await;
+            peer.mode.store(3, Ordering::SeqCst);
+            let runtime = commands::start(db, client).await.unwrap();
+            let (code, command) = request(
+                &base,
+                "POST",
+                "/api/v1/search/commands",
+                input(&indexer, &download, tv, mode),
+            )
+            .await;
+            assert_eq!(code, 202, "{command}");
+            let done = settled(&base, &command["id"]).await;
+            assert_eq!(done["status"], "succeeded", "{done}");
+            let id = if mode == "interactive" {
+                let rows = offers(&base, &command["id"]).await;
+                let (code, receipt) = request(
+                    &base,
+                    "POST",
+                    &format!(
+                        "/api/v1/search/results/{}/grab",
+                        rows[0]["id"].as_str().unwrap()
+                    ),
+                    json!({}),
+                )
+                .await;
+                assert_eq!(code, 202, "{receipt}");
+                receipt["id"].as_str().unwrap().to_owned()
+            } else {
+                done["selected_candidate_id"].as_str().unwrap().to_owned()
+            };
+            tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+                .await
+                .expect("torrent preparation boundary");
+            bind_client(&base, &indexer, if tv { "tv" } else { "movies" }, &other).await;
+            peer.mode.store(0, Ordering::SeqCst);
+            peer.release.notify_one();
+            let rejected = candidate_status(&base, &id, "rejected").await;
+            assert_eq!(rejected["error_code"], "provider_changed");
+            assert_eq!(rejected["source"]["client_id"], download["id"]);
+            assert!(peer.adds.lock().unwrap().is_empty());
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_selection_input_is_closed_and_mixed_or_null_fields_are_rejected() {
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("hrrdarr-selection-input-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    seed(&db).await;
+    let state = Arc::new(Remote::default());
+    let (remote_base, _remote) = serve(
+        axum::Router::new()
+            .fallback(remote)
+            .with_state(state.clone()),
+    )
+    .await;
+    let (base, _server, _client) = app(db.clone()).await;
+    let (indexer, download) = providers(&base, &remote_base).await;
+    for selection in [
+        json!(null),
+        json!({"kind":"default","provider_id":download["id"]}),
+        json!({"kind":"default","extra":true}),
+        json!({"kind":"other"}),
+        json!({"kind":"explicit","provider_id":download["id"]}),
+        json!({"kind":"explicit","provider_id":download["id"],"provider_revision":1,"extra":true}),
+    ] {
+        let mut search = input(&indexer, &download, true, "automatic");
+        search.as_object_mut().unwrap().remove("client_id");
+        search.as_object_mut().unwrap().remove("client_revision");
+        search["client_selection"] = selection.clone();
+        assert_eq!(
+            request(&base, "POST", "/api/v1/search/commands", search)
+                .await
+                .0,
+            400
+        );
+        let rss = json!({"target":{"media_type":"tv","indexer_id":indexer["id"],"indexer_revision":1,"client_selection":selection},"priority":"normal"});
+        assert_eq!(
+            request(&base, "POST", "/api/v1/rss/commands", rss).await.0,
+            400
+        );
+    }
+    for mixed in [json!(null), download["id"].clone()] {
+        let mut search = input(&indexer, &download, true, "automatic");
+        search["client_selection"] = json!({"kind":"default"});
+        search["client_id"] = mixed.clone();
+        assert_eq!(
+            request(&base, "POST", "/api/v1/search/commands", search)
+                .await
+                .0,
+            400
+        );
+        let rss = json!({"target":{"media_type":"tv","indexer_id":indexer["id"],"indexer_revision":1,"client_selection":{"kind":"default"},"client_id":mixed,"client_revision":1},"priority":"normal"});
+        assert_eq!(
+            request(&base, "POST", "/api/v1/rss/commands", rss).await.0,
+            400
+        );
+    }
+    assert!(state.indexer_requests.lock().unwrap().is_empty());
+    assert!(state.adds.lock().unwrap().is_empty());
+}
+
+// Native last-search producer: the fact follows a completed indexer dispatch of a targeted
+// search (success or caught indexer failure), never admission, RSS, decisions or grab.
+async fn native_last_search(db: &Database, tv: bool) -> Option<i64> {
+    db.connect()
+        .await
+        .unwrap()
+        .query(
+            &format!(
+                "SELECT native_last_search_at FROM {} WHERE id=1",
+                if tv { "episodes" } else { "movies" }
+            ),
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+async fn command_row(base: &str, id: &Value) -> Value {
+    let (status, row) = request(
+        base,
+        "GET",
+        &format!("/api/v1/search/commands/{}", id.as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{row}");
+    row
+}
+async fn submit(base: &str, indexer: &Value, download: &Value, tv: bool, mode: &str) -> Value {
+    let (code, command) = request(
+        base,
+        "POST",
+        "/api/v1/search/commands",
+        input(indexer, download, tv, mode),
+    )
+    .await;
+    assert_eq!(code, 202, "{command}");
+    command["id"].clone()
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn native_last_search_follows_dispatch_not_admission_rss_decisions_or_grab() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let table = if tv { "episodes" } else { "movies" };
+        // Same monitoring exception as the authority test: user TV searches stay acceptable.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE series SET monitored=0", ())
+            .await
+            .unwrap();
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+
+        // Background RSS sync is not a targeted search and records no per-item fact.
+        let (status, rss) = request(&base, "POST", "/api/v1/rss/commands", json!({"target":{"media_type":if tv {"tv"}else{"movies"},"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":download["id"],"client_revision":download["revision"]},"priority":"normal"})).await;
+        assert_eq!(status, 202, "{rss}");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (_, row) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", rss["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                if row["status"] == "succeeded" {
+                    break;
+                }
+                assert_ne!(row["status"], "failed", "{row}");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("RSS settlement deadline");
+        assert!(
+            !peer.offsets.lock().unwrap().is_empty(),
+            "RSS queried the peer"
+        );
+        assert_eq!(
+            (
+                native_last_search(&db, true).await,
+                native_last_search(&db, false).await
+            ),
+            (None, None)
+        );
+
+        // Admission and claim never record; the first indexer page is held in flight.
+        peer.mode.store(9, Ordering::SeqCst);
+        let before = unix_now();
+        let id = submit(&base, &indexer, &download, tv, "interactive").await;
+        tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+            .await
+            .expect("owned first search page held");
+        let running = command_row(&base, &id).await;
+        assert_eq!(running["status"], "running", "{running}");
+        assert!(running["dispatch_completed_at"].is_null());
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            None,
+            "claim is not dispatch"
+        );
+        peer.mode.store(0, Ordering::SeqCst);
+        peer.release.notify_one();
+        let done = settled(&base, &id).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        let at = native_last_search(&db, tv).await.expect("dispatch fact");
+        assert_eq!(
+            done["dispatch_completed_at"].as_i64(),
+            Some(at),
+            "fact and command progress commit together"
+        );
+        assert!(before <= at && at <= done["completed_at"].as_i64().unwrap());
+        assert_eq!(
+            native_last_search(&db, !tv).await,
+            None,
+            "the equal numeric target in the other domain is untouched"
+        );
+
+        // A grab of a retained offer never writes the fact.
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET native_last_search_at=1000 WHERE id=1"),
+                (),
+            )
+            .await
+            .unwrap();
+        let results = offers(&base, &id).await;
+        let accepted = results
+            .iter()
+            .find(|r| r["decision"]["disposition"] == "accept")
+            .unwrap_or_else(|| panic!("an accepted offer: {results:?}"));
+        let (code, candidate) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                accepted["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert!((200..300).contains(&code), "{candidate}");
+        observed(&base, candidate["id"].as_str().unwrap()).await;
+        assert_eq!(peer.adds.lock().unwrap().len(), 1);
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            Some(1000),
+            "grab wrote nothing"
+        );
+        assert_eq!(
+            command_row(&base, &id).await["dispatch_completed_at"],
+            done["dispatch_completed_at"]
+        );
+
+        // Decisions that reject every release (wrong categories) do not undo a completed
+        // dispatch: the fact is written before any decision runs.
+        peer.mode.store(1, Ordering::SeqCst);
+        let rejected = submit(&base, &indexer, &download, tv, "automatic").await;
+        let done = settled(&base, &rejected).await;
+        assert_eq!(done["status"], "failed", "{done}");
+        assert!(
+            matches!(
+                done["error_code"].as_str(),
+                Some("no_eligible_release" | "invalid_release")
+            ),
+            "{done}"
+        );
+        let at = native_last_search(&db, tv).await.unwrap();
+        assert!(at > 1000);
+        assert_eq!(done["dispatch_completed_at"].as_i64(), Some(at));
+        assert_eq!(peer.adds.lock().unwrap().len(), 1, "nothing grabbed");
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn caught_indexer_failure_records_but_refusal_or_cancel_before_completion_does_not() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let media = if tv { "tv" } else { "movies" };
+        let table = if tv { "episodes" } else { "movies" };
+        // Cancelled before any claim, and a provider revision change while queued: neither
+        // issues an indexer request, so neither records.
+        let cancelled = submit(&base, &indexer, &download, tv, "interactive").await;
+        let (status, row) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                cancelled.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!((status, &row["status"]), (200, &json!("cancelled")));
+        let stale = submit(&base, &indexer, &download, tv, "interactive").await;
+        let indexer = policy_flags(&base, &indexer, media, true, true, true).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        let done = settled(&base, &stale).await;
+        assert_eq!(
+            (done["status"].as_str(), done["error_code"].as_str()),
+            (Some("failed"), Some("provider_changed")),
+            "{done}"
+        );
+        assert!(done["dispatch_completed_at"].is_null());
+        assert!(peer.indexer_requests.lock().unwrap().is_empty());
+        assert_eq!(native_last_search(&db, tv).await, None);
+
+        // A continuation page fails with HTTP 401 after page zero was fetched: the dispatch
+        // ended with a caught, classified indexer failure and still records.
+        peer.mode.store(5, Ordering::SeqCst);
+        let failing = submit(&base, &indexer, &download, tv, "interactive").await;
+        let row = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row = command_row(&base, &failing).await;
+                if !row["dispatch_completed_at"].is_null()
+                    && matches!(row["status"].as_str(), Some("retry_wait" | "failed"))
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("caught failure settles");
+        assert_eq!(row["error_code"], "provider_unavailable", "{row}");
+        assert_eq!(row["fetch_complete"], false);
+        assert!(offers(&base, &failing).await.is_empty());
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            row["dispatch_completed_at"].as_i64()
+        );
+        request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                failing.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        peer.mode.store(0, Ordering::SeqCst);
+        // Clear the failure backoff through the real provider Test, as the retry test does.
+        let (status, tested) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/providers/{}/test", indexer["id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{tested}");
+
+        // Cancelled while the first page is in flight: the completion is not recorded.
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET native_last_search_at=NULL WHERE id=1"),
+                (),
+            )
+            .await
+            .unwrap();
+        peer.mode.store(9, Ordering::SeqCst);
+        let inflight = submit(&base, &indexer, &download, tv, "interactive").await;
+        tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+            .await
+            .expect("owned first search page held");
+        let (status, row) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                inflight.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            (status, &row["status"]),
+            (200, &json!("cancelled")),
+            "{row}"
+        );
+        peer.mode.store(0, Ordering::SeqCst);
+        peer.release.notify_one();
+        // The single worker runs commands one at a time: once the follow-up search for the
+        // equal-numbered target in the other domain settles, the cancelled run has finished.
+        let other = submit(&base, &indexer, &download, !tv, "interactive").await;
+        let done = settled(&base, &other).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(
+            native_last_search(&db, !tv).await,
+            done["dispatch_completed_at"].as_i64()
+        );
+        assert_eq!(native_last_search(&db, tv).await, None);
+        let row = command_row(&base, &inflight).await;
+        assert_eq!(row["status"], "cancelled");
+        assert!(row["dispatch_completed_at"].is_null(), "{row}");
+        let row = command_row(&base, &cancelled).await;
+        assert!(row["started_at"].is_null() && row["dispatch_completed_at"].is_null());
+        // Storage refuses a dispatch record outside a running command or moving backwards.
+        let c = db.connect().await.unwrap();
+        for (id, value) in [(&inflight, unix_now()), (&other, 1)] {
+            assert!(
+                c.execute(
+                    "UPDATE search_commands SET dispatch_completed_at=? WHERE id=?",
+                    libsql::params![value, id.as_str().unwrap()],
+                )
+                .await
+                .is_err(),
+                "terminal command accepted a dispatch record"
+            );
+        }
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
     }
 }

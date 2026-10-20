@@ -213,21 +213,121 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0049_indexer_client_binding.sql"),
     ),
     (
-        "torrent_rss_indexer",
-        include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
+        "indexer_backoff",
+        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_backoff",
         include_str!("../../migrations/0051_download_client_backoff.sql"),
     ),
     (
-        "collections",
-        include_str!("../../migrations/0052_collections.sql"),
+        "download_client_selection",
+        include_str!("../../migrations/0052_download_client_selection.sql"),
     ),
     (
-        "provider_authority",
-        include_str!("../../migrations/0053_provider_authority.sql"),
+        "path_diagnostics",
+        include_str!("../../migrations/0053_path_diagnostics.sql"),
     ),
+    (
+        "downloaded_scan",
+        include_str!("../../migrations/0054_downloaded_scan.sql"),
+    ),
+    (
+        "series_runtime",
+        include_str!("../../migrations/0055_series_runtime.sql"),
+    ),
+    (
+        "import_policy",
+        include_str!("../../migrations/0056_import_policy.sql"),
+    ),
+    (
+        "scan_media",
+        include_str!("../../migrations/0057_scan_media.sql"),
+    ),
+    (
+        "scan_successor",
+        include_str!("../../migrations/0058_scan_successor.sql"),
+    ),
+    (
+        "download_client_registry",
+        include_str!("../../migrations/0059_download_client_registry.sql"),
+    ),
+    (
+        "recycle_bin",
+        include_str!("../../migrations/0060_recycle_bin.sql"),
+    ),
+    (
+        "upgrade_recycle",
+        include_str!("../../migrations/0061_upgrade_recycle.sql"),
+    ),
+    (
+        "transmission",
+        include_str!("../../migrations/0062_transmission.sql"),
+    ),
+    (
+        "notifications",
+        include_str!("../../migrations/0063_notifications.sql"),
+    ),
+    // NZBGet registry, file 0064.
+    ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
+    (
+        "rename_commands",
+        include_str!("../../migrations/0067_rename_commands.sql"),
+    ),
+    (
+        "autotagging_rules",
+        include_str!("../../migrations/0065_autotagging_rules.sql"),
+    ),
+    (
+        "collections",
+        include_str!("../../migrations/0066_collections.sql"),
+    ),
+    // Generic torrent RSS feed indexer: origin/main authored this as 0050 before the registry
+    // migrations; it is appended here and written against the registry shape.
+    (
+        "torrent_rss_indexer",
+        include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
+    ),
+    // origin/main's collections checkpoint (its 0052/0053) reconciled onto 0066: snapshot facts and
+    // ownership markers only; see docs/collections.md.
+    (
+        "collection_snapshot",
+        include_str!("../../migrations/0069_collection_snapshot.sql"),
+    ),
+    // Deluge registry plus label-family scope triggers, file 0070.
+    ("deluge", include_str!("../../migrations/0070_deluge.sql")),
+    // rTorrent registry, file 0071.
+    (
+        "rtorrent",
+        include_str!("../../migrations/0071_rtorrent.sql"),
+    ),
+    // uTorrent registry row, file 0072.
+    (
+        "utorrent",
+        include_str!("../../migrations/0072_utorrent.sql"),
+    ),
+    // Aria2 registry row, file 0073.
+    ("aria2", include_str!("../../migrations/0073_aria2.sql")),
+    // Flood registry, file 0074.
+    ("flood", include_str!("../../migrations/0074_flood.sql")),
+    // Download Station registry, file 0075.
+    (
+        "downloadstation",
+        include_str!("../../migrations/0075_downloadstation.sql"),
+    ),
+    // Native Wanted last-search facts, appended at position 76 after 0075 downloadstation.
+    (
+        "wanted_last_search",
+        include_str!("../../migrations/0076_wanted_last_search.sql"),
+    ),
+    // hc.034/hc.035 library root and read-only mount health identities, appended at position 77
+    // after 0076 wanted_last_search.
+    (
+        "library_root_health",
+        include_str!("../../migrations/0077_library_root_health.sql"),
+    ),
+    // Backup command and policy (job.002), appended at position 78 after 0077 library_root_health.
+    ("backups", include_str!("../../migrations/0078_backups.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -338,6 +438,8 @@ pub struct Database {
     // Advisory ownership lasts for the application lifetime, including backup/migration.
     _owner: Option<File>,
     backup: Option<PathBuf>,
+    // Local database file; absent for remote storage.
+    path: Option<PathBuf>,
 }
 
 impl Database {
@@ -362,15 +464,17 @@ impl Database {
         })
         .await??;
         let inner = libsql::Builder::new_local(&path).build().await?;
+        write_ahead_log(&inner.connect()?).await?;
         let engine = storage_engine(&inner.connect()?).await?;
         let mut db = Self {
             inner,
             engine,
             _owner: Some(owner),
             backup: None,
+            path: Some(path.clone()),
         };
         let conn = db.connect().await?;
-        db.backup = migrate(&conn, Some(&path)).await?;
+        db.backup = migrate(conn, Some(&path)).await?;
         Ok(db)
     }
 
@@ -382,8 +486,9 @@ impl Database {
             engine,
             _owner: None,
             backup: None,
+            path: None,
         };
-        migrate(&db.connect().await?, None).await?;
+        migrate(db.connect().await?, None).await?;
         Ok(db)
     }
 
@@ -429,6 +534,30 @@ impl Database {
     pub fn migration_backup(&self) -> Option<&Path> {
         self.backup.as_deref()
     }
+
+    /// The owned local database file; `None` for remote storage.
+    pub fn local_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+}
+
+/// Readers must never hold off a writer's commit. In rollback-journal mode an open read
+/// cursor keeps a SHARED lock, and SQLite's busy handler then sleeps synchronously on the
+/// async executor until it times out. WAL lets reads and the single writer proceed
+/// concurrently; the mode is persistent in the file. Filesystems without shared-memory
+/// support keep the previous mode, which is reported rather than treated as fatal.
+async fn write_ahead_log(conn: &Connection) -> Result<(), libsql::Error> {
+    let mode: String = conn
+        .query("PRAGMA journal_mode=WAL", ())
+        .await?
+        .next()
+        .await?
+        .ok_or(libsql::Error::QueryReturnedNoRows)?
+        .get(0)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        eprintln!("event=database_journal_mode_fallback mode={mode}");
+    }
+    Ok(())
 }
 
 async fn scalar(conn: &Connection, sql: &str) -> Result<i64, libsql::Error> {
@@ -574,24 +703,30 @@ async fn integrity(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
-    integrity(conn).await?;
-    let current = version(conn).await?;
+async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
+    integrity(&conn).await?;
+    let current = version(&conn).await?;
     if current == MIGRATIONS.len() {
         return Ok(None);
     }
     let path = local_path.ok_or("pending remote schema migrations require a verified remote backup/recovery strategy; database unchanged")?;
     let has_data = scalar(
-        conn,
+        &conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )
     .await?
         > 0;
     let backup = if has_data {
-        Some(backup(conn, path).await?)
+        Some(backup(&conn, path).await?)
     } else {
         None
     };
+    // This connection is owned here: cancellation drops it instead of exposing disabled enforcement.
+    conn.execute("PRAGMA foreign_keys = OFF", ()).await?;
+    let result: Result<Option<PathBuf>, Error> = async {
+        if scalar(&conn, "PRAGMA foreign_keys").await? != 0 {
+            return Err("migration table rebuild requires isolated foreign key suspension".into());
+        }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -605,6 +740,7 @@ async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
                 params![(index + 1) as i64, name, checksum(sql), sql]).await?;
         }
+        integrity(&tx).await?;
         Ok(())
     }.await;
     match result {
@@ -619,6 +755,22 @@ async fn migrate(conn: &Connection, local_path: Option<&Path>) -> Result<Option<
         }
     }
     Ok(backup)
+    }.await;
+    let restored: Result<(), Error> = async {
+        conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        if scalar(&conn, "PRAGMA foreign_keys").await? != 1 {
+            return Err("foreign key enforcement unavailable after migration".into());
+        }
+        Ok(())
+    }
+    .await;
+    match (result, restored) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(restore)) => {
+            Err(format!("{error}; restoring foreign key enforcement failed: {restore}").into())
+        }
+    }
 }
 
 async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
@@ -641,11 +793,8 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
     // The exclusively created private directory prevents collisions and symlink replacement.
     // No manifest is published for a partial/invalid snapshot; such directories are retained.
     let snapshot = directory.join("database.db");
-    conn.execute(
-        "VACUUM main INTO ?1",
-        params![snapshot.to_str().ok_or("backup path is not UTF-8")?],
-    )
-    .await?;
+    vacuum_into(conn, &snapshot).await?;
+    // Pre-migration copies may be unversioned prototypes, so this keeps its own checks.
     let copy = libsql::Builder::new_local(&snapshot).build().await?;
     let copy_conn = copy.connect()?;
     integrity(&copy_conn).await?;
@@ -696,6 +845,147 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
     Ok(directory)
 }
 
+/// Migration identity of this build, in runner order: (version, name, checksum).
+pub(crate) fn migration_history() -> Vec<(usize, &'static str, String)> {
+    MIGRATIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (name, sql))| (index + 1, *name, checksum(sql)))
+        .collect()
+}
+
+/// Latest schema version this build can open.
+pub fn latest_schema_version() -> usize {
+    MIGRATIONS.len()
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
+
+/// Consistent online copy of the main database (one read transaction; concurrent WAL writers
+/// continue). The target must not exist; the caller owns its private directory.
+pub(crate) async fn vacuum_into(conn: &Connection, target: &Path) -> Result<(), Error> {
+    conn.execute(
+        "VACUUM main INTO ?1",
+        params![target.to_str().ok_or("backup path is not UTF-8")?],
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotFacts {
+    pub schema_version: usize,
+    pub sqlite_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotOpen {
+    /// Untrusted candidates: never written.
+    ReadOnly,
+    /// Owned staging copies, converted to a self-contained rollback-journal file.
+    SelfContained,
+}
+
+#[derive(Debug)]
+pub(crate) enum SnapshotError {
+    /// The file could not be opened or queried as a database.
+    Unreadable,
+    /// integrity_check or foreign_key_check failed.
+    Integrity,
+    /// Migration history from a newer build.
+    Newer(i64),
+    /// Missing, unversioned or mismatched migration history.
+    History,
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable => f.write_str("snapshot is not a readable database"),
+            Self::Integrity => f.write_str("snapshot integrity check failed"),
+            Self::Newer(v) => write!(f, "snapshot schema version {v} is newer than this build"),
+            Self::History => f.write_str("snapshot migration history is not recognized"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// Opens a closed snapshot file and verifies integrity, foreign keys and that its migration
+/// history is a checksum-identical prefix of this build's. Never applies migrations.
+pub(crate) async fn inspect_snapshot(
+    path: &Path,
+    mode: SnapshotOpen,
+) -> Result<SnapshotFacts, SnapshotError> {
+    let mut builder = libsql::Builder::new_local(path);
+    if mode == SnapshotOpen::ReadOnly {
+        builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY);
+    } else {
+        builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_WRITE);
+    }
+    let copy = builder
+        .build()
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?;
+    let conn = copy.connect().map_err(|_| SnapshotError::Unreadable)?;
+    if mode == SnapshotOpen::SelfContained {
+        let journal: String = conn
+            .query("PRAGMA journal_mode=DELETE", ())
+            .await
+            .map_err(|_| SnapshotError::Unreadable)?
+            .next()
+            .await
+            .map_err(|_| SnapshotError::Unreadable)?
+            .ok_or(SnapshotError::Unreadable)?
+            .get(0)
+            .map_err(|_| SnapshotError::Unreadable)?;
+        if !journal.eq_ignore_ascii_case("delete") {
+            return Err(SnapshotError::Unreadable);
+        }
+    }
+    scalar(&conn, "SELECT count(*) FROM sqlite_schema")
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?;
+    integrity(&conn)
+        .await
+        .map_err(|_| SnapshotError::Integrity)?;
+    let has_history = scalar(
+        &conn,
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
+    )
+    .await
+    .map_err(|_| SnapshotError::Unreadable)?;
+    if has_history != 1 {
+        return Err(SnapshotError::History);
+    }
+    let newest = scalar(
+        &conn,
+        "SELECT coalesce(max(version),0) FROM schema_migrations",
+    )
+    .await
+    .map_err(|_| SnapshotError::History)?;
+    if newest > MIGRATIONS.len() as i64 {
+        return Err(SnapshotError::Newer(newest));
+    }
+    let schema_version = version(&conn).await.map_err(|_| SnapshotError::History)?;
+    let sqlite_version = conn
+        .query("SELECT sqlite_version()", ())
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?
+        .next()
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?
+        .ok_or(SnapshotError::Unreadable)?
+        .get::<String>(0)
+        .map_err(|_| SnapshotError::Unreadable)?;
+    Ok(SnapshotFacts {
+        schema_version,
+        sqlite_version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,7 +997,8 @@ mod tests {
             .await
             .unwrap();
         let conn = db.connect().unwrap();
-        let error = migrate(&conn, None).await.unwrap_err();
+        let error = migrate(conn, None).await.unwrap_err();
+        let conn = db.connect().unwrap();
         assert!(
             error
                 .to_string()
@@ -719,6 +1010,45 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn local_databases_use_write_ahead_logging() {
+        let directory = std::env::temp_dir().join(format!("hrrdarr-wal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("db");
+        {
+            let db = Database::open_local(&path).await.unwrap();
+            let conn = db.connect().await.unwrap();
+            let mode: String = conn
+                .query("PRAGMA journal_mode", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(mode, "wal");
+            // A live read cursor must not block a concurrent writer's commit.
+            let reader = db.connect().await.unwrap();
+            let mut rows = reader
+                .query("SELECT 1 FROM sqlite_schema", ())
+                .await
+                .unwrap();
+            assert!(rows.next().await.unwrap().is_some());
+            let writer = db.connect().await.unwrap();
+            writer
+                .busy_timeout(std::time::Duration::from_millis(50))
+                .unwrap();
+            writer
+                .execute("CREATE TABLE wal_probe(id INTEGER)", ())
+                .await
+                .unwrap();
+            drop(rows);
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }
 
@@ -788,8 +1118,30 @@ mod indexer_policy_tests;
 
 #[cfg(test)]
 mod indexer_client_tests;
-#[cfg(test)]
-mod torrent_rss_tests;
 
 #[cfg(test)]
-mod backoff_tests;
+mod indexer_backoff_tests;
+
+#[cfg(test)]
+mod aria2_registry_tests;
+#[cfg(test)]
+mod deluge_registry_tests;
+#[cfg(test)]
+mod download_client_backoff_tests;
+#[cfg(test)]
+mod download_client_registry_tests;
+#[cfg(test)]
+mod download_client_selection_tests;
+#[cfg(test)]
+mod downloadstation_registry_tests;
+#[cfg(test)]
+mod flood_registry_tests;
+#[cfg(test)]
+mod nzbget_registry_tests;
+mod rtorrent_registry_tests;
+#[cfg(test)]
+mod torrent_rss_tests;
+#[cfg(test)]
+mod transmission_registry_tests;
+#[cfg(test)]
+mod utorrent_registry_tests;

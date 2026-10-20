@@ -476,6 +476,7 @@ async fn create(
         }
     };
     crate::health::download_roots_changed(&tx, None).await?;
+    crate::health::library_roots_changed(&tx).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, response))
 }
@@ -497,7 +498,7 @@ async fn delete(
     // Collection defaults are policy, not library contents: deleting their root
     // disables the policy instead of blocking on the RESTRICT reference.
     tx.execute(
-        "UPDATE movie_collection_settings SET root_folder_id=NULL,monitored=0,settings_revision=settings_revision+1 WHERE root_folder_id=?",
+        "UPDATE movie_collections SET root_folder_id=NULL,monitored=0 WHERE root_folder_id=?",
         [key],
     )
     .await?;
@@ -512,6 +513,7 @@ async fn delete(
         return Err(Error(StatusCode::NOT_FOUND, "root_not_found"));
     }
     crate::health::download_roots_changed(&tx, None).await?;
+    crate::health::library_roots_changed(&tx).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

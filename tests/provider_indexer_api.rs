@@ -87,6 +87,14 @@ async fn fixture(State(state): State<Arc<Upstream>>, OriginalUri(uri): OriginalU
         .collect();
     let caps = values.get("t").is_some_and(|s| s == "caps");
     let mode = state.mode.load(Ordering::SeqCst);
+    if mode == 6 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "7200")],
+            "rate limited",
+        )
+            .into_response();
+    }
     if mode == 2 {
         return (
             StatusCode::FOUND,
@@ -533,37 +541,52 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
     }
     values
 }
-// Reasoning: the registry holds seven identities per domain (CDH, communication, root folder, removed
-// metadata, indexer search/RSS from 0048 and the 0049 binding check). Every one is compared so an
-// unexpected marker on a sibling check fails; the helpers below name the intended marker sets.
-// Reasoning: 0051 registers download_client_backoff per domain (14 -> 16 identities).
-const IDENTITIES: [(&str, &str); 16] = [
+// Reasoning: 0053 adds scoped path diagnostics. Compare all eleven identities
+// per domain so unexpected sibling markers fail; client saves invalidate their path check too.
+// Reasoning: 0060 adds recycle_bin per domain; provider edits never mark it.
+// Reasoning: 0077 adds root_folder/mount_read_only per domain and movies collection_root_folder (24 -> 29); provider edits never mark them.
+const IDENTITIES: [(&str, &str); 29] = [
+    ("movies", "collection_root_folder"),
     ("movies", "completed_download_handling"),
     ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
     ("movies", "download_client_root_folder"),
     ("movies", "indexer_download_client"),
+    ("movies", "indexer_failures"),
     ("movies", "indexer_rss"),
     ("movies", "indexer_search"),
+    ("movies", "indexer_status"),
+    ("movies", "mount_read_only"),
+    ("movies", "recycle_bin"),
+    ("movies", "remote_path_mapping"),
     ("movies", "removed_metadata"),
+    ("movies", "root_folder"),
     ("tv", "completed_download_handling"),
     ("tv", "download_client_backoff"),
     ("tv", "download_client_communication"),
     ("tv", "download_client_root_folder"),
     ("tv", "indexer_download_client"),
+    ("tv", "indexer_failures"),
     ("tv", "indexer_rss"),
     ("tv", "indexer_search"),
+    ("tv", "indexer_status"),
+    ("tv", "mount_read_only"),
+    ("tv", "recycle_bin"),
+    ("tv", "remote_path_mapping"),
     ("tv", "removed_metadata"),
+    ("tv", "root_folder"),
 ];
-/// Indexer edits invalidate capability and binding checks for their domain.
+/// Indexer edits invalidate capability, binding and backoff checks for their domain.
 fn indexer_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
     domains
         .iter()
         .flat_map(|d| {
             [
                 (*d, "indexer_download_client"),
+                (*d, "indexer_failures"),
                 (*d, "indexer_rss"),
                 (*d, "indexer_search"),
+                (*d, "indexer_status"),
             ]
         })
         .collect()
@@ -575,8 +598,11 @@ fn client_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
         .flat_map(|d| {
             [
                 (*d, "completed_download_handling"),
+                (*d, "download_client_backoff"),
                 (*d, "download_client_communication"),
                 (*d, "download_client_root_folder"),
+                // 0053: client configuration also invalidates its scoped path evidence.
+                (*d, "remote_path_mapping"),
             ]
         })
         .collect()
@@ -870,5 +896,198 @@ async fn client_preferences_are_scoped_validated_retained_and_marked_atomically(
     );
     server.abort();
     let _ = server.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn saved_indexer_backoff_survives_reopen_and_test_recovers_both_scopes() -> Result<(), Error>
+{
+    let scratch = Sandbox::new();
+    let db_path = scratch.0.join("backoff.db");
+    let db = Arc::new(Database::open_local(&db_path).await?);
+    let upstream = Arc::new(Upstream::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_address = listener.local_addr()?;
+    let app = axum::Router::new()
+        .route("/torznab", axum::routing::get(fixture))
+        .with_state(upstream.clone());
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(db.clone(), None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let config = json!({"name":"Backoff fixture","enabled":true,"priority":1,"settings":{"implementation":"torznab","endpoint":format!("http://{upstream_address}/torznab"),"tv":{"categories":[5030],"anime_categories":[]},"movies":{"categories":[2000]}}});
+    let (status, provider) =
+        request(address, "POST", "/api/v1/providers", &config.to_string()).await;
+    assert_eq!(status, 201, "{provider}");
+    let id = provider["id"].as_str().unwrap();
+    let path = format!("/api/v1/providers/{id}");
+    let query = |media| json!({"kind":"rss","media_type":media,"offset":0,"limit":1}).to_string();
+    upstream.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        request(address, "POST", &format!("{path}/search"), &query("tv"))
+            .await
+            .0,
+        502
+    );
+    let c = db.connect().await?;
+    let row = c
+        .query("SELECT media_type,failure_count FROM indexer_status", ())
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<String>(0)?, "tv");
+    assert_eq!(row.get::<i64>(1)?, 1);
+    // libSQL rows own their cursor; release the read lock before HTTP writes.
+    drop(row);
+    let before = upstream.queries.lock().unwrap().len();
+    assert_eq!(
+        request(address, "POST", &format!("{path}/search"), &query("tv"))
+            .await
+            .0,
+        429
+    );
+    assert_eq!(
+        upstream.queries.lock().unwrap().len(),
+        before,
+        "blocked read sends no requests"
+    );
+    assert_eq!(
+        c.query("SELECT failure_count FROM indexer_status", ())
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get::<i64>(0)?,
+        1,
+        "blocked admission does not escalate"
+    );
+    upstream.mode.store(0, Ordering::SeqCst);
+    let (status, response) =
+        request(address, "POST", &format!("{path}/search"), &query("movies")).await;
+    assert_eq!(status, 200, "{response}");
+    server.abort();
+    let _ = server.await;
+    drop(c);
+    drop(db);
+    let db = Arc::new(Database::open_local(&db_path).await?);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = providers::router(db.clone(), None);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let before = upstream.queries.lock().unwrap().len();
+    assert_eq!(
+        request(address, "POST", &format!("{path}/search"), &query("tv"))
+            .await
+            .0,
+        429
+    );
+    assert_eq!(
+        upstream.queries.lock().unwrap().len(),
+        before,
+        "restart retains durable cooldown"
+    );
+    assert_eq!(
+        request(address, "POST", &format!("{path}/test"), "")
+            .await
+            .0,
+        200
+    );
+    let c = db.connect().await?;
+    assert!(
+        c.query("SELECT 1 FROM indexer_status", ())
+            .await?
+            .next()
+            .await?
+            .is_none()
+    );
+    // A failure after public caps belongs to TV only; the unattempted movie scope stays healthy.
+    upstream.mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        request(address, "POST", &format!("{path}/test"), "")
+            .await
+            .0,
+        502
+    );
+    let row = c
+        .query("SELECT count(*),min(media_type) FROM indexer_status", ())
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 1);
+    assert_eq!(row.get::<String>(1)?, "tv");
+    drop(row);
+    // Common caps failure affects both scopes and honors the remote retry interval.
+    upstream.mode.store(6, Ordering::SeqCst);
+    assert_eq!(
+        request(address, "POST", &format!("{path}/test"), "")
+            .await
+            .0,
+        429
+    );
+    let row = c
+        .query(
+            "SELECT count(*),min(disabled_until-last_failure_at) FROM indexer_status",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!(row.get::<i64>(0)?, 2);
+    assert_eq!(row.get::<i64>(1)?, 7200);
+    drop(row);
+    upstream.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        request(address, "POST", &format!("{path}/test"), "")
+            .await
+            .0,
+        200,
+        "saved Test bypasses active transport cooldown"
+    );
+    assert!(
+        c.query("SELECT 1 FROM indexer_status", ())
+            .await?
+            .next()
+            .await?
+            .is_none()
+    );
+    // Reconfiguration resets durable authority; an older in-flight failed search cannot restore it.
+    upstream.mode.store(3, Ordering::SeqCst);
+    let route = format!("{path}/search");
+    let body = query("movies");
+    let in_flight = tokio::spawn(async move { request(address, "POST", &route, &body).await });
+    tokio::time::timeout(Duration::from_secs(3), upstream.started.notified())
+        .await
+        .unwrap();
+    let mut changed = config.clone();
+    changed["revision"] = json!(1);
+    changed["name"] = json!("Revision two");
+    assert_eq!(
+        request(address, "PUT", &path, &changed.to_string()).await.0,
+        200
+    );
+    upstream.mode.store(1, Ordering::SeqCst);
+    upstream.release.notify_one();
+    assert_eq!(in_flight.await.unwrap().0, 409);
+    assert!(
+        c.query("SELECT 1 FROM indexer_status", ())
+            .await?
+            .next()
+            .await?
+            .is_none()
+    );
+    server.abort();
+    let _ = server.await;
+    upstream_task.abort();
+    let _ = upstream_task.await;
     Ok(())
 }

@@ -49,14 +49,52 @@ pub fn render() -> String {
     registry.visit::<crate::commands::processing::ProcessingPolicyReset>();
     registry.visit::<crate::revision_policy::Policy>();
     registry.visit::<crate::revision_policy::Update>();
+    registry.visit::<crate::import_policy::Policy>();
+    registry.visit::<crate::import_policy::Update>();
+    registry.visit::<crate::recycle_bin::Settings>();
+    registry.visit::<crate::recycle_bin::Update>();
+    registry.visit::<crate::recycle_bin::deletion::DeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::Deletion>();
+    registry.visit::<crate::recycle_bin::deletion::Batch>();
+    registry.visit::<crate::notifications::model::NotificationInput>();
+    registry.visit::<crate::notifications::model::Notification>();
+    registry.visit::<crate::notifications::model::NotificationList>();
+    registry.visit::<crate::notifications::model::ImplementationList>();
+    registry.visit::<crate::notifications::model::TestInput>();
+    registry.visit::<crate::notifications::model::TestResult>();
+    registry.visit::<crate::notifications::model::TestAllResult>();
+    registry.visit::<crate::notifications::model::DeliveryList>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
     registry.visit::<crate::tags::Detail>();
     registry.visit::<crate::tags::Owners>();
     registry.visit::<crate::tags::Page>();
+    registry.visit::<crate::autotagging::Input>();
+    registry.visit::<crate::autotagging::Rule>();
+    registry.visit::<crate::autotagging::SchemaEntry>();
+    registry.visit::<crate::collections::Collection>();
+    registry.visit::<crate::collections::Patch>();
+    registry.visit::<crate::collections::BulkPatch>();
+    registry.visit::<crate::collections::ListQuery>();
+    registry.visit::<crate::api::ApiPage<crate::collections::Collection>>();
+    registry.visit::<crate::commands::collection_refresh::CollectionRefreshInput>();
+    registry.visit::<crate::commands::collection_refresh::ListParams>();
+    registry.visit::<crate::api::ApiPage<crate::commands::collection_refresh::CollectionRefreshCommand>>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::backup::BackupQuery,
+        crate::api::ApiPage<crate::backup::BackupFile>,
+        crate::backup::BackupDetail,
+        crate::backup::BackupSettings,
+        crate::backup::BackupSettingsUpdate,
+        crate::backup::PendingRestore,
+        crate::backup::RestoreStatus,
+        crate::commands::backup::BackupCommandInput,
+        crate::commands::backup::ListParams,
+        crate::commands::backup::BackupCommand,
+        crate::api::ApiPage<crate::commands::backup::BackupCommand>,
         crate::custom_formats::Input,
         crate::custom_formats::Format,
         crate::custom_formats::Bulk,
@@ -83,7 +121,11 @@ pub fn render() -> String {
         crate::search::ReleasePolicy,
         crate::commands::blocklist::BlocklistClearInput,
         crate::api::ApiPage<crate::commands::blocklist::BlocklistClearCommand>,
+        crate::commands::recycle_cleanup::RecycleBinCleanupInput,
+        crate::api::ApiPage<crate::commands::recycle_cleanup::RecycleBinCleanupCommand>,
         crate::commands::manual_import::ManualImportBatchInput,
+        crate::commands::manual_import::ManualImportReconcileInput,
+        crate::commands::manual_import::ManualImportReconciliation,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
         crate::health::HealthCommandInput,
@@ -93,6 +135,15 @@ pub fn render() -> String {
         crate::api::ApiPage<crate::health::HealthCommand>,
         crate::commands::quality_reset::QualityResetInput,
         crate::api::ApiPage<crate::commands::quality_reset::QualityResetCommand>,
+        crate::commands::downloaded_scan::DownloadedScanInput,
+        crate::commands::downloaded_scan::DownloadedScanQuery,
+        crate::commands::downloaded_scan::DownloadedScanChildQuery,
+        crate::api::ApiPage<crate::commands::downloaded_scan::DownloadedScanCommand>,
+        crate::api::ApiPage<crate::commands::downloaded_scan::ScanChild>,
+        crate::commands::downloaded_scan::ScanChildResumeInput,
+        crate::commands::downloaded_scan::ScanCleanupResumeInput,
+        crate::commands::downloaded_scan::ScanMemberQuery,
+        crate::api::ApiPage<crate::commands::downloaded_scan::ScanChildMember>,
         crate::commands::rescan::RescanInput,
         crate::commands::rescan::RescanQuery,
         crate::commands::rescan::RescanBatch,
@@ -158,6 +209,25 @@ pub fn render() -> String {
         crate::naming::movie_preview::MovieRenamePreviewItem,
         crate::naming::movie_preview::MovieRenamePreviewStatus,
         crate::naming::movie_preview::MovieRenamePreviewReason,
+        crate::naming::plan::TvRenamePreview,
+        crate::naming::plan::TvRenamePreviewItem,
+        crate::naming::plan::FolderRenamePreview,
+        crate::naming::plan::FolderRenamePreviewItem,
+        crate::naming::plan::RenameStatus,
+        crate::naming::plan::RenameReason,
+        crate::commands::rename::RenameInput,
+        crate::commands::rename::RenameTarget,
+        crate::commands::rename::RenameName,
+        crate::commands::rename::RenameCommand,
+        crate::commands::rename::RenameCommandDetail,
+        crate::commands::rename::RenameItem,
+        crate::commands::rename::RenameItemState,
+        crate::api::ApiPage<crate::commands::rename::RenameCommand>,
+        crate::rename::events::RenameEvent,
+        crate::rename::events::RenameEventKind,
+        crate::rename::events::RenameOwner,
+        crate::rename::events::RenameEventQuery,
+        crate::api::ApiPage<crate::rename::events::RenameEvent>,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,
@@ -214,6 +284,8 @@ pub fn render() -> String {
         crate::naming::TvNamingUpdate,
         crate::naming::TvNamingExamplesQuery,
         crate::naming::TvNamingExamples,
+        crate::naming::MultiEpisodeNamingExample,
+        crate::naming::MultiEpisodeExampleStatus,
         crate::naming::MovieNamingConfig,
         crate::naming::MovieNamingUpdate,
         crate::naming::MovieNamingExamplesQuery,
@@ -221,6 +293,15 @@ pub fn render() -> String {
         crate::parse::ParseQuery,
         crate::parse::TvParseResult,
         crate::parse::MovieParseResult,
+        crate::wanted::WantedQuery,
+        crate::wanted::WantedPage<crate::wanted::TvWantedItem>,
+        crate::wanted::WantedPage<crate::wanted::MovieWantedItem>,
+        crate::wanted::WantedSearchInput,
+        crate::wanted::WantedSearchReceipt,
+        crate::calendar::CalendarQuery,
+        crate::calendar::CalendarFeedQuery,
+        crate::calendar::CalendarPage<crate::calendar::TvCalendarEntry>,
+        crate::calendar::CalendarPage<crate::calendar::MovieCalendarEntry>,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",

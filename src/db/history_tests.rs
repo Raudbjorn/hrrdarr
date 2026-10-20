@@ -136,7 +136,7 @@ async fn history_order_upgrade_rollback_preserves_facts_and_uses_index() -> Resu
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     assert_eq!(rows(&conn).await?, before);
     for predicate in [
         "",
@@ -321,7 +321,7 @@ CREATE TABLE History(Id INTEGER,MovieId INTEGER,Date TEXT,EventType INTEGER);INS
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT history_version FROM snapshot_imports").await?,
         0

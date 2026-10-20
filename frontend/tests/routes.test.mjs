@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseHash,hashFor,VIEW_IDS,VIEW_PATHS,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS,MAX_DISPLAY_LENGTH,MAX_HASH_LENGTH} from '../src/lib/routes.ts';
 
-const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history'];
+// Reasoning: 'backup' (System → Backup, /system/backup) is now an implemented view.
+const EXPECTED_VIEWS=['library','health','backup','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','collections','autotagging','notifications'];
 
 test('table covers exactly the existing views',()=>{
   assert.deepEqual([...VIEW_IDS].sort(),[...EXPECTED_VIEWS].sort());
@@ -17,6 +18,20 @@ test('every view round-trips and has a unique path',()=>{
   }
   assert.equal(paths.size,VIEW_IDS.length);
   assert.equal(hashFor('library'),'#/');
+});
+
+test('wanted routes use the reference paths',()=>{
+  assert.deepEqual(parseHash('#/wanted/missing'),{kind:'view',view:'wanted-missing'});
+  assert.deepEqual(parseHash('#/wanted/cutoffunmet'),{kind:'view',view:'wanted-cutoff'});
+  assert.equal(parseHash('#/wanted/cutoff').kind,'not-found');
+});
+
+test('calendar route uses the reference path',()=>{
+  assert.deepEqual(parseHash('#/calendar'),{kind:'view',view:'calendar'});
+  assert.deepEqual(parseHash('#/calendar/'),{kind:'view',view:'calendar'});
+  assert.deepEqual(parseHash('#/collections'),{kind:'view',view:'collections'});
+  assert.deepEqual(parseHash('#/settings/autotagging'),{kind:'view',view:'autotagging'});
+  assert.equal(parseHash('#/calendar/month').kind,'not-found');
 });
 
 test('empty hashes map to library',()=>{
@@ -80,10 +95,12 @@ test('settings index lists only implemented views and no unavailable section',()
     assert.ok(VIEW_PATHS[s.view].startsWith('/settings/'),s.view);
     assert.equal(seen.has(s.view),false);seen.add(s.view);
   }
-  assert.deepEqual(UNAVAILABLE_SECTIONS,['Import lists','Metadata','Connect (notifications)','UI settings','Backup','Updates','Logs']);
+  // Reasoning: Backup is delivered as System → Backup (/system/backup, not a settings page), so it
+  // is no longer listed as unavailable; #/settings/backup below still stays not-found.
+  assert.deepEqual(UNAVAILABLE_SECTIONS,['Import lists','Metadata','UI settings','Updates','Logs']);
   const labels=SETTINGS_SECTIONS.map(s=>s.label.toLowerCase());
   for(const name of UNAVAILABLE_SECTIONS) assert.equal(labels.includes(name.toLowerCase()),false,name);
-  for(const bad of ['importlists','metadata','connect','ui','backup','updates','logs']) assert.equal(parseHash(`#/settings/${bad}`).kind,'not-found',bad);
+  for(const bad of ['importlists','metadata','ui','backup','updates','logs']) assert.equal(parseHash(`#/settings/${bad}`).kind,'not-found',bad);
 });
 
 test('components render path as text and link real anchors',()=>{

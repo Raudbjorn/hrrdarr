@@ -491,28 +491,14 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
     }
     let mut owners = BTreeMap::new();
     for (remote, fact) in &plan.facts {
-        let intent = c
-            .query(
-                "SELECT local_edit,removed FROM movie_collection_intents WHERE tmdb_id=?",
-                [*remote],
-            )
-            .await?
-            .next()
-            .await?;
-        if let Some(r) = intent {
-            if r.get::<i64>(0)? != 0 || r.get::<i64>(1)? != 0 {
-                issue(
-                    &mut report.unsupported,
-                    "Collections",
-                    "native collection intent retained; source policy inactive",
-                );
-                continue;
-            }
-        }
-        let existing=c.query("SELECT c.id,c.metadata_revision,c.title,coalesce(s.local_edit,0) FROM movie_collections c LEFT JOIN movie_collection_settings s ON s.collection_id=c.id WHERE c.tmdb_id=?",[*remote]).await?.next().await?;
-        let (collection, created) = if let Some(r) = existing {
+        // Native authority is local to movie_collections (migration 0066 stores policy inline):
+        // local_edit marks an API/UI policy edit, metadata_revision a natively fetched graph or title.
+        let existing=c.query("SELECT id,metadata_revision,title,local_edit,snapshot_owned,(monitored=1 OR search_on_add=1 OR quality_profile_id IS NOT NULL OR root_folder_id IS NOT NULL OR minimum_availability IS NOT NULL OR EXISTS(SELECT 1 FROM movie_collection_tags t WHERE t.collection_id=movie_collections.id)) FROM movie_collections WHERE tmdb_id=?",[*remote]).await?.next().await?;
+        // Whether the stored policy may be (re)written by this snapshot.
+        let (collection, created, replaceable) = if let Some(r) = existing {
             let id: i64 = r.get(0)?;
-            if r.get::<i64>(1)? > 0 || r.get::<i64>(3)? != 0 {
+            let local_edit = r.get::<i64>(3)? != 0;
+            if r.get::<i64>(1)? > 0 || local_edit {
                 issue(
                     &mut report.unsupported,
                     "Collections",
@@ -530,17 +516,16 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
                 );
             }
             report.duplicates += 1;
-            (id, false)
+            let owned = r.get::<i64>(4)? != 0;
+            let has_policy = r.get::<i64>(5)? != 0;
+            // Policy an earlier snapshot wrote and nobody edited since is replaced by this newer
+            // backup; any other existing policy is native and retained.
+            (id, false, owned || !has_policy)
         } else {
             c.execute("INSERT INTO movie_collections(tmdb_id,title,sort_title,overview,images_json,added,last_info_sync)VALUES(?,?,?,?,?,?,?)",params![*remote,fact.title.clone(),fact.sort.clone(),fact.overview.clone(),fact.images.clone(),fact.added.clone(),fact.synced.clone()]).await?;
             report.mapped += 1;
-            (c.last_insert_rowid(), true)
+            (c.last_insert_rowid(), true, true)
         };
-        c.execute(
-            "INSERT INTO movie_collection_intents(tmdb_id)VALUES(?) ON CONFLICT DO NOTHING",
-            [*remote],
-        )
-        .await?;
         if let Some(source) = fact.source_id {
             if mapped(c, report, "movie_collections", source)
                 .await?
@@ -551,19 +536,7 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
             }
             c.execute("INSERT INTO snapshot_mappings(application,fingerprint,destination_table,source_id,destination_id)VALUES('radarr',?,'movie_collections',?,?) ON CONFLICT DO NOTHING",params![report.fingerprint.clone(),source,collection]).await?;
         }
-        // Native settings (discovery or local edits) win; settings an earlier snapshot wrote
-        // and nobody edited since are replaced by this newer source policy.
-        let settings = c
-            .query(
-                "SELECT snapshot_owned=1 AND local_edit=0 FROM movie_collection_settings WHERE collection_id=?",
-                [collection],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|r| r.get::<i64>(0).map(|v| v != 0))
-            .transpose()?;
-        if created || settings != Some(false) {
+        if created || replaceable {
             let profile = if let Some(source) = fact.profile {
                 mapped(c, report, "quality_profiles", source).await?
             } else {
@@ -603,16 +576,12 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
                     "unresolved or absent defaults; collection policy inactive",
                 );
             }
-            if settings.is_some() {
-                c.execute(
-                    "DELETE FROM movie_collection_tags WHERE collection_id=?",
-                    [collection],
-                )
-                .await?;
-                c.execute("UPDATE movie_collection_settings SET monitored=?,root_folder_id=?,quality_profile_id=?,minimum_availability=?,search_on_add=?,settings_revision=settings_revision+1 WHERE collection_id=? AND snapshot_owned=1 AND local_edit=0",params![i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),fact.search.map(i64::from),collection]).await?;
-            } else {
-                c.execute("INSERT INTO movie_collection_settings(collection_id,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,snapshot_owned)VALUES(?,?,?,?,?,?,1)",params![collection,i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),fact.search.map(i64::from)]).await?;
-            }
+            c.execute(
+                "DELETE FROM movie_collection_tags WHERE collection_id=?",
+                [collection],
+            )
+            .await?;
+            c.execute("UPDATE movie_collections SET monitored=?,root_folder_id=?,quality_profile_id=?,minimum_availability=?,search_on_add=?,snapshot_owned=1 WHERE id=?",params![i64::from(fact.monitored&&complete),root,profile,fact.availability.clone(),i64::from(fact.search.unwrap_or(false)),collection]).await?;
             // A partly mapped tag set must never broaden automatic matching/defaults.
             if resolved {
                 for tag in tags {
@@ -638,7 +607,6 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
     for (remote, source) in &plan.members {
         listed.entry(*source).or_default().insert(*remote);
     }
-    let mut vacated = BTreeSet::new();
     for (remote, source) in &plan.members {
         let Some(collection) = owners.get(remote) else {
             continue;
@@ -683,7 +651,6 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
                     params![old, metadata],
                 )
                 .await?;
-                vacated.insert(old);
             }
         }
         if same {
@@ -698,7 +665,7 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
             );
             continue;
         }
-        c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision)SELECT ?,?,'snapshot',metadata_revision FROM movie_collections WHERE id=?",params![*collection,metadata,*collection]).await?;
+        c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin)VALUES(?,?,'snapshot')",params![*collection,metadata]).await?;
         report.mapped += 1;
     }
     // A movie this backup maps but lists in no collection had its association cleared at the
@@ -718,32 +685,13 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
     }
     drop(catalog);
     for metadata in cleared {
-        let mut rows = c
-            .query(
-                "SELECT collection_id FROM movie_collection_members WHERE metadata_id=? AND origin='snapshot'",
-                [metadata],
-            )
-            .await?;
-        let mut stale = Vec::new();
-        while let Some(r) = rows.next().await? {
-            stale.push(r.get::<i64>(0)?);
-        }
-        drop(rows);
-        for old in stale {
-            c.execute(
-                "DELETE FROM movie_collection_members WHERE collection_id=? AND metadata_id=? AND origin='snapshot'",
-                params![old, metadata],
-            )
-            .await?;
-            vacated.insert(old);
-        }
-    }
-    // Deferred so a collection this snapshot is still populating is never retired mid-loop.
-    let populated: BTreeSet<i64> = owners.values().copied().collect();
-    for old in vacated.difference(&populated) {
-        crate::collections::repository::cleanup_without_library(c, *old)
-            .await
-            .map_err(|_| INVALID)?;
+        // Collections stay catalog entities here (unlike a retired adoption-only collection):
+        // only the snapshot-origin membership rows go.
+        c.execute(
+            "DELETE FROM movie_collection_members WHERE metadata_id=? AND origin='snapshot'",
+            [metadata],
+        )
+        .await?;
     }
     for (remote, title, year) in &plan.exclusions {
         if let Some(r) = c

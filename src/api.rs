@@ -45,6 +45,8 @@ pub struct Operation {
     pub status: String,
     pub message: String,
     pub error_code: Option<String>,
+    pub path_failure_code: Option<String>,
+    pub recovery_required: bool,
 }
 #[derive(Deserialize, TS)]
 pub struct SnapshotOptions {

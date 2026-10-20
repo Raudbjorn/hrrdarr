@@ -684,6 +684,7 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     let source = Arc::new(Mutex::new(show()));
     source.lock().unwrap()["originalLanguage"] = json!("ara");
     source.lock().unwrap()["network"] = json!(" RÚV ");
+    source.lock().unwrap()["runtime"] = json!(0);
     source.lock().unwrap()["originalCountry"] = json!("isl");
     source.lock().unwrap()["status"] = json!("Ended");
     source.lock().unwrap()["genres"] = json!(["Drama", "drama", "Comedy"]);
@@ -726,6 +727,7 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     .await;
     assert_eq!(status, 201, "{added}");
     let id = added["id"].as_i64().unwrap();
+    assert_eq!(added["runtime"], 0);
     let c = db.connect().await.unwrap();
     assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 26); // TV Arabic is 26; movies use 31.
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network=' RÚV ' AND original_country='ISL' AND status='ended' AND genres_json='[\"Comedy\",\"Drama\"]'").await, 1);
@@ -765,12 +767,63 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
             .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
+        assert_eq!(scalar(&c, "SELECT runtime FROM series").await, 0);
         assert_eq!(scalar(&c, "SELECT monitored FROM series").await, 0);
         assert_eq!(
             scalar(&c, "SELECT episode_file_id FROM episodes WHERE tvdb_id=502").await,
             1
         );
     }
+    // Series runtime is minutes; zero is supplied data, and null/absent retains it.
+    for wire in [Some(json!(i64::from(i32::MAX))), None, Some(Value::Null)] {
+        let mut body = show();
+        if let Some(wire) = wire {
+            body["runtime"] = wire;
+        }
+        *source.lock().unwrap() = body;
+        let tx = c.transaction().await.unwrap();
+        refresh::apply(
+            &tx,
+            &captured,
+            Details::Series(metadata.series(101).await.unwrap()),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            scalar(&c, "SELECT runtime FROM series").await,
+            i64::from(i32::MAX)
+        );
+        let (status, projected) = request(
+            &client,
+            &base,
+            "GET",
+            &format!("/api/v1/tv/series/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(projected["runtime"], i64::from(i32::MAX));
+    }
+    for runtime in [
+        json!(-1),
+        json!(i64::from(i32::MAX) + 1),
+        json!(0.5),
+        json!("45"),
+    ] {
+        source.lock().unwrap()["runtime"] = runtime;
+        assert!(metadata.series(101).await.is_err());
+        assert_eq!(
+            scalar(&c, "SELECT runtime FROM series").await,
+            i64::from(i32::MAX)
+        );
+    }
+    source
+        .lock()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime");
     // All sparse language-only responses also preserve the other known facts.
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network=' RÚV ' AND original_country='ISL' AND status='ended' AND genres_json='[\"Comedy\",\"Drama\"]'").await, 1);
     // A successful supplied status restores an owner previously marked deleted.
@@ -811,6 +864,7 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     }
     source.lock().unwrap()["originalLanguage"] = json!("ar");
     source.lock().unwrap()["title"] = json!("Must roll back");
+    source.lock().unwrap()["runtime"] = json!(0);
     source.lock().unwrap()["network"] = json!("Rollback network");
     source.lock().unwrap()["genres"] = json!(["Rollback"]);
     c.execute_batch("CREATE TRIGGER fixture_metadata_failure BEFORE UPDATE ON episodes BEGIN SELECT RAISE(ABORT,'fixture late failure'); END;").await.unwrap();
@@ -826,6 +880,10 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
         .is_err()
     );
     tx.rollback().await.unwrap();
+    assert_eq!(
+        scalar(&c, "SELECT runtime FROM series").await,
+        i64::from(i32::MAX)
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network='New network' AND genres_json='[]' AND status='continuing'").await, 1);
     assert_eq!(scalar(&c, "SELECT original_language FROM series").await, 9);
     assert_eq!(
@@ -856,6 +914,7 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     )
     .await;
     assert_eq!(status, 201, "{added}");
+    assert!(added["runtime"].is_null());
     assert_eq!(
         scalar(
             &c,
@@ -872,6 +931,18 @@ async fn tv_original_language_survives_lookup_add_refresh_failure_and_reopen() {
     drop(db);
     let db = Database::open_local(&path).await.unwrap();
     let c = db.connect().await.unwrap();
+    assert_eq!(
+        scalar(&c, "SELECT runtime FROM series WHERE tvdb_id=101").await,
+        i64::from(i32::MAX)
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM series WHERE tvdb_id=303 AND runtime IS NULL"
+        )
+        .await,
+        1
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=101 AND network='New network' AND genres_json='[]' AND status='continuing'").await, 1);
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series_tags WHERE tag_id=1").await,
