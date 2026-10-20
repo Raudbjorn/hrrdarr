@@ -35,20 +35,20 @@ Per item: `title` (required, at most 2048 bytes), a locator (torrent-typed `encl
 - `POST /api/v1/providers/{id}/search` accepts only `kind: "rss"`; offset/limit page locally over the single fetched document.
 - The RSS command (`src/commands/rss.rs`) polls feeds per enabled domain scope through the same `raw_search`, with the same provider lane, rate-limit cool-down, revision fencing and fingerprint idempotency as Torznab. Replays do not repeat external grabs; disabled providers, absent scopes, disabled RSS flags and stale revisions are refused before any request.
 
-## Migration 0050
+## Migration 0068
 
-`0050_torrent_rss_indexer.sql` is the only new migration. `providers` is referenced by cascading foreign keys and the runner holds `foreign_keys=ON` inside its transaction, so a rebuild would delete dependent rows. The two CHECK lists (`providers.implementation` and the `provider_scopes` table CHECK) are therefore widened in place with the documented `writable_schema` edit plus `PRAGMA writable_schema=RESET` (verified against this libSQL build; every existing row already satisfies the wider predicate). A guard table makes the migration fail and roll back if either replacement did not apply. Triggers are dropped and recreated from their *live* 0049 definitions. One nullable column, `minimum_seeders`, is added with a feed-only CHECK. The edit is local-engine behaviour; the runner already refuses pending remote migrations, and remote Turso was not exercised.
+`0068_torrent_rss_indexer.sql` is the only new migration for this feature (authored upstream as `0050_torrent_rss_indexer.sql` before the download-client registry; it is the last migration here). The registry (0059) turned implementation membership into data and shape/option rules into triggers, so the migration is additive: one `provider_implementations` row (`torrentrss`, `indexer`, `torrent`), the nullable `provider_scopes.minimum_seeders` column (feed scopes only, 0..1000000), and replacement scope shape/options/client-options triggers plus the RSS admission and schedule triggers. `providers` and `provider_scopes` are never rebuilt (a rebuild under `foreign_keys=ON` would cascade-delete dependent rows), and no `writable_schema` edit is needed. `search_commands_admit` and `indexer_status` stay native-indexer only. A feed has no durable indexer backoff; it keeps the transport's in-memory rate-limit cool-down.
 
 ## Per-site decisions for implementation enumerations
 
 | Site | Decision |
 | --- | --- |
-| `providers.implementation` CHECK (0009) | Extended in 0050 |
-| `provider_scopes` table CHECK (0009) | Extended in 0050 (feed shape: no categories, no client columns) |
+| `providers.implementation` | Registry row added in 0068 (the 0009 CHECK was replaced by the 0059 registry foreign key) |
+| `provider_scope_shape_*` (0059/0064) | Extended in 0068 (feed shape: no categories, priorities or client columns) |
 | `provider_scopes.download_client_id` CHECK (0049) | Left: native indexers only |
 | `provider_scope_options_*` (0011), `provider_client_options_*` (0012) | Extended; feed scopes must have search flags 0 and all native/client options NULL |
-| `provider_test_*_owner` (0010/0012) | Extended: revision-bound tests allowed for feeds |
-| `rss_commands_admit`, `rss_schedules_admit`, `rss_schedules_update` (0025) | Extended: a feed may be an RSS indexer paired with a qBittorrent client |
+| `provider_test_*_owner` (0010/0012/0059) | Unchanged: they resolve through the registry, so revision-bound tests are allowed for feeds |
+| `rss_commands_admit`, `rss_schedules_admit`, `rss_schedules_update` (0025 lineage, live definitions 0059/0067) | Extended: a feed may be an RSS indexer paired with a torrent client (registry protocol match) |
 | `search_commands_admit` (0027 lineage) | Left: feeds cannot search |
 | Older superseded trigger definitions (0027/0030-0033/0042 and others) | Left byte-identical; only the live definitions were rewritten |
 | `src/providers/mod.rs` settings enum, `read`, `write_scopes`, probe, health-change capture, importer reconstruction | Extended |

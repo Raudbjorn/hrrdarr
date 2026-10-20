@@ -62,7 +62,7 @@ async fn native_library_domains_monitoring_statistics_and_atomicity() -> Result<
     let db_path = files.0.join("library.db");
     let db = Arc::new(Database::open_local(&db_path).await?);
     let conn = db.connect().await?;
-    conn.execute_batch("INSERT INTO quality_profiles(id,media_type,name) VALUES(1,'tv','TV'),(2,'movies','Movies'); INSERT INTO movie_metadata(id,tmdb_id,title,year) VALUES(50,500,'Catalog only',2020);").await?;
+    conn.execute_batch("INSERT INTO quality_profiles(id,media_type,name) VALUES(1,'tv','TV'),(2,'movies','Movies'); INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime) VALUES(50,500,'Catalog only',2020,0);").await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = library::router(db.clone());
@@ -86,6 +86,7 @@ async fn native_library_domains_monitoring_statistics_and_atomicity() -> Result<
     );
     assert_eq!(movie["title"], "Catalog only");
     assert_eq!(movie["metadata_id"], 50);
+    assert_eq!(movie["runtime"], 0);
     assert!(movie["is_available"].is_null());
     let (status, second) = request(
         address,

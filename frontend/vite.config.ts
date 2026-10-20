@@ -10,5 +10,5 @@ if (target) {
     throw new Error('HRRDARR_API_ORIGIN must be an HTTP(S) origin without credentials or a path.');
   }
 }
-return { plugins: [svelte()], server: { host: '127.0.0.1', ...(target ? { proxy: { '/api': { target } } } : {}) } };
+return { plugins: [svelte()], server: { host: '127.0.0.1', ...(target ? { proxy: { '/api': { target }, '/feed': { target } } } : {}) } };
 });

@@ -39,3 +39,7 @@ Queued or waiting commands whose captured identity is obsolete fail independentl
 Parent verification passed 136 distinct Rust tests (plus repeated child-helper executions), 16 frontend tests, generated-contract and Svelte checks, locked compilation, formatting, build and diff checks. The full owned browser workflow passed independently. Review corrected its late-completion assertion to wait for the exact newly accepted command UUID; the fresh rerun passed after that correction.
 
 No live metadata service, production library, remote worker topology, power-loss durability, or external mutating action was tested. This adds the bounded migration-0021 metadata command table without a dependency. Manual single-target refresh is delivered; metadata schedules, full-library refresh, reference refresh/rescan policies, richer movie metadata/credits/artwork, and full upstream job behavior remain incomplete. Sonarr and Radarr source inspection establishes those requirements, not runtime equivalence. Full command and Slice 2 parity remain Partial.
+
+## Series runtime preservation
+
+Refresh retains a validated series runtime in minutes independently from episode runtimes. Missing/null input preserves the stored observation; explicit zero is stored. Metadata adoption preserves the existing conflict rule for a different known local value. The runtime joins the other series facts in the same transaction, including rollback on later refresh failure.

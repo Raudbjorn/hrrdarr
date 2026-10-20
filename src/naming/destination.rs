@@ -207,7 +207,7 @@ pub(crate) async fn resolve_owned_destination(
         MediaTarget::Episode(id) => {
             let row = c
                 .query(
-                    "SELECT s.title,e.season,e.number,e.title,e.air_date,l.series_type FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN library_settings l ON l.series_id=s.id WHERE e.id=?",
+                    "SELECT s.title,e.season,e.number,e.title,e.air_date,l.series_type,e.absolute_episode_number FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN library_settings l ON l.series_id=s.id WHERE e.id=?",
                     [*id],
                 )
                 .await?
@@ -244,6 +244,20 @@ pub(crate) async fn resolve_owned_destination(
                 revision: Some(revision.clone()),
                 air_date: row.get(4)?,
             };
+            if field == TemplateField::AnimeEpisode && template.contains("{absolute:") {
+                validated_basename(root, basename)?;
+                let parsed = render::parse(field, &template)
+                    .map_err(|_| scan_failure(field, "invalid_template"))?;
+                let set = render::EpisodeSetNamingFacts::from_single(&facts, row.get(6)?);
+                let stem = render::render_episode_set(&parsed, &set, None, &config)
+                    .map_err(|e| set_render_failure(field, e))?;
+                let filename = match basename.rsplit_once('.') {
+                    Some((_, ext)) if !ext.is_empty() => format!("{stem}.{ext}"),
+                    _ => stem,
+                };
+                validated_basename(root, &filename)?;
+                return preserved(root, &filename);
+            }
             finish_render(
                 field,
                 &template,
@@ -289,6 +303,187 @@ pub(crate) async fn resolve_owned_destination(
     }
 }
 
+/// Destination and policy snapshot for immutable scan inventory. The producer must
+/// compare the captured naming revision during prepare, and reserve collisions for
+/// the entire published manifest; this read-only resolver does not reserve paths.
+#[derive(Debug)]
+pub(crate) struct EpisodeSetDestination {
+    pub destination: String,
+    pub naming_revision: i64,
+}
+fn scan_failure(field: TemplateField, class: &'static str) -> DestinationError {
+    DestinationError::Render(RenderFailure {
+        field: field.name(),
+        class,
+    })
+}
+fn set_render_failure(field: TemplateField, error: render::RenderError) -> DestinationError {
+    scan_failure(
+        field,
+        match error {
+            render::RenderError::NeedsPolicy => "multi_episode_style_required",
+            render::RenderError::MissingMembershipToken => "membership_token_required",
+            render::RenderError::MissingAbsoluteNumber => "absolute_number_required",
+            render::RenderError::MissingAirDate => "air_date_required",
+            render::RenderError::ComponentTooLong => "filename_too_long",
+            render::RenderError::IllegalCharacter => "illegal_character",
+            render::RenderError::InvalidEpisodeSet => "invalid_episode_set",
+            _ => "render_failed",
+        },
+    )
+}
+fn validated_basename(root: &str, basename: &str) -> Result<(), DestinationError> {
+    if !std::path::Path::new(root).is_absolute()
+        || basename.is_empty()
+        || basename.len() > render::MAX_COMPONENT_BYTES
+        || matches!(basename, "." | "..")
+        || basename
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        return Err(scan_failure(
+            TemplateField::StandardEpisode,
+            "invalid_source_basename",
+        ));
+    }
+    Ok(())
+}
+/// Complete membership, loaded in the caller's read/write transaction. The bounded
+/// set must belong to one series/season. Duplicate IDs are harmless, conflicting
+/// coordinates or missing rows fail. No filesystem writes or collision guesses.
+pub(crate) async fn resolve_episode_set_destination(
+    c: &Connection,
+    episode_ids: &[i64],
+    root: &str,
+    basename: &str,
+    quality_id: i64,
+    revision: &crate::media_files::FileRevision,
+    evidence: &crate::custom_formats::Evidence,
+) -> Result<EpisodeSetDestination, DestinationError> {
+    use render::{EpisodeMemberNamingFacts, EpisodeSetNamingFacts, MultiEpisodeStyle};
+    let fail = |class| scan_failure(TemplateField::StandardEpisode, class);
+    if c.is_autocommit() {
+        return Err(internal("episode_set_requires_snapshot"));
+    }
+    validated_basename(root, basename)?;
+    if episode_ids.is_empty()
+        || episode_ids.len() > render::MAX_EPISODE_MEMBERS
+        || episode_ids.iter().any(|id| *id <= 0)
+    {
+        return Err(fail("invalid_episode_set"));
+    }
+    let ids = episode_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let encoded = serde_json::to_string(&ids).map_err(|_| internal("episode_ids_encoding"))?;
+    let mut rows=c.query("SELECT e.id,e.series_id,e.season,e.number,substr(e.title,1,4097),substr(e.air_date,1,33),e.absolute_episode_number,substr(s.title,1,4097),l.series_type FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN library_settings l ON l.series_id=s.id WHERE e.id IN (SELECT value FROM json_each(?)) ORDER BY e.season,e.number,e.id LIMIT 20001",[encoded]).await?;
+    const MAX_SET_FACT_BYTES: usize = 64 * 1024 * 1024;
+    let mut fact_bytes = 0usize;
+    let mut members = Vec::with_capacity(ids.len());
+    let mut owner = None;
+    let mut series_title = None;
+    let mut series_type = None;
+    while let Some(row) = rows.next().await? {
+        let current: i64 = row.get(1)?;
+        if owner.is_some_and(|id| id != current) {
+            return Err(fail("mixed_series"));
+        }
+        owner = Some(current);
+        series_title = Some(row.get::<String>(7)?);
+        series_type = row.get::<Option<String>>(8)?;
+        let member = EpisodeMemberNamingFacts {
+            episode_id: row.get(0)?,
+            season: row.get(2)?,
+            episode: row.get(3)?,
+            title: row.get(4)?,
+            air_date: row.get(5)?,
+            absolute_episode_number: row.get(6)?,
+        };
+        fact_bytes = fact_bytes
+            .saturating_add(std::mem::size_of::<EpisodeMemberNamingFacts>())
+            .saturating_add(member.title.as_ref().map_or(0, String::len))
+            .saturating_add(member.air_date.as_ref().map_or(0, String::len));
+        if fact_bytes > MAX_SET_FACT_BYTES
+            || member.title.as_ref().is_some_and(|s| s.len() > 4096)
+            || member.air_date.as_ref().is_some_and(|s| s.len() > 32)
+            || series_title.as_ref().is_some_and(|s| s.len() > 4096)
+        {
+            return Err(fail("naming_facts_too_large"));
+        }
+        members.push(member);
+    }
+    if members.len() != ids.len() {
+        return Err(fail("target_missing"));
+    }
+    if members
+        .windows(2)
+        .any(|w| w[0].season != w[1].season || w[0].episode == w[1].episode)
+    {
+        return Err(fail("invalid_episode_set"));
+    }
+    let settings=c.query("SELECT revision,rename_enabled,replace_illegal_characters,colon_replacement,custom_colon_replacement,standard_episode_format,daily_episode_format,anime_episode_format,multi_episode_style FROM naming_settings WHERE domain='tv'",()).await?.next().await?.ok_or_else(||internal("naming_settings_missing"))?;
+    let naming_revision = settings.get(0)?;
+    let (field, column) = match series_type.as_deref() {
+        Some("daily") => (TemplateField::DailyEpisode, 6),
+        Some("anime") => (TemplateField::AnimeEpisode, 7),
+        _ => (TemplateField::StandardEpisode, 5),
+    };
+    let template: Option<String> = settings.get(column)?;
+    if settings.get::<i64>(1)? == 0 || template.is_none() {
+        return Ok(EpisodeSetDestination {
+            destination: preserved(root, basename)?,
+            naming_revision,
+        });
+    }
+    let template = template.unwrap();
+    let style = settings
+        .get::<Option<i64>>(8)?
+        .map(MultiEpisodeStyle::try_from)
+        .transpose()
+        .map_err(|_| internal("invalid_stored_naming_style"))?;
+    let colon: String = settings.get(3)?;
+    let custom: Option<String> = settings.get(4)?;
+    let config = RenderConfig {
+        replace_illegal_characters: settings.get::<i64>(2)? == 1,
+        colon: super::colon_policy(
+            super::colon_from_db(&colon).map_err(|_| internal("invalid_stored_naming_settings"))?,
+            custom.as_deref(),
+        ),
+    };
+    // Original-language/custom-format facts are series-scoped; only after proving
+    // the common owner may an ID be used for that lookup. It never selects naming membership.
+    let custom_formats = matching_names(
+        c,
+        &MediaTarget::Episode(members[0].episode_id),
+        field,
+        &template,
+        evidence,
+    )
+    .await?;
+    let facts = EpisodeSetNamingFacts {
+        series_title: series_title.ok_or_else(|| fail("target_missing"))?,
+        anime: series_type.as_deref() == Some("anime"),
+        members,
+        quality_title: quality_title(c, "tv", quality_id).await?,
+        revision: Some(revision.clone()),
+        custom_formats,
+    };
+    let parsed =
+        render::parse(field, &template).map_err(|_| scan_failure(field, "invalid_template"))?;
+    let stem = render::render_episode_set(&parsed, &facts, style, &config)
+        .map_err(|e| set_render_failure(field, e))?;
+    let filename = match basename.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() => format!("{stem}.{ext}"),
+        _ => stem,
+    };
+    validated_basename(root, &filename).map_err(|_| scan_failure(field, "filename_too_long"))?;
+    Ok(EpisodeSetDestination {
+        destination: preserved(root, &filename)?,
+        naming_revision,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +519,172 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn complete_set_destination_reads_real_members_and_preserves_unconfigured_basename() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("hrrdarr-set-naming-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&scratch.0).unwrap();
+        let db = crate::db::Database::open_local(scratch.0.join("db"))
+            .await
+            .unwrap();
+        let c = db.connect().await.unwrap();
+        c.execute("INSERT INTO series(id,title,path) VALUES(1,'Halcyon Vale','/library/Show'),(2,'Other','/library/Other')",()).await.unwrap();
+        c.execute(
+            "INSERT INTO seasons(series_id,number) VALUES(1,3),(2,3)",
+            (),
+        )
+        .await
+        .unwrap();
+        c.execute("INSERT INTO episodes(id,series_id,season,number,title,absolute_episode_number) VALUES(7,1,3,7,'Part One',47),(8,1,3,8,'Part Two',48),(10,1,3,10,'Part Four',50),(20,2,3,7,'Other',7)",()).await.unwrap();
+        let evidence = crate::custom_formats::Evidence {
+            version: 1,
+            revision: None,
+            title: "release".into(),
+            filename: None,
+            languages: None,
+            release_group: None,
+            indexer_flags: None,
+            release_type: None,
+            size: None,
+            year: None,
+            edition: None,
+            source: 0,
+            resolution: 0,
+            modifier: 0,
+        };
+        let revision = crate::media_files::FileRevision {
+            version: 1,
+            real: 0,
+            is_repack: false,
+        };
+        assert!(
+            resolve_episode_set_destination(
+                &c,
+                &[7, 8],
+                "/library/Show",
+                "complete.mkv",
+                0,
+                &revision,
+                &evidence
+            )
+            .await
+            .is_err()
+        );
+        let tx = c.transaction().await.unwrap();
+        let original = resolve_episode_set_destination(
+            &tx,
+            &[8, 7, 7],
+            "/library/Show",
+            "complete.mkv",
+            0,
+            &revision,
+            &evidence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.destination, "/library/Show/complete.mkv");
+        assert_eq!(original.naming_revision, 1);
+        assert!(
+            resolve_episode_set_destination(
+                &tx,
+                &[7, 20],
+                "/library/Show",
+                "complete.mkv",
+                0,
+                &revision,
+                &evidence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            resolve_episode_set_destination(
+                &tx,
+                &[7, 99],
+                "/library/Show",
+                "complete.mkv",
+                0,
+                &revision,
+                &evidence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            resolve_episode_set_destination(
+                &tx,
+                &[7, 8],
+                "/library/Show",
+                "../escape.mkv",
+                0,
+                &revision,
+                &evidence
+            )
+            .await
+            .is_err()
+        );
+        tx.rollback().await.unwrap();
+        c.execute("UPDATE naming_settings SET rename_enabled=1,standard_episode_format='S{season:00}E{episode:00}',revision=revision+1 WHERE domain='tv'",()).await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        let error = resolve_episode_set_destination(
+            &tx,
+            &[7, 8],
+            "/library/Show",
+            "complete.mkv",
+            0,
+            &revision,
+            &evidence,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DestinationError::Render(RenderFailure {
+                class: "multi_episode_style_required",
+                ..
+            })
+        ));
+        tx.rollback().await.unwrap();
+        c.execute("UPDATE naming_settings SET multi_episode_style=5,revision=revision+1 WHERE domain='tv'",()).await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        let named = resolve_episode_set_destination(
+            &tx,
+            &[10, 8, 7],
+            "/library/Show",
+            "complete.mkv",
+            0,
+            &revision,
+            &evidence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(named.destination, "/library/Show/S03E07-E08+E10.mkv");
+        assert_eq!(named.naming_revision, 3);
+        tx.rollback().await.unwrap();
+        c.execute("UPDATE naming_settings SET standard_episode_format=NULL,revision=revision+1 WHERE domain='tv'",()).await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        let original = resolve_episode_set_destination(
+            &tx,
+            &[7, 8],
+            "/library/Show",
+            "complete.mkv",
+            0,
+            &revision,
+            &evidence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.destination, "/library/Show/complete.mkv");
+        assert_eq!(original.naming_revision, 4);
+        tx.rollback().await.unwrap();
+    }
     #[test]
     fn short_stem_is_untouched_and_joined_with_the_downloaded_files_own_extension() {
         let facts = EpisodeNamingFacts {

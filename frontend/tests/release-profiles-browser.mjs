@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-const origin=process.env.UI_URL;assert.equal(new URL(origin).hostname,'127.0.0.1');const fixture=JSON.parse(process.env.UI_FIXTURE_JSON);const browser=await chromium.launch({headless:true});const page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',d=>d.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
+const origin=process.env.UI_URL;assert.equal(new URL(origin).hostname,'127.0.0.1');const fixture=JSON.parse(process.env.UI_FIXTURE_JSON);const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});const page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',d=>d.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
 const nav=page.getByRole('navigation',{name:'Workspace'}),panel=page.getByRole('region',{name:'Release profiles',exact:true});const path=d=>`/api/v1/${d}/release-profiles`;
 async function read(d){const r=await page.request.get(origin+path(d));assert.equal(r.status(),200);return r.json();}
 const input=p=>{const {id,media_type,...v}=p;return v;};

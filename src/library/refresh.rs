@@ -20,7 +20,6 @@ pub struct CapturedTarget {
 pub enum Details {
     Series(SeriesDetails),
     Movie(MovieDetails),
-    MovieWithCollection(crate::metadata::MovieWithCollection),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -84,11 +83,11 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
     {
         return Err(Error::TargetChanged);
     }
-    match (captured.target, details) {
+    let changed = match (captured.target, details) {
         (Target::Tv { series_id }, Details::Series(details))
             if details.tvdb_id == captured.external_id =>
         {
-            series(c, series_id, details).await
+            series(c, series_id, details).await?
         }
         (Target::Movies { .. }, Details::Movie(details))
             if details.tmdb_id == captured.external_id =>
@@ -98,25 +97,25 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
                 captured.metadata_id.ok_or(Error::TargetChanged)?,
                 details,
             )
-            .await
+            .await?
         }
-        (Target::Movies { movie_id }, Details::MovieWithCollection(details))
-            if details.movie.tmdb_id == captured.external_id =>
-        {
-            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
-            let changed = movie(c, metadata_id, details.movie).await?;
-            let associated = crate::collections::repository::adopt(
-                c,
-                movie_id,
-                metadata_id,
-                details.collection,
-                None,
-            )
-            .await?;
-            Ok(changed.max(u16::from(associated)))
-        }
-        _ => Err(Error::TargetChanged),
-    }
+        _ => return Err(Error::TargetChanged),
+    };
+    // Refreshed facts may newly satisfy (or stop satisfying) AutoTagging rules; same transaction.
+    let (domain, id) = match captured.target {
+        Target::Tv { series_id } => (crate::api::MediaDomain::Tv, series_id),
+        Target::Movies { movie_id } => (crate::api::MediaDomain::Movies, movie_id),
+    };
+    crate::autotagging::apply_item(c, domain, id)
+        .await
+        .map_err(|e| {
+            if e.0 == axum::http::StatusCode::INTERNAL_SERVER_ERROR {
+                Error::Storage
+            } else {
+                Error::Conflict
+            }
+        })?;
+    Ok(changed)
 }
 async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
     let detail = detail.validated().map_err(|_| Error::Conflict)?;
@@ -207,6 +206,7 @@ pub(crate) async fn movie_facts(
     } else {
         None
     };
+    let collection_changed = crate::collections::associate(c, id, &detail.collection).await?;
     let credits_changed = match &detail.credits {
         Some(credits) => credits_replace(c, id, credits, replace).await?,
         None => false,
@@ -229,7 +229,7 @@ pub(crate) async fn movie_facts(
             .await?;
         }
     }
-    Ok(changed || aliases_changed || credits_changed)
+    Ok(changed || aliases_changed || credits_changed || collection_changed)
 }
 
 type CreditRow = (
@@ -378,8 +378,11 @@ pub(crate) async fn series_facts(
     // scalar/set facts here, not the potentially 10,000-episode graph.
     use crate::metadata::{canonical_country, canonical_scalar, canonical_set};
     if detail
-        .original_language
-        .is_some_and(|v| !(0..=52).contains(&v))
+        .runtime
+        .is_some_and(|value| !(0..=crate::metadata::MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        || detail
+            .original_language
+            .is_some_and(|v| !(0..=52).contains(&v))
         || detail
             .status
             .as_deref()
@@ -397,10 +400,11 @@ pub(crate) async fn series_facts(
             .into(),
         detail.status.clone().into(),
         set_json(&canonical_set(detail.genres.clone()).map_err(|_| Error::Conflict)?)?,
+        detail.runtime.into(),
     ];
-    let row = c.query("SELECT original_language,network,original_country,status,genres_json FROM series WHERE id=?", [id]).await?.next().await?.ok_or(Error::TargetChanged)?;
+    let row = c.query("SELECT original_language,network,original_country,status,genres_json,runtime FROM series WHERE id=?", [id]).await?.next().await?.ok_or(Error::TargetChanged)?;
     let mut changed = false;
-    let mut values = Vec::with_capacity(6);
+    let mut values = Vec::with_capacity(7);
     for (i, incoming) in supplied.into_iter().enumerate() {
         let prior = row.get_value(i as i32)?;
         let value = if incoming == Value::Null || (i == 4 && same_set(&incoming, &prior)?) {
@@ -416,7 +420,7 @@ pub(crate) async fn series_facts(
     }
     if changed {
         values.push(id.into());
-        c.execute("UPDATE series SET original_language=?,network=?,original_country=?,status=?,genres_json=? WHERE id=?",values).await?;
+        c.execute("UPDATE series SET original_language=?,network=?,original_country=?,status=?,genres_json=?,runtime=? WHERE id=?",values).await?;
     }
     Ok(changed)
 }
@@ -584,7 +588,7 @@ mod tests {
             .unwrap();
         let c = db.connect().await.unwrap();
         c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,1,'TV','/tv'); INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,1,'Movie');").await.unwrap();
-        let tv: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","seasons":[],"episodes":[],"network":"Network","original_country":"isl","status":"continuing","genres":["Drama","drama"]})).unwrap();
+        let tv: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","runtime":0,"seasons":[],"episodes":[],"network":"Network","original_country":"isl","status":"continuing","genres":["Drama","drama"]})).unwrap();
         let film: MovieDetails = serde_json::from_value(json!({"tmdb_id":1,"title":"Movie","runtime":0,"studio":"Studio","genres":["Drama","drama"],"keywords":[]})).unwrap();
         let tx = c.transaction().await.unwrap();
         assert!(series_facts(&tx, 1, &tv, false).await.unwrap());
@@ -649,6 +653,34 @@ mod tests {
             }
             tx.rollback().await.unwrap();
         }
+        // Runtime is a concrete adoption fact, including zero. Detect a late conflict
+        // before filling any earlier NULL scalar; sparse updates retain the known runtime.
+        let mut runtime_only: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","seasons":[],"episodes":[],"runtime":45,"original_language":0})).unwrap();
+        assert_eq!(
+            series_facts(&c, 1, &runtime_only, false).await,
+            Err(Error::Conflict)
+        );
+        let unchanged = c
+            .query(
+                "SELECT runtime,original_language FROM series WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.get::<i64>(0).unwrap(), 0);
+        assert_eq!(unchanged.get_value(1).unwrap(), Value::Null);
+        runtime_only.runtime = None;
+        runtime_only.original_language = None;
+        assert!(!series_facts(&c, 1, &runtime_only, true).await.unwrap());
+        runtime_only.runtime = Some(crate::metadata::MAX_SERIES_RUNTIME_MINUTES + 1);
+        assert_eq!(
+            series_facts(&c, 1, &runtime_only, true).await,
+            Err(Error::Conflict)
+        );
         // Keywords [] is equally concrete; a late conflict blocks an earlier NULL fill.
         film.genres = None;
         film.keywords = Some(vec!["New".into()]);

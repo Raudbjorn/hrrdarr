@@ -1,4 +1,6 @@
 pub mod api;
+pub mod autotagging;
+pub mod collections;
 pub mod credits;
 pub mod db;
 pub mod episodes;
@@ -41,6 +43,8 @@ pub mod tags;
 
 pub mod completed_download_handling;
 pub mod delay_profiles;
+pub mod import_policy;
+pub mod recycle_bin;
 pub mod release_profiles;
 pub mod revision_policy;
 
@@ -51,4 +55,10 @@ pub mod health_detectors;
 
 pub mod host;
 
-pub mod collections;
+pub mod wanted;
+
+pub mod calendar;
+
+pub mod import_lists;
+pub mod notifications;
+pub mod rename;

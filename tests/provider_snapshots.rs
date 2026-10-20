@@ -500,12 +500,11 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             serde_json::to_value(&report.unsupported)?
         );
         // One marker for each affected class key, not once per imported indexer.
-        // Reasoning: per domain the commit marks the indexer class once (search, RSS and the 0049 binding
-        // check = 3 keys) and the download-client class once (CDH, communication and root folder = 3 keys),
-        // so 6 generations in total; the pre-0048/0049 expectation of 3 counted only CDH, communication and binding.
+        // Reasoning: 0053 adds one client path key; one indexer class mark advances five keys,
+        // and one client class mark advances five, for ten generations in the imported domain.
         assert_eq!(
             scalar(&c, "SELECT sum(generation) FROM health_checks").await,
-            before + 6
+            before + 10
         );
         let row=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='DownloadClients' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},report.fingerprint.clone()]).await?.next().await?.unwrap();
         let client: String = row.get(0)?;
@@ -737,6 +736,87 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
         native_clients[0], native_clients[1],
         "Same source client ID is namespaced by application"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn download_client_snapshot_tags_map_both_domains_and_never_drop_constraints()
+-> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, media) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        for mapped in [true, false] {
+            let path = scratch.0.join(format!("{media}-{mapped}-source.db"));
+            fixture(&path, app, false).await;
+            let raw = libsql::Builder::new_local(&path).build().await?;
+            let source = raw.connect()?;
+            source.execute_batch("CREATE TABLE Tags(Id INTEGER,Label TEXT); INSERT INTO Tags VALUES(7,'eligible'); ALTER TABLE DownloadClients ADD COLUMN Tags TEXT DEFAULT '[]';").await?;
+            source
+                .execute(
+                    "UPDATE DownloadClients SET Tags=? WHERE Implementation='QBittorrent'",
+                    [if mapped { "[7]" } else { "[8]" }],
+                )
+                .await?;
+            drop(source);
+            drop(raw);
+            let db = destination(&scratch.0.join(format!("{media}-{mapped}-destination.db"))).await;
+            let c = db.connect().await?;
+            c.execute(
+                "INSERT INTO tags(id,media_type,label)VALUES(7,?,'unrelated')",
+                [media],
+            )
+            .await?;
+            let bytes = std::fs::read(&path)?;
+            let report =
+                snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{media}/{mapped}: initial tag import: {error:?}")
+                    });
+            assert!(
+                report.applied,
+                "{media}/{mapped}: initial import must commit"
+            );
+            let count = scalar(&c, "SELECT count(*) FROM download_client_tags").await;
+            if mapped {
+                assert_eq!(count, 1);
+                let row=c.query("SELECT t.id,t.label,t.media_type FROM download_client_tags d JOIN tags t ON t.id=d.tag_id",()).await?.next().await?.unwrap();
+                assert_ne!(row.get::<i64>(0)?, 7);
+                assert_eq!(row.get::<String>(1)?, "eligible");
+                assert_eq!(row.get::<String>(2)?, media);
+                // libsql Row retains its statement. Release this read before replay
+                // commits through a separate connection; otherwise the fixture holds a lock.
+                drop(row);
+                let replay = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+                    .await
+                    .unwrap_or_else(|error| panic!("{media}: mapped tag replay: {error:?}"));
+                assert!(replay.applied, "{media}: replay must commit");
+                assert_eq!(replay.conflicts, 0);
+                assert_eq!(
+                    scalar(&c, "SELECT count(*) FROM download_client_tags").await,
+                    1
+                );
+            } else {
+                assert_eq!(count, 0);
+                assert_eq!(
+                    scalar(
+                        &c,
+                        "SELECT count(*) FROM providers WHERE implementation='qbittorrent'"
+                    )
+                    .await,
+                    0
+                );
+                assert!(
+                    report
+                        .unsupported
+                        .iter()
+                        .any(|u| u.table == "DownloadClients"
+                            && u.columns.iter().any(|c| c.contains("unmapped")))
+                );
+            }
+        }
+    }
     Ok(())
 }
 

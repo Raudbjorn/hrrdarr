@@ -41,9 +41,10 @@ async function run(domain){
  const button=health.getByRole('button',{name:`Run ${domain} health checks`,exact:true});
  const reply=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await button.focus();await page.keyboard.press('Enter');const response=await reply;assert.equal(response.status(),202);
- const admission=await response.json();assert.equal(admission.requested_scope,domain);assert.equal(admission.selection.length,4);
+ const admission=await response.json();assert.equal(admission.requested_scope,domain);// Reasoning: migration 0053 added remote_path_mapping, so each domain registers 11 checks.
+assert.equal(admission.selection.length,12); // Reasoning: 0059 adds recycle_bin per domain (11 -> 12). // Reasoning: 0051 adds client backoff to the nine existing checks.
  // A scheduled batch may win admission; verify every requested generation rather than assuming a new command ID.
- const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===4&&!s.active_command&&admission.selection.every(token=>s.checks.some(check=>check.identity.scope===token.identity.scope&&check.identity.check_key===token.identity.check_key&&check.observed_generation>=token.generation)),'Scoped requested generations not current');await refreshHealth();return snapshot;
+ const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===12&&!s.active_command&&admission.selection.every(token=>s.checks.some(check=>check.identity.scope===token.identity.scope&&check.identity.check_key===token.identity.check_key&&check.observed_generation>=token.generation)),'Scoped requested generations not current');await refreshHealth();return snapshot;
 }
 try{
  await mode(0);await page.goto(origin);const owners={tv:await add('tv'),movies:await add('movies')};

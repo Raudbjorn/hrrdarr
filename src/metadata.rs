@@ -12,6 +12,7 @@ const TV_ORIGIN: &str = "https://skyhook.sonarr.tv/v1/tvdb/";
 const MOVIE_ORIGIN: &str = "https://api.radarr.video/v1/";
 const MAX_RESULTS: usize = 100;
 const MAX_EPISODES: usize = 10000;
+pub(crate) const MAX_SERIES_RUNTIME_MINUTES: i64 = i32::MAX as i64;
 #[derive(Debug)]
 pub enum MetadataError {
     InvalidInput,
@@ -86,12 +87,6 @@ impl From<HttpError> for MetadataError {
         }
     }
 }
-pub mod collections;
-pub use collections::{
-    CollectionAssociation, CollectionDetails, CollectionMember, CollectionSummary,
-    MovieWithCollection,
-};
-
 type Result<T> = std::result::Result<T, MetadataError>;
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct LookupResult {
@@ -103,6 +98,7 @@ pub struct LookupResult {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct SeriesDetails {
+    pub runtime: Option<i64>,
     pub network: Option<String>,
     pub original_country: Option<String>,
     pub status: Option<String>,
@@ -149,6 +145,73 @@ pub struct MovieDetails {
     // None is absent metadata (existing credits are preserved); Some([]) explicitly clears them.
     #[serde(default)]
     pub credits: Option<Vec<CreditDetails>>,
+    // Absent preserves stored membership; Clear (wire null) removes it; Present sets it.
+    #[serde(default)]
+    pub collection: CollectionAssociation,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct CollectionRef {
+    pub tmdb_id: i64,
+    pub title: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum CollectionAssociation {
+    #[default]
+    Absent,
+    Clear,
+    Present(CollectionRef),
+}
+/// Complete collection graph from the movie metadata service; identity facts only.
+#[derive(Clone, Debug)]
+pub struct CollectionDetails {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub overview: Option<String>,
+    pub parts: Vec<CollectionPart>,
+}
+#[derive(Clone, Debug)]
+pub struct CollectionPart {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub year: Option<i64>,
+    pub imdb_id: Option<String>,
+}
+pub const MAX_COLLECTION_PARTS: usize = 1000;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCollectionRef {
+    tmdb_id: i64,
+    name: String,
+}
+#[derive(Default)]
+enum WireAssociation {
+    #[default]
+    Absent,
+    Clear,
+    Present(WireCollectionRef),
+}
+impl<'de> Deserialize<'de> for WireAssociation {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Option::<WireCollectionRef>::deserialize(d).map(|v| v.map_or(Self::Clear, Self::Present))
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCollection {
+    tmdb_id: i64,
+    name: String,
+    overview: Option<String>,
+    // No default: a missing graph must never be mistaken for an empty one.
+    parts: Vec<WirePart>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WirePart {
+    tmdb_id: i64,
+    title: String,
+    year: Option<i64>,
+    imdb_id: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
@@ -270,6 +333,47 @@ impl MetadataClient {
             return Err(MetadataError::InvalidResponse);
         }
         wire.details()
+    }
+    /// One bounded request for a complete collection graph; 404 is `NotFound`.
+    pub async fn collection(&self, id: i64) -> Result<CollectionDetails> {
+        input_id(id)?;
+        let wire: WireCollection = self
+            .fetch(false, &format!("movie/collection/{id}"), &[])
+            .await?;
+        if wire.tmdb_id != id || wire.parts.len() > MAX_COLLECTION_PARTS {
+            return Err(MetadataError::InvalidResponse);
+        }
+        text(&wire.name, 512, false)?;
+        let mut seen = BTreeSet::new();
+        let mut parts = Vec::with_capacity(wire.parts.len());
+        for part in wire.parts {
+            identity(part.tmdb_id)?;
+            text(&part.title, 1024, false)?;
+            let year = part.year.filter(|y| *y != 0);
+            validate_year(year)?;
+            if !seen.insert(part.tmdb_id) {
+                return Err(MetadataError::InvalidResponse);
+            }
+            parts.push(CollectionPart {
+                tmdb_id: part.tmdb_id,
+                title: part.title,
+                year,
+                imdb_id: imdb(part.imdb_id)?,
+            });
+        }
+        let overview = match wire.overview {
+            Some(o) if !o.is_empty() => {
+                text(&o, 65536, true)?;
+                Some(o)
+            }
+            _ => None,
+        };
+        Ok(CollectionDetails {
+            tmdb_id: id,
+            title: wire.name,
+            overview,
+            parts,
+        })
     }
     pub async fn lookup_tv(&self, term: &str) -> Result<Vec<LookupResult>> {
         let term = query(term)?;
@@ -536,6 +640,7 @@ fn validate_results(results: Vec<LookupResult>) -> Result<Vec<LookupResult>> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Show {
+    runtime: Option<i64>,
     network: Option<String>,
     original_country: Option<String>,
     status: Option<String>,
@@ -569,6 +674,12 @@ struct Episode {
 }
 impl Show {
     fn summary(self) -> Result<LookupResult> {
+        if self
+            .runtime
+            .is_some_and(|value| !(0..=MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        {
+            return Err(MetadataError::InvalidResponse);
+        }
         identity(self.tvdb_id)?;
         text(&self.title, 1024, false)?;
         canonical_scalar(self.network.clone())?;
@@ -629,8 +740,10 @@ impl Show {
             }
         });
         let genres = canonical_set(self.genres.take())?;
+        let runtime = self.runtime;
         let summary = self.summary()?;
         SeriesDetails {
+            runtime,
             network,
             original_country,
             status,
@@ -649,8 +762,6 @@ impl Show {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Movie {
-    #[serde(default)]
-    collection: collections::WireAssociation,
     studio: Option<String>,
     genres: Option<Vec<String>>,
     keywords: Option<Vec<String>>,
@@ -665,20 +776,26 @@ struct Movie {
     premier: Option<String>,
     original_language: Option<String>,
     alternative_titles: Option<Vec<AlternativeTitle>>,
-    credits: Option<Vec<WireCredit>>,
+    credits: Option<WireCredits>,
+    #[serde(default)]
+    collection: WireAssociation,
 }
-// Fixture-defined contract: the live service shape is not verified by this crate's tests.
+// A supplied set must contain both groups so partial payloads cannot silently erase credits.
+#[derive(Deserialize)]
+struct WireCredits {
+    cast: Vec<WireCredit>,
+    crew: Vec<WireCredit>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireCredit {
     name: String,
-    person_tmdb_id: i64,
+    tmdb_id: i64,
     credit_id: String,
     department: Option<String>,
     job: Option<String>,
     character: Option<String>,
     order: Option<i64>,
-    r#type: String,
     images: Option<Vec<WireCreditImage>>,
 }
 #[derive(Deserialize)]
@@ -717,7 +834,6 @@ fn original_language(value: Option<String>) -> Result<Option<i64>> {
 }
 impl Movie {
     fn details(self) -> Result<MovieDetails> {
-        self.collection.normalize()?;
         identity(self.tmdb_id)?;
         text(&self.title, 1024, false)?;
         let year = self.year.filter(|year| *year != 0);
@@ -751,38 +867,51 @@ impl Movie {
         let credits = self
             .credits
             .map(|credits| {
-                if credits.len() > MAX_CREDITS {
+                if credits.cast.len().saturating_add(credits.crew.len()) > MAX_CREDITS {
                     return Err(MetadataError::InvalidResponse);
                 }
-                credits
+                Ok(credits
+                    .cast
                     .into_iter()
-                    .map(|credit| {
-                        let kind = match credit.r#type.as_str() {
-                            "cast" => CreditKind::Cast,
-                            "crew" => CreditKind::Crew,
-                            _ => return Err(MetadataError::InvalidResponse),
-                        };
-                        Ok(CreditDetails {
-                            credit_tmdb_id: credit.credit_id,
-                            person_tmdb_id: credit.person_tmdb_id,
-                            person_name: credit.name,
-                            department: credit.department,
-                            job: credit.job,
-                            character: credit.character,
-                            order: credit.order.unwrap_or(0),
-                            kind,
-                            images: credit
-                                .images
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|image| CreditImage {
-                                    cover_type: image.cover_type,
-                                    url: image.url,
-                                })
-                                .collect(),
-                        })
+                    .map(|credit| (CreditKind::Cast, credit))
+                    .chain(
+                        credits
+                            .crew
+                            .into_iter()
+                            .map(|credit| (CreditKind::Crew, credit)),
+                    )
+                    .map(|(kind, credit)| CreditDetails {
+                        credit_tmdb_id: credit.credit_id,
+                        person_tmdb_id: credit.tmdb_id,
+                        person_name: credit.name,
+                        department: if kind == CreditKind::Crew {
+                            credit.department
+                        } else {
+                            None
+                        },
+                        job: if kind == CreditKind::Crew {
+                            credit.job
+                        } else {
+                            None
+                        },
+                        character: if kind == CreditKind::Cast {
+                            credit.character
+                        } else {
+                            None
+                        },
+                        order: credit.order.unwrap_or(0),
+                        kind,
+                        images: credit
+                            .images
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|image| CreditImage {
+                                cover_type: image.cover_type,
+                                url: image.url,
+                            })
+                            .collect(),
                     })
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<Vec<_>>())
             })
             .transpose()?;
         let in_cinemas = timestamp(self.in_cinema)?;
@@ -812,6 +941,18 @@ impl Movie {
             original_language: original_language(self.original_language)?,
             alternative_titles,
             credits: credits.map(validate_credits).transpose()?,
+            collection: match self.collection {
+                WireAssociation::Absent => CollectionAssociation::Absent,
+                WireAssociation::Clear => CollectionAssociation::Clear,
+                WireAssociation::Present(v) => {
+                    identity(v.tmdb_id)?;
+                    text(&v.name, 512, false)?;
+                    CollectionAssociation::Present(CollectionRef {
+                        tmdb_id: v.tmdb_id,
+                        title: v.name,
+                    })
+                }
+            },
         })
     }
 }
@@ -823,6 +964,12 @@ fn validate_year(value: Option<i64>) -> Result<()> {
 }
 impl SeriesDetails {
     pub(crate) fn validated(mut self) -> Result<Self> {
+        if self
+            .runtime
+            .is_some_and(|value| !(0..=MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        {
+            return Err(MetadataError::InvalidResponse);
+        }
         identity(self.tvdb_id)?;
         text(&self.title, 1024, false)?;
         validate_year(self.year)?;
@@ -1063,6 +1210,26 @@ mod tests {
             );
         }
         assert_eq!(show(json!({"genres":[]})).unwrap().genres, Some(vec![]));
+        for runtime in [0, 45, 10081, MAX_SERIES_RUNTIME_MINUTES] {
+            assert_eq!(
+                show(json!({"runtime":runtime})).unwrap().runtime,
+                Some(runtime)
+            );
+        }
+        assert_eq!(show(json!({})).unwrap().runtime, None);
+        assert_eq!(show(json!({"runtime":null})).unwrap().runtime, None);
+        for runtime in [
+            json!(-1),
+            json!(MAX_SERIES_RUNTIME_MINUTES + 1),
+            json!(0.5),
+            json!("45"),
+            json!([]),
+        ] {
+            assert!(show(json!({"runtime":runtime})).is_err());
+        }
+        let mut direct = show(json!({"runtime":45})).unwrap();
+        direct.runtime = Some(MAX_SERIES_RUNTIME_MINUTES + 1);
+        assert!(direct.validated().is_err());
         let film = movie(json!({"studio":" Studio ","genres":["b","A","a"],"keywords":["Ý","ý"],"runtime":0,"status":{"ignored":"wire"}})).unwrap();
         assert_eq!(film.studio.as_deref(), Some(" Studio "));
         assert_eq!(film.genres.unwrap(), ["A", "b"]);

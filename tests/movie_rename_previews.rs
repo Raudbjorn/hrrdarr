@@ -222,7 +222,9 @@ async fn complete_multi_movie_preview_bounds_relative_paths_and_http_read_only()
             .send()
             .await?
             .status(),
-        404
+        // Reasoning: the TV preview route now exists (api.044), so the former absent-route 404 is
+        // stale. A movie selector on the TV route is an unknown TV selector: 400, still read-only.
+        400
     );
     assert_eq!(number(&c, "PRAGMA data_version").await, before);
     assert_eq!(

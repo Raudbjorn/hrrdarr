@@ -25,7 +25,11 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const DEADLINE_SECONDS: u64 = 8;
 #[derive(Debug)]
-struct Error(StatusCode, &'static str, &'static str);
+pub(crate) struct Error(
+    pub(crate) StatusCode,
+    pub(crate) &'static str,
+    pub(crate) &'static str,
+);
 type Result<T> = std::result::Result<T, Error>;
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -493,6 +497,11 @@ async fn preview(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<MovieRenamePreview>> {
     let ids = ids(raw)?;
+    compute(&db, ids).await.map(Json)
+}
+/// The preview computation shared with rename execution, so a command renames to exactly the
+/// filename the preview showed. `ids` must be sorted, distinct and bounded by the caller.
+pub(crate) async fn compute(db: &Database, ids: Vec<i64>) -> Result<MovieRenamePreview> {
     tokio::time::timeout(Duration::from_secs(DEADLINE_SECONDS), async {
         let c = db.connect().await?;
         let tx = c
@@ -578,7 +587,7 @@ async fn preview(
         if serde_json::to_vec(&result).map_err(|_| storage())?.len() > MAX_RESPONSE_BYTES {
             return Err(unavailable());
         }
-        Ok(Json(result))
+        Ok(result)
     })
     .await
     .map_err(|_| unavailable())?

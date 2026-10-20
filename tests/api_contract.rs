@@ -291,6 +291,9 @@ async fn actual_handler_wire_specimens_typecheck_against_generated_types() {
             status: "preview".into(),
             message: "Example".into(),
             error_code: None,
+            // A clean preview has no retained path failure or recovery obligation.
+            path_failure_code: None,
+            recovery_required: false,
         })
         .unwrap(),
     ));

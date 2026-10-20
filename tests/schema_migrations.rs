@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Reasoning: version 54 is unallocated after provider authority 0053 (collections 0052 follows main's 0051); insertion must precede unknown-history rejection.
+    // Reasoning: 0080 import_lists (position 76) is the latest allocation; the unknown-history probe must use future version 77.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (54,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (77,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(
@@ -2914,7 +2914,45 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
             "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
-        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
+        // 0054 adds only the exact scan capacity term; preserve every earlier predicate/comment.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0060 appends only the exact recycle bin cleanup capacity term.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.
+        if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+            expected = expected.replace(
+                "AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+                "AND (NEW.selection_kind='default' OR EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+            ).replace(
+                "p.enabled=1)) THEN RAISE(ABORT,'invalid RSS provider",
+                "p.enabled=1))) THEN RAISE(ABORT,'invalid RSS provider",
+            );
+        }
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // only the qBittorrent literal changes, every other predicate byte is still compared.
+        expected = expected.replace(
+            "p.implementation='qbittorrent'",
+            if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+                "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)"
+            } else {
+                "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
+            },
+        );
+        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
         // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
         // (feeds cannot search) and every other byte must still match exactly.
         if name == "rss_commands_admit" {
@@ -3260,7 +3298,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -3319,7 +3357,45 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
             "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
-        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
+        // 0054 adds only the exact scan capacity term; preserve every earlier predicate/comment.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0060 appends only the exact recycle bin cleanup capacity term.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.
+        if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+            expected = expected.replace(
+                "AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+                "AND (NEW.selection_kind='default' OR EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+            ).replace(
+                "p.enabled=1)) THEN RAISE(ABORT,'invalid RSS provider",
+                "p.enabled=1))) THEN RAISE(ABORT,'invalid RSS provider",
+            );
+        }
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // only the qBittorrent literal changes, every other predicate byte is still compared.
+        expected = expected.replace(
+            "p.implementation='qbittorrent'",
+            if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+                "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)"
+            } else {
+                "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
+            },
+        );
+        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
         // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
         // (feeds cannot search) and every other byte must still match exactly.
         if name == "rss_commands_admit" {
@@ -3345,8 +3421,9 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
         .get(0)?;
     assert!(
         rescan_admit_sql.contains(
-            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
+            "+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024"
         ),
+        // Reasoning: 0060 appends the recycle bin cleanup term after the 0054 scan term.
         "{rescan_admit_sql}"
     );
 
@@ -3957,7 +4034,7 @@ fn normalize_whitespace(sql: &str) -> String {
 // membership is *derived* from the triggers actually found (by their shared
 // 'command capacity reached' abort message), not hardcoded, so a future migration that adds another
 // pool table but forgets to update every sibling body fails this test loudly instead of silently
-// under-counting capacity in production. The fixed comparison against today's known nine tables
+// under-counting capacity in production. The fixed comparison against today's known ten tables
 // additionally catches the opposite failure: a table silently and consistently dropped from every
 // trigger body at once (which the cross-reference check alone would not detect, since a shrunken
 // but internally consistent set would still pass it).
@@ -3991,13 +4068,16 @@ async fn pool_admit_triggers_cross_reference_every_capacity_table() -> Result<()
         "quality_reset_commands",
         "rescan_commands",
         "health_commands", // Migration0042 joins the active pool; terminal history remains excluded.
+        "downloaded_scan_commands", //0054 adds parents; children never consume extra job slots.
+        "recycle_bin_cleanup_commands", // 0060 manual/scheduled CleanUpRecycleBin joins the active pool.
+        "rename_commands", // 0067 file/folder rename commands join the active pool (reasoning: every admit trigger was re-created to count them).
     ]
     .into_iter()
     .map(String::from)
     .collect();
     assert_eq!(
         pool_tables, known_pool_tables,
-        "the shared command-capacity pool must have exactly these nine member tables; update \
+        "the shared command-capacity pool must have exactly these twelve member tables; update \
          both this list and every admit trigger body together if that ever changes"
     );
     assert_eq!(
@@ -4273,7 +4353,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.
@@ -4323,7 +4403,45 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
             "+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
             1,
         );
-        // Reasoning: reopening also applies migration 0050, which widens only the RSS admission trigger's
+        // 0054 adds only the exact scan capacity term; preserve every earlier predicate/comment.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0060 appends only the exact recycle bin cleanup capacity term.
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0067 appends only the exact rename command capacity term (reasoning: pool membership grew by one).
+        expected = expected.replacen(
+            ">=1024",
+            "+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024",
+            1,
+        );
+        // 0052 permits unresolved defaults only; explicit and legacy admission keep the old scope/revision predicate.
+        if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+            expected = expected.replace(
+                "AND EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+                "AND (NEW.selection_kind='default' OR EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.client_id",
+            ).replace(
+                "p.enabled=1)) THEN RAISE(ABORT,'invalid RSS provider",
+                "p.enabled=1))) THEN RAISE(ABORT,'invalid RSS provider",
+            );
+        }
+        // 0058 resolves client kind/protocol through the provider_implementations registry;
+        // only the qBittorrent literal changes, every other predicate byte is still compared.
+        expected = expected.replace(
+            "p.implementation='qbittorrent'",
+            if matches!(name, "rss_commands_admit" | "search_commands_admit") {
+                "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)"
+            } else {
+                "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
+            },
+        );
+        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
         // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
         // (feeds cannot search) and every other byte must still match exactly.
         if name == "rss_commands_admit" {
