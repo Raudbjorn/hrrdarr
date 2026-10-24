@@ -215,12 +215,23 @@ pub(crate) async fn set(
             MediaDomain::Tv => MediaDomain::Movies,
             MediaDomain::Movies => MediaDomain::Tv,
         };
-        if let Some(other_bin) = read(c, other).await?.path {
+        let other_settings = read(c, other).await?;
+        if let Some(other_bin) = other_settings.path {
             if other_bin != *bin && overlaps(&other_bin, bin) {
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "recycle_bin_nested",
                     "TV and movie recycle bins may be the same folder but cannot be nested",
+                ));
+            }
+            // Recycled files carry no domain in their path, so one cleanup serves the whole
+            // folder. A shared folder therefore has one retention: with different retentions one
+            // domain would remove files the other domain still keeps.
+            if other_bin == *bin && other_settings.cleanup_days != input.cleanup_days {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "recycle_bin_retention_conflict",
+                    "TV and movie recycle bins that share a folder must use the same cleanup days",
                 ));
             }
         }

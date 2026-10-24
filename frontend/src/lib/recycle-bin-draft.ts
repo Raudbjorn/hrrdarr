@@ -1,4 +1,4 @@
-import type { RecycleBinSettings, RecycleBinSettingsUpdate, FileDeletionMode, RecycleBinCleanupCommand, FileDeletion } from './api.generated';
+import type { MediaDomain, RecycleBinSettings, RecycleBinSettingsUpdate, FileDeletionMode, RecycleBinCleanupCommand, FileDeletion } from './api.generated';
 import type { Result } from './api';
 
 export const MAX_CLEANUP_DAYS = 36500;
@@ -21,6 +21,11 @@ export function recycleBinUpdate(revision: number, draft: RecycleBinDraft): Resu
     return { ok: false, error: 'The recycle bin must be an absolute folder path (starting with /) without . or .. segments, backslashes or control characters.' };
   if (raw.split('/').every(part => part === '')) return { ok: false, error: 'The filesystem root cannot be a recycle bin.' };
   return { ok: true, data: { revision, path: raw, cleanup_days: days } };
+}
+export type DeletionOwner = { domain: MediaDomain; id: number };
+/** File IDs are domain-scoped; a prepared deletion may only run for its original owner. */
+export function deletionOwnerMatches(prepared: DeletionOwner, current: DeletionOwner | null): boolean {
+  return current !== null && prepared.domain === current.domain && prepared.id === current.id;
 }
 
 export type DeletionPlan = { mode: FileDeletionMode; title: string; detail: string; confirm: string };

@@ -16,8 +16,9 @@ A path must be absolute, normalized (no `.`/`..`, repeated or trailing separator
 characters), at most 4096 bytes and not `/`. It must not equal, contain or lie inside any root
 folder, series folder or movie folder of either domain. Both directions are enforced: the settings
 write checks Rust and SQL, and root-folder/series/movie insert and update triggers refuse a library
-path that would overlap a configured bin. TV and movies may share one bin but cannot nest. Overlap
-is lexical; bind mounts or symlinked aliases of the same directory are not detected. Saving does
+path that would overlap a configured bin. TV and movies may share one bin but cannot nest; when
+they share a folder, both domains must use the same cleanup days. Overlap is lexical; bind mounts
+or symlinked aliases of the same directory are not detected. Saving does
 not create the folder: Health reports a missing or unwritable bin.
 
 The first scheduled cleanup is one day after choosing or changing the path. The UI is under

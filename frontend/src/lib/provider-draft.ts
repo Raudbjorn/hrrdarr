@@ -31,6 +31,12 @@ export function eligibleDownloadClient(provider:Provider|null,domain:MediaDomain
   const indexerImplementation=typeof indexer==='string'?indexer:indexer?.settings.implementation;
   return !indexerImplementation || protocolOf(indexerImplementation)===protocolOf(provider.settings.implementation);
 }
+/** Keep provider records from every loaded page so selections survive pagination. */
+export function mergeProviderPages(seen: readonly Provider[], page: readonly Provider[]): Provider[] {
+  const byId = new Map(seen.map((provider) => [provider.id, provider]));
+  for (const provider of page) byId.set(provider.id, provider);
+  return [...byId.values()];
+}
 const clientAttemptLabels:Record<string,string>={selected:'Client selected',prepared:'Ready to send',dispatching:'Sending',definitely_not_submitted:'Not submitted',observed:'Confirmed in client',unknown:'Outcome uncertain'};
 export const clientAttemptLabel=(state:string)=>clientAttemptLabels[state]??state;
 

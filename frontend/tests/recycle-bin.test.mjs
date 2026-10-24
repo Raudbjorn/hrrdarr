@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {recycleBinUpdate,deletionPlan,describeDeletionFailure,describeDeletions,describeCleanup,MAX_CLEANUP_DAYS,MAX_DELETE_FILES} from '../src/lib/recycle-bin-draft.ts';
+import {deletionOwnerMatches,recycleBinUpdate,deletionPlan,describeDeletionFailure,describeDeletions,describeCleanup,MAX_CLEANUP_DAYS,MAX_DELETE_FILES} from '../src/lib/recycle-bin-draft.ts';
 import {getRecycleBin,updateRecycleBin,deleteMediaFile,deleteMediaFiles,createRecycleBinCleanup,listRecycleBinCleanups} from '../src/lib/api.ts';
 import {describeEvent} from '../src/lib/history-view.ts';
 
@@ -9,6 +9,11 @@ async function withFetch(stub,run){const original=globalThis.fetch;globalThis.fe
 const json=(value,status=200)=>new Response(JSON.stringify(value),{status});
 const settings=over=>({media_type:'tv',revision:3,path:'/data/recycle',cleanup_days:7,next_cleanup_at:null,...over});
 
+test('deletion confirmations remain bound to their domain-scoped owner',()=>{
+ assert.equal(deletionOwnerMatches({domain:'tv',id:7},{domain:'tv',id:7}),true);
+ assert.equal(deletionOwnerMatches({domain:'tv',id:7},{domain:'movies',id:7}),false);
+ assert.equal(deletionOwnerMatches({domain:'tv',id:7},null),false);
+});
 test('settings draft mirrors server validation and maps empty path to null',()=>{
   assert.deepEqual(recycleBinUpdate(2,{path:'  ',cleanup_days:0}),{ok:true,data:{revision:2,path:null,cleanup_days:0}});
   assert.deepEqual(recycleBinUpdate(2,{path:'/r',cleanup_days:MAX_CLEANUP_DAYS}),{ok:true,data:{revision:2,path:'/r',cleanup_days:MAX_CLEANUP_DAYS}});

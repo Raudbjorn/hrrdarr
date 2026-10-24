@@ -5,7 +5,7 @@
   import { onMount, untrack } from 'svelte';
   import type { ApiPage, ClientSelection, MediaDomain, MovieWantedItem, Provider, SearchCommand, TvWantedItem, WantedKind, WantedPage, WantedSearchInput, WantedSearchReceipt } from './api.generated';
   import { createWantedSearch, getSearchCommand, listProviders, listWanted, monitorEpisodes, monitorMovies } from './api';
-  import { eligibleDownloadClient, indexerScope, isIndexer } from './provider-draft';
+  import { eligibleDownloadClient, indexerScope, isIndexer, mergeProviderPages } from './provider-draft';
   import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, monitoredLabel, receiptSummary, retainVisible, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
   type Item = TvWantedItem | MovieWantedItem;
   let { kind, onkind }: { kind: WantedKind; onkind: (kind: WantedKind) => void } = $props();
@@ -15,7 +15,7 @@
   let page = $state<WantedPage<Item> | null>(null), loading = $state(false), loadError = $state('');
   let selection = $state<Set<number>>(new Set());
   let providers = $state<ApiPage<Provider> | null>(null), providerOffset = $state(0), providerError = $state(''), providerLoading = $state(false);
-  let indexerId = $state(''), clientId = $state('');
+  let knownProviders = $state<Provider[]>([]), indexerId = $state(''), clientId = $state('');
   let searching = $state(false), pending = $state<WantedSearchInput | null>(null), uncertain = $state(false);
   let searchError = $state(''), receipt = $state<WantedSearchReceipt | null>(null), confirmAll = $state(false);
   let statuses = $state<SearchCommand[]>([]), statusLoading = $state(false), statusError = $state('');
@@ -26,10 +26,10 @@
   const listName = $derived(kind === 'missing' ? `Missing ${noun}` : `Cutoff unmet ${noun}`);
   const visibleIds = $derived(page?.items.map((item) => item.target.id) ?? []);
   const allVisibleSelected = $derived(visibleIds.length > 0 && visibleIds.every((id) => selection.has(id)));
-  const indexer = $derived(providers?.items.find((p) => p.id === indexerId) ?? null);
-  const client = $derived(providers?.items.find((p) => p.id === clientId) ?? null);
-  const indexers = $derived(providers?.items.filter((p) => p.enabled && isIndexer(p) && indexerScope(p, domain)?.enable_automatic_search !== false && indexerScope(p, domain) !== null) ?? []);
-  const clients = $derived(providers?.items.filter((p) => eligibleDownloadClient(p, domain, indexer)) ?? []);
+  const indexer = $derived(knownProviders.find((p) => p.id === indexerId) ?? null);
+  const client = $derived(knownProviders.find((p) => p.id === clientId) ?? null);
+  const indexers = $derived(knownProviders.filter((p) => p.enabled && isIndexer(p) && indexerScope(p, domain)?.enable_automatic_search !== false && indexerScope(p, domain) !== null));
+  const clients = $derived(knownProviders.filter((p) => eligibleDownloadClient(p, domain, indexer)));
   const searchReady = $derived(!!indexer && (!clientId || !!client) && !searching && !uncertain && pending === null);
   const busy = $derived(loading || searching || monitoring);
 
@@ -49,7 +49,10 @@
     const result = await listProviders(offset);
     if (!alive) return;
     providerLoading = false;
-    if (result.ok) { providers = result.data; providerOffset = offset; } else providerError = result.error;
+    if (result.ok) {
+      providers = result.data; providerOffset = offset;
+      knownProviders = mergeProviderPages(knownProviders, result.data.items);
+    } else providerError = result.error;
   }
   function resetScope() {
     ++readVersion; page = null; selection = new Set(); confirmAll = false; monitorNotice = ''; monitorError = '';
@@ -207,7 +210,7 @@
       <legend>Search providers</legend>
       <label>Wanted search indexer<select bind:value={indexerId} onchange={() => { clientId = ''; }}><option value="">Choose an indexer</option>{#each indexers as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
       <label>Wanted download client<select bind:value={clientId}><option value="">Default — choose from eligible clients</option>{#each clients as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
-      {#if providers}<div class="actions"><button type="button" disabled={providerLoading || providerOffset === 0} onclick={() => loadProviders(Math.max(0, providerOffset - 25))}>Previous providers</button><button type="button" disabled={providerLoading || providerOffset + providers.limit >= providers.total} onclick={() => loadProviders(providerOffset + 25)}>Next providers</button><button type="button" disabled={providerLoading} onclick={() => { indexerId = ''; clientId = ''; void loadProviders(); }}>Reload providers</button></div>{/if}
+      {#if providers}<div class="actions"><button type="button" disabled={providerLoading || providerOffset === 0} onclick={() => loadProviders(Math.max(0, providerOffset - 25))}>Previous providers</button><button type="button" disabled={providerLoading || providerOffset + providers.limit >= providers.total} onclick={() => loadProviders(providerOffset + 25)}>Next providers</button><button type="button" disabled={providerLoading} onclick={() => { indexerId = ''; clientId = ''; knownProviders = []; void loadProviders(); }}>Reload providers</button></div>{/if}
       <div class="actions">
         <button disabled={!searchReady || !selection.size} onclick={searchSelected}>Search selected ({selection.size})</button>
         <button disabled={!searchReady || !page || page.total === 0} onclick={() => { confirmAll = true; }}>Search all</button>
