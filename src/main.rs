@@ -142,11 +142,18 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
+    let notifier = state
+        .db
+        .permits_local_imports()
+        .then(|| hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone()));
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
+    if let Some(notifier) = notifier {
+        notifier.shutdown().await;
+    }
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -170,6 +177,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .with_state(state.clone())
         .merge(hrrdarr::search::router(state.db.clone(), refresh.clone()))
         .merge(hrrdarr::wanted::router(state.db.clone(), refresh.clone()))
+        .merge(hrrdarr::calendar::router(state.db.clone()))
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
@@ -195,6 +203,10 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
+        .merge(hrrdarr::notifications::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+        ))
         .merge(hrrdarr::commands::router(state.db.clone()))
         .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))

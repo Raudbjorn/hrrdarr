@@ -264,6 +264,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "transmission",
         include_str!("../../migrations/0062_transmission.sql"),
     ),
+    (
+        "notifications",
+        include_str!("../../migrations/0063_notifications.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

@@ -19,6 +19,7 @@ The UI uses dependency-free hash routing (`#/...`), implemented by the pure tabl
 | `#/activity/history` | History |
 | `#/wanted/missing` | Wanted: missing (TV/Movies switch) |
 | `#/wanted/cutoffunmet` | Wanted: cutoff unmet (TV/Movies switch) |
+| `#/calendar` | Calendar: month, week and agenda (TV/Movies/Both); see `docs/calendar-api.md` |
 | `#/system/health` | Health |
 | `#/system/rss` | RSS |
 | `#/add/import` | Import existing library |

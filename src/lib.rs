@@ -54,3 +54,7 @@ pub mod health_detectors;
 pub mod host;
 
 pub mod wanted;
+
+pub mod calendar;
+
+pub mod notifications;

@@ -57,6 +57,14 @@ pub fn render() -> String {
     registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
     registry.visit::<crate::recycle_bin::deletion::Deletion>();
     registry.visit::<crate::recycle_bin::deletion::Batch>();
+    registry.visit::<crate::notifications::model::NotificationInput>();
+    registry.visit::<crate::notifications::model::Notification>();
+    registry.visit::<crate::notifications::model::NotificationList>();
+    registry.visit::<crate::notifications::model::ImplementationList>();
+    registry.visit::<crate::notifications::model::TestInput>();
+    registry.visit::<crate::notifications::model::TestResult>();
+    registry.visit::<crate::notifications::model::TestAllResult>();
+    registry.visit::<crate::notifications::model::DeliveryList>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
@@ -249,6 +257,10 @@ pub fn render() -> String {
         crate::wanted::WantedPage<crate::wanted::MovieWantedItem>,
         crate::wanted::WantedSearchInput,
         crate::wanted::WantedSearchReceipt,
+        crate::calendar::CalendarQuery,
+        crate::calendar::CalendarFeedQuery,
+        crate::calendar::CalendarPage<crate::calendar::TvCalendarEntry>,
+        crate::calendar::CalendarPage<crate::calendar::MovieCalendarEntry>,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",

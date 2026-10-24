@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseHash,hashFor,VIEW_IDS,VIEW_PATHS,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS,MAX_DISPLAY_LENGTH,MAX_HASH_LENGTH} from '../src/lib/routes.ts';
 
-const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff'];
+const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','notifications'];
 
 test('table covers exactly the existing views',()=>{
   assert.deepEqual([...VIEW_IDS].sort(),[...EXPECTED_VIEWS].sort());
@@ -23,6 +23,12 @@ test('wanted routes use the reference paths',()=>{
   assert.deepEqual(parseHash('#/wanted/missing'),{kind:'view',view:'wanted-missing'});
   assert.deepEqual(parseHash('#/wanted/cutoffunmet'),{kind:'view',view:'wanted-cutoff'});
   assert.equal(parseHash('#/wanted/cutoff').kind,'not-found');
+});
+
+test('calendar route uses the reference path',()=>{
+  assert.deepEqual(parseHash('#/calendar'),{kind:'view',view:'calendar'});
+  assert.deepEqual(parseHash('#/calendar/'),{kind:'view',view:'calendar'});
+  assert.equal(parseHash('#/calendar/month').kind,'not-found');
 });
 
 test('empty hashes map to library',()=>{
@@ -86,10 +92,10 @@ test('settings index lists only implemented views and no unavailable section',()
     assert.ok(VIEW_PATHS[s.view].startsWith('/settings/'),s.view);
     assert.equal(seen.has(s.view),false);seen.add(s.view);
   }
-  assert.deepEqual(UNAVAILABLE_SECTIONS,['Import lists','Metadata','Connect (notifications)','UI settings','Backup','Updates','Logs']);
+  assert.deepEqual(UNAVAILABLE_SECTIONS,['Import lists','Metadata','UI settings','Backup','Updates','Logs']);
   const labels=SETTINGS_SECTIONS.map(s=>s.label.toLowerCase());
   for(const name of UNAVAILABLE_SECTIONS) assert.equal(labels.includes(name.toLowerCase()),false,name);
-  for(const bad of ['importlists','metadata','connect','ui','backup','updates','logs']) assert.equal(parseHash(`#/settings/${bad}`).kind,'not-found',bad);
+  for(const bad of ['importlists','metadata','ui','backup','updates','logs']) assert.equal(parseHash(`#/settings/${bad}`).kind,'not-found',bad);
 });
 
 test('components render path as text and link real anchors',()=>{
