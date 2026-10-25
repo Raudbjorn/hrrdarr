@@ -17,6 +17,8 @@
   let providers = $state<ApiPage<Provider> | null>(null), providerOffset = $state(0), providerError = $state(''), providerLoading = $state(false);
   let knownProviders = $state<Provider[]>([]), indexerId = $state(''), clientId = $state('');
   let searching = $state(false), pending = $state<{ domain: MediaDomain; body: WantedSearchInput } | null>(null), uncertain = $state(false);
+  // The filter the visible page was loaded with; a search is authorized only for that filter.
+  let loadedQuery = $state('');
   let searchError = $state(''), receipt = $state<WantedSearchReceipt | null>(null), confirmAll = $state(false);
   let statuses = $state<SearchCommand[]>([]), statusLoading = $state(false), statusError = $state('');
   let monitoring = $state(false), monitorNotice = $state(''), monitorError = $state('');
@@ -30,7 +32,8 @@
   const client = $derived(knownProviders.find((p) => p.id === clientId) ?? null);
   const indexers = $derived(knownProviders.filter((p) => p.enabled && isIndexer(p) && indexerScope(p, domain)?.enable_automatic_search !== false && indexerScope(p, domain) !== null));
   const clients = $derived(knownProviders.filter((p) => eligibleDownloadClient(p, domain, indexer)));
-  const searchReady = $derived(!!indexer && (!clientId || !!client) && !searching && !uncertain && pending === null);
+  const currentQuery = $derived(wantedQuery(domain, kind, options));
+  const searchReady = $derived(!!indexer && (!clientId || !!client) && !searching && !uncertain && pending === null && loadedQuery === currentQuery);
   const busy = $derived(loading || searching || monitoring);
 
   async function load() {
@@ -42,6 +45,7 @@
     if (!result.ok) { loadError = result.error; return; }
     if (result.data.media_type !== scope || result.data.kind !== list) { loadError = 'Unexpected Wanted response for this list.'; return; }
     page = result.data;
+    loadedQuery = query;
     selection = retainVisible(selection, result.data.items.map((item) => item.target.id));
   }
   async function loadProviders(offset = 0) {

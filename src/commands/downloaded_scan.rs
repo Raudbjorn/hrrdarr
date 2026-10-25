@@ -47,6 +47,9 @@ const INVENTORY_MAX_BYTES: i64 = 64 * 1024 * 1024;
 /// One blocking inventory capture per source path: a stalled mount blocks only scans of that
 /// same path, and a retry of that path queues behind the running capture instead of starting
 /// another walk over the same tree.
+/// A bounded number of blocking inventory captures at a time, process-wide: one stalled source
+/// holds one capture and unrelated scans keep the rest.
+static CAPTURE_BUDGET: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 fn capture_gate(path: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     static GATES: std::sync::OnceLock<
         std::sync::Mutex<
@@ -55,6 +58,9 @@ fn capture_gate(path: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     > = std::sync::OnceLock::new();
     let gates = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut gates = gates.lock().expect("capture gates are not poisoned");
+    // A finished capture leaves an expired gate behind; it is dropped here so the map only
+    // holds the paths of live captures.
+    gates.retain(|_, weak| weak.strong_count() > 0);
     if let Some(gate) = gates.get(path).and_then(std::sync::Weak::upgrade) {
         return gate;
     }
@@ -1715,8 +1721,13 @@ async fn discover(
         .acquire_owned()
         .await
         .map_err(|_| Failure::Retry("scan_source_io"))?;
+    let budget = CAPTURE_BUDGET
+        .acquire_owned()
+        .await
+        .map_err(|_| Failure::Retry("scan_source_io"))?;
     let captured = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _budget = budget;
         Inventory::capture(&path)
     })
     .await
