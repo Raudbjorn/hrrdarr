@@ -981,6 +981,21 @@ async fn health_import_and_manual_events_flow_end_to_end() {
             "POST",
             "/api/v1/notifications",
             hook(
+                "Movies health",
+                "movies-health",
+                json!({}),
+                json!({"on_health_issue":true,"include_health_warnings":true})
+            )
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        h.call(
+            "POST",
+            "/api/v1/notifications",
+            hook(
                 "Upgrades",
                 "upgrades",
                 json!({}),
@@ -1036,6 +1051,20 @@ async fn health_import_and_manual_events_flow_end_to_end() {
     );
     assert_eq!(hooks("errors")[0]["level"], "Error");
     assert_eq!(hooks("errors")[0]["message"], "Indexers unavailable");
+
+    // A system health event matches only the movie scope of this notification. Delivery must
+    // use the Radarr contract even though a TV scope exists with the trigger disabled.
+    h.clear();
+    h.sql("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES('00000000-0000-4000-8000-000000000005','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000105',1,'system','system_check','issue',0,101,3,'r','System unavailable','https://wiki.invalid/system','SystemCheck');").await;
+    h.pump().await;
+    let movies_health = h
+        .seen()
+        .iter()
+        .filter(|c| c.target == "/movies-health")
+        .map(|c| c.json())
+        .collect::<Vec<_>>();
+    assert_eq!(movies_health.len(), 1);
+    assert_eq!(movies_health[0]["mediaType"], "movies");
 
     // A movie import receipt produces a Download event; a plain import does not reach OnUpgrade-only targets
     // beyond the ones that opted in.

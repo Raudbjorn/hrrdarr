@@ -377,13 +377,16 @@ impl Dispatcher {
         };
         let domain = match event.scope {
             Scope::Domain(d) => d,
-            Scope::System => {
-                if rt.notification.tv.is_some() {
-                    MediaDomain::Tv
-                } else {
-                    MediaDomain::Movies
-                }
-            }
+            Scope::System => matched_scope_domain(c, &event, notification)
+                .await
+                .map_err(|_| storage())?
+                .unwrap_or_else(|| {
+                    if rt.notification.tv.is_some() {
+                        MediaDomain::Tv
+                    } else {
+                        MediaDomain::Movies
+                    }
+                }),
         };
         let message = events::build(c, &event, domain)
             .await
@@ -417,10 +420,8 @@ async fn catalog_plex(
     Ok(n > 0)
 }
 
-/// Notification ids that should receive this event: enabled, scoped to the event domain, trigger
-/// flag set, tag scope satisfied. One id per notification even when several scopes match.
-pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, libsql::Error> {
-    let flag = match event.kind {
+fn trigger_flag(kind: EventKind) -> Option<&'static str> {
+    Some(match kind {
         EventKind::Grab => "on_grab",
         EventKind::Import => "on_import",
         EventKind::Rename => "on_rename",
@@ -431,81 +432,185 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
         EventKind::HealthRestored => "on_health_restored",
         EventKind::ApplicationUpdate => "on_application_update",
         EventKind::ManualInteraction => "on_manual_interaction",
-        EventKind::Test => return Ok(Vec::new()),
+        EventKind::Test => return None,
+    })
+}
+
+#[derive(Debug)]
+struct ScopeCandidate {
+    id: String,
+    media: String,
+    on_upgrade: bool,
+    on_file_delete_for_upgrade: bool,
+    include_health_warnings: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EventFilters {
+    upgrade: bool,
+    delete_for_upgrade: bool,
+    warning_only: bool,
+}
+
+impl EventFilters {
+    fn from(event: &EventRow) -> Self {
+        Self {
+            upgrade: event.payload.get("is_upgrade").and_then(Value::as_i64) == Some(1),
+            delete_for_upgrade: event.payload.get("reason").and_then(Value::as_str)
+                == Some("Upgrade"),
+            warning_only: event.kind == EventKind::HealthIssue
+                && event
+                    .payload
+                    .get("severity")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(3)
+                    < 3,
+        }
+    }
+}
+
+async fn live_tags(
+    c: &Connection,
+    event: &EventRow,
+) -> Result<Option<BTreeSet<i64>>, libsql::Error> {
+    match (event.tag_ids.as_ref(), event.scope, event.subject_id) {
+        (Some(tags), _, _) => Ok(Some(tags.iter().copied().collect())),
+        (None, Scope::Domain(domain), Some(subject)) => {
+            let sql = match domain {
+                MediaDomain::Tv => "SELECT tag_id FROM series_tags WHERE series_id=?",
+                MediaDomain::Movies => "SELECT tag_id FROM movie_tags WHERE movie_id=?",
+            };
+            let mut set = BTreeSet::new();
+            let mut rows = c.query(sql, [subject]).await?;
+            while let Some(r) = rows.next().await? {
+                set.insert(r.get::<i64>(0)?);
+            }
+            Ok(Some(set))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn scope_candidates(
+    c: &Connection,
+    event: &EventRow,
+    notification: Option<&str>,
+) -> Result<Vec<ScopeCandidate>, libsql::Error> {
+    let Some(flag) = trigger_flag(event.kind) else {
+        return Ok(Vec::new());
     };
-    let upgrade = event.payload.get("is_upgrade").and_then(Value::as_i64) == Some(1);
-    let delete_for_upgrade = event.payload.get("reason").and_then(Value::as_str) == Some("Upgrade");
-    let warning_only = event.kind == EventKind::HealthIssue
-        && event
-            .payload
-            .get("severity")
-            .and_then(Value::as_i64)
-            .unwrap_or(3)
-            < 3;
-    // `flag` comes from the closed list above.
+    let filter = if notification.is_some() {
+        " AND n.id=?2"
+    } else {
+        ""
+    };
     let sql = format!(
-        "SELECT n.id,s.media_type,s.on_upgrade,s.on_file_delete_for_upgrade,s.include_health_warnings FROM notifications n JOIN notification_scopes s ON s.notification_id=n.id WHERE n.enabled=1 AND (?1='system' OR s.media_type=?1) AND s.{flag}=1 ORDER BY n.id,s.media_type DESC"
+        "SELECT n.id,s.media_type,s.on_upgrade,s.on_file_delete_for_upgrade,s.include_health_warnings \
+         FROM notifications n JOIN notification_scopes s ON s.notification_id=n.id \
+         WHERE n.enabled=1 AND (?1='system' OR s.media_type=?1) AND s.{flag}=1{filter} \
+         ORDER BY n.id,s.media_type DESC"
     );
-    let mut rows = c.query(&sql, params![event.scope.as_str()]).await?;
+    let mut rows = if let Some(notification) = notification {
+        c.query(&sql, params![event.scope.as_str(), notification.to_owned()])
+            .await?
+    } else {
+        c.query(&sql, [event.scope.as_str()]).await?
+    };
     let mut candidates = Vec::new();
     while let Some(r) = rows.next().await? {
-        candidates.push((
-            r.get::<String>(0)?,
-            r.get::<String>(1)?,
-            r.get::<i64>(2)? == 1,
-            r.get::<i64>(3)? == 1,
-            r.get::<i64>(4)? == 1,
-        ));
+        candidates.push(ScopeCandidate {
+            id: r.get(0)?,
+            media: r.get(1)?,
+            on_upgrade: r.get::<i64>(2)? == 1,
+            on_file_delete_for_upgrade: r.get::<i64>(3)? == 1,
+            include_health_warnings: r.get::<i64>(4)? == 1,
+        });
     }
-    let live_tags: Option<BTreeSet<i64>> =
-        match (event.tag_ids.as_ref(), event.scope, event.subject_id) {
-            (Some(t), _, _) => Some(t.iter().copied().collect()),
-            (None, Scope::Domain(domain), Some(subject)) => {
-                let sql = match domain {
-                    MediaDomain::Tv => "SELECT tag_id FROM series_tags WHERE series_id=?",
-                    MediaDomain::Movies => "SELECT tag_id FROM movie_tags WHERE movie_id=?",
-                };
-                let mut set = BTreeSet::new();
-                let mut rows = c.query(sql, [subject]).await?;
-                while let Some(r) = rows.next().await? {
-                    set.insert(r.get::<i64>(0)?);
-                }
-                Some(set)
-            }
-            _ => None,
-        };
-    let mut out: Vec<String> = Vec::new();
-    for (id, media, on_upgrade, on_delete_upgrade, warnings) in candidates {
-        if out.contains(&id) {
-            continue;
+    Ok(candidates)
+}
+
+async fn accepts_scope(
+    c: &Connection,
+    event: &EventRow,
+    filters: EventFilters,
+    live_tags: &Option<BTreeSet<i64>>,
+    candidate: &ScopeCandidate,
+) -> Result<bool, libsql::Error> {
+    if filters.upgrade && !candidate.on_upgrade {
+        return Ok(false);
+    }
+    if filters.delete_for_upgrade
+        && event.kind == EventKind::FileDelete
+        && !candidate.on_file_delete_for_upgrade
+    {
+        return Ok(false);
+    }
+    if filters.warning_only && !candidate.include_health_warnings {
+        return Ok(false);
+    }
+    if let (Some(tags), Some(_)) = (live_tags, event.subject_id) {
+        let mut rows = c
+            .query(
+                "SELECT tag_id FROM notification_tags WHERE notification_id=? AND media_type=?",
+                params![candidate.id.clone(), candidate.media.clone()],
+            )
+            .await?;
+        let mut wanted = BTreeSet::new();
+        while let Some(r) = rows.next().await? {
+            wanted.insert(r.get::<i64>(0)?);
         }
-        if upgrade && !on_upgrade {
-            continue;
+        if !wanted.is_empty() && wanted.is_disjoint(tags) {
+            return Ok(false);
         }
-        if delete_for_upgrade && event.kind == EventKind::FileDelete && !on_delete_upgrade {
-            continue;
+    }
+    Ok(true)
+}
+
+async fn matching_scopes(
+    c: &Connection,
+    event: &EventRow,
+    notification: Option<&str>,
+) -> Result<Vec<(String, String)>, libsql::Error> {
+    let filters = EventFilters::from(event);
+    let tags = live_tags(c, event).await?;
+    let mut matches = Vec::new();
+    for candidate in scope_candidates(c, event, notification).await? {
+        if accepts_scope(c, event, filters, &tags, &candidate).await? {
+            matches.push((candidate.id, candidate.media));
         }
-        if warning_only && !warnings {
-            continue;
+    }
+    Ok(matches)
+}
+
+/// Notification ids that should receive this event: enabled, scoped to the event domain, trigger
+/// flag set, tag scope satisfied. One id per notification even when several scopes match.
+pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, libsql::Error> {
+    let mut out = Vec::new();
+    for (id, _) in matching_scopes(c, event, None).await? {
+        if !out.contains(&id) {
+            out.push(id);
         }
-        if let (Some(tags), Some(_)) = (&live_tags, event.subject_id) {
-            let mut rows = c
-                .query(
-                    "SELECT tag_id FROM notification_tags WHERE notification_id=? AND media_type=?",
-                    params![id.clone(), media.clone()],
-                )
-                .await?;
-            let mut wanted = BTreeSet::new();
-            while let Some(r) = rows.next().await? {
-                wanted.insert(r.get::<i64>(0)?);
-            }
-            if !wanted.is_empty() && wanted.is_disjoint(tags) {
-                continue;
-            }
-        }
-        out.push(id);
     }
     Ok(out)
+}
+
+async fn matched_scope_domain(
+    c: &Connection,
+    event: &EventRow,
+    notification: &str,
+) -> Result<Option<MediaDomain>, libsql::Error> {
+    let Some((_, media)) = matching_scopes(c, event, Some(notification))
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    Ok(match media.as_str() {
+        "tv" => Some(MediaDomain::Tv),
+        "movies" => Some(MediaDomain::Movies),
+        _ => None,
+    })
 }
 
 pub struct Handle {

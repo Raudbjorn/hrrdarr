@@ -429,12 +429,56 @@ async fn queue_and_history_map_status_per_domain_category() {
             ),
             done(
                 14,
-                "Show.MoveWarn",
+                "Show.MoveFail",
                 "tv",
                 "SUCCESS",
                 "SUCCESS",
                 "FAILURE",
                 "NONE",
+                "NONE",
+                "NONE",
+            ),
+            done(
+                22,
+                "Show.ParManual",
+                "tv",
+                "MANUAL",
+                "SUCCESS",
+                "SUCCESS",
+                "NONE",
+                "NONE",
+                "NONE",
+            ),
+            done(
+                23,
+                "Show.ParRepairable",
+                "tv",
+                "REPAIR_POSSIBLE",
+                "SUCCESS",
+                "SUCCESS",
+                "NONE",
+                "NONE",
+                "NONE",
+            ),
+            done(
+                24,
+                "Show.UnpackPassword",
+                "tv",
+                "SUCCESS",
+                "PASSWORD",
+                "SUCCESS",
+                "NONE",
+                "NONE",
+                "NONE",
+            ),
+            done(
+                25,
+                "Show.ScriptFail",
+                "tv",
+                "SUCCESS",
+                "SUCCESS",
+                "SUCCESS",
+                "FAILURE",
                 "NONE",
                 "NONE",
             ),
@@ -471,6 +515,35 @@ async fn queue_and_history_map_status_per_domain_category() {
                 "MANUAL",
                 "BAD",
             ),
+            done(
+                26,
+                "Show.BadMarked",
+                "tv",
+                "SUCCESS",
+                "SUCCESS",
+                "SUCCESS",
+                "NONE",
+                "NONE",
+                "BAD",
+            ),
+            json!({
+                "NZBID":21,
+                "Name":"Show.FetchFailed",
+                "Category":"tv",
+                "Kind":"URL",
+                "ParStatus":"NONE",
+                "UnpackStatus":"NONE",
+                "MoveStatus":"NONE",
+                "ScriptStatus":"NONE",
+                "DeleteStatus":"NONE",
+                "MarkStatus":"NONE",
+                "UrlStatus":"FAILURE",
+                "Status":"FAILURE/FETCH",
+                "FileSizeLo":0,
+                "FileSizeHi":0,
+                "DestDir":"",
+                "FinalDir":""
+            }),
             ok_done(18, "Film.Done", "movies"),
             ok_done(19, "Other.Done", "other"),
             json!({"NZBID":20,"Name":"dup","Category":"tv","Kind":"DUP","FileSizeLo":1,"FileSizeHi":0}),
@@ -494,8 +567,8 @@ async fn queue_and_history_map_status_per_domain_category() {
     };
     assert_eq!(
         tv.len(),
-        13,
-        "tv queue 7 + history 6 (user-deleted and DUP records omitted)"
+        19,
+        "tv queue 7 + history 12 (user-deleted and DUP records omitted)"
     );
     assert!(
         tv.iter()
@@ -521,12 +594,12 @@ async fn queue_and_history_map_status_per_domain_category() {
         Some(DownloadDiagnostic::Repairing)
     );
     assert_eq!(by("Show.S01E06").status, DownloadStatus::Unknown);
-    assert_eq!(
-        by("(fetching NZB)").status,
-        DownloadStatus::Downloading,
-        "locators are never projected"
-    );
+    assert_eq!(by("(fetching NZB)").status, DownloadStatus::Downloading);
+    assert_eq!(by("(fetching NZB)").eta_seconds, Some(6));
     assert!(!serde_json::to_string(&tv).unwrap().contains("PRIVATE"));
+    let failed_fetch = by("Show.FetchFailed");
+    assert_eq!(failed_fetch.status, DownloadStatus::Failed);
+    assert!(!failed_fetch.completed);
     let completed = by("Show.Done");
     assert!(
         completed.completed
@@ -544,10 +617,22 @@ async fn queue_and_history_map_status_per_domain_category() {
             Some(&DownloadDiagnostic::DiskFull)
         )
     );
-    assert_eq!(by("Show.MoveWarn").status, DownloadStatus::Warning);
-    assert!(!by("Show.MoveWarn").completed);
+    assert_eq!(by("Show.MoveFail").status, DownloadStatus::Failed);
+    assert!(!by("Show.MoveFail").completed);
+    // NZBGet grades these as warnings (WARNING/DAMAGED, WARNING/REPAIRABLE,
+    // WARNING/PASSWORD, WARNING/SCRIPT) even though the detail fields are not successes.
+    for name in [
+        "Show.ParManual",
+        "Show.ParRepairable",
+        "Show.UnpackPassword",
+        "Show.ScriptFail",
+    ] {
+        assert_eq!(by(name).status, DownloadStatus::Warning, "{name}");
+        assert!(!by(name).completed, "{name}");
+    }
     assert_eq!(by("Show.Health").status, DownloadStatus::Failed);
     assert_eq!(by("Show.MarkedBad").status, DownloadStatus::Failed);
+    assert_eq!(by("Show.BadMarked").status, DownloadStatus::Failed);
     assert!(!tv.iter().any(|i| i.name == "Show.UserDeleted"));
     // Global pause pauses every active job; the sizes use the Lo/Hi halves.
     f.0.lock().unwrap().download_paused = true;

@@ -119,7 +119,10 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
                 format!("{prefix}/{name}")
             };
             let kind = entry.file_type()?;
-            if kind.is_dir() && depth + 1 < MAX_OUTPUT_DEPTH {
+            if kind.is_dir() {
+                if depth + 1 >= MAX_OUTPUT_DEPTH {
+                    return Err(std::io::Error::other("output depth limit"));
+                }
                 pending.push((entry.path(), relative, depth + 1));
             } else if kind.is_file() {
                 if files.len() == MAX_OUTPUT_FILES {
@@ -131,4 +134,25 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
     }
     files.sort();
     Ok(LocalListing::Directory(files))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn depth_limit_fails_closed() {
+        let root =
+            std::env::temp_dir().join(format!("hrrdarr-output-depth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut current = root.clone();
+        for depth in 0..MAX_OUTPUT_DEPTH {
+            current.push(format!("level-{depth}"));
+            std::fs::create_dir(&current).unwrap();
+        }
+
+        let result = list_local_output(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_err());
+    }
 }
