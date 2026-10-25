@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -135,6 +135,8 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
             for row in &mut expected {
                 row.extend(std::iter::repeat_n(libsql::Value::Integer(1), 3));
                 // Reasoning: 0049 then appends the NULL download_client_id preference column.
+                row.push(libsql::Value::Null);
+                // Reasoning: 0050 appends the nullable feed-only minimum_seeders column (NULL for old rows).
                 row.push(libsql::Value::Null);
             }
         }
@@ -184,7 +186,14 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
         let actual = actual
             .replace("p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)", "p.implementation='qbittorrent'")
             .replace("p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')", "p.implementation='qbittorrent'");
+        // 0068 widens only the RSS admission trigger's indexer list to torrentrss; reverse that one exact edit.
+        let actual = actual.replace(
+            "p.implementation IN ('torznab','newznab','torrentrss')",
+            "p.implementation IN ('torznab','newznab')",
+        );
         // 0054 adds exactly one scan-parent capacity contribution to each old guard.
+        // Reasoning: 0067 appends the rename command term to every pool guard; strip it to compare the 41-era predicate.
+        let actual = actual.replace("+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))", "");
         assert_eq!(actual.matches(scan_added).count(), 1);
         assert_eq!(actual.matches(recycle_added).count(), 1);
         assert_eq!(
@@ -226,7 +235,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     Ok(())
 }
 #[tokio::test]
@@ -658,7 +667,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -743,7 +752,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).

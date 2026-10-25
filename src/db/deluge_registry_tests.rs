@@ -44,14 +44,15 @@ async fn deluge_registry_scope_shape_options_and_labels_are_enforced() -> Result
             (row.get::<String>(0)?, row.get::<String>(1)?),
             ("download_client".into(), "torrent".into())
         );
-        // The rest of the family (rTorrent, uTorrent, Aria2 and Flood are registered by 0069 to 0072) is anticipated by the triggers but not registered yet.
+        // Reasoning: the runner continues through 0069 to 0074, which register the rest of the family
+        // (rTorrent, uTorrent, Aria2, Flood and Download Station), so a fresh database holds all of them.
         let mut rows = c
             .query(
-                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('downloadstation')",
+                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('rtorrent','utorrent','aria2','flood','downloadstation')",
                 (),
             )
             .await?;
-        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 5);
         let id = client(&c).await?;
         // Queue placement is last (0) or first (1); add-paused is initial_state.
         for priority in [0, 1] {

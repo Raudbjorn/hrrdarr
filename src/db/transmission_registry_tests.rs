@@ -123,26 +123,34 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
-    for (sql, expected) in TABLES[..5].iter().zip(&before) {
-        assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
+    for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
+        let mut expected = expected.clone();
+        if index == 1 {
+            // 0068 appends the nullable minimum_seeders column to provider_scopes.
+            for row in &mut expected {
+                row.push(libsql::Value::Null);
+            }
+        }
+        assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     // Reasoning: the runner continues through the later nzbget migration, so the registry holds
     // all appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
-    for (name, protocol) in [
-        ("aria2", "torrent"),
-        ("deluge", "torrent"),
-        ("downloadstation", "torrent"),
-        ("flood", "torrent"),
-        ("nzbget", "usenet"),
-        ("rtorrent", "torrent"),
-        ("transmission", "torrent"),
-        ("utorrent", "torrent"),
+    for (name, kind, protocol) in [
+        ("aria2", "download_client", "torrent"),
+        ("deluge", "download_client", "torrent"),
+        ("downloadstation", "download_client", "torrent"),
+        ("flood", "download_client", "torrent"),
+        ("nzbget", "download_client", "usenet"),
+        ("rtorrent", "download_client", "torrent"),
+        ("torrentrss", "indexer", "torrent"),
+        ("transmission", "download_client", "torrent"),
+        ("utorrent", "download_client", "torrent"),
     ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),
-            libsql::Value::Text("download_client".into()),
+            libsql::Value::Text(kind.into()),
             libsql::Value::Text(protocol.into()),
         ]);
     }
@@ -277,6 +285,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     Ok(())
 }

@@ -145,6 +145,73 @@ pub struct MovieDetails {
     // None is absent metadata (existing credits are preserved); Some([]) explicitly clears them.
     #[serde(default)]
     pub credits: Option<Vec<CreditDetails>>,
+    // Absent preserves stored membership; Clear (wire null) removes it; Present sets it.
+    #[serde(default)]
+    pub collection: CollectionAssociation,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct CollectionRef {
+    pub tmdb_id: i64,
+    pub title: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum CollectionAssociation {
+    #[default]
+    Absent,
+    Clear,
+    Present(CollectionRef),
+}
+/// Complete collection graph from the movie metadata service; identity facts only.
+#[derive(Clone, Debug)]
+pub struct CollectionDetails {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub overview: Option<String>,
+    pub parts: Vec<CollectionPart>,
+}
+#[derive(Clone, Debug)]
+pub struct CollectionPart {
+    pub tmdb_id: i64,
+    pub title: String,
+    pub year: Option<i64>,
+    pub imdb_id: Option<String>,
+}
+pub const MAX_COLLECTION_PARTS: usize = 1000;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCollectionRef {
+    tmdb_id: i64,
+    name: String,
+}
+#[derive(Default)]
+enum WireAssociation {
+    #[default]
+    Absent,
+    Clear,
+    Present(WireCollectionRef),
+}
+impl<'de> Deserialize<'de> for WireAssociation {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Option::<WireCollectionRef>::deserialize(d).map(|v| v.map_or(Self::Clear, Self::Present))
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCollection {
+    tmdb_id: i64,
+    name: String,
+    overview: Option<String>,
+    // No default: a missing graph must never be mistaken for an empty one.
+    parts: Vec<WirePart>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WirePart {
+    tmdb_id: i64,
+    title: String,
+    year: Option<i64>,
+    imdb_id: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
@@ -266,6 +333,47 @@ impl MetadataClient {
             return Err(MetadataError::InvalidResponse);
         }
         wire.details()
+    }
+    /// One bounded request for a complete collection graph; 404 is `NotFound`.
+    pub async fn collection(&self, id: i64) -> Result<CollectionDetails> {
+        input_id(id)?;
+        let wire: WireCollection = self
+            .fetch(false, &format!("movie/collection/{id}"), &[])
+            .await?;
+        if wire.tmdb_id != id || wire.parts.len() > MAX_COLLECTION_PARTS {
+            return Err(MetadataError::InvalidResponse);
+        }
+        text(&wire.name, 512, false)?;
+        let mut seen = BTreeSet::new();
+        let mut parts = Vec::with_capacity(wire.parts.len());
+        for part in wire.parts {
+            identity(part.tmdb_id)?;
+            text(&part.title, 1024, false)?;
+            let year = part.year.filter(|y| *y != 0);
+            validate_year(year)?;
+            if !seen.insert(part.tmdb_id) {
+                return Err(MetadataError::InvalidResponse);
+            }
+            parts.push(CollectionPart {
+                tmdb_id: part.tmdb_id,
+                title: part.title,
+                year,
+                imdb_id: imdb(part.imdb_id)?,
+            });
+        }
+        let overview = match wire.overview {
+            Some(o) if !o.is_empty() => {
+                text(&o, 65536, true)?;
+                Some(o)
+            }
+            _ => None,
+        };
+        Ok(CollectionDetails {
+            tmdb_id: id,
+            title: wire.name,
+            overview,
+            parts,
+        })
     }
     pub async fn lookup_tv(&self, term: &str) -> Result<Vec<LookupResult>> {
         let term = query(term)?;
@@ -669,6 +777,8 @@ struct Movie {
     original_language: Option<String>,
     alternative_titles: Option<Vec<AlternativeTitle>>,
     credits: Option<WireCredits>,
+    #[serde(default)]
+    collection: WireAssociation,
 }
 // A supplied set must contain both groups so partial payloads cannot silently erase credits.
 #[derive(Deserialize)]
@@ -831,6 +941,18 @@ impl Movie {
             original_language: original_language(self.original_language)?,
             alternative_titles,
             credits: credits.map(validate_credits).transpose()?,
+            collection: match self.collection {
+                WireAssociation::Absent => CollectionAssociation::Absent,
+                WireAssociation::Clear => CollectionAssociation::Clear,
+                WireAssociation::Present(v) => {
+                    identity(v.tmdb_id)?;
+                    text(&v.name, 512, false)?;
+                    CollectionAssociation::Present(CollectionRef {
+                        tmdb_id: v.tmdb_id,
+                        title: v.name,
+                    })
+                }
+            },
         })
     }
 }

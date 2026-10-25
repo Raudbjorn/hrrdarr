@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     // Reasoning: 0051 adds explicit legacy provenance to every preserved command.
     for row in &mut before[0] {
         row.extend([

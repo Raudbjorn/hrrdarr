@@ -73,7 +73,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version_of(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+            assert_eq!(version_of(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
             assert_eq!(
                 scalar(&c, "SELECT tag_version FROM snapshot_imports").await?,
                 0
@@ -141,7 +141,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             drop(c);
             drop(db);
             let reopened = Database::open_local(&path).await?;
-            assert_eq!(version_of(&reopened.connect().await?).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+            assert_eq!(version_of(&reopened.connect().await?).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
         }
     }
     Ok(())

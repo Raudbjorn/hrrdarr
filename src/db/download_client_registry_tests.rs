@@ -128,10 +128,17 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(69)]] // Reasoning: the runner applies through latest 0072 (0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge registry, 0064 NZBGet registry, 0063 notifications; recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
+        vec![vec![libsql::Value::Integer(75)]] // Reasoning: the runner applies through latest 0075 (0075 provider scope union, 0074 downloadstation, 0073 flood, 0072 aria2, 0071 utorrent, 0070 rtorrent, 0069 deluge, 0068 torrent RSS indexer, 0064 NZBGet registry, 0063 notifications; recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
     );
-    for (sql, expected) in TABLES.iter().zip(&before) {
-        assert_eq!(&rows(&c, sql).await?, expected, "{sql}");
+    for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
+        let mut expected = expected.clone();
+        if index == 1 {
+            // 0068 appends the nullable minimum_seeders column to provider_scopes.
+            for row in &mut expected {
+                row.push(libsql::Value::Null);
+            }
+        }
+        assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     assert!(rows(&c, "PRAGMA foreign_key_check").await?.is_empty());
     assert_eq!(
@@ -140,9 +147,9 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     );
     assert_eq!(
         rows(&c, "SELECT implementation,kind,protocol FROM provider_implementations ORDER BY implementation").await?,
-        // Reasoning: the runner continues through 0062, which appends the transmission row; the
+        // Reasoning: the runner continues through 0062 (transmission) and 0068 (torrentrss), which append their rows; the
         // four 0059 rows are unchanged.
-        [("aria2", "download_client", "torrent"), ("deluge", "download_client", "torrent"), ("flood", "download_client", "torrent"), ("newznab", "indexer", "usenet"), ("nzbget", "download_client", "usenet"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent"), ("utorrent", "download_client", "torrent")]
+        [("aria2", "download_client", "torrent"), ("deluge", "download_client", "torrent"), ("downloadstation", "download_client", "torrent"), ("flood", "download_client", "torrent"), ("newznab", "indexer", "usenet"), ("nzbget", "download_client", "usenet"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torrentrss", "indexer", "torrent"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent"), ("utorrent", "download_client", "torrent")]
             .map(|(a, b, p)| vec![libsql::Value::Text(a.into()), libsql::Value::Text(b.into()), libsql::Value::Text(p.into())])
             .to_vec()
     );

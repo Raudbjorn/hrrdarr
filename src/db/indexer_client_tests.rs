@@ -110,11 +110,13 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         let mut expected = before[1].clone();
         // Only the appended preference column differs: all old values remain exact and NULL.
+        // Reasoning: 0050 appends a second nullable column (minimum_seeders); both stay NULL for old rows.
         for row in &mut expected {
+            row.push(libsql::Value::Null);
             row.push(libsql::Value::Null);
         }
         assert_eq!(rows(&c, "provider_scopes").await?, expected);
@@ -124,7 +126,7 @@ async fn indexer_client_upgrade48_rollback_defaults_and_reopen_preserve_history(
         assert_eq!(rows(&c, "health_lifecycle").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..48], before[4].as_slice());
-        assert_eq!(history.len(), 70); // Reasoning: latest is 0073 (0073 downloadstation registry, 0072 flood registry, 0071 aria2 registry, 0070 utorrent registry, 0069 rtorrent registry, 0068 deluge label-family registry, 0063 notifications, 0064 NZBGet registry, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(history.len(), 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
         assert_eq!(count(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='IndexerDownloadClientCheck'").await?,2);
         integrity(&c).await?;
     }

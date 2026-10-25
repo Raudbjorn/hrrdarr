@@ -38,7 +38,7 @@ pub(super) async fn evaluate(
         MediaDomain::Movies => "movies",
     };
     let mut providers = Vec::new();
-    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation NOT IN ('torznab','newznab') ORDER BY p.id LIMIT 257", [media]).await.map_err(|_| "storage_error")?;
+    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation='qbittorrent' ORDER BY p.id LIMIT 257", [media]).await.map_err(|_| "storage_error")?;
     while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
         if providers.len() == 256 {
             return Err("check_failed");
