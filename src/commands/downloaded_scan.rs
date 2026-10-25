@@ -44,6 +44,9 @@ const DECISION_MAX_BYTES: usize = 16_000;
 const REASON_MAX_BYTES: usize = 128;
 const REASONS_MAX: usize = 64;
 const INVENTORY_MAX_BYTES: i64 = 64 * 1024 * 1024;
+/// One blocking inventory capture at a time, process-wide: a capture that cannot finish holds
+/// one blocking worker instead of one per retry.
+static CAPTURES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const HISTORY_MAX_ROWS: usize = 20_001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -860,21 +863,36 @@ async fn create(
             return Ok((StatusCode::OK, bounded(render(&tx, existing).await?)?));
         }
         if let Some(provider) = &request.provider {
-            // A tracked request needs a known provider scoped to this domain, even when the
-            // remote item turns out to be unknown; the receipt itself is resolved at discovery.
-            let known = tx
+            // A tracked request needs a known download client scoped to this domain, even when
+            // the remote item turns out to be unknown; the receipt itself is resolved at
+            // discovery. An indexer owns no receipt, so admitting one would silently degrade the
+            // request to an untracked move.
+            let row = tx
                 .query(
-                    "SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=? WHERE p.id=?",
+                    "SELECT EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?), EXISTS(SELECT 1 FROM provider_implementations i WHERE i.implementation=p.implementation AND i.kind='download_client') FROM providers p WHERE p.id=?",
                     params![domain(media), provider.clone()],
                 )
                 .await?
                 .next()
-                .await?
-                .is_some();
-            if !known {
+                .await?;
+            let Some(row) = row else {
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "downloaded_scan_provider_unknown",
+                ));
+            };
+            let scoped: i64 = row.get(0)?;
+            let client: i64 = row.get(1)?;
+            if scoped != 1 {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "downloaded_scan_provider_unknown",
+                ));
+            }
+            if client != 1 {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "downloaded_scan_provider_not_client",
                 ));
             }
         }
@@ -1675,9 +1693,19 @@ async fn discover(
     let tracking = receipt::resolve(&c, claim).await?;
     let carried = receipt::carried_members(&c, claim).await?;
     let path = claim.path.clone();
-    let captured = tokio::task::spawn_blocking(move || Inventory::capture(&path))
+    // The capture keeps its permit until the blocking walk actually ends, so a timed-out
+    // attempt cannot leave a second walk behind it: a stalled mount keeps one blocking worker
+    // instead of one per retry.
+    let permit = CAPTURES
+        .acquire()
         .await
         .map_err(|_| Failure::Retry("scan_source_io"))?;
+    let captured = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        Inventory::capture(&path)
+    })
+    .await
+    .map_err(|_| Failure::Retry("scan_source_io"))?;
     let inventory = match captured {
         Ok(inventory) => Arc::new(inventory),
         // A valid path that does not exist is a recorded, unsuccessful outcome, not an error.

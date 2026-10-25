@@ -8,7 +8,7 @@ independently; equal numeric file IDs in the two domains never select each other
 ## Settings
 
 `GET`/`PUT /api/v1/{tv|movies}/recycle-bin` reads and writes
-`{media_type, revision, path, cleanup_days, next_cleanup_at}`. A write must send the current
+`{media_type, revision, path, cleanup_days}`. A write must send the current
 `revision` (compare-and-swap; a stale revision returns 409 `recycle_bin_conflict`) and an explicit
 `path` (`null` clears the bin). `cleanup_days` is 0–36500; 0 disables automatic cleanup.
 

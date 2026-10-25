@@ -45,7 +45,9 @@ impl Harness {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = commands::router(db.clone()).merge(hrrdarr::import::router(db.clone()));
+        let app = commands::router(db.clone())
+            .merge(hrrdarr::import::router(db.clone()))
+            .merge(hrrdarr::media_files::router(db.clone()));
         let server = Server(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
         }));
@@ -1260,6 +1262,23 @@ async fn failed_replacement_keeps_every_original_and_explicit_resume_is_generati
         .await,
         2
     );
+    // The quarantined originals are no longer active files: the file list and its total
+    // report the replacement only, so the library counts one file per episode.
+    let (code, listed) = h
+        .call("GET", "/api/v1/tv/files?series_id=1", Value::Null)
+        .await;
+    assert_eq!(code, 200, "{listed}");
+    let active: Vec<i64> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["id"].as_i64().unwrap())
+        .collect();
+    assert!(
+        !active.contains(&1) && !active.contains(&2),
+        "retired originals stay listed as active files: {active:?}"
+    );
+    assert_eq!(listed["total"], active.len() as i64);
     assert_eq!(
         h.count(
             "SELECT count(*) FROM episodes e JOIN episode_files f ON f.id=e.episode_file_id WHERE e.id IN (1,2) AND f.path=?",

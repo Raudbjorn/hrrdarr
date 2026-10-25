@@ -36,7 +36,7 @@ Movie rows carry `availability`: `available` / `unavailable` from the existing b
 | Key | Values | Default |
 | --- | --- | --- |
 | `limit` | 1–100 | 50 |
-| `offset` | 0–2147483647 | 0 |
+| `offset` | 0–100000 | 0 |
 | `monitored` | `monitored`, `unmonitored`, `all` | `monitored` |
 | `sort` | TV: `air_date`, `series_title`; movies: `title`, `year`, `in_cinemas`, `digital_release`, `physical_release`; cutoff lists also `quality` | TV `air_date`, movies `title` |
 | `direction` | `asc`, `desc` | `asc` (native choice; the reference omitted direction defaults to descending) |
