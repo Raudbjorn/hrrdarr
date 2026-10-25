@@ -104,7 +104,7 @@ pub enum ProviderDefaults {
         older_priority: TorrentQueuePriority,
         add_paused: bool,
         tags: Vec<i64>,
-        // Suggested endpoint shape; the RPC path `/rpc` is appended to it.
+        /// Suggested endpoint shape; the RPC path `/rpc` is appended to it.
         endpoint_hint: String,
     },
 }
