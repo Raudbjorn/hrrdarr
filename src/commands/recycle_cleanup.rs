@@ -376,6 +376,16 @@ pub(super) async fn run(db: &Arc<Database>, command: RecycleBinCleanupCommand) -
     let settings = crate::recycle_bin::read(&c, media)
         .await
         .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code()))?;
+    // A bin shared with the other domain holds both domains' files, and this walk has no
+    // media filter. Settings saved before the retention guard can still disagree, so the run
+    // refuses to delete anything rather than expiring the other domain's files early.
+    let other = match media {
+        MediaDomain::Tv => MediaDomain::Movies,
+        MediaDomain::Movies => MediaDomain::Tv,
+    };
+    let other_settings = crate::recycle_bin::read(&c, other)
+        .await
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code()))?;
     drop(c);
     let running = "WHERE id=? AND status='running'";
     let Some(bin) = settings.path.clone() else {
@@ -384,6 +394,11 @@ pub(super) async fn run(db: &Arc<Database>, command: RecycleBinCleanupCommand) -
     };
     if settings.cleanup_days == 0 {
         return settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status='succeeded',completed_at=?,outcome='disabled',bin_path=?,cleanup_days=0 {running}"), params![now()?, bin, id.to_string()]).await;
+    }
+    if other_settings.path.as_deref() == Some(bin.as_str())
+        && other_settings.cleanup_days != settings.cleanup_days
+    {
+        return settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status='failed',completed_at=?,error_code='recycle_bin_retention_conflict',bin_path=?,cleanup_days=? {running}"), params![now()?, bin, settings.cleanup_days, id.to_string()]).await;
     }
     // Serialize with imports and explicit deletions; never walk a bin a transfer is writing.
     let guard = match crate::import::acquire_deletion_guard(db, &id.to_string()) {

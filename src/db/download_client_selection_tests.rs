@@ -27,12 +27,12 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<Vec<libsql::Value>>, Erro
     }
     Ok(result)
 }
-async fn seed51(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+async fn seed55(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let db = libsql::Builder::new_local(path).build().await?;
     let c = db.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(51).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(55).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -52,7 +52,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
 -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
-    let (raw, c) = seed51(&path).await?;
+    let (raw, c) = seed55(&path).await?;
     library(&c).await?;
     let client = super::refresh_tests::provider(&c).await?;
     for media in ["tv", "movies"] {
@@ -102,7 +102,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     }
     // Historical imported data is unrelated to the pending imports but shares their library owners.
     c.execute_batch("INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/tv/old.mkv'); UPDATE episodes SET episode_file_id=1 WHERE id=1; INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message)VALUES('prior-import','episode',1,'/prior','copy','/tv/old.mkv','preview','fixture'); INSERT INTO import_journal(operation_id,plan_json,phase)VALUES('prior-import','{}','preview'); INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256)VALUES('prior-import','episode',1,1,'/prior','/tv/old.mkv',1,printf('%064d',0)); UPDATE import_journal SET phase='complete',stage_json='{}' WHERE operation_id='prior-import';").await?;
-    c.execute("CREATE TRIGGER selection_fail_history BEFORE INSERT ON schema_migrations WHEN NEW.version=52 BEGIN SELECT RAISE(ABORT,'injected late selection migration failure'); END",()).await?;
+    c.execute("CREATE TRIGGER selection_fail_history BEFORE INSERT ON schema_migrations WHEN NEW.version=56 BEGIN SELECT RAISE(ABORT,'injected late selection migration failure'); END",()).await?;
     let tables = [
         "rss_commands",
         "rss_schedules",
@@ -173,7 +173,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {

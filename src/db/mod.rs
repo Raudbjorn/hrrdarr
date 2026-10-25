@@ -212,13 +212,34 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "indexer_client_binding",
         include_str!("../../migrations/0049_indexer_client_binding.sql"),
     ),
+    // The published origin/main prefix continues here. These four migrations are restored
+    // verbatim, so a database that already ran them keeps a valid history and upgrades instead
+    // of failing the checksum comparison; the schema work this branch adds follows them.
     (
-        "indexer_backoff",
-        include_str!("../../migrations/0050_indexer_backoff.sql"),
+        "torrent_rss_indexer",
+        include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
     ),
     (
         "download_client_backoff",
         include_str!("../../migrations/0051_download_client_backoff.sql"),
+    ),
+    (
+        "collections",
+        include_str!("../../migrations/0052_collections.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0053_provider_authority.sql"),
+    ),
+    // The published backoff migration carries no health deadline; this branch's engine reads
+    // one, so it is added here instead of inside the published migration.
+    (
+        "download_client_health_deadline",
+        include_str!("../../migrations/reconcile_download_client_health_deadline.sql"),
+    ),
+    (
+        "indexer_backoff",
+        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_selection",
@@ -288,11 +309,21 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
     ),
-    // origin/main's collections checkpoint (its 0052/0053) reconciled onto 0066: snapshot facts and
-    // ownership markers only; see docs/collections.md.
+    // The published checkpoint (its 0052/0053) stored the collection policy in its own settings
+    // table; this branch keeps it inline on movie_collections, so the checkpoint is superseded
+    // here and its policy and tags are carried across. See docs/collections.md.
+    (
+        "collections_checkpoint_supersede",
+        include_str!("../../migrations/reconcile_collections_checkpoint_supersede.sql"),
+    ),
+    // Snapshot facts and ownership markers only, reconciled onto 0066.
     (
         "collection_snapshot",
         include_str!("../../migrations/0069_collection_snapshot.sql"),
+    ),
+    (
+        "collections_checkpoint_carry",
+        include_str!("../../migrations/reconcile_collections_checkpoint_carry.sql"),
     ),
     // Deluge registry plus label-family scope triggers, file 0070.
     ("deluge", include_str!("../../migrations/0070_deluge.sql")),
@@ -315,18 +346,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "downloadstation",
         include_str!("../../migrations/0075_downloadstation.sql"),
     ),
-    // Native Wanted last-search facts, appended at position 76 after 0075 downloadstation.
+    // Native Wanted last-search facts, appended at position 82 after 0075 downloadstation.
     (
         "wanted_last_search",
         include_str!("../../migrations/0076_wanted_last_search.sql"),
     ),
-    // hc.034/hc.035 library root and read-only mount health identities, appended at position 77
+    // hc.034/hc.035 library root and read-only mount health identities, appended at position 83
     // after 0076 wanted_last_search.
     (
         "library_root_health",
         include_str!("../../migrations/0077_library_root_health.sql"),
     ),
-    // Backup command and policy (job.002), appended at position 78 after 0077 library_root_health.
+    // Backup command and policy (job.002), appended at position 84 after 0077 library_root_health.
     ("backups", include_str!("../../migrations/0078_backups.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
@@ -1051,6 +1082,9 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
+
+#[cfg(test)]
+mod published_prefix_tests;
 
 #[cfg(test)]
 mod refresh_tests;

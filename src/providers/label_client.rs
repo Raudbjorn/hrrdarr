@@ -587,10 +587,10 @@ async fn submit_inner<W: Wire>(
             // The add may have landed with its reply (or the labelling that follows it) lost.
             // An unlabelled torrent with exactly this hash right after our own attempt is ours:
             // finish labelling it so a later reconcile observes it in this domain.
-            if let Ok(Some(torrent)) = wire.get(&hash).await {
-                if torrent.label.is_empty() {
-                    let _ = wire.adopt(&hash, &configured.category, first).await;
-                }
+            if let Ok(Some(torrent)) = wire.get(&hash).await
+                && torrent.label.is_empty()
+            {
+                let _ = wire.adopt(&hash, &configured.category, first).await;
             }
             return Err(QbitError::MutationUnknown);
         }
@@ -659,7 +659,11 @@ pub(crate) async fn details_with<W: Wire>(
         let done = file.downloaded_bytes.min(file.size_bytes);
         result.push(TorrentFile {
             index: index as u32,
-            name: wire.redact(file.path),
+            // The private import path keeps the original remote name. The receipt evaluation and
+            // the source-file lookup join this name to `save_path`, so a redaction marker here
+            // would send the import at a file that does not exist. Redaction belongs to the
+            // public projections, exactly as in the qBittorrent client.
+            name: file.path,
             size_bytes: file.size_bytes,
             progress: if file.size_bytes == 0 {
                 1.0

@@ -464,10 +464,10 @@ struct Owner {
 }
 impl Owner {
     fn owns(&self, directory: &str, labels: &[String]) -> bool {
-        if let (Some(label), true) = (&self.label, self.labels_supported) {
-            if !labels.is_empty() {
-                return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
-            }
+        if let (Some(label), true) = (&self.label, self.labels_supported)
+            && !labels.is_empty()
+        {
+            return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
         }
         within(directory, &self.directory)
     }
@@ -512,13 +512,13 @@ impl Owners {
         };
         let tv = tv.as_ref().map(|s| owner(s, session)).transpose()?;
         let movies = movies.as_ref().map(|s| owner(s, session)).transpose()?;
-        if let (Some(a), Some(b)) = (&tv, &movies) {
-            if within(&a.directory, &b.directory) || within(&b.directory, &a.directory) {
-                return Err(TransmissionTestFailure {
-                    error: QbitError::ScopeConflict,
-                    problem: Some(TransmissionProblem::DomainsOverlap),
-                });
-            }
+        if let (Some(a), Some(b)) = (&tv, &movies)
+            && (within(&a.directory, &b.directory) || within(&b.directory, &a.directory))
+        {
+            return Err(TransmissionTestFailure {
+                error: QbitError::ScopeConflict,
+                problem: Some(TransmissionProblem::DomainsOverlap),
+            });
         }
         Ok(Self { tv, movies })
     }
@@ -1081,10 +1081,10 @@ async fn submit_inner(
     } else {
         return Err(QbitError::Rejected);
     };
-    if let Some(returned) = returned {
-        if torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash {
-            return Err(QbitError::MutationUnknown);
-        }
+    if let Some(returned) = returned
+        && torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash
+    {
+        return Err(QbitError::MutationUnknown);
     }
     if duplicate {
         // Someone else added it between the lookup and add: never mutate a torrent this call
@@ -1217,7 +1217,10 @@ pub async fn details(
         let wanted = optional_bool(stat, "wanted")?.ok_or(QbitError::InvalidResponse)?;
         result.push(TorrentFile {
             index: index as u32,
-            name: rpc.redact(name.to_owned()),
+            // The private import path keeps the original remote name: the receipt evaluation and
+            // the source-file lookup join it to `save_path`. Redaction belongs to the public
+            // projections, exactly as in the qBittorrent client.
+            name: name.to_owned(),
             size_bytes: length,
             progress: if length == 0 {
                 1.0

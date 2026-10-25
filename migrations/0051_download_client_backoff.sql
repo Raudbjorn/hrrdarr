@@ -8,7 +8,6 @@ CREATE TABLE download_client_status (
  initial_failure_at INTEGER CHECK(initial_failure_at IS NULL OR (typeof(initial_failure_at)='integer' AND initial_failure_at BETWEEN 0 AND 9007199254740991)),
  last_failure_at INTEGER CHECK(last_failure_at IS NULL OR (typeof(last_failure_at)='integer' AND last_failure_at BETWEEN 0 AND 9007199254740991)),
  disabled_until INTEGER CHECK(disabled_until IS NULL OR (typeof(disabled_until)='integer' AND disabled_until BETWEEN 0 AND 9007199254740991)),
- next_health_at INTEGER CHECK(next_health_at IS NULL OR (typeof(next_health_at)='integer' AND next_health_at BETWEEN 0 AND 9007199254740991 AND disabled_until IS NOT NULL AND next_health_at<=disabled_until)),
  PRIMARY KEY(provider_id,media_type),
  CHECK((initial_failure_at IS NULL AND last_failure_at IS NULL AND escalation_level=0) OR (initial_failure_at IS NOT NULL AND last_failure_at IS NOT NULL AND last_failure_at>=initial_failure_at)),
  CHECK(disabled_until IS NULL OR (escalation_level>0 AND initial_failure_at IS NOT NULL))
@@ -20,8 +19,8 @@ CREATE TRIGGER download_client_status_update BEFORE UPDATE ON download_client_st
  SELECT CASE WHEN NEW.provider_id IS NOT OLD.provider_id OR NEW.media_type IS NOT OLD.media_type THEN RAISE(ABORT,'download client status identity is immutable') END;
  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=NEW.provider_id AND p.implementation='qbittorrent' AND p.revision=NEW.config_revision AND s.media_type=NEW.media_type) THEN RAISE(ABORT,'invalid download client status owner') END;
 END;
--- Consume the persisted deadline once; retain expired failure history.
-CREATE INDEX download_client_status_health_due ON download_client_status(next_health_at) WHERE next_health_at IS NOT NULL;
+-- Expiry is consumed independently of pending work and may be rearmed after publication.
+ALTER TABLE health_checks ADD COLUMN next_expiry_at INTEGER CHECK(next_expiry_at IS NULL OR (typeof(next_expiry_at)='integer' AND next_expiry_at BETWEEN 0 AND 9007199254740991 AND scope IN ('tv','movies') AND check_key='download_client_backoff'));
 INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES
  ('tv','download_client_backoff',1,1,'DownloadClientStatusCheck'),
  ('movies','download_client_backoff',1,1,'DownloadClientStatusCheck');

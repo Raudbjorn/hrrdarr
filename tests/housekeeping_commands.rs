@@ -17,7 +17,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 const NOW: i64 = 2_000_000_000;
-const TABLES: [&str; 9] = [
+const TABLES: [&str; 10] = [
     "commands",
     "metadata_refresh_commands",
     "blocklist_clear_commands",
@@ -28,6 +28,8 @@ const TABLES: [&str; 9] = [
     "rescan_commands",
     // Reasoning: 0060 adds recycle bin cleanup history to the pruned command tables.
     "recycle_bin_cleanup_commands",
+    // Reasoning: 0067 adds rename history to the pruned command tables.
+    "rename_commands",
 ];
 const DOMAINS: [&str; 2] = ["tv", "movies"];
 
@@ -172,6 +174,9 @@ async fn seed(
         "recycle_bin_cleanup_commands" => format!(
             "INSERT INTO recycle_bin_cleanup_commands(name,media_type,origin,outcome,{common})"
         ).replace("VALUES('", &format!("VALUES('clean_up_recycle_bin','{domain}','manual',{},'", if status == "succeeded" { "'not_configured'" } else { "NULL" })),
+        "rename_commands" => format!(
+            "INSERT INTO rename_commands(name,media_type,{common})"
+        ).replace("VALUES('", &format!("VALUES('{}','{domain}',", if domain == "tv" { "rename_series" } else { "rename_movie" })),
         other => panic!("unknown table {other}"),
     };
     c.execute(&sql, ())

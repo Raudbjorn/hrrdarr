@@ -28,12 +28,12 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<Vec<libsql::Value>>, Erro
     }
     Ok(result)
 }
-async fn seed50(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+async fn seed53(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let db = libsql::Builder::new_local(path).build().await?;
     let c = db.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(50).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(53).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -48,10 +48,10 @@ async fn status(c: &Connection, p: &str, media: &str) -> Result<(), libsql::Erro
     Ok(())
 }
 #[tokio::test]
-async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), Error> {
+async fn backoff_upgrade53_rollback_reopen_preserves_authority() -> Result<(), Error> {
     let s = Scratch::new();
     let path = s.0.join("db");
-    let (raw, c) = seed50(&path).await?;
+    let (raw, c) = seed53(&path).await?;
     let p = super::refresh_tests::provider(&c).await?;
     super::refresh_tests::enqueue(&c, &p, "tv").await?;
     super::refresh_tests::enqueue(&c, &p, "movies").await?;
@@ -87,7 +87,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[50].1).await?;
+    tx.execute_batch(MIGRATIONS[53].1).await?;
     assert!(
         tx.execute(
             "INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,next_health_at)VALUES('invalid','tv',1,0,-1)",
@@ -104,16 +104,13 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: latest is migration file 0078 backups at position 78, appended after 0077 library_root_health; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
-    // 0068 appends the nullable minimum_seeders column to provider_scopes; every predecessor value stays exact.
-    let mut scopes = before[1].clone();
-    for row in &mut scopes {
-        row.push(libsql::Value::Null);
-    }
-    assert_eq!(rows(&c, queries[1]).await?, scopes);
+    // The published feed column is already present before this reconciliation migration and
+    // remains unchanged through the later registry rebuild.
+    assert_eq!(rows(&c, queries[1]).await?, before[1]);
     let mut commands = before[2].clone();
     for row in &mut commands {
         row.extend([
@@ -134,7 +131,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let backup = libsql::Builder::new_local(db.migration_backup().unwrap().join("database.db"))
         .build()
         .await?;
-    assert_eq!(version(&backup.connect()?).await?, 50);
+    assert_eq!(version(&backup.connect()?).await?, 53);
     drop(backup);
     integrity(&c).await?;
     let schema = rows(&c, queries[8]).await?;

@@ -29,7 +29,9 @@ the collection row, its policy and the movie.
 returns the active one); `GET` list/detail. The worker also schedules it every 24 hours while collections exist.
 Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 parts) outside any transaction, then
 applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
-missing members are added. A run spans worker slices through a cursor and survives restarts. Per-collection fetch
+missing members are added. A run spans worker slices through a cursor and survives restarts. A continuation re-keys
+its queue position, so a refresh spanning several slices takes its turn behind work queued earlier instead of
+preempting it. Per-collection fetch
 failures are counted; if nothing succeeded and the service was unavailable the command fails
 (`metadata_unavailable`). Migration `0066_collections.sql`; snapshot ownership in `0069_collection_snapshot.sql`.
 

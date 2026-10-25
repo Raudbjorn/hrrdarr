@@ -16,8 +16,11 @@ A path must be absolute, normalized (no `.`/`..`, repeated or trailing separator
 characters), at most 4096 bytes and not `/`. It must not equal, contain or lie inside any root
 folder, series folder or movie folder of either domain. Both directions are enforced: the settings
 write checks Rust and SQL, and root-folder/series/movie insert and update triggers refuse a library
-path that would overlap a configured bin. TV and movies may share one bin but cannot nest. Overlap
-is lexical; bind mounts or symlinked aliases of the same directory are not detected. Saving does
+path that would overlap a configured bin. TV and movies may share one bin but cannot nest. A shared
+bin requires the same cleanup period in both domains; a differing period is refused with 409
+`recycle_bin_retention_conflict`, and a cleanup run fails rather than deleting the other domain's
+files. Overlap is lexical; bind mounts or symlinked aliases of the same directory are not detected.
+Saving does
 not create the folder: Health reports a missing or unwritable bin.
 
 The first scheduled cleanup is one day after choosing or changing the path. The UI is under
@@ -159,8 +162,9 @@ symlinks, special files, entries on another mount or in-progress `.partial` file
 anything outside the bin. Everything already in the bin counts, not only files hrrdarr moved there.
 Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 60 s); a bounded run reports
 `bounded` and leaves the rest for the next run. Outcomes: `cleaned`, `not_configured`, `disabled`;
-a missing bin fails with `recycle_bin_unavailable`. Cleanup waits (retry) while a file operation
-holds the effect permit.
+a missing bin fails with `recycle_bin_unavailable`, and a shared bin whose domains disagree on
+retention fails with `recycle_bin_retention_conflict` without deleting anything. Cleanup waits
+(retry) while a file operation holds the effect permit.
 
 ## Health
 

@@ -204,28 +204,20 @@ pub(super) async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
     }
     Ok(())
 }
-pub(super) async fn claim_due(
+/// Claims the refresh the shared worker queue selected. The worker orders this queue by
+/// `next_attempt_at`, and a continuation requeues for now(), so a refresh that spans several
+/// slices takes its turn behind the work that was already queued instead of preempting it.
+pub(super) async fn claim(
     c: &Connection,
+    id: Uuid,
     timestamp: i64,
-) -> Result<Option<CollectionRefreshCommand>> {
-    let Some(r) = c
-        .query(
-            "SELECT id FROM collection_refresh_commands WHERE status='queued' AND next_attempt_at<=? ORDER BY created_at,id LIMIT 1",
-            [timestamp],
-        )
-        .await?
-        .next()
-        .await?
-    else {
-        return Ok(None);
-    };
-    let id = Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?;
+) -> Result<CollectionRefreshCommand> {
     c.execute(
         "UPDATE collection_refresh_commands SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error_code=NULL WHERE id=?",
         params![timestamp, id.to_string()],
     )
     .await?;
-    Ok(Some(read(c, id).await?))
+    read(c, id).await
 }
 /// An interrupted slice resumes from its cursor; completed collections are not repeated.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
@@ -329,7 +321,7 @@ pub(super) async fn run(
     .await?;
     eprintln!(
         "event=collection_refresh_settled command_id={id} checked={} failed={} added={}",
-        total_checked + 0,
+        total_checked,
         total_failed,
         command.movies_added + added
     );
