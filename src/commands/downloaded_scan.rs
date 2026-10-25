@@ -49,7 +49,9 @@ const INVENTORY_MAX_BYTES: i64 = 64 * 1024 * 1024;
 /// another walk over the same tree.
 fn capture_gate(path: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     static GATES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>,
+        >,
     > = std::sync::OnceLock::new();
     let gates = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut gates = gates.lock().expect("capture gates are not poisoned");
