@@ -44,9 +44,22 @@ const DECISION_MAX_BYTES: usize = 16_000;
 const REASON_MAX_BYTES: usize = 128;
 const REASONS_MAX: usize = 64;
 const INVENTORY_MAX_BYTES: i64 = 64 * 1024 * 1024;
-/// One blocking inventory capture at a time, process-wide: a capture that cannot finish holds
-/// one blocking worker instead of one per retry.
-static CAPTURES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// One blocking inventory capture per source path: a stalled mount blocks only scans of that
+/// same path, and a retry of that path queues behind the running capture instead of starting
+/// another walk over the same tree.
+fn capture_gate(path: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut gates = gates.lock().expect("capture gates are not poisoned");
+    if let Some(gate) = gates.get(path).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::const_new(1));
+    gates.insert(path.to_owned(), std::sync::Arc::downgrade(&gate));
+    gate
+}
 const HISTORY_MAX_ROWS: usize = 20_001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -1694,10 +1707,10 @@ async fn discover(
     let carried = receipt::carried_members(&c, claim).await?;
     let path = claim.path.clone();
     // The capture keeps its permit until the blocking walk actually ends, so a timed-out
-    // attempt cannot leave a second walk behind it: a stalled mount keeps one blocking worker
-    // instead of one per retry.
-    let permit = CAPTURES
-        .acquire()
+    // attempt cannot leave a second walk behind it. The gate belongs to the source path, so a
+    // stalled mount holds only the scans of that path.
+    let permit = capture_gate(&path)
+        .acquire_owned()
         .await
         .map_err(|_| Failure::Retry("scan_source_io"))?;
     let captured = tokio::task::spawn_blocking(move || {
