@@ -6,7 +6,7 @@
   import type { ApiPage, ClientSelection, MediaDomain, MovieWantedItem, Provider, SearchCommand, TvWantedItem, WantedKind, WantedPage, WantedSearchInput, WantedSearchReceipt } from './api.generated';
   import { createWantedSearch, getSearchCommand, listProviders, listWanted, monitorEpisodes, monitorMovies } from './api';
   import { eligibleDownloadClient, indexerScope, isIndexer, mergeProviderPages } from './provider-draft';
-  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, monitoredLabel, receiptSummary, retainVisible, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
+  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, monitoredLabel, receiptSummary, retainVisible, sameWantedWork, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
   type Item = TvWantedItem | MovieWantedItem;
   let { kind, onkind }: { kind: WantedKind; onkind: (kind: WantedKind) => void } = $props();
 
@@ -17,6 +17,8 @@
   let providers = $state<ApiPage<Provider> | null>(null), providerOffset = $state(0), providerError = $state(''), providerLoading = $state(false);
   let knownProviders = $state<Provider[]>([]), indexerId = $state(''), clientId = $state('');
   let searching = $state(false), pending = $state<{ domain: MediaDomain; body: WantedSearchInput } | null>(null), uncertain = $state(false);
+  // A discarded uncertain request keeps its identity: the same work must not be admitted twice.
+  let discarded = $state<{ domain: MediaDomain; body: WantedSearchInput } | null>(null);
   // The filter the visible page was loaded with; a search is authorized only for that filter.
   let loadedQuery = $state('');
   let searchError = $state(''), receipt = $state<WantedSearchReceipt | null>(null), confirmAll = $state(false);
@@ -85,12 +87,17 @@
     return client ? { kind: 'explicit', provider_id: client.id, provider_revision: client.revision } : { kind: 'default' };
   }
   async function submit(scope: MediaDomain, body: WantedSearchInput) {
-    searching = true; searchError = ''; confirmAll = false; pending = { domain: scope, body };
-    const result = await createWantedSearch(scope, body);
+    // A discarded uncertain request may already have been admitted; the same work is resent with
+    // its original identity so the server reads it back instead of admitting it twice.
+    const sent = discarded && discarded.domain === scope && sameWantedWork(discarded.body, body)
+      ? { ...body, request_id: discarded.body.request_id }
+      : body;
+    searching = true; searchError = ''; confirmAll = false; pending = { domain: scope, body: sent };
+    const result = await createWantedSearch(scope, sent);
     if (!alive) return;
     searching = false;
     if (result.ok) {
-      receipt = result.data; pending = null; uncertain = false; selection = new Set();
+      receipt = result.data; pending = null; uncertain = false; discarded = null; selection = new Set();
       await readStatuses(); void load();
       return;
     }
@@ -230,7 +237,7 @@
     {/if}
     {#if searching}<p role="status">Submitting search request…</p>{/if}
     {#if searchError}<p role="alert" class="error">{searchError}</p>{/if}
-    {#if uncertain && pending}<p role="alert">The search request may have been admitted. Resending the same request reads back its original result instead of searching twice. It stays bound to {pending.domain === 'tv' ? 'TV' : 'movies'}.</p><button onclick={() => submit(pending!.domain, pending!.body)}>Retry same search request</button><button onclick={() => { pending = null; uncertain = false; searchError = ''; }}>Discard pending request</button>{/if}
+    {#if uncertain && pending}<p role="alert">The search request may have been admitted. Resending the same request reads back its original result instead of searching twice. It stays bound to {pending.domain === 'tv' ? 'TV' : 'movies'}.</p><button onclick={() => submit(pending!.domain, pending!.body)}>Retry same search request</button><button onclick={() => { discarded = pending; pending = null; uncertain = false; searchError = ''; }}>Discard pending request</button>{/if}
     {#if receipt}
       <div role="status" class="receipt"><p>{receiptSummary(receipt)}</p><p class="muted">Request {receipt.request_id}</p></div>
       {#if receipt.commands.length}
