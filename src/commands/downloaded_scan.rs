@@ -1722,7 +1722,7 @@ async fn discover(
         .await
         .map_err(|_| Failure::Retry("scan_source_io"))?;
     let budget = CAPTURE_BUDGET
-        .acquire_owned()
+        .acquire()
         .await
         .map_err(|_| Failure::Retry("scan_source_io"))?;
     let captured = tokio::task::spawn_blocking(move || {
