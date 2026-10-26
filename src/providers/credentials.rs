@@ -1,11 +1,11 @@
 use ring::{
-    aead,
+    aead, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
 
 /// Intentionally neither Debug nor serializable: only the secret facility supplies this key.
-pub struct CredentialKey(aead::LessSafeKey);
+pub struct CredentialKey(aead::LessSafeKey, hmac::Key);
 impl CredentialKey {
     pub fn from_hex(value: &str) -> Result<Self, &'static str> {
         if value.len() != 64 {
@@ -21,8 +21,16 @@ impl CredentialKey {
         }
         let key = aead::UnboundKey::new(&aead::AES_256_GCM, &bytes)
             .map_err(|_| "Invalid provider key")?;
+        // A separate, labelled MAC key: the AEAD key is never used for another primitive.
+        let parts = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, &bytes),
+            b"hrrdarr/notification-delivery-part/v1",
+        );
         bytes.fill(0);
-        Ok(Self(aead::LessSafeKey::new(key)))
+        Ok(Self(
+            aead::LessSafeKey::new(key),
+            hmac::Key::new(hmac::HMAC_SHA256, parts.as_ref()),
+        ))
     }
     /// Separate AEAD purpose from provider credentials; payloads never have a plaintext fallback.
     pub(super) fn seal_release(
@@ -71,6 +79,15 @@ impl CredentialKey {
             .len();
         body.truncate(length);
         Ok(body)
+    }
+    /// Keyed 64-bit identity of one notification request. Requests can carry secrets, so a plain
+    /// digest stored beside them would let anyone reading the database test guessed secrets
+    /// offline; without this key the identity is useless for that.
+    pub(crate) fn delivery_part_id(&self, request: &[u8]) -> String {
+        hmac::sign(&self.1, request).as_ref()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
     /// Notification secrets: a distinct AEAD purpose bound to the notification identity, so an
     /// envelope cannot be replayed onto another notification or into the provider registry.

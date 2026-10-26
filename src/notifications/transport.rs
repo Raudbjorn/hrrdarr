@@ -79,6 +79,57 @@ impl Outgoing {
         self.headers.push((name.to_owned(), value.into()));
         self
     }
+    /// Stable 64-bit identity of the whole request (method, URL, headers, body), recorded once it
+    /// is acknowledged so a retried delivery skips it. With the credential key it is an HMAC, so
+    /// the stored identity cannot be used to check guessed secrets offline. Without a key no
+    /// secret field can be stored, so a plain digest reveals nothing the database lacks.
+    pub fn part_id(&self, key: Option<&crate::providers::CredentialKey>) -> String {
+        let bytes = self.identity_bytes();
+        if let Some(key) = key {
+            return key.delivery_part_id(&bytes);
+        }
+        let mut hex = crate::providers::qbittorrent::digest_hex(&ring::digest::SHA256, &bytes);
+        hex.truncate(16);
+        hex
+    }
+    /// Length-prefixed fields, so bytes cannot move between fields without changing the identity.
+    fn identity_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut field = |part: &[u8]| {
+            bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(part);
+        };
+        field(match self.method {
+            Method::Get => b"GET",
+            Method::Post => b"POST",
+            Method::Put => b"PUT",
+        });
+        field(self.url.as_bytes());
+        for (name, value) in &self.headers {
+            field(name.as_bytes());
+            field(value.as_bytes());
+        }
+        match &self.body {
+            Body::None => field(b"none"),
+            Body::Json(value) => {
+                field(b"json");
+                field(&serde_json::to_vec(value).unwrap_or_default());
+            }
+            Body::Form(pairs) => {
+                field(b"form");
+                for (name, value) in pairs {
+                    field(name.as_bytes());
+                    field(value.as_bytes());
+                }
+            }
+            Body::Text { content_type, text } => {
+                field(b"text");
+                field(content_type.as_bytes());
+                field(text.as_bytes());
+            }
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,48 +438,54 @@ fn classify(error: reqwest::Error) -> SendError {
     }
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-pub fn base64(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(BASE64[(n >> 18) as usize & 63] as char);
-        out.push(BASE64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            BASE64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            BASE64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-pub fn basic_auth(user: &str, password: &str) -> String {
-    format!("Basic {}", base64(format!("{user}:{password}").as_bytes()))
-}
+pub use crate::providers::http::basic_auth;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        for (plain, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(plain.as_bytes()), encoded);
-        }
+    fn part_ids_separate_requests_and_are_stable() {
+        let a = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"a"}));
+        let b = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"b"}));
+        assert_eq!(a.part_id(None), a.clone().part_id(None));
+        assert_eq!(a.part_id(None).len(), 16);
+        assert_ne!(a.part_id(None), b.part_id(None));
+        assert_ne!(
+            a.part_id(None),
+            a.clone().header("Authorization", "Bearer x").part_id(None)
+        );
+        // Length-prefixed fields: moving bytes between URL and header cannot collide.
+        assert_ne!(
+            Outgoing::get("http://h/ab").header("c", "d").part_id(None),
+            Outgoing::get("http://h/a").header("bc", "d").part_id(None)
+        );
+    }
+    #[test]
+    fn keyed_part_ids_cannot_be_recomputed_without_the_key() {
+        use crate::providers::CredentialKey;
+        let key = CredentialKey::from_hex(&"0f".repeat(32)).unwrap();
+        let other = CredentialKey::from_hex(&"1e".repeat(32)).unwrap();
+        let request = Outgoing::post_json("https://ntfy.sh", serde_json::json!({"topic":"a"}))
+            .header("Authorization", basic_auth("user", "guessable"));
+        let keyed = request.part_id(Some(&key));
+        assert_eq!(keyed.len(), 16);
+        assert_eq!(
+            keyed,
+            request.clone().part_id(Some(&key)),
+            "stable under one key"
+        );
+        // Reasoning: someone reading the database has the request content except the secret. A
+        // plain digest would let them confirm a guessed password; the keyed one matches neither
+        // the plain digest nor the same request under another key.
+        assert_ne!(keyed, request.part_id(None));
+        assert_ne!(keyed, request.part_id(Some(&other)));
+    }
+    #[test]
+    fn basic_auth_matches_rfc7617_example() {
+        assert_eq!(
+            basic_auth("Aladdin", "open sesame"),
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
     }
     #[test]
     fn policy_denies_only_unreachable_targets() {

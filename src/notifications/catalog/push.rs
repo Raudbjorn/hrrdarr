@@ -75,6 +75,8 @@ fn slack(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
 }
 
 fn telegram(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
+    // sendMessage allows 4096 characters *after entity parsing*: `&amp;` counts as one, so the
+    // escaped text fits whenever the clipped plain text (256 + 1 + 3500) does.
     let text = format!(
         "<b>{}</b>\n{}",
         html_escape::encode_text(&clip(&m.title, 256)),
@@ -288,7 +290,7 @@ pub fn implementations() -> Vec<Implementation> {
             domains: BOTH,
             fields: || {
                 vec![
-                    Field::secret("webhook_url", "Webhook URL")
+                    Field::secret_url("webhook_url", "Webhook URL")
                         .required()
                         .help("Channel webhook; treated as a secret."),
                     Field::text("username", "Username").default_text("hrrdarr"),
@@ -305,7 +307,7 @@ pub fn implementations() -> Vec<Implementation> {
             domains: BOTH,
             fields: || {
                 vec![
-                    Field::secret("webhook_url", "Webhook URL")
+                    Field::secret_url("webhook_url", "Webhook URL")
                         .required()
                         .help("Incoming webhook; treated as a secret."),
                     Field::text("username", "Username").default_text("hrrdarr"),
