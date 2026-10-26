@@ -14,7 +14,8 @@ All routes are under `/api/v1/notifications` (generated types: `Notification*` i
 | `GET /{id}`, `PUT /{id}`, `DELETE /{id}` | Read / update (revision fenced) / delete |
 | `GET /schema` | Implementation catalog: field schema driving validation and the UI form |
 | `POST /test` | Test an unsaved draft (`{draft, existing_id?}`); `existing_id` lends stored secrets |
-| `POST /{id}/test`, `POST /testall` | Test saved notifications |
+| `POST /{id}/test` | Test one saved notification |
+| `POST /testall` | Test every **enabled** saved notification (disabled ones are skipped and not listed in the result) |
 | `GET /deliveries?limit=` | Recent delivery journal (class codes only) |
 
 A notification has an `implementation`, non-secret `settings`, write-only `secrets`, and up to two
@@ -36,6 +37,9 @@ Responses list only `secrets_configured` names. On update an omitted secret is k
 it (not allowed for required secrets). Without the key, creating a notification that has secrets
 fails with 503; secretless implementations (for example Kodi without a password) still work.
 Errors, logs, the delivery journal and the test results never contain URLs, tokens or response bodies.
+The one exception is custom-script output: a script's stdout (DEBUG) and stderr (WARN) are logged as the
+script wrote them, clipped to 2 KiB, so a script that echoes its arguments, environment or an event's
+content puts that in the process log. Scripts must not print secrets.
 
 ### Validation
 Strict and bounded: unknown settings/secrets rejected, secrets sent as settings rejected, types and
@@ -81,9 +85,17 @@ notify plus library update) records a 64-bit identity of each acknowledged reque
 so a retry sends only the requests that were not acknowledged. Requests can carry secrets, so the
 identity is an HMAC under a sub-key derived from the credential key: reading the database does not
 allow checking guessed secrets against it. Without a credential key no secret can be stored, and a
-plain digest is used. Rotating the key re-sends parts of a delivery still being retried. A request that timed out may still have
+plain digest is used. Rotating the key changes every identity, so a retrying delivery of a notification without secrets re-sends parts it
+had already acknowledged. Rotation also makes every stored secret unreadable: a notification with secrets fails
+permanently as `credentials_unavailable` (its pending deliveries are parked as `failed`) until its secrets are
+entered again, so rotate the key only together with re-entering them. A request that timed out may still have
 arrived, so this narrows duplicates rather than excluding them. Plex refreshes are not tracked: they
 follow a fresh section listing and repeating one is harmless.
+
+The dispatcher runs only in the process that owns a local database. With a remote database the API, the
+capture triggers and the test endpoints still work and events accumulate in `notification_events` (newest
+2048 kept), but nothing fans them out or delivers them; startup logs
+`event=notification_dispatcher_disabled code=local_ownership_required`, as it does for the command worker.
 
 Disabling a notification **holds** its pending deliveries: they are not claimed, spend no attempt,
 and resume when it is re-enabled. Events that occur while it is disabled are not recorded for it.
@@ -92,7 +104,7 @@ Deleting a notification discards its deliveries.
 ## Tests
 
 `POST /test`, `POST /{id}/test` and `POST /testall` send a synthetic Test event to each configured
-domain, both domains concurrently, each limited to 40 s. At most 4 notification tests run at once
+domain (`/testall` only for enabled notifications), both domains concurrently, each limited to 40 s. At most 4 notification tests run at once
 across all test requests. One notification's test finishes within 45 s (the client waits 60 s);
 `/testall` runs notifications concurrently and finishes within 90 s (the client waits 120 s).
 Anything unfinished at the deadline reports `timeout`; such a send may still have been delivered.

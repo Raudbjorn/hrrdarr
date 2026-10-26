@@ -88,7 +88,11 @@
   }
   function changeView(next: CalendarView) {
     if (next === mode) return;
-    mode = next; void load();
+    // Month cells and arrow keys can leave `focusDate` outside the anchor's week; re-anchor on it so
+    // the new range always contains the one tabbable day.
+    anchor = focusDate; mode = next;
+    if (selectedDate && !inRange(selectedDate, rangeFor(next, anchor))) selectedDate = null;
+    void load();
   }
   function changeScope(next: CalendarScope) {
     if (next === scope) return;

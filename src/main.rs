@@ -142,10 +142,16 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
-    let notifier = state
-        .db
-        .permits_local_imports()
-        .then(|| hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone()));
+    let notifier = if state.db.permits_local_imports() {
+        Some(hrrdarr::notifications::start(
+            state.db.clone(),
+            state.provider_key.clone(),
+        ))
+    } else {
+        // Events are still captured and notifications can be tested, but nothing can deliver them.
+        eprintln!("event=notification_dispatcher_disabled code=local_ownership_required");
+        None
+    };
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

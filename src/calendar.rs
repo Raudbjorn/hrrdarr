@@ -659,7 +659,7 @@ async fn select_tv(
     .await?;
     let mut rows = c
         .query(
-            &format!("{TV_COLUMNS}{from} WHERE e.air_date_utc IS NOT NULL AND {valid} AND unixepoch(e.air_date_utc)>=?1 AND unixepoch(e.air_date_utc)<?2 AND {filter} ORDER BY unixepoch(e.air_date_utc),e.id LIMIT ?3"),
+            &format!("{TV_COLUMNS}{from} WHERE e.air_date_utc IS NOT NULL AND {valid} AND unixepoch(e.air_date_utc)>=?1 AND unixepoch(e.air_date_utc)<=?2 AND {filter} ORDER BY unixepoch(e.air_date_utc),e.id LIMIT ?3"),
             libsql::params![window.start.timestamp(), window.end.timestamp(), cap as i64 + 1],
         )
         .await?;
@@ -671,11 +671,15 @@ async fn select_tv(
         }
         let raw: String = row.get(16)?;
         // SQLite's reader is permissive (e.g. day 30 of February); Rust decides validity.
-        let Some(start) = stored_instant(&raw).filter(|t| *t >= window.start && *t < window.end)
-        else {
+        let Some(start) = stored_instant(&raw) else {
             invalid_selected += 1;
             continue;
         };
+        // `unixepoch()` rounds a fractional second up, so the SQL range includes the end second and
+        // the exact instant decides which window owns the row.
+        if start < window.start || start >= window.end {
+            continue;
+        }
         let id: i64 = row.get(0)?;
         let series_monitored = row.get::<i64>(3)? == 1;
         let monitored = row.get::<i64>(14)? == 1;
@@ -783,7 +787,7 @@ async fn select_movies(
         .iter()
         .map(|kind| {
             let col = kind.column();
-            format!("SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,d.studio,d.runtime,f.id,{},d.{col},unixepoch(d.{col}){from} WHERE d.{col} IS NOT NULL AND {} AND unixepoch(d.{col})>=?1 AND unixepoch(d.{col})<?2 AND {filter}", kind.order(), valid_sql(&format!("d.{col}")))
+            format!("SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,d.studio,d.runtime,f.id,{},d.{col},unixepoch(d.{col}){from} WHERE d.{col} IS NOT NULL AND {} AND unixepoch(d.{col})>=?1 AND unixepoch(d.{col})<=?2 AND {filter}", kind.order(), valid_sql(&format!("d.{col}")))
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
@@ -810,13 +814,15 @@ async fn select_movies(
             _ => return Err(state_invalid()),
         };
         let raw: String = row.get(12)?;
-        let Some((released, date)) = stored_instant(&raw)
-            .map(|t| (t, t.date_naive()))
-            .filter(|(_, d)| *d >= window.first_date && *d < window.end_date)
-        else {
+        let Some(released) = stored_instant(&raw) else {
             invalid_selected += 1;
             continue;
         };
+        // The SQL range includes the end second (see the TV selector); the exact date decides.
+        let date = released.date_naive();
+        if date < window.first_date || date >= window.end_date {
+            continue;
+        }
         let id: i64 = row.get(0)?;
         items.push(MovieCalendarEntry {
             event_id: format!("movie-{id}-{}", kind.key()),

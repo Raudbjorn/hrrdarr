@@ -935,3 +935,41 @@ async fn production_routes_pass_the_same_host_authority_guard() {
         assert_eq!(raw_get(&origin, &path, "evil.example").await.0, 403);
     }
 }
+
+/// Candidate selection must keep supported sub-second precision: a row an instant before a window
+/// boundary belongs to the earlier window and is never counted as invalid in the next one.
+#[tokio::test]
+async fn fractional_seconds_never_cross_a_window_boundary() {
+    let app = app().await;
+    exec(
+        &app.db,
+        "INSERT INTO series(id,title,path,monitored) VALUES (1,'Edge','/owned/edge',1);
+         INSERT INTO seasons(series_id,number) VALUES (1,1);
+         INSERT INTO episodes(series_id,season,number,title,air_date_utc) VALUES (1,1,1,'Late','2026-10-31T23:59:59.9995Z');
+         INSERT INTO movie_metadata(id,title,year,digital_release) VALUES (1,'Late film',2026,'2026-10-31T23:59:59.9995Z');
+         INSERT INTO movies(id,metadata_id,path) VALUES (1,1,'/owned/m/1');",
+    )
+    .await;
+    for domain in ["tv", "movies"] {
+        let before = ok(
+            &app.base,
+            &format!("/api/v1/{domain}/calendar?start=2026-10-31&end=2026-11-01"),
+        )
+        .await;
+        let after = ok(
+            &app.base,
+            &format!("/api/v1/{domain}/calendar?start=2026-11-01&end=2026-11-02"),
+        )
+        .await;
+        assert_eq!(
+            (
+                before["total"].as_i64(),
+                before["diagnostics"]["invalid_dates"].as_i64(),
+                after["total"].as_i64(),
+                after["diagnostics"]["invalid_dates"].as_i64()
+            ),
+            (Some(1), Some(0), Some(0), Some(0)),
+            "{domain}: {before} / {after}"
+        );
+    }
+}

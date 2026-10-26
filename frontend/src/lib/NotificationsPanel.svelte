@@ -1,14 +1,16 @@
 <script lang="ts">
-  import {onMount} from 'svelte';
-  import type {Notification,NotificationImplementation,Tag,NotificationDelivery} from './api.generated';
+  import {onMount,untrack} from 'svelte';
+  import type {MediaDomain,Notification,NotificationImplementation,Tag,NotificationDelivery} from './api.generated';
   import {listNotifications,getNotificationSchema,createNotification,updateNotification,deleteNotification,testNotificationDraft,testSavedNotification,listTags,listNotificationDeliveries,type SettingsWriteState} from './api';
   import {blankDraft,draftFromNotification,buildInput,describeTest,triggersOn,SCOPE_DEFS,type NotificationDraft} from './notification-draft';
 
+  // The panel stays mounted while hidden, so tag changes made elsewhere arrive as version bumps.
+  let {tagVersions={tv:0,movies:0}}:{tagVersions?:Record<MediaDomain,number>}=$props();
   let schema=$state<NotificationImplementation[]>([]),items=$state<Notification[]>([]),tags=$state<{tv:Tag[];movies:Tag[]}>({tv:[],movies:[]});
   let deliveries=$state<NotificationDelivery[]>([]);
   let draft=$state<NotificationDraft|null>(null),editing=$state<Notification|null>(null);
   let loading=$state(false),write=$state<SettingsWriteState>('idle'),error=$state(''),notice=$state(''),testing=$state(false),testNote=$state('');
-  let alive=true;
+  let alive=true,tagEpoch=0,seenTags=untrack(()=>`${tagVersions.tv}:${tagVersions.movies}`);
   const busy=$derived(write==='busy'||testing);
   const impl=$derived(draft?schema.find(s=>s.implementation===draft!.implementation)??null:null);
 
@@ -16,6 +18,7 @@
     loading=true;error='';
     const [s,l,tv,mv,d]=await Promise.all([getNotificationSchema(),listNotifications(),listTags('tv'),listTags('movies'),listNotificationDeliveries(10)]);
     if(!alive)return;
+    tagEpoch++;
     loading=false;
     if(!s.ok){error=s.error;return;}
     if(!l.ok){error=l.error;return;}
@@ -23,6 +26,17 @@
     tags={tv:tv.ok?tv.data:[],movies:mv.ok?mv.data:[]};
     deliveries=d.ok?d.data.items:[];
   }
+  // Refreshes only the tag choices: an open draft keeps its fields and selected tag ids.
+  async function reloadTags() {
+    const epoch=++tagEpoch;
+    const [tv,mv]=await Promise.all([listTags('tv'),listTags('movies')]);
+    if(!alive||epoch!==tagEpoch)return;
+    tags={tv:tv.ok?tv.data:tags.tv,movies:mv.ok?mv.data:tags.movies};
+  }
+  $effect(()=>{
+    const key=`${tagVersions.tv}:${tagVersions.movies}`;
+    untrack(()=>{if(key!==seenTags){seenTags=key;void reloadTags();}});
+  });
   function startAdd(name:string) {
     const found=schema.find(s=>s.implementation===name);
     if(!found||busy)return;

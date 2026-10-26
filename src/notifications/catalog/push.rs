@@ -5,7 +5,7 @@ use crate::api::MediaDomain;
 use crate::notifications::{
     events::{EventKind, Message},
     model::{Field, ImplementationKind},
-    transport::{Outgoing, basic_auth},
+    transport::{MAX_URL_BYTES, Outgoing, basic_auth},
 };
 use serde_json::json;
 
@@ -240,24 +240,41 @@ fn prowl(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
 }
 
 fn join(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
+    const ENDPOINT: &str = "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush";
     let title = clip(&m.title, 250);
-    let text = clip(&m.text, 1000);
-    let mut query = vec![
-        ("apikey", c.text("api_key")),
-        ("title", title.as_str()),
-        ("text", text.as_str()),
-        ("priority", c.opt("priority").unwrap_or("0")),
-    ];
     let names = c.list("device_names").join(",");
-    if names.is_empty() {
-        query.push(("deviceId", "group.all"));
-    } else {
-        query.push(("deviceNames", names.as_str()));
+    // The message travels in the query string, so the budget is the percent-encoded URL (a CJK
+    // character is 3 bytes raw and 9 encoded), not the raw text: take the longest prefix of the
+    // text whose complete request URL still passes the transport's length limit.
+    let url_for = |limit: usize| -> Result<String, &'static str> {
+        let text = clip(&m.text, limit);
+        let mut query = vec![
+            ("apikey", c.text("api_key")),
+            ("title", title.as_str()),
+            ("text", text.as_str()),
+            ("priority", c.opt("priority").unwrap_or("0")),
+        ];
+        if names.is_empty() {
+            query.push(("deviceId", "group.all"));
+        } else {
+            query.push(("deviceNames", names.as_str()));
+        }
+        url_with_query(ENDPOINT, &query)
+    };
+    let (mut low, mut high) = (0usize, 1000usize);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if url_for(mid)?.len() <= MAX_URL_BYTES {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
     }
-    Ok(vec![Outgoing::get(url_with_query(
-        "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush",
-        &query,
-    )?)])
+    let url = url_for(low)?;
+    if url.len() > MAX_URL_BYTES {
+        return Err("invalid_url");
+    }
+    Ok(vec![Outgoing::get(url)])
 }
 
 fn pushcut(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
@@ -482,4 +499,49 @@ pub fn implementations() -> Vec<Implementation> {
             build: Build::Http(pushcut),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notifications::{events::test_message, model::SettingValue};
+    use std::collections::BTreeMap;
+
+    fn join_url(text: &str, names: &str) -> String {
+        let settings = BTreeMap::from([(
+            "device_names".to_owned(),
+            SettingValue::Text(names.to_owned()),
+        )]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "k".repeat(32))]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let mut message = test_message(MediaDomain::Tv);
+        message.text = text.to_owned();
+        let mut requests = join(&config, &message).unwrap();
+        assert_eq!(requests.len(), 1);
+        requests.remove(0).url
+    }
+
+    /// The message is percent-encoded into the query, so a raw 1000-byte clip of 3-byte characters
+    /// would be a ~3 KB URL the transport rejects as a permanent failure.
+    #[test]
+    fn join_message_is_budgeted_against_the_encoded_url() {
+        let url = join_url(&"漢".repeat(400), "");
+        assert!(url.len() <= MAX_URL_BYTES, "{}", url.len());
+        let parsed = url::Url::parse(&url).unwrap();
+        let text = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "text")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(text.chars().count() > 100 && text.chars().all(|c| c == '漢'));
+        // Device names spend the same budget.
+        let names = ["Phone-漢"; 20].join(",");
+        assert!(join_url(&"漢".repeat(400), &names).len() <= MAX_URL_BYTES);
+        // Short ASCII is untouched.
+        assert!(join_url("hello", "").contains("text=hello"));
+    }
 }
