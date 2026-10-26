@@ -96,15 +96,22 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 63); // Reasoning: latest is 0063 (0063 notifications, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 14 } // Reasoning: fourteen migrations follow 49 through 63 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 26 } // Reasoning: twenty-six migrations follow 49 through 75 (0075 provider scope union, 0074 downloadstation registry, 0073 flood registry, 0072 aria2 registry, 0071 utorrent registry, 0070 rtorrent registry, 0069 deluge registry, 0068 torrent RSS indexer, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
                 );
+            } else if *table == "provider_scopes" {
+                // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
+                let mut expected = expected.clone();
+                for row in &mut expected {
+                    row.push(libsql::Value::Null);
+                }
+                assert_eq!(actual, expected);
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.
                 let mut expected = expected.clone();

@@ -730,7 +730,7 @@ async fn source_false_governs_later_clients_and_local_false_blocks_source_true()
     }
 }
 #[tokio::test]
-async fn snapshot_capacity_failure_rolls_back_providers_core_archive_and_settings() {
+async fn snapshot_capacity_failure_defers_cdh_without_aborting_library_import() {
     let _serial = SNAPSHOTS.lock().await;
     for version in [233, 206, 242] {
         let media = if version == 233 { "tv" } else { "movies" };
@@ -747,10 +747,10 @@ async fn snapshot_capacity_failure_rolls_back_providers_core_archive_and_setting
         let c = db.connect().await.unwrap();
         for _ in 0..65 {
             let id = uuid::Uuid::new_v4().to_string();
-            c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'qbittorrent','legacy',1,1,1,1,'http://127.0.0.1:9')",[id.clone()]).await.unwrap();
+            c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'qbittorrent','legacy',1,1,1,1,'http://127.0.0.2:9')",[id.clone()]).await.unwrap();
             c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES(?,'qbittorrent',?,'owned',0,0,'started','default',0,0,0)",libsql::params![id,media]).await.unwrap();
         }
-        let before = database_state(&c).await;
+        // Distinct legacy endpoints keep source-client matching unambiguous; this test isolates capacity.
         let config = if version == 233 {
             json!({"host":"127.0.0.1","port":9,"tvCategory":"tv"})
         } else {
@@ -761,17 +761,98 @@ async fn snapshot_capacity_failure_rolls_back_providers_core_archive_and_setting
         );
         let bytes = fixture(&s, version, "capacity", &extra).await;
         let key = hrrdarr::providers::CredentialKey::from_hex(&"ac".repeat(32)).unwrap();
-        let error = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
+        let settings_before = scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='tv'").await
+            + scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='movies'").await;
+        // Previously the whole import aborted here, so an overflowed upgrade could not restore any
+        // backup until a schedule slot was freed. Only the CDH step is deferred now: native CDH is
+        // the untouched default at this point, so rolling the step back never leaves imports more
+        // enabled than the source intent, and reconciliation_pending still drives provisioning.
+        let report = snapshots::import_with_providers(&db, app, bytes, false, Some(&key))
             .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "completed download handling activation failed"
+            .unwrap();
+        assert!(
+            report.applied,
+            "library import commits despite CDH capacity: {report:?}"
+        );
+        assert!(
+            report.unsupported.iter().any(|u| u
+                .columns
+                .iter()
+                .any(|c| c.contains("refresh schedule capacity reached"))),
+            "deferral is reported, not silent"
         );
         assert_eq!(
-            database_state(&c).await,
-            before,
-            "all source and native state rolls back on aggregate capacity failure"
+            scalar(&c, "SELECT sum(cdh_version) FROM snapshot_imports").await,
+            0,
+            "unstamped so a rerun after freeing slots can apply CDH"
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM download_processing_policies WHERE enabled=1"
+            )
+            .await
+                + scalar(&c, "SELECT count(*) FROM download_refresh_schedules").await,
+            0,
+            "no partial authority or schedules from the rolled-back step"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='tv'").await
+                + scalar(&c, "SELECT revision FROM completed_download_handling_settings WHERE media_type='movies'").await,
+            settings_before,
+            "master settings unchanged"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM providers WHERE enabled=1").await,
+            65,
+            "reconstructed source client stays disabled"
         );
     }
+}
+#[tokio::test]
+async fn desired_policy_tracks_provider_state_and_reset_requires_revision() {
+    let scratch = Scratch::new();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let (base, server) = server(db.clone()).await;
+    let (code, provider) = request(&base, "POST", "/api/v1/providers", client_input()).await;
+    assert_eq!(code, 201, "{provider}");
+    let id = &provider["id"];
+    let (code, disabled) = request(
+        &base,
+        "PUT",
+        &format!("/api/v1/providers/{}", id.as_str().unwrap()),
+        json!({"revision":provider["revision"],"name":"disabled","enabled":false,"priority":1,"settings":client_input()["settings"]}),
+    )
+    .await;
+    assert_eq!(code, 200, "{disabled}");
+    for media in ["tv", "movies"] {
+        let p = policy(&base, id, media).await;
+        // cdh_scope_authority includes p.enabled; the read must not claim imports are desired.
+        assert_eq!(p["enabled"], false);
+        assert_eq!(p["desired_enabled"], false, "{p}");
+        assert!(p["enabled_override"].is_null());
+        let path = format!(
+            "/api/v1/download-processing/policies/{}/{media}/inherit",
+            id.as_str().unwrap()
+        );
+        // The generated contract requires `revision`; omission must not act as a null CAS.
+        let (code, v) = request(
+            &base,
+            "PUT",
+            &path,
+            json!({"provider_revision":disabled["revision"],"mode":"copy"}),
+        )
+        .await;
+        assert_eq!(code, 400, "{v}");
+        let (code, v) = request(
+            &base,
+            "PUT",
+            &path,
+            json!({"revision":p["revision"],"provider_revision":disabled["revision"],"mode":"copy"}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["desired_enabled"], false);
+    }
+    server.stop().await;
 }

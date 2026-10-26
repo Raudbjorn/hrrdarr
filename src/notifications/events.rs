@@ -681,8 +681,8 @@ pub async fn build(
             severity = None;
         }
         (EventKind::Rename, _) => {
-            // The rename executor does not exist yet; the builder consumes the payload contract a
-            // future emitter must provide: previous_paths and paths arrays.
+            // Emitted by the `notification_event_rename_*` triggers when a rename command settles:
+            // `paths` and `previous_paths` are parallel arrays of the renamed items.
             let paths_now: Vec<String> = payload
                 .get("paths")
                 .and_then(Value::as_array)

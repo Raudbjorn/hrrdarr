@@ -48,6 +48,8 @@ pub enum HttpRequestBody {
     },
     /// A serialized JSON document POSTed as `application/json` (bounded by [`MAX_JSON_BYTES`]).
     Json(Vec<u8>),
+    /// A serialized XML-RPC call POSTed as `text/xml` (bounded by [`MAX_JSON_BYTES`]).
+    Xml(Vec<u8>),
 }
 pub struct HttpResponse {
     pub status: u16,
@@ -327,7 +329,7 @@ impl HttpOperation<'_> {
             value.set_sensitive(true);
             header_map.insert(name, value);
         }
-        let length_limit = if matches!(body, HttpRequestBody::Json(_)) {
+        let length_limit = if matches!(body, HttpRequestBody::Json(_) | HttpRequestBody::Xml(_)) {
             MAX_JSON_BYTES as u64
         } else {
             MAX_MULTIPART_BYTES
@@ -382,6 +384,16 @@ impl HttpOperation<'_> {
                     .client
                     .post(url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+            }
+            HttpRequestBody::Xml(bytes) => {
+                if bytes.is_empty() || bytes.len() > MAX_JSON_BYTES {
+                    return Err(HttpError::InvalidRequest);
+                }
+                self.client
+                    .client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "text/xml")
                     .body(bytes)
             }
         }

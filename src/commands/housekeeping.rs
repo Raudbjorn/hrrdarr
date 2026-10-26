@@ -57,7 +57,7 @@ const MEDIA: &str = "{a}.media_type";
 ///   complete (interrupted import state).
 /// - metadata/blocklist/quality/rescan/recycle-cleanup rows have no inbound references and active-only
 ///   dedup indexes, so terminal rows are pure history.
-const TABLES: [Table; 9] = [
+const TABLES: [Table; 10] = [
     Table {
         name: "commands",
         terminal: TERMINAL,
@@ -109,6 +109,13 @@ const TABLES: [Table; 9] = [
     // Cleanup history (0059) has no inbound references and an active-only dedup index.
     Table {
         name: "recycle_bin_cleanup_commands",
+        terminal: TERMINAL,
+        domain: MEDIA,
+        protect: "1",
+    },
+    // Rename history (0067): items cascade with the command; events are retained separately.
+    Table {
+        name: "rename_commands",
         terminal: TERMINAL,
         domain: MEDIA,
         protect: "1",

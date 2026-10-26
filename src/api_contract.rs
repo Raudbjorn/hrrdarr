@@ -71,6 +71,17 @@ pub fn render() -> String {
     registry.visit::<crate::tags::Detail>();
     registry.visit::<crate::tags::Owners>();
     registry.visit::<crate::tags::Page>();
+    registry.visit::<crate::autotagging::Input>();
+    registry.visit::<crate::autotagging::Rule>();
+    registry.visit::<crate::autotagging::SchemaEntry>();
+    registry.visit::<crate::collections::Collection>();
+    registry.visit::<crate::collections::Patch>();
+    registry.visit::<crate::collections::BulkPatch>();
+    registry.visit::<crate::collections::ListQuery>();
+    registry.visit::<crate::api::ApiPage<crate::collections::Collection>>();
+    registry.visit::<crate::commands::collection_refresh::CollectionRefreshInput>();
+    registry.visit::<crate::commands::collection_refresh::ListParams>();
+    registry.visit::<crate::api::ApiPage<crate::commands::collection_refresh::CollectionRefreshCommand>>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
         crate::custom_formats::Input,
@@ -187,6 +198,25 @@ pub fn render() -> String {
         crate::naming::movie_preview::MovieRenamePreviewItem,
         crate::naming::movie_preview::MovieRenamePreviewStatus,
         crate::naming::movie_preview::MovieRenamePreviewReason,
+        crate::naming::plan::TvRenamePreview,
+        crate::naming::plan::TvRenamePreviewItem,
+        crate::naming::plan::FolderRenamePreview,
+        crate::naming::plan::FolderRenamePreviewItem,
+        crate::naming::plan::RenameStatus,
+        crate::naming::plan::RenameReason,
+        crate::commands::rename::RenameInput,
+        crate::commands::rename::RenameTarget,
+        crate::commands::rename::RenameName,
+        crate::commands::rename::RenameCommand,
+        crate::commands::rename::RenameCommandDetail,
+        crate::commands::rename::RenameItem,
+        crate::commands::rename::RenameItemState,
+        crate::api::ApiPage<crate::commands::rename::RenameCommand>,
+        crate::rename::events::RenameEvent,
+        crate::rename::events::RenameEventKind,
+        crate::rename::events::RenameOwner,
+        crate::rename::events::RenameEventQuery,
+        crate::api::ApiPage<crate::rename::events::RenameEvent>,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,

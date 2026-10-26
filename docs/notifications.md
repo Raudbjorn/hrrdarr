@@ -54,10 +54,11 @@ notification has the matching trigger for that domain.
 | Import / Upgrade | insert into `import_history`; upgrade = the operation has a replaced-file record (`rss_candidate_imports.old_file_json` or `scan_import_replacements`) |
 | Series add / Movie added | insert into `series` / `movies` |
 | Series delete / Movie delete | delete from `series` / `movies` (title, path, tags snapshotted) |
-| File delete | delete from `episode_files` / `movie_files`; reason `Manual` (an unfinished `file_deletions` journal: `admitted`, `copied` or `committed`; aborted and completed journals do not count), `Upgrade` (replacement journals), `NoLinkedEpisodes`, else `MissingFromDisk` |
+| File delete | delete from `episode_files` / `movie_files`, plus the in-place path rewrite of a movie file whose replacement journal is unfinished (reason `Upgrade`: a movie upgrade keeps the file id, so no delete happens); reason `Manual` (an unfinished `file_deletions` journal: `admitted`, `copied` or `committed`; aborted and completed journals do not count), `Upgrade` (replacement journals), `NoLinkedEpisodes`, else `MissingFromDisk` |
 | Health issue / restored | insert into `health_transitions` with `in_grace=0` (the 1024-row health ring is not an outbox, so the trigger copies what is needed) |
 | Manual interaction | `rss_candidates.status` becomes `needs_attention` |
-| Rename, Application update | accepted by `notifications::events::emit` and rendered, but **nothing emits them yet**: there is no rename executor or updater in the codebase |
+| Rename | a `rename_commands` row settling (`succeeded`, `failed` or `cancelled`) with `items_renamed > 0`; one event per series or movie listing the paths its `rename_events` rows renamed, cut to the 16 KiB event cap (`rename_events` stays the complete record). Items recovered after the command settled are not announced |
+| Application update | accepted by `notifications::events::emit` and rendered, but **nothing emits it yet**: there is no updater in the codebase |
 
 `notification_events` keeps the newest 2048 events. The worker (`notifications::start`, run only by
 the process that owns the database) polls every 2 s: it fans events out to one
@@ -154,7 +155,7 @@ community contract (`research/wiki/custom-scripts.md`):
 * **Add/Delete** (`SeriesAdd`, `SeriesDelete`, `MovieAdded`, `MovieDelete`): identity fields (+ path on delete/movie add).
 * **Health** (`HealthIssue`/`HealthRestored`): `<app>_health_issue_level|message|type|wiki` (or `restored`).
 * **ManualInteractionRequired**: identity plus release/client fields as for Grab.
-* **Rename / ApplicationUpdate**: variable sets are rendered but no emitter exists yet.
+* **Rename**: `*_episodefile_paths` / `*_moviefile_paths` and the `previous` variants, `|`-joined. **ApplicationUpdate**: rendered, but no emitter exists yet.
 * **Test**: only the three base variables.
 
 Not provided: quality, quality version, release group, scene name, indexer flags, custom format
@@ -174,7 +175,7 @@ only to events that change files; other events are skipped.
 ## Not claimed
 
 * No real third-party service was contacted; vendor wire formats are unverified against live APIs.
-* Rename and Application-update triggers are stored and renderable but never fired.
+* The Application-update trigger is stored and renderable but never fired.
 * Import-complete (TV batch) is stored but never fired.
 * Delivery is at-least-once, not exactly-once; there is no per-target ordering guarantee.
 * Event capture was exercised with fixture rows and the real trigger paths for series/movie

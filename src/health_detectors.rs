@@ -106,7 +106,7 @@ pub async fn evaluate_current(
     if domain == MediaDomain::Tv {
         // ponytail: serial probing is bounded to 256 clients and the worker's 30s batch;
         // add resumable batches if measured deployments exceed that budget.
-        let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type='tv' AND p.implementation NOT IN ('torznab','newznab') ORDER BY p.id LIMIT ?", [(MAX_HEALTH_CLIENTS + 1) as i64]).await.map_err(|_| "storage_error")?;
+        let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type='tv' AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') ORDER BY p.id LIMIT ?", [(MAX_HEALTH_CLIENTS + 1) as i64]).await.map_err(|_| "storage_error")?;
         while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
             if providers.len() == MAX_HEALTH_CLIENTS {
                 return Err("check_failed");
@@ -124,7 +124,16 @@ pub async fn evaluate_current(
         // Do not silently treat a future unsupported client as a successful status.
         if !matches!(
             implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission"
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
         ) {
             return Err("check_failed");
         }
@@ -167,6 +176,30 @@ pub async fn evaluate_communication(
     client: &RefreshClient,
     domain: MediaDomain,
 ) -> Result<Option<CommunicationIssue>, &'static str> {
+    evaluate_communication_detailed(db, client, domain)
+        .await
+        .map_err(|(code, _)| code)
+}
+
+/// As [`evaluate_communication`], also returning the remaining cooldown behind
+/// `provider_cooldown` so the engine can defer its recheck to that boundary.
+pub(crate) async fn evaluate_communication_detailed(
+    db: &Database,
+    client: &RefreshClient,
+    domain: MediaDomain,
+) -> Result<Option<CommunicationIssue>, (&'static str, Option<u32>)> {
+    let mut cooldown = None;
+    evaluate_communication_inner(db, client, domain, &mut cooldown)
+        .await
+        .map_err(|code| (code, cooldown))
+}
+
+async fn evaluate_communication_inner(
+    db: &Database,
+    client: &RefreshClient,
+    domain: MediaDomain,
+    cooldown: &mut Option<u32>,
+) -> Result<Option<CommunicationIssue>, &'static str> {
     use crate::providers::CommunicationProbeError;
     if !client.matches_database(db) {
         return Err("check_failed");
@@ -181,7 +214,7 @@ pub async fn evaluate_communication(
         MediaDomain::Tv => "tv",
         MediaDomain::Movies => "movies",
     };
-    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation,p.name FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation NOT IN ('torznab','newznab') ORDER BY p.id LIMIT ?", libsql::params![media,(MAX_HEALTH_CLIENTS+1) as i64]).await.map_err(|_| "storage_error")?;
+    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation,p.name FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') ORDER BY p.id LIMIT ?", libsql::params![media,(MAX_HEALTH_CLIENTS+1) as i64]).await.map_err(|_| "storage_error")?;
     while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
         if providers.len() == MAX_HEALTH_CLIENTS {
             return Err("check_failed");
@@ -203,7 +236,16 @@ pub async fn evaluate_communication(
         }
         if !matches!(
             implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission"
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
         ) {
             return Err("check_failed");
         }
@@ -217,6 +259,10 @@ pub async fn evaluate_communication(
                 break;
             }
             Err(CommunicationProbeError::Unevaluated(code)) => return Err(code),
+            Err(CommunicationProbeError::Cooldown(seconds)) => {
+                *cooldown = Some(seconds);
+                return Err(crate::health::PROVIDER_COOLDOWN);
+            }
         }
     }
     if !empty && remote_failure.is_none() {
@@ -282,7 +328,7 @@ pub async fn evaluate_indexer_client(
          CASE WHEN typeof(s.provider_id)='text' AND length(CAST(s.provider_id AS BLOB))=36
           AND instr(s.provider_id,char(0))=0 AND typeof(p.name)='text'
           AND length(CAST(p.name AS BLOB)) BETWEEN 1 AND 128 AND instr(p.name,char(0))=0
-          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','qbittorrent','sabnzbd','transmission')
+          AND typeof(p.implementation)='text' AND p.implementation IN ('torznab','newznab','torrentrss','qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation')
           AND typeof(p.settings_version)='integer' AND p.settings_version=1
           AND typeof(p.enabled)='integer' AND p.enabled IN (0,1)
           AND typeof(s.implementation)='text' AND s.implementation=p.implementation
@@ -290,7 +336,7 @@ pub async fn evaluate_indexer_client(
            AND length(CAST(s.download_client_id AS BLOB))=36 AND instr(s.download_client_id,char(0))=0))
          THEN 1 ELSE 0 END,
          t.id IS NOT NULL,
-         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission') AND typeof(t.implementation)='text'
+         CASE WHEN t.implementation IN ('qbittorrent','sabnzbd','transmission','nzbget','deluge','rtorrent','utorrent','aria2','flood','downloadstation') AND typeof(t.implementation)='text'
           AND typeof(t.settings_version)='integer' AND t.settings_version=1
           AND typeof(t.enabled)='integer' AND t.enabled IN (0,1)
          THEN 1 ELSE 0 END,
@@ -325,14 +371,32 @@ pub async fn evaluate_indexer_client(
         if binding.as_deref().is_some_and(|id| !canonical_uuid(id))
             || (matches!(
                 implementation.as_str(),
-                "qbittorrent" | "sabnzbd" | "transmission"
+                "qbittorrent"
+                    | "sabnzbd"
+                    | "transmission"
+                    | "nzbget"
+                    | "deluge"
+                    | "rtorrent"
+                    | "utorrent"
+                    | "aria2"
+                    | "flood"
+                    | "downloadstation"
             ) && binding.is_some())
         {
             return Err("check_failed");
         }
         if matches!(
             implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission"
+            "qbittorrent"
+                | "sabnzbd"
+                | "transmission"
+                | "nzbget"
+                | "deluge"
+                | "rtorrent"
+                | "utorrent"
+                | "aria2"
+                | "flood"
+                | "downloadstation"
         ) || row.get::<i64>(3).map_err(|_| "check_failed")? == 0
         {
             continue;

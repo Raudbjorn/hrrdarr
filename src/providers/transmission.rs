@@ -170,6 +170,11 @@ pub(crate) fn settings_fingerprint(settings: &ProviderSettings) -> Result<String
     Ok(digest_hex(&ring::digest::SHA256, &bytes))
 }
 
+/// Standard padded base64 (RFC 4648 §4) for `metainfo` and for the label clients' uploads; one
+/// shared encoder (the `base64` crate) instead of a hand-written copy per client.
+pub(super) fn base64(bytes: &[u8]) -> String {
+    BASE64.encode(bytes)
+}
 /// Path segments of a rooted remote path; drive-letter paths compare case-insensitively.
 fn segments(path: &str) -> Option<(bool, Vec<String>)> {
     let drive = path.len() >= 3

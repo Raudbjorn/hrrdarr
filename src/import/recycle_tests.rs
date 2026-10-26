@@ -169,6 +169,19 @@ async fn recycled_upgrade_both_domains() {
             &bin,
         )
         .await;
+        // A movie upgrade rewrites the file row in place, so no DELETE reaches the notification
+        // trigger; the in-place rewrite must emit the upgrade file-delete event itself. (An
+        // episode upgrade inserts a new file row and leaves the old one for later cleanup.)
+        let domain = if movie { "movies" } else { "tv" };
+        let setup = case.c().await;
+        setup
+            .execute_batch(&format!(
+                "INSERT INTO notifications(id,name,implementation,settings_json,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000001','Upgrades','webhook','{{}}',1,1);
+                 INSERT INTO notification_scopes(notification_id,media_type,on_file_delete_for_upgrade) VALUES('00000000-0000-4000-8000-000000000001','{domain}',1);"
+            ))
+            .await
+            .unwrap();
+        drop(setup);
         let original_inode = std::fs::metadata(&case.oldpath).unwrap().ino();
         let done = execute_owned(&case.db, &case.op).await.unwrap();
         assert_eq!(done.status, "complete");
@@ -176,6 +189,15 @@ async fn recycled_upgrade_both_domains() {
             done.message,
             "Replacement imported; original moved to the recycle bin"
         );
+        if movie {
+            let c = case.c().await;
+            assert_eq!(
+                scalar(&c, &format!("SELECT count(*) FROM notification_events WHERE kind='file_delete' AND scope='movies' AND subject_id=1 AND json_extract(payload_json,'$.reason')='Upgrade' AND json_extract(payload_json,'$.path')='{}'", case.oldpath)).await,
+                1,
+                "one upgrade file-delete event naming the retired path: {:?}",
+                text(&c, "SELECT group_concat(kind||scope||payload_json,' ; ') FROM notification_events").await
+            );
+        }
         let recycled = case.recycled(&bin);
         assert_eq!(std::fs::read(&recycled).unwrap(), b"original-media");
         assert_eq!(
@@ -190,7 +212,6 @@ async fn recycled_upgrade_both_domains() {
             b"new-media-content"
         );
         let c = case.c().await;
-        let domain = if movie { "movies" } else { "tv" };
         assert_eq!(
             text(&c, &format!("SELECT phase||':'||transfer||':'||coalesce(error_code,'') FROM upgrade_recycles WHERE media_type='{domain}' AND old_file_id=1")).await,
             Some("complete:rename:".into())

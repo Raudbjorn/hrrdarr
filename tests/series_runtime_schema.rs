@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        63 // Reasoning: latest is 0063 (0063 notifications, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        75 // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;
