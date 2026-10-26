@@ -5,7 +5,7 @@ import {pathToFileURL} from 'node:url';
 const origin=process.env.UI_URL,scratch=process.env.UI_SCRATCH;
 assert.ok(origin&&scratch,'Set UI_URL and UI_SCRATCH=fixture.scratch');assert.equal(new URL(origin).hostname,'127.0.0.1');assert.ok(scratch.startsWith('/'));
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-const browser=await chromium.launch({headless:true});const page=await browser.newPage();page.setDefaultTimeout(10000);
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});const page=await browser.newPage();page.setDefaultTimeout(10000);
 const errors=[],writes=[];page.on('pageerror',error=>errors.push(error.message));
 const panel=page.getByRole('region',{name:'Movie filename preview',exact:true});
 const collection=page.getByRole('complementary',{name:'Library collection',exact:true});

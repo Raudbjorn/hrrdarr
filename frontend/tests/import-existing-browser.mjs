@@ -26,7 +26,7 @@ writeFileSync(`${tvPath}/Second Fixture Show/Second.Fixture.Show.S01E01.mkv`, Bu
 mkdirSync(`${moviePath}/Fixture Import Movie`, { recursive: true });
 writeFileSync(`${moviePath}/Fixture Import Movie/Fixture.Import.Movie.2021.1080p.WEB-DL.mkv`, Buffer.alloc(65536));
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE } : {}) });
 const page = await browser.newPage();
 page.setDefaultTimeout(15000);
 const errors = [];

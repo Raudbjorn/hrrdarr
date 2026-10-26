@@ -302,10 +302,23 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
     Ok(out)
 }
 
-// Only successful upgrades omit 0052's deliberate changes; rollback/backup/reopen witnesses stay exact.
-async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
+// Only successful upgrades omit deliberate additions; rollback/backup/reopen witnesses stay exact.
+async fn upgrade_witness(
+    c: &Connection,
+    predecessor_names: &str,
+) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
-    witness_with_schema(c, &format!("SELECT * FROM ({PRESERVED_SCHEMA}) WHERE
+    // 0053 appends one journal column and two indexes; preserve old columns separately below.
+    // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
+    // 0059 resolves client kind through provider_implementations: map only that predicate back
+    // to the qBittorrent literal, and exclude the provider tables/guards it rebuilds (their rows
+    // and constraints are covered by db::download_client_registry_tests).
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(sql,'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+        name IN ({predecessor_names}) AND
+        NOT (type='table' AND name IN ('providers','provider_scopes')) AND
+        name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
+        NOT (type='table' AND name IN ('import_journal','download_processing')) AND
+        name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND
         tbl_name NOT IN ('download_client_tags','rss_client_attempts') AND name NOT IN (
         'rss_commands','search_commands','rss_schedules','rss_candidates',
         'rss_commands_active','rss_candidate_selection_identity','rss_schedules_selection',
@@ -314,7 +327,16 @@ async fn upgrade_witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         'rss_schedules_admit','rss_schedules_update','rss_candidate_admit','rss_candidate_transition',
         'rss_comparison_facts_update','rss_hash_retained','rss_candidate_local_storage_retry',
         'rss_candidate_selection_admit','rss_candidate_selection_transition',
-        'rss_selected_episode_insert','rss_selected_episode_delete') ORDER BY type,name")).await
+        'rss_selected_episode_insert','rss_selected_episode_delete',
+        'import_journal_path_unresolved','download_processing_path_unresolved') ORDER BY type,name")).await?;
+    // 0054 adds new producer objects (outside the actual44 object set), extends only
+    // the exact capacity term above, and rebuilds processing / ownership guards.
+    // Its dedicated migration tests exercise those changed guards; retain every
+    // predecessor processing column definition here rather than dropping its shape.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('download_processing') WHERE name!='scan_command_id' ORDER BY cid").await?);
+    // Compare every predecessor journal column definition exactly despite the additive column.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
+    Ok(result)
 }
 
 async fn seed(c: &Connection) -> Result<(), Error> {
@@ -512,7 +534,16 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = raw_connection(&old).await?;
     seed(&c).await?;
     let before = witness(&c).await?;
-    let upgrade_before = upgrade_witness(&c).await?;
+    let mut names = c
+        .query("SELECT name FROM sqlite_schema ORDER BY name", ())
+        .await?;
+    let mut predecessor_names = Vec::new();
+    while let Some(row) = names.next().await? {
+        predecessor_names.push(format!("'{}'", row.get::<String>(0)?.replace('\'', "''")));
+    }
+    let predecessor_names = predecessor_names.join(",");
+    drop(names);
+    let upgrade_before = upgrade_witness(&c, &predecessor_names).await?;
     drop(c);
     drop(old);
     let db = Database::open_local(scratch.database()).await?;
@@ -523,9 +554,25 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: 0052 adds client selection; historical migration prefixes stay fixed.
+        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
-    assert_eq!(upgrade_witness(&c).await?, upgrade_before);
+    assert_eq!(
+        upgrade_witness(&c, &predecessor_names).await?,
+        upgrade_before
+    );
+    // 0055 only appends unknown runtime / pending exact-replay activation defaults.
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE runtime IS NOT NULL").await?,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT sum(series_runtime_version) FROM snapshot_imports"
+        )
+        .await?,
+        0
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
     assert_eq!(scalar(&c, "SELECT count(*) FROM movie_metadata WHERE studio IS NULL AND genres_json IS NULL AND keywords_json IS NULL").await?, 3);
     assert_eq!(
@@ -649,7 +696,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        52 // Reasoning: 0052 adds client selection; historical migration prefixes stay fixed.
+        62 // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

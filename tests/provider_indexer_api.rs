@@ -541,9 +541,10 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
     }
     values
 }
-// Reasoning: 0051 adds scoped client backoff checks. Compare all ten identities
-// per domain so unexpected sibling markers fail; client saves also invalidate their backoff check.
-const IDENTITIES: [(&str, &str); 20] = [
+// Reasoning: 0053 adds scoped path diagnostics. Compare all eleven identities
+// per domain so unexpected sibling markers fail; client saves invalidate their path check too.
+// Reasoning: 0060 adds recycle_bin per domain; provider edits never mark it.
+const IDENTITIES: [(&str, &str); 24] = [
     ("movies", "completed_download_handling"),
     ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
@@ -553,6 +554,8 @@ const IDENTITIES: [(&str, &str); 20] = [
     ("movies", "indexer_rss"),
     ("movies", "indexer_search"),
     ("movies", "indexer_status"),
+    ("movies", "recycle_bin"),
+    ("movies", "remote_path_mapping"),
     ("movies", "removed_metadata"),
     ("tv", "completed_download_handling"),
     ("tv", "download_client_backoff"),
@@ -563,6 +566,8 @@ const IDENTITIES: [(&str, &str); 20] = [
     ("tv", "indexer_rss"),
     ("tv", "indexer_search"),
     ("tv", "indexer_status"),
+    ("tv", "recycle_bin"),
+    ("tv", "remote_path_mapping"),
     ("tv", "removed_metadata"),
 ];
 /// Indexer edits invalidate capability, binding and backoff checks for their domain.
@@ -590,6 +595,8 @@ fn client_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {
                 (*d, "download_client_backoff"),
                 (*d, "download_client_communication"),
                 (*d, "download_client_root_folder"),
+                // 0053: client configuration also invalidates its scoped path evidence.
+                (*d, "remote_path_mapping"),
             ]
         })
         .collect()

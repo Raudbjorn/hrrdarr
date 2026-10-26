@@ -1,7 +1,8 @@
 // Pure hash-route table. No DOM access: callers pass in `location.hash`.
 export type ViewId =
   | 'library' | 'health' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles'
-  | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history';
+  | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'
+  | 'wanted-missing' | 'wanted-cutoff';
 
 export type Route =
   | { kind: 'view'; view: ViewId }
@@ -20,6 +21,8 @@ export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   activity: '/activity/queue',
   blocklist: '/activity/blocklist',
   history: '/activity/history',
+  'wanted-missing': '/wanted/missing',
+  'wanted-cutoff': '/wanted/cutoffunmet',
   providers: '/settings/providers',
   qualities: '/settings/quality',
   profiles: '/settings/profiles',
@@ -41,7 +44,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { view: 'qualities', label: 'Quality', description: 'Quality definitions' },
   { view: 'profiles', label: 'Profiles', description: 'Quality, delay and release profiles' },
   { view: 'naming', label: 'Naming', description: 'Episode and movie file naming' },
-  { view: 'media-management', label: 'Media management', description: 'Revision and upgrade policy' },
+  { view: 'media-management', label: 'Media management', description: 'Revision, import policy and recycle bin' },
   { view: 'custom-formats', label: 'Custom formats', description: 'Release matching formats' },
   { view: 'tags', label: 'Tags', description: 'Tags shared by library items and settings' },
   { view: 'general', label: 'General', description: 'Host and general settings' },

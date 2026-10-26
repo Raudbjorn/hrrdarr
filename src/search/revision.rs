@@ -97,6 +97,93 @@ pub(crate) fn order(a: &FileRevision, b: &FileRevision) -> Ordering {
     (a.real, a.version).cmp(&(b.real, b.version))
 }
 
+/// Scan provenance is independent of the legacy RSS binding. A new explicit scan
+/// may observe the actual local baseline even when its real receipt has no revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScanRevisionEvidence {
+    pub version: u8,
+    pub filename: Observation,
+    pub folder: Option<Observation>,
+    pub download: Option<Observation>,
+    pub receipt: Option<Observation>,
+    pub effective: FileRevision,
+}
+pub(crate) fn scan_revision(
+    filename: &ParsedRelease,
+    folder: Option<&ParsedRelease>,
+    download: Option<&ParsedRelease>,
+    receipt: Option<&Observation>,
+) -> Result<ScanRevisionEvidence, &'static str> {
+    let filename = Observation::from_parsed(filename).ok_or("revision_unknown")?;
+    let folder = folder.and_then(Observation::from_parsed);
+    let download = download.and_then(Observation::from_parsed);
+    let mut selected: Option<&Observation> = None;
+    for observation in [Some(&filename), folder.as_ref(), download.as_ref(), receipt]
+        .into_iter()
+        .flatten()
+    {
+        observation.validate()?;
+        if !observation.explicit_marker {
+            if observation.value.version != 1
+                || observation.value.real != 0
+                || observation.value.is_repack
+            {
+                return Err("revision_evidence_invalid");
+            }
+            continue;
+        }
+        if let Some(previous) = selected {
+            // Explicit name tags outrank fallback baselines. Among explicit
+            // observations compare (REAL, version); an exact tie keeps the earlier
+            // actual observation and its repack flag. Requirement precedence is
+            // filename, folder, current client item, then grabbed receipt.
+            if order(&observation.value, &previous.value) == Ordering::Greater {
+                selected = Some(observation);
+            }
+        } else {
+            selected = Some(observation);
+        }
+    }
+    let effective = selected.unwrap_or(&filename).value.clone();
+    Ok(ScanRevisionEvidence {
+        version: 1,
+        filename,
+        folder,
+        download,
+        receipt: receipt.cloned(),
+        effective,
+    })
+}
+/// Import compares measured files, not whether another release should be grabbed.
+/// Equality passes; cutoff, age, group, min-increment and upgrade_allowed do not apply.
+pub(crate) fn compare_import(
+    candidate: &Facts<'_>,
+    current: &Facts<'_>,
+    mode: Mode,
+) -> Vec<&'static str> {
+    match candidate.rank.cmp(&current.rank) {
+        Ordering::Less => vec!["not_quality_upgrade"],
+        Ordering::Greater => Vec::new(),
+        Ordering::Equal => {
+            let mut reasons = Vec::new();
+            if mode != Mode::DoNotPrefer {
+                match candidate.revision.zip(current.revision) {
+                    Some((new, old)) if order(new, old) == Ordering::Less => {
+                        reasons.push("not_revision_upgrade")
+                    }
+                    None => reasons.push("existing_revision_unknown"),
+                    _ => {}
+                }
+            }
+            if candidate.score < current.score {
+                reasons.push("not_custom_format_upgrade");
+            }
+            reasons
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EvaluationClock {
     pub proper_cutoff_utc: i64,
@@ -359,7 +446,17 @@ mod tests {
         );
         let legacy = serde_json::json!({"version":1,"real":0,"is_repack":false,"extra":1});
         assert!(serde_json::from_value::<FileRevision>(legacy).is_err());
-        assert!(revision(0, 0, false).validate().is_err());
+        // Quality v0 is an observed value; it is not an evidence-envelope version.
+        assert!(revision(0, 0, false).validate().is_ok());
+        assert!(revision(-1, 0, false).validate().is_err());
+        let zero = super::super::parser::parse("Harbor - 023v0 1080p WEB-DL", true).unwrap();
+        let bound = reconcile(None, &zero).unwrap();
+        assert_eq!(bound.effective, revision(0, 0, false));
+        assert!(bound.validate().is_ok());
+        assert_eq!(
+            order(&bound.effective, &revision(1, 0, false)),
+            Ordering::Less
+        );
         assert!(
             revision(1, i64::from(i32::MAX) + 1, false)
                 .validate()
@@ -601,5 +698,164 @@ mod tests {
             single_midnight::<Utc>(LocalResult::None).unwrap_err(),
             "proper_age_clock_nonexistent"
         );
+    }
+}
+
+#[cfg(test)]
+mod scan_import_tests {
+    use super::*;
+    fn parsed(suffix: &str) -> ParsedRelease {
+        crate::search::parser::parse(&format!("Harbor.S01E01.1080p.WEB-DL.{suffix}"), true).unwrap()
+    }
+    #[test]
+    fn scan_observations_preserve_absence_and_explicit_zero() {
+        let zero = parsed("v0");
+        let baseline = parsed("");
+        let second = parsed("v2");
+        let evidence = scan_revision(&zero, None, None, None).unwrap();
+        assert_eq!(evidence.effective.version, 0);
+        assert!(evidence.receipt.is_none());
+        let evidence = scan_revision(
+            &zero,
+            None,
+            None,
+            Observation::from_parsed(&baseline).as_ref(),
+        )
+        .unwrap();
+        assert_eq!(evidence.effective.version, 0);
+        let evidence = scan_revision(
+            &zero,
+            None,
+            None,
+            Observation::from_parsed(&second).as_ref(),
+        )
+        .unwrap();
+        assert_eq!(evidence.filename.value.version, 0);
+        assert_eq!(evidence.effective.version, 2);
+        // Numeric ties select one original observation; repack is not a new
+        // confidence/ranking dimension and must not cause a valid input rejection.
+        assert!(
+            !scan_revision(
+                &parsed("PROPER"),
+                None,
+                None,
+                Observation::from_parsed(&parsed("REPACK")).as_ref()
+            )
+            .unwrap()
+            .effective
+            .is_repack
+        );
+        assert!(
+            scan_revision(
+                &parsed("REPACK"),
+                None,
+                None,
+                Observation::from_parsed(&parsed("PROPER")).as_ref()
+            )
+            .unwrap()
+            .effective
+            .is_repack
+        );
+        let real = scan_revision(
+            &parsed("REAL"),
+            None,
+            None,
+            Observation::from_parsed(&second).as_ref(),
+        )
+        .unwrap();
+        assert_eq!((real.effective.real, real.effective.version), (1, 1));
+        let higher_real = scan_revision(
+            &parsed("v3"),
+            None,
+            None,
+            Observation::from_parsed(&parsed("REAL.v0")).as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            (higher_real.effective.real, higher_real.effective.version),
+            (1, 0)
+        );
+        let folder = parsed("REPACK");
+        let client = parsed("PROPER");
+        let history = Observation::from_parsed(&client);
+        assert!(
+            scan_revision(&baseline, Some(&folder), Some(&client), history.as_ref())
+                .unwrap()
+                .effective
+                .is_repack
+        );
+        assert!(
+            !scan_revision(
+                &baseline,
+                None,
+                Some(&client),
+                Observation::from_parsed(&folder).as_ref()
+            )
+            .unwrap()
+            .effective
+            .is_repack
+        );
+        assert_eq!(
+            scan_revision(
+                &zero,
+                Some(&baseline),
+                Some(&baseline),
+                Observation::from_parsed(&baseline).as_ref()
+            )
+            .unwrap()
+            .effective
+            .version,
+            0
+        );
+        // This explicit scan accommodation must not weaken old RSS unknown handling.
+        assert_eq!(reconcile(None, &baseline).unwrap_err(), "revision_unknown");
+    }
+    #[test]
+    fn import_equality_and_independent_revision_cf_downgrades() {
+        let revision = parsed("").revision.unwrap();
+        let higher = parsed("PROPER").revision.unwrap();
+        let old = Facts {
+            quality_id: 3,
+            rank: 1,
+            revision: Some(&revision),
+            score: 10,
+            group: Some("A"),
+            date_added: Some(1),
+        };
+        let mut incoming = Facts {
+            quality_id: 3,
+            rank: 1,
+            revision: Some(&revision),
+            score: 10,
+            group: Some("B"),
+            date_added: None,
+        };
+        let mode = Mode::PreferAndUpgrade;
+        assert!(compare_import(&incoming, &old, mode).is_empty());
+        incoming.revision = Some(&higher);
+        incoming.score = 9;
+        assert_eq!(
+            compare_import(&incoming, &old, mode),
+            vec!["not_custom_format_upgrade"]
+        );
+        incoming.rank = 2;
+        assert!(compare_import(&incoming, &old, mode).is_empty());
+        incoming.rank = 0;
+        assert_eq!(
+            compare_import(&incoming, &old, mode),
+            vec!["not_quality_upgrade"]
+        );
+        let new_old = Facts {
+            revision: Some(&higher),
+            ..old
+        };
+        incoming.rank = 1;
+        incoming.revision = Some(&revision);
+        incoming.score = 10;
+        assert_eq!(
+            compare_import(&incoming, &new_old, mode),
+            vec!["not_revision_upgrade"]
+        );
+        assert!(compare_import(&incoming, &new_old, Mode::DoNotPrefer).is_empty());
     }
 }

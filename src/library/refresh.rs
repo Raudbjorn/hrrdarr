@@ -362,8 +362,11 @@ pub(crate) async fn series_facts(
     // scalar/set facts here, not the potentially 10,000-episode graph.
     use crate::metadata::{canonical_country, canonical_scalar, canonical_set};
     if detail
-        .original_language
-        .is_some_and(|v| !(0..=52).contains(&v))
+        .runtime
+        .is_some_and(|value| !(0..=crate::metadata::MAX_SERIES_RUNTIME_MINUTES).contains(&value))
+        || detail
+            .original_language
+            .is_some_and(|v| !(0..=52).contains(&v))
         || detail
             .status
             .as_deref()
@@ -381,10 +384,11 @@ pub(crate) async fn series_facts(
             .into(),
         detail.status.clone().into(),
         set_json(&canonical_set(detail.genres.clone()).map_err(|_| Error::Conflict)?)?,
+        detail.runtime.into(),
     ];
-    let row = c.query("SELECT original_language,network,original_country,status,genres_json FROM series WHERE id=?", [id]).await?.next().await?.ok_or(Error::TargetChanged)?;
+    let row = c.query("SELECT original_language,network,original_country,status,genres_json,runtime FROM series WHERE id=?", [id]).await?.next().await?.ok_or(Error::TargetChanged)?;
     let mut changed = false;
-    let mut values = Vec::with_capacity(6);
+    let mut values = Vec::with_capacity(7);
     for (i, incoming) in supplied.into_iter().enumerate() {
         let prior = row.get_value(i as i32)?;
         let value = if incoming == Value::Null || (i == 4 && same_set(&incoming, &prior)?) {
@@ -400,7 +404,7 @@ pub(crate) async fn series_facts(
     }
     if changed {
         values.push(id.into());
-        c.execute("UPDATE series SET original_language=?,network=?,original_country=?,status=?,genres_json=? WHERE id=?",values).await?;
+        c.execute("UPDATE series SET original_language=?,network=?,original_country=?,status=?,genres_json=?,runtime=? WHERE id=?",values).await?;
     }
     Ok(changed)
 }
@@ -568,7 +572,7 @@ mod tests {
             .unwrap();
         let c = db.connect().await.unwrap();
         c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,1,'TV','/tv'); INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,1,'Movie');").await.unwrap();
-        let tv: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","seasons":[],"episodes":[],"network":"Network","original_country":"isl","status":"continuing","genres":["Drama","drama"]})).unwrap();
+        let tv: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","runtime":0,"seasons":[],"episodes":[],"network":"Network","original_country":"isl","status":"continuing","genres":["Drama","drama"]})).unwrap();
         let film: MovieDetails = serde_json::from_value(json!({"tmdb_id":1,"title":"Movie","runtime":0,"studio":"Studio","genres":["Drama","drama"],"keywords":[]})).unwrap();
         let tx = c.transaction().await.unwrap();
         assert!(series_facts(&tx, 1, &tv, false).await.unwrap());
@@ -633,6 +637,34 @@ mod tests {
             }
             tx.rollback().await.unwrap();
         }
+        // Runtime is a concrete adoption fact, including zero. Detect a late conflict
+        // before filling any earlier NULL scalar; sparse updates retain the known runtime.
+        let mut runtime_only: SeriesDetails = serde_json::from_value(json!({"tvdb_id":1,"title":"TV","seasons":[],"episodes":[],"runtime":45,"original_language":0})).unwrap();
+        assert_eq!(
+            series_facts(&c, 1, &runtime_only, false).await,
+            Err(Error::Conflict)
+        );
+        let unchanged = c
+            .query(
+                "SELECT runtime,original_language FROM series WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.get::<i64>(0).unwrap(), 0);
+        assert_eq!(unchanged.get_value(1).unwrap(), Value::Null);
+        runtime_only.runtime = None;
+        runtime_only.original_language = None;
+        assert!(!series_facts(&c, 1, &runtime_only, true).await.unwrap());
+        runtime_only.runtime = Some(crate::metadata::MAX_SERIES_RUNTIME_MINUTES + 1);
+        assert_eq!(
+            series_facts(&c, 1, &runtime_only, true).await,
+            Err(Error::Conflict)
+        );
         // Keywords [] is equally concrete; a late conflict blocks an earlier NULL fill.
         film.genres = None;
         film.keywords = Some(vec!["New".into()]);

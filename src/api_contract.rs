@@ -49,6 +49,14 @@ pub fn render() -> String {
     registry.visit::<crate::commands::processing::ProcessingPolicyReset>();
     registry.visit::<crate::revision_policy::Policy>();
     registry.visit::<crate::revision_policy::Update>();
+    registry.visit::<crate::import_policy::Policy>();
+    registry.visit::<crate::import_policy::Update>();
+    registry.visit::<crate::recycle_bin::Settings>();
+    registry.visit::<crate::recycle_bin::Update>();
+    registry.visit::<crate::recycle_bin::deletion::DeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
+    registry.visit::<crate::recycle_bin::deletion::Deletion>();
+    registry.visit::<crate::recycle_bin::deletion::Batch>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
@@ -83,7 +91,11 @@ pub fn render() -> String {
         crate::search::ReleasePolicy,
         crate::commands::blocklist::BlocklistClearInput,
         crate::api::ApiPage<crate::commands::blocklist::BlocklistClearCommand>,
+        crate::commands::recycle_cleanup::RecycleBinCleanupInput,
+        crate::api::ApiPage<crate::commands::recycle_cleanup::RecycleBinCleanupCommand>,
         crate::commands::manual_import::ManualImportBatchInput,
+        crate::commands::manual_import::ManualImportReconcileInput,
+        crate::commands::manual_import::ManualImportReconciliation,
         crate::commands::manual_import::ManualImportCommandQuery,
         crate::api::ApiPage<crate::commands::manual_import::ManualImportCommand>,
         crate::health::HealthCommandInput,
@@ -93,6 +105,15 @@ pub fn render() -> String {
         crate::api::ApiPage<crate::health::HealthCommand>,
         crate::commands::quality_reset::QualityResetInput,
         crate::api::ApiPage<crate::commands::quality_reset::QualityResetCommand>,
+        crate::commands::downloaded_scan::DownloadedScanInput,
+        crate::commands::downloaded_scan::DownloadedScanQuery,
+        crate::commands::downloaded_scan::DownloadedScanChildQuery,
+        crate::api::ApiPage<crate::commands::downloaded_scan::DownloadedScanCommand>,
+        crate::api::ApiPage<crate::commands::downloaded_scan::ScanChild>,
+        crate::commands::downloaded_scan::ScanChildResumeInput,
+        crate::commands::downloaded_scan::ScanCleanupResumeInput,
+        crate::commands::downloaded_scan::ScanMemberQuery,
+        crate::api::ApiPage<crate::commands::downloaded_scan::ScanChildMember>,
         crate::commands::rescan::RescanInput,
         crate::commands::rescan::RescanQuery,
         crate::commands::rescan::RescanBatch,
@@ -214,6 +235,8 @@ pub fn render() -> String {
         crate::naming::TvNamingUpdate,
         crate::naming::TvNamingExamplesQuery,
         crate::naming::TvNamingExamples,
+        crate::naming::MultiEpisodeNamingExample,
+        crate::naming::MultiEpisodeExampleStatus,
         crate::naming::MovieNamingConfig,
         crate::naming::MovieNamingUpdate,
         crate::naming::MovieNamingExamplesQuery,
@@ -221,6 +244,11 @@ pub fn render() -> String {
         crate::parse::ParseQuery,
         crate::parse::TvParseResult,
         crate::parse::MovieParseResult,
+        crate::wanted::WantedQuery,
+        crate::wanted::WantedPage<crate::wanted::TvWantedItem>,
+        crate::wanted::WantedPage<crate::wanted::MovieWantedItem>,
+        crate::wanted::WantedSearchInput,
+        crate::wanted::WantedSearchReceipt,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",

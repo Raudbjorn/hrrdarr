@@ -22,6 +22,11 @@ const STATUS_RESERVE: Duration = Duration::from_secs(5);
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_FIELD_BYTES: usize = 32 * 1024;
 const MAX_MULTIPART_BYTES: u64 = (MAX_BODY_BYTES + MAX_FIELD_BYTES + 16 * 1024) as u64;
+/// JSON request bodies may carry a base64-encoded `.torrent` of up to [`MAX_BODY_BYTES`].
+pub const MAX_JSON_BYTES: usize = MAX_BODY_BYTES / 2 * 3 + 64 * 1024;
+/// Transmission's CSRF token is an opaque printable string; anything larger is rejected.
+const MAX_SESSION_ID_BYTES: usize = 128;
+const SESSION_HEADER: &str = "x-transmission-session-id";
 // Private protocol payloads must never acquire a Debug or public serialization implementation.
 pub enum HttpRequestBody {
     Empty,
@@ -32,11 +37,15 @@ pub enum HttpRequestBody {
         field_name: String,
         file: Vec<u8>,
     },
+    /// A serialized JSON document POSTed as `application/json` (bounded by [`MAX_JSON_BYTES`]).
+    Json(Vec<u8>),
 }
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub set_cookies: Vec<String>,
+    /// A bounded `X-Transmission-Session-Id` response header, when the server sent one.
+    pub session_id: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpError {
@@ -287,7 +296,7 @@ impl HttpOperation<'_> {
                 .map_err(|_| HttpError::InvalidRequest)?;
             if !matches!(
                 name.as_str(),
-                "cookie" | "referer" | "origin" | "authorization"
+                "cookie" | "referer" | "origin" | "authorization" | SESSION_HEADER
             ) || header_map.contains_key(&name)
                 || value.len() > 4096
             {
@@ -309,6 +318,11 @@ impl HttpOperation<'_> {
             value.set_sensitive(true);
             header_map.insert(name, value);
         }
+        let length_limit = if matches!(body, HttpRequestBody::Json(_)) {
+            MAX_JSON_BYTES as u64
+        } else {
+            MAX_MULTIPART_BYTES
+        };
         let request = match body {
             HttpRequestBody::Empty => self.client.client.get(url),
             HttpRequestBody::Form(fields) => {
@@ -351,6 +365,16 @@ impl HttpOperation<'_> {
                 }
                 self.client.client.post(url).multipart(form)
             }
+            HttpRequestBody::Json(bytes) => {
+                if bytes.is_empty() || bytes.len() > MAX_JSON_BYTES {
+                    return Err(HttpError::InvalidRequest);
+                }
+                self.client
+                    .client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+            }
         }
         .headers(header_map)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -364,7 +388,7 @@ impl HttpOperation<'_> {
                     .to_str()
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
-                    .is_none_or(|size| size > MAX_MULTIPART_BYTES)
+                    .is_none_or(|size| size > length_limit)
             })
         {
             return Err(HttpError::InvalidRequest);
@@ -397,6 +421,7 @@ impl HttpOperation<'_> {
                         status: status.as_u16(),
                         body: Vec::new(),
                         set_cookies: Vec::new(),
+                        session_id: None,
                     });
                 }
                 return Err(HttpError::Authentication);
@@ -438,6 +463,19 @@ impl HttpOperation<'_> {
                         .to_owned(),
                 );
             }
+            let session_id = match response.headers().get(SESSION_HEADER) {
+                None => None,
+                Some(value) => {
+                    let value = value.to_str().map_err(|_| HttpError::InvalidResponse)?;
+                    if value.is_empty()
+                        || value.len() > MAX_SESSION_ID_BYTES
+                        || !value.bytes().all(|b| b.is_ascii_graphic())
+                    {
+                        return Err(HttpError::InvalidResponse);
+                    }
+                    Some(value.to_owned())
+                }
+            };
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(classify)? {
                 if chunk.len() > MAX_BODY_BYTES - bytes.len() {
@@ -449,6 +487,7 @@ impl HttpOperation<'_> {
                 status: status.as_u16(),
                 body: bytes,
                 set_cookies,
+                session_id,
             })
         };
         tokio::time::timeout_at(self.deadline - STATUS_RESERVE, work)

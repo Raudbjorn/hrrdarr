@@ -105,6 +105,14 @@ pub enum DownloadDiagnostic {
     Metadata,
     DhtDisabled,
     UnknownState,
+    /// Usenet post-processing stages; the download itself has finished transferring.
+    Verifying,
+    Repairing,
+    Extracting,
+    Moving,
+    PostProcessing,
+    /// Unpacking stopped because the client reported a write error or full disk.
+    DiskFull,
 }
 #[derive(Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -468,14 +476,14 @@ fn scope(settings: &ProviderSettings, domain: MediaDomain) -> Result<&DownloadSc
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
+pub(crate) fn target_domain(target: &MediaTarget) -> Result<MediaDomain> {
     match target {
         MediaTarget::Episode(id) if *id > 0 => Ok(MediaDomain::Tv),
         MediaTarget::Movie(id) if *id > 0 => Ok(MediaDomain::Movies),
         _ => Err(QbitError::InvalidRequest),
     }
 }
-fn hash(value: &str) -> Result<String> {
+pub(crate) fn hash(value: &str) -> Result<String> {
     if ![40, 64].contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(QbitError::InvalidRequest);
     }
@@ -1517,6 +1525,19 @@ pub struct ClientStatus {
     pub locality: EndpointLocality,
     pub removes_completed_downloads: bool,
 }
+pub(crate) enum ClientStatusSnapshot {
+    Status(ClientStatus),
+    OutputMissing(EndpointLocality),
+    OutputInvalid(EndpointLocality),
+}
+impl ClientStatusSnapshot {
+    fn into_status(self) -> Result<ClientStatus> {
+        match self {
+            Self::Status(status) => Ok(status),
+            Self::OutputMissing(_) | Self::OutputInvalid(_) => Err(QbitError::InvalidResponse),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootSource {
     Default,
@@ -1527,7 +1548,7 @@ pub enum EndpointLocality {
     Loopback,
     Unknown,
 }
-fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
+pub(crate) fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
     let url = url::Url::parse(endpoint).map_err(|_| QbitError::InvalidRequest)?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -1543,7 +1564,7 @@ fn endpoint_locality(endpoint: &str) -> Result<EndpointLocality> {
         EndpointLocality::Unknown
     })
 }
-fn validate_remote_path(path: &str) -> Result<()> {
+pub(crate) fn validate_remote_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.len() > 4096
         || path.chars().any(char::is_control)
@@ -1576,7 +1597,7 @@ fn validate_remote_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
-fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
+pub(crate) fn remote_root(default: &str, category: Option<&str>) -> Result<(String, RootSource)> {
     validate_remote_path(default)?;
     let rooted = |p: &str| {
         p.starts_with('/') || p.starts_with("\\\\") || (p.len() >= 3 && p.as_bytes()[1] == b':')
@@ -1607,29 +1628,66 @@ pub async fn client_status(
     credentials: Option<&Credentials>,
     domain: MediaDomain,
 ) -> Result<ClientStatus> {
+    client_status_snapshot(operation, settings, credentials, domain)
+        .await?
+        .into_status()
+}
+pub(crate) async fn client_status_snapshot(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    domain: MediaDomain,
+) -> Result<ClientStatusSnapshot> {
     let configured = scope(settings, domain)?;
     let mut session = Session::connect(operation, settings, credentials).await?;
     let preferences = session
         .get("api/v2/app/preferences", "query/preferences", &[])
         .await?;
-    let removes_completed_downloads = removes_completed_downloads(session.version, &preferences)?;
-    let default = text(&preferences, "save_path", 4096)?;
     let categories = if session.legacy {
         BTreeMap::new()
     } else {
         session.categories().await?
     };
-    let (remote_root, root_source) = remote_root(
-        &default,
+    status_from_preferences(
+        session.version,
+        &preferences,
         categories.get(&configured.category).map(String::as_str),
-    )?;
-    Ok(ClientStatus {
+        domain,
+        endpoint_locality(settings.endpoint())?,
+    )
+}
+fn status_from_preferences(
+    version: Version,
+    preferences: &Value,
+    category: Option<&str>,
+    domain: MediaDomain,
+    locality: EndpointLocality,
+) -> Result<ClientStatusSnapshot> {
+    if !preferences.is_object() {
+        return Err(QbitError::InvalidResponse);
+    }
+    // Unrelated malformed protocol fields must not become a path diagnosis.
+    let removes_completed_downloads = removes_completed_downloads(version, preferences)?;
+    match preferences.get("save_path") {
+        None | Some(Value::Null) => return Ok(ClientStatusSnapshot::OutputMissing(locality)),
+        Some(Value::String(value)) if value.is_empty() => {
+            return Ok(ClientStatusSnapshot::OutputMissing(locality));
+        }
+        _ => {}
+    }
+    let Ok(default) = text(preferences, "save_path", 4096) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    let Ok((remote_root, root_source)) = remote_root(&default, category) else {
+        return Ok(ClientStatusSnapshot::OutputInvalid(locality));
+    };
+    Ok(ClientStatusSnapshot::Status(ClientStatus {
         domain,
         remote_root,
         root_source,
-        locality: endpoint_locality(settings.endpoint())?,
+        locality,
         removes_completed_downloads,
-    })
+    }))
 }
 fn verify_tags(torrent: &Value, requested: &[String]) -> Result<()> {
     let raw = text(torrent, "tags", 16_384)?;
@@ -1990,14 +2048,14 @@ pub enum AddOutcome {
         hashes: Vec<String>,
     },
 }
-fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
+pub(crate) fn digest_hex(algorithm: &'static ring::digest::Algorithm, data: &[u8]) -> String {
     ring::digest::digest(algorithm, data)
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn magnet_hashes(value: &str) -> Result<Vec<String>> {
+pub(crate) fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     if value.len() > 16384 || value.chars().any(char::is_control) {
         return Err(QbitError::InvalidRequest);
     }
@@ -2050,7 +2108,7 @@ fn magnet_hashes(value: &str) -> Result<Vec<String>> {
     Ok(identities.into_iter().collect())
 }
 /// Walk bencode without reserializing: info hashes cover the original byte slice.
-fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn torrent_hashes(bytes: &[u8]) -> Result<Vec<String>> {
     struct Decoder<'a> {
         bytes: &'a [u8],
         position: usize,
@@ -2380,6 +2438,27 @@ impl SubmissionIdentity {
     pub fn payload_sha256(&self) -> &str {
         &self.payload_sha256
     }
+    pub(crate) fn settings_fingerprint(&self) -> &str {
+        &self.settings_fingerprint
+    }
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+    /// Shared journal shape for client protocols whose identity is a caller-derived token.
+    pub(crate) fn tokenized(
+        target: MediaTarget,
+        token: String,
+        settings_fingerprint: String,
+        payload_sha256: String,
+    ) -> Self {
+        Self {
+            version: 1,
+            target,
+            hashes: vec![token],
+            settings_fingerprint,
+            payload_sha256,
+        }
+    }
     fn validate(&self, settings: &ProviderSettings) -> Result<MediaDomain> {
         let domain = target_domain(&self.target)?;
         scope(settings, domain)?;
@@ -2432,38 +2511,12 @@ pub async fn reconcile(
         },
     )
 }
-pub async fn prepare(
+/// Fetches a release URL into `.torrent` bytes (no redirects; bounded transport) and derives the
+/// info-hash identities of a magnet or metainfo payload. Shared by every torrent client.
+pub(crate) async fn resolve_source(
     operation: &HttpOperation<'_>,
-    settings: &ProviderSettings,
-    target: MediaTarget,
     source: AddSource,
-    recent: bool,
-    options: QbitOptions,
-) -> Result<PreparedDownload> {
-    let domain = target_domain(&target)?;
-    scope(settings, domain)?;
-    if options.tags.len() > 64
-        || options.tags.iter().any(|tag| {
-            tag.is_empty()
-                || tag.trim() != tag
-                || tag.len() > 64
-                || tag.contains(',')
-                || tag.chars().any(char::is_control)
-        })
-        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
-    {
-        return Err(QbitError::InvalidRequest);
-    }
-    if options
-        .ratio_limit
-        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
-        || [options.seeding_minutes, options.inactive_seeding_minutes]
-            .into_iter()
-            .flatten()
-            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
-    {
-        return Err(QbitError::InvalidRequest);
-    }
+) -> Result<(AddSource, Vec<String>)> {
     let source = match source {
         AddSource::Url(value) => {
             if value.len() > 16384 || value.chars().any(char::is_control) {
@@ -2505,6 +2558,41 @@ pub async fn prepare(
         }
         AddSource::Url(_) => return Err(QbitError::InvalidRequest),
     };
+    Ok((source, identities))
+}
+pub async fn prepare(
+    operation: &HttpOperation<'_>,
+    settings: &ProviderSettings,
+    target: MediaTarget,
+    source: AddSource,
+    recent: bool,
+    options: QbitOptions,
+) -> Result<PreparedDownload> {
+    let domain = target_domain(&target)?;
+    scope(settings, domain)?;
+    if options.tags.len() > 64
+        || options.tags.iter().any(|tag| {
+            tag.is_empty()
+                || tag.trim() != tag
+                || tag.len() > 64
+                || tag.contains(',')
+                || tag.chars().any(char::is_control)
+        })
+        || options.tags.iter().collect::<BTreeSet<_>>().len() != options.tags.len()
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    if options
+        .ratio_limit
+        .is_some_and(|n| !n.is_finite() || n > 1_000_000.0 || (n < 0.0 && n != -1.0 && n != -2.0))
+        || [options.seeding_minutes, options.inactive_seeding_minutes]
+            .into_iter()
+            .flatten()
+            .any(|n| !(-2..=i32::MAX as i64).contains(&n))
+    {
+        return Err(QbitError::InvalidRequest);
+    }
+    let (source, identities) = resolve_source(operation, source).await?;
     let payload = match &source {
         AddSource::Magnet(value) => value.as_bytes(),
         AddSource::Torrent { bytes, .. } => bytes,
@@ -3458,6 +3546,94 @@ mod tests {
                 endpoint_locality(endpoint).unwrap(),
                 EndpointLocality::Unknown
             );
+        }
+    }
+
+    #[test]
+    fn output_diagnosis_requires_exact_path_evidence() {
+        let valid = serde_json::json!({"save_path":"/downloads", "max_ratio_enabled":false,
+            "max_seeding_time_enabled":false, "max_seeding_time":-1, "max_ratio_act":0});
+        for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+            let decode = |prefs: &Value, category: Option<&str>| {
+                status_from_preferences(
+                    Version(2, 11, 0),
+                    prefs,
+                    category,
+                    domain,
+                    EndpointLocality::Unknown,
+                )
+            };
+            for value in [Value::Null, Value::String(String::new())] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputMissing(EndpointLocality::Unknown)
+                ));
+                assert!(matches!(
+                    decode(&prefs, None).unwrap().into_status(),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut absent = valid.clone();
+            absent.as_object_mut().unwrap().remove("save_path");
+            assert!(matches!(
+                decode(&absent, None).unwrap(),
+                ClientStatusSnapshot::OutputMissing(_)
+            ));
+            for value in [
+                serde_json::json!(42),
+                serde_json::json!("relative"),
+                serde_json::json!("/private\u{0}path"),
+                serde_json::json!("/../escape"),
+                serde_json::json!(format!("/{}", "x".repeat(4096))),
+            ] {
+                let mut prefs = valid.clone();
+                prefs["save_path"] = value;
+                assert!(matches!(
+                    decode(&prefs, None).unwrap(),
+                    ClientStatusSnapshot::OutputInvalid(_)
+                ));
+            }
+            assert!(matches!(
+                decode(&valid, Some("../escape")).unwrap(),
+                ClientStatusSnapshot::OutputInvalid(_)
+            ));
+            for category in [
+                None,
+                Some("movies/new"),
+                Some(r"C:\downloads"),
+                Some(r"\\server\share"),
+            ] {
+                let status = decode(&valid, category).unwrap().into_status().unwrap();
+                assert_eq!(status.domain, domain);
+                assert_eq!(status.locality, EndpointLocality::Unknown);
+            }
+            for key in [
+                "max_ratio_enabled",
+                "max_seeding_time_enabled",
+                "max_seeding_time",
+                "max_ratio_act",
+            ] {
+                let mut prefs = valid.clone();
+                // The time value is required only when its policy is enabled.
+                prefs["max_seeding_time_enabled"] = serde_json::json!(true);
+                prefs.as_object_mut().unwrap().remove(key);
+                assert!(matches!(
+                    decode(&prefs, None),
+                    Err(QbitError::InvalidResponse)
+                ));
+            }
+            let mut disabled_time = valid.clone();
+            disabled_time
+                .as_object_mut()
+                .unwrap()
+                .remove("max_seeding_time");
+            assert!(decode(&disabled_time, None).unwrap().into_status().is_ok());
+            assert!(matches!(
+                decode(&Value::Null, None),
+                Err(QbitError::InvalidResponse)
+            ));
         }
     }
 

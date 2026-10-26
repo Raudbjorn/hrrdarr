@@ -17,6 +17,8 @@ The UI uses dependency-free hash routing (`#/...`), implemented by the pure tabl
 | `#/activity/queue` | Activity |
 | `#/activity/blocklist` | Blocklist |
 | `#/activity/history` | History |
+| `#/wanted/missing` | Wanted: missing (TV/Movies switch) |
+| `#/wanted/cutoffunmet` | Wanted: cutoff unmet (TV/Movies switch) |
 | `#/system/health` | Health |
 | `#/system/rss` | RSS |
 | `#/add/import` | Import existing library |

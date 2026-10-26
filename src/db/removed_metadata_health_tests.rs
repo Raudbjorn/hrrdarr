@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -364,8 +364,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         out.push(rows(c, &format!("SELECT * FROM {table} ORDER BY 1")).await?);
     }
     // Reasoning: preserve predecessor (version<=45) health rows; exclude later registrations,
-    // including the four 0050 backoff identities covered by their migration tests.
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff') ORDER BY scope,check_key").await?);
+    // including the two 0053 path diagnostics and two 0060 recycle_bin identities covered by their migration tests.
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -429,8 +429,17 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
-    assert_eq!(witness(&c).await?, before);
+    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    // 0055/56 append runtime=NULL and two inactive activation markers. Keep the
+    // complete row witness; rollback and backup above still compare unmodified45.
+    let mut upgraded = before.clone();
+    for row in &mut upgraded[0] {
+        row.push(Value::Null);
+    }
+    for row in &mut upgraded[7] {
+        row.extend([Value::Integer(0), Value::Integer(0)]);
+    }
+    assert_eq!(witness(&c).await?, upgraded);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='indexer_download_client' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
@@ -441,7 +450,7 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_none());
     let c = db.connect().await?;
-    assert_eq!(witness(&c).await?, before);
+    assert_eq!(witness(&c).await?, upgraded);
     assert_eq!(health(&c).await?, complete);
     integrity(&c).await?;
     // Normal lifecycle discovers existing removed owners; migration never asserts success.

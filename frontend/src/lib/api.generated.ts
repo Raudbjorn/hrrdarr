@@ -118,13 +118,17 @@ export type DelayProtocol = "usenet" | "torrent";
 
 export type DelaySettings = { "semantics": "legacy_age_only", torrent_delay_minutes: number | null, usenet_delay_minutes: number | null, } | { "semantics": "profile" } & DelayProfileSettings;
 
+export type DeletionEventType = "file_deleted";
+
+export type DeletionReason = "manual" | "upgrade";
+
 export type Direction = "remote_to_local" | "local_to_remote";
 
 export type Disposition = "accept" | "reject" | "delay";
 
 export type DownloadContentLayout = "default" | "original" | "subfolder";
 
-export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state";
+export type DownloadDiagnostic = "error" | "missing_files" | "stalled" | "metadata" | "dht_disabled" | "unknown_state" | "verifying" | "repairing" | "extracting" | "moving" | "post_processing" | "disk_full";
 
 export type DownloadFile = { index: number, name: string, size_bytes: number, progress: number, priority: number, };
 
@@ -138,13 +142,21 @@ export type DownloadItem = { hash: string, domain: MediaDomain, name: string, ca
 
 export type DownloadPage = { domain: MediaDomain, offset: number, limit: number, next_offset: number | null, items: Array<DownloadItem>, };
 
-export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, reasons: Array<string>, created_at: number, updated_at: number, };
+export type DownloadProcessing = { receipt_id: string, target: ReleaseTarget, provider_id: string, provider_revision: number, remote_id: string, policy_revision: number, status: ProcessingStatus, preflight_attempts: number, total_preflight_attempts: number, next_attempt_at: number, operation_id: string | null, import_phase: string | null, resume_requested: boolean, retirement_state: string | null, recycle_state: string | null, recovery_bytes_retained: boolean, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, reasons: Array<string>, created_at: number, updated_at: number, scan_command_id: string | null, scan_reserved: boolean, };
 
 export type DownloadQuery = { domain: MediaDomain, offset: number, limit: number, imported: boolean, };
 
 export type DownloadScope = { category: string, imported_category: string | null, recent_priority: number, older_priority: number, initial_state?: DownloadInitialState, content_layout?: DownloadContentLayout, sequential_order?: boolean, first_last_first?: boolean, add_tags?: boolean, tags?: Array<number>, };
 
 export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "warning" | "stalled" | "unknown";
+
+export type DownloadedScanChildQuery = { disposition?: ScanDisposition, limit?: number, offset?: number, };
+
+export type DownloadedScanCommand = { id: string, media_type: MediaDomain, path: string, mode: ScanMode, priority: CommandPriority, tracked: ScanTracked | null, tracking: ScanTracking, status: CommandStatus, phase: ScanPhase, outcome: ScanOutcome | null, error_code: string | null, attempts: number, run_generation: number, cancel_requested: boolean, inventory_revision: number, source: ScanSource | null, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, counts: ScanCounts, receipt_id: string | null, predecessor_operation_id: string | null, coverage: ScanCoverage, cleanup: ScanCleanup, supersedes_command_id: string | null, successor_command_id: string | null, successor_allowed: boolean, };
+
+export type DownloadedScanInput = { id: string, path: string, mode: ScanMode, priority: CommandPriority, tracked?: ScanTracked, supersedes_command_id?: string, };
+
+export type DownloadedScanQuery = { status?: CommandStatus, limit?: number, offset?: number, };
 
 export type Episode = { id: number, series_id: number, season: number, number: number, title: string, monitored: boolean, episode_file_id: number | null, has_file: boolean, file_path: string | null, tvdb_id: number | null, air_date: string | null, air_date_utc: string | null, last_search_time: string | null, runtime: number | null, finale_type: string | null, overview: string | null, absolute_episode_number: number | null, scene_absolute_episode_number: number | null, scene_episode_number: number | null, scene_season_number: number | null, unverified_scene_numbering: boolean | null, series?: EpisodeSeriesProjection, episode_file?: EpisodeFileProjection, images?: Array<EpisodeCover> | null, };
 
@@ -164,11 +176,23 @@ export type EpisodeMonitorMany = { episode_ids: Array<number>, monitored: boolea
 
 export type EpisodeQuery = { series_id?: number, season?: number, episode_ids?: string, episode_file_id?: number, offset?: number, limit?: number, include_series?: boolean, include_episode_file?: boolean, include_images?: boolean, };
 
-export type EpisodeSeriesProjection = { id: number, tvdb_id: number | null, title: string, year: number | null, path: string, poster: string | null, monitored: boolean, };
+export type EpisodeSeriesProjection = { runtime: number | null, id: number, tvdb_id: number | null, title: string, year: number | null, path: string, poster: string | null, monitored: boolean, };
 
 export type EvaluatedRelease = { metadata: ReleaseMetadata, decision: ReleaseDecision, };
 
 export type FileBulk = { files: Array<FileUpdate>, };
+
+export type FileBulkDeleteInput = { file_ids: Array<number>, mode: FileDeletionMode, };
+
+export type FileDeleteInput = { mode: FileDeletionMode, };
+
+export type FileDeletion = { id: string, media_type: MediaDomain, file_id: number, path: string, effect: FileDeletionEffect, recycle_path: string | null, targets: Array<MediaTarget>, };
+
+export type FileDeletionBatch = { batch_id: string, deletions: Array<FileDeletion>, };
+
+export type FileDeletionEffect = "recycled" | "deleted" | "already_missing";
+
+export type FileDeletionMode = "recycle" | "permanent";
 
 export type FileEditor = { file_ids: Array<number>, quality?: FileQualityInput | null, languages?: Array<number> | null, release_group?: string | null, edition?: string | null, indexer_flags?: number | null, release_type?: number | null, };
 
@@ -240,7 +264,7 @@ export type HealthTransitions = { oldest_retained_sequence: number | null, lates
 
 export type HistoricalFile = { media_type: MediaDomain, id: number, };
 
-export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent;
+export type HistoryEvent = { "origin": "native_import" } & NativeHistoryEvent | { "origin": "source_snapshot" } & SourceHistoryEvent | { "origin": "native_deletion" } & NativeDeletionEvent;
 
 export type HistoryEventType = "file_imported";
 
@@ -259,6 +283,10 @@ export type HostSettingSource = "default" | "environment";
 export type HostSettings = { authentication: HostAuthentication, configured_bind: string, bound_address: string, bind_source: HostSettingSource, allowed_hosts: Array<string>, allowed_hosts_source: HostSettingSource, filtering_enabled: boolean, trusted_networks: Array<string>, trusted_networks_source: HostSettingSource, forwarding_enabled: boolean, mutability: HostMutability, apply_mode: HostApplyMode, capabilities: HostCapabilities, };
 
 export type ImportInput = ManualImportRequest | ImportRequest;
+
+export type ImportPolicy = { media_type: MediaDomain, revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
+
+export type ImportPolicyUpdate = { revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
 
 export type ImportRequest = { episode_id: number, source: string, mode: string, destination: string, };
 
@@ -294,7 +322,7 @@ export type LibraryCreate = { title?: string | null, year?: number | null, tvdb_
 
 export type LibraryEditor = { ids: Array<number>, patch: LibraryPatch, };
 
-export type LibraryItem = { tag_ids: Array<number>, id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
+export type LibraryItem = { runtime: number | null, tag_ids: Array<number>, id: number, media_type: MediaDomain, metadata_id: number | null, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null, path: string, poster: string | null, monitored: boolean, settings: LibrarySettings, statistics: LibraryStatistics, seasons?: Array<LibrarySeason>, is_available: boolean | null, };
 
 export type LibraryPage = { items: Array<LibraryItem>, total: number, limit: number, offset: number, };
 
@@ -319,6 +347,10 @@ export type ManualImportBatchInput = { operation_ids: Array<string>, priority: C
 export type ManualImportCommand = { id: string, batch_id: string, operation_id: string, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, };
 
 export type ManualImportCommandQuery = { batch_id?: string, status?: CommandStatus, limit?: number, offset?: number, };
+
+export type ManualImportReconcileInput = { operation_ids: Array<string>, };
+
+export type ManualImportReconciliation = { operation_id: string, operation: Operation | null, active_command: ManualImportCommand | null, };
 
 export type ManualImportRequest = { target: MediaTarget, source: string, mode: Mode, destination: string, };
 
@@ -398,15 +430,23 @@ export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "i
 
 export type MovieRenamePreviewStatus = "change" | "unavailable";
 
+export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+
+export type MultiEpisodeExampleStatus = "rendered" | "preserved" | "needs_policy" | "invalid";
+
+export type MultiEpisodeNamingExample = { field: string, contiguous: boolean, episodes: Array<number>, status: MultiEpisodeExampleStatus, filename: string | null, reason: string | null, };
+
 export type NamingErrorDetail = { code: string, message: string, };
 
 export type NamingErrorEnvelope = { error: NamingErrorDetail, };
+
+export type NativeDeletionEvent = { id: string, deletion_id: string, event_type: DeletionEventType, reason: DeletionReason, target: MediaTarget, file: HistoricalFile, path: string, recycle_path: string | null, deleted_at: string, };
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
 export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
 
-export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, };
+export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, };
 
 export type ParseQuery = { title: string, };
 
@@ -444,7 +484,11 @@ export type ProviderChanges = { enabled?: boolean | null, priority?: number | nu
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, 
+/**
+ * Suggested endpoint shape; the RPC path `/rpc` is appended to it.
+ */
+endpoint_hint: string, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -458,7 +502,7 @@ export type ProviderFilesResult = { provider_id: string, revision: number, resul
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };
 
-export type ProviderImplementation = "newznab" | "qbittorrent" | "torznab";
+export type ProviderImplementation = "newznab" | "qbittorrent" | "sabnzbd" | "torznab" | "transmission";
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -482,13 +526,13 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
-export type ProviderTestOutcome = IndexerTest | ClientTest;
+export type ProviderTestOutcome = IndexerTest | ClientTest | SabnzbdTest | TransmissionTest;
 
 export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: ProviderTestOutcome, };
 
@@ -537,6 +581,22 @@ export type QueueObservation = { association: MediaTarget | null, download: Down
 export type QueueQuery = { provider_id: string, media_type: MediaDomain, limit?: number, offset?: number, };
 
 export type QueueSnapshot = { target: RefreshTarget, provider_revision: number, observed_at: number, command_id: string | null, items: Array<QueueObservation>, total: number, limit: number, offset: number, };
+
+export type RecycleBinCleanupCommand = { id: string, name: RecycleBinCleanupName, target: RecycleBinCleanupTarget, origin: RecycleBinCleanupOrigin, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, outcome: RecycleBinCleanupOutcome | null, bin_path: string | null, cleanup_days: number | null, files_removed: number, folders_removed: number, entries_skipped: number, entries_failed: number, bounded: boolean, };
+
+export type RecycleBinCleanupInput = { target: RecycleBinCleanupTarget, priority: CommandPriority, };
+
+export type RecycleBinCleanupName = "clean_up_recycle_bin";
+
+export type RecycleBinCleanupOrigin = "manual" | "automatic";
+
+export type RecycleBinCleanupOutcome = "cleaned" | "not_configured" | "disabled";
+
+export type RecycleBinCleanupTarget = { media_type: MediaDomain, };
+
+export type RecycleBinSettings = { media_type: MediaDomain, revision: number, path: string | null, cleanup_days: number, };
+
+export type RecycleBinSettingsUpdate = { revision: number, path: string | null, cleanup_days: number, };
 
 export type RefreshSchedule = { intent: RefreshScheduleIntent, requested_enabled: boolean | null, target: RefreshTarget, revision: number, provider_revision: number, enabled: boolean, interval_seconds: number, next_run_at: number, last_run_at: number | null, error_code: string | null, };
 
@@ -620,6 +680,52 @@ export type RssTarget = { media_type: MediaDomain, indexer_id: string, indexer_r
 
 export type RssTargetInput = { media_type: MediaDomain, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, };
 
+export type SabnzbdTest = { sabnzbd_version: string, domains: Array<MediaDomain>, warnings: Array<SabnzbdTestWarning>, };
+
+export type SabnzbdTestWarning = "develop_version" | "removes_completed_downloads";
+
+export type ScanChild = { id: string, ordinal: number, relative_path: string, source_path: string, kind: ScanEntryKind, disposition: ScanDisposition, selected: boolean, reasons: Array<string>, series_id: number | null, movie_id: number | null, anchor_episode_id: number | null, member_count: number, expected_old_movie_file_id: number | null, destination: string | null, resolved_mode: ScanResolvedMode | null, quality_id: number | null, revision: FileRevision | null, edition: string | null, size: number | null, observation: ScanObservationState | null, error_code: string | null, operation_id: string | null, operation_phase: string | null, path_failure_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
+
+export type ScanChildMember = { episode_id: number, series_id: number, season_number: number, episode_number: number, expected_old_episode_file_id: number | null, };
+
+export type ScanChildResumeInput = { operation_id: string, inventory_revision: number, expected_resume_generation: number, };
+
+export type ScanCleanup = { state: ScanCleanupState, phase: ScanCleanupPhase | null, reason: string | null, removed: number, error_code: string | null, resume_generation: number, resume_requested: boolean, recovery_required: boolean, };
+
+export type ScanCleanupPhase = "observed" | "remove_intent" | "settled";
+
+export type ScanCleanupResumeInput = { inventory_revision: number, expected_cleanup_resume_generation: number, };
+
+export type ScanCleanupState = "not_needed" | "pending" | "complete" | "retained";
+
+export type ScanCounts = { entries: number, ready: number, importing: number, imported: number, already_imported: number, rejected: number, failed: number, cancelled: number, recovery_required: number, };
+
+export type ScanCoverage = { state: ScanCoverageState, expected: number, covered: number, missing: number, };
+
+export type ScanCoverageState = "untracked" | "pending" | "complete" | "incomplete";
+
+export type ScanDisposition = "ready" | "importing" | "imported" | "already_imported" | "rejected" | "failed" | "cancelled";
+
+export type ScanEntryKind = "file" | "directory" | "symlink" | "other";
+
+export type ScanMemberQuery = { limit?: number, offset?: number, };
+
+export type ScanMode = "auto" | "move" | "copy";
+
+export type ScanObservationState = "measured" | "unavailable";
+
+export type ScanOutcome = "success" | "unsuccessful";
+
+export type ScanPhase = "queued" | "inventory" | "waiting_predecessor" | "awaiting_import" | "importing" | "recovery_required" | "cleanup" | "settled";
+
+export type ScanResolvedMode = "copy" | "move";
+
+export type ScanSource = "found" | "missing";
+
+export type ScanTracked = { provider_id: string, remote_id: string, };
+
+export type ScanTracking = "untracked" | "pending" | "unknown_fallback" | "receipt";
+
 export type Score = { format_ids: Array<number>, score: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
@@ -638,7 +744,7 @@ export type SearchResult = { id: string, command_id: string, metadata: ReleaseMe
 
 export type SelectionKind = "legacy_fixed" | "default" | "explicit";
 
-export type SeriesDetails = { network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
+export type SeriesDetails = { runtime: number | null, network: string | null, original_country: string | null, status: string | null, genres: Array<string> | null, original_language: number | null, tvdb_id: number, title: string, year: number | null, imdb_id: string | null, seasons: Array<number>, episodes: Array<EpisodeDetails>, };
 
 export type SeriesLookupAdd = { tvdb_id: number, path: string, settings?: LibraryPatch, };
 
@@ -674,15 +780,25 @@ export type TagOwnersQuery = { limit?: number, offset?: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
 
+export type TorrentPlacement = { "strategy": "category", category: string, } | { "strategy": "directory", directory: string, };
+
+export type TorrentQueuePriority = "last" | "first";
+
+export type TransmissionScope = { placement: TorrentPlacement, recent_priority?: TorrentQueuePriority, older_priority?: TorrentQueuePriority, add_paused?: boolean, tags?: Array<number>, };
+
+export type TransmissionTest = { transmission_version: string, rpc_version: number, domains: Array<MediaDomain>, labels_supported: boolean, warnings: Array<TransmissionTestWarning>, };
+
+export type TransmissionTestWarning = "labels_unsupported" | "queue_disabled";
+
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
 export type TvIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, anime_categories: Array<number>, anime_standard_format_search?: boolean, };
 
 export type TvNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
-export type TvNamingExamples = { standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, };
+export type TvNamingExamples = { standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_examples: Array<MultiEpisodeNamingExample>, };
 
-export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_episode_format?: string, daily_episode_format?: string, anime_episode_format?: string, series_folder_format?: string, season_folder_format?: string, specials_folder_format?: string, };
+export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_characters?: boolean, colon_replacement?: ColonReplacement, custom_colon_replacement?: string, standard_episode_format?: string, daily_episode_format?: string, anime_episode_format?: string, series_folder_format?: string, season_folder_format?: string, specials_folder_format?: string, multi_episode_style?: number, multi_episode_draft?: boolean, };
 
 export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
@@ -694,4 +810,42 @@ export type TvReleaseProfileInput = { name: string | null, enabled: boolean, req
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
+export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+
 export type UnmappedFolder = { name: string, path: string, relative_path: string, };
+
+export type UsenetPriority = "default" | "paused" | "low" | "normal" | "high" | "force";
+
+export type UsenetScope = { category: string, recent_priority?: UsenetPriority, older_priority?: UsenetPriority, tags?: Array<number>, };
+
+export type WantedAvailability = "all" | "available" | "unavailable";
+
+export type WantedCutoff = { profile_id: number, quality_rank: number, threshold_rank: number, basis: WantedCutoffBasis, };
+
+export type WantedCutoffBasis = "configured_cutoff" | "first_allowed";
+
+export type WantedDiagnostics = { unknown_air_date: number | null, unknown_series_runtime: number | null, unknown_year: number | null, unknown_cutoff: number | null, };
+
+export type WantedDirection = "asc" | "desc";
+
+export type WantedFile = { id: number, path: string, quality_id: number | null, quality_name: string | null, };
+
+export type WantedKind = "missing" | "cutoff";
+
+export type WantedMonitored = "monitored" | "unmonitored" | "all";
+
+export type WantedMovieAvailability = "available" | "unavailable" | "ungated";
+
+export type WantedPage<T> = { media_type: MediaDomain, kind: WantedKind, items: Array<T>, total: number, limit: number, offset: number, sort: WantedSort, direction: WantedDirection, monitored: WantedMonitored, evaluated_at: number, diagnostics: WantedDiagnostics, };
+
+export type WantedQuery = { limit?: number, offset?: number, monitored?: WantedMonitored, sort?: WantedSort, direction?: WantedDirection, availability?: WantedAvailability, };
+
+export type WantedSearchCommand = { target: MediaTarget, command_id: string, };
+
+export type WantedSearchInput = { request_id: string, kind: WantedKind, selection: WantedSelection, indexer_id: string, indexer_revision: number, client_selection: ClientSelection, priority: CommandPriority, };
+
+export type WantedSearchReceipt = { request_id: string, media_type: MediaDomain, kind: WantedKind, replayed: boolean, matched: number | null, skipped_active: number | null, admitted: number, commands: Array<WantedSearchCommand>, };
+
+export type WantedSelection = { "kind": "ids", ids: Array<number>, } | { "kind": "all", monitored: WantedMonitored, availability?: WantedAvailability, };
+
+export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality";

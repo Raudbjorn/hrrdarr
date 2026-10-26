@@ -2,16 +2,18 @@
   import { onDestroy, untrack } from 'svelte';
   import type { ApiPage, FilePatch, FileResource, MediaDomain } from './api.generated';
   import type { SettingsWriteState } from './api';
-  import { listMediaFiles, readMediaFiles, updateMediaFile, editMediaFiles, listQualityDefinitions, getCustomFormatSchema } from './api';
+  import { listMediaFiles, readMediaFiles, updateMediaFile, editMediaFiles, listQualityDefinitions, getCustomFormatSchema, getRecycleBin, deleteMediaFile, deleteMediaFiles } from './api';
+  import { deletionOwnerMatches, deletionPlan, describeDeletionFailure, describeDeletions, MAX_DELETE_FILES, type DeletionPlan } from './recycle-bin-draft';
   import { emptyFileMetadataDraft, fileMetadataCatalogs, buildFileMetadataPatch, validateFileReadback, mixedFileValue, fileValueLabel, type FileMetadataCatalogs } from './file-metadata-draft';
 
   type Owner = { domain: MediaDomain; id: number; title: string };
   type Action = 'keep' | 'clear' | 'set';
   type Field = 'quality' | 'languages' | 'release_group' | 'edition' | 'indexer_flags' | 'release_type';
-  let { target, active = true, relatedWrite = 'idle', discardVersion = 0, onwrite = () => {}, ondirty = () => {}, onsaved = () => {} }: {
-    target: Owner | null; active?: boolean; relatedWrite?: SettingsWriteState; discardVersion?: number;
+  let { target, active = true, relatedWrite = 'idle', discardVersion = 0, refreshVersion = 0, onwrite = () => {}, ondirty = () => {}, onsaved = () => {}, ondeleted = () => {} }: {
+    target: Owner | null; active?: boolean; relatedWrite?: SettingsWriteState; discardVersion?: number; refreshVersion?: number;
     onwrite?: (state: SettingsWriteState) => void; ondirty?: (dirty: boolean) => void;
     onsaved?: (target: { domain: MediaDomain; id: number }) => void;
+    ondeleted?: (target: { domain: MediaDomain; id: number }) => void;
   } = $props();
 
   const freshActions = (): Record<Field, Action> => ({ quality: 'keep', languages: 'keep', release_group: 'keep', edition: 'keep', indexer_flags: 'keep', release_type: 'keep' });
@@ -22,16 +24,26 @@
   let languageIds = $state<number[]>([]), group = $state(''), edition = $state(''), flags = $state<number[]>([]), releaseType = $state('');
   let loading = $state(false), busy = $state(false), uncertain = $state(false), error = $state(''), notice = $state(''), contextError = $state('');
   let attempted = $state<{ ids: number[]; patch: FilePatch } | null>(null), reconciled = $state(false);
+  let seenRefresh = $state(0);
+  // Deletion: confirmation is bound to the owner whose files were prepared.
+  let confirming = $state<{ owner: Owner; ids: number[]; paths: string[]; plan: DeletionPlan } | null>(null), deleting = $state(false), preparing = $state(false);
+  let confirmButton = $state<HTMLButtonElement | null>(null);
+  const stale = $derived(refreshVersion !== seenRefresh);
   let alive = true, epoch = 0, seenDiscard = -1, wasActive = false;
   const dirty = $derived(Object.values(actions).some(action => action !== 'keep'));
-  const locked = $derived(loading || busy || uncertain || relatedWrite !== 'idle' || !active || !!contextError);
+  const locked = $derived(loading || busy || uncertain || deleting || preparing || !!confirming || relatedWrite !== 'idle' || !active || !!contextError);
   const fields = $derived<{ key: Field; label: string }[]>([
     { key: 'quality', label: 'Quality' }, { key: 'languages', label: 'Languages' },
     { key: 'release_group', label: 'Release group' }, { key: 'indexer_flags', label: 'Indexer flags' },
     ...(owner?.domain === 'tv' ? [{ key: 'release_type' as const, label: 'Release type' }] : [{ key: 'edition' as const, label: 'Edition' }]),
   ]);
-  $effect(() => onwrite(busy ? 'busy' : uncertain ? 'uncertain' : 'idle'));
+  $effect(() => onwrite(busy || deleting || preparing || confirming ? 'busy' : uncertain ? 'uncertain' : 'idle'));
+  $effect(() => { if (confirming && confirmButton) confirmButton.focus(); });
   $effect(() => ondirty(dirty));
+  $effect(() => {
+    if (stale && owner && same(owner, target) && active && !editing.length && !dirty && !loading && !busy && !uncertain && relatedWrite === 'idle' && !error)
+      untrack(() => { void load(); });
+  });
   const same = (a: Owner | null, b: Owner | null) => !!a && !!b && a.domain === b.domain && a.id === b.id;
   function current(token: number, captured: Owner) { return alive && token === epoch && same(owner, captured); }
   function clearDraft() {
@@ -46,12 +58,14 @@
     const next = target, shown = active, version = discardVersion;
     untrack(() => {
       if (next && !same(owner, next)) {
-        if (busy || uncertain || (dirty && version === seenDiscard)) {
-          contextError = 'Finish or reconcile the retained file edit before changing its library owner.';
+        if (busy || uncertain || preparing || confirming || deleting || (dirty && version === seenDiscard)) {
+          contextError = preparing || confirming || deleting
+            ? 'Finish or cancel the pending deletion before changing its library owner.'
+            : 'Finish or reconcile the retained file edit before changing its library owner.';
           return;
         }
         ++epoch; owner = { ...next }; offset = 0; page = null; catalogs = null; selected = []; inspected = null;
-        loading = false; clearDraft(); error = ''; notice = ''; contextError = ''; seenDiscard = version;
+        loading = false; preparing = false; confirming = null; clearDraft(); error = ''; notice = ''; contextError = ''; seenDiscard = version;
         wasActive = shown; if (shown) void load(); return;
       }
       if (next && same(owner, next)) { owner = { ...next }; contextError = ''; }
@@ -63,7 +77,7 @@
 
   async function load() {
     if (!owner || loading || busy || uncertain || relatedWrite !== 'idle' || !active) return;
-    const captured = { ...owner }, token = ++epoch; loading = true; error = '';
+    const captured = { ...owner }, token = ++epoch, revision = refreshVersion; loading = true; error = '';
     const [files, definitions, schema] = await Promise.all([listMediaFiles(captured.domain, captured.id, offset), listQualityDefinitions(captured.domain), getCustomFormatSchema(captured.domain)]);
     if (!current(token, captured)) return;
     loading = false;
@@ -77,7 +91,7 @@
     }
     const checked = items.length ? validateFileReadback(captured.domain, captured.id, items.map(item => item.id), items) : { ok: true as const, data: [] as FileResource[] };
     if (!choices.ok || !checked.ok) { error = !choices.ok ? choices.error : !checked.ok ? checked.error : ''; catalogs = null; return; }
-    catalogs = choices.data; page = { ...files.data, items: checked.data };
+    catalogs = choices.data; page = { ...files.data, items: checked.data }; seenRefresh = revision;
     selected = selected.filter(id => checked.data.some(file => file.id === id));
     if (inspected) inspected = checked.data.find(file => file.id === inspected?.id) ?? null;
   }
@@ -158,6 +172,48 @@
     clearDraft(); notice = 'Current metadata retained. Select files to start a new edit.';
   }
   function closeEdit() { if (!locked && discard()) { clearDraft(); error = ''; } }
+  async function askDelete(files: FileResource[]) {
+    if (!owner || locked || editing.length || !files.length || files.length > MAX_DELETE_FILES) return;
+    const captured = { ...owner }, token = ++epoch; preparing = true; error = ''; notice = '';
+    const settings = await getRecycleBin(captured.domain);
+    preparing = false;
+    if (!current(token, captured)) return;
+    if (!settings.ok) { error = `Recycle bin settings could not be read, so nothing will be deleted. ${settings.error}`; return; }
+    if (settings.data.media_type !== captured.domain) { error = 'Recycle bin settings did not match this media type; nothing will be deleted.'; return; }
+    const ids = files.map(file => file.id);
+    confirming = { owner: captured, ids, paths: files.map(file => file.path), plan: deletionPlan(settings.data, ids) };
+  }
+  function cancelDelete() { if (!deleting) { confirming = null; notice = 'Deletion cancelled; nothing was changed.'; } }
+  async function confirmDelete() {
+    if (!owner || !confirming || deleting) return;
+    const request = confirming;
+    if (!deletionOwnerMatches(request.owner, owner)) {
+      confirming = null;
+      error = 'The library item changed while the deletion was pending; nothing was deleted.';
+      return;
+    }
+    const captured = { ...request.owner }, token = ++epoch; deleting = true; error = '';
+    const result = request.ids.length === 1
+      ? await deleteMediaFile(captured.domain, request.ids[0], request.plan.mode)
+      : await deleteMediaFiles(captured.domain, request.ids, request.plan.mode);
+    if (!current(token, captured)) { deleting = false; confirming = null; return; }
+    deleting = false; confirming = null;
+    if (!result.ok) {
+      const failure = describeDeletionFailure(result); error = failure.message;
+      // Partial or uncertain outcomes: reload so the listing reflects what was actually deleted.
+      if (failure.reload || request.ids.length > 1) { selected = []; inspected = null; ondeleted(captured); await load(); }
+      return;
+    }
+    const count = request.ids.length;
+    notice = describeDeletions('deletions' in result.data ? result.data.deletions : [result.data]);
+    selected = selected.filter(id => !request.ids.includes(id));
+    if (inspected && request.ids.includes(inspected.id)) inspected = null;
+    if (page && page.items.length === count && offset > 0 && page.items.every(file => request.ids.includes(file.id))) offset = Math.max(0, offset - 25);
+    ondeleted(captured);
+    const kept = notice;
+    await load();
+    if (current(epoch, captured) && !error) notice = kept;
+  }
   function shownValue(files: FileResource[], field: Field) {
     const value = mixedFileValue(files, field);
     if (value.kind === 'mixed') return 'Mixed values';
@@ -185,13 +241,14 @@
   onDestroy(() => { alive = false; ++epoch; });
 </script>
 
-<svelte:window onbeforeunload={event => { if (dirty || busy || uncertain) { event.preventDefault(); event.returnValue = ''; } }} />
+<svelte:window onbeforeunload={event => { if (dirty || busy || uncertain || deleting) { event.preventDefault(); event.returnValue = ''; } }} />
 
 <section aria-label="File metadata" aria-busy={loading || busy}>
+  {#if stale}<p role="status">An import completed. Your retained edit is unchanged; the file listing will refresh when the edit and any pending write are resolved.</p>{/if}
   <h2>Files and metadata</h2>
   {#if owner}
     <p>{owner.title} · {owner.domain === 'tv' ? 'TV series' : 'Movie'} {owner.id}</p>
-    <p>Inspect stored file facts and correct metadata. These edits do not move or rename files.</p>
+    <p>Inspect stored file facts and correct metadata. Metadata edits do not move or rename files; Delete removes a file only after an explicit confirmation.</p>
     {#if loading}<p role="status">Loading file metadata and choices…</p>{/if}
     {#if busy}<p role="status">Saving or reading back file metadata…</p>{/if}
     {#if error}<p role="alert">{error}</p>{/if}
@@ -207,12 +264,24 @@
           <td><input type="checkbox" aria-label={`Select file ${file.id}`} value={file.id} bind:group={selected} disabled={locked || editing.length > 0} /></td>
           <td>File {file.id}<span class="path">{file.relative_path ?? file.path}</span><span>{file.size === null ? 'Size unknown' : `${file.size} stored bytes`}</span></td>
           <td>{qualityLabel(file)}<br />{languageLabel(file.languages)}</td>
-          <td><button type="button" onclick={() => inspected = file}>Inspect file {file.id}</button><button type="button" disabled={locked || !catalogs} onclick={() => begin([file])}>Edit file {file.id}</button></td>
+          <td><button type="button" onclick={() => inspected = file}>Inspect file {file.id}</button><button type="button" disabled={locked || !catalogs} onclick={() => begin([file])}>Edit file {file.id}</button><button type="button" class="danger" disabled={locked || editing.length > 0} onclick={() => askDelete([file])}>Delete file {file.id}</button></td>
         </tr>{:else}<tr><td colspan="4">No file records for this library item.</td></tr>{/each}
       </tbody></table></div>
       <div class="actions"><button type="button" disabled={locked || !catalogs || !selected.length} onclick={() => begin(page!.items.filter(file => selected.includes(file.id)))}>Edit selected files ({selected.length})</button>
+        <button type="button" class="danger" disabled={locked || editing.length > 0 || !selected.length || selected.length > MAX_DELETE_FILES} onclick={() => askDelete(page!.items.filter(file => selected.includes(file.id)))}>Delete selected files ({selected.length})</button>
         <button type="button" disabled={locked || offset === 0} onclick={() => changePage(Math.max(0, offset - 25))}>Previous files</button>
         <button type="button" disabled={locked || offset + 25 >= page.total} onclick={() => changePage(offset + 25)}>Next files</button></div>
+    {/if}
+    {#if preparing}<p role="status">Reading recycle bin settings before confirming deletion…</p>{/if}
+    {#if deleting}<p role="status">Deleting files… Cross-device recycling copies and verifies each file and can take a while.</p>{/if}
+    {#if confirming}
+      <div class="confirm" role="alertdialog" aria-modal="false" aria-labelledby="file-delete-title" aria-describedby="file-delete-detail" tabindex="-1"
+        onkeydown={event => { if (event.key === 'Escape') { event.preventDefault(); cancelDelete(); } }}>
+        <h3 id="file-delete-title">{confirming.plan.title}</h3>
+        <p id="file-delete-detail">{confirming.plan.detail}</p>
+        <ul aria-label="Files to delete">{#each confirming.paths as path, index (confirming.ids[index])}<li>File {confirming.ids[index]}: <span class="path">{path}</span></li>{/each}</ul>
+        <div class="actions"><button type="button" class="danger" bind:this={confirmButton} disabled={deleting} onclick={confirmDelete}>{confirming.plan.confirm}</button><button type="button" disabled={deleting} onclick={cancelDelete}>Cancel deletion</button></div>
+      </div>
     {/if}
     {#if inspected}
       <section aria-label={`File ${inspected.id} facts`}><h3>File {inspected.id} facts</h3>
@@ -262,5 +331,5 @@
 </section>
 
 <style>
-  section{margin-block:1.5rem}h2,h3{overflow-wrap:anywhere}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;vertical-align:top;padding:.65rem;border-bottom:1px solid #cbd5de}td .path{display:block;overflow-wrap:anywhere;max-width:28rem}td button{display:block;margin-bottom:.4rem}.actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-block:.8rem}fieldset{min-width:0;border:1px solid #cbd5de;padding:1rem;margin-block:1rem}.field{padding-block:.75rem;border-bottom:1px solid #cbd5de}label{display:grid;gap:.35rem;margin-block:.5rem}.check{display:flex;align-items:center;gap:.5rem}.choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.2rem .8rem}input:not([type=checkbox]),select{width:100%;max-width:32rem;min-width:0;box-sizing:border-box}dl{display:grid;grid-template-columns:minmax(8rem,1fr) 3fr;gap:.5rem}dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}p{overflow-wrap:anywhere}[role=alert]{border-left:3px solid #a12637;padding-left:.75rem;color:#a12637}button,select{min-height:2.5rem}@media(max-width:600px){dl{grid-template-columns:1fr}dd{margin-bottom:.5rem}fieldset{padding:.65rem}.choices{grid-template-columns:1fr}}
+  section{margin-block:1.5rem}h2,h3{overflow-wrap:anywhere}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;vertical-align:top;padding:.65rem;border-bottom:1px solid #cbd5de}td .path{display:block;overflow-wrap:anywhere;max-width:28rem}td button{display:block;margin-bottom:.4rem}.actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-block:.8rem}fieldset{min-width:0;border:1px solid #cbd5de;padding:1rem;margin-block:1rem}.field{padding-block:.75rem;border-bottom:1px solid #cbd5de}label{display:grid;gap:.35rem;margin-block:.5rem}.check{display:flex;align-items:center;gap:.5rem}.choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.2rem .8rem}input:not([type=checkbox]),select{width:100%;max-width:32rem;min-width:0;box-sizing:border-box}dl{display:grid;grid-template-columns:minmax(8rem,1fr) 3fr;gap:.5rem}dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}p{overflow-wrap:anywhere}[role=alert]{border-left:3px solid #a12637;padding-left:.75rem;color:#a12637}.confirm{border:2px solid #a12637;padding:1rem;background:#fff7f8}.confirm .path{overflow-wrap:anywhere}.danger{color:#a12637}button,select{min-height:2.5rem}@media(max-width:600px){dl{grid-template-columns:1fr}dd{margin-bottom:.5rem}fieldset{padding:.65rem}.choices{grid-template-columns:1fr}}
 </style>

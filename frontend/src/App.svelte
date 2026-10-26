@@ -4,12 +4,14 @@
   import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
+  import ImportPolicyPanel from './lib/ImportPolicyPanel.svelte';
+  import RecycleBinPanel from './lib/RecycleBinPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
   import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
   import CreateTags from './lib/CreateTags.svelte';
   import { findLibraryByExternalId } from './lib/api';
   import { unknownTagWrite } from './lib/tag-draft';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import SettingsIndex from './lib/SettingsIndex.svelte';
   import NotFound from './lib/NotFound.svelte';
   import { parseHash, hashFor, SETTINGS_INDEX_HASH, type ViewId } from './lib/routes';
@@ -19,6 +21,7 @@
   import RssPanel from './lib/RssPanel.svelte';
   import ReleaseSearchPanel from './lib/ReleaseSearchPanel.svelte';
   import ImportPanel from './lib/ImportPanel.svelte';
+  import DownloadedScanPanel from './lib/DownloadedScanPanel.svelte';
   import ProviderPanel from './lib/ProviderPanel.svelte';
   import HealthPanel from './lib/HealthPanel.svelte';
   import GeneralSettingsPanel from './lib/GeneralSettingsPanel.svelte';
@@ -32,7 +35,11 @@
   import NamingPanel from './lib/NamingPanel.svelte';
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
+  import WantedPanel from './lib/WantedPanel.svelte';
   let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
+  // A receipt's scan link opens that scan in the library view; it never starts or retries anything.
+  let scanRequest=$state<{domain:MediaDomain;id:string;nonce:number}|null>(null),scanNonce=0;
+  function openScan(scope:MediaDomain,id:string){scanRequest={domain:scope,id,nonce:++scanNonce};navigate('library');}
   function openHealthSettings(domain:MediaDomain){healthSettingsRequest={domain,nonce:++healthSettingsNonce};healthNavigation=`Opening ${domain} completed-download settings…`;navigate('activity');}
   let activityVisited=$state(false),providersVisited=$state(false),providerVersion=$state(0);
   let activityWrite=$state<SettingsWriteState>('idle'),providerWrite=$state<SettingsWriteState>('idle');
@@ -75,7 +82,7 @@
   let tagWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), assignmentWrites=$state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let creationIds=$state<number[]>([]), creationReady=$state(true), creationUncertain=$state(false);
   function tagsSaved(items:LibraryItem[]){if(page)page={...page,items:page.items.map(item=>items.find(saved=>saved.id===item.id)??item)};if(selected){const updated=items.find(item=>item.id===selected!.id);if(updated)selected={...selected,tag_ids:updated.tag_ids};}}
-  async function reconcileCreation(){if(!choice||saving)return;saving=true;const result=await findLibraryByExternalId(domain,choice.external_id);saving=false;if(!result.ok){error=result.error;return;}creationUncertain=false;if(result.data.items.length){adding=false;choice=null;await load();await select(result.data.items[0].id);notice='Existing library item loaded. Review its tags before changing them.';}else notice='No matching library item found. Review the retained creation draft before retrying.';}
+  async function reconcileCreation(){if(!choice||saving)return;++importReadEpoch;saving=true;const result=await findLibraryByExternalId(domain,choice.external_id);saving=false;if(!result.ok){error=result.error;return;}creationUncertain=false;if(result.data.items.length){adding=false;choice=null;await load();await select(result.data.items[0].id);notice='Existing library item loaded. Review its tags before changing them.';}else notice='No matching library item found. Review the retained creation draft before retrying.';}
   let qualityCatalogVersions = $state({tv:0,movies:0});
   let profileWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'}), qualityWrites = $state<Record<MediaDomain,SettingsWriteState>>({tv:'idle',movies:'idle'});
   let domain: MediaDomain = $state('tv'), page: LibraryPage | null = $state(null), selected: LibraryItem | null = $state(null);
@@ -83,9 +90,18 @@
   let loading = $state(false), detailLoading = $state(false), saving = $state(false), error = $state(''), notice = $state('');
   let fileTarget = $state<{domain:MediaDomain;id:number;title:string}|null>(null);
   let fileWrite = $state<SettingsWriteState>('idle'), fileDirty = $state(false), fileDiscardVersion = $state(0);
+  let manualWrite = $state<SettingsWriteState>('idle'), scanWrite = $state<SettingsWriteState>('idle');
+  let importVersions = $state({tv:0,movies:0}), importSeen = $state({tv:0,movies:0});
+  let importDetailOwner = $state<{domain:MediaDomain;id:number}|null>(null);
+  let importReadEpoch = 0, selectionOwner: {domain:MediaDomain;id:number}|null = null;
+  let importRefreshing = $state(false), importRefreshError = $state('');
+  let fileRefresh = $state<{domain:MediaDomain;id:number;version:number}>({domain:'tv',id:0,version:0});
   let movieFileVersion = $state({id:0,version:0});
-  const fileRelatedWrite=$derived<SettingsWriteState>(saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
-  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle' || fileWrite!=='idle');
+  const fileRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:scanWrite!=='idle'?scanWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
+  const manualRelatedWrite=$derived<SettingsWriteState>(fileWrite!=='idle'?fileWrite:scanWrite!=='idle'?scanWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites.tv!=='idle'?assignmentWrites.tv:assignmentWrites.movies);
+  const libraryLocked=$derived(saving || creationUncertain || assignmentWrites[domain]!=='idle' || fileWrite!=='idle' || manualWrite!=='idle' || scanWrite!=='idle');
+  // Scan admission/control waits for other library writes; background scan effects rely on backend guards.
+  const scanRelatedWrite=$derived<SettingsWriteState>(manualWrite!=='idle'?manualWrite:fileWrite!=='idle'?fileWrite:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]);
   function admitFileOwner(scope:MediaDomain,id:number|null):boolean {
     if(fileWrite!=='idle')return false;
     if(!fileTarget || (fileTarget.domain===scope && fileTarget.id===id))return true;
@@ -94,6 +110,14 @@
   }
   function filesSaved(owner:{domain:MediaDomain;id:number}) {
     if(owner.domain==='movies')movieFileVersion={id:owner.id,version:movieFileVersion.version+1};
+  }
+  // A deletion removes file associations: reread library statistics and episode file state.
+  function filesDeleted(owner:{domain:MediaDomain;id:number}) {
+    importVersions={...importVersions,[owner.domain]:importVersions[owner.domain]+1};
+    if(selectionOwner?.domain===owner.domain && selectionOwner.id===owner.id) {
+      importDetailOwner=owner;
+      if(owner.domain==='movies')filesSaved(owner);
+    }
   }
   const tagRelatedWrites=$derived<Record<MediaDomain,SettingsWriteState>>({...assignmentWrites,[domain]:saving?'busy':creationUncertain?'uncertain':assignmentWrites[domain]});
   const tagRelatedWithDelay=$derived<Record<MediaDomain,SettingsWriteState>>({tv:delayWrites.tv!=='idle'?delayWrites.tv:tagRelatedWrites.tv,movies:delayWrites.movies!=='idle'?delayWrites.movies:tagRelatedWrites.movies});
@@ -123,10 +147,10 @@
     if (result.ok) profiles = result.data; else profilesError = result.error;
   }
   function changeDomain(next: MediaDomain) {
-    if(next===domain || libraryLocked || !admitFileOwner(next,null))return;creationIds=[];creationReady=true;searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
+    if(next===domain || libraryLocked || !admitFileOwner(next,null))return;selectionOwner=null;creationIds=[];creationReady=true;searchTarget = null; domain = next; ++profileVersion; profiles = null; profilesError = ''; profilesLoading = false; ++detailVersion; ++searchVersion; selected = null; episodes = []; episodeId = null; page = null; adding = false; results = []; choice = null; searching = false; searched = false; detailLoading = false; notice = ''; error = ''; void load();
   }
   async function select(id: number, offset = 0) {
-    if(libraryLocked || !admitFileOwner(domain,id))return;searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
+    if(libraryLocked || !admitFileOwner(domain,id))return;selectionOwner={domain,id};searchTarget = null; const version = ++detailVersion, scope = domain; detailLoading = true; error = ''; episodeId = null; selected = null; episodes = [];
     const result = await getLibrary(scope, id);
     if (!alive || version !== detailVersion) return;
     if (!result.ok) { detailLoading = false; selected = null; error = result.error; return; }
@@ -147,7 +171,7 @@
   }
   async function add() {
     if (!choice || libraryLocked || !creationReady || tagWrites[domain]!=='idle') return;
-    const scope = domain, externalId = choice.external_id, version = searchVersion; saving = true; error = '';
+    const scope = domain, externalId = choice.external_id, version = searchVersion; ++importReadEpoch; saving = true; error = '';
     const result = await addLibrary(scope, externalId, path,{tags:{mode:'replace',ids:creationIds}});
     saving = false;
     if (!alive || scope !== domain || version !== searchVersion) return;
@@ -156,7 +180,7 @@
   }
   async function patch(patch: LibraryPatch) {
     if (!selected || libraryLocked) return;
-    const item = selected, version = detailVersion; saving = true; error = ''; notice = '';
+    const item = selected, version = detailVersion; ++importReadEpoch; saving = true; error = ''; notice = '';
     const result = await updateLibrary(item.media_type, item.id, patch); saving = false;
     if (!alive || version !== detailVersion) return;
     if (!result.ok) {error = result.error; return;}
@@ -164,7 +188,7 @@
   }
   async function monitor(episode: Episode) {
     if (libraryLocked) return;
-    const version = detailVersion; saving = true; error = '';
+    const version = detailVersion; ++importReadEpoch; saving = true; error = '';
     const result = await monitorEpisode(episode.id, !episode.monitored); saving = false;
     if (!alive || version !== detailVersion) return;
     if (result.ok) { episodes = episodes.map(item => item.id === episode.id ? result.data : item); notice = 'Episode monitoring saved.'; }
@@ -173,26 +197,76 @@
   function saveSettings() {
     void patch(domain === 'tv' ? {quality_profile_id: profileId, series_type: (seriesType || null) as SeriesType | null, season_folder: seasonFolder === '' ? null : seasonFolder === 'true', use_scene_numbering: sceneNumbering === '' ? null : sceneNumbering === 'true', monitor_new_items: (newItems || null) as 'all' | 'none' | null} : {quality_profile_id: profileId, minimum_availability: (availability || null) as MinimumAvailability | null});
   }
-  function refreshAfterImport() { void load(page?.offset ?? 0); if (selected) void select(selected.id, episodeOffset); }
+  function refreshAfterImport(event:{operationId:string;target:MediaTarget;owner:{domain:MediaDomain;id:number}|null}) {
+    const scope=event.target.media_type==='movie'?'movies':'tv';
+    const owner=event.owner ?? (scope==='movies'?{domain:scope,id:event.target.id}:domain==='tv' && selected && episodes.some(e=>e.id===event.target.id)?{domain:scope,id:selected.id}:null);
+    // Legacy receipts lack a series owner; conservatively reread visible TV facts without inventing ownership.
+    const refreshOwner=owner ?? (selectionOwner?.domain===scope?selectionOwner:null);
+    importVersions={...importVersions,[scope]:importVersions[scope]+1};
+    if(refreshOwner && selectionOwner?.domain===refreshOwner.domain && selectionOwner.id===refreshOwner.id) {
+      importDetailOwner=refreshOwner;
+      if(scope==='movies')filesSaved(refreshOwner);
+    }
+    if(fileTarget?.domain===scope && (!owner || fileTarget.id===owner.id))
+      fileRefresh={domain:scope,id:fileTarget.id,version:fileRefresh.version+1};
+  }
+  // Same owner-scoped invalidation as manual import completion; null owners refresh conservatively.
+  function refreshAfterScan(event:{domain:MediaDomain;commandId:string;owners:number[]|null}) {
+    const scope=event.domain, owns=(id:number)=>event.owners===null || event.owners.includes(id);
+    importVersions={...importVersions,[scope]:importVersions[scope]+1};
+    if(selectionOwner?.domain===scope && owns(selectionOwner.id)) {
+      importDetailOwner={...selectionOwner};
+      if(scope==='movies')filesSaved(selectionOwner);
+    }
+    if(fileTarget?.domain===scope && owns(fileTarget.id))
+      fileRefresh={domain:scope,id:fileTarget.id,version:fileRefresh.version+1};
+  }
+  $effect(() => {
+    if(view==='library' && !libraryLocked && !loading && !detailLoading && !importRefreshing && !importRefreshError && importSeen[domain]!==importVersions[domain])
+      untrack(()=>{void refreshImportObservations();});
+  });
+  async function refreshImportObservations() {
+    const scope=domain, revision=importVersions[scope], list=listVersion, detail=detailVersion, writes=importReadEpoch;
+    const owner=importDetailOwner?.domain===scope && selected?.id===importDetailOwner.id?selected.id:null;
+    const offset=episodeOffset; importRefreshing=true; importRefreshError='';
+    const [collection,item,rows]=await Promise.all([
+      listLibrary(scope,page?.offset??0), owner===null?null:getLibrary(scope,owner),
+      owner===null || scope!=='tv'?null:listEpisodes(owner,offset),
+    ]);
+    if(!alive)return;
+    importRefreshing=false;
+    if(scope!==domain || libraryLocked || detailLoading || list!==listVersion || detail!==detailVersion || writes!==importReadEpoch)return;
+    if(!collection.ok || (item && !item.ok) || (rows && !rows.ok)) {
+      importRefreshError=[collection,item,rows].flatMap(result=>result && !result.ok?[result.error]:[]).join(' '); return;
+    }
+    page=collection.data; importSeen={...importSeen,[scope]:revision};
+    if(owner!==null && selected?.id===owner && item?.ok) {
+      // Refresh import observations without replacing local library settings or file drafts.
+      selected={...selected,statistics:item.data.statistics};
+      if(rows?.ok){episodes=rows.data.items;episodeTotal=rows.data.total;if(episodeId!==null && !episodes.some(e=>e.id===episodeId && !e.has_file))episodeId=null;}
+      if(importVersions[scope]===revision)importDetailOwner=null;
+    }
+  }
   onMount(() => { alive = true; applyHash(); window.addEventListener('hashchange', applyHash); void load(); return () => {window.removeEventListener('hashchange', applyHash); alive = false; ++listVersion; ++detailVersion; ++searchVersion; ++profileVersion;}; });
 </script>
 
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#/" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='wanted-missing'||view==='wanted-cutoff'} onclick={()=>navigate('wanted-missing')}>Wanted</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
   {#if view === 'settings-index'}<SettingsIndex />{/if}
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
+  {#if view === 'wanted-missing' || view === 'wanted-cutoff'}<WantedPanel kind={view === 'wanted-cutoff' ? 'cutoff' : 'missing'} onkind={(next) => navigate(next === 'cutoff' ? 'wanted-cutoff' : 'wanted-missing')} />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={providerRelatedWrite} {tagVersions} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
-  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state} onscan={openScan}/></div>{/if}
   {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
   {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
   {#if customFormatsVisited}<div hidden={view !== 'custom-formats'}><CustomFormatPanel /></div>{/if}
   {#if qualitiesVisited}<div hidden={view !== 'qualities'}><QualityDefinitionsPanel relatedWrites={profileWrites} onwritestate={(scope,state) => {qualityWrites[scope]=state;}} onchange={(scope) => {qualityCatalogVersions[scope]++;}} /></div>{/if}
   {#if profilesVisited}<div hidden={view !== 'profiles'}><nav aria-label="Profile sections"><button aria-pressed={profileSection==='quality'} onclick={()=>profileSection='quality'}>Quality profiles</button><button aria-pressed={profileSection==='delay'} onclick={()=>{delayVisited=true;profileSection='delay';}}>Delay profiles</button><button aria-pressed={profileSection==='release'} onclick={()=>{releaseVisited=true;profileSection='release';}}>Release profiles</button></nav><div hidden={profileSection!=='quality'}><QualityProfilesPanel relatedWrites={qualityWrites} onwritestate={(scope,state) => {profileWrites[scope]=state;}} catalogVersions={qualityCatalogVersions} onchange={(scope) => {if(scope===domain) {void loadProfiles(); void load(page?.offset ?? 0);}}} /></div>{#if delayVisited}<div hidden={profileSection!=='delay'}><DelayProfilesPanel request={delayRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>delayWrites={...delayWrites,[scope]:state}} onchange={scope=>delayUsageVersion={...delayUsageVersion,[scope]:delayUsageVersion[scope]+1}} /></div>{/if}{#if releaseVisited}<div hidden={profileSection!=='release'}><ReleaseProfilesPanel request={releaseRequest} tagVersions={tagVersions} relatedWrites={tagWrites} onwrite={(scope,state)=>releaseWrites={...releaseWrites,[scope]:state}} onchange={scope=>releaseUsageVersion={...releaseUsageVersion,[scope]:releaseUsageVersion[scope]+1}} /></div>{/if}</div>{/if}
-  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /></div>{/if}
+  {#if revisionVisited}<div hidden={view!=='media-management'}><h1>Media management</h1><RevisionPolicyPanel /><ImportPolicyPanel /><RecycleBinPanel /></div>{/if}
   {#if historyVisited}<div hidden={view!=='history'}><HistoryPanel /></div>{/if}
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
@@ -207,10 +281,10 @@
       {#if searching}<p role="status">Searching catalogue…</p>{:else if searched && !results.length}<p>No matches. Try a different title or catalogue ID.</p>{/if}
       <ul class="lookup-results">{#each results as result (`${result.media_type}:${result.external_id}`)}<li><button disabled={libraryLocked} aria-pressed={choice?.external_id === result.external_id} onclick={() => {choice = result; path = '';creationIds=[];creationReady=true;}}>{result.title} {result.year ?? ''}<small>{domain === 'tv' ? 'TVDB' : 'TMDB'} {result.external_id}</small></button></li>{/each}</ul>
       {#if choice}<form onsubmit={(event) => {event.preventDefault(); void add();}}><h2>{choice.title}</h2><label>Existing library directory<input bind:value={path} required placeholder="/library/title" /></label><p>Choose a directory that already exists. Adding does not create folders, search for downloads or import files. Monitoring starts enabled; edit it below after adding.</p>{#key `${domain}:${choice.external_id}`}<CreateTags {domain} catalogVersion={tagVersions[domain]} disabled={libraryLocked||tagWrites[domain]!=='idle'} onchange={(ids,ready)=>{creationIds=ids;creationReady=ready;}} />{/key}<button class="primary" disabled={libraryLocked||!creationReady||tagWrites[domain]!=='idle'}>Add to library</button></form>{/if}
-    {#if creationUncertain}<p role="alert">Add outcome unknown. Check for the created item before retrying.</p><button disabled={saving || fileWrite!=='idle' || assignmentWrites[domain]!=='idle'} onclick={reconcileCreation}>Check creation outcome</button>{/if}
+    {#if creationUncertain}<p role="alert">Add outcome unknown. Check for the created item before retrying.</p><button disabled={saving || manualWrite!=='idle' || fileWrite!=='idle' || assignmentWrites[domain]!=='idle'} onclick={reconcileCreation}>Check creation outcome</button>{/if}
     </section>
   {/if}
-  <LibraryTagsPanel {domain} items={page?.items??[]} {selected} catalogVersion={tagVersions[domain]} relatedWrite={fileWrite!=='idle'?fileWrite:tagWrites[domain]!=='idle'?tagWrites[domain]:saving?'busy':creationUncertain?'uncertain':'idle'} onwrite={(scope,state)=>assignmentWrites={...assignmentWrites,[scope]:state}} onsaved={tagsSaved} />
+  <LibraryTagsPanel {domain} items={page?.items??[]} {selected} catalogVersion={tagVersions[domain]} relatedWrite={manualWrite!=='idle'?manualWrite:fileWrite!=='idle'?fileWrite:tagWrites[domain]!=='idle'?tagWrites[domain]:saving?'busy':creationUncertain?'uncertain':'idle'} onwrite={(scope,state)=>{if(state!=='idle')++importReadEpoch;assignmentWrites={...assignmentWrites,[scope]:state};}} onsaved={tagsSaved} />
   <div class="workspace">
     <aside aria-label="Library collection"><div class="section-heading"><h1>{domain === 'tv' ? 'Series' : 'Movies'}</h1><button disabled={loading} onclick={() => load(page?.offset ?? 0)}>Refresh library</button></div>
       {#if loading}<p role="status">Loading library…</p>{/if}
@@ -252,12 +326,16 @@
       {:else if !detailLoading}<div class="empty"><h1>Select a title</h1><p>Review monitoring, inspect episodes and import an existing media file.</p></div>{/if}
       {#if fileTarget}<div hidden={view!=='library' || detailLoading || !selected || selected.id!==fileTarget.id || domain!==fileTarget.domain}>
         <MediaFilesPanel target={fileTarget} active={view==='library' && !detailLoading && !!selected && selected.id===fileTarget.id && domain===fileTarget.domain}
-          relatedWrite={fileRelatedWrite} discardVersion={fileDiscardVersion} onwrite={state=>fileWrite=state} ondirty={dirty=>fileDirty=dirty} onsaved={filesSaved} />
+          relatedWrite={fileRelatedWrite} discardVersion={fileDiscardVersion} refreshVersion={fileRefresh.domain===fileTarget.domain && fileRefresh.id===fileTarget.id?fileRefresh.version:0} onwrite={state=>{if(state!=='idle')++importReadEpoch;fileWrite=state;}} ondirty={dirty=>fileDirty=dirty} onsaved={filesSaved} ondeleted={filesDeleted} />
       </div>{/if}
     </article>
   </div>
   </div>
-  {#if view === 'library'}<ImportPanel {target} label={targetLabel} oncomplete={refreshAfterImport} />{/if}
+  <div hidden={view!=='library'}>
+    {#if importRefreshError}<p role="alert">Import completed, but library refresh failed: {importRefreshError}</p><button disabled={libraryLocked || importRefreshing} onclick={()=>importRefreshError=''}>Retry library refresh</button>{/if}
+    <ImportPanel {target} label={targetLabel} owner={selected?{domain,id:selected.id}:null} active={view==='library'} relatedWrite={manualRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;manualWrite=state;}} oncomplete={refreshAfterImport} />
+    <DownloadedScanPanel {domain} active={view==='library'} request={scanRequest} relatedWrite={scanRelatedWrite} onwrite={state=>{if(state!=='idle')++importReadEpoch;scanWrite=state;}} oncomplete={refreshAfterScan} />
+  </div>
 </main>
 
 <style>

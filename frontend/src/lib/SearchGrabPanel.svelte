@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import {clientAttemptLabel,eligibleDownloadClient,indexerScope} from './provider-draft';
+  import {clientAttemptLabel,eligibleDownloadClient,indexerScope,isIndexer} from './provider-draft';
   import type { ApiPage, MediaTarget, Provider, SearchCommand, SearchCommandInput, SearchMode, SearchResult } from './api.generated';
   import { listProviders, listSearchCommands, getSearchCommand, deleteSearchCommand, createSearchCommand, cancelSearchCommand, listSearchResults, grabSearchResult } from './api';
   let { target }: {target:MediaTarget} = $props();
@@ -12,7 +12,7 @@
   let pending:SearchCommandInput|null=$state(null), retryMissing=$state(false), error=$state(''), notice=$state('');
   let alive=true, timer:ReturnType<typeof setTimeout>|undefined;
   const boundClientId=$derived(indexerScope(indexer,domain)?.download_client_id);
-  const selectionReady=$derived.by(()=>!!indexer?.enabled&&!!indexerScope(indexer,domain)&&(!clientId||eligibleDownloadClient(client,domain)));
+  const selectionReady=$derived.by(()=>!!indexer?.enabled&&!!indexerScope(indexer,domain)&&(!clientId||eligibleDownloadClient(client,domain,indexer)));
   const active=(c:SearchCommand)=>['queued','running','retry_wait'].includes(c.status);
   const eligible=(p:Provider)=>p.enabled && p.settings[domain]!==null;
   function poll(){clearTimeout(timer);if(alive&&!document.hidden)timer=setTimeout(()=>void read(),5000);}
@@ -86,8 +86,8 @@
   <button disabled={reading||saving} onclick={()=>read(true)}>Check search status</button>
   <fieldset disabled={providerBusy||reading||saving||uncertain||pending!==null}>
     <legend>Search providers</legend>
-    <label>Download search indexer<select bind:value={indexerId} onchange={chooseIndexer}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&p.settings.implementation!=='qbittorrent')??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
-    <label>Search download client<select bind:value={clientId} onchange={()=>{client=providers?.items.find(p=>p.id===clientId)??null;}}><option value="">Default — choose from eligible clients</option>{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&p.settings.implementation==='qbittorrent')??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
+    <label>Download search indexer<select bind:value={indexerId} onchange={chooseIndexer}><option value="">Choose an indexer</option>{#if indexer&&!providers?.items.some(p=>p.id===indexer!.id)}<option value={indexer.id}>{indexer.name}</option>{/if}{#each providers?.items.filter(p=>eligible(p)&&isIndexer(p))??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
+    <label>Search download client<select bind:value={clientId} onchange={()=>{client=providers?.items.find(p=>p.id===clientId)??null;}}><option value="">Default — choose from eligible clients</option>{#if client&&!providers?.items.some(p=>p.id===client!.id&&eligibleDownloadClient(p,domain,indexer))}<option value={client.id}>{client.name}</option>{/if}{#each providers?.items.filter(p=>eligibleDownloadClient(p,domain,indexer))??[] as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
     {#if providers}<div class="actions"><button disabled={providers.offset===0} onclick={()=>loadProviders(Math.max(0,providers!.offset-25))}>Previous download search providers</button><button disabled={providers.offset+providers.limit>=providers.total} onclick={()=>loadProviders(providers!.offset+providers!.limit)}>Next download search providers</button><button onclick={()=>{indexer=null;client=null;indexerId='';clientId='';void loadProviders();}}>Reload download search providers</button></div>{/if}
     {#if boundClientId}<p>Default selection uses this indexer’s {domain} client preference: {boundClientId}. Selecting a client above overrides that preference.</p>{/if}
     {#if indexerScope(indexer,domain)?.enable_interactive_search===false}<p>Interactive search is disabled for this indexer’s {domain} scope.</p>{/if}

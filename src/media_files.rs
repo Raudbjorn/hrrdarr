@@ -1,5 +1,7 @@
-//! Native, domain-scoped file metadata. No endpoint here changes the filesystem.
+//! Native, domain-scoped file metadata. Only the explicit DELETE routes (implemented in
+//! `recycle_bin::deletion`) change the filesystem; metadata routes never do.
 pub(crate) mod media_info;
+pub(crate) mod probe;
 use crate::db::Database;
 use axum::{
     Extension, Json, Router,
@@ -21,7 +23,10 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // only a journaled replacement retirement removes a file from library views.
 pub(crate) fn active_file_sql(media: &str) -> &'static str {
     if media == "tv" {
-        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND (ri.retirement_state='quarantined' OR EXISTS(SELECT 1 FROM same_path_replacements sp JOIN import_journal sj ON sj.operation_id=sp.operation_id WHERE sp.operation_id=ri.operation_id AND sp.state='installed' AND sj.phase IN ('committed','complete'))))"
+        // A retired original is no longer the active file for its episode: an RSS replacement
+        // keeps its row for recovery, and a scan replacement keeps its row at the recovery path.
+        // A shared original stays visible while it is still shared.
+        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND (ri.retirement_state='quarantined' OR EXISTS(SELECT 1 FROM same_path_replacements sp JOIN import_journal sj ON sj.operation_id=sp.operation_id WHERE sp.operation_id=ri.operation_id AND sp.state='installed' AND sj.phase IN ('committed','complete')))) AND NOT EXISTS(SELECT 1 FROM scan_import_replacements sr WHERE sr.media_type='tv' AND sr.old_episode_file_id=f.id AND sr.retirement_state='quarantined')"
     } else {
         "1"
     }
@@ -91,9 +96,17 @@ pub fn router(db: Arc<Database>) -> Router {
         router = router.merge(
             Router::new()
                 .route(&format!("{prefix}"), get(list))
-                .route(&format!("{prefix}/bulk"), put(bulk))
+                .route(
+                    &format!("{prefix}/bulk"),
+                    put(bulk).delete(crate::recycle_bin::deletion::delete_bulk),
+                )
                 .route(&format!("{prefix}/editor"), put(editor))
-                .route(&format!("{prefix}/{{id}}"), get(detail).put(update))
+                .route(
+                    &format!("{prefix}/{{id}}"),
+                    get(detail)
+                        .put(update)
+                        .delete(crate::recycle_bin::deletion::delete_one),
+                )
                 .layer(Extension(media.to_owned()))
                 .layer(DefaultBodyLimit::max(256 * 1024))
                 .with_state(db.clone()),
@@ -102,11 +115,16 @@ pub fn router(db: Arc<Database>) -> Router {
     // Keep documented JSON errors for unsupported domains; real domains use static prefixes.
     router
         .route("/api/v1/{media}/files", get(unknown_domain))
-        .route("/api/v1/{media}/files/bulk", put(unknown_domain))
+        .route(
+            "/api/v1/{media}/files/bulk",
+            put(unknown_domain).delete(unknown_domain),
+        )
         .route("/api/v1/{media}/files/editor", put(unknown_domain))
         .route(
             "/api/v1/{media}/files/{id}",
-            get(unknown_domain).put(unknown_domain),
+            get(unknown_domain)
+                .put(unknown_domain)
+                .delete(unknown_domain),
         )
 }
 #[derive(Deserialize, ts_rs::TS)]
@@ -603,7 +621,7 @@ pub struct FileRevision {
 }
 impl FileRevision {
     pub(crate) fn validate(&self) -> std::result::Result<(), &'static str> {
-        if !(1..=i64::from(i32::MAX)).contains(&self.version)
+        if !(0..=i64::from(i32::MAX)).contains(&self.version)
             || !(0..=i64::from(i32::MAX)).contains(&self.real)
         {
             return Err("Invalid quality revision");

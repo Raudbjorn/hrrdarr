@@ -5,7 +5,7 @@ const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr
 const origin=process.env.UI_URL,remote=process.env.UI_PROVIDER_ORIGIN;
 assert.equal(new URL(origin).hostname,'127.0.0.1');assert.equal(new URL(remote).hostname,'127.0.0.1');
 const heldReads=[];
-const browser=await chromium.launch({headless:true}),page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',d=>d.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})}),page=await browser.newPage();page.setDefaultTimeout(15000);page.on('dialog',d=>d.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
 const nav=page.getByRole('navigation',{name:'Workspace'}),activity=page.getByRole('region',{name:'Activity',exact:true}),master=page.getByRole('region',{name:'Completed-download handling',exact:true}),processing=page.getByRole('region',{name:'Completed downloads',exact:true});
 const get=async path=>{const r=await page.request.get(`${origin}${path}`);assert.equal(r.status(),200,await r.text());return r.json();};
 const until=async(fn,accept,label)=>{const end=Date.now()+15000;while(Date.now()<end){const v=await fn();if(accept(v))return v;await page.waitForTimeout(100);}assert.fail(label);};

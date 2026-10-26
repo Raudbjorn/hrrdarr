@@ -409,35 +409,68 @@ pub(crate) async fn evaluate_with_pending(
     Ok(result)
 }
 fn available(c: &Candidate, now: i64, delay_days: i64) -> bool {
-    let reached = |value: &Option<String>| {
+    movie_available(
+        &MovieReleaseFacts {
+            minimum: c.minimum.as_deref(),
+            status: c.status.as_deref(),
+            cinema: c.cinema.as_deref(),
+            digital: c.digital.as_deref(),
+            physical: c.physical.as_deref(),
+        },
+        now,
+        delay_days,
+    )
+}
+/// Persisted movie facts read by the background minimum-availability rule.
+pub(crate) struct MovieReleaseFacts<'a> {
+    pub minimum: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub cinema: Option<&'a str>,
+    pub digital: Option<&'a str>,
+    pub physical: Option<&'a str>,
+}
+/// The single background movie availability rule. Release decisions apply it only to RSS;
+/// Wanted reports it as a display fact and never uses it to bypass user-search semantics.
+pub(crate) fn movie_available(c: &MovieReleaseFacts<'_>, now: i64, delay_days: i64) -> bool {
+    let reached = |value: Option<&str>| {
         value
-            .as_deref()
             .and_then(timestamp)
             .is_some_and(|t| t.saturating_add(delay_days * 86400) <= now)
     };
-    match c.minimum.as_deref() {
+    match c.minimum {
         Some("tba") => true,
         Some("announced") => {
             c.status
-                .as_deref()
                 .is_some_and(|s| matches!(s, "announced" | "in_cinemas" | "released"))
                 || c.cinema.is_some()
                 || c.digital.is_some()
                 || c.physical.is_some()
         }
-        Some("in_cinemas") => reached(&c.cinema) || reached(&c.digital) || reached(&c.physical),
+        Some("in_cinemas") => reached(c.cinema) || reached(c.digital) || reached(c.physical),
         Some("released") => {
-            reached(&c.digital)
-                || reached(&c.physical)
+            reached(c.digital)
+                || reached(c.physical)
                 || (c.digital.is_none()
                     && c.physical.is_none()
                     && c.cinema
-                        .as_deref()
                         .and_then(timestamp)
                         .is_some_and(|t| t.saturating_add((90 + delay_days) * 86400) <= now))
         }
         _ => false,
     }
+}
+/// Background availability delay in days; `None` means no movie availability policy is
+/// persisted, in which case background decisions apply no availability gate.
+pub(crate) async fn movie_availability_delay(c: &Connection) -> Result<Option<i64>> {
+    Ok(c.query(
+        "SELECT availability_delay_days FROM release_delay_policies WHERE media_type='movies'",
+        (),
+    )
+    .await?
+    .next()
+    .await?
+    .map(|row| row.get::<i64>(0))
+    .transpose()?)
 }
 
 /// Shared profile/rank/size/cutoff checks for releases and already downloaded files.
@@ -471,9 +504,7 @@ pub(super) async fn apply_quality(
         let quality_id = q.get::<i64>(0)?;
         result.quality_id = Some(quality_id);
         if let Some(profile_id) = profile_id {
-            let profile = crate::quality_profiles::fetch(c, domain(media), profile_id)
-                .await
-                .map_err(|error| settings_error(error, "release_profile_error"))?;
+            let profile = load_profile(c, media, profile_id).await?;
             let ranked = profile_ranks(&profile.items);
             if let Some((_, rank, allowed, min, max)) =
                 ranked.iter().find(|(id, ..)| *id == quality_id)
@@ -656,6 +687,269 @@ pub(super) async fn apply_quality(
         result.deny("quality_unknown")
     }
     Ok(assessment)
+}
+
+async fn load_profile(
+    c: &Connection,
+    media: MediaDomain,
+    id: i64,
+) -> Result<crate::quality_profiles::Profile> {
+    crate::quality_profiles::fetch(c, domain(media), id)
+        .await
+        .map_err(|e| settings_error(e, "release_profile_error"))
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportOldQuality {
+    pub file_id: i64,
+    pub quality_id: i64,
+    pub rank: usize,
+    pub revision: Option<crate::media_files::FileRevision>,
+    pub evidence: crate::custom_formats::Evidence,
+    pub score: i64,
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportQualityAssessment {
+    pub quality_id: i64,
+    pub rank: usize,
+    pub score: i64,
+    pub format_ids: Vec<i64>,
+    pub mode: crate::revision_policy::Mode,
+    pub policy_fingerprint: String,
+    pub evidence_fingerprint: String,
+    pub originals: Vec<ImportOldQuality>,
+    pub reasons: Vec<String>,
+}
+pub(super) fn facts_digest(value: &impl serde::Serialize) -> Result<String> {
+    struct Sink {
+        hash: ring::digest::Context,
+        bytes: usize,
+    }
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.saturating_add(bytes.len());
+            if self.bytes > 64 * 1024 * 1024 {
+                return Err(std::io::Error::other("comparison facts limit"));
+            }
+            self.hash.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink {
+        hash: ring::digest::Context::new(&ring::digest::SHA256),
+        bytes: 0,
+    };
+    serde_json::to_writer(&mut sink, value).map_err(|_| SearchError("comparison_facts_limit"))?;
+    Ok(sink
+        .hash
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+/// A single assessment for the complete physical file. Reuses factual profile ranks,
+/// CF evaluation and revision facts, deliberately without release-selection vetoes.
+pub(super) async fn assess_downloaded_quality(
+    c: &Connection,
+    media: MediaDomain,
+    profile_id: Option<i64>,
+    files: &[Option<i64>],
+    parsed: &parser::ParsedRelease,
+    evidence: &crate::custom_formats::Evidence,
+    original_language: Option<i64>,
+    warmed: Option<&ImportQualityAssessment>,
+) -> Result<ImportQualityAssessment> {
+    if files.len() > parser::MAX_DOWNLOADED_MEMBERS {
+        return Err(SearchError("episode_match_limit"));
+    }
+    let quality_name = parsed
+        .quality_name
+        .as_deref()
+        .ok_or(SearchError("quality_observation_required"))?;
+    let row = c
+        .query(
+            "SELECT quality_id FROM quality_definitions WHERE media_type=? AND name=?",
+            params![domain(media), quality_name],
+        )
+        .await?
+        .next()
+        .await?
+        .ok_or(SearchError("quality_observation_required"))?;
+    let quality_id: i64 = row.get(0)?;
+    let profile = load_profile(
+        c,
+        media,
+        profile_id.ok_or(SearchError("quality_profile_unconfigured"))?,
+    )
+    .await?;
+    let ranked = profile_ranks(&profile.items);
+    let rank = ranked
+        .iter()
+        .find(|(id, ..)| *id == quality_id)
+        .map(|(_, rank, ..)| *rank)
+        .ok_or(SearchError("quality_rank_unknown"))?;
+    let policy = profile
+        .policy
+        .as_ref()
+        .ok_or(SearchError("quality_policy_unconfigured"))?;
+    let formats = crate::custom_formats::catalog(c, media)
+        .await
+        .map_err(|e| settings_error(e, "custom_format_catalog_invalid"))?;
+    let mode = crate::revision_policy::read(c, media)
+        .await
+        .map_err(|e| SearchError(e.code()))?;
+    let policy_fingerprint = facts_digest(&(&profile, &formats, &mode, original_language))?;
+    let evidence_fingerprint = facts_digest(evidence)?;
+    let score = if let Some(warm) = warmed {
+        if warm.policy_fingerprint != policy_fingerprint
+            || warm.evidence_fingerprint != evidence_fingerprint
+            || warm.quality_id != quality_id
+            || warm.rank != rank
+        {
+            return Err(SearchError("scan_preflight_changed"));
+        }
+        crate::custom_formats::Score {
+            score: warm.score,
+            format_ids: warm.format_ids.clone(),
+        }
+    } else {
+        if !c.is_autocommit() {
+            return Err(SearchError("scan_warm_required"));
+        }
+        crate::custom_formats::score(
+            &formats,
+            media,
+            evidence.clone(),
+            original_language,
+            policy.format_items.clone(),
+            false,
+        )
+        .await?
+    };
+    let warmed_originals: std::collections::BTreeMap<_, _> = warmed
+        .into_iter()
+        .flat_map(|w| w.originals.iter())
+        .map(|o| (o.file_id, o))
+        .collect();
+    let mut originals = Vec::new();
+    let mut original_bytes = 0usize;
+    let mut reasons = std::collections::BTreeSet::new();
+    let column = if media == MediaDomain::Tv {
+        "episode_file_id"
+    } else {
+        "movie_file_id"
+    };
+    for file_id in files
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let row=c.query(&format!("SELECT quality_id,substr(CAST(revision_json AS BLOB),1,1025) FROM file_metadata WHERE media_type=? AND {column}=?"),params![domain(media),file_id]).await?.next().await?.ok_or(SearchError("existing_quality_unknown"))?;
+        let old_id = row
+            .get::<Option<i64>>(0)?
+            .ok_or(SearchError("existing_quality_unknown"))?;
+        let old_rank = ranked
+            .iter()
+            .find(|(id, ..)| *id == old_id)
+            .map(|(_, rank, ..)| *rank)
+            .ok_or(SearchError("existing_quality_unknown"))?;
+        let raw = row.get::<Option<Vec<u8>>>(1)?;
+        let old_revision = raw
+            .map(|raw| {
+                if raw.len() > 1024 {
+                    return Err(SearchError("existing_revision_invalid"));
+                }
+                let r: crate::media_files::FileRevision = serde_json::from_slice(&raw)
+                    .map_err(|_| SearchError("existing_revision_invalid"))?;
+                r.validate()
+                    .map_err(|_| SearchError("existing_revision_invalid"))?;
+                Ok(r)
+            })
+            .transpose()?;
+        let old_evidence = crate::custom_formats::existing(c, media, file_id).await?;
+        let old_score = if warmed.is_some() {
+            let old = warmed_originals
+                .get(&file_id)
+                .ok_or(SearchError("scan_preflight_changed"))?;
+            if old.quality_id != old_id
+                || old.rank != old_rank
+                || old.revision != old_revision
+                || old.evidence != old_evidence
+            {
+                return Err(SearchError("scan_preflight_changed"));
+            }
+            old.score
+        } else {
+            crate::custom_formats::score(
+                &formats,
+                media,
+                old_evidence.clone(),
+                original_language,
+                policy.format_items.clone(),
+                false,
+            )
+            .await?
+            .score
+        };
+        let incoming = revision::Facts {
+            quality_id,
+            rank,
+            revision: parsed.revision.as_ref(),
+            score: score.score,
+            group: evidence.release_group.as_deref(),
+            date_added: None,
+        };
+        let current = revision::Facts {
+            quality_id: old_id,
+            rank: old_rank,
+            revision: old_revision.as_ref(),
+            score: old_score,
+            group: old_evidence.release_group.as_deref(),
+            date_added: None,
+        };
+        reasons.extend(
+            revision::compare_import(&incoming, &current, mode.mode)
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let original = ImportOldQuality {
+            file_id,
+            quality_id: old_id,
+            rank: old_rank,
+            revision: old_revision,
+            evidence: old_evidence,
+            score: old_score,
+        };
+        original_bytes = original_bytes.saturating_add(
+            serde_json::to_vec(&original)
+                .map_err(|_| SearchError("invalid_comparison_facts"))?
+                .len(),
+        );
+        if original_bytes > 64 * 1024 * 1024 {
+            return Err(SearchError("comparison_facts_limit"));
+        }
+        originals.push(original);
+    }
+    if warmed.is_some() && originals.len() != warmed_originals.len() {
+        return Err(SearchError("scan_preflight_changed"));
+    }
+    Ok(ImportQualityAssessment {
+        quality_id,
+        rank,
+        score: score.score,
+        format_ids: score.format_ids,
+        mode: mode.mode,
+        policy_fingerprint,
+        evidence_fingerprint,
+        originals,
+        reasons: reasons.into_iter().collect(),
+    })
 }
 
 fn profile_ranks(items: &[ProfileItem]) -> Vec<(i64, usize, bool, Option<f64>, Option<f64>)> {

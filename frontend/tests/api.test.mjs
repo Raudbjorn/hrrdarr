@@ -503,7 +503,22 @@ test('naming examples query builders allowlist domain-scoped fields and drop the
     await getTvNamingExamples({ standard_movie_format: 'x', multi_episode_style: 1, revision: 2 });
     await getMovieNamingExamples({ standard_episode_format: 'x', multi_episode_style: 1, revision: 2 });
   });
-  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples', '/api/v1/movies/config/naming/examples']);
+  // TV multi-episode previews now consume this existing setting; movies still reject it.
+  assert.deepEqual(calls, ['/api/v1/tv/config/naming/examples?multi_episode_style=1', '/api/v1/movies/config/naming/examples']);
+});
+
+test('multi-episode draft preview distinguishes cleared style from saved settings and preserves zero', async () => {
+  const calls = [];
+  await withFetch(async (path) => { calls.push(path); return json({}); }, async () => {
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: true });
+    await getTvNamingExamples({ multi_episode_draft: true, rename_enabled: false, multi_episode_style: 0 });
+    await getTvNamingExamples({ multi_episode_draft: false });
+  });
+  assert.deepEqual(calls, [
+    '/api/v1/tv/config/naming/examples?rename_enabled=true&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?rename_enabled=false&multi_episode_style=0&multi_episode_draft=true',
+    '/api/v1/tv/config/naming/examples?multi_episode_draft=false',
+  ]);
 });
 
 const fileApi = await import('../src/lib/api.ts');
@@ -560,4 +575,25 @@ test('file writes retain structured errors and do not automatically retry lost r
   assert.deepEqual(result,{ok:false,error:'Response lost'});
  });
  assert.equal(requests,1);
+});
+
+test('bulk file deletion waits one per-file transfer bound for every file in the batch', async () => {
+  const { deleteMediaFile, deleteMediaFiles } = await import('../src/lib/api.ts');
+  const original = AbortSignal.timeout;
+  const timeouts = [];
+  AbortSignal.timeout = ms => { timeouts.push(ms); return original.call(AbortSignal, ms); };
+  try {
+    await withFetch(async (path, options) => {
+      const body = JSON.parse(options.body);
+      return json(path.endsWith('/bulk')
+        ? { deletions: body.file_ids.map(file_id => ({ file_id, media_type: 'tv' })) }
+        : { file_id: 4, media_type: 'tv' });
+    }, async () => {
+      assert.equal((await deleteMediaFile('tv', 4, 'recycle')).ok, true);
+      assert.equal((await deleteMediaFiles('tv', [1, 2, 3], 'recycle')).ok, true);
+    });
+  } finally { AbortSignal.timeout = original; }
+  // Reasoning: the server copies cross-device files one at a time, each bounded at 30 min, so
+  // a batch of three may legitimately run three bounds; one bound would abort a valid batch.
+  assert.deepEqual(timeouts, [31 * 60 * 1000, 3 * 31 * 60 * 1000]);
 });

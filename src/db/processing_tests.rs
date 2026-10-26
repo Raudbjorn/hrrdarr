@@ -103,7 +103,7 @@ async fn processing_schema25_upgrade_rollback_retirement_and_retry_fences() -> R
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     assert!(db.migration_backup().is_some());
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_processing_policies").await?,

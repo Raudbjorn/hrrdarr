@@ -216,7 +216,10 @@ async fn bound_target_corruption_overflow_and_storage_failure_are_unevaluated() 
         scope(&c, &indexer, "torznab", media, Some(&client)).await;
     }
     // Target has no scopes: it must still be validated before reporting lost scope.
-    c.execute_batch("PRAGMA ignore_check_constraints=ON; DROP TRIGGER provider_identity_immutable; DROP TRIGGER provider_revision_step;").await.unwrap();
+    // Reasoning: 0058 replaced the implementation CHECK with a provider_implementations foreign
+    // key, so simulating an unregistered ('future') implementation also needs foreign_keys=OFF on
+    // this fixture connection; the evaluator's own connection still sees the corrupt row.
+    c.execute_batch("PRAGMA ignore_check_constraints=ON; PRAGMA foreign_keys=OFF; DROP TRIGGER provider_identity_immutable; DROP TRIGGER provider_revision_step;").await.unwrap();
     for change in [
         "enabled=2",
         "enabled=0.5",
@@ -242,7 +245,9 @@ async fn bound_target_corruption_overflow_and_storage_failure_are_unevaluated() 
     for media in ["tv", "movies"] {
         scope(&c, &client, "qbittorrent", media, None).await;
     }
-    c.execute_batch("PRAGMA foreign_keys=OFF; DROP TRIGGER provider_scope_options_update; DROP TRIGGER provider_client_options_update;").await.unwrap();
+    // Reasoning: 0058 moved the scope shape CHECK into provider_scope_shape_update, which
+    // ignore_check_constraints cannot bypass; drop it too so the fixture can simulate corruption.
+    c.execute_batch("PRAGMA foreign_keys=OFF; DROP TRIGGER provider_scope_options_update; DROP TRIGGER provider_client_options_update; DROP TRIGGER provider_scope_shape_update;").await.unwrap();
     c.execute(
         "UPDATE provider_scopes SET implementation='future' WHERE provider_id=?",
         [client.as_str()],

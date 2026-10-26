@@ -1,4 +1,7 @@
+import type { WantedKind, WantedPage, TvWantedItem, MovieWantedItem, WantedSearchInput, WantedSearchReceipt } from './api.generated';
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
+import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
+import type { DownloadedScanInput, DownloadedScanCommand, DownloadedScanQuery, DownloadedScanChildQuery, ScanChild, ScanChildResumeInput, ScanCleanupResumeInput, ScanChildMember, ScanMemberQuery } from './api.generated';
 import type { QualityProfile, QualityProfileInput, QualityDefinition } from './api.generated';
 import type { SearchCommandInput, SearchCommand, SearchResult, MediaTarget, ProcessingPolicy, ProcessingPolicyInput, ProcessingInput, DownloadProcessing, RssTargetInput, RssInput, RssCommand, RssCandidate, RssScheduleInput, RssSchedule, ReleasePolicy, ReleaseSearchInput, ReleaseSearchPage, QualityProfilePage, BlocklistClearCommand, BlocklistClearInput, BlocklistEntry, BlocklistIdentity, BlocklistQuery, BlocklistRemoval, MetadataCommand, MetadataCommandInput, MetadataCommandQuery, MetadataRefreshTarget, Command, CommandInput, CommandQuery, CommandPriority, RefreshTarget, RefreshSchedule, RefreshScheduleInput, RefreshScheduleDelete, QueueSnapshot, Provider, ProviderInput, ProviderUpdate, ProviderSchema, ProviderKind, ProviderTestResult, ApiPage, MovieCredit, Episode, LibraryItem, LibraryPage, LibraryPatch, LookupResult, ManualImportRequest, MediaDomain, ApiErrorEnvelope, ImportRequest, LegacyEpisode, LegacyError, LegacySeries, Operation, TvNamingConfig, TvNamingUpdate, TvNamingExamples, TvNamingExamplesQuery, MovieNamingConfig, MovieNamingUpdate, MovieNamingExamples, MovieNamingExamplesQuery, RootFolder, RescanBatch, RescanCommand } from './api.generated';
 
@@ -92,8 +95,88 @@ const validOperation = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 export const getImport = (id: string) => validOperation(id) ? request<Operation>(`/api/v1/imports/${id}`, undefined, undefined, true) : Promise.resolve<Result<Operation>>({ok:false,error:'Invalid operation ID.'});
 export const executeImport = (id: string) => validOperation(id) ? request<Operation>(`/api/v1/imports/${id}/execute`, undefined, 'POST', true) : Promise.resolve<Result<Operation>>({ok:false,error:'Invalid operation ID.'});
 
+const validManualImportIds = (ids: string[]) => Array.isArray(ids) && ids.length >= 1 && ids.length <= 100
+  && ids.every(id => typeof id === 'string' && validOperation(id))
+  && new Set(ids.map(id => id.toLowerCase())).size === ids.length;
+export const createManualImportCommands = (input: ManualImportBatchInput) =>
+  validManualImportIds(input.operation_ids) && ['normal', 'high'].includes(input.priority)
+    ? request<ManualImportCommand[]>('/api/v1/manual-import/commands', input, 'POST', true)
+    : Promise.resolve<Result<ManualImportCommand[]>>({ok: false, error: 'Choose 1–100 distinct operation IDs and a valid priority.'});
+export const getManualImportCommand = (id: string) => validOperation(id)
+  ? request<ManualImportCommand>(`/api/v1/manual-import/commands/${id}`, undefined, undefined, true)
+  : Promise.resolve<Result<ManualImportCommand>>({ok: false, error: 'Invalid command ID.'});
+export const cancelManualImportCommand = (id: string) => validOperation(id)
+  ? request<ManualImportCommand>(`/api/v1/manual-import/commands/${id}/cancel`, undefined, 'POST', true)
+  : Promise.resolve<Result<ManualImportCommand>>({ok: false, error: 'Invalid command ID.'});
+export const reconcileManualImports = (operationIds: string[]) => validManualImportIds(operationIds)
+  ? request<ManualImportReconciliation[]>('/api/v1/manual-import/commands/reconcile', {operation_ids: operationIds}, 'POST', true)
+  : Promise.resolve<Result<ManualImportReconciliation[]>>({ok: false, error: 'Choose 1–100 distinct operation IDs.'});
+
 export const listProviders = (offset = 0) => request<ApiPage<Provider>>(`/api/v1/providers?limit=25&offset=${offset}`, undefined, undefined, true);
 export const getProviderSchema = (media: MediaDomain, kind: ProviderKind) => request<ProviderSchema>(`/api/v1/providers/schema?${new URLSearchParams({media_type: media, kind})}`, undefined, undefined, true);
+// Downloaded-folder scan (phase A discovery): one POST authorizes bounded discovery of exactly one
+// named file or folder. Nothing here retries; a lost response is reconciled by GET with the SAME id.
+const scanId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
+const scanPath = (path: unknown): path is string => typeof path === 'string'
+  && path.startsWith('/') && path !== '/' && !path.endsWith('/') && !path.includes('\0')
+  && new TextEncoder().encode(path).length <= 4096
+  && path.slice(1).split('/').every(part => part !== '' && part !== '.' && part !== '..');
+const scanRemote = (remote: unknown): remote is string => typeof remote === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(remote);
+const scanDomain = (domain: unknown): domain is MediaDomain => domain === 'tv' || domain === 'movies';
+const scanRoot = (domain: MediaDomain) => `/api/v1/${domain}/downloaded-scan-commands`;
+const scanError = <T>(error: string) => Promise.resolve<Result<T>>({ ok: false, error });
+const scanPage = (query: { limit?: number; offset?: number } | undefined, extra: Record<string, string | undefined>) => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(extra)) if (value !== undefined) params.set(key, value);
+  if (query?.limit !== undefined) params.set('limit', String(query.limit));
+  if (query?.offset !== undefined) params.set('offset', String(query.offset));
+  const text = params.toString();
+  return text ? `?${text}` : '';
+};
+const validScanPage = (query: { limit?: number; offset?: number } | undefined) => !query
+  || ((query.limit === undefined || (Number.isInteger(query.limit) && query.limit >= 1 && query.limit <= 100))
+    && (query.offset === undefined || (Number.isInteger(query.offset) && query.offset >= 0 && query.offset <= 100_000)));
+export const createDownloadedScanCommand = (domain: MediaDomain, input: DownloadedScanInput) => {
+  if (!scanDomain(domain)) return scanError<DownloadedScanCommand>('Choose TV or movies.');
+  if (!scanId(input.id)) return scanError<DownloadedScanCommand>('Invalid command ID.');
+  if (!scanPath(input.path)) return scanError<DownloadedScanCommand>('Enter an absolute, normalized file or folder path of at most 4096 bytes.');
+  if (!['auto', 'move', 'copy'].includes(input.mode) || !['normal', 'high'].includes(input.priority)) return scanError<DownloadedScanCommand>('Choose a valid mode and priority.');
+  if (input.tracked !== undefined && (!scanId(input.tracked.provider_id) || !scanRemote(input.tracked.remote_id))) return scanError<DownloadedScanCommand>('Tracked downloads need a provider ID and a lowercase 40- or 64-character hash.');
+  return request<DownloadedScanCommand>(scanRoot(domain), input, 'POST', true);
+};
+export const listDownloadedScanCommands = (domain: MediaDomain, query?: DownloadedScanQuery) => scanDomain(domain) && validScanPage(query)
+  ? request<ApiPage<DownloadedScanCommand>>(`${scanRoot(domain)}${scanPage(query, { status: query?.status })}`, undefined, undefined, true)
+  : scanError<ApiPage<DownloadedScanCommand>>('Invalid scan list request.');
+export const getDownloadedScanCommand = (domain: MediaDomain, id: string) => scanDomain(domain) && scanId(id)
+  ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}`, undefined, undefined, true)
+  : scanError<DownloadedScanCommand>('Invalid command ID.');
+export const listDownloadedScanChildren = (domain: MediaDomain, id: string, query?: DownloadedScanChildQuery) => scanDomain(domain) && scanId(id) && validScanPage(query)
+  ? request<ApiPage<ScanChild>>(`${scanRoot(domain)}/${id}/children${scanPage(query, { disposition: query?.disposition })}`, undefined, undefined, true)
+  : scanError<ApiPage<ScanChild>>('Invalid scan children request.');
+export const cancelDownloadedScanCommand = (domain: MediaDomain, id: string) => scanDomain(domain) && scanId(id)
+  ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}/cancel`, undefined, 'POST', true)
+  : scanError<DownloadedScanCommand>('Invalid command ID.');
+// Explicit recovery of one failed child; the body names the exact operation and the generation
+// last read. A lost response is reconciled by re-reading or repeating the identical body.
+export const resumeDownloadedScanChild = (domain: MediaDomain, id: string, childId: string, input: ScanChildResumeInput) =>
+  scanDomain(domain) && scanId(id) && scanId(childId) && scanId(input.operation_id)
+    && (input.inventory_revision === 0 || input.inventory_revision === 1)
+    && Number.isSafeInteger(input.expected_resume_generation) && input.expected_resume_generation >= 0
+    ? request<ScanChild>(`${scanRoot(domain)}/${id}/children/${childId}/resume`, input, 'POST', true)
+    : scanError<ScanChild>('Invalid scan child resume request.');
+// Complete paginated TV membership of one child's physical file (movie children have none).
+export const listDownloadedScanMembers = (domain: MediaDomain, id: string, childId: string, query?: ScanMemberQuery) =>
+  scanDomain(domain) && scanId(id) && scanId(childId) && validScanPage(query)
+    ? request<ApiPage<ScanChildMember>>(`${scanRoot(domain)}/${id}/children/${childId}/members${scanPage(query, {})}`, undefined, undefined, true)
+    : scanError<ApiPage<ScanChildMember>>('Invalid scan membership request.');
+// Explicit recovery of an uncertain source-folder cleanup; the body names the generation last
+// read. A lost response is reconciled by re-reading or repeating the identical body.
+export const resumeDownloadedScanCleanup = (domain: MediaDomain, id: string, input: ScanCleanupResumeInput) =>
+  scanDomain(domain) && scanId(id) && (input.inventory_revision === 0 || input.inventory_revision === 1)
+    && Number.isSafeInteger(input.expected_cleanup_resume_generation) && input.expected_cleanup_resume_generation >= 0
+    ? request<DownloadedScanCommand>(`${scanRoot(domain)}/${id}/resume-cleanup`, input, 'POST', true)
+    : scanError<DownloadedScanCommand>('Invalid scan cleanup resume request.');
+
 const invalidProvider = <T>(): Promise<Result<T>> => Promise.resolve({ok:false,error:'Invalid provider ID or revision.'});
 export const getProvider = (id: string) => validOperation(id) ? request<Provider>(`/api/v1/providers/${id}`, undefined, undefined, true) : invalidProvider<Provider>();
 export const createProvider = (input: ProviderInput) => request<Provider>('/api/v1/providers', input, 'POST', true);
@@ -181,7 +264,7 @@ export const getTvNaming = () => request<TvNamingConfig>('/api/v1/tv/config/nami
 export const updateTvNaming = (input: TvNamingUpdate) => validId(input.revision) ? request<TvNamingConfig>('/api/v1/tv/config/naming', input, 'PUT', true) : invalidProvider<TvNamingConfig>();
 export const getTvNamingExamples = (query: TvNamingExamplesQuery = {}) => {
   const params = new URLSearchParams();
-  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_episode_format','daily_episode_format','anime_episode_format','series_folder_format','season_folder_format','specials_folder_format'] as const) {
+  for (const field of ['rename_enabled','replace_illegal_characters','colon_replacement','custom_colon_replacement','standard_episode_format','daily_episode_format','anime_episode_format','series_folder_format','season_folder_format','specials_folder_format','multi_episode_style','multi_episode_draft'] as const) {
     if (query[field] != null) params.set(field, String(query[field]));
   }
   const qs = params.toString();
@@ -249,6 +332,9 @@ export const createDelayProfile = (domain: MediaDomain, input: import('./api.gen
 export const updateDelayProfile = (domain: MediaDomain, id: number, input: import('./api.generated').DelayProfileWrite) => validId(id) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').DelayProfileCatalog>();
 export const deleteDelayProfile = (domain: MediaDomain, id: number, revision: number) => validId(id)&&validId(revision) ? request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/${id}?revision=${revision}`, undefined, 'DELETE', true) : invalid<import('./api.generated').DelayProfileCatalog>();
 export const reorderDelayProfiles = (domain: MediaDomain, input: import('./api.generated').DelayProfileReorder) => request<import('./api.generated').DelayProfileCatalog>(`${delayPath(domain)}/reorder`, input, 'PUT', true);
+export const getImportPolicy = (domain: MediaDomain) => request<import('./api.generated').ImportPolicy>(`/api/v1/${domain}/import-policy`, undefined, undefined, true);
+export const updateImportPolicy = (domain: MediaDomain, input: import('./api.generated').ImportPolicyUpdate) => request<import('./api.generated').ImportPolicy>(`/api/v1/${domain}/import-policy`, input, 'PUT', true);
+
 export const getRevisionPolicy = (domain: MediaDomain) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, undefined, undefined, true);
 export const updateRevisionPolicy = (domain: MediaDomain, input: import('./api.generated').RevisionPolicyUpdate) => request<import('./api.generated').RevisionPolicy>(`/api/v1/${domain}/revision-policy`, input, 'PUT', true);
 
@@ -259,6 +345,7 @@ export const createReleaseProfile=(domain:MediaDomain,input:import('./api.genera
 export const updateReleaseProfile=(domain:MediaDomain,id:number,input:import('./api.generated').ReleaseProfileWrite<import('./release-profile-draft').Input>)=>validId(id)&&validId(input.revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}`,input,'PUT',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 export const deleteReleaseProfile=(domain:MediaDomain,id:number,revision:number)=>validId(id)&&validId(revision)?request<import('./api.generated').ReleaseProfileCatalog>(`${releaseProfilePath(domain)}/${id}?revision=${revision}`,undefined,'DELETE',true):invalid<import('./api.generated').ReleaseProfileCatalog>();
 
+import { isClientImplementation } from './provider-draft.ts';
 // One readback boundary for settings which reconcile policies and schedules together.
 export const getCompletedDownloadHandling = (media: MediaDomain) => request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,undefined,undefined,true);
 export const saveCompletedDownloadHandling = (media: MediaDomain, input: import('./api.generated').CompletedDownloadHandlingUpdate) => validId(input.revision) ? request<import('./api.generated').CompletedDownloadHandling>(`/api/v1/${media}/completed-download-handling`,input,'PUT',true) : invalidProvider<import('./api.generated').CompletedDownloadHandling>();
@@ -274,7 +361,7 @@ export async function readDownloadHandling(providerId?: string): Promise<Result<
     if(!saved.ok && saved.status!==404)return saved;
     if(saved.ok){
       provider=saved.data;
-      if(provider.settings.implementation==='qbittorrent')for(const media of ['tv','movies'] as const){
+      if(isClientImplementation(provider.settings.implementation))for(const media of ['tv','movies'] as const){
         if(!provider.settings[media])continue;
         const policy=await getProcessingPolicy(providerId,media);
         if(!policy.ok)return policy;
@@ -392,3 +479,50 @@ export async function readMediaFiles(domain: MediaDomain, ownerId: number, fileI
   if (!filePageValid(result.data) || result.data.offset !== 0 || result.data.total !== ids.length) return invalidFiles('Readback did not return the complete attempted selection.');
   return validateFileReadback(domain, ownerId, ids, result.data.items);
 }
+
+// Recycle bin settings, explicit file deletion and CleanUpRecycleBin. Deletion always carries the
+// mode the user confirmed; the server refuses it when current settings disagree.
+import type { RecycleBinSettings, RecycleBinSettingsUpdate, FileDeletion, FileDeletionBatch, FileDeletionMode, RecycleBinCleanupCommand } from './api.generated';
+import { MAX_DELETE_FILES } from './recycle-bin-draft.ts';
+/** Same-device recycling is one rename; a cross-device copy is bounded server-side at 30 minutes. */
+const FILE_DELETE_TIMEOUT_MS = 31 * 60 * 1000;
+export const getRecycleBin = (domain: MediaDomain) => fileDomain(domain) ? request<RecycleBinSettings>(`/api/v1/${domain}/recycle-bin`, undefined, undefined, true) : Promise.resolve(invalidFiles<RecycleBinSettings>());
+export const updateRecycleBin = (domain: MediaDomain, input: RecycleBinSettingsUpdate) => fileDomain(domain) ? request<RecycleBinSettings>(`/api/v1/${domain}/recycle-bin`, input, 'PUT', true) : Promise.resolve(invalidFiles<RecycleBinSettings>());
+export async function deleteMediaFile(domain: MediaDomain, fileId: number, mode: FileDeletionMode): Promise<Result<FileDeletion>> {
+  if (!fileDomain(domain) || !validId(fileId) || (mode !== 'recycle' && mode !== 'permanent')) return invalidFiles();
+  const result = await request<FileDeletion>(`/api/v1/${domain}/files/${fileId}`, { mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS);
+  return !result.ok || (result.data?.file_id === fileId && result.data.media_type === domain) ? result : invalidFiles('Invalid deletion response; reload the file list.');
+}
+export async function deleteMediaFiles(domain: MediaDomain, fileIds: number[], mode: FileDeletionMode): Promise<Result<FileDeletionBatch>> {
+  if (!fileDomain(domain) || !validFileIds(fileIds) || fileIds.length > MAX_DELETE_FILES || (mode !== 'recycle' && mode !== 'permanent')) return invalidFiles();
+  const ids = [...fileIds];
+  // The server recycles the batch one file at a time, each copy bounded separately.
+  const result = await request<FileDeletionBatch>(`/api/v1/${domain}/files/bulk`, { file_ids: ids, mode }, 'DELETE', true, FILE_DELETE_TIMEOUT_MS * ids.length);
+  if (!result.ok) return result;
+  const deleted = result.data?.deletions;
+  return Array.isArray(deleted) && deleted.length === ids.length && deleted.every((d, i) => d?.file_id === ids[i] && d.media_type === domain) ? result : invalidFiles('Invalid bulk deletion response; reload the file list.');
+}
+export const listRecycleBinCleanups = (domain: MediaDomain, limit = 5) => fileDomain(domain) && Number.isInteger(limit) && limit >= 1 && limit <= 100
+  ? request<ApiPage<RecycleBinCleanupCommand>>(`/api/v1/recycle-bin/cleanup-commands?${new URLSearchParams({ media_type: domain, limit: String(limit) })}`, undefined, undefined, true)
+  : Promise.resolve(invalidFiles<ApiPage<RecycleBinCleanupCommand>>());
+export const createRecycleBinCleanup = (domain: MediaDomain) => fileDomain(domain) ? request<RecycleBinCleanupCommand>('/api/v1/recycle-bin/cleanup-commands', { target: { media_type: domain }, priority: 'high' }, 'POST', true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());
+export const getRecycleBinCleanup = (id: string) => validOperation(id) ? request<RecycleBinCleanupCommand>(`/api/v1/recycle-bin/cleanup-commands/${id}`, undefined, undefined, true) : Promise.resolve(invalidFiles<RecycleBinCleanupCommand>());
+
+// Wanted lists are read-only GETs; searches admit durable commands and are never retried
+// automatically. A lost response is reconciled by resending the SAME request (exact replay).
+export const listWanted = <T extends TvWantedItem | MovieWantedItem>(domain: MediaDomain, kind: WantedKind, query: string) =>
+  (domain === 'tv' || domain === 'movies') && (kind === 'missing' || kind === 'cutoff')
+    ? request<WantedPage<T>>(`/api/v1/${domain}/wanted/${kind}${query ? `?${query}` : ''}`, undefined, undefined, true)
+    : Promise.resolve<Result<WantedPage<T>>>({ ok: false, error: 'Unknown Wanted list.' });
+const validWantedSelection = (input: WantedSearchInput) => input.selection.kind === 'all'
+  || (input.selection.ids.length >= 1 && input.selection.ids.length <= 1024 && input.selection.ids.every(validId));
+export const createWantedSearch = (domain: MediaDomain, input: WantedSearchInput) =>
+  (domain === 'tv' || domain === 'movies') && validOperation(input.request_id) && validOperation(input.indexer_id) && validId(input.indexer_revision)
+    && validClientSelection({ client_selection: input.client_selection }) && validWantedSelection(input)
+    ? request<WantedSearchReceipt>(`/api/v1/${domain}/wanted/search`, input, 'POST', true)
+    : Promise.resolve<Result<WantedSearchReceipt>>({ ok: false, error: 'Invalid Wanted search request.' });
+const validMonitorIds = (ids: number[]) => ids.length >= 1 && ids.length <= 100 && ids.every(validId) && new Set(ids).size === ids.length;
+export const monitorEpisodes = (ids: number[], monitored: boolean) => validMonitorIds(ids)
+  ? request<Episode[]>('/api/v1/episodes/monitor', { episode_ids: ids, monitored }, 'PUT', true) : invalid<Episode[]>();
+export const monitorMovies = (ids: number[], monitored: boolean) => validMonitorIds(ids)
+  ? request<LibraryItem[]>('/api/v1/movies/editor', { ids, patch: { monitored } }, 'PUT', true) : invalid<LibraryItem[]>();

@@ -70,8 +70,8 @@ null when absent, otherwise a validated scan-fact projection as described below.
 Migration 0006 adds one optional metadata row per existing file, with exclusive
 TV/movie foreign keys, domain-scoped quality references and deletion restrictions.
 Existing files and imported snapshot mappings stay intact. No metadata is invented
-at migration time. Future physical-deletion recovery must explicitly remove these
-rows and preserve snapshot mapping records to prevent replay resurrection.
+at migration time. Physical deletion ([recycle-bin.md](recycle-bin.md)) removes these rows
+with the file record and leaves snapshot mapping records in place.
 
 Sonarr 233 and Radarr 206/242 readers map optional file size/date/season/original
 path/group/flags/type plus serialized quality/revision and language metadata.
@@ -164,11 +164,11 @@ null/zero distinctions and domain-specific HDR mapping. HTTP fixtures exercise
 both snapshot-to-resource paths and private-field exclusion. Existing
 migration/import/episode regressions remain applicable.
 
-Both API ledger rows remain **Partial**. Outstanding controller behavior includes
-safe physical single/bulk DELETE with recycle/history/recovery, scene validation,
-scene-dependent media-info codec formatting, custom-format scoring/cutoff policy
-and realtime events.
-No DELETE placeholder reports success. Polling reads are available; live services,
+Both API ledger rows remain **Partial**. Single/bulk `DELETE` with an explicit
+`recycle`/`permanent` mode, journaled recovery and deletion history is described in
+[recycle-bin.md](recycle-bin.md). Outstanding controller behavior includes scene
+validation, scene-dependent media-info codec formatting, custom-format
+scoring/cutoff policy and realtime events. Polling reads are available; live services,
 remote storage and filesystem recovery have not been exercised. Full import/manual
 library/provider or combined TV/movie slice gates are not established here.
 The structural JSON predicate requirement per.006 has no current query consumer:

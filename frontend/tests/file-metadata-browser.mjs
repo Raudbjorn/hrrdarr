@@ -13,7 +13,7 @@ const scratch = await realpath(process.env.UI_SCRATCH);
 assert.ok(basename(scratch).startsWith('hrrdarr-library-ui-'));
 const artifacts = process.env.UI_SCREENSHOT_DIR;
 if (artifacts) {
-  assert.ok(isAbsolute(artifacts) && artifacts.includes('/.do-not-commit/loop/iteration102'), 'Screenshots require an owned ignored iteration102 directory');
+  assert.ok(isAbsolute(artifacts) && artifacts.includes('/.do-not-commit/loop/iteration103'), 'Screenshots require an owned ignored iteration103 directory');
   await mkdir(artifacts, {recursive: true});
 }
 const {chromium} = await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE || '/usr/lib/node_modules/playwright/index.mjs').href);

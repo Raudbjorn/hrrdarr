@@ -24,6 +24,98 @@ use std::{
     time::Duration,
 };
 
+// Opt-in start barrier lets the browser cancel genuinely queued commands before any claim.
+struct CommandWorkerFixture {
+    runtime: tokio::sync::Mutex<Option<commands::Runtime>>,
+    db: Arc<Database>,
+    refresh: hrrdarr::providers::RefreshClient,
+    metadata: Arc<MetadataClient>,
+}
+async fn start_command_worker(State(state): State<Arc<CommandWorkerFixture>>) -> StatusCode {
+    let mut runtime = state.runtime.lock().await;
+    if runtime.is_some() {
+        return StatusCode::CONFLICT;
+    }
+    match commands::start_with_metadata(
+        state.db.clone(),
+        state.refresh.clone(),
+        state.metadata.clone(),
+    )
+    .await
+    {
+        Ok(worker) => {
+            *runtime = Some(worker);
+            StatusCode::NO_CONTENT
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+// Barrier counterpart: the downloaded-scan browser parks admitted scans before any claim so it
+// can cancel genuinely queued work, then restarts the worker through the route above.
+async fn stop_command_worker(State(state): State<Arc<CommandWorkerFixture>>) -> StatusCode {
+    match state.runtime.lock().await.take() {
+        Some(runtime) => {
+            runtime.shutdown().await;
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::CONFLICT,
+    }
+}
+/// Minimal PCM WAV bytes (one audio stream). Downloaded-scan sources use the sample-exempt
+/// `.flv` extension, so the probe result never decides acceptance.
+fn scan_payload(tag: u8) -> Vec<u8> {
+    const DATA_BYTES: u32 = 16000;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(DATA_BYTES + 36).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&DATA_BYTES.to_le_bytes());
+    wav.resize(44 + DATA_BYTES as usize, 0);
+    wav.extend(std::iter::repeat_n(tag, 4096));
+    wav
+}
+/// Isolated downloaded-scan sources under `scratch/downloaded-scan`; nothing else reads them.
+fn downloaded_scan_sources(root: &std::path::Path) {
+    let files: [(&str, Option<u8>); 8] = [
+        (
+            "tv/Fixture.series.S01E01.1080p.WEB-DL/Fixture.series.S01E01.1080p.WEB-DL.flv",
+            Some(1),
+        ),
+        ("tv/Fixture.series.S01E01.1080p.WEB-DL/readme.nfo", None),
+        (
+            "movies/Fixture.movie.2021.1080p.WEB-DL.English/Fixture.movie.2021.1080p.WEB-DL.English.flv",
+            Some(2),
+        ),
+        (
+            "tv-recovery/Fixture.series.S01E02.1080p.WEB-DL/Fixture.series.S01E02.1080p.WEB-DL.flv",
+            Some(3),
+        ),
+        ("cancel/Fixture.series.S01E02.1080p.WEB-DL.flv", Some(4)),
+        ("unmatched/Unknown.Show.S01E01.1080p.WEB-DL.flv", Some(5)),
+        ("unmatched/notes.txt", None),
+        // Tracked receipt folder: initially nothing for the receipt's episode (see the hook below).
+        (
+            "tracked/Fixture.series.S01E03.1080p.WEB-DL/readme.nfo",
+            None,
+        ),
+    ];
+    for (relative, tag) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, tag.map_or_else(|| b"text".to_vec(), scan_payload)).unwrap();
+    }
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+}
+
 struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -319,6 +411,247 @@ async fn import_failure(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+// One-use downloaded-scan browser hook (no production route, inert elsewhere): adds S01E03 to
+// the given series and an OBSERVED tracked qBittorrent receipt for it with a blocked processing
+// row, mirroring tests/downloaded_scan_tracked.rs. Both providers point at 127.0.0.1:1, which
+// is never needed: tracked scans read the receipt from storage only.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackedReceiptInput {
+    series_id: i64,
+}
+async fn seed_tracked_receipt(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<TrackedReceiptInput>,
+) -> Response {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let (indexer, client, command, candidate) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    let hash = "e".repeat(40);
+    for (id, implementation, name) in [
+        (&indexer, "torznab", "Tracked indexer"),
+        (&client, "qbittorrent", "Tracked client"),
+    ] {
+        tx.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,?,?,1,1,1,1,'http://127.0.0.1:1/')", libsql::params![id.clone(), implementation, name]).await.unwrap();
+    }
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab','tv','[5000]','[]',0,NULL)", [indexer.clone()]).await.unwrap();
+    tx.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent','tv','tv',0,0,'started','default',0,0,0)", [client.clone()]).await.unwrap();
+    tx.execute("INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode,enabled_override) VALUES(?,'tv',1,1,1,'copy',1)", [client.clone()]).await.unwrap();
+    let episode: i64 = tx
+        .query("INSERT INTO episodes(series_id,season,number,title,runtime,air_date) VALUES(?,1,3,'Tracked episode',45,'2020-01-03') RETURNING id", [input.series_id])
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    tx.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync','tv',?,1,?,1,100,100)", libsql::params![command.clone(), indexer.clone(), client.clone()]).await.unwrap();
+    tx.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Fixture.series.S01E03.1080p.WEB-DL',?,?,NULL,'pending','[]',100,100 FROM rss_commands WHERE id=?", libsql::params![candidate.clone(), "f".repeat(64), vec![1u8; 29], input.series_id, command]).await.unwrap();
+    tx.execute(
+        "INSERT INTO rss_candidate_episodes VALUES(?,1,?)",
+        libsql::params![candidate.clone(), episode],
+    )
+    .await
+    .unwrap();
+    let identity = json!({"version":1,"target":{"media_type":"episode","id":episode},"hashes":[hash],"settings_fingerprint":"c".repeat(64),"payload_sha256":"d".repeat(64)}).to_string();
+    tx.execute(
+        "UPDATE rss_candidates SET status='prepared',submission_identity_json=? WHERE id=?",
+        libsql::params![identity, candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+        libsql::params![client.clone(), hash.clone(), candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+        [candidate.clone()],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+        libsql::params![hash.clone(), candidate.clone()],
+    )
+    .await
+    .unwrap();
+    // Blocked in the same transaction so the processing worker never claims it first.
+    tx.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at)VALUES(?,1,'queued',100,100,100)", [candidate.clone()]).await.unwrap();
+    tx.execute("UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1,updated_at=101 WHERE candidate_id=?", [candidate.clone()]).await.unwrap();
+    tx.execute("UPDATE download_processing SET status='blocked',error_code='path_mapping_missing',reasons_json='[\"hc021_mapping_missing\",\"path_mapping_missing\"]',updated_at=102 WHERE candidate_id=?", [candidate.clone()]).await.unwrap();
+    tx.commit().await.unwrap();
+    Json(json!({"provider_id":client,"remote_id":hash,"candidate_id":candidate,"episode_id":episode})).into_response()
+}
+// One-use Wanted browser hook (no production route, inert elsewhere): adds a small owned
+// library whose episode and movie IDs collide numerically, with aired/future episodes and
+// files below/at the supplied profiles' cutoff. Profiles are created by the browser via API.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WantedSeedInput {
+    tv_profile_id: i64,
+    movie_profile_id: i64,
+}
+async fn seed_wanted(
+    State(db): State<Arc<Database>>,
+    Json(input): Json<WantedSeedInput>,
+) -> Response {
+    let c = db.connect().await.unwrap();
+    let tx = c
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    let (tv, movies) = (input.tv_profile_id, input.movie_profile_id);
+    let series: i64 = tx.query("INSERT INTO series(tvdb_id,title,path,monitored,runtime) VALUES(9101,'Wanted Harbor','/owned-wanted/tv',1,30) RETURNING id", ()).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+    tx.execute(
+        "INSERT INTO seasons(series_id,number,monitored) VALUES(?,1,1)",
+        [series],
+    )
+    .await
+    .unwrap();
+    tx.execute("INSERT INTO library_settings(media_type,series_id,quality_profile_id,series_type,use_scene_numbering) VALUES('tv',?,?,'standard',0)", libsql::params![series, tv]).await.unwrap();
+    let mut episodes = serde_json::Map::new();
+    for (key, number, title, air, quality) in [
+        (
+            "pilot",
+            1,
+            "Wanted pilot",
+            Some("2020-01-01T00:00:00Z"),
+            None,
+        ),
+        (
+            "second",
+            2,
+            "Wanted second",
+            Some("2020-01-08T00:00:00Z"),
+            None,
+        ),
+        (
+            "future",
+            3,
+            "Wanted future",
+            Some("2099-01-01T00:00:00Z"),
+            None,
+        ),
+        (
+            "low",
+            4,
+            "Wanted low quality",
+            Some("2020-01-15T00:00:00Z"),
+            Some(4),
+        ),
+        (
+            "good",
+            5,
+            "Wanted good quality",
+            Some("2020-01-22T00:00:00Z"),
+            Some(3),
+        ),
+    ] {
+        let file = match quality {
+            Some(quality) => {
+                let file: i64 = tx
+                    .query(
+                        "INSERT INTO episode_files(series_id,path) VALUES(?,?) RETURNING id",
+                        libsql::params![series, format!("/owned-wanted/tv/e{number}.mkv")],
+                    )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get(0)
+                    .unwrap();
+                tx.execute("INSERT INTO file_metadata(media_type,episode_file_id,quality_id) VALUES('tv',?,?)", libsql::params![file, quality]).await.unwrap();
+                Some(file)
+            }
+            None => None,
+        };
+        let id: i64 = tx.query("INSERT INTO episodes(series_id,season,number,title,monitored,air_date_utc,episode_file_id) VALUES(?,1,?,?,1,?,?) RETURNING id", libsql::params![series, number, title, air, file]).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+        episodes.insert(key.into(), json!(id));
+    }
+    let mut movie_ids = serde_json::Map::new();
+    for (key, tmdb, title, year, digital, quality) in [
+        (
+            "alpha",
+            9201,
+            "Wanted Alpha",
+            2020,
+            "2020-06-01 00:00:00",
+            None,
+        ),
+        (
+            "bravo",
+            9202,
+            "Wanted Bravo",
+            2099,
+            "2099-06-01 00:00:00",
+            None,
+        ),
+        (
+            "charlie",
+            9203,
+            "Wanted Charlie",
+            2018,
+            "2018-06-01 00:00:00",
+            Some(4),
+        ),
+    ] {
+        let metadata: i64 = tx.query("INSERT INTO movie_metadata(tmdb_id,title,year,digital_release) VALUES(?,?,?,?) RETURNING id", libsql::params![tmdb, title, year, digital]).await.unwrap().next().await.unwrap().unwrap().get(0).unwrap();
+        let id: i64 = tx
+            .query(
+                "INSERT INTO movies(metadata_id,path,monitored) VALUES(?,?,1) RETURNING id",
+                libsql::params![metadata, format!("/owned-wanted/movies/{tmdb}")],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        tx.execute("INSERT INTO library_settings(media_type,movie_id,quality_profile_id,minimum_availability) VALUES('movies',?,?,'released')", libsql::params![id, movies]).await.unwrap();
+        if let Some(quality) = quality {
+            let file: i64 = tx
+                .query(
+                    "INSERT INTO movie_files(movie_id,path) VALUES(?,?) RETURNING id",
+                    libsql::params![id, format!("/owned-wanted/movies/{tmdb}/f.mkv")],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            tx.execute("INSERT INTO file_metadata(media_type,movie_file_id,quality_id) VALUES('movies',?,?)", libsql::params![file, quality]).await.unwrap();
+        }
+        movie_ids.insert(key.into(), json!(id));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO release_delay_policies VALUES('movies',0,0,0)",
+        (),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    Json(json!({"series_id":series,"episodes":episodes,"movies":movie_ids})).into_response()
 }
 // This one-use hook has no production route and is inert in existing browser flows.
 #[derive(Deserialize)]
@@ -921,6 +1254,7 @@ async fn library_ui_fixture() {
         )
         .unwrap();
     }
+    downloaded_scan_sources(&scratch.0.join("downloaded-scan"));
     std::fs::write(incoming.join("episode.mkv"), b"scratch episode media").unwrap();
     std::fs::write(incoming.join("movie.mkv"), b"scratch movie media").unwrap();
     let (metadata_origin, _metadata) = serve(
@@ -954,11 +1288,32 @@ async fn library_ui_fixture() {
     let clear_root = scratch.0.join("clear-source");
     std::fs::create_dir(&clear_root).unwrap();
     let clear_fixture = blocklist_fixture(db.clone(), &clear_root, 902).await;
-    let worker = commands::start_with_metadata(db.clone(), refresh.clone(), client.clone())
-        .await
-        .unwrap();
+    let worker = Arc::new(CommandWorkerFixture {
+        runtime: tokio::sync::Mutex::new(None),
+        db: db.clone(),
+        refresh: refresh.clone(),
+        metadata: client.clone(),
+    });
+    if std::env::var("HRRDARR_UI_PAUSE_COMMANDS").as_deref() != Ok("1") {
+        assert_eq!(
+            start_command_worker(State(worker.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+    }
     let (api, _api) = serve(
         library::router(db.clone())
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/fixture/start-command-worker",
+                        post(start_command_worker),
+                    )
+                    .route(
+                        "/api/fixture/stop-command-worker",
+                        post(stop_command_worker),
+                    )
+                    .with_state(worker.clone()),
+            )
             .merge(library::metadata_router(db.clone(), client))
             .merge(episodes::router(db.clone()))
             .merge(hrrdarr::credits::router(db.clone()))
@@ -967,7 +1322,8 @@ async fn library_ui_fixture() {
             .merge(commands::router(db.clone()))
             .merge(hrrdarr::health::router(db.clone()))
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
-            .merge(releases::router(db.clone(), refresh))
+            .merge(releases::router(db.clone(), refresh.clone()))
+            .merge(hrrdarr::wanted::router(db.clone(), refresh))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
@@ -982,15 +1338,22 @@ async fn library_ui_fixture() {
             )
             .merge(hrrdarr::delay_profiles::router(db.clone()))
             .merge(hrrdarr::revision_policy::router(db.clone()))
+            .merge(hrrdarr::import_policy::router(db.clone()))
             .merge(hrrdarr::remote_paths::router(db.clone()))
             .merge(hrrdarr::media_files::router(db.clone()))
+            .merge(hrrdarr::recycle_bin::router(db.clone()))
             .merge(hrrdarr::naming::router(db.clone()))
             .merge(hrrdarr::custom_formats::router(db.clone()))
             .merge(hrrdarr::root_folders::router(db.clone()))
             .merge(
                 Router::new()
                     .route("/api/fixture/fail-import-history", post(import_failure))
+                    .route(
+                        "/api/fixture/tracked-scan-receipt",
+                        post(seed_tracked_receipt),
+                    )
                     .route("/api/fixture/client-backoff/age", post(age_client_failure))
+                    .route("/api/fixture/wanted-seed", post(seed_wanted))
                     .route(
                         "/api/fixture/client-backoff/pending",
                         post(pending_client_refreshes),
@@ -1026,7 +1389,7 @@ async fn library_ui_fixture() {
     let shutdown = scratch.0.join("shutdown");
     println!(
         "UI_FIXTURE {}",
-        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
+        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"downloaded_scan":scratch.0.join("downloaded-scan"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
     while !shutdown.exists() && tokio::time::Instant::now() < deadline {
@@ -1034,7 +1397,9 @@ async fn library_ui_fixture() {
     }
     // Join aborted servers before removing their database and scratch files.
     _api.stop().await;
-    worker.shutdown().await;
+    if let Some(runtime) = worker.runtime.lock().await.take() {
+        runtime.shutdown().await;
+    }
     _metadata.stop().await;
     _providers.stop().await;
     alternate_providers.stop().await;

@@ -451,11 +451,11 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             serde_json::to_value(&report.unsupported)?
         );
         // One marker for each affected class key, not once per imported indexer.
-        // Reasoning: 0051 adds one client backoff key; one indexer class mark advances five keys,
-        // and one client class mark advances four, for nine generations in the imported domain.
+        // Reasoning: 0053 adds one client path key; one indexer class mark advances five keys,
+        // and one client class mark advances five, for ten generations in the imported domain.
         assert_eq!(
             scalar(&c, "SELECT sum(generation) FROM health_checks").await,
-            before + 9
+            before + 10
         );
         let row=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='DownloadClients' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},report.fingerprint.clone()]).await?.next().await?.unwrap();
         let client: String = row.get(0)?;

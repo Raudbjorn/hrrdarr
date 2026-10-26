@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -126,9 +126,9 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     )
     .await?;
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO root_folders(media_type,path)VALUES('tv','/unused/tv'),('movies','/unused/movies');").await?;
-    // Exclude registrations added after this predecessor, including 0050 backoff identities.
+    // Exclude later registrations, including the two 0053 path diagnostics identities.
     let queries = [
-        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff') ORDER BY scope,check_key",
+        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
         "SELECT * FROM health_lifecycle",
         "SELECT * FROM health_commands ORDER BY id",
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
@@ -180,8 +180,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 52); // Reasoning: 0052 adds client selection; historical prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 20); // Reasoning: 0051 adds two client backoff identities (18 -> 20).
+        assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");
