@@ -208,6 +208,18 @@ BEGIN
      ELSE 'MissingFromDisk' END),
   (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=OLD.movie_id),CAST(strftime('%s','now') AS INTEGER));
 END;
+-- A movie replacement keeps the file id and rewrites the path in place (also when the new path equals
+-- the old one, as UPDATE OF fires on assignment), so the DELETE trigger above never sees an upgrade.
+-- The in-place rewrite of a file with an unfinished replacement is the old bytes being retired.
+CREATE TRIGGER notification_event_movie_file_upgrade AFTER UPDATE OF path ON movie_files
+WHEN EXISTS(SELECT 1 FROM notification_scopes s JOIN notifications n ON n.id=s.notification_id WHERE n.enabled=1 AND s.media_type='movies' AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
+ AND (EXISTS(SELECT 1 FROM scan_import_replacements r JOIN import_journal j ON j.operation_id=r.operation_id WHERE r.old_movie_file_id=OLD.id AND j.phase!='complete')
+  OR EXISTS(SELECT 1 FROM rss_candidate_imports r JOIN import_journal j ON j.operation_id=r.operation_id WHERE r.old_movie_file_id=OLD.id AND j.phase!='complete'))
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ VALUES('file_delete','movies',OLD.movie_id,json_object('movie_file_id',OLD.id,'path',OLD.path,'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=OLD.movie_id),CAST(strftime('%s','now') AS INTEGER));
+END;
 -- Health: only transitions outside the startup grace window are real state changes. The health
 -- ring keeps 1024 rows and is explicitly not a delivery outbox, so this copies what is needed.
 CREATE TRIGGER notification_event_health AFTER INSERT ON health_transitions
