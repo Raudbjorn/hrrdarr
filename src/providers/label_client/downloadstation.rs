@@ -247,16 +247,12 @@ fn task(row: &Value, root: &str) -> Result<Option<(String, RawTorrent)>> {
             None => return Ok(None),
         },
     };
-    let size = row.get("size").and_then(Value::as_u64).unwrap_or(0);
+    let size = bytes(row.get("size"))?;
     let transfer = row.get("additional").and_then(|a| a.get("transfer"));
-    let number = |key: &str| {
-        transfer
-            .and_then(|t| t.get(key))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
-    let done = number("size_downloaded");
-    let uploaded = number("size_uploaded");
+    let number = |key: &str| bytes(transfer.and_then(|t| t.get(key)));
+    let done = number("size_downloaded")?;
+    let uploaded = number("size_uploaded")?;
+    let (download_rate, upload_rate) = (number("speed_download")?, number("speed_upload")?);
     Ok(Some((
         id,
         RawTorrent {
@@ -267,8 +263,8 @@ fn task(row: &Value, root: &str) -> Result<Option<(String, RawTorrent)>> {
             size_bytes: size,
             downloaded_bytes: if size > 0 { done.min(size) } else { 0 },
             state: status_state(&status, size, done),
-            download_rate: number("speed_download"),
-            upload_rate: number("speed_upload"),
+            download_rate,
+            upload_rate,
             eta_seconds: None,
             ratio: if size > 0 {
                 uploaded as f64 / size as f64
@@ -278,6 +274,19 @@ fn task(row: &Value, root: &str) -> Result<Option<(String, RawTorrent)>> {
             seeding_seconds: None,
         },
     )))
+}
+/// A byte count or rate as Download Station reports it: its API guide types these as strings,
+/// while some builds send JSON numbers. A missing field is zero; a present value that is neither
+/// a number nor a plain decimal string is a malformed response, never a silent zero.
+fn bytes(value: Option<&Value>) -> Result<u64> {
+    match value {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n.as_u64().ok_or(QbitError::InvalidResponse),
+        Some(Value::String(s)) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            s.parse().map_err(|_| QbitError::InvalidResponse)
+        }
+        Some(_) => Err(QbitError::InvalidResponse),
+    }
 }
 /// Lowercase 40-character info hash of a magnet URI, if it carries one.
 fn magnet_hash(uri: &str) -> Option<String> {
@@ -377,11 +386,8 @@ impl Wire for DownloadStationWire<'_, '_> {
                     .ok_or(QbitError::InvalidResponse)?
                     .trim_start_matches('/')
                     .to_owned();
-                let size = f.get("size").and_then(Value::as_u64).unwrap_or(0);
-                let done = f
-                    .get("size_downloaded")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let size = bytes(f.get("size"))?;
+                let done = bytes(f.get("size_downloaded"))?;
                 Ok(RawFile {
                     path,
                     size_bytes: size,

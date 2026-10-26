@@ -213,10 +213,13 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
                 .map(|d| status(d, params[0].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
+        // Like aria2, honour the `[offset, offset + num)` window of these two listings.
         "aria2.tellWaiting" => ok(json!(
             m.downloads
                 .iter()
                 .filter(|d| matches!(d.status.as_str(), "waiting" | "paused"))
+                .skip(params[0].as_u64().unwrap() as usize)
+                .take(params[1].as_u64().unwrap() as usize)
                 .map(|d| status(d, params[2].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
@@ -224,6 +227,8 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
             m.downloads
                 .iter()
                 .filter(|d| matches!(d.status.as_str(), "complete" | "error" | "removed"))
+                .skip(params[0].as_u64().unwrap() as usize)
+                .take(params[1].as_u64().unwrap() as usize)
                 .map(|d| status(d, params[2].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
@@ -948,5 +953,82 @@ async fn status_mapping_isolation_details_and_controls() {
         Ok(())
     );
     assert_eq!(f.calls("aria2.removeDownloadResult").len(), 2);
+    task.abort();
+}
+
+/// Foreign downloads (outside every label folder) that only fill the listing windows.
+fn fill(f: &Fixture, count: u32, status: &str) {
+    for n in 0..count {
+        f.put(dl(
+            &format!("{:016x}", 0x1000 + n),
+            &format!("{:040x}", 0x1000 + n),
+            "Filler",
+            "/downloads/other",
+            status,
+        ));
+    }
+}
+#[tokio::test]
+async fn listings_page_through_every_window_and_fail_beyond_the_resource_bound() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let tv = "/downloads/tv-hrr";
+    // Reasoning: aria2 answers tellWaiting/tellStopped with at most `num` entries from `offset`;
+    // a download that sits past the first 1000 must still be listed, not silently dropped.
+    fill(&f, 1500, "waiting");
+    f.put(dl(
+        "00000000000000a1",
+        &format!("{:040}", 1),
+        "LateQueued",
+        tv,
+        "waiting",
+    ));
+    fill(&f, 1100, "complete");
+    let mut late = dl(
+        "00000000000000a2",
+        &format!("{:040}", 2),
+        "LateDone",
+        tv,
+        "complete",
+    );
+    late.completed = late.total;
+    f.put(late);
+    let page = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await
+    .unwrap();
+    let names: Vec<_> = page.items.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"LateQueued"), "{names:?}");
+    assert!(names.contains(&"LateDone"), "{names:?}");
+    assert!(
+        f.calls("aria2.tellWaiting")
+            .iter()
+            .any(|p| p[0].as_u64() == Some(1000)),
+        "the second waiting window is requested"
+    );
+    assert!(
+        f.calls("aria2.tellStopped")
+            .iter()
+            .any(|p| p[0].as_u64() == Some(1000)),
+        "the second stopped window is requested"
+    );
+    // Past the resource bound the inventory is refused instead of returned partially.
+    fill(&f, 7000, "waiting");
+    let result = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(QbitError::Http(HttpError::ResponseTooLarge))),
+        "an oversized listing must fail closed"
+    );
     task.abort();
 }

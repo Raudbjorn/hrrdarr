@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Aria2/` i
 
 ## Configuration
 
-`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration 0071 (registry row only; the scope triggers and unique label index came with 0068).
+`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration 0072 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is the full JSON-RPC URL; nothing is appended.
 - Each scope is the shared `TorrentLabelScope`. aria2 has no labels, so `category` names a subfolder of aria2's own download directory (1-64 of lowercase letters, digits, `.`, `_`, `-`; TV and movie values must differ). `recent_priority`/`older_priority` (`first` moves a new download to the queue front), `add_paused` and `tags` behave as for the other clients.
@@ -38,4 +38,4 @@ Pause, Resume, Priority (`changePosition`) and Remove (`remove`, falling back to
 
 - Live aria2 compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed aria2c was contacted. Field names, string typing and the `Unauthorized` error come from the RPC manual, not a live run.
 - WebSocket and XML-RPC transports, per-file selection, seeding limits (`seed-ratio`, `seed-time`) and the health classifier are not implemented.
-- Migration 0071 is the 68th entry on this branch (0065-0067 are reserved by other lanes); the merge renumbers by position.
+- Migration 0072 is the 72nd entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).

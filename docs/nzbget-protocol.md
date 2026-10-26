@@ -38,12 +38,12 @@ contribute to queue-time estimates):
 - Queue results are filtered to this domain's category, but other queued categories remain in the server-wide ETA calculation.
 - Paused: global `DownloadPaused`, `Status` PAUSED, or all remaining bytes paused.
 - QUEUED, or DOWNLOADING with no active downloads and bytes remaining: `queued`. DOWNLOADING and FETCHING: `downloading`.
-- LOADING_PARS, VERIFYING_SOURCES, VERIFYING_REPAIRED: `downloading` / `verifying`; REPAIRING: `repairing`; UNPACKING: `extracting`; MOVING: `moving`; PP_QUEUED, RENAMING, EXECUTING_SCRIPT, PP_FINISHED: `post_processing`. Any other status is `unknown`.
+- LOADING_PARS, VERIFYING_SOURCES, VERIFYING_REPAIRED: `downloading` / `verifying`; REPAIRING: `repairing`; UNPACKING: `extracting`; MOVING: `moving`; PP_QUEUED, RENAMING, POST_UNPACK_RENAMING, POST_DOWNLOAD_RENAMING, EXECUTING_SCRIPT, PP_FINISHED: `post_processing`. Any other status is `unknown`.
 - ETA is the unpaused bytes of every group ahead in server queue order, including other categories, plus this job's, divided by `DownloadRate`; none when paused, when the rate is 0 or beyond a year. Sizes combine `...Lo`/`...Hi` into 64 bits (MB fields are a fallback). A URL still being fetched is shown as "(fetching NZB)", never as the locator.
 
 History (`history`, category-filtered, `Kind` DUP records skipped):
 
-- URL-kind history items are failed URL fetches: `UrlStatus` FAILURE/SCAN_FAILURE is `failed`, and SCAN_SKIPPED is `warning`; they are never importable.
+- URL-kind history items never produced a downloadable NZB, so they are never importable. `UrlStatus` FAILURE (the URL fetch failed) and SCAN_FAILURE (fetched, but the file is not a proper NZB, usually an HTML error page) are `failed`; SCAN_SKIPPED (fetched, but the file was not an NZB and the scanner skipped it) is `warning`.
 - A user deletion (`DeleteStatus` MANUAL) is omitted unless `MarkStatus` is BAD, which is `failed`.
 - Otherwise the detail statuses are graded as NZBGet itself grades them (`NzbInfo::MakeTextStatus`), most severe first: `failed` for `ParStatus` FAILURE, `UnpackStatus` FAILURE, `MoveStatus` FAILURE, `MarkStatus` BAD or `DeleteStatus` HEALTH, DUPE, SCAN, COPY or BAD; `warning` for `ParStatus` MANUAL (damaged) or REPAIR_POSSIBLE (repairable), `UnpackStatus` SPACE (diagnostic `disk_full`) or PASSWORD (encrypted), `ScriptStatus` FAILURE (only the post-processing script failed) or another `DeleteStatus`; else `completed`. This differs from the references in that a later warning cannot hide an earlier failure and that the individual values carry NZBGet's own severities. Entries with no detail fields use the combined `Status` (`SUCCESS/...`, `WARNING/...`, `FAILURE/...`, `DELETED/...`).
 - Only `completed` is importable. The output folder is `FinalDir` (else `DestDir`), widened to a folder named after the job, and goes through the shared remote path mapping and directory listing as for SABnzbd.

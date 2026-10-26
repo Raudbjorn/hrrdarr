@@ -402,6 +402,8 @@ async fn queue_and_history_map_status_per_domain_category() {
                 2_000_000,
                 0,
             ),
+            group(31, "Show.S01E07", "tv", "POST_UNPACK_RENAMING", 0, 0),
+            group(32, "Show.S01E08", "tv", "POST_DOWNLOAD_RENAMING", 0, 0),
         ];
         m.history = vec![
             ok_done(11, "Show.Done", "tv"),
@@ -567,8 +569,8 @@ async fn queue_and_history_map_status_per_domain_category() {
     };
     assert_eq!(
         tv.len(),
-        19,
-        "tv queue 7 + history 12 (user-deleted and DUP records omitted)"
+        21,
+        "tv queue 9 + history 12 (user-deleted and DUP records omitted)"
     );
     assert!(
         tv.iter()
@@ -594,6 +596,16 @@ async fn queue_and_history_map_status_per_domain_category() {
         Some(DownloadDiagnostic::Repairing)
     );
     assert_eq!(by("Show.S01E06").status, DownloadStatus::Unknown);
+    // Reasoning: the documented listgroups statuses POST_UNPACK_RENAMING and POST_DOWNLOAD_RENAMING
+    // are active post-processing phases, so they are not "unknown".
+    for name in ["Show.S01E07", "Show.S01E08"] {
+        assert_eq!(by(name).status, DownloadStatus::Downloading, "{name}");
+        assert_eq!(
+            by(name).diagnostic,
+            Some(DownloadDiagnostic::PostProcessing),
+            "{name}"
+        );
+    }
     assert_eq!(by("(fetching NZB)").status, DownloadStatus::Downloading);
     assert_eq!(by("(fetching NZB)").eta_seconds, Some(6));
     assert!(!serde_json::to_string(&tv).unwrap().contains("PRIVATE"));

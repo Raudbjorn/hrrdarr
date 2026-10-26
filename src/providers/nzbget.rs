@@ -560,7 +560,12 @@ fn queue_progress(group: &Value, global: &Global) -> Result<QueueProgress> {
                 DownloadStatus::Downloading,
                 Some(DownloadDiagnostic::Moving),
             ),
-            "PP_QUEUED" | "RENAMING" | "EXECUTING_SCRIPT" | "PP_FINISHED" => (
+            "PP_QUEUED"
+            | "RENAMING"
+            | "POST_UNPACK_RENAMING"
+            | "POST_DOWNLOAD_RENAMING"
+            | "EXECUTING_SCRIPT"
+            | "PP_FINISHED" => (
                 DownloadStatus::Downloading,
                 Some(DownloadDiagnostic::PostProcessing),
             ),

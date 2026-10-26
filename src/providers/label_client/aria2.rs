@@ -115,31 +115,45 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
     fn folder(&self, label: &str) -> String {
         format!("{}/{label}", self.default_dir)
     }
+    /// Reads every window of an offset-paged listing. A listing that outgrows the resource bound
+    /// fails instead of being returned as if the first windows were the whole inventory.
+    async fn pages(&mut self, method: &str, keys: &Value) -> Result<Vec<Value>> {
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = self
+                .call(method, vec![json!(offset), json!(WINDOW), keys.clone()])
+                .await?;
+            let page = page.as_array().ok_or(QbitError::InvalidResponse)?;
+            entries.extend(page.iter().cloned());
+            if entries.len() > MAX_LISTED_TORRENTS {
+                return Err(HttpError::ResponseTooLarge.into());
+            }
+            if page.len() < WINDOW {
+                return Ok(entries);
+            }
+            offset += WINDOW;
+        }
+    }
     async fn all(&mut self) -> Result<Vec<RawTorrent>> {
         let keys = json!(STATUS_KEYS);
-        let active = self.call("aria2.tellActive", vec![keys.clone()]).await?;
-        let waiting = self
-            .call(
-                "aria2.tellWaiting",
-                vec![json!(0), json!(WINDOW), keys.clone()],
-            )
-            .await?;
-        let stopped = self
-            .call("aria2.tellStopped", vec![json!(0), json!(WINDOW), keys])
-            .await?;
+        let active = match self.call("aria2.tellActive", vec![keys.clone()]).await? {
+            Value::Array(entries) => entries,
+            _ => return Err(QbitError::InvalidResponse),
+        };
+        let waiting = self.pages("aria2.tellWaiting", &keys).await?;
+        let stopped = self.pages("aria2.tellStopped", &keys).await?;
         let mut out = Vec::new();
         self.gids.clear();
-        for list in [&active, &waiting, &stopped] {
-            for entry in list.as_array().ok_or(QbitError::InvalidResponse)? {
-                if let Some((gid, torrent)) = torrent(entry, &self.default_dir)? {
-                    // A hash seen twice (for example a stopped result next to a restarted
-                    // download) keeps the first, most active, entry.
-                    if out.iter().any(|t: &RawTorrent| t.hash == torrent.hash) {
-                        continue;
-                    }
-                    self.gids.insert(torrent.hash.clone(), gid);
-                    out.push(torrent);
+        for entry in active.iter().chain(&waiting).chain(&stopped) {
+            if let Some((gid, torrent)) = torrent(entry, &self.default_dir)? {
+                // A hash seen twice (for example a stopped result next to a restarted
+                // download) keeps the first, most active, entry.
+                if out.iter().any(|t: &RawTorrent| t.hash == torrent.hash) {
+                    continue;
                 }
+                self.gids.insert(torrent.hash.clone(), gid);
+                out.push(torrent);
             }
         }
         if out.len() > MAX_LISTED_TORRENTS {
