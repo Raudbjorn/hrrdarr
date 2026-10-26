@@ -12,6 +12,11 @@ const INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const SLICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
 const SLICE_COLLECTIONS: i64 = 50;
 const MAX_CONTINUATIONS: i64 = 1000;
+/// Delay before retrying after a busy metadata lane (a rate limit carries its own `Retry-After`).
+const BUSY_RETRY_SECONDS: i64 = 30;
+const MAX_RETRY_SECONDS: i64 = 3600;
+/// A run that keeps meeting transient errors gives up this long after it started.
+const RETRY_WINDOW_SECONDS: i64 = 6 * 60 * 60;
 const RETAINED_TERMINAL: i64 = 100;
 
 #[derive(Serialize, ts_rs::TS)]
@@ -204,28 +209,18 @@ pub(super) async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
     }
     Ok(())
 }
-pub(super) async fn claim_due(
+/// Claims the queued refresh the worker selected through the shared priority ordering.
+pub(super) async fn claim(
     c: &Connection,
+    id: Uuid,
     timestamp: i64,
-) -> Result<Option<CollectionRefreshCommand>> {
-    let Some(r) = c
-        .query(
-            "SELECT id FROM collection_refresh_commands WHERE status='queued' AND next_attempt_at<=? ORDER BY created_at,id LIMIT 1",
-            [timestamp],
-        )
-        .await?
-        .next()
-        .await?
-    else {
-        return Ok(None);
-    };
-    let id = Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?;
+) -> Result<CollectionRefreshCommand> {
     c.execute(
-        "UPDATE collection_refresh_commands SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error_code=NULL WHERE id=?",
+        "UPDATE collection_refresh_commands SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error_code=NULL WHERE id=? AND status='queued'",
         params![timestamp, id.to_string()],
     )
     .await?;
-    Ok(Some(read(c, id).await?))
+    read(c, id).await
 }
 /// An interrupted slice resumes from its cursor; completed collections are not repeated.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
@@ -259,6 +254,10 @@ pub(super) async fn run(
     let mut cursor = command.cursor;
     let (mut checked, mut failed, mut unavailable, mut added, mut searches) =
         (0i64, 0i64, 0i64, 0i64, 0i64);
+    // Set when a rate limit or busy lane stops the slice: the collection that met it is not
+    // settled (the cursor stays before it) and the command is requeued instead of burning through
+    // the catalog.
+    let mut retry_after: Option<i64> = None;
     for (collection_id, tmdb_id) in &batch {
         if started.elapsed() > SLICE_BUDGET || !still_running(&c, id).await? {
             break;
@@ -286,17 +285,47 @@ pub(super) async fn run(
                 failed += 1;
                 unavailable += 1;
             }
+            Err(MetadataError::RateLimited(seconds)) => {
+                retry_after = Some(
+                    seconds
+                        .map_or(BUSY_RETRY_SECONDS, i64::from)
+                        .clamp(1, MAX_RETRY_SECONDS),
+                );
+                break;
+            }
+            Err(MetadataError::Busy) => {
+                retry_after = Some(BUSY_RETRY_SECONDS);
+                break;
+            }
             Err(_) => failed += 1,
         }
         cursor = *collection_id;
     }
+    let progress = "collections_checked=collections_checked+?,collections_failed=collections_failed+?,movies_added=movies_added+?,searches_pending=searches_pending+?,cursor=?";
+    if let Some(delay) = retry_after {
+        let timestamp = now()?;
+        let gave_up = command
+            .started_at
+            .is_some_and(|started| timestamp - started > RETRY_WINDOW_SECONDS);
+        if !gave_up {
+            c.execute(
+                &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=? WHERE id=? AND status='running'"),
+                params![checked, failed, added, searches, cursor, timestamp + delay, id.to_string()],
+            )
+            .await?;
+            eprintln!("event=collection_refresh_retry command_id={id} delay_seconds={delay}");
+            return Ok(());
+        }
+    }
+    // Still throttled after the retry window: stop with an honest failure instead of reporting a
+    // run that never reached the metadata service as a success.
+    let gave_up = retry_after.is_some();
     // Everything up to `cursor` is settled; anything left runs in a later slice.
     let more = !collections::refreshable(&c, cursor, 1)
         .await
         .map_err(map)?
         .is_empty();
-    let progress = "collections_checked=collections_checked+?,collections_failed=collections_failed+?,movies_added=movies_added+?,searches_pending=searches_pending+?,cursor=?";
-    if more {
+    if more && !gave_up {
         c.execute(
             &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=? WHERE id=? AND status='running'"),
             params![checked, failed, added, searches, cursor, now()?, id.to_string()],
@@ -306,7 +335,7 @@ pub(super) async fn run(
     }
     let total_checked = command.collections_checked + checked;
     let total_failed = command.collections_failed + failed;
-    let all_unavailable = total_checked == 0 && total_failed > 0 && unavailable > 0;
+    let all_unavailable = gave_up || (total_checked == 0 && total_failed > 0 && unavailable > 0);
     c.execute(
         &format!("UPDATE collection_refresh_commands SET {progress},status=?,completed_at=?,error_code=? WHERE id=? AND status='running'"),
         params![
