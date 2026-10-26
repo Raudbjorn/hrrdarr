@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
+        75 // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -341,6 +341,13 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .replace(
                 " IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')",
                 "='qbittorrent'",
+            )
+            // Reasoning: 0068 admits the generic torrent RSS feed as an indexer in the RSS/search
+            // admission guards (tests/torrent_rss.rs covers the admission itself); that widened
+            // indexer predicate is the only other allocated change, so map it back to compare the rest.
+            .replace(
+                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab')",
             );
         assert_eq!(
             actual, expected,

@@ -31,6 +31,12 @@ impl ProviderKind {
                     | ProviderSettings::Sabnzbd { .. }
                     | ProviderSettings::Nzbget { .. }
                     | ProviderSettings::Transmission { .. }
+                    | ProviderSettings::Deluge { .. }
+                    | ProviderSettings::Rtorrent { .. }
+                    | ProviderSettings::Downloadstation { .. }
+                    | ProviderSettings::Flood { .. }
+                    | ProviderSettings::Aria2 { .. }
+                    | ProviderSettings::Utorrent { .. }
             ) | (
                 Self::Indexer,
                 ProviderSettings::Torznab { .. }
@@ -69,7 +75,13 @@ impl ProviderFilter {
                 settings @ (ProviderSettings::Qbittorrent { .. }
                 | ProviderSettings::Sabnzbd { .. }
                 | ProviderSettings::Nzbget { .. }
-                | ProviderSettings::Transmission { .. }),
+                | ProviderSettings::Transmission { .. }
+                | ProviderSettings::Deluge { .. }
+                | ProviderSettings::Rtorrent { .. }
+                | ProviderSettings::Downloadstation { .. }
+                | ProviderSettings::Flood { .. }
+                | ProviderSettings::Aria2 { .. }
+                | ProviderSettings::Utorrent { .. }),
                 media,
             ) => settings.client_scoped(media),
         };
@@ -125,6 +137,14 @@ pub enum ProviderDefaults {
         // Suggested endpoint shape; the RPC path `/rpc` is appended to it.
         endpoint_hint: String,
     },
+    LabelTorrentClient {
+        recent_priority: TorrentQueuePriority,
+        older_priority: TorrentQueuePriority,
+        add_paused: bool,
+        tags: Vec<i64>,
+        // Suggested endpoint shape; the API path `/json` is appended to it.
+        endpoint_hint: String,
+    },
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +156,12 @@ pub enum ProviderImplementation {
     Torrentrss,
     Torznab,
     Transmission,
+    Deluge,
+    Rtorrent,
+    Utorrent,
+    Aria2,
+    Flood,
+    Downloadstation,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[serde(tag = "media_type", rename_all = "snake_case")]
@@ -193,6 +219,12 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Sabnzbd
         | ProviderImplementation::Nzbget
         | ProviderImplementation::Transmission
+        | ProviderImplementation::Deluge
+        | ProviderImplementation::Rtorrent
+        | ProviderImplementation::Downloadstation
+        | ProviderImplementation::Flood
+        | ProviderImplementation::Aria2
+        | ProviderImplementation::Utorrent
         | ProviderImplementation::Torrentrss => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
@@ -401,6 +433,91 @@ pub(super) async fn schema(
                     add_paused: false,
                     tags: vec![],
                     endpoint_hint: "http://transmission.example:9091/transmission".into(),
+                },
+            },
+            // The label has no safe default on a shared client; the user names each domain's label.
+            ProviderTemplate {
+                implementation: ProviderImplementation::Deluge,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://deluge.example:8112".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Rtorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://rtorrent.example/RPC2".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Utorrent,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://utorrent.example:8080/gui".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Aria2,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://aria2.example:6800/jsonrpc".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Flood,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "http://flood.example:3000".into(),
+                },
+            },
+            ProviderTemplate {
+                implementation: ProviderImplementation::Downloadstation,
+                presets: vec![],
+                supported_media: vec![MediaDomain::Tv, MediaDomain::Movies],
+                enabled: false,
+                priority: 1,
+                defaults: ProviderDefaults::LabelTorrentClient {
+                    recent_priority: TorrentQueuePriority::Last,
+                    older_priority: TorrentQueuePriority::Last,
+                    add_paused: false,
+                    tags: vec![],
+                    endpoint_hint: "https://nas.example:5001".into(),
                 },
             },
         ],

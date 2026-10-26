@@ -108,3 +108,61 @@ test('NZBGet is a usenet download client for both domains and never accepts torr
   assert.equal(eligibleDownloadClient(client,domain==='tv'?'movies':'tv'),false);
  }
 });
+
+test('Deluge is a torrent download client for both domains and is never bound to a usenet indexer',()=>{
+ assert.equal(protocolOf('deluge'),'torrent');
+ assert.equal(isClientImplementation('deluge'),true);
+ for(const domain of ['tv','movies']){
+  const client={id:'dg',enabled:true,settings:{implementation:'deluge',endpoint:'http://127.0.0.1:8112',tv:domain==='tv'?{category:'tv'}:null,movies:domain==='movies'?{category:'movies'}:null}};
+  assert.equal(isDownloadClient(client),true);
+  assert.equal(eligibleDownloadClient(client,domain),true);
+  assert.equal(eligibleDownloadClient(client,domain==='tv'?'movies':'tv'),false);
+  assert.equal(eligibleDownloadClient(client,domain,'newznab'),false);
+  assert.equal(eligibleDownloadClient(client,domain,'torznab'),true);
+ }
+});
+
+test('rTorrent is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('rtorrent'),'torrent');
+ assert.equal(isClientImplementation('rtorrent'),true);
+ const client={id:'rt',enabled:true,settings:{implementation:'rtorrent',endpoint:'http://127.0.0.1/RPC2',tv:{category:'tv'},movies:null}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'tv','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'tv','newznab'),false);
+});
+
+test('uTorrent is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('utorrent'),'torrent');
+ assert.equal(isClientImplementation('utorrent'),true);
+ const client={id:'ut',enabled:true,settings:{implementation:'utorrent',endpoint:'http://127.0.0.1:8080/gui',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});
+
+test('Aria2 is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('aria2'),'torrent');
+ assert.equal(isClientImplementation('aria2'),true);
+ const client={id:'a2',enabled:true,settings:{implementation:'aria2',endpoint:'http://127.0.0.1:6800/jsonrpc',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});
+
+test('Flood is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('flood'),'torrent');
+ assert.equal(isClientImplementation('flood'),true);
+ const client={id:'fl',enabled:true,settings:{implementation:'flood',endpoint:'http://127.0.0.1:3000',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});
+
+test('Download Station is a torrent download client for both domains',()=>{
+ assert.equal(protocolOf('downloadstation'),'torrent');
+ assert.equal(isClientImplementation('downloadstation'),true);
+ const client={id:'ds',enabled:true,settings:{implementation:'downloadstation',endpoint:'https://nas.example:5001',tv:null,movies:{category:'movies'}}};
+ assert.equal(isDownloadClient(client),true);
+ assert.equal(eligibleDownloadClient(client,'movies','torznab'),true);
+ assert.equal(eligibleDownloadClient(client,'movies','newznab'),false);
+});

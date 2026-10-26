@@ -162,7 +162,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        68 // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
+        75 // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

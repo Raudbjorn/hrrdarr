@@ -8,6 +8,7 @@ pub mod draft;
 pub mod http;
 pub mod indexer;
 mod indexer_backoff;
+pub mod label_client;
 pub mod nzbget;
 pub mod qbittorrent;
 pub mod sabnzbd;
@@ -443,6 +444,38 @@ impl TorrentQueuePriority {
         }
     }
 }
+/// One media domain of a label-isolated torrent client (Deluge and similar). The label isolates
+/// TV from movies on a shared client; labels compare case-insensitively.
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct TorrentLabelScope {
+    pub category: String,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub recent_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub older_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_paused: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// Label rules shared by the label clients: lowercase letters, digits and `_ . -` (Deluge's
+/// Label plugin rejects anything else), so one name works across the family.
+fn valid_torrent_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
 /// Where one domain's torrents are placed on a shared Transmission client and how they are
 /// recognised again.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -515,10 +548,20 @@ pub(crate) enum Protocol {
     Torrent,
     Usenet,
 }
+/// Implementations on the shared label-torrent engine, in registry order.
+pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 6] = [
+    "deluge",
+    "rtorrent",
+    "utorrent",
+    "aria2",
+    "flood",
+    "downloadstation",
+];
 impl Protocol {
     pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
         match implementation {
             "torznab" | "torrentrss" | "qbittorrent" | "transmission" => Some(Self::Torrent),
+            label if LABEL_IMPLEMENTATIONS.contains(&label) => Some(Self::Torrent),
             "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
             _ => None,
         }
@@ -574,6 +617,60 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TransmissionScope>,
     },
+    /// Endpoint is the Deluge Web UI base URL (the JSON-RPC API is `<endpoint>/json`). The
+    /// credential is the Web UI password. Requires the Label plugin.
+    Deluge {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the rTorrent XML-RPC URL (for example an nginx or ruTorrent `/RPC2` mount).
+    /// Optional HTTP basic credentials. Torrents are labelled with `d.custom1`.
+    Rtorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the uTorrent Web UI base (for example `http://host:8080/gui`). Basic
+    /// credentials are required; torrents are labelled with uTorrent labels.
+    Utorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the aria2 JSON-RPC URL (usually `http://host:6800/jsonrpc`). The optional RPC
+    /// secret is an API-key credential. A domain is the subfolder `<default dir>/<label>`.
+    Aria2 {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the Flood base URL (for example `http://host:3000`). Optional basic credentials
+    /// are the Flood user name and password; torrents are labelled with Flood tags.
+    Flood {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the Synology DSM base URL (for example `https://nas.example:5001`). Basic
+    /// credentials are required; a domain is the destination folder `<default>/<label>/<hash>`.
+    Downloadstation {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
     Torrentrss {
         endpoint: String,
         #[serde(deserialize_with = "required_nullable")]
@@ -591,6 +688,12 @@ impl ProviderSettings {
             Self::Sabnzbd { .. } => "sabnzbd",
             Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
+            Self::Deluge { .. } => "deluge",
+            Self::Rtorrent { .. } => "rtorrent",
+            Self::Utorrent { .. } => "utorrent",
+            Self::Aria2 { .. } => "aria2",
+            Self::Flood { .. } => "flood",
+            Self::Downloadstation { .. } => "downloadstation",
             Self::Torrentrss { .. } => "torrentrss",
         }
     }
@@ -602,6 +705,12 @@ impl ProviderSettings {
             | Self::Sabnzbd { endpoint, .. }
             | Self::Nzbget { endpoint, .. }
             | Self::Transmission { endpoint, .. }
+            | Self::Deluge { endpoint, .. }
+            | Self::Rtorrent { endpoint, .. }
+            | Self::Downloadstation { endpoint, .. }
+            | Self::Flood { endpoint, .. }
+            | Self::Aria2 { endpoint, .. }
+            | Self::Utorrent { endpoint, .. }
             | Self::Torrentrss { endpoint, .. } => endpoint,
         }
     }
@@ -610,7 +719,13 @@ impl ProviderSettings {
             Self::Torznab { .. }
             | Self::Torrentrss { .. }
             | Self::Qbittorrent { .. }
-            | Self::Transmission { .. } => Protocol::Torrent,
+            | Self::Transmission { .. }
+            | Self::Deluge { .. }
+            | Self::Rtorrent { .. }
+            | Self::Downloadstation { .. }
+            | Self::Flood { .. }
+            | Self::Aria2 { .. }
+            | Self::Utorrent { .. } => Protocol::Torrent,
             Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
@@ -621,7 +736,123 @@ impl ProviderSettings {
                 | Self::Sabnzbd { .. }
                 | Self::Nzbget { .. }
                 | Self::Transmission { .. }
-        )
+        ) || self.is_label_torrent()
+    }
+    /// The TV and movie scopes of a label-torrent client (one arm per client of the family).
+    fn label_pair(&self) -> Option<(&Option<TorrentLabelScope>, &Option<TorrentLabelScope>)> {
+        match self {
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
+            | Self::Flood { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => Some((tv, movies)),
+            _ => None,
+        }
+    }
+    /// A label-torrent client by registry name (one arm per client of the family).
+    fn from_label_parts(
+        implementation: &str,
+        endpoint: String,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        Some(match implementation {
+            "deluge" => Self::Deluge {
+                endpoint,
+                tv,
+                movies,
+            },
+            "rtorrent" => Self::Rtorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            "utorrent" => Self::Utorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            "aria2" => Self::Aria2 {
+                endpoint,
+                tv,
+                movies,
+            },
+            "flood" => Self::Flood {
+                endpoint,
+                tv,
+                movies,
+            },
+            "downloadstation" => Self::Downloadstation {
+                endpoint,
+                tv,
+                movies,
+            },
+            _ => return None,
+        })
+    }
+    /// The same client with other label scopes (one arm per client of the family).
+    fn relabelled(
+        &self,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        match self {
+            Self::Deluge { endpoint, .. } => Some(Self::Deluge {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Rtorrent { endpoint, .. } => Some(Self::Rtorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Utorrent { endpoint, .. } => Some(Self::Utorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Aria2 { endpoint, .. } => Some(Self::Aria2 {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Flood { endpoint, .. } => Some(Self::Flood {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Downloadstation { endpoint, .. } => Some(Self::Downloadstation {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            _ => None,
+        }
+    }
+    /// Whether this client uses the shared label-torrent engine.
+    pub(crate) fn is_label_torrent(&self) -> bool {
+        self.label_pair().is_some()
+    }
+    /// The label scope of one domain on a label-torrent client.
+    pub(crate) fn label_scope(&self, domain: MediaDomain) -> Option<&TorrentLabelScope> {
+        let (tv, movies) = self.label_pair()?;
+        match domain {
+            MediaDomain::Tv => tv.as_ref(),
+            MediaDomain::Movies => movies.as_ref(),
+        }
+    }
+    /// Copy without eligibility tags, which never change remote submission behaviour.
+    pub(crate) fn without_label_tags(&self) -> Option<Self> {
+        let (tv, movies) = self.label_pair()?;
+        let strip = |scope: &Option<TorrentLabelScope>| {
+            scope.clone().map(|mut s| {
+                s.tags = None;
+                s
+            })
+        };
+        self.relabelled(strip(tv), strip(movies))
     }
     /// Whether a download client configures this media domain; indexers always answer false.
     pub(crate) fn client_scoped(&self, domain: MediaDomain) -> bool {
@@ -634,7 +865,7 @@ impl ProviderSettings {
             (Self::Nzbget { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (Self::Transmission { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (Self::Transmission { movies, .. }, MediaDomain::Movies) => movies.is_some(),
-            _ => false,
+            _ => self.label_scope(domain).is_some(),
         }
     }
     /// Domains configured by a download client, in TV/movies order.
@@ -795,6 +1026,33 @@ impl ProviderSettings {
                     }
                 }
             }
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
+            | Self::Flood { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    if !valid_torrent_label(&s.category) {
+                        return Err(bad());
+                    }
+                }
+                if let (Some(tv), Some(movies)) = (tv, movies) {
+                    if tv.category == movies.category {
+                        return Err(bad());
+                    }
+                }
+            }
             Self::Transmission { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
                     return Err(bad());
@@ -923,6 +1181,7 @@ pub enum ProviderTestOutcome {
     UsenetClient(sabnzbd::SabnzbdTest),
     NzbgetClient(nzbget::NzbgetTest),
     TorrentClient(transmission::TransmissionTest),
+    LabelClient(label_client::LabelClientTest),
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct ProviderDownloadResult {
@@ -1454,6 +1713,15 @@ impl RefreshClient {
                     )
                     .await
                 }
+                settings if settings.is_label_torrent() => {
+                    label_client::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
                 ProviderSettings::Transmission { .. } => {
                     transmission::client_status_snapshot(
                         &operation,
@@ -1555,6 +1823,16 @@ impl RefreshClient {
                         Err(e) => Err(refresh_error(qbit_error(e).0)),
                     }
                 }
+                settings if settings.is_label_torrent() => label_client::details(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                    target,
+                    remote_id,
+                )
+                .await
+                .map(download::DownloadDetails::from)
+                .map_err(|e| refresh_error(qbit_error(e).0)),
                 ProviderSettings::Transmission { .. } => transmission::details(
                     &operation,
                     &provider.settings,
@@ -1677,6 +1955,20 @@ impl RefreshClient {
             .map_err(|e| PreparationError::release(refresh_error(http_error(e).0)))?;
         let work = async {
             let prepared = match source {
+                download::ReleaseSource::Torrent { source, options }
+                    if provider.settings.is_label_torrent() =>
+                {
+                    label_client::prepare(
+                        &operation,
+                        &provider.settings,
+                        target,
+                        source,
+                        recent,
+                        options,
+                    )
+                    .await
+                    .map(download::PreparedSubmission::Label)
+                }
                 download::ReleaseSource::Torrent { source, options }
                     if matches!(provider.settings, ProviderSettings::Transmission { .. }) =>
                 {
@@ -1806,6 +2098,17 @@ impl RefreshClient {
                     )
                     .await
                 }
+                (settings, download::PreparedSubmission::Label(prepared))
+                    if settings.is_label_torrent() =>
+                {
+                    label_client::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
                 (
                     ProviderSettings::Transmission { .. },
                     download::PreparedSubmission::Transmission(prepared),
@@ -1895,6 +2198,15 @@ impl RefreshClient {
                 }
                 ProviderSettings::Nzbget { .. } => {
                     nzbget::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                settings if settings.is_label_torrent() => {
+                    label_client::reconcile(
                         &operation,
                         &provider.settings,
                         credentials.as_ref(),
@@ -2064,6 +2376,9 @@ async fn refresh_items(
         ProviderSettings::Nzbget { .. } => {
             nzbget::refresh_pages(operation, settings, credentials, domain).await
         }
+        settings if settings.is_label_torrent() => {
+            label_client::refresh_pages(operation, settings, credentials, domain).await
+        }
         ProviderSettings::Transmission { .. } => {
             transmission::refresh_pages(operation, settings, credentials, domain).await
         }
@@ -2203,6 +2518,8 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let mut movie_nzbget = None;
     let mut tv_torrent = None;
     let mut movie_torrent = None;
+    let mut tv_label = None;
+    let mut movie_label = None;
     while let Some(scope) = scopes.next().await? {
         let media: String = scope.get(0)?;
         if implementation == "torrentrss" {
@@ -2257,6 +2574,23 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 tv_torrent = Some(item)
             } else {
                 movie_torrent = Some(item)
+            }
+        } else if LABEL_IMPLEMENTATIONS.contains(&implementation.as_str()) {
+            let item = TorrentLabelScope {
+                category: scope.get(3)?,
+                recent_priority: TorrentQueuePriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: TorrentQueuePriority::stored(scope.get::<i64>(6)?)?,
+                add_paused: match scope.get::<String>(9)?.as_str() {
+                    "started" => false,
+                    "stopped" => true,
+                    _ => return Err(corrupt()),
+                },
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_label = Some(item)
+            } else {
+                movie_label = Some(item)
             }
         } else if implementation == "nzbget" {
             let item = NzbgetScope {
@@ -2383,7 +2717,8 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_torrent,
             movies: movie_torrent,
         },
-        _ => return Err(corrupt()),
+        label => ProviderSettings::from_label_parts(label, endpoint, tv_label, movie_label)
+            .ok_or_else(corrupt)?,
     };
     settings.validate().map_err(|_| corrupt())?;
     let credentials: Option<Vec<u8>> = row.get(6)?;
@@ -2445,6 +2780,15 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
         ProviderSettings::Transmission { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
+        | ProviderSettings::Flood { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => [
             ("tv", tv.as_ref().map(|s| &s.tags)),
             ("movies", movies.as_ref().map(|s| &s.tags)),
         ],
@@ -2554,6 +2898,21 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.code(),s.older_priority.code(),state]).await?;
             }
         }
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
+        | ProviderSettings::Flood { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                let state = if s.add_paused { "stopped" } else { "started" };
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.wire(),s.older_priority.wire(),state]).await?;
+            }
+        }
         ProviderSettings::Transmission { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
@@ -2657,6 +3016,15 @@ impl HealthConfigurationChanges {
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Transmission { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Deluge { tv, movies, .. }
+                | ProviderSettings::Rtorrent { tv, movies, .. }
+                | ProviderSettings::Downloadstation { tv, movies, .. }
+                | ProviderSettings::Flood { tv, movies, .. }
+                | ProviderSettings::Aria2 { tv, movies, .. }
+                | ProviderSettings::Utorrent { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
@@ -3347,6 +3715,11 @@ async fn probe(
             .await
             .map(ProviderTestOutcome::NzbgetClient)
             .map_err(nzbget_test_error)
+    } else if settings.is_label_torrent() {
+        label_client::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::LabelClient)
+            .map_err(label_test_error)
     } else if matches!(settings, ProviderSettings::Transmission { .. }) {
         transmission::test_connection(operation, settings, credentials.as_ref())
             .await
@@ -3388,114 +3761,166 @@ async fn run_test(
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
     let is_indexer = !provider.settings.is_download_client();
-    let operation = if is_indexer {
+    let is_feed = matches!(provider.settings, ProviderSettings::Torrentrss { .. });
+    // Reasoning: durable, revision-fenced indexer backoff is scoped to Torznab/Newznab media
+    // scopes; a feed keeps the in-memory provider cooldown it was authored with, so a rate-limited
+    // feed test is answered from shared provider state without requesting the feed again.
+    let operation = if is_indexer && !is_feed {
         transport.indexer_operation(provider.id)
     } else {
         transport.operation(provider.id)
     }
     .map_err(|e| http_error(e).0)?;
     let work = async {
-        let (result, observation, client_observation) = if is_indexer {
-            let scoped = indexer::test_with_scope(
-                &operation,
-                &provider.settings,
-                &IndexerAccess::from_credentials(&credentials),
-            )
-            .await;
-            let failed_domain = scoped.as_ref().err().and_then(|(_, domain)| *domain);
-            let result = scoped.map_err(|(error, _)| error);
-            let observation =
-                indexer_backoff::observation(&result).map(|value| (value, failed_domain));
-            (
-                result
-                    .map(ProviderTestOutcome::Indexer)
-                    .map_err(|error| indexer_error(error, &operation)),
-                observation,
-                None,
-            )
-        } else if matches!(provider.settings, ProviderSettings::Nzbget { .. }) {
-            let result =
-                nzbget::test_connection(&operation, &provider.settings, credentials.as_ref()).await;
-            let observation = match result.as_ref() {
-                Ok(_) => Some(backoff::Observation::Success),
-                Err(failure)
-                    if communication_error(failure.error)
-                        == CommunicationProbeError::RemoteFailure =>
-                {
-                    Some(backoff::Observation::Failure)
-                }
-                Err(_) => None,
+        let (result, observation, client_observation) =
+            if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
+                // A feed has no capability document: every configured scope is fetched and parsed.
+                let result = indexer::test_feed(
+                    &operation,
+                    &provider.settings,
+                    &IndexerAccess::from_credentials(&credentials),
+                )
+                .await;
+                (
+                    result
+                        .map(ProviderTestOutcome::Feed)
+                        .map_err(|error| indexer_error(error, &operation)),
+                    None,
+                    None,
+                )
+            } else if is_indexer {
+                let scoped = indexer::test_with_scope(
+                    &operation,
+                    &provider.settings,
+                    &IndexerAccess::from_credentials(&credentials),
+                )
+                .await;
+                let failed_domain = scoped.as_ref().err().and_then(|(_, domain)| *domain);
+                let result = scoped.map_err(|(error, _)| error);
+                let observation =
+                    indexer_backoff::observation(&result).map(|value| (value, failed_domain));
+                (
+                    result
+                        .map(ProviderTestOutcome::Indexer)
+                        .map_err(|error| indexer_error(error, &operation)),
+                    observation,
+                    None,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Nzbget { .. }) {
+                let result =
+                    nzbget::test_connection(&operation, &provider.settings, credentials.as_ref())
+                        .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::NzbgetClient)
+                        .map_err(nzbget_test_error),
+                    None,
+                    observation,
+                )
+            } else if provider.settings.is_label_torrent() {
+                let result = label_client::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::LabelClient)
+                        .map_err(label_test_error),
+                    None,
+                    observation,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Transmission { .. }) {
+                let result = transmission::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::TorrentClient)
+                        .map_err(transmission_test_error),
+                    None,
+                    observation,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Sabnzbd { .. }) {
+                let result =
+                    sabnzbd::test_connection(&operation, &provider.settings, credentials.as_ref())
+                        .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::UsenetClient)
+                        .map_err(sab_test_error),
+                    None,
+                    observation,
+                )
+            } else {
+                let result = qbittorrent::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(error)
+                        if communication_error(*error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::DownloadClient)
+                        .map_err(qbit_error),
+                    None,
+                    observation,
+                )
             };
-            (
-                result
-                    .map(ProviderTestOutcome::NzbgetClient)
-                    .map_err(nzbget_test_error),
-                None,
-                observation,
-            )
-        } else if matches!(provider.settings, ProviderSettings::Transmission { .. }) {
-            let result =
-                transmission::test_connection(&operation, &provider.settings, credentials.as_ref())
-                    .await;
-            let observation = match result.as_ref() {
-                Ok(_) => Some(backoff::Observation::Success),
-                Err(failure)
-                    if communication_error(failure.error)
-                        == CommunicationProbeError::RemoteFailure =>
-                {
-                    Some(backoff::Observation::Failure)
-                }
-                Err(_) => None,
-            };
-            (
-                result
-                    .map(ProviderTestOutcome::TorrentClient)
-                    .map_err(transmission_test_error),
-                None,
-                observation,
-            )
-        } else if matches!(provider.settings, ProviderSettings::Sabnzbd { .. }) {
-            let result =
-                sabnzbd::test_connection(&operation, &provider.settings, credentials.as_ref())
-                    .await;
-            let observation = match result.as_ref() {
-                Ok(_) => Some(backoff::Observation::Success),
-                Err(failure)
-                    if communication_error(failure.error)
-                        == CommunicationProbeError::RemoteFailure =>
-                {
-                    Some(backoff::Observation::Failure)
-                }
-                Err(_) => None,
-            };
-            (
-                result
-                    .map(ProviderTestOutcome::UsenetClient)
-                    .map_err(sab_test_error),
-                None,
-                observation,
-            )
-        } else {
-            let result =
-                qbittorrent::test_connection(&operation, &provider.settings, credentials.as_ref())
-                    .await;
-            let observation = match result.as_ref() {
-                Ok(_) => Some(backoff::Observation::Success),
-                Err(error)
-                    if communication_error(*error) == CommunicationProbeError::RemoteFailure =>
-                {
-                    Some(backoff::Observation::Failure)
-                }
-                Err(_) => None,
-            };
-            (
-                result
-                    .map(ProviderTestOutcome::DownloadClient)
-                    .map_err(qbit_error),
-                None,
-                observation,
-            )
-        };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
@@ -3639,6 +4064,21 @@ fn nzbget_test_error(failure: nzbget::NzbgetTestFailure) -> (Error, &'static str
         "unsupported",
     )
 }
+/// Label-client test problems keep the stored static code set while giving an actionable message.
+fn label_test_error(failure: label_client::LabelTestFailure) -> (Error, &'static str) {
+    use label_client::LabelProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::LabelsUnavailable) => (
+            "label_plugin_unavailable",
+            "The client cannot hold labels; enable its Label plugin so TV and movies stay isolated",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
 /// Transmission test problems keep the stored static code set while giving an actionable message.
 fn transmission_test_error(
     failure: transmission::TransmissionTestFailure,
@@ -3721,6 +4161,10 @@ async fn downloads(
             }
             ProviderSettings::Nzbget { .. } => {
                 nzbget::query(&operation, &provider.settings, credentials.as_ref(), &input).await
+            }
+            settings if settings.is_label_torrent() => {
+                label_client::query(&operation, &provider.settings, credentials.as_ref(), &input)
+                    .await
             }
             ProviderSettings::Transmission { .. } => {
                 transmission::query(&operation, &provider.settings, credentials.as_ref(), &input)

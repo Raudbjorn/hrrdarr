@@ -5,6 +5,21 @@ use crate::{
 use libsql::TransactionBehavior;
 use std::path::Path;
 
+/// Download clients whose output directory can be inspected; the provider query and the
+/// per-provider guard below both derive from this one list.
+const INSPECTABLE_CLIENTS: [&str; 10] = [
+    "qbittorrent",
+    "sabnzbd",
+    "transmission",
+    "nzbget",
+    "deluge",
+    "rtorrent",
+    "utorrent",
+    "aria2",
+    "flood",
+    "downloadstation",
+];
+
 pub(super) async fn evaluate(
     db: &Database,
     client: &RefreshClient,
@@ -38,7 +53,15 @@ pub(super) async fn evaluate(
         MediaDomain::Movies => "movies",
     };
     let mut providers = Vec::new();
-    let mut rows = tx.query("SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation='qbittorrent' ORDER BY p.id LIMIT 257", [media]).await.map_err(|_| "storage_error")?;
+    // `INSPECTABLE_CLIENTS` is a closed list of literals, so interpolating it is injection-free.
+    let clients = INSPECTABLE_CLIENTS.map(|c| format!("'{c}'")).join(",");
+    let query = format!(
+        "SELECT p.id,p.revision,p.implementation FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation IN ({clients}) ORDER BY p.id LIMIT 257"
+    );
+    let mut rows = tx
+        .query(&query, [media])
+        .await
+        .map_err(|_| "storage_error")?;
     while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
         if providers.len() == 256 {
             return Err("check_failed");
@@ -55,10 +78,7 @@ pub(super) async fn evaluate(
     let mut conflict = false;
     let mut failed = None;
     for (id, revision, implementation) in providers {
-        if !matches!(
-            implementation.as_str(),
-            "qbittorrent" | "sabnzbd" | "transmission" | "nzbget"
-        ) {
+        if !INSPECTABLE_CLIENTS.contains(&implementation.as_str()) {
             failed.get_or_insert("check_failed");
             continue;
         }
@@ -104,6 +124,8 @@ fn contains(root: &str, output: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn download_root_component_boundaries() {
         assert!(super::contains("/library/movies", "/library/movies"));
@@ -113,5 +135,35 @@ mod tests {
         ));
         assert!(!super::contains("/library/movies", "/library/movies-old"));
         assert!(!super::contains("/library/movies", "/library"));
+    }
+
+    // Reasoning: the provider query and the per-provider guard both derive from
+    // `INSPECTABLE_CLIENTS`; a client registered as a download client but missing from it was
+    // silently never checked for writing into a library root.
+    #[tokio::test]
+    async fn every_registered_download_client_is_inspected() {
+        let dir = std::env::temp_dir().join(format!("hrrdarr-roots-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let db = Database::open_local(dir.join("db")).await.unwrap();
+        let c = db.connect().await.unwrap();
+        let mut rows = c
+            .query(
+                "SELECT implementation FROM provider_implementations WHERE kind='download_client' ORDER BY implementation",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut registered = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            registered.push(row.get::<String>(0).unwrap());
+        }
+        drop(rows);
+        drop(c);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+        let mut inspected: Vec<String> =
+            INSPECTABLE_CLIENTS.iter().map(|c| c.to_string()).collect();
+        inspected.sort();
+        assert_eq!(registered, inspected);
     }
 }

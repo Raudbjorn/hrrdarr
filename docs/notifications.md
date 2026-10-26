@@ -30,6 +30,7 @@ manual interaction required, and TV-only on import complete. An empty tag list m
 tag-filtered.
 
 ### Secrets
+
 Secret fields are stored in one AES-256-GCM envelope bound to the notification id and
 implementation, using the same independently stored key as providers (`HRRDARR_PROVIDER_KEY`).
 Responses list only `secrets_configured` names. On update an omitted secret is kept, `null` clears
@@ -38,6 +39,7 @@ fails with 503; secretless implementations (for example Kodi without a password)
 Errors, logs, the delivery journal and the test results never contain URLs, tokens or response bodies.
 
 ### Validation
+
 Strict and bounded: unknown settings/secrets rejected, secrets sent as settings rejected, types and
 ranges per schema, control characters rejected, at most 64 notifications, 200 tags per scope, 64 KiB
 request bodies, unique case-insensitive names, tag IDs must exist in that scope's domain.
@@ -61,8 +63,10 @@ notification has the matching trigger for that domain.
 
 `notification_events` keeps the newest 2048 events. The worker (`notifications::start`, run only by
 the process that owns the database) polls every 2 s: it fans events out to one
-`notification_deliveries` row per matching notification (enabled, domain, trigger flag, tag scope),
-then claims due deliveries under a 120 s lease and sends them (max 4 concurrent).
+`notification_deliveries` row per matching notification (enabled, domain, trigger flag, tag scope).
+Domain-scoped events render with the event's domain; system-scoped events render with the scope
+whose trigger matched, preferring TV when both scopes match.
+Then it claims due deliveries under a 120 s lease and sends them (max 4 concurrent).
 
 Delivery is **at least once**. Retryable failures (timeout, transport error, 5xx, 429) back off
 30 s, 2 min, 8 min, 32 min... capped at 6 h (a server `Retry-After` can lengthen it) up to 5

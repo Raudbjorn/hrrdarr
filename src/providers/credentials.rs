@@ -348,10 +348,19 @@ impl Credentials {
             return false;
         }
         match self {
-            // Transmission, NZBGet and the cookie-based torrent feed do not take an API key.
+            // Transmission, NZBGet, the cookie-based torrent feed and the basic-auth label clients do not
+            // take an API key (Aria2's RPC secret and Deluge's Web UI password are API-key credentials).
             Self::ApiKey { api_key } => {
-                !matches!(implementation, "transmission" | "nzbget" | "torrentrss")
-                    && valid(api_key)
+                !matches!(
+                    implementation,
+                    "transmission"
+                        | "nzbget"
+                        | "torrentrss"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(api_key)
             }
             Self::Feed {
                 cookie,
@@ -380,8 +389,16 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                matches!(implementation, "qbittorrent" | "transmission" | "nzbget")
-                    && valid(username)
+                matches!(
+                    implementation,
+                    "qbittorrent"
+                        | "transmission"
+                        | "nzbget"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(username)
                     && valid(password)
             }
         }

@@ -273,10 +273,10 @@ impl<'o, 'a> Rpc<'o, 'a> {
         }
         let mut value: Value =
             serde_json::from_slice(&response.body).map_err(|_| QbitError::InvalidResponse)?;
-        if let Some(id) = value.get("id") {
-            if id.as_u64() != Some(self.request_id) {
-                return Err(QbitError::InvalidResponse);
-            }
+        if let Some(id) = value.get("id")
+            && id.as_u64() != Some(self.request_id)
+        {
+            return Err(QbitError::InvalidResponse);
         }
         if value.get("error").is_some_and(|e| !e.is_null()) {
             return Err(QbitError::Rejected);
@@ -518,83 +518,104 @@ struct Active {
     category: String,
     item: DownloadItem,
 }
-/// Queue groups in server order; `cumulative` accumulates remaining bytes ahead of each job so
-/// the estimate for a job covers what must be downloaded before it finishes.
-fn queue_item(
-    rpc: &Rpc<'_, '_>,
-    group: &Value,
-    domain: MediaDomain,
-    global: &Global,
-    cumulative: &mut u64,
-) -> Result<Active> {
-    let id = nzb_id(group, "NZBID")?;
-    let raw_name = text(group, "NZBName", 2048)?.to_owned();
-    let filename = optional_text(group, "NZBFilename", 2048)?.to_owned();
-    let category = optional_text(group, "Category", 256)?.to_owned();
+/// Queue groups in server order; `ahead` accumulates remaining bytes ahead of each job across
+/// every category because NZBGet shares one download rate across the whole queue.
+struct QueueProgress {
+    size: u64,
+    remaining: u64,
+    waiting: u64,
+    paused: bool,
+    status: DownloadStatus,
+    diagnostic: Option<DownloadDiagnostic>,
+}
+fn queue_progress(group: &Value, global: &Global) -> Result<QueueProgress> {
     let state = text(group, "Status", 64)?.to_ascii_uppercase();
     let size = size64(group, "FileSize")?;
     let remaining = size64(group, "RemainingSize")?.min(size);
     let paused_size = size64(group, "PausedSize").unwrap_or(0).min(remaining);
     let active_downloads = unsigned(group, "ActiveDownloads").unwrap_or(0);
-    let (status, diagnostic) =
-        if state == "PAUSED" || global.paused || (remaining == paused_size && remaining != 0) {
-            (DownloadStatus::Paused, None)
-        } else {
-            match state.as_str() {
-                "QUEUED" => (DownloadStatus::Queued, None),
-                "DOWNLOADING" if active_downloads == 0 && remaining != 0 => {
-                    (DownloadStatus::Queued, None)
-                }
-                "DOWNLOADING" | "FETCHING" => (DownloadStatus::Downloading, None),
-                "LOADING_PARS" | "VERIFYING_SOURCES" | "VERIFYING_REPAIRED" => (
-                    DownloadStatus::Downloading,
-                    Some(DownloadDiagnostic::Verifying),
-                ),
-                "REPAIRING" => (
-                    DownloadStatus::Downloading,
-                    Some(DownloadDiagnostic::Repairing),
-                ),
-                "UNPACKING" => (
-                    DownloadStatus::Downloading,
-                    Some(DownloadDiagnostic::Extracting),
-                ),
-                "MOVING" => (
-                    DownloadStatus::Downloading,
-                    Some(DownloadDiagnostic::Moving),
-                ),
-                "PP_QUEUED" | "RENAMING" | "EXECUTING_SCRIPT" | "PP_FINISHED" => (
-                    DownloadStatus::Downloading,
-                    Some(DownloadDiagnostic::PostProcessing),
-                ),
-                _ => (
-                    DownloadStatus::Unknown,
-                    Some(DownloadDiagnostic::UnknownState),
-                ),
+    let paused = state == "PAUSED" || global.paused || (remaining == paused_size && remaining != 0);
+    let (status, diagnostic) = if paused {
+        (DownloadStatus::Paused, None)
+    } else {
+        match state.as_str() {
+            "QUEUED" => (DownloadStatus::Queued, None),
+            "DOWNLOADING" if active_downloads == 0 && remaining != 0 => {
+                (DownloadStatus::Queued, None)
             }
-        };
-    let waiting = remaining - paused_size;
-    let eta = if matches!(status, DownloadStatus::Paused) || global.rate == 0 {
+            "DOWNLOADING" | "FETCHING" => (DownloadStatus::Downloading, None),
+            "LOADING_PARS" | "VERIFYING_SOURCES" | "VERIFYING_REPAIRED" => (
+                DownloadStatus::Downloading,
+                Some(DownloadDiagnostic::Verifying),
+            ),
+            "REPAIRING" => (
+                DownloadStatus::Downloading,
+                Some(DownloadDiagnostic::Repairing),
+            ),
+            "UNPACKING" => (
+                DownloadStatus::Downloading,
+                Some(DownloadDiagnostic::Extracting),
+            ),
+            "MOVING" => (
+                DownloadStatus::Downloading,
+                Some(DownloadDiagnostic::Moving),
+            ),
+            "PP_QUEUED"
+            | "RENAMING"
+            | "POST_UNPACK_RENAMING"
+            | "POST_DOWNLOAD_RENAMING"
+            | "EXECUTING_SCRIPT"
+            | "PP_FINISHED" => (
+                DownloadStatus::Downloading,
+                Some(DownloadDiagnostic::PostProcessing),
+            ),
+            _ => (
+                DownloadStatus::Unknown,
+                Some(DownloadDiagnostic::UnknownState),
+            ),
+        }
+    };
+    Ok(QueueProgress {
+        size,
+        remaining,
+        waiting: remaining - paused_size,
+        paused,
+        status,
+        diagnostic,
+    })
+}
+fn queue_item(
+    rpc: &Rpc<'_, '_>,
+    group: &Value,
+    domain: MediaDomain,
+    global: &Global,
+    ahead: u64,
+    progress: QueueProgress,
+) -> Result<Active> {
+    let id = nzb_id(group, "NZBID")?;
+    let raw_name = text(group, "NZBName", 2048)?.to_owned();
+    let filename = optional_text(group, "NZBFilename", 2048)?.to_owned();
+    let category = optional_text(group, "Category", 256)?.to_owned();
+    let eta = if progress.paused || global.rate == 0 {
         None
     } else {
-        let total = cumulative.saturating_add(waiting) / global.rate;
-        *cumulative = cumulative.saturating_add(waiting);
+        let total = ahead.saturating_add(progress.waiting) / global.rate;
         Some(total).filter(|seconds| *seconds <= MAX_ETA_SECONDS)
-    };
-    let progress = if size == 0 {
-        0.0
-    } else {
-        (size - remaining) as f64 / size as f64
     };
     let item = DownloadItem {
         hash: remote_id(id),
         domain,
         name: display_name(rpc, &raw_name),
         category: category.clone(),
-        status,
-        diagnostic,
-        progress,
-        size_bytes: size,
-        remaining_bytes: Some(remaining),
+        status: progress.status,
+        diagnostic: progress.diagnostic,
+        progress: if progress.size == 0 {
+            0.0
+        } else {
+            (progress.size - progress.remaining) as f64 / progress.size as f64
+        },
+        size_bytes: progress.size,
+        remaining_bytes: Some(progress.remaining),
         download_bytes_per_second: 0,
         upload_bytes_per_second: 0,
         eta_seconds: eta,
@@ -634,6 +655,7 @@ fn history_item(rpc: &Rpc<'_, '_>, entry: &Value, domain: MediaDomain) -> Result
     let script = detail(entry, "ScriptStatus")?;
     let delete = detail(entry, "DeleteStatus")?;
     let mark = detail(entry, "MarkStatus")?;
+    let url = detail(entry, "UrlStatus")?;
     let summary = detail(entry, "Status")?.to_ascii_uppercase();
     let ok = |s: &str| matches!(s, "" | "SUCCESS" | "NONE");
     let (mut status, mut diagnostic) = (DownloadStatus::Completed, None);
@@ -651,13 +673,39 @@ fn history_item(rpc: &Rpc<'_, '_>, entry: &Value, domain: MediaDomain) -> Result
                 deleted_by_user = true;
             }
         } else {
-            // The most severe finding wins: failure over warning over success.
-            let mut failed = !ok(par) || !ok(script);
-            let mut warning = !ok(moved);
+            // NZBGet grades each detail status itself (daemon/queue/DownloadInfo.cpp,
+            // `NzbInfo::MakeTextStatus`), and the most severe finding wins: failure over warning
+            // over success.
+            let mut failed = matches!(url, "FAILURE" | "SCAN_FAILURE");
+            let mut warning = url == "SCAN_SKIPPED";
+            // ParStatus: MANUAL is a damaged file the user allowed, REPAIR_POSSIBLE is repairable;
+            // NZBGet reports both as warnings.
+            if par == "MANUAL" || par == "REPAIR_POSSIBLE" {
+                warning = true;
+            } else if !ok(par) {
+                failed = true;
+            }
+            // UnpackStatus: SPACE (no disk space) and PASSWORD (encrypted archive) are warnings.
             if unpack == "SPACE" {
                 warning = true;
                 diagnostic = Some(DownloadDiagnostic::DiskFull);
+            } else if unpack == "PASSWORD" {
+                warning = true;
             } else if !ok(unpack) {
+                failed = true;
+            }
+            // MoveStatus: the files never reached the destination.
+            if !ok(moved) {
+                failed = true;
+            }
+            // ScriptStatus: only a post-processing script failed, the download itself is intact.
+            if script == "FAILURE" {
+                warning = true;
+            } else if !ok(script) {
+                failed = true;
+            }
+            // MarkStatus: the user marked the download as bad.
+            if mark == "BAD" {
                 failed = true;
             }
             if !ok(delete) {
@@ -744,12 +792,16 @@ async fn observe(
     let mut active = Vec::new();
     let mut cumulative = 0u64;
     for group in &groups {
-        // A group in another category is another domain's (or the user's); ignore it entirely.
         let category = optional_text(group, "Category", 256)?;
+        let progress = queue_progress(group, &global)?;
+        let ahead = cumulative;
+        if !progress.paused && global.rate != 0 {
+            cumulative = cumulative.saturating_add(progress.waiting);
+        }
         if !same_category(category, &configured.category) {
             continue;
         }
-        active.push(queue_item(rpc, group, domain, &global, &mut cumulative)?);
+        active.push(queue_item(rpc, group, domain, &global, ahead, progress)?);
     }
     let history = rpc.history().await?;
     let mut finished = Vec::new();

@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 68); // Reasoning: latest is migration file 0068 torrent_rss_indexer at position 68, appended after 0067 rename_commands; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

@@ -266,8 +266,8 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        68
-    ); // Reasoning: 0068 is the torrent RSS indexer migration and the latest on a fresh database.
+        75
+    ); // Reasoning: 0075 provider_scope_union is the latest on a fresh database; 0068 (torrent RSS indexer) stays at version 68 below.
     assert_eq!(
         text(&c, "SELECT name FROM schema_migrations WHERE version=68").await?,
         "torrent_rss_indexer"
@@ -335,8 +335,8 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            68
-        ); // Reasoning: 0068 is the torrent RSS indexer migration; the runner applies only it on top of 67.
+            75
+        ); // Reasoning: on top of 67 the runner applies 0068 (torrent RSS indexer) and then the label-client lane's 0069 to 0074 and the 0075 trigger union, ending at 75.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -348,7 +348,7 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..67], before[4].as_slice());
-        assert_eq!(history.len(), 68); // Reasoning: 0068 adds exactly one history row on top of 67.
+        assert_eq!(history.len(), 75); // Reasoning: one history row per applied migration, 68 through 75, on top of the 67 that were already recorded.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,
