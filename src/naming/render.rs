@@ -402,11 +402,10 @@ pub fn parse(field: TemplateField, raw: &str) -> Result<Template, TemplateError>
         if component.is_empty() {
             return Err(TemplateError::EmptyPathComponent);
         }
-        if let [Segment::Literal(text)] = component.as_slice() {
-            if trim_edges(text).is_empty() {
+        if let [Segment::Literal(text)] = component.as_slice()
+            && trim_edges(text).is_empty() {
                 return Err(TemplateError::EmptyPathComponent);
             }
-        }
     }
     Ok(Template {
         domain: field.domain(),
@@ -852,11 +851,10 @@ impl EpisodeSetNamingFacts {
             {
                 return Err(RenderError::InvalidEpisodeSet);
             }
-            if let Some(previous) = ids.insert(member.episode_id, member) {
-                if previous != member {
+            if let Some(previous) = ids.insert(member.episode_id, member)
+                && previous != member {
                     return Err(RenderError::InvalidEpisodeSet);
                 }
-            }
         }
         let mut members = ids.into_values().collect::<Vec<_>>();
         members.sort_by_key(|m| (m.season, m.episode, m.episode_id));

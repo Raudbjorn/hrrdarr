@@ -170,6 +170,32 @@ struct Episode {
     air_date: Option<String>,
 }
 
+async fn snapshot_tags(
+    c: &Connection,
+    domain: MediaDomain,
+    ids: &[i64],
+) -> Result<Vec<String>, BuildError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let encoded = serde_json::to_string(ids).map_err(|_| BuildError::Storage)?;
+    let media = match domain {
+        MediaDomain::Tv => "tv",
+        MediaDomain::Movies => "movies",
+    };
+    let mut rows = c
+        .query(
+            "SELECT t.label FROM tags t JOIN json_each(?) j ON j.value=t.id WHERE t.media_type=? ORDER BY t.label",
+            params![encoded, media],
+        )
+        .await?;
+    let mut labels = Vec::new();
+    while let Some(r) = rows.next().await? {
+        labels.push(r.get(0)?);
+    }
+    Ok(labels)
+}
+
 async fn series(c: &Connection, id: i64, snapshot: &Value) -> Result<Series, BuildError> {
     let mut rows = c
         .query(
@@ -596,7 +622,12 @@ pub async fn build(
                 ("SeriesDelete", "MovieDelete")
             };
             if let (MediaDomain::Tv, Some(id)) = (domain, event.subject_id) {
-                let v = series(c, id, payload).await?;
+                let mut v = series(c, id, payload).await?;
+                if event.kind == EventKind::Delete
+                    && let Some(ids) = event.tag_ids.as_deref()
+                {
+                    v.tags = snapshot_tags(c, domain, ids).await?;
+                }
                 env = base_env(domain, tv_type);
                 tv_env(&mut env, &v, !add);
                 title = if add {
@@ -613,7 +644,12 @@ pub async fn build(
                     vec![v.path.clone()]
                 };
             } else if let (MediaDomain::Movies, Some(id)) = (domain, event.subject_id) {
-                let v = movie(c, id, payload).await?;
+                let mut v = movie(c, id, payload).await?;
+                if event.kind == EventKind::Delete
+                    && let Some(ids) = event.tag_ids.as_deref()
+                {
+                    v.tags = snapshot_tags(c, domain, ids).await?;
+                }
                 env = base_env(domain, movie_type);
                 movie_env(&mut env, &v, true);
                 title = if add { "Movie Added" } else { "Movie Deleted" }.into();
@@ -834,5 +870,5 @@ pub async fn emit(
     )
     .await?;
     let mut rows = c.query("SELECT last_insert_rowid()", ()).await?;
-    Ok(rows.next().await?.map(|r| r.get(0)).transpose()?)
+    rows.next().await?.map(|r| r.get(0)).transpose()
 }

@@ -153,22 +153,20 @@ fn digest_terms(media: MediaDomain, profiles: &[ProfileTerms]) -> Result<Digest>
             }
         }
     }
-    Ok(hash
+    hash
         .finish()
         .as_ref()
         .try_into()
-        .map_err(|_| TermError::WorkerFailed)?)
+        .map_err(|_| TermError::WorkerFailed)
 }
 fn title_digest(title: &str) -> Result<Digest> {
     if title.len() > MAX_TITLE_BYTES {
         return Err(TermError::LimitExceeded);
     }
-    Ok(
-        ring::digest::digest(&ring::digest::SHA256, title.as_bytes())
+    ring::digest::digest(&ring::digest::SHA256, title.as_bytes())
             .as_ref()
             .try_into()
-            .map_err(|_| TermError::WorkerFailed)?,
-    )
+            .map_err(|_| TermError::WorkerFailed)
 }
 static CPU: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 async fn bounded<T: Send + 'static>(

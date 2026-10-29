@@ -244,11 +244,10 @@ pub(crate) fn decode_private(bytes: &[u8]) -> Result<Release> {
     }
     let mut value: PrivateRelease =
         serde_json::from_slice(bytes).map_err(|_| IndexerError::InvalidResponse)?;
-    if let Some(facts) = value.facts.torrent.as_mut() {
-        if facts.magnet_url.is_none() {
+    if let Some(facts) = value.facts.torrent.as_mut()
+        && facts.magnet_url.is_none() {
             facts.magnet_url = selected_magnet(&value.download_url)?;
         }
-    }
     Ok(Release {
         metadata: value.metadata,
         guid: value.guid,
@@ -1886,8 +1885,8 @@ async fn fetch(
     }
     let bytes = operation.get(endpoint, &params).await?;
     let body = String::from_utf8(bytes).map_err(|_| IndexerError::InvalidResponse)?;
-    if api_key.is_none() {
-        if let Ok(doc) = Document::parse_with_options(
+    if api_key.is_none()
+        && let Ok(doc) = Document::parse_with_options(
             &body,
             ParsingOptions {
                 allow_dtd: false,
@@ -1907,7 +1906,6 @@ async fn fetch(
                 return Err(IndexerError::Authentication);
             }
         }
-    }
     Ok(body)
 }
 fn cooldown<T>(operation: &super::http::HttpOperation<'_>, result: Result<T>) -> Result<T> {

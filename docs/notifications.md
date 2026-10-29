@@ -30,14 +30,18 @@ manual interaction required, and TV-only on import complete. An empty tag list m
 tag-filtered.
 
 ### Secrets
+
 Secret fields are stored in one AES-256-GCM envelope bound to the notification id and
 implementation, using the same independently stored key as providers (`HRRDARR_PROVIDER_KEY`).
 Responses list only `secrets_configured` names. On update an omitted secret is kept, `null` clears
 it (not allowed for required secrets). Without the key, creating a notification that has secrets
 fails with 503; secretless implementations (for example Kodi without a password) still work.
 Errors, logs, the delivery journal and the test results never contain URLs, tokens or response bodies.
+Custom scripts are the one exception: up to 2 KiB of a script's own stdout/stderr is logged verbatim,
+so a script that prints a secret writes it to the process log.
 
 ### Validation
+
 Strict and bounded: unknown settings/secrets rejected, secrets sent as settings rejected, types and
 ranges per schema, control characters rejected, at most 64 notifications, 200 tags per scope, 64 KiB
 request bodies, unique case-insensitive names, tag IDs must exist in that scope's domain.
@@ -54,15 +58,17 @@ notification has the matching trigger for that domain.
 | Import / Upgrade | insert into `import_history`; upgrade = the operation has a replaced-file record (`rss_candidate_imports.old_file_json` or `scan_import_replacements`) |
 | Series add / Movie added | insert into `series` / `movies` |
 | Series delete / Movie delete | delete from `series` / `movies` (title, path, tags snapshotted) |
-| File delete | delete from `episode_files` / `movie_files`; reason `Manual` (an unfinished `file_deletions` journal: `admitted`, `copied` or `committed`; aborted and completed journals do not count), `Upgrade` (replacement journals), `NoLinkedEpisodes`, else `MissingFromDisk` |
+| File delete | manual deletion of `episode_files` / `movie_files`, or retirement of a replaced original; reason `Manual` (an unfinished `file_deletions` journal: `admitted`, `copied` or `committed`; aborted and completed journals do not count), `Upgrade` (replacement retirement), `NoLinkedEpisodes`, else `MissingFromDisk` |
 | Health issue / restored | insert into `health_transitions` with `in_grace=0` (the 1024-row health ring is not an outbox, so the trigger copies what is needed) |
 | Manual interaction | `rss_candidates.status` becomes `needs_attention` |
 | Rename, Application update | accepted by `notifications::events::emit` and rendered, but **nothing emits them yet**: there is no rename executor or updater in the codebase |
 
-`notification_events` keeps the newest 2048 events. The worker (`notifications::start`, run only by
-the process that owns the database) polls every 2 s: it fans events out to one
+`notification_events` keeps the newest 2048 events. The worker (`notifications::start`, started by
+every server process) polls every 2 s: it fans events out to one
 `notification_deliveries` row per matching notification (enabled, domain, trigger flag, tag scope),
-then claims due deliveries under a 120 s lease and sends them (max 4 concurrent). Each delivery
+then claims due deliveries under a 120 s lease and sends them (max 4 concurrent). The worker owns no
+library file: fan-out is idempotent and a delivery is leased, so processes that share one database
+(a remote deployment) do not duplicate a send. Each delivery
 records the scope that matched (`media_type`): a system event (health, update) is rendered for that
 domain, so a notification whose movies scope asked for health events gets `radarr_*` variables and
 the movie app path even when its TV scope exists. When both scopes match, TV is used. Health
@@ -80,7 +86,10 @@ notify plus library update) records a 64-bit identity of each acknowledged reque
 so a retry sends only the requests that were not acknowledged. Requests can carry secrets, so the
 identity is an HMAC under a sub-key derived from the credential key: reading the database does not
 allow checking guessed secrets against it. Without a credential key no secret can be stored, and a
-plain digest is used. Rotating the key re-sends parts of a delivery still being retried. A request that timed out may still have
+plain digest is used. Rotating the key re-sends parts of a delivery still being retried, but it also
+strands the stored secrets: an envelope sealed under the old key can no longer be opened, so a
+secret-backed delivery fails permanently with `credentials_unavailable` until that notification's
+secrets are entered again. A request that timed out may still have
 arrived, so this narrows duplicates rather than excluding them. Plex refreshes are not tracked: they
 follow a fresh section listing and repeating one is harmless.
 
@@ -91,7 +100,9 @@ Deleting a notification discards its deliveries.
 ## Tests
 
 `POST /test`, `POST /{id}/test` and `POST /testall` send a synthetic Test event to each configured
-domain, both domains concurrently, each limited to 40 s. At most 4 notification tests run at once
+domain, both domains concurrently, each limited to 40 s. `/testall` covers the **enabled**
+notifications only: a disabled definition is not attempted and does not appear in the result.
+At most 4 notification tests run at once
 across all test requests. One notification's test finishes within 45 s (the client waits 60 s);
 `/testall` runs notifications concurrently and finishes within 90 s (the client waits 120 s).
 Anything unfinished at the deadline reports `timeout`; such a send may still have been delivered.
@@ -178,10 +189,14 @@ only to events that change files; other events are skipped.
 * Import-complete (TV batch) is stored but never fired.
 * Delivery is at-least-once, not exactly-once; there is no per-target ordering guarantee.
 * Event capture was exercised with fixture rows and the real trigger paths for series/movie
-  add/delete, file delete, health, import receipts; the live RSS grab path was not run end to end here.
+  add/delete, file delete (including the upgrade retirement of a replaced original), health, import
+  receipts; the live RSS grab path was not run end to end here.
 * Sonarr/Radarr V3 wire compatibility (`/api/v3/notification`) is not provided.
 * The outbox drops its oldest events beyond 2048; a long outage can lose undelivered events.
 * A health check that escalates from warning to error emits no new transition (health engine
   behaviour), so a notification that excludes warnings is not told about the escalation.
 * Held deliveries of a disabled notification resume on re-enable however old they are, bounded only
   by the 2048-event outbox.
+* The dispatcher runs in every server process, including on a remote database. Fan-out is
+  idempotent and a delivery is claimed under a lease, but two live processes over one remote
+  database were not exercised.

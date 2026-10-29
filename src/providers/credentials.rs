@@ -12,7 +12,7 @@ impl CredentialKey {
             return Err("Provider key must contain 64 hexadecimal characters");
         }
         let mut bytes = [0u8; 32];
-        for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (i, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let digit = |c: u8| (c as char).to_digit(16).map(|n| n as u8);
             bytes[i] = digit(pair[0])
                 .zip(digit(pair[1]))

@@ -113,8 +113,8 @@ fn revision_tokens(
                 version_specified = true;
                 marker = true;
             }
-        } else if tv {
-            if let Some(n) = token
+        } else if tv
+            && let Some(n) = token
                 .strip_prefix('v')
                 .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
             {
@@ -128,7 +128,6 @@ fn revision_tokens(
                 version_specified = true;
                 marker = true;
             }
-        }
         if group_follows {
             break;
         }
@@ -203,14 +202,12 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
                 }
             }
         }
-        if parsed_numbering.is_none() {
-            if let Some(i) = tokens.iter().position(|s| *s == "-") {
-                if let Some(episode) = lower.get(i + 1).and_then(|s| number(version_suffix(s).0)) {
+        if parsed_numbering.is_none()
+            && let Some(i) = tokens.iter().position(|s| *s == "-")
+                && let Some(episode) = lower.get(i + 1).and_then(|s| number(version_suffix(s).0)) {
                     boundary = i;
                     parsed_numbering = Some(Numbering::Absolute { episode });
                 }
-            }
-        }
         if parsed_numbering.is_none() {
             return Err("unsupported_numbering");
         }

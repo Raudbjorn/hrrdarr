@@ -443,11 +443,10 @@ struct Owner {
 }
 impl Owner {
     fn owns(&self, directory: &str, labels: &[String]) -> bool {
-        if let (Some(label), true) = (&self.label, self.labels_supported) {
-            if !labels.is_empty() {
+        if let (Some(label), true) = (&self.label, self.labels_supported)
+            && !labels.is_empty() {
                 return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
             }
-        }
         within(directory, &self.directory)
     }
 }
@@ -491,14 +490,13 @@ impl Owners {
         };
         let tv = tv.as_ref().map(|s| owner(s, session)).transpose()?;
         let movies = movies.as_ref().map(|s| owner(s, session)).transpose()?;
-        if let (Some(a), Some(b)) = (&tv, &movies) {
-            if within(&a.directory, &b.directory) || within(&b.directory, &a.directory) {
+        if let (Some(a), Some(b)) = (&tv, &movies)
+            && (within(&a.directory, &b.directory) || within(&b.directory, &a.directory)) {
                 return Err(TransmissionTestFailure {
                     error: QbitError::ScopeConflict,
                     problem: Some(TransmissionProblem::DomainsOverlap),
                 });
             }
-        }
         Ok(Self { tv, movies })
     }
     fn plain(settings: &ProviderSettings, session: &Session) -> Result<Self> {
@@ -1060,11 +1058,10 @@ async fn submit_inner(
     } else {
         return Err(QbitError::Rejected);
     };
-    if let Some(returned) = returned {
-        if torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash {
+    if let Some(returned) = returned
+        && torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash {
             return Err(QbitError::MutationUnknown);
         }
-    }
     if duplicate {
         // Someone else added it between the lookup and add: never mutate a torrent this call
         // did not create. It is ours only if it sits in this domain.

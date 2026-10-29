@@ -208,6 +208,60 @@ BEGIN
      ELSE 'MissingFromDisk' END),
   (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=OLD.movie_id),CAST(strftime('%s','now') AS INTEGER));
 END;
+-- Upgrade retirement. Upgrade paths reuse or retain file rows instead of deleting them, so the
+-- row-delete triggers cannot observe the replacement. Retirement is the atomic point at which
+-- the original leaves the library; emit the documented Upgrade file-delete event here.
+CREATE TRIGGER notification_event_upgrade_file_delete_rss AFTER UPDATE OF retirement_state ON rss_candidate_imports
+WHEN NEW.retirement_state='quarantined'
+ AND OLD.retirement_state IS NOT 'quarantined'
+ AND NEW.old_file_json IS NOT NULL
+ AND EXISTS(
+  SELECT 1 FROM notification_scopes s
+  JOIN notifications n ON n.id=s.notification_id
+  WHERE n.enabled=1
+    AND s.media_type=CASE WHEN NEW.old_episode_file_id IS NOT NULL THEN 'tv' ELSE 'movies' END
+    AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','tv',f.series_id,
+  json_object('episode_file_id',NEW.old_episode_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM series_tags WHERE series_id=f.series_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM episode_files f
+ WHERE NEW.old_episode_file_id IS NOT NULL AND f.id=NEW.old_episode_file_id;
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','movies',f.movie_id,
+  json_object('movie_file_id',NEW.old_movie_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=f.movie_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM movie_files f
+ WHERE NEW.old_movie_file_id IS NOT NULL AND f.id=NEW.old_movie_file_id;
+END;
+CREATE TRIGGER notification_event_upgrade_file_delete_scan AFTER UPDATE OF retirement_state ON scan_import_replacements
+WHEN NEW.retirement_state='quarantined'
+ AND OLD.retirement_state IS NOT 'quarantined'
+ AND EXISTS(
+  SELECT 1 FROM notification_scopes s
+  JOIN notifications n ON n.id=s.notification_id
+  WHERE n.enabled=1
+    AND s.media_type=NEW.media_type
+    AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','tv',f.series_id,
+  json_object('episode_file_id',NEW.old_episode_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM series_tags WHERE series_id=f.series_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM episode_files f
+ WHERE NEW.media_type='tv' AND NEW.old_episode_file_id IS NOT NULL AND f.id=NEW.old_episode_file_id;
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','movies',f.movie_id,
+  json_object('movie_file_id',NEW.old_movie_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=f.movie_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM movie_files f
+ WHERE NEW.media_type='movies' AND NEW.old_movie_file_id IS NOT NULL AND f.id=NEW.old_movie_file_id;
+END;
 -- Health: only transitions outside the startup grace window are real state changes. The health
 -- ring keeps 1024 rows and is explicitly not a delivery outbox, so this copies what is needed.
 CREATE TRIGGER notification_event_health AFTER INSERT ON health_transitions

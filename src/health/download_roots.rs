@@ -87,11 +87,10 @@ pub(super) async fn evaluate(
             }
         }
     }
-    if !conflict {
-        if let Some(code) = failed {
+    if !conflict
+        && let Some(code) = failed {
             return Err(code);
         }
-    }
     Ok(conflict.then_some(DetectorIssue {
         reason: "download_client_root_folder",
         message: "A download client writes into a configured library root. Configure a separate download directory before importing media.",

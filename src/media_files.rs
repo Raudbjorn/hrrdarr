@@ -92,7 +92,7 @@ pub fn router(db: Arc<Database>) -> Router {
         let prefix = format!("/api/v1/{media}/files");
         router = router.merge(
             Router::new()
-                .route(&format!("{prefix}"), get(list))
+                .route(&prefix.to_string(), get(list))
                 .route(
                     &format!("{prefix}/bulk"),
                     put(bulk).delete(crate::recycle_bin::deletion::delete_bulk),

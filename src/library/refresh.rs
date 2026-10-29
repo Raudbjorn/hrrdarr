@@ -104,8 +104,8 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
 }
 async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
     let detail = detail.validated().map_err(|_| Error::Conflict)?;
-    if let Some(imdb) = &detail.imdb_id {
-        if c.query(
+    if let Some(imdb) = &detail.imdb_id
+        && c.query(
             "SELECT 1 FROM movie_metadata WHERE imdb_id=? AND id!=? LIMIT 1",
             params![imdb.clone(), id],
         )
@@ -116,7 +116,6 @@ async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
         {
             return Err(Error::Conflict);
         }
-    }
     let facts_changed = movie_facts(c, id, &detail, true).await?;
     let changed=c.execute("UPDATE movie_metadata SET title=?1,year=COALESCE(?2,year),imdb_id=COALESCE(?3,imdb_id) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR imdb_id IS NOT COALESCE(?3,imdb_id))",params![detail.title,detail.year,detail.imdb_id,id]).await?;
     Ok(u16::from(facts_changed || changed > 0))
@@ -468,11 +467,10 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
         return Err(Error::Conflict);
     }
     for episode in &detail.episodes {
-        if let Some(stored) = old.get(&episode.tvdb_id) {
-            if stored.season != episode.season || stored.number != episode.number {
+        if let Some(stored) = old.get(&episode.tvdb_id)
+            && (stored.season != episode.season || stored.number != episode.number) {
                 return Err(Error::Conflict);
             }
-        }
     }
     // Enforce global catalog ownership even where a legacy database has a nonunique index.
     let ids = incoming_ids.iter().copied().collect::<Vec<_>>();
@@ -499,7 +497,7 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
     }
     let mut additions = Vec::new();
     for number in incoming_seasons {
-        if !seasons.contains_key(&number) {
+        if let std::collections::btree_map::Entry::Vacant(e) = seasons.entry(number) {
             let monitored = if number == 0 {
                 0
             } else {
@@ -510,7 +508,7 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
                 }
             };
             additions.push((number, monitored));
-            seasons.insert(number, monitored);
+            e.insert(monitored);
         }
     }
     // All ambiguous identities and monitoring policy are checked before modifying any row.

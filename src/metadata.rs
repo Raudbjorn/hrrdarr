@@ -67,11 +67,10 @@ impl IntoResponse for MetadataError {
             Json(crate::api::ApiErrorEnvelope::new(code, message)),
         )
             .into_response();
-        if let Self::RateLimited(Some(seconds)) = self {
-            if let Ok(value) = seconds.to_string().parse() {
+        if let Self::RateLimited(Some(seconds)) = self
+            && let Ok(value) = seconds.to_string().parse() {
                 response.headers_mut().insert("retry-after", value);
             }
-        }
         response
     }
 }
@@ -896,16 +895,14 @@ impl SeriesDetails {
             {
                 return Err(MetadataError::InvalidResponse);
             }
-            if let Some(value) = &episode.overview {
-                if !value.is_empty() {
+            if let Some(value) = &episode.overview
+                && !value.is_empty() {
                     text(value, 32768, true)?;
                 }
-            }
-            if let Some(value) = &episode.finale_type {
-                if !value.is_empty() {
+            if let Some(value) = &episode.finale_type
+                && !value.is_empty() {
                     text(value, 128, false)?;
                 }
-            }
         }
         Ok(self)
     }

@@ -921,6 +921,7 @@ async fn outbox_delivers_domain_events_with_tag_scope_and_idle_install_records_n
     assert_eq!(del["eventType"], "SeriesDelete");
     assert_eq!(del["series"]["title"], "Cartoon");
     assert_eq!(del["series"]["path"], "/tv/cartoon");
+    assert_eq!(del["series"]["tags"], json!(["kids"]));
     assert_eq!(
         h.count("SELECT count(*) FROM notification_deliveries WHERE state='delivered'")
             .await,

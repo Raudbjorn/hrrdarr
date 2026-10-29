@@ -1790,7 +1790,7 @@ async fn discover(
             };
             let key = owner_key(&raw, tv);
             let owner = match owners.get(&key) {
-                Some(cached) => cached.clone(),
+                Some(cached) => *cached,
                 None => {
                     let resolved = match resolve_scan_owner(&c, claim.media, &raw).await {
                         Ok(owner) => Ok(owner),
@@ -1799,7 +1799,7 @@ async fn discover(
                             None => Err(code),
                         },
                     };
-                    owners.insert(key, resolved.clone());
+                    owners.insert(key, resolved);
                     resolved
                 }
             };

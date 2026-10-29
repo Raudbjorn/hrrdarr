@@ -1154,8 +1154,8 @@ async fn create_record(
                 }
                 row.get(0)?
             } else {
-                if let Some(imdb) = &req.imdb_id {
-                    if c.query(
+                if let Some(imdb) = &req.imdb_id
+                    && c.query(
                         "SELECT id FROM movie_metadata WHERE imdb_id=?",
                         [imdb.clone()],
                     )
@@ -1166,7 +1166,6 @@ async fn create_record(
                     {
                         return Err(conflict());
                     }
-                }
                 c.execute(
                     "INSERT INTO movie_metadata(tmdb_id,imdb_id,title,year)VALUES(?,?,?,?)",
                     params![tmdb, req.imdb_id.clone(), title, req.year],

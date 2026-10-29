@@ -6,7 +6,7 @@
   import type { CalendarPage, MediaDomain, MovieCalendarEntry, MovieReleaseType, TvCalendarEntry } from './api.generated';
   import { listCalendar } from './api';
   import {
-    POLL_INTERVAL_MS, RELEASE_LABELS, RELEASE_TYPES, STATUS_LABELS, WEEKDAYS, countLabel, dateLabel, defaultOptions, feedPath,
+    POLL_INTERVAL_MS, RELEASE_LABELS, RELEASE_TYPES, STATUS_LABELS, WEEKDAYS, countLabel, dateLabel, defaultOptions, feedPath, focusInRange,
     groupByDate, inRange, localDateOf, moveDate, movieItem, movieQuery, rangeFor, rangeTitle, step, tvItem, tvQuery, webcalUrl, weeksOf,
     type CalendarItem, type CalendarOptions, type CalendarScope, type CalendarStatus, type CalendarView, type LocalDate,
   } from './calendar-view';
@@ -88,7 +88,12 @@
   }
   function changeView(next: CalendarView) {
     if (next === mode) return;
-    mode = next; void load();
+    mode = next;
+    // The roving tabindex needs the focused day inside the rendered range: a day reached by
+    // arrowing in another view can sit outside the week or month the new view renders, which
+    // would leave the grid without a tabbable day.
+    focusDate = focusInRange(next, anchor, focusDate);
+    void load();
   }
   function changeScope(next: CalendarScope) {
     if (next === scope) return;

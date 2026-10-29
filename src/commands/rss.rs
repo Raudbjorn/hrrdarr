@@ -1521,11 +1521,10 @@ async fn process_candidate(
         Ok(prepared) => prepared,
         Err(error) => {
             if error.local_storage_failure {
-                if let Some(identity) = error.identity.as_ref() {
-                    if !retain_prepared_identity(&c, client, &p, identity, operation).await? {
+                if let Some(identity) = error.identity.as_ref()
+                    && !retain_prepared_identity(&c, client, &p, identity, operation).await? {
                         return Ok(());
                     }
-                }
                 return Err(Error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "command_storage_error",
@@ -2035,7 +2034,7 @@ async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> 
     if matches!(current.as_str(), "submitting" | "reconciling") {
         return Err(error);
     }
-    candidate_state(&c, id, "rejected", Some(code), None).await?;
+    candidate_state(c, id, "rejected", Some(code), None).await?;
     Ok(())
 }
 pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> Result<()> {

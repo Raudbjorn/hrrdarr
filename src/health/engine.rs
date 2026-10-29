@@ -45,11 +45,10 @@ async fn enqueue(
         return Ok(None);
     }
     let old = active(c).await?;
-    if let Some(cmd) = &old {
-        if !matches!(cmd.status, CommandStatus::Queued) {
+    if let Some(cmd) = &old
+        && !matches!(cmd.status, CommandStatus::Queued) {
             return Ok(Some((cmd.id, false)));
         }
-    }
     let id = if let Some(cmd) = &old {
         if priority.number() > cmd.priority.number() {
             c.execute(
@@ -302,11 +301,10 @@ pub(crate) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Resul
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let result = async {
-        if let Some(cmd) = active(&tx).await? {
-            if matches!(cmd.status, CommandStatus::Running) {
+        if let Some(cmd) = active(&tx).await?
+            && matches!(cmd.status, CommandStatus::Running) {
                 fail(&tx, &cmd, timestamp, code).await?;
             }
-        }
         Ok(())
     }
     .await;
@@ -542,7 +540,7 @@ async fn evaluate(
             identity: member.identity.clone(),
             severity: v.severity,
             reason: v.reason.into(),
-            message: v.message.into(),
+            message: v.message,
             wiki_url: v.wiki_url.into(),
             compatibility_type: v.compatibility_type.into(),
         })),

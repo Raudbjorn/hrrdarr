@@ -150,13 +150,11 @@ async fn eligible(
     }
     let binding: Option<String> = source.get(1)?;
     // A stored binding predating protocol validation cannot silently select nothing.
-    if let Some(bound) = &binding {
-        if let Some(row) = c.query("SELECT r.protocol FROM providers p JOIN provider_implementations r ON r.implementation=p.implementation WHERE p.id=? AND r.kind='download_client'",[bound.clone()]).await?.next().await? {
-            if row.get::<String>(0)? != protocol {
+    if let Some(bound) = &binding
+        && let Some(row) = c.query("SELECT r.protocol FROM providers p JOIN provider_implementations r ON r.implementation=p.implementation WHERE p.id=? AND r.kind='download_client'",[bound.clone()]).await?.next().await?
+            && row.get::<String>(0)? != protocol {
                 return Err(protocol_mismatch());
             }
-        }
-    }
     let owner = match target {
         crate::db::MediaTarget::Episode(_) => c
             .query("SELECT series_id FROM episodes WHERE id=?", [target_id])

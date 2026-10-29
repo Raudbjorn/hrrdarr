@@ -305,8 +305,7 @@ pub(crate) fn validate_shape(m: MediaDomain, v: &Definition) -> Result<()> {
             fingerprint,
             source_id,
         } = reference
-        {
-            if v.enabled
+            && (v.enabled
                 || application.name()
                     != if matches!(m, MediaDomain::Tv) {
                         "sonarr"
@@ -317,11 +316,10 @@ pub(crate) fn validate_shape(m: MediaDomain, v: &Definition) -> Result<()> {
                 || !fingerprint
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                || !(1..=MAX_ID).contains(source_id)
+                || !(1..=MAX_ID).contains(source_id))
             {
                 return Err(invalid());
             }
-        }
     }
     Ok(())
 }
@@ -487,9 +485,8 @@ async fn validate_references(c: &Connection, m: MediaDomain, v: &Definition) -> 
         }
     }
     for reference in &v.indexers {
-        if let IndexerReference::Provider { id } = reference {
-            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
-        }
+        if let IndexerReference::Provider { id } = reference
+            && c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
     }
     Ok(())
 }
@@ -865,11 +862,10 @@ fn proposed(all: &Catalog, id: Option<i64>, value: Option<&Definition>) -> Resul
     if !found {
         return Err(missing());
     }
-    if id.is_none() {
-        if let Some(v) = value {
+    if id.is_none()
+        && let Some(v) = value {
             definitions.push(v.clone())
         }
-    }
     Ok(definitions)
 }
 async fn save(

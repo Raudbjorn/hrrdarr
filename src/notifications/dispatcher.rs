@@ -486,6 +486,10 @@ impl Dispatcher {
                 .await
                 .map_err(|_| storage())?
                 .ok_or_else(|| permanent("event_discarded"))?;
+            let tag_ids = r
+                .get::<Option<String>>(4)
+                .map_err(|_| storage())?
+                .and_then(|json| serde_json::from_str(&json).ok());
             EventRow {
                 sequence,
                 kind: EventKind::parse(&r.get::<String>(0).map_err(|_| storage())?)
@@ -495,7 +499,7 @@ impl Dispatcher {
                 subject_id: r.get(2).map_err(|_| storage())?,
                 payload: serde_json::from_str(&r.get::<String>(3).map_err(|_| storage())?)
                     .map_err(|_| permanent("event_invalid"))?,
-                tag_ids: None,
+                tag_ids,
             }
         };
         // A domain event matched its own domain; a system event matched the recorded scope.
@@ -679,7 +683,8 @@ impl Handle {
     }
 }
 
-/// Starts the polling worker. Call only where this process owns the database.
+/// Starts the polling worker. Several processes may share one database: fan-out is idempotent and
+/// a delivery is claimed under a lease.
 pub fn start(dispatcher: Dispatcher) -> Handle {
     let stop = Arc::new(Notify::new());
     let signal = stop.clone();

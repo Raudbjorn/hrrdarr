@@ -342,8 +342,8 @@ pub(super) async fn write(conn: &Connection, events: &[Event], report: &mut Repo
         }
         let mut quality = event.quality;
         let mut revision = event.revision.clone();
-        if let Some(id) = quality {
-            if conn
+        if let Some(id) = quality
+            && conn
                 .query(
                     "SELECT 1 FROM quality_definitions WHERE media_type=? AND quality_id=?",
                     params![if tv { "tv" } else { "movies" }, id],
@@ -357,7 +357,6 @@ pub(super) async fn write(conn: &Connection, events: &[Event], report: &mut Repo
                 quality = None;
                 revision = None;
             }
-        }
         let values: Vec<Value> = vec![
             Value::Text(if tv { "episode" } else { "movie" }.into()),
             if tv { target.into() } else { Value::Null },

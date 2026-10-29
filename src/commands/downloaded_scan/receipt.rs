@@ -99,11 +99,10 @@ pub(super) async fn resolve(
             captured: true,
         };
         drop(row);
-        if let Some(operation) = &receipt.predecessor {
-            if !predecessor_complete(c, operation).await? {
+        if let Some(operation) = &receipt.predecessor
+            && !predecessor_complete(c, operation).await? {
                 return Err(waiting(operation)?);
             }
-        }
         return Ok(Some(receipt));
     }
     let known = c
@@ -215,8 +214,8 @@ pub(super) async fn resolve(
         predecessor,
         captured: false,
     };
-    if let Some(operation) = receipt.predecessor.clone() {
-        if !predecessor_complete(c, &operation).await? {
+    if let Some(operation) = receipt.predecessor.clone()
+        && !predecessor_complete(c, &operation).await? {
             // Reserve now so no new singleton ownership can start, then wait for the original
             // owner to finish under its own authority.
             let tx = c
@@ -243,7 +242,6 @@ pub(super) async fn resolve(
             );
             return Err(waiting(&operation)?);
         }
-    }
     Ok(Some(receipt))
 }
 

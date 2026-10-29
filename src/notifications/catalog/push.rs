@@ -1,11 +1,11 @@
 //! Chat and push-message providers. Each builder is a pure function from settings and a message
 //! to requests, so the protocol is unit-testable without any I/O.
-use super::{BOTH, Build, Config, Implementation, clip};
+use super::{clip, Build, Config, Implementation, BOTH};
 use crate::api::MediaDomain;
 use crate::notifications::{
     events::{EventKind, Message},
     model::{Field, ImplementationKind},
-    transport::{Outgoing, basic_auth},
+    transport::{basic_auth, Outgoing, MAX_URL_BYTES},
 };
 use serde_json::json;
 
@@ -14,6 +14,27 @@ fn url_with_query(base: &str, query: &[(&str, &str)]) -> Result<String, &'static
     url.query_pairs_mut().extend_pairs(query);
     Ok(url.into())
 }
+fn encoded_len(value: &str) -> usize {
+    url::form_urlencoded::byte_serialize(value.as_bytes())
+        .map(str::len)
+        .sum()
+}
+
+fn clip_encoded(value: &str, max_bytes: usize) -> &str {
+    let mut used = 0;
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        let mut encoded = [0u8; 4];
+        let len = encoded_len(ch.encode_utf8(&mut encoded));
+        if used + len > max_bytes {
+            break;
+        }
+        used += len;
+        end = index + ch.len_utf8();
+    }
+    &value[..end]
+}
+
 fn join_path(base: &str, tail: &str) -> String {
     format!(
         "{}/{}",
@@ -136,10 +157,11 @@ fn gotify(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
         "priority": c.int("priority").unwrap_or(5),
         "extras": {"client::display": {"contentType": "text/plain"}},
     });
-    Ok(vec![
-        Outgoing::post_json(join_path(c.text("server_url"), "message"), body)
-            .header("X-Gotify-Key", c.text("app_token")),
-    ])
+    Ok(vec![Outgoing::post_json(
+        join_path(c.text("server_url"), "message"),
+        body,
+    )
+    .header("X-Gotify-Key", c.text("app_token"))])
 }
 
 fn pushover(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
@@ -240,24 +262,44 @@ fn prowl(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
 }
 
 fn join(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
+    const BASE: &str = "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush";
+
     let title = clip(&m.title, 250);
     let text = clip(&m.text, 1000);
+    let api_key = c.text("api_key");
+    let priority = c.opt("priority").unwrap_or("0");
+    let names = c.list("device_names").join(",");
+    let device = if names.is_empty() {
+        ("deviceId", "group.all")
+    } else {
+        ("deviceNames", names.as_str())
+    };
+
     let mut query = vec![
-        ("apikey", c.text("api_key")),
+        ("apikey", api_key),
         ("title", title.as_str()),
         ("text", text.as_str()),
-        ("priority", c.opt("priority").unwrap_or("0")),
+        ("priority", priority),
+        device,
     ];
-    let names = c.list("device_names").join(",");
-    if names.is_empty() {
-        query.push(("deviceId", "group.all"));
-    } else {
-        query.push(("deviceNames", names.as_str()));
+    let encoded_query_len = query
+        .iter()
+        .map(|(key, value)| encoded_len(key) + 1 + encoded_len(value))
+        .sum::<usize>()
+        + query.len()
+        - 1;
+    // The `?` and the `text` value are excluded; every other query byte is fixed.
+    let fixed_len = BASE.len() + 1 + encoded_query_len - encoded_len(&text);
+    let text_budget = MAX_URL_BYTES.saturating_sub(fixed_len);
+    if encoded_len(&text) > text_budget {
+        let clipped = clip_encoded(&text, text_budget);
+        query[2] = ("text", clipped);
     }
-    Ok(vec![Outgoing::get(url_with_query(
-        "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush",
-        &query,
-    )?)])
+    let url = url_with_query(BASE, &query)?;
+    if url.len() > MAX_URL_BYTES {
+        return Err("invalid_url");
+    }
+    Ok(vec![Outgoing::get(url)])
 }
 
 fn pushcut(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
@@ -266,13 +308,11 @@ fn pushcut(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
     url.path_segments_mut()
         .map_err(|_| "invalid_url")?
         .push(c.text("notification_name"));
-    Ok(vec![
-        Outgoing::post_json(
-            String::from(url),
-            json!({"title":clip(&m.title,250),"text":clip(&m.text,1000)}),
-        )
-        .header("API-Key", c.text("api_key")),
-    ])
+    Ok(vec![Outgoing::post_json(
+        String::from(url),
+        json!({"title":clip(&m.title,250),"text":clip(&m.text,1000)}),
+    )
+    .header("API-Key", c.text("api_key"))])
 }
 
 fn priority_options() -> [&'static str; 5] {
@@ -482,4 +522,84 @@ pub fn implementations() -> Vec<Implementation> {
             build: Build::Http(pushcut),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notifications::model::SettingValue;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn join_truncates_non_ascii_message_to_fit_transport_url_limit() {
+        let settings = BTreeMap::from([
+            (
+                "device_names".to_owned(),
+                SettingValue::Text("phone".to_owned()),
+            ),
+            ("priority".to_owned(), SettingValue::Text("2".to_owned())),
+        ]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "join-key".to_owned())]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let message = Message {
+            kind: EventKind::Test,
+            domain: MediaDomain::Tv,
+            title: "标题".to_owned(),
+            text: "通".repeat(333),
+            json: json!({}),
+            env: Vec::new(),
+            paths: Vec::new(),
+            severity: None,
+        };
+
+        let requests = join(&config, &message).expect("Join request should be built");
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.len() <= MAX_URL_BYTES);
+        let parsed = url::Url::parse(&requests[0].url).unwrap();
+        let text = url::form_urlencoded::parse(parsed.query().unwrap().as_bytes())
+            .find_map(|(key, value)| (key.as_ref() == "text").then_some(value.into_owned()))
+            .unwrap();
+        assert!(!text.is_empty());
+        assert!(text.len() < 999);
+        assert!(text.chars().count() < 333);
+        assert!(text.chars().all(|ch| ch == '通'));
+    }
+
+    #[test]
+    fn join_truncates_text_for_long_api_key_and_device_names() {
+        let settings = BTreeMap::from([(
+            "device_names".to_owned(),
+            SettingValue::Text("手机".repeat(40)),
+        )]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "k".repeat(1024))]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let message = Message {
+            kind: EventKind::Test,
+            domain: MediaDomain::Tv,
+            title: "题".to_owned(),
+            text: "内容".repeat(500),
+            json: json!({}),
+            env: Vec::new(),
+            paths: Vec::new(),
+            severity: None,
+        };
+
+        let requests = join(&config, &message).expect("Join request should be built");
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.len() <= MAX_URL_BYTES);
+        let parsed = url::Url::parse(&requests[0].url).unwrap();
+        let text = url::form_urlencoded::parse(parsed.query().unwrap().as_bytes())
+            .find_map(|(key, value)| (key.as_ref() == "text").then_some(value.into_owned()))
+            .unwrap();
+        assert!(!text.is_empty());
+        assert!(text.len() < 1000);
+    }
 }

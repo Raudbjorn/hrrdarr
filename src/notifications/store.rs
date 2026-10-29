@@ -1,6 +1,6 @@
 //! Validation and persistence of notification definitions.
 use super::{
-    catalog::{self, Implementation},
+    catalog::{self},
     error::{ApiError, Result},
     model::*,
 };

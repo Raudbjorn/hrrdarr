@@ -229,11 +229,10 @@ impl<'o, 'a> Api<'o, 'a> {
         let mut query = vec![("mode".to_owned(), mode.to_owned())];
         query.extend(parameters.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
         query.push(("output".into(), "json".into()));
-        if authenticated {
-            if let Some(key) = self.key {
+        if authenticated
+            && let Some(key) = self.key {
                 query.push(("apikey".into(), key.to_owned()));
             }
-        }
         let response = self
             .operation
             .request(&self.url, &query, &[], HttpRequestBody::Empty)

@@ -364,8 +364,8 @@ fn read_file(row: &Row, movie: i64, id: i64, settings: &Settings) -> Result<File
         quality_title = name.unwrap_or_default();
         invalid |= !valid_text(&quality_title);
     }
-    if settings.revision() && has_quality {
-        if let Some(raw) = row.get::<Option<String>>(9)? {
+    if settings.revision() && has_quality
+        && let Some(raw) = row.get::<Option<String>>(9)? {
             if raw.len() > MAX_SNAPSHOT_BYTES {
                 return Err(unavailable());
             }
@@ -374,7 +374,6 @@ fn read_file(row: &Row, movie: i64, id: i64, settings: &Settings) -> Result<File
                 _ => invalid = true,
             }
         }
-    }
     let language = if settings.cf() {
         row.get::<Option<i64>>(4)?
     } else {

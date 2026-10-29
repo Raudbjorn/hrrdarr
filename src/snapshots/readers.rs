@@ -375,13 +375,12 @@ pub(super) fn radarr(source: &Source) -> Result<Plan> {
         }
         let path = root(text(row, "Path")?)?;
         roots.insert(id, path.clone());
-        if let Some(file) = optional_id(row, "MovieFileId")? {
-            if selected_files.insert(file, id).is_some() {
+        if let Some(file) = optional_id(row, "MovieFileId")?
+            && selected_files.insert(file, id).is_some() {
                 return Err(ImportError(
                     "source movie file is selected by multiple movies",
                 ));
             }
-        }
         plan.entities.push(Entity {
             table: "movies",
             source_id: id,

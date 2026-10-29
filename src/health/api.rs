@@ -291,7 +291,7 @@ async fn commands(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::ReadOnly)
         .await?;
-    let outcome=async{let predicate="(?1='all' OR EXISTS(SELECT 1 FROM health_command_checks m WHERE m.command_id=c.id AND m.scope=?1)) AND (?2 IS NULL OR c.status=?2)";let status=q.status.map(CommandStatus::text);let total=tx.query(&format!("SELECT count(*) FROM health_commands c WHERE {predicate}"),params![q.scope.text(),status]).await?.next().await?.ok_or_else(invariant)?.get(0)?;let mut rows=tx.query(&format!("SELECT id FROM health_commands c WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4"),params![q.scope.text(),status,i64::from(q.limit),i64::from(q.offset)]).await?;let mut items=Vec::new();while let Some(r)=rows.next().await?{items.push(read(&tx,uuid(r.get(0)?)?).await?)}bounded(crate::api::ApiPage{items,total,limit:q.limit.into(),offset:q.offset.into()})}.await;
+    let outcome=async{let predicate="(?1='all' OR EXISTS(SELECT 1 FROM health_command_checks m WHERE m.command_id=c.id AND m.scope=?1)) AND (?2 IS NULL OR c.status=?2)";let status=q.status.map(CommandStatus::text);let total=tx.query(&format!("SELECT count(*) FROM health_commands c WHERE {predicate}"),params![q.scope.text(),status]).await?.next().await?.ok_or_else(invariant)?.get(0)?;let mut rows=tx.query(&format!("SELECT id FROM health_commands c WHERE {predicate} ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4"),params![q.scope.text(),status,i64::from(q.limit),i64::from(q.offset)]).await?;let mut items=Vec::new();while let Some(r)=rows.next().await?{items.push(read(&tx,uuid(r.get(0)?)?).await?)}bounded(crate::api::ApiPage{items,total,limit:q.limit,offset:q.offset.into()})}.await;
     finish(tx, outcome).await
 }
 async fn detail(

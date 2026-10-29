@@ -192,11 +192,10 @@ impl Inventory {
                     if source_path.len() + 1 + entry.relative_path.len() > 4096 {
                         return Err(limit());
                     }
-                    if let Some((parent, _)) = entry.relative_path.rsplit_once('/') {
-                        if parents.get(parent) != Some(&Kind::Directory) {
+                    if let Some((parent, _)) = entry.relative_path.rsplit_once('/')
+                        && parents.get(parent) != Some(&Kind::Directory) {
                             return Err(invalid());
                         }
-                    }
                 }
                 previous = Some(entry.relative_path.clone());
                 parents.insert(entry.relative_path.clone(), entry.kind);

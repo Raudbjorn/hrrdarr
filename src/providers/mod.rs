@@ -621,11 +621,10 @@ impl ProviderSettings {
                         return Err(bad());
                     }
                 }
-                if let (Some(tv), Some(movies)) = (tv, movies) {
-                    if tv.category.to_lowercase() == movies.category.to_lowercase() {
+                if let (Some(tv), Some(movies)) = (tv, movies)
+                    && tv.category.to_lowercase() == movies.category.to_lowercase() {
                         return Err(bad());
                     }
-                }
             }
             Self::Transmission { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
@@ -1941,11 +1940,10 @@ fn validate(input: &ProviderInput) -> Result<()> {
         return Err(bad());
     }
     input.settings.validate()?;
-    if let Change::Value(c) = &input.credentials {
-        if !c.valid(input.settings.implementation()) {
+    if let Change::Value(c) = &input.credentials
+        && !c.valid(input.settings.implementation()) {
             return Err(bad());
         }
-    }
     Ok(())
 }
 fn stored_bool(value: i64) -> Result<bool> {
