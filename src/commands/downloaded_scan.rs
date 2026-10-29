@@ -2218,6 +2218,9 @@ async fn publish_in(
                 Err(crate::naming::destination::DestinationError::Db(error)) => {
                     return Err(error.into());
                 }
+                Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+                    return Err(Failure::Retry(code));
+                }
                 Err(crate::naming::destination::DestinationError::Internal(_)) => {
                     return Err(Failure::Fail("scan_facts_invalid"));
                 }

@@ -729,6 +729,7 @@ async fn destination_for(
         Ok(destination) => Ok(Some(destination)),
         Err(DestinationError::Render(_)) => Ok(None),
         Err(DestinationError::Db(error)) => Err(Error::from(error)),
+        Err(DestinationError::Unavailable(code)) => Err(Error::unavailable(code)),
         Err(DestinationError::Internal(reason)) => {
             eprintln!("event=scan_destination_unavailable condition={reason}");
             Err(Error::internal())

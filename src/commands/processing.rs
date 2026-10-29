@@ -122,6 +122,7 @@ pub struct ProcessingPolicyInput {
 #[serde(deny_unknown_fields)]
 pub struct ProcessingPolicyReset {
     pub provider_revision: i64,
+    #[serde(deserialize_with = "required_nullable")]
     pub revision: Option<i64>,
     pub mode: ProcessingMode,
 }
@@ -348,13 +349,16 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    let provider=c.query("SELECT p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
+    let provider=c.query("SELECT p.revision,p.enabled FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
+    let provider_enabled = provider.get::<i64>(1)? == 1;
     let stored=c.query("SELECT provider_revision,revision,enabled,mode,enabled_override FROM download_processing_policies WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
-    let master = crate::completed_download_handling::read(c, media)
-        .await
-        .map_err(|e| Error(e.0, e.1))?
-        .enabled;
+    // Mirrors cdh_scope_authority.desired_enabled so reads match reconciliation.
+    let master = provider_enabled
+        && crate::completed_download_handling::read(c, media)
+            .await
+            .map_err(|e| Error(e.0, e.1))?
+            .enabled;
     let observation=c.query("SELECT intent,enabled FROM download_refresh_schedules WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?;
     let (observation_suppressed, observation_enabled) = match observation {
         Some(r) => (r.get::<String>(0)? == "suppressed", r.get::<i64>(1)? == 1),
@@ -787,7 +791,14 @@ async fn failure_in(
         && allow_retry
         && matches!(
             code,
-            "interrupted" | "storage_error" | "download_timeout" | "download_unavailable"
+            "interrupted"
+                | "storage_error"
+                | "download_timeout"
+                | "download_unavailable"
+                | "custom_format_busy"
+                | "custom_format_timeout"
+                | "custom_format_worker_failed"
+                | "custom_format_state_changed"
         )
         && current.preflight_attempts < 3;
     let timestamp = now()?;
@@ -808,7 +819,23 @@ fn processing_error(code: &str) -> &'static str {
         "target_changed" => "target_changed",
         "import_busy" => "import_busy",
         "source_unavailable" => "source_unavailable",
+        // Transient: preflight_failure requeues these (bounded) instead of blocking.
+        "import_error" | "storage_error" => "storage_error",
+        "custom_format_busy" => "custom_format_busy",
+        "custom_format_timeout" => "custom_format_timeout",
+        "custom_format_worker_failed" => "custom_format_worker_failed",
         _ => "import_conflict",
+    }
+}
+// Matcher admission, timeouts and storage reads are transient; only a decided rejection blocks.
+fn preflight_evaluation_error(code: &'static str) -> Error {
+    match code {
+        "release_storage_error" => Error(StatusCode::SERVICE_UNAVAILABLE, "storage_error"),
+        "custom_format_busy"
+        | "custom_format_timeout"
+        | "custom_format_worker_failed"
+        | "custom_format_state_changed" => Error(StatusCode::SERVICE_UNAVAILABLE, code),
+        _ => Error(StatusCode::CONFLICT, "quality_rejected"),
     }
 }
 pub(super) async fn run(
@@ -901,7 +928,7 @@ async fn preflight(
             &item.receipt_id.to_string(),
         )
         .await
-        .map_err(|_| Error(StatusCode::CONFLICT, "quality_rejected"))?;
+        .map_err(|e| preflight_evaluation_error(e.0))?;
         if let Some(facts) = result.accepted {
             if accepted.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "ambiguous_files"));
@@ -973,6 +1000,9 @@ async fn preflight(
                 }
                 Err(crate::naming::destination::DestinationError::Db(e)) => {
                     return Err(Error::from(e));
+                }
+                Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+                    return Err(Error(StatusCode::SERVICE_UNAVAILABLE, code));
                 }
                 Err(crate::naming::destination::DestinationError::Internal(reason)) => {
                     eprintln!("event=naming_destination_unavailable condition={reason}");
@@ -1549,5 +1579,45 @@ mod path_diagnostics_tests {
         assert!(!completed.recovery_required);
         assert_eq!(read(&c, tv.receipt_id).await?.reasons, vec![PATH_MARKER]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preflight_error_tests {
+    use super::*;
+    #[test]
+    fn transient_matcher_and_storage_errors_stay_retryable() {
+        for code in [
+            "custom_format_busy",
+            "custom_format_timeout",
+            "custom_format_worker_failed",
+            "custom_format_state_changed",
+        ] {
+            assert_eq!(preflight_evaluation_error(code).1, code);
+        }
+        assert_eq!(
+            preflight_evaluation_error("release_storage_error").1,
+            "storage_error"
+        );
+        assert_eq!(
+            preflight_evaluation_error("custom_format_regex_invalid").1,
+            "quality_rejected"
+        );
+    }
+
+    // prepare_owned's transient failures must survive processing_error into a code that
+    // preflight_failure requeues; before, all of them became a blocking import_conflict.
+    #[test]
+    fn prepare_owned_transient_codes_reach_the_retry_set() {
+        for (code, mapped) in [
+            ("import_error", "storage_error"),
+            ("storage_error", "storage_error"),
+            ("custom_format_busy", "custom_format_busy"),
+            ("custom_format_timeout", "custom_format_timeout"),
+            ("custom_format_worker_failed", "custom_format_worker_failed"),
+        ] {
+            assert_eq!(processing_error(code), mapped, "{code}");
+        }
+        assert_eq!(processing_error("preflight_changed"), "import_conflict");
     }
 }

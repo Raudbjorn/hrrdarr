@@ -287,6 +287,19 @@ impl Error {
             started_attempt: false,
         }
     }
+    /// A failure that may clear on retry; `code` is a processing retry code.
+    fn unavailable(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: "Import naming evaluation is temporarily unavailable; retry",
+            diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
+        }
+    }
     fn missing() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,

@@ -93,6 +93,7 @@
     // arrowing in another view can sit outside the week or month the new view renders, which
     // would leave the grid without a tabbable day.
     focusDate = focusInRange(next, anchor, focusDate);
+    if (selectedDate && !inRange(selectedDate, rangeFor(next, anchor))) selectedDate = null;
     void load();
   }
   function changeScope(next: CalendarScope) {

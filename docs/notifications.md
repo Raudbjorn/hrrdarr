@@ -14,7 +14,8 @@ All routes are under `/api/v1/notifications` (generated types: `Notification*` i
 | `GET /{id}`, `PUT /{id}`, `DELETE /{id}` | Read / update (revision fenced) / delete |
 | `GET /schema` | Implementation catalog: field schema driving validation and the UI form |
 | `POST /test` | Test an unsaved draft (`{draft, existing_id?}`); `existing_id` lends stored secrets |
-| `POST /{id}/test`, `POST /testall` | Test saved notifications |
+| `POST /{id}/test` | Test one saved notification |
+| `POST /testall` | Test every **enabled** saved notification (disabled ones are skipped and not listed in the result) |
 | `GET /deliveries?limit=` | Recent delivery journal (class codes only) |
 
 A notification has an `implementation`, non-secret `settings`, write-only `secrets`, and up to two
@@ -37,8 +38,9 @@ Responses list only `secrets_configured` names. On update an omitted secret is k
 it (not allowed for required secrets). Without the key, creating a notification that has secrets
 fails with 503; secretless implementations (for example Kodi without a password) still work.
 Errors, logs, the delivery journal and the test results never contain URLs, tokens or response bodies.
-Custom scripts are the one exception: up to 2 KiB of a script's own stdout/stderr is logged verbatim,
-so a script that prints a secret writes it to the process log.
+The one exception is custom-script output: a script's stdout (DEBUG) and stderr (WARN) are logged as the
+script wrote them, clipped to 2 KiB, so a script that echoes its arguments, environment or an event's
+content puts that in the process log. Scripts must not print secrets.
 
 ### Validation
 
@@ -61,7 +63,8 @@ notification has the matching trigger for that domain.
 | File delete | manual deletion of `episode_files` / `movie_files`, or retirement of a replaced original; reason `Manual` (an unfinished `file_deletions` journal: `admitted`, `copied` or `committed`; aborted and completed journals do not count), `Upgrade` (replacement retirement), `NoLinkedEpisodes`, else `MissingFromDisk` |
 | Health issue / restored | insert into `health_transitions` with `in_grace=0` (the 1024-row health ring is not an outbox, so the trigger copies what is needed) |
 | Manual interaction | `rss_candidates.status` becomes `needs_attention` |
-| Rename, Application update | accepted by `notifications::events::emit` and rendered, but **nothing emits them yet**: there is no rename executor or updater in the codebase |
+| Rename | a `rename_commands` row settling (`succeeded`, `failed` or `cancelled`) with `items_renamed > 0`; one event per series or movie listing the paths its `rename_events` rows renamed, cut to the 16 KiB event cap (`rename_events` stays the complete record). Items recovered after the command settled are not announced |
+| Application update | accepted by `notifications::events::emit` and rendered, but **nothing emits it yet**: there is no updater in the codebase |
 
 `notification_events` keeps the newest 2048 events. The worker (`notifications::start`, started by
 every server process) polls every 2 s: it fans events out to one
@@ -86,10 +89,10 @@ notify plus library update) records a 64-bit identity of each acknowledged reque
 so a retry sends only the requests that were not acknowledged. Requests can carry secrets, so the
 identity is an HMAC under a sub-key derived from the credential key: reading the database does not
 allow checking guessed secrets against it. Without a credential key no secret can be stored, and a
-plain digest is used. Rotating the key re-sends parts of a delivery still being retried, but it also
-strands the stored secrets: an envelope sealed under the old key can no longer be opened, so a
-secret-backed delivery fails permanently with `credentials_unavailable` until that notification's
-secrets are entered again. A request that timed out may still have
+plain digest is used. Rotating the key changes every identity, so a retrying delivery of a notification without secrets re-sends parts it
+had already acknowledged. Rotation also makes every stored secret unreadable: a notification with secrets fails
+permanently as `credentials_unavailable` (its pending deliveries are parked as `failed`) until its secrets are
+entered again, so rotate the key only together with re-entering them. A request that timed out may still have
 arrived, so this narrows duplicates rather than excluding them. Plex refreshes are not tracked: they
 follow a fresh section listing and repeating one is harmless.
 
@@ -165,7 +168,7 @@ community contract (`research/wiki/custom-scripts.md`):
 * **Add/Delete** (`SeriesAdd`, `SeriesDelete`, `MovieAdded`, `MovieDelete`): identity fields (+ path on delete/movie add).
 * **Health** (`HealthIssue`/`HealthRestored`): `<app>_health_issue_level|message|type|wiki` (or `restored`).
 * **ManualInteractionRequired**: identity plus release/client fields as for Grab.
-* **Rename / ApplicationUpdate**: variable sets are rendered but no emitter exists yet.
+* **Rename**: `*_episodefile_paths` / `*_moviefile_paths` and the `previous` variants, `|`-joined. **ApplicationUpdate**: rendered, but no emitter exists yet.
 * **Test**: only the three base variables.
 
 Not provided: quality, quality version, release group, scene name, indexer flags, custom format
@@ -185,7 +188,7 @@ only to events that change files; other events are skipped.
 ## Not claimed
 
 * No real third-party service was contacted; vendor wire formats are unverified against live APIs.
-* Rename and Application-update triggers are stored and renderable but never fired.
+* The Application-update trigger is stored and renderable but never fired.
 * Import-complete (TV batch) is stored but never fired.
 * Delivery is at-least-once, not exactly-once; there is no per-target ordering guarantee.
 * Event capture was exercised with fixture rows and the real trigger paths for series/movie

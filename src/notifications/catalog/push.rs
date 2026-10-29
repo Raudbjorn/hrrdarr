@@ -527,7 +527,7 @@ pub fn implementations() -> Vec<Implementation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::model::SettingValue;
+    use crate::notifications::{events::test_message, model::SettingValue};
     use std::collections::BTreeMap;
 
     #[test]
@@ -601,5 +601,42 @@ mod tests {
             .unwrap();
         assert!(!text.is_empty());
         assert!(text.len() < 1000);
+    }
+    fn join_url(text: &str, names: &str) -> String {
+        let settings = BTreeMap::from([(
+            "device_names".to_owned(),
+            SettingValue::Text(names.to_owned()),
+        )]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "k".repeat(32))]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let mut message = test_message(MediaDomain::Tv);
+        message.text = text.to_owned();
+        let mut requests = join(&config, &message).unwrap();
+        assert_eq!(requests.len(), 1);
+        requests.remove(0).url
+    }
+
+    /// The message is percent-encoded into the query, so a raw 1000-byte clip of 3-byte characters
+    /// would be a ~3 KB URL the transport rejects as a permanent failure.
+    #[test]
+    fn join_message_is_budgeted_against_the_encoded_url() {
+        let url = join_url(&"漢".repeat(400), "");
+        assert!(url.len() <= MAX_URL_BYTES, "{}", url.len());
+        let parsed = url::Url::parse(&url).unwrap();
+        let text = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "text")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(text.chars().count() > 100 && text.chars().all(|c| c == '漢'));
+        // Device names spend the same budget.
+        let names = ["Phone-漢"; 20].join(",");
+        assert!(join_url(&"漢".repeat(400), &names).len() <= MAX_URL_BYTES);
+        // Short ASCII is untouched.
+        assert!(join_url("hello", "").contains("text=hello"));
     }
 }

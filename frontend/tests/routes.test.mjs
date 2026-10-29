@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseHash,hashFor,VIEW_IDS,VIEW_PATHS,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS,MAX_DISPLAY_LENGTH,MAX_HASH_LENGTH} from '../src/lib/routes.ts';
 
-const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','notifications'];
+const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','collections','autotagging','notifications'];
 
 test('table covers exactly the existing views',()=>{
   assert.deepEqual([...VIEW_IDS].sort(),[...EXPECTED_VIEWS].sort());
@@ -28,6 +28,8 @@ test('wanted routes use the reference paths',()=>{
 test('calendar route uses the reference path',()=>{
   assert.deepEqual(parseHash('#/calendar'),{kind:'view',view:'calendar'});
   assert.deepEqual(parseHash('#/calendar/'),{kind:'view',view:'calendar'});
+  assert.deepEqual(parseHash('#/collections'),{kind:'view',view:'collections'});
+  assert.deepEqual(parseHash('#/settings/autotagging'),{kind:'view',view:'autotagging'});
   assert.equal(parseHash('#/calendar/month').kind,'not-found');
 });
 

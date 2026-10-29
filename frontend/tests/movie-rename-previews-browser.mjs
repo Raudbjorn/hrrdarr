@@ -41,8 +41,9 @@ try{
  const previewButton=panel.getByRole('button',{name:'Preview filenames',exact:true});await previewButton.focus();await previewButton.press('Enter');assert.equal((await initial).status(),200);
  await panel.getByText('movie.mkv',{exact:true}).waitFor();await panel.getByText(/Renaming is disabled/).waitFor();
  await panel.getByText('<original>.mkv',{exact:true}).waitFor();assert.equal(await panel.locator('original,img,script').count(),0);
- await panel.getByText('Preview only. Destination occupancy, symlinks, and execution safety are not checked.',{exact:true}).waitFor();
- assert.equal(await panel.getByRole('button',{name:/^(Rename|Apply|Execute)/}).count(),0);
+ // Reasoning: cmd.011 now exists, so the old 'no Rename control' assertion is stale. Rename controls exist but a preview never clicks them.
+ await panel.getByText(/The preview does not check destination occupancy or links\./).waitFor();
+ await panel.getByRole('button',{name:'Rename selected (1)',exact:true}).waitFor();await panel.getByRole('button',{name:'Rename all',exact:true}).waitFor();
  await detail.getByText('Library settings',{exact:true}).click();await detail.getByLabel('Minimum availability',{exact:true}).selectOption('announced');
  const configured=await configure(true,'{Movie Title}');assert.equal((await reload()).status(),200);await panel.getByText('Preview Film.mkv',{exact:true}).waitFor();
  await panel.getByText(`Naming revision ${configured.revision}. Paths are relative to this movie’s folder.`,{exact:true}).waitFor();

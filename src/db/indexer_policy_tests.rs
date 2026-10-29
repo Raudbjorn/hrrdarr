@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 63); // Reasoning: latest is 0063 (0063 notifications, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -146,11 +146,13 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         assert_eq!(&actual[..expected.len()], expected);
         assert_eq!(
             &actual[expected.len()..],
-            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column.
+            // Reasoning: 0048 appends three enabled flags; 0049 then appends the NULL download_client_id column;
+            // 0050 appends the NULL feed-only minimum_seeders column.
             &[
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
                 libsql::Value::Integer(1),
+                libsql::Value::Null,
                 libsql::Value::Null
             ]
         );
@@ -274,7 +276,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 63); // Reasoning: latest is 0063 (0063 notifications, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&fresh.connect().await?).await?, 75); // Reasoning: latest is migration file 0075 provider_scope_union at position 75, appended after 0074 downloadstation; historical prefixes stay fixed.
     assert_eq!(
         scalar(
             &fresh.connect().await?,

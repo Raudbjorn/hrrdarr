@@ -515,14 +515,18 @@ pub(crate) fn release(
         tv,
         release.metadata.size_bytes,
     );
-    if !release.metadata.languages.is_empty() {
-        let values: Option<Vec<_>> = release
-            .metadata
-            .languages
-            .iter()
-            .map(|s| language(s, tv))
-            .collect();
-        e.languages = values;
+    // Torznab keeps combined values such as "English,French"; unknown tokens are skipped
+    // so they cannot erase recognised indexer or title languages. Duplicates are kept so an
+    // oversized indexer list still fails the MAX_LANGUAGE_FACTS bound.
+    let values: Vec<_> = release
+        .metadata
+        .languages
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|s| language(s.trim(), tv))
+        .collect();
+    if !values.is_empty() {
+        e.languages = Some(values);
     }
     let f = &release.facts;
     let mut flags = 0i64;
@@ -1002,7 +1006,7 @@ mod tests {
                 let xml = format!(
                     r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>{title}</title><guid>owned-test</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>https://example.invalid/owned</link><torznab:attr name="downloadvolumefactor" value="{factor}"/></item></channel></rss>"#
                 );
-                let r = crate::providers::indexer::parse_page(
+                let mut r = crate::providers::indexer::parse_page(
                     &xml,
                     0,
                     100,
@@ -1018,6 +1022,23 @@ mod tests {
                 .remove(0);
                 let parsed = crate::search::parser::parse(title, tv).unwrap();
                 assert_eq!(release(&r, &parsed, tv).indexer_flags, Some(flag));
+                let english = language("English", tv).unwrap();
+                let french = language("French", tv).unwrap();
+                r.metadata.languages = vec!["English,French".into(), "Klingon".into()];
+                assert_eq!(
+                    release(&r, &parsed, tv).languages,
+                    Some(vec![english, french])
+                );
+                r.metadata.languages = vec!["Klingon".into()];
+                let titled = if tv {
+                    "Harbor.S01E01.French.1080p.WEB-DL"
+                } else {
+                    "Harbor.2020.French.1080p.WEB-DL"
+                };
+                r.metadata.title = Some(titled.into());
+                let titled_parse = crate::search::parser::parse(titled, tv).unwrap();
+                // An unrecognised indexer token must not erase title-parsed languages.
+                assert_eq!(release(&r, &titled_parse, tv).languages, Some(vec![french]));
             }
         }
     }

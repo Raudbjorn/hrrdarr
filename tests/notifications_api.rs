@@ -987,6 +987,21 @@ async fn health_import_and_manual_events_flow_end_to_end() {
             "POST",
             "/api/v1/notifications",
             hook(
+                "Movies health",
+                "movies-health",
+                json!({}),
+                json!({"on_health_issue":true,"include_health_warnings":true})
+            )
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        h.call(
+            "POST",
+            "/api/v1/notifications",
+            hook(
                 "Upgrades",
                 "upgrades",
                 json!({}),
@@ -1042,6 +1057,20 @@ async fn health_import_and_manual_events_flow_end_to_end() {
     );
     assert_eq!(hooks("errors")[0]["level"], "Error");
     assert_eq!(hooks("errors")[0]["message"], "Indexers unavailable");
+
+    // A system health event matches only the movie scope of this notification. Delivery must
+    // use the Radarr contract even though a TV scope exists with the trigger disabled.
+    h.clear();
+    h.sql("INSERT INTO health_transitions(event_id,epoch,command_id,command_attempt,scope,check_key,kind,in_grace,created_at,severity,reason,message,wiki_url,compatibility_type) VALUES('00000000-0000-4000-8000-000000000005','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000105',1,'system','system_check','issue',0,101,3,'r','System unavailable','https://wiki.invalid/system','SystemCheck');").await;
+    h.pump().await;
+    let movies_health = h
+        .seen()
+        .iter()
+        .filter(|c| c.target == "/movies-health")
+        .map(|c| c.json())
+        .collect::<Vec<_>>();
+    assert_eq!(movies_health.len(), 1);
+    assert_eq!(movies_health[0]["mediaType"], "movies");
 
     // A movie import receipt produces a Download event; a plain import does not reach OnUpgrade-only targets
     // beyond the ones that opted in.
@@ -1521,6 +1550,100 @@ async fn file_delete_reason_ignores_aborted_deletion_journals() {
         .map(|c| c.json()["deleteReason"].as_str().unwrap_or("").to_owned())
         .collect();
     assert_eq!(reasons, ["MissingFromDisk", "Manual"]);
+}
+
+/// A rename commits to its own outbox; settling the command bridges it into the notification
+/// outbox as one event per series or movie, with the renamed paths bounded to the event cap.
+#[tokio::test]
+async fn settled_renames_notify_once_per_owner_with_bounded_paths() {
+    let h = harness().await;
+    let base = h.fake_base.clone();
+    let (code, n) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Renames",
+                "webhook",
+                json!({"url":format!("{base}/renames")}),
+                json!({}),
+                both(json!({"on_rename":true}), json!({"on_rename":true})),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201, "{n}");
+    let cmd = "00000000-0000-4000-8000-0000000000c1";
+    let event = |n: u32, owner: &str, old: &str, new: &str| {
+        format!(
+            "INSERT INTO rename_events(id,kind,media_type,series_id,movie_id,command_id,old_path,new_path) VALUES('00000000-0000-4000-8000-0000000001{n:02}','file','tv',{owner},NULL,'{cmd}','{old}','{new}');"
+        )
+    };
+    h.sql(&format!(
+        "INSERT INTO series(id,title,year,path)VALUES(1,'Show',2020,'/tv/show'),(2,'Other',2021,'/tv/other');\
+         INSERT INTO rename_commands(id,name,media_type,status,attempts,next_attempt_at,created_at) VALUES('{cmd}','rename_files','tv','queued',0,0,1);\
+         UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id='{cmd}';"
+    ))
+    .await;
+    h.sql(&event(1, "1", "/tv/show/a.mkv", "/tv/show/A.mkv"))
+        .await;
+    h.sql(&event(2, "1", "/tv/show/b.mkv", "/tv/show/B.mkv"))
+        .await;
+    h.sql(&event(3, "2", "/tv/other/c.mkv", "/tv/other/C.mkv"))
+        .await;
+    // Nothing is announced while the command is still running.
+    assert_eq!(
+        h.count("SELECT count(*) FROM notification_events WHERE kind='rename'")
+            .await,
+        0
+    );
+    h.sql(&format!(
+        "UPDATE rename_commands SET status='succeeded',completed_at=2,items_renamed=3 WHERE id='{cmd}';"
+    ))
+    .await;
+    h.pump().await;
+    let hits: Vec<_> = h
+        .seen()
+        .iter()
+        .filter(|c| c.target == "/renames")
+        .map(|c| c.json())
+        .collect();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    let show = hits.iter().find(|j| j["series"]["id"] == 1).unwrap();
+    assert_eq!(show["eventType"], "Rename");
+    assert_eq!(
+        show["renamedEpisodeFiles"],
+        json!([
+            {"path":"/tv/show/A.mkv","previousPath":"/tv/show/a.mkv"},
+            {"path":"/tv/show/B.mkv","previousPath":"/tv/show/b.mkv"}
+        ])
+    );
+
+    // A movie command bridges the same way, and a huge path set is cut to fit the 16 KiB event
+    // cap instead of aborting the statement that settles the command.
+    let mcmd = "00000000-0000-4000-8000-0000000000c2";
+    h.sql(&format!(
+        "INSERT INTO movie_metadata(id,tmdb_id,title,year)VALUES(1,300,'Film',2001);INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies/film');\
+         INSERT INTO rename_commands(id,name,media_type,status,attempts,next_attempt_at,created_at) VALUES('{mcmd}','rename_movie','movies','queued',0,0,1);\
+         UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id='{mcmd}';"
+    ))
+    .await;
+    let long = "x".repeat(900);
+    for n in 0..40u32 {
+        h.sql(&format!(
+            "INSERT INTO rename_events(id,kind,media_type,series_id,movie_id,command_id,old_path,new_path) VALUES('00000000-0000-4000-8000-0000000002{n:02}','file','movies',NULL,1,'{mcmd}','/movies/film/{long}{n}.mkv','/movies/film/{n}.mkv');"
+        ))
+        .await;
+    }
+    h.sql(&format!(
+        "UPDATE rename_commands SET status='succeeded',completed_at=2,items_renamed=40 WHERE id='{mcmd}';"
+    ))
+    .await;
+    let (kept, bytes) = (
+        h.count("SELECT json_array_length(json_extract(payload_json,'$.paths')) FROM notification_events WHERE kind='rename' AND scope='movies'").await,
+        h.count("SELECT length(CAST(payload_json AS BLOB)) FROM notification_events WHERE kind='rename' AND scope='movies'").await,
+    );
+    assert!((1..40).contains(&kept), "kept {kept} of 40");
+    assert!(bytes <= 16384, "{bytes}");
 }
 
 /// Secret webhook URLs get the URL and host policy when they are written, not as a permanent

@@ -280,29 +280,41 @@ pub(crate) fn compare(
     if !profile.upgrade_allowed {
         result.reasons.push("upgrades_disabled");
     }
-    match quality_order {
-        Ordering::Less => result.reasons.push("not_quality_upgrade"),
-        Ordering::Greater => {
-            if profile.cutoff_rank.is_some_and(|rank| current.rank >= rank) {
-                result.reasons.push("cutoff_met");
-            }
-        }
-        Ordering::Equal => {
-            let prefer = context.mode != Mode::DoNotPrefer;
-            if prefer && revision_order.is_none() {
-                result.reasons.push("revision_unknown");
-            }
-            if prefer && revision_order == Some(Ordering::Less) {
-                result.reasons.push("not_revision_upgrade");
-            }
-            if !(prefer && exact_revision_upgrade) {
-                if current.score >= profile.cutoff_score {
+    // Sonarr/Radarr UpgradeDiskSpecification run CutoffNotMet before IsUpgradable: a file at
+    // the quality cutoff and format cutoff, not facing a same-quality revision upgrade, is
+    // rejected as cutoff met, whatever the candidate's score or quality.
+    let cutoff_met = profile.cutoff_rank.is_some_and(|rank| current.rank >= rank)
+        && !exact_revision_upgrade
+        && current.score >= profile.cutoff_score;
+    if cutoff_met {
+        result.reasons.push("cutoff_met");
+    } else {
+        match quality_order {
+            Ordering::Less => result.reasons.push("not_quality_upgrade"),
+            Ordering::Greater => {
+                if profile.cutoff_rank.is_some_and(|rank| current.rank >= rank) {
                     result.reasons.push("cutoff_met");
-                } else if candidate.score <= current.score {
-                    result.reasons.push("custom_format_not_upgrade");
-                } else if candidate.score.saturating_sub(current.score) < profile.minimum_increment
-                {
-                    result.reasons.push("custom_format_upgrade_increment");
+                }
+            }
+            Ordering::Equal => {
+                let prefer = context.mode != Mode::DoNotPrefer;
+                if prefer && revision_order.is_none() {
+                    result.reasons.push("revision_unknown");
+                }
+                if prefer && revision_order == Some(Ordering::Less) {
+                    result.reasons.push("not_revision_upgrade");
+                }
+                if !(prefer && exact_revision_upgrade) {
+                    // A non-improving score is reported before the format cutoff, as in Radarr.
+                    if candidate.score <= current.score {
+                        result.reasons.push("custom_format_not_upgrade");
+                    } else if current.score >= profile.cutoff_score {
+                        result.reasons.push("cutoff_met");
+                    } else if candidate.score.saturating_sub(current.score)
+                        < profile.minimum_increment
+                    {
+                        result.reasons.push("custom_format_upgrade_increment");
+                    }
                 }
             }
         }
@@ -530,15 +542,75 @@ mod tests {
                 .contains(&"anime_revision_group_mismatch")
         );
         context.mode = Mode::DoNotPrefer;
+        // Candidate 0 <= current 100 is not an upgrade regardless of the format cutoff (also met);
+        // Radarr reports the score rejection first, so cutoff_met no longer masks it.
+        assert_eq!(
+            compare(&candidate, &current, &policy, &context).reasons,
+            vec!["custom_format_not_upgrade"]
+        );
+        candidate.score = 101;
         assert_eq!(
             compare(&candidate, &current, &policy, &context).reasons,
             vec!["cutoff_met"]
         );
+        candidate.score = 0;
         policy.upgrade_allowed = false;
         assert!(
             compare(&candidate, &current, &policy, &context)
                 .reasons
                 .contains(&"upgrades_disabled")
+        );
+    }
+    #[test]
+    fn disk_cutoff_gate_precedes_upgrade_reasons() {
+        let v1 = revision(1, 0, false);
+        let current = Facts {
+            quality_id: 3,
+            rank: 1,
+            revision: Some(&v1),
+            score: 0,
+            group: None,
+            date_added: None,
+        };
+        let mut candidate = Facts {
+            quality_id: 3,
+            rank: 1,
+            revision: Some(&v1),
+            score: 0,
+            group: None,
+            date_added: None,
+        };
+        let context = Context {
+            mode: Mode::PreferAndUpgrade,
+            search: SearchContext::UserSearch,
+            anime: false,
+            queued: false,
+            clock: EvaluationClock {
+                proper_cutoff_utc: 0,
+            },
+        };
+        let mut policy = Profile {
+            upgrade_allowed: true,
+            cutoff_rank: Some(1),
+            cutoff_score: 0,
+            minimum_increment: 1,
+        };
+        // Upstream CutoffNotMet runs first, so the score/revision reasons are not reached.
+        assert_eq!(
+            compare(&candidate, &current, &policy, &context).reasons,
+            vec!["cutoff_met"]
+        );
+        candidate.rank = 0;
+        assert_eq!(
+            compare(&candidate, &current, &policy, &context).reasons,
+            vec!["cutoff_met"]
+        );
+        // Below the format cutoff the gate is open and IsUpgradable order applies.
+        candidate.rank = 1;
+        policy.cutoff_score = 10;
+        assert_eq!(
+            compare(&candidate, &current, &policy, &context).reasons,
+            vec!["custom_format_not_upgrade"]
         );
     }
     #[test]

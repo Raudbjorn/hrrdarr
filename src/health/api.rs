@@ -57,6 +57,29 @@ pub enum HealthEvaluation {
     Stale,
     Failed,
 }
+/// Queued work outranks a recorded error: `last_error` stays exposed, but `Failed`
+/// means nothing is queued to replace it (stale inputs, retries and cancels keep reasons).
+fn evaluation(
+    running: bool,
+    failed: bool,
+    reasons: i64,
+    observed: bool,
+    current: bool,
+) -> HealthEvaluation {
+    if running {
+        HealthEvaluation::Running
+    } else if reasons != 0 {
+        HealthEvaluation::Pending
+    } else if failed {
+        HealthEvaluation::Failed
+    } else if !observed {
+        HealthEvaluation::NeverRun
+    } else if current {
+        HealthEvaluation::Current
+    } else {
+        HealthEvaluation::Stale
+    }
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct HealthCheckState {
     pub identity: HealthIdentity,
@@ -231,19 +254,13 @@ async fn snapshot_at(c: &Connection, q: Page) -> Result<Json<HealthSnapshot>> {
             observed_generation,
             checked_at: r.get(6)?,
             observed_epoch,
-            evaluation: if running {
-                HealthEvaluation::Running
-            } else if error.is_some() {
-                HealthEvaluation::Failed
-            } else if reasons != 0 {
-                HealthEvaluation::Pending
-            } else if severity.is_none() {
-                HealthEvaluation::NeverRun
-            } else if current {
-                HealthEvaluation::Current
-            } else {
-                HealthEvaluation::Stale
-            },
+            evaluation: evaluation(
+                running,
+                error.is_some(),
+                reasons,
+                severity.is_some(),
+                current,
+            ),
             last_error: error,
             pending_reasons: reasons,
             due_at: r.get(10)?,
@@ -340,4 +357,27 @@ async fn transitions(
         .await?;
     let outcome=async{let r=tx.query("SELECT min(sequence),max(sequence) FROM health_transitions",()).await?.next().await?.ok_or_else(invariant)?;let oldest=r.get::<Option<i64>>(0)?;let latest=r.get::<Option<i64>>(1)?;let mut rows=tx.query("SELECT sequence,event_id,epoch,command_id,kind,in_grace,created_at,scope,check_key,severity,reason,message,wiki_url,compatibility_type FROM health_transitions WHERE sequence>? ORDER BY sequence LIMIT ?",params![q.after_sequence,i64::from(q.limit)]).await?;let mut items=Vec::new();while let Some(r)=rows.next().await?{items.push(HealthTransition{sequence:r.get(0)?,event_id:uuid(r.get(1)?)?,epoch:uuid(r.get(2)?)?,command_id:uuid(r.get(3)?)?,kind:r.get(4)?,in_grace:r.get::<i64>(5)?==1,created_at:r.get(6)?,issue:HealthIssue{identity:HealthIdentity{scope:HealthScope::parse(&r.get::<String>(7)?)?,check_key:r.get(8)?},severity:HealthSeverity::parse(r.get(9)?)?,reason:r.get(10)?,message:r.get(11)?,wiki_url:r.get(12)?,compatibility_type:r.get(13)?}})}bounded(HealthTransitions{oldest_retained_sequence:oldest,latest_sequence:latest,next_cursor:items.last().map_or(q.after_sequence,|v|v.sequence),gap:oldest.is_some_and(|v|q.after_sequence<v-1),items})}.await;
     finish(tx, outcome).await
+}
+
+#[cfg(test)]
+mod evaluation_tests {
+    use super::{HealthEvaluation as E, evaluation};
+    #[test]
+    fn queued_recheck_is_pending_even_after_a_failed_attempt() {
+        assert!(matches!(
+            evaluation(false, true, 1, true, false),
+            E::Pending
+        ));
+        assert!(matches!(evaluation(false, true, 0, true, false), E::Failed));
+        assert!(matches!(evaluation(true, true, 1, true, false), E::Running));
+        assert!(matches!(
+            evaluation(false, false, 0, false, false),
+            E::NeverRun
+        ));
+        assert!(matches!(
+            evaluation(false, false, 0, true, true),
+            E::Current
+        ));
+        assert!(matches!(evaluation(false, false, 0, true, false), E::Stale));
+    }
 }

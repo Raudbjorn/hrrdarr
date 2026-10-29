@@ -1,0 +1,83 @@
+#!/bin/bash
+# Hermetic tests for gh-resolve's REST backend: a fake `gh` on PATH serves
+# fixtures shaped like the REST and /ccr/ responses observed on 2026-10-18,
+# so mutations and multi-comment threads are covered without touching GitHub.
+set -euo pipefail
+
+SCRIPT="$(cd "$(dirname "$0")" && pwd)/gh-resolve"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+mkdir "$WORK/bin"
+export FAKE_STATE="$WORK/state"
+echo false > "$FAKE_STATE"
+
+cat > "$WORK/bin/gh" << 'FAKE'
+#!/bin/bash
+args="$*"
+case "$args" in
+    "auth status"*) exit 0 ;;
+    "api rate_limit"*) exit 0 ;;
+    *graphql*) echo 'gh: GitHub GraphQL is not available from Claude Code sessions; use the REST API (HTTP 403)'; exit 1 ;;
+    *"/ccr/comments/101/resolve") [ -f "$FAKE_STATE.sticky" ] || echo true > "$FAKE_STATE"; echo '{}' ;;
+    *"/ccr/comments/101/unresolve") echo false > "$FAKE_STATE"; echo '{}' ;;
+    *"/comments/101/replies"*)
+        printf '%s' "${args##*body=}" > "$FAKE_STATE.body"
+        echo '{"id":103,"html_url":"https://github.com/o/r/pull/7#discussion_r103","created_at":"2026-10-18T02:00:00Z","user":{"login":"me"}}' ;;
+    *"/ccr/review_threads")
+        echo "[{\"resolved\":$(cat "$FAKE_STATE"),\"outdated\":false,\"path\":\"a.rs\",\"line\":12,\"comment_ids\":[102,101]},
+              {\"resolved\":false,\"outdated\":true,\"path\":\"b.rs\",\"line\":null,\"comment_ids\":[201]}]" ;;
+    # Two pages, as gh --paginate emits them: concatenated JSON arrays
+    *"/pulls/7/comments?per_page=100")
+        echo '[{"id":102,"in_reply_to_id":101,"user":{"login":"bot"},"body":"Fix:\n```suggestion\nlet x = 2;\n```","created_at":"2026-10-18T01:00:00Z","html_url":"u102","diff_hunk":"@@ h","start_line":null,"side":"RIGHT"}]'
+        echo '[{"id":101,"in_reply_to_id":null,"user":{"login":"alice"},"body":"Off by one","created_at":"2026-10-18T00:00:00Z","html_url":"u101","diff_hunk":"@@ h","start_line":10,"side":"RIGHT"},
+               {"id":201,"in_reply_to_id":null,"user":{"login":"bob"},"body":"stale","created_at":"2026-10-17T00:00:00Z","html_url":"u201","diff_hunk":"@@ g","start_line":null,"side":"LEFT"}]' ;;
+    *"/pulls/7") echo '{"number":7,"title":"T","html_url":"https://github.com/o/r/pull/7","head":{"sha":"abc123","ref":"feat"}}' ;;
+    *"/check-runs"*)
+        echo '{"total_count":3,"check_runs":[
+            {"name":"test","status":"completed","conclusion":"failure","details_url":"d1","app":{"name":"GitHub Actions","slug":"github-actions"}},
+            {"name":"lint","status":"in_progress","conclusion":null,"details_url":"d2","app":{"name":"GitHub Actions","slug":"github-actions"}},
+            {"name":"fmt","status":"completed","conclusion":"success","details_url":"d3","app":{"name":"GitHub Actions","slug":"github-actions"}}]}' ;;
+    *"/status"*) echo '{"state":"success","total_count":1,"statuses":[{"context":"ci/x","state":"success","description":"ok","target_url":"t","creator":{"login":"x"}}]}' ;;
+    *) echo "fake gh: unhandled: $args" >&2; exit 99 ;;
+esac
+FAKE
+chmod +x "$WORK/bin/gh"
+
+export PATH="$WORK/bin:$PATH" GH_RESOLVE_BACKEND=rest
+run() { "$SCRIPT" -r o/r "$@"; }
+pass=0 fail=0
+check() {  # <name> <expected> <actual>
+    if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $1: want [$2] got [$3]"; fi
+}
+
+# Root comment (no in_reply_to_id) names the thread even though /ccr/ lists
+# the reply's ID first; comments sort chronologically across pages.
+t=$(run -j -f 7 | jq -c '.threads[0] | [.id, .startLine, [.comments[].author]]')
+check "thread id/order" '["RT_7_101",10,["alice","bot"]]' "$t"
+check "outdated null line" '[true,null]' "$(run -j 7 | jq -c '.threads[1] | [.isOutdated, .line]')"
+check "suggestion from reply" '"let x = 2;"' "$(run suggestions -j 7 | jq -c '.suggestions[0].suggestion')"
+# The outdated thread's LEFT side survives the mapping
+check "diffSide" '"LEFT"' "$(run agent -j 7 | jq -c '.threads[1].diffSide')"
+
+# One failure outranks one pending; REST lowercase enums become uppercase
+c=$(run checks -j 7 | jq -c '[.rollupState, .contextsTotal, .summary.failed, .summary.pending, .summary.passed]')
+check "checks rollup" '["FAILURE",4,1,1,2]' "$c"
+
+check "resolve exit" 0 "$(run resolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+check "resolve state" true "$(cat "$FAKE_STATE")"
+check "unresolve exit" 0 "$(run unresolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+# A 2xx whose effect is not visible on re-read must count as failure
+touch "$FAKE_STATE.sticky"
+check "sticky resolve fails" 1 "$(run resolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+rm "$FAKE_STATE.sticky"
+
+# -f keeps a numeric-looking body a string (the GraphQL path's -F pitfall)
+run reply RT_7_101 -m 42 -q >/dev/null 2>&1
+check "reply body" 42 "$(cat "$FAKE_STATE.body")"
+
+check "graphql blocked hint" 1 \
+    "$(GH_RESOLVE_BACKEND=graphql run 7 2>&1 | grep -c 'GH_RESOLVE_BACKEND=rest' || true)"
+check "bad backend" 1 "$(GH_RESOLVE_BACKEND=bogus run 7 >/dev/null 2>&1; echo $?)"
+
+echo "gh-resolve REST backend: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

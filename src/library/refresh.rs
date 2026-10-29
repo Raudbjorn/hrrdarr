@@ -83,11 +83,11 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
     {
         return Err(Error::TargetChanged);
     }
-    match (captured.target, details) {
+    let changed = match (captured.target, details) {
         (Target::Tv { series_id }, Details::Series(details))
             if details.tvdb_id == captured.external_id =>
         {
-            series(c, series_id, details).await
+            series(c, series_id, details).await?
         }
         (Target::Movies { .. }, Details::Movie(details))
             if details.tmdb_id == captured.external_id =>
@@ -97,10 +97,25 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
                 captured.metadata_id.ok_or(Error::TargetChanged)?,
                 details,
             )
-            .await
+            .await?
         }
-        _ => Err(Error::TargetChanged),
-    }
+        _ => return Err(Error::TargetChanged),
+    };
+    // Refreshed facts may newly satisfy (or stop satisfying) AutoTagging rules; same transaction.
+    let (domain, id) = match captured.target {
+        Target::Tv { series_id } => (crate::api::MediaDomain::Tv, series_id),
+        Target::Movies { movie_id } => (crate::api::MediaDomain::Movies, movie_id),
+    };
+    crate::autotagging::apply_item(c, domain, id)
+        .await
+        .map_err(|e| {
+            if e.0 == axum::http::StatusCode::INTERNAL_SERVER_ERROR {
+                Error::Storage
+            } else {
+                Error::Conflict
+            }
+        })?;
+    Ok(changed)
 }
 async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
     let detail = detail.validated().map_err(|_| Error::Conflict)?;
@@ -190,6 +205,7 @@ pub(crate) async fn movie_facts(
     } else {
         None
     };
+    let collection_changed = crate::collections::associate(c, id, &detail.collection).await?;
     let credits_changed = match &detail.credits {
         Some(credits) => credits_replace(c, id, credits, replace).await?,
         None => false,
@@ -212,7 +228,7 @@ pub(crate) async fn movie_facts(
             .await?;
         }
     }
-    Ok(changed || aliases_changed || credits_changed)
+    Ok(changed || aliases_changed || credits_changed || collection_changed)
 }
 
 type CreditRow = (
