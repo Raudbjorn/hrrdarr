@@ -352,11 +352,11 @@ pub(super) async fn write(conn: &Connection, events: &[Event], report: &mut Repo
                 .next()
                 .await?
                 .is_none()
-            {
-                issue(&mut report.unsupported, "Quality.unsupported");
-                quality = None;
-                revision = None;
-            }
+        {
+            issue(&mut report.unsupported, "Quality.unsupported");
+            quality = None;
+            revision = None;
+        }
         let values: Vec<Value> = vec![
             Value::Text(if tv { "episode" } else { "movie" }.into()),
             if tv { target.into() } else { Value::Null },

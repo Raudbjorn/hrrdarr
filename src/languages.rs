@@ -123,14 +123,14 @@ pub fn iso_language_id(media: MediaDomain, code: &str) -> Option<i32> {
     }
     if let Some(region) = region
         && matches!(code, "fr" | "de" | "pt" | "zh" | "th")
-            && region
-                != match code {
-                    "zh" => "cn",
-                    other => other,
-                }
-        {
-            return None;
-        }
+        && region
+            != match code {
+                "zh" => "cn",
+                other => other,
+            }
+    {
+        return None;
+    }
     let name = match code {
         "en" | "eng" => Some("English"),
         "fr" | "fra" | "fre" => Some("French"),

@@ -193,9 +193,10 @@ impl Inventory {
                         return Err(limit());
                     }
                     if let Some((parent, _)) = entry.relative_path.rsplit_once('/')
-                        && parents.get(parent) != Some(&Kind::Directory) {
-                            return Err(invalid());
-                        }
+                        && parents.get(parent) != Some(&Kind::Directory)
+                    {
+                        return Err(invalid());
+                    }
                 }
                 previous = Some(entry.relative_path.clone());
                 parents.insert(entry.relative_path.clone(), entry.kind);

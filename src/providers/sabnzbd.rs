@@ -229,10 +229,9 @@ impl<'o, 'a> Api<'o, 'a> {
         let mut query = vec![("mode".to_owned(), mode.to_owned())];
         query.extend(parameters.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
         query.push(("output".into(), "json".into()));
-        if authenticated
-            && let Some(key) = self.key {
-                query.push(("apikey".into(), key.to_owned()));
-            }
+        if authenticated && let Some(key) = self.key {
+            query.push(("apikey".into(), key.to_owned()));
+        }
         let response = self
             .operation
             .request(&self.url, &query, &[], HttpRequestBody::Empty)
@@ -242,7 +241,10 @@ impl<'o, 'a> Api<'o, 'a> {
         }
         let text = std::str::from_utf8(&response.body).map_err(|_| QbitError::InvalidResponse)?;
         let trimmed = text.trim();
-        if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("error:") {
+        // The prefix is compared as bytes: a byte count is not a character boundary, and the
+        // matched ASCII prefix makes the remainder safe to slice.
+        if trimmed.as_bytes().len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"error:")
+        {
             return Err(classify_error(&trimmed[6..]));
         }
         let value: Value = serde_json::from_str(trimmed).map_err(|_| QbitError::InvalidResponse)?;

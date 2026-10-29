@@ -463,9 +463,10 @@ pub(crate) fn parsed(
     for token in tokens {
         if token.len() > 2
             && let Some(id) = language(token, tv)
-                && !languages.contains(&id) {
-                    languages.push(id);
-                }
+            && !languages.contains(&id)
+        {
+            languages.push(id);
+        }
     }
     Evidence {
         version: 1,

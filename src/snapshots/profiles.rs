@@ -452,13 +452,13 @@ pub(super) async fn prepare(
             assignments.push((*owner, *id));
             if !old
                 && let Some(index) = settings_indices.get(owner)
-                    && let Some((_, field)) = entities[*index]
-                        .fields
-                        .iter_mut()
-                        .find(|(name, _)| *name == "quality_profile_id")
-                    {
-                        *field = Field::Value((*id).into());
-                    }
+                && let Some((_, field)) = entities[*index]
+                    .fields
+                    .iter_mut()
+                    .find(|(name, _)| *name == "quality_profile_id")
+            {
+                *field = Field::Value((*id).into());
+            }
         } else if profiles
             .profiles
             .get(source_profile)

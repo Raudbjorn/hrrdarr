@@ -1023,12 +1023,13 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
             error.boundary(PathBoundary::Precommit)
         });
     if outcome.is_err()
-        && let Err(error) = owned::restore_uncommitted(&db, opid, lease).await {
-            eprintln!(
-                "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
-                opid, error.code, error.diagnostic
-            );
-        }
+        && let Err(error) = owned::restore_uncommitted(&db, opid, lease).await
+    {
+        eprintln!(
+            "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
+            opid, error.code, error.diagnostic
+        );
+    }
     outcome
 }
 async fn arm(db: &Database, opid: &str) -> Result<Record> {

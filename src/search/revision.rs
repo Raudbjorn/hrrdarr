@@ -76,9 +76,10 @@ pub(crate) fn reconcile(
         file.validate()?;
     }
     if let (Some(release), Some(file)) = (release, file.as_ref())
-        && release.value != file.value {
-            return Err("revision_evidence_conflict");
-        }
+        && release.value != file.value
+    {
+        return Err("revision_evidence_conflict");
+    }
     let effective = file
         .as_ref()
         .or(release)

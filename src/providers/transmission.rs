@@ -449,9 +449,10 @@ struct Owner {
 impl Owner {
     fn owns(&self, directory: &str, labels: &[String]) -> bool {
         if let (Some(label), true) = (&self.label, self.labels_supported)
-            && !labels.is_empty() {
-                return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
-            }
+            && !labels.is_empty()
+        {
+            return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
+        }
         within(directory, &self.directory)
     }
 }
@@ -496,12 +497,13 @@ impl Owners {
         let tv = tv.as_ref().map(|s| owner(s, session)).transpose()?;
         let movies = movies.as_ref().map(|s| owner(s, session)).transpose()?;
         if let (Some(a), Some(b)) = (&tv, &movies)
-            && (within(&a.directory, &b.directory) || within(&b.directory, &a.directory)) {
-                return Err(TransmissionTestFailure {
-                    error: QbitError::ScopeConflict,
-                    problem: Some(TransmissionProblem::DomainsOverlap),
-                });
-            }
+            && (within(&a.directory, &b.directory) || within(&b.directory, &a.directory))
+        {
+            return Err(TransmissionTestFailure {
+                error: QbitError::ScopeConflict,
+                problem: Some(TransmissionProblem::DomainsOverlap),
+            });
+        }
         Ok(Self { tv, movies })
     }
     fn plain(settings: &ProviderSettings, session: &Session) -> Result<Self> {
@@ -1064,9 +1066,10 @@ async fn submit_inner(
         return Err(QbitError::Rejected);
     };
     if let Some(returned) = returned
-        && torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash {
-            return Err(QbitError::MutationUnknown);
-        }
+        && torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash
+    {
+        return Err(QbitError::MutationUnknown);
+    }
     if duplicate {
         // Someone else added it between the lookup and add: never mutate a torrent this call
         // did not create. It is ours only if it sits in this domain.
@@ -1341,6 +1344,20 @@ pub async fn control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), expected);
+        }
+    }
     #[test]
     fn containment_is_segment_wise_and_rooted() {
         assert!(within("/data/tv", "/data/tv"));

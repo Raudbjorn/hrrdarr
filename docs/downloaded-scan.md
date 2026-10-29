@@ -62,8 +62,9 @@ returning a truncated page. The generated TypeScript contract is
   tracked scan copies, because the client's move capability is unknown and unknown capability
   never implies a move. Explicit `move`/`copy` stay explicit.
 - `priority` is `normal|high`.
-- `tracked` is optional. The provider must exist and be scoped to the route's domain (`409
-  downloaded_scan_provider_unknown`).
+- `tracked` is optional. The provider must exist, be a download client and be scoped to the
+  route's domain (`409 downloaded_scan_provider_unknown` for an unknown or unscoped provider,
+  `409 downloaded_scan_provider_not_client` for an indexer).
 - `supersedes_command_id` is optional and names the settled scan this request explicitly
   continues; see [Explicit successor](#explicit-successor-scan-remaining-files). A malformed
   value is `400`.

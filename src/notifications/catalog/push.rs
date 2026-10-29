@@ -1,11 +1,11 @@
 //! Chat and push-message providers. Each builder is a pure function from settings and a message
 //! to requests, so the protocol is unit-testable without any I/O.
-use super::{clip, Build, Config, Implementation, BOTH};
+use super::{BOTH, Build, Config, Implementation, clip};
 use crate::api::MediaDomain;
 use crate::notifications::{
     events::{EventKind, Message},
     model::{Field, ImplementationKind},
-    transport::{basic_auth, Outgoing, MAX_URL_BYTES},
+    transport::{MAX_URL_BYTES, Outgoing, basic_auth},
 };
 use serde_json::json;
 
@@ -157,11 +157,10 @@ fn gotify(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
         "priority": c.int("priority").unwrap_or(5),
         "extras": {"client::display": {"contentType": "text/plain"}},
     });
-    Ok(vec![Outgoing::post_json(
-        join_path(c.text("server_url"), "message"),
-        body,
-    )
-    .header("X-Gotify-Key", c.text("app_token"))])
+    Ok(vec![
+        Outgoing::post_json(join_path(c.text("server_url"), "message"), body)
+            .header("X-Gotify-Key", c.text("app_token")),
+    ])
 }
 
 fn pushover(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
@@ -308,11 +307,13 @@ fn pushcut(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
     url.path_segments_mut()
         .map_err(|_| "invalid_url")?
         .push(c.text("notification_name"));
-    Ok(vec![Outgoing::post_json(
-        String::from(url),
-        json!({"title":clip(&m.title,250),"text":clip(&m.text,1000)}),
-    )
-    .header("API-Key", c.text("api_key"))])
+    Ok(vec![
+        Outgoing::post_json(
+            String::from(url),
+            json!({"title":clip(&m.title,250),"text":clip(&m.text,1000)}),
+        )
+        .header("API-Key", c.text("api_key")),
+    ])
 }
 
 fn priority_options() -> [&'static str; 5] {

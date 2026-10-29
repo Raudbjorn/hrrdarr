@@ -989,9 +989,10 @@ impl ProviderSettings {
                     }
                 }
                 if let (Some(tv), Some(movies)) = (tv, movies)
-                    && tv.category.to_lowercase() == movies.category.to_lowercase() {
-                        return Err(bad());
-                    }
+                    && tv.category.to_lowercase() == movies.category.to_lowercase()
+                {
+                    return Err(bad());
+                }
             }
             Self::Nzbget { tv, movies, .. } => {
                 if tv.is_none() && movies.is_none() {
@@ -2487,9 +2488,10 @@ fn validate(input: &ProviderInput) -> Result<()> {
     }
     input.settings.validate()?;
     if let Change::Value(c) = &input.credentials
-        && !c.valid(input.settings.implementation()) {
-            return Err(bad());
-        }
+        && !c.valid(input.settings.implementation())
+    {
+        return Err(bad());
+    }
     Ok(())
 }
 fn stored_bool(value: i64) -> Result<bool> {

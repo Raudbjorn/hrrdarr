@@ -377,9 +377,10 @@ pub(crate) async fn evaluate_with_pending(
             .next()
             .await?;
         if let Some(policy) = availability
-            && !available(&candidate, now, policy.get(0)?) {
-                result.deny("movie_unavailable");
-            }
+            && !available(&candidate, now, policy.get(0)?)
+        {
+            result.deny("movie_unavailable");
+        }
     }
     super::delay::apply(
         &delay,

@@ -1535,9 +1535,10 @@ async fn process_candidate(
         Err(error) => {
             if error.local_storage_failure {
                 if let Some(identity) = error.identity.as_ref()
-                    && !retain_prepared_identity(&c, client, &p, identity, operation).await? {
-                        return Ok(());
-                    }
+                    && !retain_prepared_identity(&c, client, &p, identity, operation).await?
+                {
+                    return Ok(());
+                }
                 return Err(Error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "command_storage_error",

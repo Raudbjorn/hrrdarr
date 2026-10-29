@@ -1169,9 +1169,9 @@ async fn create_record(
                     .next()
                     .await?
                     .is_some()
-                    {
-                        return Err(conflict());
-                    }
+                {
+                    return Err(conflict());
+                }
                 c.execute(
                     "INSERT INTO movie_metadata(tmdb_id,imdb_id,title,year)VALUES(?,?,?,?)",
                     params![tmdb, req.imdb_id.clone(), title, req.year],

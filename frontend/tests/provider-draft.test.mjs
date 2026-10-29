@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
+import {clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,mergeProviderPages,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
+test('provider selections survive loading another page',()=>{
+ const first={id:'indexer',revision:1,name:'Indexer',enabled:true,priority:1,has_credentials:true,settings:{implementation:'torznab',endpoint:'http://x',tv:{enable_automatic_search:true},movies:null}};
+ const second={id:'client',revision:1,name:'Client',enabled:true,priority:1,has_credentials:true,settings:{implementation:'qbittorrent',endpoint:'http://x',tv:{category:'tv'},movies:null}};
+ const known=mergeProviderPages([], [first]);
+ const after=mergeProviderPages(known, [second]);
+ assert.deepEqual(after.map(provider=>provider.id),['indexer','client']);
+ assert.equal(after.find(provider=>provider.id==='indexer'),first);
+});
 test('unknown creation adoption compares all submitted public settings without equating unrelated records',()=>{
  const pending={name:'shared',enabled:true,priority:3,settings:{implementation:'qbittorrent',endpoint:'http://127.0.0.1:1234',tv:{category:'tv'},movies:{category:'movies'}}};
  const stored={id:'new',revision:1,has_credentials:true,...pending,settings:{movies:{category:'movies'},tv:{category:'tv'},endpoint:pending.settings.endpoint,implementation:'qbittorrent'}};
@@ -80,6 +88,12 @@ test('Transmission endpoint composes from host, port, SSL and URL base and parse
   assert.equal(transmissionEndpoint({useSsl:false,urlBase:'',...bad}),null,JSON.stringify(bad));
  for(const bad of ['ftp://h/x','http://u:p@h/x','http://h/x?y','http://h/x#f','not a url'])assert.equal(parseTransmissionEndpoint(bad),null,bad);
  assert.equal(normalizeUrlBase('///'),'');
+ // Encoded bases survive a save/reopen round trip; a malformed escape is data, not an exception.
+ for(const endpoint of ['http://h:9091/my%20base','http://h:9091/a%zz/b']){
+  const parsed=parseTransmissionEndpoint(endpoint);
+  assert.notEqual(parsed,null,endpoint);
+  assert.equal(transmissionEndpoint(parsed),endpoint,endpoint);
+ }
 });
 test('Transmission placements mirror the server rules and keep domains apart',()=>{
  for(const ok of ['tv','tv-sonarr','Movies_4K','a.b'])assert.equal(validTransmissionCategory(ok),true,ok);

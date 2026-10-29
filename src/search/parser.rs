@@ -117,17 +117,17 @@ fn revision_tokens(
             && let Some(n) = token
                 .strip_prefix('v')
                 .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-            {
-                let version = revision_number(n, 0)?;
-                // An explicit v0 replaces the implicit baseline, but never a higher marker.
-                value.version = if version_specified {
-                    value.version.max(version)
-                } else {
-                    version
-                };
-                version_specified = true;
-                marker = true;
-            }
+        {
+            let version = revision_number(n, 0)?;
+            // An explicit v0 replaces the implicit baseline, but never a higher marker.
+            value.version = if version_specified {
+                value.version.max(version)
+            } else {
+                version
+            };
+            version_specified = true;
+            marker = true;
+        }
         if group_follows {
             break;
         }
@@ -204,10 +204,11 @@ pub fn parse(value: &str, tv: bool) -> Result<ParsedRelease, &'static str> {
         }
         if parsed_numbering.is_none()
             && let Some(i) = tokens.iter().position(|s| *s == "-")
-                && let Some(episode) = lower.get(i + 1).and_then(|s| number(version_suffix(s).0)) {
-                    boundary = i;
-                    parsed_numbering = Some(Numbering::Absolute { episode });
-                }
+            && let Some(episode) = lower.get(i + 1).and_then(|s| number(version_suffix(s).0))
+        {
+            boundary = i;
+            parsed_numbering = Some(Numbering::Absolute { episode });
+        }
         if parsed_numbering.is_none() {
             return Err("unsupported_numbering");
         }

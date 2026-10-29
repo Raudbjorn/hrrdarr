@@ -1842,19 +1842,20 @@ fn scan_path_excluded(file: ScanFileInput<'_>, tv: bool) -> bool {
     }
     if let Some((stem, _)) = basename.rsplit_once('.')
         && let Some((_, suffix)) = stem.rsplit_once('-')
-            && matches!(
-                suffix,
-                "trailer"
-                    | "other"
-                    | "behindthescenes"
-                    | "deleted"
-                    | "featurette"
-                    | "interview"
-                    | "scene"
-                    | "short"
-            ) {
-                return true;
-            }
+        && matches!(
+            suffix,
+            "trailer"
+                | "other"
+                | "behindthescenes"
+                | "deleted"
+                | "featurette"
+                | "interview"
+                | "scene"
+                | "short"
+        )
+    {
+        return true;
+    }
     let Some((parents, _)) = file.relative_path.rsplit_once('/') else {
         return false;
     };
@@ -1966,9 +1967,9 @@ pub(crate) async fn evaluate_scan_file(
                 .map_err(|_| SearchError("scan_proof_invalid"))?
                 .len()
                 > SCAN_PROOF_BYTES)
-        {
-            return Err(SearchError("scan_proof_invalid"));
-        }
+    {
+        return Err(SearchError("scan_proof_invalid"));
+    }
     let mut rejected_quality = None;
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -1987,9 +1988,9 @@ pub(crate) async fn evaluate_scan_file(
     .map_err(|_| SearchError("scan_decision_timeout"))??;
     if let Some(expected) = expected
         && !matches!(&result,ScanFileDecision::PolicyEligible(current) if &current.proof==expected)
-        {
-            return Err(SearchError("scan_preflight_changed"));
-        }
+    {
+        return Err(SearchError("scan_preflight_changed"));
+    }
     Ok(result)
 }
 async fn evaluate_scan_inner(

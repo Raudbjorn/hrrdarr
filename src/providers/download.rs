@@ -121,6 +121,8 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
             let kind = entry.file_type()?;
             if kind.is_dir() {
                 if depth + 1 >= MAX_OUTPUT_DEPTH {
+                    // A directory below the cap hides files from the caller, and a partial
+                    // listing would let the preflight judge incomplete evidence. Refuse it.
                     return Err(std::io::Error::other("output depth limit"));
                 }
                 pending.push((entry.path(), relative, depth + 1));
@@ -140,6 +142,52 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
 mod tests {
     use super::*;
 
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch() -> Scratch {
+        let path = std::env::temp_dir().join(format!("hrrdarr-download-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+
+    #[test]
+    fn listing_within_the_depth_cap_returns_every_file() {
+        let s = scratch();
+        let deep = s.0.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("movie.mkv"), b"bytes").unwrap();
+        std::fs::write(s.0.join("top.mkv"), b"bytes").unwrap();
+        match list_local_output(&s.0).unwrap() {
+            LocalListing::Directory(files) => assert_eq!(
+                files,
+                vec![
+                    ("a/b/c/d/e/movie.mkv".to_owned(), 5),
+                    ("top.mkv".to_owned(), 5)
+                ]
+            ),
+            _ => panic!("expected a directory listing"),
+        }
+    }
+
+    #[test]
+    fn a_directory_below_the_depth_cap_is_refused_instead_of_truncated() {
+        let s = scratch();
+        let deep = s.0.join("a/b/c/d/e/f");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("movie.mkv"), b"bytes").unwrap();
+        std::fs::write(s.0.join("top.mkv"), b"bytes").unwrap();
+        // The deep file is invisible to a truncated listing, so the listing is refused rather
+        // than letting the preflight judge incomplete evidence.
+        let error = match list_local_output(&s.0) {
+            Ok(_) => panic!("expected the listing to be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "output depth limit");
+    }
     #[test]
     fn depth_limit_fails_closed() {
         let root =

@@ -68,9 +68,10 @@ impl IntoResponse for MetadataError {
         )
             .into_response();
         if let Self::RateLimited(Some(seconds)) = self
-            && let Ok(value) = seconds.to_string().parse() {
-                response.headers_mut().insert("retry-after", value);
-            }
+            && let Ok(value) = seconds.to_string().parse()
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
         response
     }
 }
@@ -1018,13 +1019,15 @@ impl SeriesDetails {
                 return Err(MetadataError::InvalidResponse);
             }
             if let Some(value) = &episode.overview
-                && !value.is_empty() {
-                    text(value, 32768, true)?;
-                }
+                && !value.is_empty()
+            {
+                text(value, 32768, true)?;
+            }
             if let Some(value) = &episode.finale_type
-                && !value.is_empty() {
-                    text(value, 128, false)?;
-                }
+                && !value.is_empty()
+            {
+                text(value, 128, false)?;
+            }
         }
         Ok(self)
     }

@@ -23,7 +23,10 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // only a journaled replacement retirement removes a file from library views.
 pub(crate) fn active_file_sql(media: &str) -> &'static str {
     if media == "tv" {
-        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND (ri.retirement_state='quarantined' OR EXISTS(SELECT 1 FROM same_path_replacements sp JOIN import_journal sj ON sj.operation_id=sp.operation_id WHERE sp.operation_id=ri.operation_id AND sp.state='installed' AND sj.phase IN ('committed','complete'))))"
+        // A retired original is no longer the active file for its episode: an RSS replacement
+        // keeps its row for recovery, and a scan replacement keeps its row at the recovery path.
+        // A shared original stays visible while it is still shared.
+        "NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.old_episode_file_id=f.id AND (ri.retirement_state='quarantined' OR EXISTS(SELECT 1 FROM same_path_replacements sp JOIN import_journal sj ON sj.operation_id=sp.operation_id WHERE sp.operation_id=ri.operation_id AND sp.state='installed' AND sj.phase IN ('committed','complete')))) AND NOT EXISTS(SELECT 1 FROM scan_import_replacements sr WHERE sr.media_type='tv' AND sr.old_episode_file_id=f.id AND sr.retirement_state='quarantined')"
     } else {
         "1"
     }

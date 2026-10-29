@@ -1272,6 +1272,7 @@ mod tests {
              CREATE TABLE episode_files(id INTEGER PRIMARY KEY,series_id INTEGER);
              CREATE TABLE episodes(id INTEGER PRIMARY KEY,series_id INTEGER,season INTEGER,number INTEGER,title TEXT,monitored INTEGER,air_date TEXT,air_date_utc TEXT,runtime INTEGER,episode_file_id INTEGER,overview TEXT,finale_type TEXT,absolute_episode_number INTEGER);
              CREATE TABLE rss_candidate_imports(old_episode_file_id INTEGER,operation_id TEXT,retirement_state TEXT);
+             CREATE TABLE scan_import_replacements(media_type TEXT,old_episode_file_id INTEGER,retirement_state TEXT);
              CREATE TABLE same_path_replacements(operation_id TEXT,state TEXT);
              CREATE TABLE import_journal(operation_id TEXT,phase TEXT);
              CREATE TABLE movie_metadata(id INTEGER PRIMARY KEY,title TEXT,year INTEGER,tmdb_id INTEGER,imdb_id TEXT,status TEXT,studio TEXT,runtime INTEGER,in_cinemas TEXT,digital_release TEXT,physical_release TEXT);

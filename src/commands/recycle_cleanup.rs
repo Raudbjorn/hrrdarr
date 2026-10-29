@@ -8,7 +8,8 @@ use crate::recycle_bin::fsops;
 const MAX_DEPTH: usize = 32;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_REMOVALS: u64 = 10_000;
-const RUN_SECONDS: u64 = 60;
+// Keep the walk below the worker's 45 s step timeout.
+const RUN_SECONDS: u64 = 30;
 const BUSY_RETRY_SECONDS: i64 = 30;
 /// Returns the retention applied to one bin. A shared bin has no per-entry domain marker, so the
 /// longest retention wins; zero disables cleanup for the shared path.

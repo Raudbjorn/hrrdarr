@@ -216,13 +216,15 @@ pub(crate) async fn set(
             MediaDomain::Movies => MediaDomain::Tv,
         };
         if let Some(other_bin) = read(c, other).await?.path
-            && other_bin != *bin && overlaps(&other_bin, bin) {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "recycle_bin_nested",
-                    "TV and movie recycle bins may be the same folder but cannot be nested",
-                ));
-            }
+            && other_bin != *bin
+            && overlaps(&other_bin, bin)
+        {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "recycle_bin_nested",
+                "TV and movie recycle bins may be the same folder but cannot be nested",
+            ));
+        }
     }
     let changed = c.execute("UPDATE recycle_bin_settings SET path=?1,cleanup_days=?2,revision=revision+1,next_cleanup_at=CASE WHEN ?1 IS NULL THEN NULL WHEN path IS ?1 THEN next_cleanup_at ELSE ?3 END WHERE media_type=?4 AND revision=?5", params![path.clone(), input.cleanup_days, now + CLEANUP_INTERVAL_SECONDS, domain(media), input.revision]).await?;
     if changed != 1 {
