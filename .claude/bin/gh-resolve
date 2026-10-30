@@ -1213,7 +1213,8 @@ cmd_suggestions() {
             # Full body, never elided: a partial suggestion is unreviewable,
             # and blank output would otherwise be ambiguous with a deletion.
             local preview
-            preview=$(base64 -d <<< "$b64")
+            preview=$(base64 -d <<< "$b64" && printf '.') || return 1
+            preview=${preview%.}
             if [ -z "$preview" ]; then
                 dim "   | (empty — deletes L${start:-?}${end:+-L$end})"
             else
@@ -1308,7 +1309,9 @@ cmd_suggestions() {
         fi
 
         local replacement
-        replacement=$(base64 -d <<< "$b64")
+        # A sentinel preserves trailing newlines stripped by command substitution.
+        replacement=$(base64 -d <<< "$b64" && printf '.') || return 1
+        replacement=${replacement%.}
 
         if [ "$dry_run" = "true" ]; then
             dim "  [DRY RUN] $path:L$start-L$end ($tid)"

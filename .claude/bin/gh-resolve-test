@@ -160,6 +160,14 @@ suggestion a.rs "$plain" 18 20 ''
 check "empty apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
 check "empty suggestion deletes range" 21 "$(sed -n '18p' a.rs)"
 git restore a.rs
+suggestion a.rs "$plain" 18 20 $'replacement\n\n'
+check "trailing blank apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
+check "trailing blank lines preserved" '["replacement","","","21","22"]' "$(jq -Rsc 'split("\n")[17:22]' a.rs)"
+git restore a.rs
+suggestion a.rs "$plain" 18 20 $'\n'
+check "newline-only apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
+check "newline-only differs from deletion" '["","","21","22","23"]' "$(jq -Rsc 'split("\n")[17:22]' a.rs)"
+git restore a.rs
 for fence in "${plain}:-2+0" "${plain}:-0+2" "${plain}:unsupported"; do
     suggestion a.rs "$fence"
     check "unsupported fence excluded" 0 "$(run suggestions -j 7 | jq '.suggestions|length')"
