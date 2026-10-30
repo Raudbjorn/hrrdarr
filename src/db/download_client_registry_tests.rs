@@ -69,7 +69,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     // Like the runner, rebuild migrations (0052, 0059) execute with foreign keys off.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(62).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(58).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -104,7 +104,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[62].1).await?;
+    tx.execute_batch(MIGRATIONS[58].1).await?;
     // The registry immutability trigger exists inside the migration transaction.
     assert!(tx.execute("UPDATE provider_implementations SET protocol='usenet' WHERE implementation='qbittorrent'",()).await.is_err());
     tx.rollback().await?;
@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(86)]] // Reasoning: the runner applies through latest 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations (0077 library_root_health; 0076 wanted_last_search; 0075 downloadstation registry; 0074 flood registry; 0073 aria2 registry; 0072 utorrent registry; 0071 rtorrent registry; 0070 deluge registry and label-family triggers; 0069 collection snapshot ownership; 0068 torrent RSS indexer; 0064 NZBGet registry; 0063 notifications; the recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
+        vec![vec![libsql::Value::Integer(81)]] // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();

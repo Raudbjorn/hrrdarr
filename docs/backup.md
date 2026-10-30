@@ -1,11 +1,11 @@
 # Backup and restore
 
-Migration `0078_backups.sql` (registered at runner position 84, after 0077
-library_root_health) adds the backup policy singleton `backup_settings` and the
-durable `Backup` command table `backup_commands`. The runner restores the published
-50-53 prefix before this branch's own migrations, so the runner position of
-`0078_backups.sql` is 84 even though its file number is 0078. Archives themselves live on disk
-and are listed from the backup folder; the database stores only policy and command history.
+Migration `0081_backups.sql` (runner position 81, after `0080_library_root_health.sql`)
+adds the backup policy singleton `backup_settings` and durable `Backup` command table.
+The migration prefix follows current main through version 78, then adds Wanted, library-root
+health and Backup. Archives live on disk; the database stores policy and command history.
+Incompatible older migration histories are rejected before writes; they require a separately
+validated upgrade/recovery path, not renumbering recorded migrations or deleting database state.
 The UI is System → Backup (`#/system/backup`).
 
 Backups cover the **local** libSQL database only. With remote storage (`TURSO_DATABASE_URL`) every

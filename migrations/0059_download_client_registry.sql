@@ -7,14 +7,9 @@ CREATE TABLE provider_implementations (
  kind TEXT NOT NULL CHECK(kind IN ('indexer','download_client')),
  protocol TEXT NOT NULL CHECK(protocol IN ('torrent','usenet'))
 ) WITHOUT ROWID;
--- 'torrentrss' is seeded here because the published 0050 admits it as a provider implementation:
--- a database that already ran that migration may hold such a provider, and the registry's foreign
--- key would reject the row when the providers table is rebuilt below. The registry is immutable
--- once written, so the row cannot be added by a later migration.
 INSERT INTO provider_implementations(implementation,kind,protocol) VALUES
  ('torznab','indexer','torrent'),('newznab','indexer','usenet'),
- ('qbittorrent','download_client','torrent'),('sabnzbd','download_client','usenet'),
- ('torrentrss','indexer','torrent');
+ ('qbittorrent','download_client','torrent'),('sabnzbd','download_client','usenet');
 CREATE TRIGGER provider_implementation_immutable BEFORE UPDATE ON provider_implementations BEGIN SELECT RAISE(ABORT,'provider implementation registry is immutable'); END;
 CREATE TRIGGER provider_implementation_retained BEFORE DELETE ON provider_implementations BEGIN SELECT RAISE(ABORT,'provider implementation registry is immutable'); END;
 
@@ -46,7 +41,7 @@ CREATE TABLE provider_scopes (
     category TEXT CHECK (category IS NULL OR (length(trim(category))>0 AND length(CAST(category AS BLOB))<=64)),
     imported_category TEXT CHECK (imported_category IS NULL OR (length(trim(imported_category))>0 AND length(CAST(imported_category AS BLOB))<=64)),
     recent_priority INTEGER CHECK (recent_priority IS NULL OR (typeof(recent_priority)='integer' AND recent_priority BETWEEN -100 AND 2)),
-    older_priority INTEGER CHECK (older_priority IS NULL OR (typeof(older_priority)='integer' AND older_priority BETWEEN -100 AND 2)), anime_standard_format_search INTEGER, remove_year INTEGER, initial_state TEXT, content_layout TEXT, sequential_order INTEGER, first_last_first INTEGER, add_tags INTEGER, minimum_seeders INTEGER CHECK (minimum_seeders IS NULL OR (implementation='torrentrss' AND typeof(minimum_seeders)='integer' AND minimum_seeders BETWEEN 0 AND 1000000)), enable_rss INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_rss)='integer' AND enable_rss IN (0,1)), enable_automatic_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_automatic_search)='integer' AND enable_automatic_search IN (0,1)), enable_interactive_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_interactive_search)='integer' AND enable_interactive_search IN (0,1)), download_client_id TEXT DEFAULT NULL CHECK (
+    older_priority INTEGER CHECK (older_priority IS NULL OR (typeof(older_priority)='integer' AND older_priority BETWEEN -100 AND 2)), anime_standard_format_search INTEGER, remove_year INTEGER, initial_state TEXT, content_layout TEXT, sequential_order INTEGER, first_last_first INTEGER, add_tags INTEGER, enable_rss INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_rss)='integer' AND enable_rss IN (0,1)), enable_automatic_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_automatic_search)='integer' AND enable_automatic_search IN (0,1)), enable_interactive_search INTEGER NOT NULL DEFAULT 1 CHECK(typeof(enable_interactive_search)='integer' AND enable_interactive_search IN (0,1)), download_client_id TEXT DEFAULT NULL CHECK (
     download_client_id IS NULL OR (
         implementation IN ('torznab','newznab')
         AND typeof(download_client_id)='text'
@@ -64,7 +59,7 @@ CREATE TABLE provider_scopes (
     PRIMARY KEY(provider_id,media_type),
     FOREIGN KEY(provider_id,implementation) REFERENCES providers(id,implementation) ON DELETE CASCADE
 );
-INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,minimum_seeders,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id) SELECT provider_id,implementation,media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,minimum_seeders,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id FROM _registry58_scopes;
+INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id) SELECT provider_id,implementation,media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id FROM _registry58_scopes;
 DROP TABLE _registry58_scopes;
 DROP TABLE _registry58_providers;
 

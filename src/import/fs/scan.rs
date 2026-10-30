@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod durable;
 mod siblings;
-pub(crate) use siblings::Siblings;
 
 const MAX_ENTRIES: usize = 20_000;
 const MAX_DEPTH: usize = 32;

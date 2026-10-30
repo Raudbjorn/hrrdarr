@@ -725,7 +725,9 @@ async fn status_mapping_tag_isolation_details_and_controls() {
     let mut meta = tr(&h(11), "", "/downloads", &["tv-hrr"], &["downloading"]);
     (meta.size, meta.done, meta.files) = (0, 0, vec![]);
     f.put(meta);
-    // A multi-file torrent: its directory is its own folder.
+    // A multi-file torrent: its directory is its own folder. Reasoning: Flood resolves a content
+    // path by joining it onto `directory` (`path.join(torrent.directory, content.path)`), so the
+    // paths are relative to that folder and do not repeat the torrent name.
     let mut multi = tr(
         &h(12),
         "Multi.Pack",
@@ -735,10 +737,37 @@ async fn status_mapping_tag_isolation_details_and_controls() {
     );
     multi.done = multi.size;
     multi.files = vec![
-        ("Multi.Pack/Multi.Pack.S01E01.mkv".into(), 1048000, 100.0, 1),
-        ("Multi.Pack/sample.mkv".into(), 576, 0.0, 0),
+        ("Multi.Pack.S01E01.mkv".into(), 1048000, 100.0, 1),
+        ("sample.mkv".into(), 576, 0.0, 0),
     ];
     f.put(multi);
+    // A torrent moved to a directory whose basename differs from its name: the reported
+    // directory and content path still join to the real file.
+    let mut moved = tr(
+        &h(13),
+        "Release",
+        "/downloads/custom",
+        &["tv-hrr"],
+        &["complete", "seeding"],
+    );
+    moved.done = moved.size;
+    moved.files = vec![("episode.mkv".into(), 1048576, 100.0, 1)];
+    f.put(moved);
+    // A torrent with a skipped file finishes with `bytesDone` below `sizeBytes`; Flood still
+    // reports it complete.
+    let mut skipped = tr(
+        &h(14),
+        "Skipped.Sample",
+        "/downloads/Skipped.Sample",
+        &["tv-hrr"],
+        &["complete", "seeding"],
+    );
+    skipped.done = skipped.size - 576;
+    skipped.files = vec![
+        ("episode.mkv".into(), skipped.size - 576, 100.0, 1),
+        ("sample.mkv".into(), 576, 0.0, 0),
+    ];
+    f.put(skipped);
 
     let page = label_client::query(
         &operation,
@@ -810,17 +839,51 @@ async fn status_mapping_tag_isolation_details_and_controls() {
     )
     .await
     .unwrap();
-    assert_eq!(details.save_path, "/downloads");
+    assert_eq!(details.save_path, "/downloads/Multi.Pack");
     assert_eq!(
         details
             .files
             .iter()
             .map(|f| (f.name.as_str(), f.priority))
             .collect::<Vec<_>>(),
-        vec![
-            ("Multi.Pack/Multi.Pack.S01E01.mkv", 1),
-            ("Multi.Pack/sample.mkv", 0)
-        ]
+        vec![("Multi.Pack.S01E01.mkv", 1), ("sample.mkv", 0)]
+    );
+    // The directory/path pair is preserved for a relocated torrent: the file is
+    // `/downloads/custom/episode.mkv`, not `/downloads/custom/Release/episode.mkv`.
+    let moved = label_client::details(
+        &operation,
+        &settings,
+        Some(&login()),
+        &MediaTarget::Episode(1),
+        &h(13),
+    )
+    .await
+    .unwrap();
+    assert_eq!(moved.save_path, "/downloads/custom");
+    assert_eq!(
+        moved
+            .files
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["episode.mkv"]
+    );
+    // Flood's own completion indication decides when bytes were skipped on purpose.
+    assert!(
+        label_client::query(
+            &operation,
+            &settings,
+            Some(&login()),
+            &query(MediaDomain::Tv)
+        )
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .find(|i| i.hash == h(14))
+        .unwrap()
+        .completed,
+        "a torrent Flood reports complete is complete even with skipped bytes"
     );
     assert_eq!(
         label_client::details(

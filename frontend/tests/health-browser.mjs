@@ -15,12 +15,12 @@ const refresh=async()=>{await idle(health);await health.getByRole('button',{name
 const openHealth=async()=>{await nav.getByRole('button',{name:'Health',exact:true}).click();await idle(health);};
 const run=async scope=>{await health.getByLabel('Health scope').selectOption(scope);await idle(health);const reply=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/v1/health/commands'&&response.request().method()==='POST');await health.getByRole('button',{name:`Run ${scope} health checks`,exact:true}).click();const response=await reply;assert.equal(response.status(),202);return response.json();};
 // Reasoning: 0051 adds download_client_backoff to the nine existing keys per domain.
-// Reasoning: 0082 adds root_folder and mount_read_only per domain plus the movies-only collection_root_folder.
+// Reasoning: 0080 adds root_folder and mount_read_only per domain plus the movies-only collection_root_folder.
 const identities=['movies','tv'].flatMap(domain=>['completed_download_handling','download_client_backoff','download_client_communication','download_client_root_folder','indexer_download_client','indexer_failures','indexer_rss','indexer_search','indexer_status','mount_read_only','recycle_bin','remote_path_mapping','removed_metadata','root_folder'].map(key=>`${domain}:${key}`)).concat('movies:collection_root_folder').sort();
 const scopedChecks=domain=>domain==='tv'?14:15;
 const identity=check=>`${check.identity.scope}:${check.identity.check_key}`;
 const issueFor=(snapshot,domain,key)=>snapshot.issues.find(issue=>identity(issue)===`${domain}:${key}`);
-// Reasoning: migrations 0053 (remote_path_mapping), 0059 (recycle_bin) and 0082 (five library root/mount checks) give 29 checks, exceeding the API's sixteen-row page; aggregate both pages for registry assertions.
+// Reasoning: migrations 0053 (remote_path_mapping), 0059 (recycle_bin) and 0080 (five library root/mount checks) give 29 checks, exceeding the API's sixteen-row page; aggregate both pages for registry assertions.
 const fullHealth=async()=>{const first=await get('/api/v1/health');const second=await get('/api/v1/health?offset=16');return {...first,checks:[...first.checks,...second.checks],issues:[...first.issues,...second.issues]};};
 const current=async()=>{const snapshot=await until(fullHealth,snapshot=>snapshot.summary.current===29&&!snapshot.active_command,'All twenty-nine scoped checks did not become current');assert.equal(snapshot.summary.total,29);assert.deepEqual(snapshot.checks.map(identity).sort(),identities);assert.deepEqual(snapshot.coverage.identities.map(value=>`${value.scope}:${value.check_key}`).sort(),identities);for(const check of snapshot.checks){assert.equal(check.evaluation,'current');assert.equal(check.last_error,null);}return snapshot;};
 // Reasoning: with 29 checks the all-scope first page (movies first) no longer reaches TV communication; rows are read in their own scope.
@@ -69,7 +69,7 @@ try{
  // Item-only503 therefore leaves both CDH checks current/healthy and communication current/Error.
  assert.equal((await page.request.post(remote+'/fixture-mode?mode=1')).status(),204);await run('all');
  const failed=await until(fullHealth,snapshot=>!snapshot.active_command&&['tv','movies'].every(domain=>issueFor(snapshot,domain,'download_client_communication')?.reason==='download_client_communication_failed'),'Both scoped item-list failures were not published');
- // Reasoning: 0082 adds five checks (24 -> 29 total; tv 14, movies 15 per scope); counts below follow the registry.
+ // Reasoning: 0080 adds five checks (24 -> 29 total; tv 14, movies 15 per scope); counts below follow the registry.
  assert.equal(failed.summary.total,29);assert.deepEqual(failed.checks.map(identity).sort(),identities);for(const domain of ['tv','movies']){assert.equal(failed.checks.find(check=>identity(check)===`${domain}:completed_download_handling`).evaluation,'current');assert.equal(issueFor(failed,domain,'completed_download_handling'),undefined);}assert.equal(failed.summary.current,29);assert.equal(failed.summary.failed,0);// Reasoning: both absent-indexer errors remain alongside the two communication errors.
  // Reasoning: since 0053 each domain also reports remote_path_mapping path_output_local_unavailable, because the mock client advertises a save path that does not exist locally.
  assert.equal(failed.summary.non_ok,6);

@@ -109,7 +109,7 @@ async fn witness_queries(c: &Connection) -> Result<Vec<String>, Error> {
             " WHERE version<=53"
         } else if name == "health_checks" {
             // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
-            // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
             " WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         } else {
             ""
@@ -206,7 +206,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        86 // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -322,6 +322,8 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 // Reasoning: 0065 appends collection policy columns to movie_collections; its rows
                 // and predecessor columns are covered by tests/autotagging_metadata_schema.rs.
                 | "movie_collections"
+                // Reasoning: 0077 appends provenance; collection_schema preserves prior membership and FKs.
+                | "movie_collection_members"
         ) {
             continue;
         }
@@ -334,15 +336,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .get(0)?;
         // Reasoning: 0058 otherwise changes only the client predicate, now resolved through the
         // provider_implementations registry (protocol-matched for RSS/search); map it back.
-        // Reasoning: 0068 widens only the RSS admission/schedule predicates' indexer list to torrentrss;
-        // reverse that one exact edit so every other byte is still compared.
-        let actual = actual.replace(
-            "p.implementation IN ('torznab','newznab','torrentrss')",
-            "p.implementation IN ('torznab','newznab')",
-        );
-        // Reasoning: 0069 appends the snapshot-origin provenance column to the membership table.
         let actual = actual
-            .replace(", origin TEXT NOT NULL DEFAULT 'legacy' CHECK(origin IN('legacy','snapshot','discovery','graph'))", "")
             .replace(
                 "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)",
                 "p.implementation='qbittorrent'",
@@ -351,15 +345,15 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 " IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')",
                 "='qbittorrent'",
             )
-            // Reasoning: 0076 wanted_last_search appends only these exact nullable columns to
-            // episodes/movies and search_commands; strip them so predecessor DDL stays exact.
+            // Reasoning: 0079 appends only these nullable columns; preserve predecessor DDL exactly.
+            .replace(", native_last_search_at INTEGER CHECK(native_last_search_at IS NULL OR (typeof(native_last_search_at)='integer' AND native_last_search_at BETWEEN 0 AND 9007199254740991))", "")
+            .replace(", dispatch_completed_at INTEGER CHECK(dispatch_completed_at IS NULL OR (typeof(dispatch_completed_at)='integer' AND dispatch_completed_at BETWEEN 0 AND 9007199254740991))", "")
+            // Reasoning: 0068 admits the generic torrent RSS feed as an indexer in the RSS/search
+            // admission guards (tests/torrent_rss.rs covers the admission itself); that widened
+            // indexer predicate is the only other allocated change, so map it back to compare the rest.
             .replace(
-                ", native_last_search_at INTEGER CHECK(native_last_search_at IS NULL OR (typeof(native_last_search_at)='integer' AND native_last_search_at BETWEEN 0 AND 9007199254740991))",
-                "",
-            )
-            .replace(
-                ", dispatch_completed_at INTEGER CHECK(dispatch_completed_at IS NULL OR (typeof(dispatch_completed_at)='integer' AND dispatch_completed_at BETWEEN 0 AND 9007199254740991))",
-                "",
+                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab')",
             );
         assert_eq!(
             actual, expected,
@@ -382,7 +376,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     assert_eq!(
         scalar(
             &after,
-            // Reasoning: 0077 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
             "SELECT count(*) FROM health_checks WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         )
         .await?,

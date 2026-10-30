@@ -5,8 +5,8 @@
   import { onMount, untrack } from 'svelte';
   import type { ApiPage, ClientSelection, MediaDomain, MovieWantedItem, Provider, SearchCommand, TvWantedItem, WantedKind, WantedPage, WantedSearchInput, WantedSearchReceipt } from './api.generated';
   import { createWantedSearch, getSearchCommand, listProviders, listWanted, monitorEpisodes, monitorMovies } from './api';
-  import { eligibleDownloadClient, indexerScope, isIndexer } from './provider-draft';
-  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, lastSearchLabel, monitoredLabel, receiptSummary, retainVisible, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
+  import { eligibleDownloadClient, indexerScope, isIndexer, mergeProviderPages } from './provider-draft';
+  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, lastSearchLabel, monitoredLabel, receiptSummary, retainVisible, sameWantedWork, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
   type Item = TvWantedItem | MovieWantedItem;
   let { kind, onkind }: { kind: WantedKind; onkind: (kind: WantedKind) => void } = $props();
 
@@ -15,8 +15,12 @@
   let page = $state<WantedPage<Item> | null>(null), loading = $state(false), loadError = $state('');
   let selection = $state<Set<number>>(new Set());
   let providers = $state<ApiPage<Provider> | null>(null), providerOffset = $state(0), providerError = $state(''), providerLoading = $state(false);
-  let indexerId = $state(''), clientId = $state('');
-  let searching = $state(false), pending = $state<WantedSearchInput | null>(null), uncertain = $state(false);
+  let knownProviders = $state<Provider[]>([]), indexerId = $state(''), clientId = $state('');
+  let searching = $state(false), pending = $state<{ domain: MediaDomain; body: WantedSearchInput } | null>(null), uncertain = $state(false);
+  // A discarded uncertain request keeps its identity: the same work must not be admitted twice.
+  let discarded = $state<{ domain: MediaDomain; body: WantedSearchInput } | null>(null);
+  // The filter the visible page was loaded with; a search is authorized only for that filter.
+  let loadedQuery = $state('');
   let searchError = $state(''), receipt = $state<WantedSearchReceipt | null>(null), confirmAll = $state(false);
   let statuses = $state<SearchCommand[]>([]), statusLoading = $state(false), statusError = $state('');
   let monitoring = $state(false), monitorNotice = $state(''), monitorError = $state('');
@@ -26,11 +30,12 @@
   const listName = $derived(kind === 'missing' ? `Missing ${noun}` : `Cutoff unmet ${noun}`);
   const visibleIds = $derived(page?.items.map((item) => item.target.id) ?? []);
   const allVisibleSelected = $derived(visibleIds.length > 0 && visibleIds.every((id) => selection.has(id)));
-  const indexer = $derived(providers?.items.find((p) => p.id === indexerId) ?? null);
-  const client = $derived(providers?.items.find((p) => p.id === clientId) ?? null);
-  const indexers = $derived(providers?.items.filter((p) => p.enabled && isIndexer(p) && indexerScope(p, domain)?.enable_automatic_search !== false && indexerScope(p, domain) !== null) ?? []);
-  const clients = $derived(providers?.items.filter((p) => eligibleDownloadClient(p, domain, indexer)) ?? []);
-  const searchReady = $derived(!!indexer && (!clientId || !!client) && !searching && !uncertain && pending === null);
+  const indexer = $derived(knownProviders.find((p) => p.id === indexerId) ?? null);
+  const client = $derived(knownProviders.find((p) => p.id === clientId) ?? null);
+  const indexers = $derived(knownProviders.filter((p) => p.enabled && isIndexer(p) && indexerScope(p, domain)?.enable_automatic_search !== false && indexerScope(p, domain) !== null));
+  const clients = $derived(knownProviders.filter((p) => eligibleDownloadClient(p, domain, indexer)));
+  const currentQuery = $derived(wantedQuery(domain, kind, options));
+  const searchReady = $derived(!!indexer && (!clientId || !!client) && !searching && !uncertain && pending === null && loadedQuery === currentQuery);
   const busy = $derived(loading || searching || monitoring);
 
   async function load() {
@@ -42,6 +47,7 @@
     if (!result.ok) { loadError = result.error; return; }
     if (result.data.media_type !== scope || result.data.kind !== list) { loadError = 'Unexpected Wanted response for this list.'; return; }
     page = result.data;
+    loadedQuery = query;
     selection = retainVisible(selection, result.data.items.map((item) => item.target.id));
   }
   async function loadProviders(offset = 0) {
@@ -49,13 +55,17 @@
     const result = await listProviders(offset);
     if (!alive) return;
     providerLoading = false;
-    if (result.ok) { providers = result.data; providerOffset = offset; } else providerError = result.error;
+    if (result.ok) {
+      providers = result.data; providerOffset = offset;
+      knownProviders = mergeProviderPages(knownProviders, result.data.items);
+    } else providerError = result.error;
   }
   function resetScope() {
     ++readVersion; page = null; selection = new Set(); confirmAll = false; monitorNotice = ''; monitorError = '';
   }
   function changeDomain(next: MediaDomain) {
-    if (next === domain || busy || pending !== null) return;
+    // An unreconciled request keeps its own domain; switching would retarget a retained body.
+    if (next === domain || busy || uncertain || pending !== null) return;
     domain = next; options = defaultOptions(next); indexerId = ''; clientId = '';
     receipt = null; statuses = []; searchError = ''; resetScope(); void load();
   }
@@ -76,13 +86,18 @@
   function clientSelection(): ClientSelection {
     return client ? { kind: 'explicit', provider_id: client.id, provider_revision: client.revision } : { kind: 'default' };
   }
-  async function submit(body: WantedSearchInput) {
-    searching = true; searchError = ''; confirmAll = false; pending = body;
-    const result = await createWantedSearch(domain, body);
+  async function submit(scope: MediaDomain, body: WantedSearchInput) {
+    // A discarded uncertain request may already have been admitted; the same work is resent with
+    // its original identity so the server reads it back instead of admitting it twice.
+    const sent = discarded && discarded.domain === scope && sameWantedWork(discarded.body, body)
+      ? { ...body, request_id: discarded.body.request_id }
+      : body;
+    searching = true; searchError = ''; confirmAll = false; pending = { domain: scope, body: sent };
+    const result = await createWantedSearch(scope, sent);
     if (!alive) return;
     searching = false;
     if (result.ok) {
-      receipt = result.data; pending = null; uncertain = false; selection = new Set();
+      receipt = result.data; pending = null; uncertain = false; discarded = null; selection = new Set();
       await readStatuses(); void load();
       return;
     }
@@ -95,14 +110,14 @@
     if (!indexer || !searchReady) return;
     const ids = selectedIds(selection);
     if (!ids.length || ids.length > MAX_WANTED_SEARCH_TARGETS) return;
-    void submit(searchBody(crypto.randomUUID(), kind, { kind: 'ids', ids }, indexer, clientSelection()));
+    void submit(domain, searchBody(crypto.randomUUID(), kind, { kind: 'ids', ids }, indexer, clientSelection()));
   }
   function searchAll() {
     if (!indexer || !searchReady) return;
     const scope = domain === 'movies' && kind === 'missing' && options.availability !== 'all'
       ? { kind: 'all' as const, monitored: options.monitored, availability: options.availability }
       : { kind: 'all' as const, monitored: options.monitored };
-    void submit(searchBody(crypto.randomUUID(), kind, scope, indexer, clientSelection()));
+    void submit(domain, searchBody(crypto.randomUUID(), kind, scope, indexer, clientSelection()));
   }
   async function readStatuses() {
     if (!receipt) return;
@@ -144,7 +159,7 @@
   <h1 id="wanted-heading">Wanted</h1>
   <div class="bar">
     <nav aria-label="Wanted lists"><button aria-pressed={kind === 'missing'} disabled={busy} onclick={() => onkind('missing')}>Missing</button><button aria-pressed={kind === 'cutoff'} disabled={busy} onclick={() => onkind('cutoff')}>Cutoff unmet</button></nav>
-    <nav aria-label="Wanted media type"><button aria-pressed={domain === 'tv'} disabled={busy || pending !== null} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} disabled={busy || pending !== null} onclick={() => changeDomain('movies')}>Movies</button></nav>
+    <nav aria-label="Wanted media type"><button aria-pressed={domain === 'tv'} disabled={busy || uncertain || pending !== null} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} disabled={busy || uncertain || pending !== null} onclick={() => changeDomain('movies')}>Movies</button></nav>
   </div>
   <p class="muted">{kind === 'missing'
     ? domain === 'tv' ? 'Episodes without an associated file whose air time plus series runtime has passed. Specials are included.' : 'Library movies with a known year and no associated file, including movies not yet available.'
@@ -208,7 +223,7 @@
       <legend>Search providers</legend>
       <label>Wanted search indexer<select bind:value={indexerId} onchange={() => { clientId = ''; }}><option value="">Choose an indexer</option>{#each indexers as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
       <label>Wanted download client<select bind:value={clientId}><option value="">Default — choose from eligible clients</option>{#each clients as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label>
-      {#if providers}<div class="actions"><button type="button" disabled={providerLoading || providerOffset === 0} onclick={() => loadProviders(Math.max(0, providerOffset - 25))}>Previous providers</button><button type="button" disabled={providerLoading || providerOffset + providers.limit >= providers.total} onclick={() => loadProviders(providerOffset + 25)}>Next providers</button><button type="button" disabled={providerLoading} onclick={() => { indexerId = ''; clientId = ''; void loadProviders(); }}>Reload providers</button></div>{/if}
+      {#if providers}<div class="actions"><button type="button" disabled={providerLoading || providerOffset === 0} onclick={() => loadProviders(Math.max(0, providerOffset - 25))}>Previous providers</button><button type="button" disabled={providerLoading || providerOffset + providers.limit >= providers.total} onclick={() => loadProviders(providerOffset + 25)}>Next providers</button><button type="button" disabled={providerLoading} onclick={() => { indexerId = ''; clientId = ''; knownProviders = []; void loadProviders(); }}>Reload providers</button></div>{/if}
       <div class="actions">
         <button disabled={!searchReady || !selection.size} onclick={searchSelected}>Search selected ({selection.size})</button>
         <button disabled={!searchReady || !page || page.total === 0} onclick={() => { confirmAll = true; }}>Search all</button>
@@ -223,7 +238,7 @@
     {/if}
     {#if searching}<p role="status">Submitting search request…</p>{/if}
     {#if searchError}<p role="alert" class="error">{searchError}</p>{/if}
-    {#if uncertain && pending}<p role="alert">The search request may have been admitted. Resending the same request reads back its original result instead of searching twice.</p><button onclick={() => submit(pending!)}>Retry same search request</button><button onclick={() => { pending = null; uncertain = false; searchError = ''; }}>Discard pending request</button>{/if}
+    {#if uncertain && pending}<p role="alert">The search request may have been admitted. Resending the same request reads back its original result instead of searching twice. It stays bound to {pending.domain === 'tv' ? 'TV' : 'movies'}.</p><button onclick={() => submit(pending!.domain, pending!.body)}>Retry same search request</button><button onclick={() => { discarded = pending; pending = null; uncertain = false; searchError = ''; }}>Discard pending request</button>{/if}
     {#if receipt}
       <div role="status" class="receipt"><p>{receiptSummary(receipt)}</p><p class="muted">Request {receipt.request_id}</p></div>
       {#if receipt.commands.length}

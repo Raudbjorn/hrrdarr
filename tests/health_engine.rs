@@ -33,7 +33,7 @@ async fn wait_current(client: &reqwest::Client, base: &str) -> Value {
             let (status, v) =
                 request(client, base, reqwest::Method::GET, "/api/v1/health", None).await;
             assert_eq!(status, 200);
-            // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder; all 29 checks must settle.
+            // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder; all 29 checks must settle.
             if v["summary"]["current"] == 29 {
                 // Reasoning: twenty-nine checks span two pages; issue assertions cover both complete domains.
                 let (_, second) = request(
@@ -81,7 +81,7 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
     assert_eq!(status, 200);
     // Reasoning: 0051 adds download_client_backoff per domain to the eighteen existing identities.
-    assert_eq!(fresh["summary"]["never_run"], 29); // Reasoning: 0077 adds five initially unobserved checks (24 -> 29).
+    assert_eq!(fresh["summary"]["never_run"], 29); // Reasoning: 0080 adds five initially unobserved checks (24 -> 29).
     let identities = |rows: &Value| {
         rows.as_array()
             .unwrap()
@@ -117,10 +117,10 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
             .into_iter()
             .map(move |key| (scope.to_owned(), key.to_owned()))
         })
-        // Reasoning: 0077 registers the collection root check only in the movies scope.
+        // Reasoning: 0080 registers the collection root check only in the movies scope.
         .chain([("movies".to_owned(), "collection_root_folder".to_owned())])
         .collect::<std::collections::BTreeSet<_>>();
-    // Reasoning: 0077 gives twenty-nine identities across two sixteen-row API pages (16 + 13).
+    // Reasoning: 0080 gives twenty-nine identities across two sixteen-row API pages (16 + 13).
     let (_, second_page) = request(
         &client,
         &base,
@@ -203,8 +203,8 @@ async fn real_health_api_and_equal_value_cdh_save_drive_owned_worker() {
         None,
     )
     .await;
-    // Reasoning: 0077 adds five identities; compare all twenty-nine members exactly.
-    assert_eq!(detail["members"].as_array().unwrap().len(), 29); // Reasoning: 0077 adds five selected identities (24 -> 29).
+    // Reasoning: 0080 adds five identities; compare all twenty-nine members exactly.
+    assert_eq!(detail["members"].as_array().unwrap().len(), 29); // Reasoning: 0080 adds five selected identities (24 -> 29).
     assert_eq!(identities(&detail["members"]), expected);
     let (_, filtered) = request(
         &client,
@@ -610,7 +610,7 @@ async fn indexer_download_client_binding_is_reported_and_cleared_through_the_own
         loop {
             let (_, v) =
                 request(&client, &base, reqwest::Method::GET, "/api/v1/health", None).await;
-            // Reasoning: 0060 recycle_bin identities are healthy while no bin is configured; 0077 adds five checks (24 -> 29).
+            // Reasoning: 0060 recycle_bin identities are healthy while no bin is configured; 0080 adds five checks (24 -> 29).
             if v["summary"]["current"] == 29 && issues(&v).is_empty() {
                 return v;
             }

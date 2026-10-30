@@ -2,10 +2,21 @@
 //! RefreshCollections command; the per-collection policy decides whether missing members are added
 //! to the library. There is no TV counterpart. Search-on-add is stored and counted but this module
 //! does not itself submit searches.
+pub mod repository;
+
+#[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionMonitoring {
+    #[default]
+    MovieOnly,
+    MovieAndCollection,
+    None,
+}
+
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
-    metadata::{CollectionAssociation, CollectionDetails},
+    metadata::CollectionDetails,
 };
 use axum::{
     Json, Router,
@@ -25,7 +36,7 @@ const MAX_ID: i64 = 9_007_199_254_740_991;
 const DEFAULT_LIMIT: u16 = 50;
 const MAX_LIMIT: u16 = 200;
 const MAX_BULK: usize = 200;
-const MAX_TAGS: usize = 64;
+const MAX_TAGS: usize = crate::tags::MAX_ASSIGNMENTS;
 const MAX_FOLDER_NAME: usize = 200;
 
 #[derive(Debug)]
@@ -75,6 +86,7 @@ pub struct Collection {
     pub title: String,
     pub overview: Option<String>,
     pub monitored: bool,
+    pub settings_revision: Option<i64>,
     pub search_on_add: bool,
     pub quality_profile_id: Option<i64>,
     pub root_folder_id: Option<i64>,
@@ -155,7 +167,7 @@ fn positive(id: i64) -> Result<i64> {
     }
 }
 
-const SELECT: &str = "SELECT c.id,c.tmdb_id,c.title,c.overview,c.monitored,c.search_on_add,c.quality_profile_id,c.root_folder_id,r.path,c.minimum_availability,c.last_info_sync,(SELECT count(*) FROM movie_collection_members m WHERE m.collection_id=c.id),(SELECT count(*) FROM movie_collection_members m JOIN movies mv ON mv.metadata_id=m.metadata_id WHERE m.collection_id=c.id) FROM movie_collections c LEFT JOIN root_folders r ON r.id=c.root_folder_id";
+const SELECT: &str = "SELECT c.id,c.tmdb_id,c.title,c.overview,COALESCE(s.monitored,0),COALESCE(s.search_on_add,0),s.quality_profile_id,s.root_folder_id,r.path,s.minimum_availability,c.last_info_sync,(SELECT count(*) FROM movie_collection_members m WHERE m.collection_id=c.id),(SELECT count(*) FROM movie_collection_members m JOIN movies mv ON mv.metadata_id=m.metadata_id WHERE m.collection_id=c.id),s.settings_revision FROM movie_collections c LEFT JOIN movie_collection_settings s ON s.collection_id=c.id LEFT JOIN root_folders r ON r.id=s.root_folder_id";
 
 async fn decode(c: &Connection, row: &libsql::Row, with_members: bool) -> Result<Collection> {
     let id: i64 = row.get(0)?;
@@ -164,7 +176,7 @@ async fn decode(c: &Connection, row: &libsql::Row, with_members: bool) -> Result
     let mut tag_ids = vec![];
     let mut rows = c
         .query(
-            "SELECT tag_id FROM movie_collection_tags WHERE collection_id=? ORDER BY tag_id LIMIT 65",
+            "SELECT tag_id FROM movie_collection_tags WHERE collection_id=? ORDER BY tag_id LIMIT 201",
             [id],
         )
         .await?;
@@ -197,6 +209,7 @@ async fn decode(c: &Connection, row: &libsql::Row, with_members: bool) -> Result
         title: row.get(2)?,
         overview: row.get(3)?,
         monitored: row.get::<i64>(4)? != 0,
+        settings_revision: row.get(13)?,
         search_on_add: row.get::<i64>(5)? != 0,
         quality_profile_id: row.get(6)?,
         root_folder_id: row.get(7)?,
@@ -244,11 +257,10 @@ async fn list(
     });
     let monitored = q.monitored.map(i64::from);
     let c = db.connect().await?;
-    let filter =
-        "WHERE (?1 IS NULL OR c.monitored=?1) AND (?2 IS NULL OR c.title LIKE ?2 ESCAPE '\\')";
+    let filter = "WHERE (?1 IS NULL OR COALESCE(s.monitored,0)=?1) AND (?2 IS NULL OR c.title LIKE ?2 ESCAPE '\\')";
     let total = c
         .query(
-            &format!("SELECT count(*) FROM movie_collections c {filter}"),
+            &format!("SELECT count(*) FROM movie_collections c LEFT JOIN movie_collection_settings s ON s.collection_id=c.id {filter}"),
             params![monitored, pattern.clone()],
         )
         .await?
@@ -340,18 +352,7 @@ async fn finish<T>(tx: libsql::Transaction, r: Result<T>) -> Result<T> {
 
 /// Validates and writes one patch inside the caller's transaction.
 async fn apply_patch(tx: &Connection, id: i64, p: &Patch) -> Result<()> {
-    read(tx, id, false).await?;
-    // A native policy edit is sticky: a later snapshot import never overwrites it (migration 0069).
-    if p.monitored.is_some()
-        || p.search_on_add.is_some()
-        || p.quality_profile_id.is_some()
-        || p.root_folder_id.is_some()
-        || p.minimum_availability.is_some()
-        || p.tag_ids.is_some()
-    {
-        tx.execute("UPDATE movie_collections SET local_edit=1 WHERE id=?", [id])
-            .await?;
-    }
+    let current = read(tx, id, false).await?;
     if let Some(Some(profile)) = p.quality_profile_id {
         if tx
             .query(
@@ -380,49 +381,32 @@ async fn apply_patch(tx: &Connection, id: i64, p: &Patch) -> Result<()> {
             return Err(bad("Root folder does not exist in the movies domain"));
         }
     }
-    // Unmonitor first so that clearing a policy field and monitoring stay consistent.
-    if p.monitored == Some(false) {
-        tx.execute("UPDATE movie_collections SET monitored=0 WHERE id=?", [id])
-            .await?;
-    }
-    if let Some(v) = p.search_on_add {
-        tx.execute(
-            "UPDATE movie_collections SET search_on_add=? WHERE id=?",
-            params![i64::from(v), id],
-        )
-        .await?;
-    }
-    if let Some(v) = p.quality_profile_id {
-        tx.execute(
-            "UPDATE movie_collections SET quality_profile_id=? WHERE id=?",
-            params![v, id],
-        )
-        .await?;
-    }
-    if let Some(v) = p.root_folder_id {
-        tx.execute(
-            "UPDATE movie_collections SET root_folder_id=? WHERE id=?",
-            params![v, id],
-        )
-        .await?;
-    }
-    if let Some(v) = &p.minimum_availability {
-        let text = v.as_ref().map(|a| {
+    let monitored = p.monitored.unwrap_or(current.monitored);
+    let search = p.search_on_add.unwrap_or(current.search_on_add);
+    let profile = p.quality_profile_id.unwrap_or(current.quality_profile_id);
+    let root = p.root_folder_id.unwrap_or(current.root_folder_id);
+    let availability = match &p.minimum_availability {
+        Some(value) => value.as_ref().map(|a| {
             serde_json::to_value(a)
                 .ok()
-                .and_then(|j| j.as_str().map(str::to_owned))
+                .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default()
-        });
-        tx.execute(
-            "UPDATE movie_collections SET minimum_availability=? WHERE id=?",
-            params![text, id],
-        )
-        .await?;
+        }),
+        None => current.minimum_availability,
+    };
+    if monitored && (profile.is_none() || root.is_none() || availability.is_none()) {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "collection_policy_incomplete",
+            "Monitoring a collection requires a quality profile, root folder and minimum availability",
+        ));
     }
+    tx.execute("INSERT INTO movie_collection_settings(collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability,local_edit) VALUES(?,?,?,?,?,?,1) ON CONFLICT(collection_id) DO UPDATE SET monitored=excluded.monitored,search_on_add=excluded.search_on_add,quality_profile_id=excluded.quality_profile_id,root_folder_id=excluded.root_folder_id,minimum_availability=excluded.minimum_availability,local_edit=1,settings_revision=settings_revision+1",params![id,i64::from(monitored),i64::from(search),profile,root,availability]).await?;
+    tx.execute("INSERT INTO movie_collection_intents(tmdb_id,local_edit) SELECT tmdb_id,1 FROM movie_collections WHERE id=? AND tmdb_id IS NOT NULL ON CONFLICT(tmdb_id) DO UPDATE SET local_edit=1,revision=revision+1",[id]).await?;
     if let Some(tags) = &p.tag_ids {
         let set: BTreeSet<i64> = tags.iter().copied().collect();
         if set.len() != tags.len() || set.len() > MAX_TAGS {
-            return Err(bad("Tags require at most 64 distinct ids"));
+            return Err(bad("Tags require at most 200 distinct ids"));
         }
         for tag in &set {
             if tx
@@ -451,27 +435,6 @@ async fn apply_patch(tx: &Connection, id: i64, p: &Patch) -> Result<()> {
             .await?;
         }
     }
-    if p.monitored == Some(true) {
-        let ready = tx
-            .query(
-                "SELECT quality_profile_id IS NOT NULL AND root_folder_id IS NOT NULL AND minimum_availability IS NOT NULL FROM movie_collections WHERE id=?",
-                [id],
-            )
-            .await?
-            .next()
-            .await?
-            .ok_or_else(missing)?
-            .get::<i64>(0)?;
-        if ready != 1 {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "collection_policy_incomplete",
-                "Monitoring a collection requires a quality profile, root folder and minimum availability",
-            ));
-        }
-        tx.execute("UPDATE movie_collections SET monitored=1 WHERE id=?", [id])
-            .await?;
-    }
     if let Some(v) = p.monitor_movies {
         tx.execute(
             "UPDATE movies SET monitored=? WHERE metadata_id IN (SELECT metadata_id FROM movie_collection_members WHERE collection_id=?)",
@@ -479,77 +442,14 @@ async fn apply_patch(tx: &Connection, id: i64, p: &Patch) -> Result<()> {
         )
         .await?;
     }
-    let consistent = tx
-        .query(
-            "SELECT monitored=0 OR (quality_profile_id IS NOT NULL AND root_folder_id IS NOT NULL AND minimum_availability IS NOT NULL) FROM movie_collections WHERE id=?",
-            [id],
-        )
-        .await?
-        .next()
-        .await?
-        .ok_or_else(missing)?
-        .get::<i64>(0)?;
-    if consistent != 1 {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "collection_policy_incomplete",
-            "A monitored collection requires a quality profile, root folder and minimum availability",
-        ));
-    }
     // A monitored collection with complete policy adopts its already-known missing members now.
     if p.monitored == Some(true) {
         add_missing(tx, id).await?;
     }
+    crate::health::library_roots_changed(tx)
+        .await
+        .map_err(|e| Error(e.0, e.1, "Collection root health invalidation failed"))?;
     Ok(())
-}
-
-/// Stores movie -> collection membership from metadata. Absent preserves, Clear removes.
-/// A movie belongs to at most one collection. Caller owns the transaction.
-pub(crate) async fn associate(
-    c: &Connection,
-    metadata_id: i64,
-    association: &CollectionAssociation,
-) -> std::result::Result<bool, libsql::Error> {
-    match association {
-        CollectionAssociation::Absent => Ok(false),
-        CollectionAssociation::Clear => Ok(c
-            .execute(
-                "DELETE FROM movie_collection_members WHERE metadata_id=?",
-                [metadata_id],
-            )
-            .await?
-            > 0),
-        CollectionAssociation::Present(reference) => {
-            c.execute(
-                "INSERT INTO movie_collections(tmdb_id,title,added)VALUES(?1,?2,strftime('%Y-%m-%dT%H:%M:%SZ','now')) ON CONFLICT(tmdb_id) DO UPDATE SET title=excluded.title,metadata_revision=metadata_revision+1 WHERE title IS NOT excluded.title",
-                params![reference.tmdb_id, reference.title.clone()],
-            )
-            .await?;
-            let id: i64 = c
-                .query(
-                    "SELECT id FROM movie_collections WHERE tmdb_id=?",
-                    [reference.tmdb_id],
-                )
-                .await?
-                .next()
-                .await?
-                .ok_or(libsql::Error::QueryReturnedNoRows)?
-                .get(0)?;
-            let removed = c
-                .execute(
-                    "DELETE FROM movie_collection_members WHERE metadata_id=? AND collection_id<>?",
-                    params![metadata_id, id],
-                )
-                .await?;
-            let added = c
-                .execute(
-                    "INSERT OR IGNORE INTO movie_collection_members(collection_id,metadata_id,origin)VALUES(?,?,'discovery')",
-                    params![id, metadata_id],
-                )
-                .await?;
-            Ok(removed > 0 || added > 0)
-        }
-    }
 }
 
 fn folder_name(title: &str, year: Option<i64>) -> String {
@@ -592,7 +492,7 @@ fn folder_name(title: &str, year: Option<i64>) -> String {
 pub(crate) async fn add_missing(c: &Connection, id: i64) -> Result<(i64, i64)> {
     let Some(row) = c
         .query(
-            "SELECT c.quality_profile_id,r.path,c.minimum_availability,c.search_on_add FROM movie_collections c JOIN root_folders r ON r.id=c.root_folder_id AND r.media_type='movies' WHERE c.id=? AND c.monitored=1 AND c.quality_profile_id IS NOT NULL AND c.minimum_availability IS NOT NULL",
+            "SELECT c.quality_profile_id,r.path,c.minimum_availability,c.search_on_add FROM movie_collection_settings c JOIN root_folders r ON r.id=c.root_folder_id AND r.media_type='movies' WHERE c.collection_id=? AND c.monitored=1 AND c.quality_profile_id IS NOT NULL AND c.minimum_availability IS NOT NULL",
             [id],
         )
         .await?
@@ -620,7 +520,7 @@ pub(crate) async fn add_missing(c: &Connection, id: i64) -> Result<(i64, i64)> {
     let mut candidates = vec![];
     let mut rows = c
         .query(
-            "SELECT d.id,d.title,d.year FROM movie_collection_members m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.collection_id=? AND NOT EXISTS(SELECT 1 FROM movies mv WHERE mv.metadata_id=d.id) ORDER BY d.id LIMIT 1000",
+            "SELECT d.id,d.title,d.year FROM movie_collection_members m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.collection_id=? AND NOT EXISTS(SELECT 1 FROM movies mv WHERE mv.metadata_id=d.id) AND NOT EXISTS(SELECT 1 FROM movie_import_exclusions x WHERE x.tmdb_id=d.tmdb_id AND x.excluded=1) ORDER BY d.id LIMIT 1000",
             [id],
         )
         .await?;
@@ -694,12 +594,18 @@ pub(crate) async fn apply_graph(
         ));
     }
     c.execute(
-        "UPDATE movie_collections SET title=?,overview=?,last_info_sync=strftime('%Y-%m-%dT%H:%M:%SZ','now'),metadata_revision=metadata_revision+1 WHERE id=?",
+        "UPDATE movie_collections SET title=?,overview=?,last_info_sync=strftime('%Y-%m-%dT%H:%M:%SZ','now'),metadata_revision=metadata_revision+1,graph_complete=1 WHERE id=?",
         params![graph.title.clone(), graph.overview.clone(), id],
     )
     .await?;
-    let mut keep = BTreeSet::new();
-    for part in &graph.parts {
+    // Replace the complete graph atomically, freeing capacity before admitting new members.
+    c.execute(
+        "DELETE FROM movie_collection_members WHERE collection_id=?",
+        [id],
+    )
+    .await?;
+    for member in &graph.movies {
+        let part = &member.movie;
         let existing = c
             .query(
                 "SELECT id FROM movie_metadata WHERE tmdb_id=?",
@@ -736,41 +642,24 @@ pub(crate) async fn apply_graph(
             .await?;
             c.last_insert_rowid()
         };
-        keep.insert(metadata_id);
         c.execute(
-            "DELETE FROM movie_collection_members WHERE metadata_id=? AND collection_id<>?",
+            "DELETE FROM movie_collection_members WHERE metadata_id=? AND collection_id<>? AND collection_id IN (SELECT id FROM movie_collections WHERE tmdb_id IS NOT NULL)",
             params![metadata_id, id],
         )
         .await?;
         c.execute(
-            "INSERT INTO movie_collection_members(collection_id,metadata_id,origin)VALUES(?,?,'graph') ON CONFLICT(collection_id,metadata_id) DO UPDATE SET origin='graph'",
+            "INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision) SELECT ?1,?2,'graph',metadata_revision FROM movie_collections WHERE id=?1 ON CONFLICT(collection_id,metadata_id) DO UPDATE SET origin='graph',metadata_revision=excluded.metadata_revision",
             params![id, metadata_id],
         )
         .await?;
     }
-    // The complete graph is authoritative: members it no longer lists leave the collection.
-    let mut stale = vec![];
-    let mut rows = c
-        .query(
-            "SELECT metadata_id FROM movie_collection_members WHERE collection_id=?",
-            [id],
-        )
-        .await?;
-    while let Some(r) = rows.next().await? {
-        let m: i64 = r.get(0)?;
-        if !keep.contains(&m) {
-            stale.push(m);
-        }
+    let added = add_missing(c, id).await?;
+    if added.0 > 0 {
+        crate::health::library_roots_changed(c)
+            .await
+            .map_err(|e| Error(e.0, e.1, "Collection root health invalidation failed"))?;
     }
-    drop(rows);
-    for m in stale {
-        c.execute(
-            "DELETE FROM movie_collection_members WHERE collection_id=? AND metadata_id=?",
-            params![id, m],
-        )
-        .await?;
-    }
-    add_missing(c, id).await
+    Ok(added)
 }
 
 /// Collections with a metadata identity after `cursor`, in id order.
@@ -804,5 +693,100 @@ mod tests {
         assert_eq!(folder_name("../../etc", None), "etc");
         assert_eq!(folder_name("???", Some(2000)), "Untitled (2000)");
         assert!(folder_name(&"é".repeat(500), Some(1999)).len() <= 200 + 7);
+    }
+    #[tokio::test]
+    async fn collection_policy_health_invalidation_commits_and_rolls_back_with_settings()
+    -> Result<(), crate::db::Error> {
+        let dir = std::env::temp_dir().join(format!(
+            "hrrdarr-collection-health-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir)?;
+        let db = crate::db::Database::open_local(dir.join("db")).await?;
+        let c = db.connect().await?;
+        c.execute_batch(
+            "INSERT INTO root_folders(id,media_type,path) VALUES(1,'movies','/movies');
+            INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,10,'Saga');",
+        )
+        .await?;
+        let patch = super::Patch {
+            root_folder_id: Some(Some(1)),
+            ..Default::default()
+        };
+        for commit in [false, true] {
+            let tx = c.transaction().await?;
+            super::apply_patch(&tx, 1, &patch).await.unwrap();
+            let invalidated: i64 = tx.query("SELECT count(*) FROM health_checks WHERE check_key IN ('root_folder','collection_root_folder') AND generation=1 AND pending_reasons=8",()).await?.next().await?.unwrap().get(0)?;
+            assert_eq!(
+                invalidated, 3,
+                "collection policy invalidates root checks in the same transaction"
+            );
+            if commit {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            let policy: i64 = c.query("SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND root_folder_id=1",()).await?.next().await?.unwrap().get(0)?;
+            let health: i64 = c.query("SELECT count(*) FROM health_checks WHERE check_key IN ('root_folder','collection_root_folder') AND generation=1 AND pending_reasons=8",()).await?.next().await?.unwrap().get(0)?;
+            assert_eq!((policy, health), if commit { (1, 3) } else { (0, 0) });
+        }
+        drop(c);
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_graph_at_capacity_can_refresh_and_replace_a_member()
+    -> Result<(), crate::db::Error> {
+        use crate::metadata::{CollectionAssociation, CollectionDetails, CollectionMember};
+        let dir = std::env::temp_dir().join(format!(
+            "hrrdarr-collection-capacity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir)?;
+        let db = crate::db::Database::open_local(dir.join("db")).await?;
+        let c = db.connect().await?;
+        c.execute(
+            "INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,10,'Complete graph')",
+            (),
+        )
+        .await?;
+        for first in [1, 1, 2] {
+            let graph = CollectionDetails {
+                tmdb_id: 10,
+                title: "Complete graph".into(),
+                overview: None,
+                images: None,
+                movies: (first..first + 1000)
+                    .map(|id| CollectionMember {
+                        movie: serde_json::from_value(
+                            serde_json::json!({"tmdb_id":id,"title":format!("Movie {id}")}),
+                        )
+                        .unwrap(),
+                        collection: CollectionAssociation::Absent,
+                        original_title: None,
+                        overview: None,
+                        images: None,
+                        ratings: None,
+                        legacy_ratings: None,
+                    })
+                    .collect(),
+            };
+            let tx = c.transaction().await?;
+            super::apply_graph(&tx, 1, &graph).await.unwrap();
+            tx.commit().await?;
+            let row=c.query("SELECT count(*),min(d.tmdb_id),max(d.tmdb_id) FROM movie_collection_members m JOIN movie_metadata d ON d.id=m.metadata_id WHERE m.collection_id=1",()).await?.next().await?.unwrap();
+            assert_eq!(
+                (row.get::<i64>(0)?, row.get::<i64>(1)?, row.get::<i64>(2)?),
+                (1000, first, first + 999)
+            );
+            let stale=c.query("SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE m.metadata_revision!=c.metadata_revision OR m.origin!='graph'",()).await?.next().await?.unwrap().get::<i64>(0)?;
+            assert_eq!(stale, 0);
+        }
+        drop(c);
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

@@ -544,7 +544,7 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
 // Reasoning: 0053 adds scoped path diagnostics. Compare all eleven identities
 // per domain so unexpected sibling markers fail; client saves invalidate their path check too.
 // Reasoning: 0060 adds recycle_bin per domain; provider edits never mark it.
-// Reasoning: 0077 adds root_folder/mount_read_only per domain and movies collection_root_folder (24 -> 29); provider edits never mark them.
+// Reasoning: 0080 adds root_folder/mount_read_only per domain and movies collection_root_folder (24 -> 29); provider edits never mark them.
 const IDENTITIES: [(&str, &str); 29] = [
     ("movies", "collection_root_folder"),
     ("movies", "completed_download_handling"),

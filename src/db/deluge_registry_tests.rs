@@ -1,4 +1,4 @@
-//! Migration 0070 (Deluge and the label-torrent family): registry row, replaced scope triggers
+//! Migration 0069 (Deluge and the label-torrent family): registry row, replaced scope triggers
 //! and label uniqueness, exercised on a freshly migrated database and across reopen.
 use super::*;
 
@@ -44,14 +44,15 @@ async fn deluge_registry_scope_shape_options_and_labels_are_enforced() -> Result
             (row.get::<String>(0)?, row.get::<String>(1)?),
             ("download_client".into(), "torrent".into())
         );
-        // The whole label family is registered once 0075 (Download Station) has run: 0070 Deluge and 0071 to 0075 for the rest.
+        // Reasoning: the runner continues through 0070 to 0074, which register the rest of the family
+        // (rTorrent, uTorrent, Aria2, Flood and Download Station), so a fresh database holds all of them.
         let mut rows = c
             .query(
-                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('deluge','rtorrent','utorrent','flood','aria2','downloadstation')",
+                "SELECT count(*) FROM provider_implementations WHERE implementation IN ('rtorrent','utorrent','aria2','flood','downloadstation')",
                 (),
             )
             .await?;
-        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 6);
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 5);
         let id = client(&c).await?;
         // Queue placement is last (0) or first (1); add-paused is initial_state.
         for priority in [0, 1] {

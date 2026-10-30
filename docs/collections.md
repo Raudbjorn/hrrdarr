@@ -8,8 +8,8 @@ library.
 
 `MovieDetails` carries a tri-state `collection` association from the movie metadata service: absent preserves the
 stored membership, explicit `null` clears it, an object sets it. It is persisted by the shared fact writer (library
-add via lookup and metadata refresh) in the same transaction. A movie is in at most one collection. Clearing keeps
-the collection row, its policy and the movie.
+add via lookup and metadata refresh) in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
+Collection adoption retains local removal intent and protects it from stale snapshot replay.
 
 ## API (`/api/v1/movies/collections`)
 
@@ -19,6 +19,8 @@ the collection row, its policy and the movie.
   `quality_profile_id`, `root_folder_id`, `minimum_availability`, `tag_ids` (replace), `monitor_movies` (one-shot
   monitoring toggle for library members). Monitoring requires profile, root folder and availability (409
   `collection_policy_incomplete`; the invariant is also enforced by triggers). Profiles/roots/tags must be movie-domain.
+  A collection's assigned quality profile cannot be deleted (`409 profile_in_use`), even without library members;
+  clear or reassign the collection's profile first. Migration 0077 preserves that guard on the shared collection settings table.
 * Monitoring a collection immediately adds its known missing members to the library at
   `<root>/<Title (Year)>` with the collection's profile, availability and tags (then AutoTagging). Existing paths,
   nested paths and existing library movies are skipped, never replaced.
@@ -29,75 +31,30 @@ the collection row, its policy and the movie.
 returns the active one); `GET` list/detail. The worker also schedules it every 24 hours while collections exist.
 Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 parts) outside any transaction, then
 applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
-missing members are added. A run spans worker slices through a cursor and survives restarts. A continuation re-keys
-its queue position, so a refresh spanning several slices takes its turn behind work queued earlier instead of
-preempting it. Per-collection fetch
+missing members are added. A run spans worker slices through a cursor and survives restarts. Automatic
+refreshes rank below ordinary commands; continuations yield through their ready timestamp, and
+transient rate limits retry with bounded delay. Per-collection fetch
 failures are counted; if nothing succeeded and the service was unavailable the command fails
-(`metadata_unavailable`). Migration `0066_collections.sql`; snapshot ownership in `0069_collection_snapshot.sql`.
+(`metadata_unavailable`). Migration `0067_collections.sql`.
 
-## Snapshot import (migration 0069)
+## Schema integration
 
-A Radarr 206 or 242 backup reconstructs collections and `ImportExclusions` (`src/snapshots/collections.rs`).
-Version 206 retains inline collection identity/title without inventing policy; 242 also maps catalog-only
-membership, facts and the movie root/profile/tag references the backup can resolve. Unresolved references stay
-inactive with diagnostics; unsupported fields remain in the private archive. Preview runs the same transaction and
-rolls back; applying twice is idempotent (`snapshot_imports.collection_version`). Import performs no metadata
-requests, movie additions, searches or media access.
+Migrations 0001–0076 retain the PR branch history and checksums. Migration 0077 moves
+existing collection policy into `movie_collection_settings`, preserving meaningful
+local settings and tags, and adds metadata provenance, retained removal intent,
+exclusions and snapshot replay state. Migration 0078 adds provider authority state. Collection root health reads this settings authority;
+policy edits, adoption, cleanup and snapshot imports invalidate its checks in their write transaction.
+Databases from the divergent main migration history are not an accepted upgrade baseline.
 
-Policy stays where 0066 put it (columns on `movie_collections`). Ownership markers decide who may write it:
+## Snapshot reconstruction
 
-* `local_edit` becomes 1 when the API changes any policy field or the tag set, and never returns to 0. A
-  collection with `local_edit=1` or `metadata_revision>0` (a natively fetched graph or a native title change) is
-  native: a snapshot keeps it and reports "newer native collection retained".
-* `snapshot_owned=1` marks policy a snapshot wrote. A newer backup replaces that policy in place (tags included)
-  while `local_edit=0`; policy that is neither snapshot-owned nor empty is native and retained.
-* `movie_collection_members.origin` is `legacy`, `snapshot`, `discovery` (metadata adoption) or `graph`
-  (RefreshCollections). A newer backup replaces `snapshot` memberships it no longer lists and removes the
-  snapshot membership of a movie it maps but lists in no collection; every other origin is native and untouched.
-  A movie whose collection the backup cannot resolve keeps its memberships.
-* `movie_import_exclusions` holds snapshot exclusions (title/year optional). Omitted snapshot-owned rows are
-  removed by a newer backup that carries an `ImportExclusions` table; rows with `local_edit=1` are retained.
-  Nothing in this branch consumes exclusions yet.
-
-Deleting a quality profile or root folder that a collection references disables that collection's policy
-(`monitored=0`, the reference cleared) instead of failing or leaving a dangling monitored policy. Tags used by a
-collection remain assignments: deleting one is a conflict, as before.
-
-## Reconciliation with origin/main's collections checkpoint
-
-origin/main (PR #1) landed an independent collections foundation as its migrations 0052/0053. This branch's
-0066 model (policy columns, API, UI, RefreshCollections, AutoTagging coupling) is the base; origin's additional
-value was ported onto it and the duplicate parts dropped:
-
-* Ported: snapshot import of collections and exclusions with its replacement rules and regression tests
-  (`tests/snapshot_collections.rs`, retargeted to the columns above), the `origin` membership provenance, the
-  reference-delete fixes for profiles and roots (`tests/collection_reference_deletes.rs`), and the preference for
-  fresh native data (`local_edit`, `metadata_revision`) over old backups.
-* Dropped as duplicate: origin's `movie_collection_settings`, `graph_complete`/member
-  revision triggers, companion `movie_with_collection` metadata API and `CollectionAssociation` types (0066 and
-  `src/metadata.rs` already carry the association on `MovieDetails`), its transactional adoption repository, the
-  selected-add `monitor`/`collection_expected_revision` options, and `collection_schema.rs`/`collection_adoption.rs`
-  tests, which assert that schema. The retire-empty-collection cleanup is not ported because this branch
-  has no collection deletion and keeps collections as catalog entities.
-* Preserved: `movie_collection_intents`, including all revisions, removal reasons and local-retention
-  guards. Upgrade snapshots these rows inside the migration transaction before the historical supersede
-  and restores their authority in 0080. Existing migration SQL/checksums stay unchanged. Databases that
-  already ran the destructive supersede need an older backup to recover previously lost intent rows.
-  This branch retains the intent state; its collection API does not yet consume it.
-* Provider authority (origin 0053) is not added: `provider_scope_tags` is covered by `download_client_tags`
-  (0052), `provider_status` by the durable `indexer_status`/`download_client_status` backoff, and the selection
-  cursor by `src/providers/selection.rs` (volatile per-domain cursors; nothing in either tree consumed origin's
-  persistent cursor table). Origin's tag-preserving `write_scopes` fix is already
-  implemented here (`retained_tags`); `tests/provider_config_api.rs` keeps the retention test for it.
-* The snapshot provider reconciliation (PR #19: `provider_conflicts`, `allow_unmapped_providers`, exact-match
-  binding) is merged as-is and works with download-client tags.
+Collections and import exclusions can be reconstructed from supported Radarr 206 and 242 backups. Version 206 retains inline collection identity/title without inventing missing policy. Version 242 also maps catalog-only membership, facts, movie root/profile/tag references and available defaults. Unresolved references stay inactive with diagnostics. Unsupported source fields remain in private archives. Preview runs the same transaction and rolls back; applying repeats is idempotent. Native collection intent, settings and exclusion removal tombstones take precedence over old snapshots. A title that differs from an existing collection with the same TMDB id is retained with a diagnostic rather than failing the import. Snapshot-origin memberships the newer backup no longer lists are replaced; only native associations are protected, and a movie whose collection reference the backup cannot resolve keeps its memberships. Collection settings a snapshot wrote (`snapshot_owned=1`) and nobody edited since (`local_edit=0`) are replaced in place by a newer backup's policy, with the settings revision advanced; discovery-created or locally edited settings are retained. When a backup carries an ImportExclusions table, snapshot-owned exclusions it omits are removed; native exclusion tombstones (`local_edit=1`) are retained. Import performs no metadata requests, movie additions, searches or media access; source collections are not treated as complete freshly fetched graphs. Sonarr imports remain separate.
 
 ## Not claimed
 
 * `search_on_add` is stored and counted as `searches_pending`; no search is submitted by this feature.
-* No artwork/poster delivery (snapshot images are stored privately, never fetched), no import-exclusion
-  consumer or API (api.014; snapshot-imported exclusions are stored only), no TV analogue, no
-  discovery/"popular" collection lists.
+* No artwork/poster delivery, no import-exclusion editor, no TV analogue, and no discovery/"popular" collection lists.
+  Private image facts and supported snapshot exclusions are retained; they do not authorize artwork downloads.
 * The command table is not part of the shared 1024-row command pool and is not covered by housekeeping; it prunes
   itself to 100 terminal rows. It does not appear in the generic Activity/command views.
 * Added movies use a simple portable folder name (not the naming-template engine), and are added monitored.

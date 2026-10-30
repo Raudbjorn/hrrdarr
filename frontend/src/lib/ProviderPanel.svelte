@@ -142,7 +142,7 @@
       if(!tagLoaded||tagLoading||tagsStale||tagError){error='Reload the client tag choices before saving.';return null;}
       for(const [on,label,who] of [[tv,tvCategory,'TV'],[movies,movieCategory,'Movie']] as const){if(on&&!/^[a-z0-9._-]{1,64}$/.test(label.trim())){error=`${who} label: use 1 to 64 lowercase letters, digits, dots, underscores or hyphens (Deluge's Label plugin accepts nothing else, and the other label clients share the rule).`;return null;}}
       if (tv && movies && tvCategory.trim() === movieCategory.trim()) {error = 'TV and movie labels must differ so each domain only sees its own downloads.'; return null;}
-      const saved = selected?.settings.implementation === 'deluge' || selected?.settings.implementation === 'rtorrent' || selected?.settings.implementation === 'utorrent' || selected?.settings.implementation === 'aria2' ? selected.settings : null;
+      const saved = selected?.settings.implementation === 'deluge' || selected?.settings.implementation === 'rtorrent' || selected?.settings.implementation === 'utorrent' || selected?.settings.implementation === 'aria2' || selected?.settings.implementation === 'flood' || selected?.settings.implementation === 'downloadstation' ? selected.settings : null;
       const scope=(domain:MediaDomain,category:string,tags:number[]):TorrentLabelScope=>({...(saved?.[domain]??{}),category:category.trim(),tags,recent_priority:torrentPriority[domain].recent,older_priority:torrentPriority[domain].older,add_paused:addPaused[domain]});
       settings = {implementation, endpoint, tv:tv?scope('tv',tvCategory,tvTags):null, movies:movies?scope('movies',movieCategory,movieTags):null};
     } else if (implementation === 'nzbget') {

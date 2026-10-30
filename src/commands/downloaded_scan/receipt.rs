@@ -99,10 +99,10 @@ pub(super) async fn resolve(
             captured: true,
         };
         drop(row);
-        if let Some(operation) = &receipt.predecessor {
-            if !predecessor_complete(c, operation).await? {
-                return Err(waiting(operation)?);
-            }
+        if let Some(operation) = &receipt.predecessor
+            && !predecessor_complete(c, operation).await?
+        {
+            return Err(waiting(operation)?);
         }
         return Ok(Some(receipt));
     }
@@ -215,34 +215,34 @@ pub(super) async fn resolve(
         predecessor,
         captured: false,
     };
-    if let Some(operation) = receipt.predecessor.clone() {
-        if !predecessor_complete(c, &operation).await? {
-            // Reserve now so no new singleton ownership can start, then wait for the original
-            // owner to finish under its own authority.
-            let tx = c
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await?;
-            let outcome = async {
-                live(&tx, claim).await?;
-                capture(&tx, claim, &receipt).await?;
-                Ok::<_, Failure>(())
-            }
-            .await;
-            match outcome {
-                Ok(()) => tx.commit().await?,
-                Err(failure) => {
-                    tx.rollback().await?;
-                    return Err(failure);
-                }
-            }
-            eprintln!(
-                "event=downloaded_scan_receipt_captured command_id={} media_type={} candidate_id={} waiting_for={operation}",
-                claim.id,
-                domain(claim.media),
-                receipt.candidate
-            );
-            return Err(waiting(&operation)?);
+    if let Some(operation) = receipt.predecessor.clone()
+        && !predecessor_complete(c, &operation).await?
+    {
+        // Reserve now so no new singleton ownership can start, then wait for the original
+        // owner to finish under its own authority.
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let outcome = async {
+            live(&tx, claim).await?;
+            capture(&tx, claim, &receipt).await?;
+            Ok::<_, Failure>(())
         }
+        .await;
+        match outcome {
+            Ok(()) => tx.commit().await?,
+            Err(failure) => {
+                tx.rollback().await?;
+                return Err(failure);
+            }
+        }
+        eprintln!(
+            "event=downloaded_scan_receipt_captured command_id={} media_type={} candidate_id={} waiting_for={operation}",
+            claim.id,
+            domain(claim.media),
+            receipt.candidate
+        );
+        return Err(waiting(&operation)?);
     }
     Ok(Some(receipt))
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {defaultOptions,sortChoices,wantedQuery,episodeLabel,formatDate,formatDateTime,lastSearchLabel,searchBody,selectedIds,receiptSummary,retainVisible,cutoffLabel,monitoredLabel,availabilityLabel} from '../src/lib/wanted-view.ts';
+import {defaultOptions,sortChoices,wantedQuery,episodeLabel,formatDate,formatDateTime,lastSearchLabel,searchBody,selectedIds,receiptSummary,retainVisible,sameWantedWork,cutoffLabel,monitoredLabel,availabilityLabel} from '../src/lib/wanted-view.ts';
 
 const episode={target:{media_type:'episode',id:7},series_id:1,series_title:'Harbor',series_monitored:true,series_type:'standard',season:1,season_monitored:true,number:2,absolute_episode_number:14,scene_season_number:null,scene_episode_number:null,scene_absolute_episode_number:null,title:'Pilot',monitored:true,effective_monitored:true,air_date:null,air_date_utc:'2020-01-01T00:00:00Z',aired_end_at:1577838600,last_search_time:null,last_search_source:null,profile_id:1,file:null,cutoff:null};
 
@@ -52,6 +52,17 @@ test('search bodies and selections are canonical',()=>{
   const body=searchBody('r',"missing",{kind:'ids',ids:[1]},{id:'i',revision:3},{kind:'default'});
   assert.deepEqual(body,{request_id:'r',kind:'missing',selection:{kind:'ids',ids:[1]},indexer_id:'i',indexer_revision:3,client_selection:{kind:'default'},priority:'normal'});
   assert.deepEqual([...retainVisible(new Set([1,2,3]),[2,3,4])],[2,3]);
+});
+
+test('the same work keeps its identity so a discarded request cannot be admitted twice',()=>{
+  const body=searchBody('first',"missing",{kind:'ids',ids:[1]},{id:'i',revision:3},{kind:'default'});
+  const again=searchBody('second',"missing",{kind:'ids',ids:[1]},{id:'i',revision:3},{kind:'default'});
+  assert.equal(sameWantedWork(body,again),true);
+  assert.equal(sameWantedWork(body,{...again,request_id:'first'}),true);
+  assert.equal(sameWantedWork(body,{...again,selection:{kind:'ids',ids:[2]}}),false);
+  assert.equal(sameWantedWork(body,{...again,indexer_id:'other'}),false);
+  assert.equal(sameWantedWork(body,{...again,client_selection:{kind:'explicit',provider_id:'c',provider_revision:1}}),false);
+  assert.equal(sameWantedWork(body,{...again,kind:'cutoff'}),false);
 });
 
 test('receipt summaries state counts and replay honestly',()=>{

@@ -267,4 +267,4 @@ Library items expose nullable `runtime` in minutes: series runtime for TV and mo
 
 The downloaded TV scan decision helper uses each selected episode's positive runtime, falling back to series runtime for missing or zero episode values. An absent series value contributes zero to this policy calculation; only a zero aggregate selects the 45-minute expected-runtime fallback, once per file. This policy default is never written into metadata. Changes to series runtime invalidate an earlier scan decision proof. Sample checking still requires actual measured file duration unless an explicit domain exemption applies.
 
-The scan worker does not yet consume this helper; these rules are prerequisites for the pending downloaded-scan workflow.
+The downloaded-scan worker consumes this helper while it evaluates each candidate, so the runtime policy already decides which downloaded TV files a scan may import.

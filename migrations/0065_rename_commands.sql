@@ -167,3 +167,33 @@ BEGIN
  SELECT CASE WHEN (SELECT count(*) FROM commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM metadata_refresh_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM blocklist_clear_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rss_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM search_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM manual_import_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM quality_reset_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rescan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM health_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN ('queued','running','retry_wait'))+(SELECT count(*) FROM rename_commands WHERE status IN ('queued','running','retry_wait'))>=1024 THEN RAISE(ABORT,'command capacity reached') END;
  SELECT CASE WHEN NEW.status!='queued' OR NEW.attempts!=0 OR NEW.outcome IS NOT NULL OR NEW.bin_path IS NOT NULL OR NEW.cleanup_days IS NOT NULL THEN RAISE(ABORT,'commands must be enqueued') END;
 END;
+-- Rename notifications. One event per renamed series or movie when its command settles, listing the
+-- paths it changed; the payload is bounded to the event table's 16 KiB cap (the rest are counted in
+-- rename_events, which stays the complete record), so one oversized path set cannot abort the
+-- status update that settles the command.
+CREATE TRIGGER notification_event_rename_tv AFTER UPDATE OF status ON rename_commands
+WHEN NEW.media_type='tv' AND NEW.status IN ('succeeded','failed','cancelled') AND OLD.status NOT IN ('succeeded','failed','cancelled') AND NEW.items_renamed>0
+ AND EXISTS(SELECT 1 FROM notification_scopes s JOIN notifications n ON n.id=s.notification_id WHERE n.enabled=1 AND s.media_type='tv' AND s.on_rename=1)
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,created_at)
+ SELECT 'rename','tv',series_id,json_object('paths',json_group_array(new_path),'previous_paths',json_group_array(old_path)),CAST(strftime('%s','now') AS INTEGER)
+ FROM (SELECT series_id,old_path,new_path FROM (
+   SELECT series_id,old_path,new_path,rowid,
+    SUM(length(CAST(json_quote(old_path) AS BLOB))+length(CAST(json_quote(new_path) AS BLOB))+8) OVER (PARTITION BY series_id ORDER BY rowid) running
+   FROM rename_events WHERE command_id=NEW.id AND media_type='tv')
+  WHERE running<=15000 ORDER BY series_id,rowid)
+ GROUP BY series_id;
+END;
+CREATE TRIGGER notification_event_rename_movies AFTER UPDATE OF status ON rename_commands
+WHEN NEW.media_type='movies' AND NEW.status IN ('succeeded','failed','cancelled') AND OLD.status NOT IN ('succeeded','failed','cancelled') AND NEW.items_renamed>0
+ AND EXISTS(SELECT 1 FROM notification_scopes s JOIN notifications n ON n.id=s.notification_id WHERE n.enabled=1 AND s.media_type='movies' AND s.on_rename=1)
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,created_at)
+ SELECT 'rename','movies',movie_id,json_object('paths',json_group_array(new_path),'previous_paths',json_group_array(old_path)),CAST(strftime('%s','now') AS INTEGER)
+ FROM (SELECT movie_id,old_path,new_path FROM (
+   SELECT movie_id,old_path,new_path,rowid,
+    SUM(length(CAST(json_quote(old_path) AS BLOB))+length(CAST(json_quote(new_path) AS BLOB))+8) OVER (PARTITION BY movie_id ORDER BY rowid) running
+   FROM rename_events WHERE command_id=NEW.id AND media_type='movies')
+  WHERE running<=15000 ORDER BY movie_id,rowid)
+ GROUP BY movie_id;
+END;

@@ -514,7 +514,7 @@ async fn write(
     let result=async{
   if tx.query("SELECT id FROM remote_path_mappings WHERE media_type=? AND host=? AND remote_key=? AND id!=?",params![name(media),input.host.clone(),key.clone(),old.map_or(0,|v|v.0)]).await?.next().await?.is_some(){return Err(conflict())}
   let id=if let Some((id,revision))=old{
-   if revision<1||revision>=9007199254740991{return Err(bad())}
+   if !(1..9007199254740991).contains(&revision){return Err(bad())}
    if tx.execute("UPDATE remote_path_mappings SET host=?,remote_path=?,remote_kind=?,remote_key=?,local_path=?,revision=revision+1 WHERE id=? AND media_type=? AND revision=?",params![input.host,input.remote_path,kind,key,input.local_path,id,name(media),revision]).await?!=1{return Err(conflict())}id
   }else{tx.execute("INSERT INTO remote_path_mappings(media_type,host,remote_path,remote_kind,remote_key,local_path) VALUES(?,?,?,?,?,?)",params![name(media),input.host,input.remote_path,kind,key,input.local_path]).await?;tx.last_insert_rowid()};
   crate::health::download_roots_changed(&tx, Some(media)).await?;

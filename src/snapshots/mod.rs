@@ -319,6 +319,10 @@ async fn import_inner(
         profiles::finish(&tx, prepared, &mut report).await?;
         tags::write(&tx, &tag_plan, &mut report).await?;
         collections::write(&tx, &collection_plan, &mut report).await?;
+        // Imported library items, root declarations and collection policy share this transaction.
+        crate::health::library_roots_changed(&tx)
+            .await
+            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
         revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
         import_policy::write(&tx, import_policy_plan.as_ref(), &mut report).await?;
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
@@ -357,30 +361,6 @@ fn identifier(s: &str) -> Result<String> {
         return Err(ImportError("unsupported source identifier"));
     }
     Ok(format!("\"{s}\""))
-}
-/// Decodes bytes projected from a TEXT cell according to the source database encoding.
-fn decode_text(bytes: Vec<u8>, encoding: &str) -> Result<String> {
-    const INVALID: ImportError = ImportError("invalid source text encoding");
-    match encoding {
-        "UTF-8" => String::from_utf8(bytes).map_err(|_| ImportError("invalid UTF-8 source text")),
-        "UTF-16le" | "UTF-16be" => {
-            if bytes.len() % 2 != 0 {
-                return Err(INVALID);
-            }
-            let units = bytes
-                .chunks_exact(2)
-                .map(|v| {
-                    if encoding == "UTF-16le" {
-                        u16::from_le_bytes([v[0], v[1]])
-                    } else {
-                        u16::from_be_bytes([v[0], v[1]])
-                    }
-                })
-                .collect::<Vec<_>>();
-            String::from_utf16(&units).map_err(|_| INVALID)
-        }
-        _ => Err(INVALID),
-    }
 }
 async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
     use std::io::Write;
@@ -480,20 +460,19 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
     {
         return Err(ImportError("snapshot integrity check failed"));
     }
-    // The BLOB projection below returns the database's own text encoding, not UTF-8.
-    let encoding: String = conn
-        .query("PRAGMA encoding", ())
-        .await?
-        .next()
-        .await?
-        .ok_or(ImportError("missing text encoding"))?
-        .get(0)?;
     let mut collection_bytes = 0usize;
     if matches!(app, Application::Radarr) {
         for name in tables.keys() {
             collections::preflight(&conn, name, &mut collection_bytes).await?;
         }
     }
+    let encoding: String = conn
+        .query("PRAGMA encoding", ())
+        .await?
+        .next()
+        .await?
+        .ok_or(ImportError("missing source encoding"))?
+        .get(0)?;
     let mut row_count = 0;
     let mut archive_bytes = 0;
     for (name, table) in &mut tables {
@@ -529,7 +508,7 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
                             return Err(ImportError("snapshot exceeds cell limit"));
                         }
                         if kind == "text" {
-                            Value::Text(decode_text(bytes, &encoding)?)
+                            Value::Text(decode_source_text(bytes, &encoding)?)
                         } else {
                             Value::Blob(bytes)
                         }
@@ -562,6 +541,34 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
         .max()
         .ok_or(ImportError("snapshot has no schema version"))?;
     Ok(Source { tables, version })
+}
+
+// CAST(TEXT AS BLOB) preserves source bytes in the database encoding, including NULs.
+fn decode_source_text(raw: Vec<u8>, encoding: &str) -> Result<String> {
+    let invalid = ImportError("invalid source text encoding");
+    let decoded = match encoding {
+        "UTF-8" => String::from_utf8(raw).map_err(|_| invalid)?,
+        "UTF-16le" | "UTF-16be" => {
+            if raw.len() % 2 != 0 {
+                return Err(invalid);
+            }
+            let units = raw.chunks_exact(2).map(|v| {
+                if encoding == "UTF-16le" {
+                    u16::from_le_bytes([v[0], v[1]])
+                } else {
+                    u16::from_be_bytes([v[0], v[1]])
+                }
+            });
+            std::char::decode_utf16(units)
+                .collect::<std::result::Result<String, _>>()
+                .map_err(|_| invalid)?
+        }
+        _ => return Err(invalid),
+    };
+    if decoded.len() > MAX_CELL_BYTES {
+        return Err(ImportError("snapshot exceeds cell limit"));
+    }
+    Ok(decoded)
 }
 
 fn archive(record: &Record) -> Result<String> {
@@ -817,10 +824,6 @@ async fn write(
             Application::Radarr => crate::api::MediaDomain::Movies,
         };
         crate::health::download_roots_changed(conn, if roots_changed { None } else { Some(media) })
-            .await
-            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
-        // Imported library items and roots change hc.034 root derivation for both domains.
-        crate::health::library_roots_changed(conn)
             .await
             .map_err(|_| ImportError("snapshot health invalidation failed"))?;
     }

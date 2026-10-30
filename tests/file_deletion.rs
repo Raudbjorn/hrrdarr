@@ -541,16 +541,7 @@ async fn settings_validate_paths_overlap_revision_and_both_domain_isolation() {
     let (status, body) = app.settings("movies", Some(&bin.join("nested")), 7).await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"]["code"], "recycle_bin_nested");
-    // A shared folder holds both domains' files and the cleanup walk has no media filter, so it
-    // needs one retention period: the shorter one would expire the other's files early.
-    let (status, body) = app.settings("movies", Some(&bin), 7).await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"]["code"], "recycle_bin_retention_conflict");
-    assert_eq!(app.settings("movies", Some(&bin), 0).await.0, 200);
-    // The guard is symmetric: TV cannot change its retention while sharing that folder.
-    let (status, body) = app.settings("tv", Some(&bin), 7).await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"]["code"], "recycle_bin_retention_conflict");
+    assert_eq!(app.settings("movies", Some(&bin), 7).await.0, 200);
     // Inverse guard: a new library declaration inside the bin is refused by storage.
     let c = app.db.connect().await.unwrap();
     assert!(
@@ -717,45 +708,6 @@ async fn cleanup_command_removes_only_expired_files_inside_the_bin() {
     let done = wait_command(&app, queued["id"].as_str().unwrap()).await;
     assert_eq!(done["status"], "failed", "{done}");
     assert_eq!(done["error_code"], "recycle_bin_unavailable");
-    app.stop().await;
-}
-
-/// A bin shared by both domains holds files the walk cannot attribute, so a configuration whose
-/// retention periods disagree is refused instead of expiring the other domain's files early.
-#[tokio::test]
-async fn a_shared_bin_with_disagreeing_retention_is_not_walked() {
-    let (scratch, db, _lib) = sandbox("shared").await;
-    let bin = scratch.0.join("bin");
-    std::fs::create_dir_all(bin.join("Show")).unwrap();
-    let old = bin.join("Show/old.mkv");
-    std::fs::write(&old, b"bytes").unwrap();
-    age(&old, 30);
-    let app = App::start(db).await;
-    assert_eq!(app.settings("tv", Some(&bin), 7).await.0, 200);
-    // Saved straight to storage: the movies domain keeps the same folder with a longer period,
-    // as an installation configured before the retention guard could hold.
-    let c = app.db.connect().await.unwrap();
-    c.execute(
-        "UPDATE recycle_bin_settings SET path=?,cleanup_days=30 WHERE media_type='movies'",
-        [s(&bin)],
-    )
-    .await
-    .unwrap();
-    drop(c);
-    let (_, queued) = app
-        .call(
-            reqwest::Method::POST,
-            "/api/v1/recycle-bin/cleanup-commands",
-            Some(json!({"target":{"media_type":"tv"},"priority":"normal"})),
-        )
-        .await;
-    let done = wait_command(&app, queued["id"].as_str().unwrap()).await;
-    assert_eq!(done["status"], "failed", "{done}");
-    assert_eq!(done["error_code"], "recycle_bin_retention_conflict");
-    assert!(
-        old.exists(),
-        "a shared bin whose periods disagree is not walked"
-    );
     app.stop().await;
 }
 

@@ -40,7 +40,7 @@ deletion and cleanup refuse a missing bin independently of Health. See
 
 ## Library root folders (hc.034)
 
-Migration 0077 (runner position 77) registers three observation-only
+Migration 0080 (runner position 80) registers three observation-only
 identities, all startup + six-hourly scheduled + manual:
 
 | Scope | Check key | Compatibility type | Help link |
@@ -63,8 +63,9 @@ Native behaviour (`src/health/library_roots.rs`):
 
 - TV and movies are evaluated independently from their own `series`/`movies` rows and
   same-domain `root_folders`; numeric IDs never cross domains. Collections are evaluated only in
-  the movies scope and only when `movie_collections.root_folder_id` is set (deleting a root clears
-  it and disables collection monitoring, so there is no dangling reference to report).
+  the movies scope and only when `movie_collection_settings.root_folder_id` is set (deleting a root clears
+  it, disables collection monitoring and advances the settings revision, so there is no dangling
+  reference to report).
 - Items are aggregated per root: each listed root shows its state, affected item count and up to
   three titles, e.g. `Missing root folder: /media/tv (not found; 3 series, e.g. A, B, C). …`. At
   most five roots are listed; the rest are counted (`N more root folders not listed`). Paths are
@@ -89,12 +90,13 @@ Native behaviour (`src/health/library_roots.rs`):
   reported: appended to an Error ("Evaluation was bounded: N series were not evaluated."), or, when
   nothing missing was found, a **Notice** `…_check_truncated` — never a healthy result.
 - Root folder create/delete and snapshot imports mark the root checks of both domains in the
-  same transaction (`health::library_roots_changed`), with the usual five-second debounce. Library
-  item add/move/delete do not mark them; the six-hour schedule and manual runs cover those.
+  same transaction (`health::library_roots_changed`), with the usual five-second debounce. Collection-policy edits, association adoption, cleanup and graph adds mark collection-root
+  health in the same transaction. Library item add/move/delete do not independently mark library
+  root checks; the six-hour schedule and manual runs cover those.
 
 ## Read-only library mounts (hc.035)
 
-Scoped `mount_read_only` identities in `tv` and `movies` (migration 0077), compatibility type
+Scoped `mount_read_only` identities in `tv` and `movies` (migration 0080), compatibility type
 `MountCheck`, help links `https://wiki.servarr.com/sonarr/system#series-mount-ro` and
 `https://wiki.servarr.com/radarr/system#movies-mount-ro`.
 
@@ -158,4 +160,5 @@ nothing. `frontend/tests/health-browser.mjs` asserts a real missing TV root (own
   up to the six-hour schedule unless a manual run or a root-folder mutation occurs.
 - A probe thread stuck on a hung mount cannot be cancelled; at most two such threads per detector
   family are tolerated before evaluations become explicitly unevaluated.
-- No notification delivery is implemented for these observations.
+- These detector tests do not establish notification delivery. Health transitions use the shared
+  notification outbox; provider delivery requires separate verification.

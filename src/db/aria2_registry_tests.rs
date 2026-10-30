@@ -1,4 +1,4 @@
-//! Migration 0073 (Aria2): the registry row on top of the label-family triggers from 0070.
+//! Migration 0072 (Aria2): the registry row on top of the label-family triggers from 0069.
 use super::*;
 
 struct Scratch(PathBuf);
@@ -46,6 +46,21 @@ async fn aria2_registry_row_and_family_scope_rules() -> Result<(), Error> {
         scope("movies", "movies", 2).await.is_err(),
         "placement out of range"
     );
+    for category in [".", ".."] {
+        assert!(
+            scope("movies", category, 0).await.is_err(),
+            "directory traversal insert"
+        );
+        assert!(
+            c.execute(
+                "UPDATE provider_scopes SET category=? WHERE provider_id=? AND media_type='tv'",
+                params![category, id.clone()]
+            )
+            .await
+            .is_err(),
+            "directory traversal update"
+        );
+    }
     scope("movies", "movies", 0).await?;
     Ok(())
 }

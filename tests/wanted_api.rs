@@ -443,6 +443,7 @@ async fn invalid_queries_are_rejected_with_static_errors() {
         "/api/v1/tv/wanted/missing?limit=101",
         "/api/v1/tv/wanted/missing?offset=-1",
         "/api/v1/tv/wanted/missing?offset=2147483648",
+        "/api/v1/tv/wanted/missing?offset=100001",
         "/api/v1/tv/wanted/missing?page=1",
         "/api/v1/tv/wanted/missing?monitored=",
         "/api/v1/tv/wanted/missing?monitored=true",

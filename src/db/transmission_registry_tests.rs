@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -138,15 +138,15 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // all appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
     for (name, kind, protocol) in [
-        ("deluge", "download_client", "torrent"),
-        ("rtorrent", "download_client", "torrent"),
-        ("utorrent", "download_client", "torrent"),
         ("aria2", "download_client", "torrent"),
-        ("flood", "download_client", "torrent"),
+        ("deluge", "download_client", "torrent"),
         ("downloadstation", "download_client", "torrent"),
+        ("flood", "download_client", "torrent"),
         ("nzbget", "download_client", "usenet"),
-        ("transmission", "download_client", "torrent"),
+        ("rtorrent", "download_client", "torrent"),
         ("torrentrss", "indexer", "torrent"),
+        ("transmission", "download_client", "torrent"),
+        ("utorrent", "download_client", "torrent"),
     ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),
@@ -285,6 +285,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     Ok(())
 }

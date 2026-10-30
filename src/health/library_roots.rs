@@ -287,8 +287,8 @@ async fn scan(db: &Database, kind: Kind, limits: &Limits) -> Result<Scan, &'stat
             "SELECT substr(m.path,1,?),substr(mm.title,1,?) FROM movies m LEFT JOIN movie_metadata mm ON mm.id=m.metadata_id ORDER BY m.id LIMIT ?",
         ),
         Kind::Collections => (
-            "SELECT count(*) FROM movie_collections WHERE root_folder_id IS NOT NULL",
-            "SELECT substr(r.path,1,?),substr(c.title,1,?) FROM movie_collections c JOIN root_folders r ON r.id=c.root_folder_id ORDER BY c.id LIMIT ?",
+            "SELECT count(*) FROM movie_collection_settings WHERE root_folder_id IS NOT NULL",
+            "SELECT substr(r.path,1,?),substr(c.title,1,?) FROM movie_collection_settings s JOIN movie_collections c ON c.id=s.collection_id JOIN root_folders r ON r.id=s.root_folder_id ORDER BY c.id LIMIT ?",
         ),
     };
     let c = db.connect().await.map_err(storage)?;

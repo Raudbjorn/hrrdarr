@@ -40,7 +40,8 @@ export const MOVIE_TRIGGERS: readonly TriggerDef<MovieNotificationTriggers>[] = 
 export const MAX_NAME_BYTES = 128;
 export const MAX_TAGS = 200;
 
-export type DraftValue = string | number | boolean;
+/** `null` is what Svelte's `bind:value` yields for a cleared number input. */
+export type DraftValue = string | number | boolean | null;
 export type NotificationDraft = {
   id?: string; revision?: number; name: string; implementation: string; enabled: boolean;
   settings: Record<string, DraftValue>;
@@ -76,6 +77,7 @@ export function draftFromNotification(n: Notification, impl: NotificationImpleme
 }
 
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const HTTP_URL = /^https?:\/\/[^/\s@]+/i;
 const fail = <T>(error: string): Result<T> => ({ ok: false, error });
 
 /** Client mirror of server validation; the server stays authoritative. */
@@ -97,13 +99,14 @@ export function buildInput(draft: NotificationDraft, impl: NotificationImplement
   for (const [on, tags] of [[draft.tv.on, draft.tv.tagIds], [draft.movies.on, draft.movies.tagIds]] as const)
     if (on && (tags.length > MAX_TAGS || new Set(tags).size !== tags.length || tags.some(t => !Number.isSafeInteger(t) || t < 1)))
       return fail(`Tags require at most ${MAX_TAGS} distinct positive IDs.`);
-  const settings: Record<string, DraftValue> = {};
+  const settings: Record<string, Exclude<DraftValue, null>> = {};
   const secrets: Record<string, string | null> = {};
   for (const f of impl.fields) {
     if (f.secret) {
       const typed = draft.secrets[f.name] ?? '';
       if (typed !== '') {
         if (typed !== typed.trim() || CONTROL.test(typed)) return fail(`${f.label} must not contain control characters or surrounding whitespace.`);
+        if (f.kind === 'url' && !HTTP_URL.test(typed)) return fail(`${f.label} must be an http(s) URL without credentials.`);
         secrets[f.name] = typed;
       } else if (draft.cleared.includes(f.name)) secrets[f.name] = null;
       const after = f.name in secrets ? secrets[f.name] !== null : storedSecrets.includes(f.name);
@@ -113,7 +116,8 @@ export function buildInput(draft: NotificationDraft, impl: NotificationImplement
     const value = draft.settings[f.name];
     if (f.kind === 'boolean') { settings[f.name] = value === true; continue; }
     if (f.kind === 'number') {
-      if (value === undefined || value === '') { if (f.required) return fail(`${f.label} is required.`); continue; }
+      // A cleared input is unset, never Number(null) === 0.
+      if (value === undefined || value === null || value === '') { if (f.required) return fail(`${f.label} is required.`); continue; }
       const n = typeof value === 'number' ? value : Number(value);
       if (!Number.isSafeInteger(n) || (f.min !== null && n < f.min) || (f.max !== null && n > f.max))
         return fail(`${f.label} must be a whole number from ${f.min ?? '-∞'} to ${f.max ?? '∞'}.`);
@@ -124,7 +128,7 @@ export function buildInput(draft: NotificationDraft, impl: NotificationImplement
     if (text !== text.trim() || CONTROL.test(text)) return fail(`${f.label} must not contain control characters or surrounding whitespace.`);
     if (f.max_length !== null && new TextEncoder().encode(text).length > f.max_length) return fail(`${f.label} is too long.`);
     if (f.kind === 'select' && !f.options.includes(text)) return fail(`${f.label} must be one of ${f.options.join(', ')}.`);
-    if (f.kind === 'url' && text !== '' && !/^https?:\/\/[^/\s@]+/i.test(text)) return fail(`${f.label} must be an http(s) URL without credentials.`);
+    if (f.kind === 'url' && text !== '' && !HTTP_URL.test(text)) return fail(`${f.label} must be an http(s) URL without credentials.`);
     if (f.kind === 'path' && text !== '' && (!text.startsWith('/') || text.split('/').some(p => p === '.' || p === '..'))) return fail(`${f.label} must be an absolute path without . or .. segments.`);
     if (text !== '') settings[f.name] = text;
   }

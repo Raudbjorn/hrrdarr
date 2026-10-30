@@ -8,7 +8,7 @@ independently; equal numeric file IDs in the two domains never select each other
 ## Settings
 
 `GET`/`PUT /api/v1/{tv|movies}/recycle-bin` reads and writes
-`{media_type, revision, path, cleanup_days, next_cleanup_at}`. A write must send the current
+`{media_type, revision, path, cleanup_days}`. A write must send the current
 `revision` (compare-and-swap; a stale revision returns 409 `recycle_bin_conflict`) and an explicit
 `path` (`null` clears the bin). `cleanup_days` is 0–36500; 0 disables automatic cleanup.
 
@@ -16,11 +16,8 @@ A path must be absolute, normalized (no `.`/`..`, repeated or trailing separator
 characters), at most 4096 bytes and not `/`. It must not equal, contain or lie inside any root
 folder, series folder or movie folder of either domain. Both directions are enforced: the settings
 write checks Rust and SQL, and root-folder/series/movie insert and update triggers refuse a library
-path that would overlap a configured bin. TV and movies may share one bin but cannot nest. A shared
-bin requires the same cleanup period in both domains; a differing period is refused with 409
-`recycle_bin_retention_conflict`, and a cleanup run fails rather than deleting the other domain's
-files. Overlap is lexical; bind mounts or symlinked aliases of the same directory are not detected.
-Saving does
+path that would overlap a configured bin. TV and movies may share one bin but cannot nest. Overlap
+is lexical; bind mounts or symlinked aliases of the same directory are not detected. Saving does
 not create the folder: Health reports a missing or unwritable bin.
 
 The first scheduled cleanup is one day after choosing or changing the path. The UI is under
@@ -160,11 +157,15 @@ Cleanup opens the bin without following symlinks and walks descriptor-relative. 
 files whose mtime is at least `cleanup_days` old, then empty subfolders. It never follows or removes
 symlinks, special files, entries on another mount or in-progress `.partial` files, and never touches
 anything outside the bin. Everything already in the bin counts, not only files hrrdarr moved there.
-Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 60 s); a bounded run reports
+When TV and movies share one bin path, the cleanup uses the longest applicable retention across
+both domains. A domain with `cleanup_days=0` disables cleanup for the shared path because the
+filesystem layout does not identify ownership per entry; use separate bins when independent
+retention or cleanup-disabled behavior is required. This is an hrrdarr rule: upstream keeps one
+global cleanup-days setting for the whole bin.
+Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 30 s); a bounded run reports
 `bounded` and leaves the rest for the next run. Outcomes: `cleaned`, `not_configured`, `disabled`;
-a missing bin fails with `recycle_bin_unavailable`, and a shared bin whose domains disagree on
-retention fails with `recycle_bin_retention_conflict` without deleting anything. Cleanup waits
-(retry) while a file operation holds the effect permit.
+a missing bin fails with `recycle_bin_unavailable`. Cleanup waits (retry) while a file operation
+holds the effect permit.
 
 ## Health
 

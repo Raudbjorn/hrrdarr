@@ -562,6 +562,20 @@ fn valid_sql(column: &str) -> String {
         "(unixepoch({column}) IS NOT NULL AND date(substr({column},1,10))=substr({column},1,10))"
     )
 }
+/// SQLite's second-valued `unixepoch()` can round a fractional timestamp across a second
+/// boundary. Strip only the fraction (and preserve any UTC offset) so the SQL candidate is
+/// the exact second containing the instant; whole-second window bounds then match Rust.
+fn floor_unixepoch_sql(column: &str) -> String {
+    format!(
+        "unixepoch(CASE
+            WHEN substr({column},-1)='Z' THEN substr({column},1,19)||'Z'
+            WHEN substr({column},-6) GLOB '[+-][0-9][0-9]:[0-9][0-9]'
+                THEN substr({column},1,19)||substr({column},-6)
+            WHEN instr({column},'.')>0 THEN substr({column},1,19)
+            ELSE {column}
+        END)"
+    )
+}
 fn id_list(ids: &BTreeSet<i64>) -> String {
     // Only validated integers are formatted into SQL.
     ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
@@ -657,9 +671,10 @@ async fn select_tv(
         libsql::params![day(&window.first_date), day(&window.end_date)],
     )
     .await?;
+    let candidate = floor_unixepoch_sql("e.air_date_utc");
     let mut rows = c
         .query(
-            &format!("{TV_COLUMNS}{from} WHERE e.air_date_utc IS NOT NULL AND {valid} AND unixepoch(e.air_date_utc)>=?1 AND unixepoch(e.air_date_utc)<?2 AND {filter} ORDER BY unixepoch(e.air_date_utc),e.id LIMIT ?3"),
+            &format!("{TV_COLUMNS}{from} WHERE e.air_date_utc IS NOT NULL AND {valid} AND {candidate}>=?1 AND {candidate}<?2 AND {filter} ORDER BY {candidate},e.id LIMIT ?3"),
             libsql::params![window.start.timestamp(), window.end.timestamp(), cap as i64 + 1],
         )
         .await?;
@@ -671,11 +686,13 @@ async fn select_tv(
         }
         let raw: String = row.get(16)?;
         // SQLite's reader is permissive (e.g. day 30 of February); Rust decides validity.
-        let Some(start) = stored_instant(&raw).filter(|t| *t >= window.start && *t < window.end)
-        else {
+        let Some(start) = stored_instant(&raw) else {
             invalid_selected += 1;
             continue;
         };
+        if start < window.start || start >= window.end {
+            continue;
+        }
         let id: i64 = row.get(0)?;
         let series_monitored = row.get::<i64>(3)? == 1;
         let monitored = row.get::<i64>(14)? == 1;
@@ -783,7 +800,8 @@ async fn select_movies(
         .iter()
         .map(|kind| {
             let col = kind.column();
-            format!("SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,d.studio,d.runtime,f.id,{},d.{col},unixepoch(d.{col}){from} WHERE d.{col} IS NOT NULL AND {} AND unixepoch(d.{col})>=?1 AND unixepoch(d.{col})<?2 AND {filter}", kind.order(), valid_sql(&format!("d.{col}")))
+            let candidate = floor_unixepoch_sql(&format!("d.{col}"));
+            format!("SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,d.studio,d.runtime,f.id,{},d.{col},{candidate}{from} WHERE d.{col} IS NOT NULL AND {} AND {candidate}>=?1 AND {candidate}<?2 AND {filter}", kind.order(), valid_sql(&format!("d.{col}")))
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
@@ -810,13 +828,14 @@ async fn select_movies(
             _ => return Err(state_invalid()),
         };
         let raw: String = row.get(12)?;
-        let Some((released, date)) = stored_instant(&raw)
-            .map(|t| (t, t.date_naive()))
-            .filter(|(_, d)| *d >= window.first_date && *d < window.end_date)
-        else {
+        let Some(released) = stored_instant(&raw) else {
             invalid_selected += 1;
             continue;
         };
+        let date = released.date_naive();
+        if date < window.first_date || date >= window.end_date {
+            continue;
+        }
         let id: i64 = row.get(0)?;
         items.push(MovieCalendarEntry {
             event_id: format!("movie-{id}-{}", kind.key()),
@@ -1237,5 +1256,59 @@ mod tests {
         ] {
             assert!(stored_instant(raw).is_none(), "{raw}");
         }
+    }
+
+    #[tokio::test]
+    async fn fractional_boundary_timestamps_stay_in_the_exact_window_without_invalid_diagnostics() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let c = db.connect().unwrap();
+        c.execute_batch(
+            "CREATE TABLE series(id INTEGER PRIMARY KEY,title TEXT,monitored INTEGER,network TEXT,runtime INTEGER);
+             CREATE TABLE seasons(series_id INTEGER,number INTEGER,monitored INTEGER);
+             CREATE TABLE library_settings(media_type TEXT,series_id INTEGER,series_type TEXT);
+             CREATE TABLE episode_files(id INTEGER PRIMARY KEY,series_id INTEGER);
+             CREATE TABLE episodes(id INTEGER PRIMARY KEY,series_id INTEGER,season INTEGER,number INTEGER,title TEXT,monitored INTEGER,air_date TEXT,air_date_utc TEXT,runtime INTEGER,episode_file_id INTEGER,overview TEXT,finale_type TEXT,absolute_episode_number INTEGER);
+             CREATE TABLE rss_candidate_imports(old_episode_file_id INTEGER,operation_id TEXT,retirement_state TEXT);
+             CREATE TABLE scan_import_replacements(media_type TEXT,old_episode_file_id INTEGER,retirement_state TEXT);
+             CREATE TABLE same_path_replacements(operation_id TEXT,state TEXT);
+             CREATE TABLE import_journal(operation_id TEXT,phase TEXT);
+             CREATE TABLE movie_metadata(id INTEGER PRIMARY KEY,title TEXT,year INTEGER,tmdb_id INTEGER,imdb_id TEXT,status TEXT,studio TEXT,runtime INTEGER,in_cinemas TEXT,digital_release TEXT,physical_release TEXT);
+             CREATE TABLE movies(id INTEGER PRIMARY KEY,metadata_id INTEGER,monitored INTEGER);
+             CREATE TABLE movie_files(id INTEGER PRIMARY KEY,movie_id INTEGER);
+             INSERT INTO series VALUES(1,'Series',1,NULL,NULL);
+             INSERT INTO seasons VALUES(1,1,1);
+             INSERT INTO library_settings VALUES('tv',1,'standard');
+             INSERT INTO episodes(id,series_id,season,number,title,monitored,air_date,air_date_utc) VALUES(1,1,1,1,'Episode',1,'2026-10-31','2026-10-31T23:59:59.9995Z');
+             INSERT INTO movie_metadata(id,title,year,digital_release) VALUES(1,'Movie',2026,'2026-10-31T23:59:59.9995Z');
+             INSERT INTO movies VALUES(1,1,1);",
+        )
+        .await
+        .unwrap();
+
+        let (tv, october) = list_q("start=2026-10-01&end=2026-11-01", MediaDomain::Tv).unwrap();
+        let (_, november) = list_q("start=2026-11-01&end=2026-12-01", MediaDomain::Tv).unwrap();
+        let october = select_tv(&c, &tv, &october, MAX_ENTRIES).await.unwrap();
+        let november = select_tv(&c, &tv, &november, MAX_ENTRIES).await.unwrap();
+        assert_eq!(october.items.len(), 1);
+        assert!(november.items.is_empty());
+        assert_eq!(october.diagnostics.invalid_dates, 0);
+        assert_eq!(november.diagnostics.invalid_dates, 0);
+
+        let (movies, october) =
+            list_q("start=2026-10-01&end=2026-11-01", MediaDomain::Movies).unwrap();
+        let (_, november) = list_q("start=2026-11-01&end=2026-12-01", MediaDomain::Movies).unwrap();
+        let october = select_movies(&c, &movies, &october, MAX_ENTRIES)
+            .await
+            .unwrap();
+        let november = select_movies(&c, &movies, &november, MAX_ENTRIES)
+            .await
+            .unwrap();
+        assert_eq!(october.items.len(), 1);
+        assert!(november.items.is_empty());
+        assert_eq!(october.diagnostics.invalid_dates, 0);
+        assert_eq!(november.diagnostics.invalid_dates, 0);
     }
 }

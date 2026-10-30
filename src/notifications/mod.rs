@@ -22,7 +22,8 @@ pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> axum::Route
     )))
 }
 
-/// Starts the outbox worker. Only the process that owns the database should call this.
+/// Starts the outbox worker. Every server process may run one: fan-out is idempotent and a
+/// delivery is claimed under a lease, so processes that share a database do not duplicate a send.
 pub fn start(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> dispatcher::Handle {
     dispatcher::start(dispatcher::Dispatcher::new(
         db,

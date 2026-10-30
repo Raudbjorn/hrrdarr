@@ -84,12 +84,17 @@ CREATE TABLE notification_deliveries (
  id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id)='integer' AND id BETWEEN 1 AND 9007199254740991),
  event_sequence INTEGER NOT NULL REFERENCES notification_events(sequence) ON DELETE CASCADE,
  notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+ -- The scope that matched at fan-out; a system event is rendered for this domain.
+ media_type TEXT NOT NULL CHECK(media_type IN ('tv','movies')),
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','delivered','failed')),
  attempts INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempts)='integer' AND attempts BETWEEN 0 AND 16),
  next_attempt_at INTEGER NOT NULL CHECK(typeof(next_attempt_at)='integer' AND next_attempt_at BETWEEN 0 AND 9007199254740991),
  -- A claimed delivery that was never resolved (process crash) becomes claimable again here.
  lease_until INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lease_until)='integer' AND lease_until BETWEEN 0 AND 9007199254740991),
  last_error TEXT CHECK(last_error IS NULL OR (length(last_error) BETWEEN 1 AND 64 AND last_error NOT GLOB '*[^a-z0-9_]*')),
+ -- Fingerprints of the requests of a multi-request delivery already acknowledged, so a retry
+ -- re-sends only the rest.
+ sent_parts TEXT NOT NULL DEFAULT '[]' CHECK(typeof(sent_parts)='text' AND length(sent_parts)<=16384 AND json_valid(sent_parts) AND json_type(sent_parts)='array'),
  created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at BETWEEN 0 AND 9007199254740991),
  completed_at INTEGER CHECK(completed_at IS NULL OR (typeof(completed_at)='integer' AND completed_at BETWEEN 0 AND 9007199254740991)),
  UNIQUE(event_sequence,notification_id),
@@ -177,14 +182,16 @@ BEGIN
 END;
 -- File delete. The reason is derived from the journals the deleting paths already keep:
 -- an explicit deletion request is Manual, a replaced file is Upgrade, anything else is a
--- file that vanished from disk and was reconciled away.
+-- file that vanished from disk and was reconciled away. Only an unfinished deletion journal
+-- counts: the deleting transaction removes the row while the journal is still admitted or
+-- copied, an aborted request kept the file, and file ids can be reused after a completed one.
 CREATE TRIGGER notification_event_episode_file_delete BEFORE DELETE ON episode_files
 WHEN EXISTS(SELECT 1 FROM notification_scopes s JOIN notifications n ON n.id=s.notification_id WHERE n.enabled=1 AND s.media_type='tv' AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
 BEGIN
  INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
  VALUES('file_delete','tv',OLD.series_id,
   json_object('episode_file_id',OLD.id,'path',OLD.path,
-   'reason',CASE WHEN EXISTS(SELECT 1 FROM file_deletions d WHERE d.media_type='tv' AND d.file_id=OLD.id) THEN 'Manual'
+   'reason',CASE WHEN EXISTS(SELECT 1 FROM file_deletions d WHERE d.media_type='tv' AND d.file_id=OLD.id AND d.phase IN ('admitted','copied','committed')) THEN 'Manual'
      WHEN EXISTS(SELECT 1 FROM scan_import_replacements r WHERE r.old_episode_file_id=OLD.id) OR EXISTS(SELECT 1 FROM rss_candidate_imports r WHERE r.old_episode_file_id=OLD.id) THEN 'Upgrade'
      WHEN NOT EXISTS(SELECT 1 FROM episodes e WHERE e.episode_file_id=OLD.id) THEN 'NoLinkedEpisodes'
      ELSE 'MissingFromDisk' END),
@@ -196,10 +203,64 @@ BEGIN
  INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
  VALUES('file_delete','movies',OLD.movie_id,
   json_object('movie_file_id',OLD.id,'path',OLD.path,
-   'reason',CASE WHEN EXISTS(SELECT 1 FROM file_deletions d WHERE d.media_type='movies' AND d.file_id=OLD.id) THEN 'Manual'
+   'reason',CASE WHEN EXISTS(SELECT 1 FROM file_deletions d WHERE d.media_type='movies' AND d.file_id=OLD.id AND d.phase IN ('admitted','copied','committed')) THEN 'Manual'
      WHEN EXISTS(SELECT 1 FROM scan_import_replacements r WHERE r.old_movie_file_id=OLD.id) OR EXISTS(SELECT 1 FROM rss_candidate_imports r WHERE r.old_movie_file_id=OLD.id) THEN 'Upgrade'
      ELSE 'MissingFromDisk' END),
   (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=OLD.movie_id),CAST(strftime('%s','now') AS INTEGER));
+END;
+-- Upgrade retirement. Upgrade paths reuse or retain file rows instead of deleting them, so the
+-- row-delete triggers cannot observe the replacement. Retirement is the atomic point at which
+-- the original leaves the library; emit the documented Upgrade file-delete event here.
+CREATE TRIGGER notification_event_upgrade_file_delete_rss AFTER UPDATE OF retirement_state ON rss_candidate_imports
+WHEN NEW.retirement_state='quarantined'
+ AND OLD.retirement_state IS NOT 'quarantined'
+ AND NEW.old_file_json IS NOT NULL
+ AND EXISTS(
+  SELECT 1 FROM notification_scopes s
+  JOIN notifications n ON n.id=s.notification_id
+  WHERE n.enabled=1
+    AND s.media_type=CASE WHEN NEW.old_episode_file_id IS NOT NULL THEN 'tv' ELSE 'movies' END
+    AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','tv',f.series_id,
+  json_object('episode_file_id',NEW.old_episode_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM series_tags WHERE series_id=f.series_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM episode_files f
+ WHERE NEW.old_episode_file_id IS NOT NULL AND f.id=NEW.old_episode_file_id;
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','movies',f.movie_id,
+  json_object('movie_file_id',NEW.old_movie_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=f.movie_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM movie_files f
+ WHERE NEW.old_movie_file_id IS NOT NULL AND f.id=NEW.old_movie_file_id;
+END;
+CREATE TRIGGER notification_event_upgrade_file_delete_scan AFTER UPDATE OF retirement_state ON scan_import_replacements
+WHEN NEW.retirement_state='quarantined'
+ AND OLD.retirement_state IS NOT 'quarantined'
+ AND EXISTS(
+  SELECT 1 FROM notification_scopes s
+  JOIN notifications n ON n.id=s.notification_id
+  WHERE n.enabled=1
+    AND s.media_type=NEW.media_type
+    AND (s.on_file_delete=1 OR s.on_file_delete_for_upgrade=1))
+BEGIN
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','tv',f.series_id,
+  json_object('episode_file_id',NEW.old_episode_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM series_tags WHERE series_id=f.series_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM episode_files f
+ WHERE NEW.media_type='tv' AND NEW.old_episode_file_id IS NOT NULL AND f.id=NEW.old_episode_file_id;
+ INSERT INTO notification_events(kind,scope,subject_id,payload_json,tag_ids_json,created_at)
+ SELECT 'file_delete','movies',f.movie_id,
+  json_object('movie_file_id',NEW.old_movie_file_id,'path',json_extract(NEW.old_file_json,'$.path'),'reason','Upgrade'),
+  (SELECT json_group_array(tag_id) FROM movie_tags WHERE movie_id=f.movie_id),
+  CAST(strftime('%s','now') AS INTEGER)
+ FROM movie_files f
+ WHERE NEW.media_type='movies' AND NEW.old_movie_file_id IS NOT NULL AND f.id=NEW.old_movie_file_id;
 END;
 -- Health: only transitions outside the startup grace window are real state changes. The health
 -- ring keeps 1024 rows and is explicitly not a delivery outbox, so this copies what is needed.

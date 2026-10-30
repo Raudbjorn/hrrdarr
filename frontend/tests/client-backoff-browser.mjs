@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-// Reasoning: 0082 registers root_folder and mount_read_only per domain plus movies collection_root_folder, so scoped registries differ (tv 14, movies 15).
+// Reasoning: 0080 registers root_folder and mount_read_only per domain plus movies collection_root_folder, so scoped registries differ (tv 14, movies 15).
 const scopedChecks=domain=>domain==='tv'?14:15;
 const origin=process.env.UI_URL,remote=process.env.UI_PROVIDER_ORIGIN;
 for(const value of [origin,remote])assert.equal(new URL(value).hostname,'127.0.0.1');
@@ -27,7 +27,7 @@ async function healthFor(domain){
  await nav.getByRole('button',{name:'Health',exact:true}).click();await idle(health);await health.getByLabel('Health scope').selectOption(domain);await idle(health);
  const response=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await health.getByRole('button',{name:`Run ${domain} health checks`,exact:true}).click();const reply=await response;assert.equal(reply.status(),202);const admission=await reply.json();// Reasoning: migration 0053 added remote_path_mapping, so each domain registers 11 checks.
-assert.equal(admission.selection.length,scopedChecks(domain)); // Reasoning: 0082 adds root_folder and mount_read_only per domain and movies-only collection_root_folder (tv 12 -> 14, movies 12 -> 15).
+assert.equal(admission.selection.length,scopedChecks(domain)); // Reasoning: 0080 adds root_folder and mount_read_only per domain and movies-only collection_root_folder (tv 12 -> 14, movies 12 -> 15).
  // Reasoning: 0059 adds recycle_bin per domain (11 -> 12).
  const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===scopedChecks(domain)&&!s.active_command&&admission.selection.every(token=>s.checks.some(c=>c.identity.check_key===token.identity.check_key&&c.observed_generation>=token.generation)),'Scoped health did not settle');
  await health.getByRole('button',{name:'Refresh health',exact:true}).click();await idle(health);return snapshot;

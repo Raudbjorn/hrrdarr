@@ -56,6 +56,13 @@ impl Field {
         f.max_length = Some(1024);
         f
     }
+    /// A URL that embeds a credential (a chat webhook): stored as a secret, but validated against
+    /// the URL and host policy when written, like any other URL setting.
+    pub(super) fn secret_url(name: &'static str, label: &'static str) -> Self {
+        let mut f = Self::url(name, label);
+        f.secret = true;
+        f
+    }
     pub(super) fn number(name: &'static str, label: &'static str, min: i64, max: i64) -> Self {
         let mut f = Self::new(name, label, FieldKind::Number);
         f.min = Some(min);

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE||'/usr/lib/node_modules/playwright/index.mjs').href);
-// Reasoning: 0082 registers root_folder and mount_read_only per domain plus movies collection_root_folder, so scoped registries differ (tv 14, movies 15).
+// Reasoning: 0080 registers root_folder and mount_read_only per domain plus movies collection_root_folder, so scoped registries differ (tv 14, movies 15).
 const scopedChecks=domain=>domain==='tv'?14:15;
 const origin=process.env.UI_URL,metadata=process.env.UI_METADATA_ORIGIN;
 for(const value of [origin,metadata])assert.equal(new URL(value).hostname,'127.0.0.1');
@@ -44,7 +44,7 @@ async function run(domain){
  const reply=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/health/commands'&&r.request().method()==='POST');
  await button.focus();await page.keyboard.press('Enter');const response=await reply;assert.equal(response.status(),202);
  const admission=await response.json();assert.equal(admission.requested_scope,domain);// Reasoning: migration 0053 added remote_path_mapping, so each domain registers 11 checks.
-assert.equal(admission.selection.length,scopedChecks(domain)); // Reasoning: 0082 adds root_folder and mount_read_only per domain and movies-only collection_root_folder (tv 12 -> 14, movies 12 -> 15).
+assert.equal(admission.selection.length,scopedChecks(domain)); // Reasoning: 0080 adds root_folder and mount_read_only per domain and movies-only collection_root_folder (tv 12 -> 14, movies 12 -> 15).
  // Reasoning: 0059 adds recycle_bin per domain (11 -> 12). // Reasoning: 0051 adds client backoff to the nine existing checks.
  // A scheduled batch may win admission; verify every requested generation rather than assuming a new command ID.
  const snapshot=await until(()=>get(`/api/v1/health?scope=${domain}`),s=>s.summary.current===scopedChecks(domain)&&!s.active_command&&admission.selection.every(token=>s.checks.some(check=>check.identity.scope===token.identity.scope&&check.identity.check_key===token.identity.check_key&&check.observed_generation>=token.generation)),'Scoped requested generations not current');await refreshHealth();return snapshot;

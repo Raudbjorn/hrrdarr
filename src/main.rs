@@ -167,18 +167,17 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
-    let notifier = state
-        .db
-        .permits_local_imports()
-        .then(|| hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone()));
+    // The notification dispatcher owns no library file, so it runs in every server process: fan-out
+    // is idempotent (one delivery row per event and notification) and a delivery is claimed under
+    // a lease, so several processes over one remote database do not duplicate a send. The command
+    // worker stays gated on local ownership because it moves media files.
+    let notifier = hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone());
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
-    if let Some(notifier) = notifier {
-        notifier.shutdown().await;
-    }
+    notifier.shutdown().await;
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }

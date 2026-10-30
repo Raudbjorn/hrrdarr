@@ -171,7 +171,20 @@ fn torrent(row: &Value, labels: &[String]) -> Result<RawTorrent> {
     }
     let name = text("name", 1024)?;
     let size = int("sizeBytes");
-    let done = int("bytesDone").min(size);
+    let status: Vec<&str> = row
+        .get("status")
+        .and_then(Value::as_array)
+        .map(|s| s.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let has = |s: &str| status.contains(&s);
+    // A torrent with skipped files can finish with `bytesDone` below `sizeBytes`; when Flood
+    // itself reports it complete, its own indication decides rather than the raw byte counts
+    // (per-file progress and wanted flags still come from the contents listing).
+    let done = if has("complete") {
+        size
+    } else {
+        int("bytesDone").min(size)
+    };
     let tags: Vec<&str> = row
         .get("tags")
         .and_then(Value::as_array)
@@ -189,12 +202,6 @@ fn torrent(row: &Value, labels: &[String]) -> Result<RawTorrent> {
         .find(|t| labels.iter().any(|l| l.eq_ignore_ascii_case(t)))
         .or_else(|| tags.first())
         .map_or(String::new(), |t| (*t).to_owned());
-    let status: Vec<&str> = row
-        .get("status")
-        .and_then(Value::as_array)
-        .map(|s| s.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let has = |s: &str| status.contains(&s);
     let state = if has("checking") {
         RawState::Checking
     } else if has("error") {
@@ -210,14 +217,10 @@ fn torrent(row: &Value, labels: &[String]) -> Result<RawTorrent> {
     } else {
         RawState::Stalled
     };
-    let mut save_path = text("directory", 4096)?.replace('\\', "/");
-    // For a multi-file torrent the directory is the torrent's own folder; the engine's file paths
-    // are relative to the folder that contains it.
-    if let Some((parent, last)) = save_path.rsplit_once('/') {
-        if last == name && !parent.is_empty() {
-            save_path = parent.to_owned();
-        }
-    }
+    // Flood resolves a content path by joining it onto the torrent's `directory`
+    // (`path.join(torrent.directory, content.path)`), wherever the torrent was moved to. The pair
+    // is therefore kept exactly as reported: neither side is rewritten to guess a folder layout.
+    let save_path = text("directory", 4096)?.replace('\\', "/");
     let eta = row.get("eta").and_then(Value::as_i64).unwrap_or(-1);
     Ok(RawTorrent {
         hash,
@@ -282,7 +285,8 @@ impl Wire for FloodWire<'_, '_> {
         Ok(self.all().await?.into_iter().find(|t| t.hash == hash))
     }
     async fn files(&mut self, hash: &str) -> Result<Vec<RawFile>> {
-        let torrent = self.get(hash).await?.ok_or(QbitError::NotFound)?;
+        // The torrent must still exist; its `directory` is the base of every content path.
+        self.get(hash).await?.ok_or(QbitError::NotFound)?;
         let value = self
             .get_json(&format!(
                 "/api/torrents/{}/contents",
@@ -293,7 +297,6 @@ impl Wire for FloodWire<'_, '_> {
         if files.len() > MAX_FILES {
             return Err(QbitError::InvalidResponse);
         }
-        let single = files.len() == 1;
         files
             .iter()
             .map(|f| {
@@ -315,11 +318,7 @@ impl Wire for FloodWire<'_, '_> {
                 // Flood's priority 0 means "do not download".
                 let priority = f.get("priority").and_then(Value::as_i64).unwrap_or(1);
                 Ok(RawFile {
-                    path: if single || name.starts_with(&format!("{}/", torrent.name)) {
-                        name
-                    } else {
-                        format!("{}/{name}", torrent.name)
-                    },
+                    path: name,
                     size_bytes: size,
                     downloaded_bytes: (size as f64 * percent / 100.0) as u64,
                     wanted: priority > 0,

@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -136,7 +136,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
         "SELECT * FROM sqlite_sequence ORDER BY name,seq",
         // Metadata45 appends nullable facts; preserve every predecessor series column by name.
         "SELECT id,tvdb_id,title,year,path,poster,monitored,original_language FROM series ORDER BY id",
-        // 0076 wanted_last_search appends native_last_search_at; preserve predecessor columns by name.
+        // 0079 wanted_last_search appends native_last_search_at; preserve predecessor columns by name.
         "SELECT id,series_id,season,number,title,episode_file_id,monitored,tvdb_id,air_date,air_date_utc,last_search_time,runtime,finale_type,overview,absolute_episode_number,scene_absolute_episode_number,scene_episode_number,scene_season_number,unverified_scene_numbering,images_json FROM episodes ORDER BY id",
         "SELECT id,metadata_id,path,monitored FROM movies ORDER BY id",
         "SELECT * FROM root_folders ORDER BY id",
@@ -181,8 +181,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0077 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
+        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");

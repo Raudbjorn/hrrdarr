@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 const DEFAULT_LIMIT: u16 = 50;
 const MAX_LIMIT: u16 = 100;
-const MAX_OFFSET: u32 = 2_147_483_647;
+const MAX_OFFSET: u32 = 100_000;
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -412,7 +412,7 @@ fn parse_query(raw: Option<&str>, media: MediaDomain, kind: WantedKind) -> Resul
             "offset" => {
                 query.offset = digits::<u32>(&value, 10)
                     .filter(|v| *v <= MAX_OFFSET)
-                    .ok_or_else(|| invalid("offset must be an integer from 0 to 2147483647"))?
+                    .ok_or_else(|| invalid("offset must be an integer from 0 to 100000"))?
             }
             "monitored" => {
                 query.filter.monitored = match value.as_ref() {
@@ -1177,6 +1177,7 @@ mod tests {
             ("limit=101", MediaDomain::Tv, WantedKind::Missing),
             ("limit=+5", MediaDomain::Tv, WantedKind::Missing),
             ("offset=2147483648", MediaDomain::Tv, WantedKind::Missing),
+            ("offset=100001", MediaDomain::Tv, WantedKind::Missing),
             ("offset=", MediaDomain::Tv, WantedKind::Missing),
             ("page=1", MediaDomain::Tv, WantedKind::Missing),
             ("sort=title", MediaDomain::Tv, WantedKind::Missing),
@@ -1210,7 +1211,7 @@ mod tests {
     #[test]
     fn query_accepts_documented_keys() {
         let q = parse(
-            "limit=100&offset=2147483647&monitored=unmonitored&sort=quality&direction=desc",
+            "limit=100&offset=100000&monitored=unmonitored&sort=quality&direction=desc",
             MediaDomain::Tv,
             WantedKind::Cutoff,
         )

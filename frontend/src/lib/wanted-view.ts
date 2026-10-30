@@ -110,3 +110,11 @@ export function retainVisible(selection: ReadonlySet<number>, visible: readonly 
   const keep = new Set(visible);
   return new Set([...selection].filter((id) => keep.has(id)));
 }
+
+/** Two search requests are the same work when everything except the request identity matches. */
+export function sameWantedWork(a: WantedSearchInput, b: WantedSearchInput): boolean {
+  return a.kind === b.kind && a.indexer_id === b.indexer_id && a.indexer_revision === b.indexer_revision
+    && a.priority === b.priority
+    && JSON.stringify(a.client_selection) === JSON.stringify(b.client_selection)
+    && JSON.stringify(a.selection) === JSON.stringify(b.selection);
+}

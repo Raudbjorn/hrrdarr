@@ -1840,22 +1840,21 @@ fn scan_path_excluded(file: ScanFileInput<'_>, tv: bool) -> bool {
     {
         return true;
     }
-    if let Some((stem, _)) = basename.rsplit_once('.') {
-        if let Some((_, suffix)) = stem.rsplit_once('-') {
-            if matches!(
-                suffix,
-                "trailer"
-                    | "other"
-                    | "behindthescenes"
-                    | "deleted"
-                    | "featurette"
-                    | "interview"
-                    | "scene"
-                    | "short"
-            ) {
-                return true;
-            }
-        }
+    if let Some((stem, _)) = basename.rsplit_once('.')
+        && let Some((_, suffix)) = stem.rsplit_once('-')
+        && matches!(
+            suffix,
+            "trailer"
+                | "other"
+                | "behindthescenes"
+                | "deleted"
+                | "featurette"
+                | "interview"
+                | "scene"
+                | "short"
+        )
+    {
+        return true;
     }
     let Some((parents, _)) = file.relative_path.rsplit_once('/') else {
         return false;
@@ -1962,15 +1961,14 @@ pub(crate) async fn evaluate_scan_file(
     if c.is_autocommit() {
         return Err(SearchError("scan_snapshot_required"));
     }
-    if let Some(proof) = expected {
-        if proof.version != 1
+    if let Some(proof) = expected
+        && (proof.version != 1
             || serde_json::to_vec(proof)
                 .map_err(|_| SearchError("scan_proof_invalid"))?
                 .len()
-                > SCAN_PROOF_BYTES
-        {
-            return Err(SearchError("scan_proof_invalid"));
-        }
+                > SCAN_PROOF_BYTES)
+    {
+        return Err(SearchError("scan_proof_invalid"));
     }
     let mut rejected_quality = None;
     let result = tokio::time::timeout(
@@ -1988,11 +1986,10 @@ pub(crate) async fn evaluate_scan_file(
     )
     .await
     .map_err(|_| SearchError("scan_decision_timeout"))??;
-    if let Some(expected) = expected {
-        if !matches!(&result,ScanFileDecision::PolicyEligible(current) if &current.proof==expected)
-        {
-            return Err(SearchError("scan_preflight_changed"));
-        }
+    if let Some(expected) = expected
+        && !matches!(&result,ScanFileDecision::PolicyEligible(current) if &current.proof==expected)
+    {
+        return Err(SearchError("scan_preflight_changed"));
     }
     Ok(result)
 }

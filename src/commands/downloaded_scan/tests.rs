@@ -128,6 +128,81 @@ fn request_paths_and_remote_identifiers_follow_the_importer_grammar() {
 }
 
 #[tokio::test]
+async fn busy_capture_deferral_survives_recovery_without_spending_attempts() {
+    let (db, scratch) = seeded().await;
+    let id = Uuid::new_v4();
+    enqueue(
+        &db,
+        MediaDomain::Tv,
+        input(id, &release(&scratch), ScanMode::Auto),
+    )
+    .await
+    .unwrap();
+    let first = actual_claim(&db, id).await.unwrap();
+    settle(
+        &db,
+        &first,
+        Failure::Busy("scan_capture_busy", CAPTURE_BUSY_DELAY),
+    )
+    .await
+    .unwrap();
+    let deferred = snapshot(&db, id).await;
+    let c = connection(&db).await.unwrap();
+    // Each worker step recovers before claiming: a capacity deferral must keep its delay and
+    // attempt count, unlike an interrupted discovery that was actually running.
+    for code in ["storage_error", "interrupted"] {
+        recover(&c, deferred.next_attempt_at - 1, code)
+            .await
+            .unwrap();
+        let current = snapshot(&db, id).await;
+        assert!(matches!(current.status, CommandStatus::Running));
+        assert_eq!(current.next_attempt_at, deferred.next_attempt_at);
+        assert_eq!((current.attempts, current.run_generation), (1, 1));
+    }
+    assert!(
+        claim(&c, id, deferred.next_attempt_at - 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let resumed = claim(&c, id, deferred.next_attempt_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((resumed.attempts, resumed.run_generation), (1, 2));
+    recover(&c, deferred.next_attempt_at + 1, "interrupted")
+        .await
+        .unwrap();
+    assert!(matches!(
+        snapshot(&db, id).await.status,
+        CommandStatus::RetryWait
+    ));
+
+    let retry = claim(&c, id, deferred.next_attempt_at + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    settle(
+        &db,
+        &retry,
+        Failure::Busy("scan_capture_busy", CAPTURE_BUSY_DELAY),
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE downloaded_scan_commands SET cancel_requested=1 WHERE id=?",
+        [id.to_string()],
+    )
+    .await
+    .unwrap();
+    recover(&c, now().unwrap(), "storage_error").await.unwrap();
+    assert!(matches!(
+        snapshot(&db, id).await.status,
+        CommandStatus::Cancelled
+    ));
+}
+
+#[tokio::test]
 async fn claim_counts_attempts_and_generations_and_recovery_spares_published_parents() {
     let (db, scratch) = seeded().await;
     let folder = release(&scratch);

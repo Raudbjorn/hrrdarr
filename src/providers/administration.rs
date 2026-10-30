@@ -219,13 +219,13 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Sabnzbd
         | ProviderImplementation::Nzbget
         | ProviderImplementation::Transmission
-        | ProviderImplementation::Torrentrss
         | ProviderImplementation::Deluge
         | ProviderImplementation::Rtorrent
         | ProviderImplementation::Downloadstation
         | ProviderImplementation::Flood
         | ProviderImplementation::Aria2
-        | ProviderImplementation::Utorrent => vec![],
+        | ProviderImplementation::Utorrent
+        | ProviderImplementation::Torrentrss => vec![],
         ProviderImplementation::Torznab => {
             if media == MediaDomain::Movies {
                 vec![ProviderPreset {

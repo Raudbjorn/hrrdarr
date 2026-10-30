@@ -1,4 +1,4 @@
-//! Migration 0074 (Flood): the registry row on top of the label-family triggers from 0070.
+//! Migration 0073 (Flood): the registry row on top of the label-family triggers from 0069.
 use super::*;
 
 struct Scratch(PathBuf);

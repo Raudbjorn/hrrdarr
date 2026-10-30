@@ -212,34 +212,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "indexer_client_binding",
         include_str!("../../migrations/0049_indexer_client_binding.sql"),
     ),
-    // The published origin/main prefix continues here. These four migrations are restored
-    // verbatim, so a database that already ran them keeps a valid history and upgrades instead
-    // of failing the checksum comparison; the schema work this branch adds follows them.
     (
-        "torrent_rss_indexer",
-        include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
+        "indexer_backoff",
+        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_backoff",
         include_str!("../../migrations/0051_download_client_backoff.sql"),
-    ),
-    (
-        "collections",
-        include_str!("../../migrations/0052_collections.sql"),
-    ),
-    (
-        "provider_authority",
-        include_str!("../../migrations/0053_provider_authority.sql"),
-    ),
-    // The published backoff migration carries no health deadline; this branch's engine reads
-    // one, so it is added here instead of inside the published migration.
-    (
-        "download_client_health_deadline",
-        include_str!("../../migrations/reconcile_download_client_health_deadline.sql"),
-    ),
-    (
-        "indexer_backoff",
-        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_selection",
@@ -293,15 +272,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     (
         "rename_commands",
-        include_str!("../../migrations/0067_rename_commands.sql"),
+        include_str!("../../migrations/0065_rename_commands.sql"),
     ),
     (
         "autotagging_rules",
-        include_str!("../../migrations/0065_autotagging_rules.sql"),
+        include_str!("../../migrations/0066_autotagging_rules.sql"),
     ),
     (
         "collections",
-        include_str!("../../migrations/0066_collections.sql"),
+        include_str!("../../migrations/0067_collections.sql"),
     ),
     // Generic torrent RSS feed indexer: origin/main authored this as 0050 before the registry
     // migrations; it is appended here and written against the registry shape.
@@ -309,64 +288,53 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
     ),
-    // The published checkpoint (its 0052/0053) stored the collection policy in its own settings
-    // table; this branch keeps it inline on movie_collections, so the checkpoint is superseded
-    // here and its policy and tags are carried across. See docs/collections.md.
-    (
-        "collections_checkpoint_supersede",
-        include_str!("../../migrations/reconcile_collections_checkpoint_supersede.sql"),
-    ),
-    // Snapshot facts and ownership markers only, reconciled onto 0066.
-    (
-        "collection_snapshot",
-        include_str!("../../migrations/0069_collection_snapshot.sql"),
-    ),
-    (
-        "collections_checkpoint_carry",
-        include_str!("../../migrations/reconcile_collections_checkpoint_carry.sql"),
-    ),
-    // Deluge registry plus label-family scope triggers, file 0070.
-    ("deluge", include_str!("../../migrations/0070_deluge.sql")),
-    // rTorrent registry, file 0071.
+    // Deluge registry plus label-family scope triggers, file 0069.
+    ("deluge", include_str!("../../migrations/0069_deluge.sql")),
+    // rTorrent registry row, file 0070.
     (
         "rtorrent",
-        include_str!("../../migrations/0071_rtorrent.sql"),
+        include_str!("../../migrations/0070_rtorrent.sql"),
     ),
-    // uTorrent registry row, file 0072.
+    // uTorrent registry row, file 0071.
     (
         "utorrent",
-        include_str!("../../migrations/0072_utorrent.sql"),
+        include_str!("../../migrations/0071_utorrent.sql"),
     ),
-    // Aria2 registry row, file 0073.
-    ("aria2", include_str!("../../migrations/0073_aria2.sql")),
-    // Flood registry, file 0074.
-    ("flood", include_str!("../../migrations/0074_flood.sql")),
-    // Download Station registry, file 0075.
+    // Aria2 registry row, file 0072.
+    ("aria2", include_str!("../../migrations/0072_aria2.sql")),
+    // Flood registry row, file 0073.
+    ("flood", include_str!("../../migrations/0073_flood.sql")),
+    // Download Station registry row, file 0074.
     (
         "downloadstation",
-        include_str!("../../migrations/0075_downloadstation.sql"),
+        include_str!("../../migrations/0074_downloadstation.sql"),
     ),
-    // Native Wanted last-search facts, appended at position 82 after 0075 downloadstation.
+    // Provider scope shapes for every registered implementation, file 0075.
+    (
+        "provider_scope_union",
+        include_str!("../../migrations/0075_provider_scope_union.sql"),
+    ),
+    (
+        "review_integrity",
+        include_str!("../../migrations/0076_review_integrity.sql"),
+    ),
+    (
+        "collection_authority",
+        include_str!("../../migrations/0077_collection_authority.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0078_provider_authority.sql"),
+    ),
     (
         "wanted_last_search",
-        include_str!("../../migrations/0076_wanted_last_search.sql"),
+        include_str!("../../migrations/0079_wanted_last_search.sql"),
     ),
-    // hc.034/hc.035 library root and read-only mount health identities, appended at position 83
-    // after 0076 wanted_last_search.
     (
         "library_root_health",
-        include_str!("../../migrations/0077_library_root_health.sql"),
+        include_str!("../../migrations/0080_library_root_health.sql"),
     ),
-    // Backup command and policy (job.002), appended at position 84 after 0077 library_root_health.
-    ("backups", include_str!("../../migrations/0078_backups.sql")),
-    (
-        "notification_delivery_scope",
-        include_str!("../../migrations/0079_notification_delivery_scope.sql"),
-    ),
-    (
-        "retain_collection_intents",
-        include_str!("../../migrations/0080_retain_collection_intents.sql"),
-    ),
+    ("backups", include_str!("../../migrations/0081_backups.sql")),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -774,10 +742,6 @@ async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<P
         if current == 0 { tx.execute(HISTORY_SQL, ()).await?; }
         for (index, &(name, sql)) in MIGRATIONS.iter().enumerate().skip(current) {
             if index == 1 { validate_legacy_paths(&tx).await?; }
-            // Preserve intents across the historical DROP without changing its recorded checksum.
-            if name == "collections_checkpoint_supersede" {
-                tx.execute_batch("CREATE TEMP TABLE retained_collection_intents AS SELECT * FROM movie_collection_intents").await?;
-            }
             tx.execute_batch(sql).await.map_err(|e| format!("migration {} ({name}) failed; reconcile legacy relationships before retrying: {e}", index + 1))?;
             integrity(&tx).await?;
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
@@ -1097,6 +1061,8 @@ mod tests {
 
 #[cfg(test)]
 mod published_prefix_tests;
+#[cfg(test)]
+mod review_integrity_tests;
 
 #[cfg(test)]
 mod refresh_tests;

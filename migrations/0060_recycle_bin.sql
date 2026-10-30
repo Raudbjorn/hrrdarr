@@ -145,7 +145,7 @@ CREATE TABLE recycle_bin_cleanup_commands (
  created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at BETWEEN 0 AND 9007199254740991),
  started_at INTEGER CHECK(started_at IS NULL OR (typeof(started_at)='integer' AND started_at BETWEEN 0 AND 9007199254740991)),
  completed_at INTEGER CHECK(completed_at IS NULL OR (typeof(completed_at)='integer' AND completed_at BETWEEN 0 AND 9007199254740991)),
- error_code TEXT CHECK(error_code IS NULL OR error_code IN ('interrupted','storage_error','import_busy','recycle_bin_unavailable','filesystem_error','recycle_bin_retention_conflict')),
+ error_code TEXT CHECK(error_code IS NULL OR error_code IN ('interrupted','storage_error','import_busy','recycle_bin_unavailable','filesystem_error')),
  outcome TEXT CHECK(outcome IS NULL OR outcome IN ('cleaned','not_configured','disabled')),
  bin_path TEXT CHECK(bin_path IS NULL OR (typeof(bin_path)='text' AND length(CAST(bin_path AS BLOB)) BETWEEN 2 AND 4096 AND instr(bin_path,char(0))=0)),
  cleanup_days INTEGER CHECK(cleanup_days IS NULL OR (typeof(cleanup_days)='integer' AND cleanup_days BETWEEN 0 AND 36500)),

@@ -1083,7 +1083,15 @@ pub(crate) async fn startup(db: &Arc<Database>) -> Result<()> {
     let deadline = tokio::time::Instant::now() + STARTUP_WAIT;
     loop {
         if let Ok(guard) = crate::import::acquire_deletion_guard(db, "startup-recovery") {
-            recover_unfinished(db).await?;
+            // A stalled filesystem observation must not hold worker startup: the journal rows stay
+            // unfinished and the next startup reconciles them.
+            match tokio::time::timeout(STARTUP_WAIT, recover_unfinished(db)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    eprintln!("event=file_delete_recovery_deferred code=timeout");
+                    return Ok(());
+                }
+            }
             // Upgrade recycles share the permit; a failure here is retried by the import's own
             // resume, so it is reported but never blocks worker startup.
             if let Err(error) = crate::import::recover_upgrade_recycles(db, &guard).await {

@@ -57,6 +57,33 @@ test('buildInput validates like the server and keeps secrets write-only',()=>{
   assert.match(buildInput(tags,gotify).error,/distinct/);
 });
 
+test('a cleared optional number is omitted, not sent as zero',()=>{
+  const d=blankDraft(gotify);d.settings.server_url='http://gotify.local';d.secrets.app_token='tok';
+  // Svelte's bind:value yields null for an emptied type=number input.
+  d.settings.priority=null;
+  const ok=buildInput(d,gotify);
+  assert.equal(ok.ok,true);
+  assert.equal('priority' in ok.data.settings,false);
+  const topic=field({name:'topic_id',label:'Topic',kind:'number',min:1,max:100});
+  const telegram={...gotify,fields:[topic]};
+  const t=blankDraft(telegram);t.settings.topic_id=null;
+  assert.equal(buildInput(t,telegram).ok,true,'min 1 must not reject a cleared field');
+  t.settings.topic_id=0;
+  assert.match(buildInput(t,telegram).error,/whole number from 1/);
+});
+
+test('secret URL fields are checked as URLs before save',()=>{
+  const discord={implementation:'discord',label:'Discord',description:'',kind:'message',domains:['tv','movies'],fields:[
+    field({name:'webhook_url',label:'Webhook URL',kind:'url',secret:true,required:true,max_length:2048}),
+  ]};
+  const d=blankDraft(discord);d.secrets.webhook_url='not a url';
+  assert.match(buildInput(d,discord).error,/Webhook URL must be an http\(s\) URL/);
+  d.secrets.webhook_url='https://discord.com/api/webhooks/1/x';
+  const ok=buildInput(d,discord);
+  assert.equal(ok.ok,true);
+  assert.deepEqual(ok.data.secrets,{webhook_url:'https://discord.com/api/webhooks/1/x'});
+});
+
 test('drafts from saved notifications never receive secret values',()=>{
   const n={id:'11111111-1111-4111-8111-111111111111',name:'Phone',implementation:'gotify',enabled:true,revision:2,settings:{server_url:'http://g',priority:5},secrets_configured:['app_token'],tv:{triggers:{on_grab:true},tag_ids:[4]},movies:null,created_at:1,updated_at:1};
   const d=draftFromNotification(n,gotify);

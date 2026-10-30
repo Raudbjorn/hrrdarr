@@ -28,7 +28,7 @@ const TABLES: [&str; 10] = [
     "rescan_commands",
     // Reasoning: 0060 adds recycle bin cleanup history to the pruned command tables.
     "recycle_bin_cleanup_commands",
-    // Reasoning: 0067 adds rename history to the pruned command tables.
+    // Reasoning: 0065 adds rename history to the pruned command tables.
     "rename_commands",
 ];
 const DOMAINS: [&str; 2] = ["tv", "movies"];

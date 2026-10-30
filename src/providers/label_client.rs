@@ -587,10 +587,10 @@ async fn submit_inner<W: Wire>(
             // The add may have landed with its reply (or the labelling that follows it) lost.
             // An unlabelled torrent with exactly this hash right after our own attempt is ours:
             // finish labelling it so a later reconcile observes it in this domain.
-            if let Ok(Some(torrent)) = wire.get(&hash).await
-                && torrent.label.is_empty()
-            {
-                let _ = wire.adopt(&hash, &configured.category, first).await;
+            if let Ok(Some(torrent)) = wire.get(&hash).await {
+                if torrent.label.is_empty() {
+                    let _ = wire.adopt(&hash, &configured.category, first).await;
+                }
             }
             return Err(QbitError::MutationUnknown);
         }

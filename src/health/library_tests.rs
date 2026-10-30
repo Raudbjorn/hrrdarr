@@ -268,7 +268,8 @@ async fn collection_root_is_a_separate_movies_identity() {
          INSERT INTO series(id,title,path) VALUES(1,'Series One','{lib}/Series');
          INSERT INTO movie_metadata(id,title) VALUES(1,'Film One');
          INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'{movies}/One');
-         INSERT INTO movie_collections(id,tmdb_id,title,root_folder_id) VALUES(1,10,'Saga A',2),(2,11,'Saga B',2),(3,12,'Unrooted',NULL);",
+         INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,10,'Saga A'),(2,11,'Saga B'),(3,12,'Unrooted');
+         INSERT INTO movie_collection_settings(collection_id,root_folder_id) VALUES(1,2),(2,2);",
         movies = text(&movies),
         saga = text(&saga),
         lib = text(&lib)

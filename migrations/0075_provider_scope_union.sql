@@ -1,10 +1,16 @@
--- Deluge: the first label-isolated torrent client. Beyond its own registry row, this migration
--- replaces the scope shape/option triggers once for the whole label family (deluge, rtorrent,
--- utorrent, flood, aria2, downloadstation) so the later family members only add a registry row.
--- A family scope is a lowercase label (the strictest rule any member's label store accepts), a
--- queue placement (recent/older: 0 last, 1 first) and an add-paused flag in initial_state
--- (started|stopped). provider_scopes is not rebuilt.
-INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('deluge','download_client','torrent');
+-- Provider scope shapes for every registered implementation at once.
+--
+-- Two lanes replaced the same six provider_scope triggers: the torrent RSS feed lane (0068) added
+-- the 'torrentrss' branch, and the label-torrent family lane (0069) added the
+-- 'deluge','rtorrent','utorrent','flood','aria2','downloadstation' branch. Whichever ran last
+-- dropped the other lane's branch, so the trigger set is reinstalled here with both. The registry
+-- rows, the minimum_seeders column (0068) and provider_label_categories (0069) are left alone:
+-- only the trigger bodies are replaced, and provider_scopes is not rebuilt (a rebuild would
+-- cascade-delete scopes, test results, schedules and journals under foreign_keys=ON).
+--
+-- A torrent RSS feed is an indexer without a search API, so its scope carries neither categories
+-- nor priorities and its search flags are off. A label client is a torrent client whose scope is
+-- one lowercase label with a queue placement and an add-paused flag in initial_state.
 
 DROP TRIGGER provider_scope_shape_insert;
 CREATE TRIGGER provider_scope_shape_insert BEFORE INSERT ON provider_scopes
@@ -36,6 +42,7 @@ WHEN NOT ((NEW.implementation IN ('torznab','newznab') AND NEW.categories IS NOT
     AND typeof(NEW.category)='text' AND length(NEW.category) BETWEEN 1 AND 64
     AND NEW.category NOT GLOB '*[^a-z0-9._-]*'))
 BEGIN SELECT RAISE(ABORT,'invalid provider scope shape'); END;
+
 DROP TRIGGER provider_scope_shape_update;
 CREATE TRIGGER provider_scope_shape_update BEFORE UPDATE ON provider_scopes
 WHEN NOT ((NEW.implementation IN ('torznab','newznab') AND NEW.categories IS NOT NULL AND NEW.anime_categories IS NOT NULL
@@ -77,6 +84,7 @@ WHEN NOT ((NEW.implementation IN ('torznab','newznab') AND NEW.media_type='tv'
  OR (NEW.implementation='torrentrss' AND NEW.anime_standard_format_search IS NULL AND NEW.remove_year IS NULL
     AND NEW.enable_automatic_search=0 AND NEW.enable_interactive_search=0))
 BEGIN SELECT RAISE(ABORT,'invalid indexer scope options'); END;
+
 DROP TRIGGER provider_scope_options_update;
 CREATE TRIGGER provider_scope_options_update BEFORE UPDATE ON provider_scopes
 WHEN NOT ((NEW.implementation IN ('torznab','newznab') AND NEW.media_type='tv'
@@ -104,6 +112,7 @@ WHEN NOT ((NEW.implementation='qbittorrent'
  OR (NEW.implementation IN ('torznab','newznab','sabnzbd','torrentrss') AND NEW.initial_state IS NULL AND NEW.content_layout IS NULL
  AND NEW.sequential_order IS NULL AND NEW.first_last_first IS NULL AND NEW.add_tags IS NULL))
 BEGIN SELECT RAISE(ABORT,'invalid client scope options'); END;
+
 DROP TRIGGER provider_client_options_update;
 CREATE TRIGGER provider_client_options_update BEFORE UPDATE ON provider_scopes
 WHEN NOT ((NEW.implementation='qbittorrent'
@@ -118,6 +127,3 @@ WHEN NOT ((NEW.implementation='qbittorrent'
  OR (NEW.implementation IN ('torznab','newznab','sabnzbd','torrentrss') AND NEW.initial_state IS NULL AND NEW.content_layout IS NULL
  AND NEW.sequential_order IS NULL AND NEW.first_last_first IS NULL AND NEW.add_tags IS NULL))
 BEGIN SELECT RAISE(ABORT,'invalid client scope options'); END;
-
--- Labels compare case-insensitively in the clients; TV and movies must never share one.
-CREATE UNIQUE INDEX provider_label_categories ON provider_scopes(provider_id,lower(category)) WHERE implementation IN ('deluge','rtorrent','utorrent','flood','aria2','downloadstation');

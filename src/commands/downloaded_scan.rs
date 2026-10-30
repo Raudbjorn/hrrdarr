@@ -44,6 +44,36 @@ const DECISION_MAX_BYTES: usize = 16_000;
 const REASON_MAX_BYTES: usize = 128;
 const REASONS_MAX: usize = 64;
 const INVENTORY_MAX_BYTES: i64 = 64 * 1024 * 1024;
+/// One blocking inventory capture per source path: a stalled mount blocks only scans of that
+/// same path, and a retry of that path queues behind the running capture instead of starting
+/// another walk over the same tree.
+/// A bounded number of blocking inventory captures at a time, process-wide: one stalled source
+/// holds one capture and unrelated scans keep the rest.
+static CAPTURE_BUDGET: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// Capacity waiting is bounded: a busy capture pool delays the command instead of failing it.
+const CAPTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A deferred command is picked up again after this delay.
+const CAPTURE_BUSY_DELAY: i64 = 30;
+/// A running discovery holds its lease for this long, so a live walk is never taken over.
+const DISCOVERY_LEASE: i64 = 60;
+fn capture_gate(path: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut gates = gates.lock().expect("capture gates are not poisoned");
+    // A finished capture leaves an expired gate behind; it is dropped here so the map only
+    // holds the paths of live captures.
+    gates.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(gate) = gates.get(path).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::const_new(1));
+    gates.insert(path.to_owned(), std::sync::Arc::downgrade(&gate));
+    gate
+}
 const HISTORY_MAX_ROWS: usize = 20_001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
@@ -860,21 +890,36 @@ async fn create(
             return Ok((StatusCode::OK, bounded(render(&tx, existing).await?)?));
         }
         if let Some(provider) = &request.provider {
-            // A tracked request needs a known provider scoped to this domain, even when the
-            // remote item turns out to be unknown; the receipt itself is resolved at discovery.
-            let known = tx
+            // A tracked request needs a known download client scoped to this domain, even when
+            // the remote item turns out to be unknown; the receipt itself is resolved at
+            // discovery. An indexer owns no receipt, so admitting one would silently degrade the
+            // request to an untracked move.
+            let row = tx
                 .query(
-                    "SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id AND s.media_type=? WHERE p.id=?",
+                    "SELECT EXISTS(SELECT 1 FROM provider_scopes s WHERE s.provider_id=p.id AND s.media_type=?), EXISTS(SELECT 1 FROM provider_implementations i WHERE i.implementation=p.implementation AND i.kind='download_client') FROM providers p WHERE p.id=?",
                     params![domain(media), provider.clone()],
                 )
                 .await?
                 .next()
-                .await?
-                .is_some();
-            if !known {
+                .await?;
+            let Some(row) = row else {
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "downloaded_scan_provider_unknown",
+                ));
+            };
+            let scoped: i64 = row.get(0)?;
+            let client: i64 = row.get(1)?;
+            if scoped != 1 {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "downloaded_scan_provider_unknown",
+                ));
+            }
+            if client != 1 {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "downloaded_scan_provider_not_client",
                 ));
             }
         }
@@ -1397,6 +1442,32 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
             supersedes: p.supersedes,
         }));
     }
+    if matches!(p.status, CommandStatus::Running) && p.revision == 0 && p.candidate.is_none() {
+        // A discovery deferred while the capture pool was busy: a new scheduling generation,
+        // never another attempt and never a reset. A live discovery holds its lease, so it is
+        // not taken over while it still runs.
+        let deferred = c
+            .execute(
+                "UPDATE downloaded_scan_commands SET run_generation=run_generation+1,ready_order_at=max(ready_order_at,?1),next_attempt_at=max(next_attempt_at,?3),error_code=NULL WHERE id=?2 AND status='running' AND inventory_revision=0 AND candidate_id IS NULL AND next_attempt_at<=?4",
+                params![timestamp, key, timestamp + DISCOVERY_LEASE, timestamp],
+            )
+            .await?;
+        if deferred == 0 {
+            return Ok(None);
+        }
+        let p = read_parent(c, id).await?.ok_or_else(not_found)?;
+        return Ok(Some(ScanClaim {
+            id,
+            continuation: false,
+            media: p.media,
+            path: p.path,
+            mode: p.mode,
+            attempts: p.attempts,
+            run_generation: p.run_generation,
+            requested: p.provider.zip(p.remote),
+            supersedes: p.supersedes,
+        }));
+    }
     if !matches!(p.status, CommandStatus::Queued | CommandStatus::RetryWait) {
         return Ok(None);
     }
@@ -1409,8 +1480,8 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
         return Ok(None);
     }
     c.execute(
-        "UPDATE downloaded_scan_commands SET status='running',attempts=attempts+1,run_generation=run_generation+1,started_at=?1,ready_order_at=max(ready_order_at,?1),error_code=NULL WHERE id=?2 AND status IN ('queued','retry_wait')",
-        params![timestamp, key],
+        "UPDATE downloaded_scan_commands SET status='running',attempts=attempts+1,run_generation=run_generation+1,started_at=?1,ready_order_at=max(ready_order_at,?1),next_attempt_at=max(next_attempt_at,?3),error_code=NULL WHERE id=?2 AND status IN ('queued','retry_wait')",
+        params![timestamp, key, timestamp + DISCOVERY_LEASE],
     )
     .await?;
     let p = read_parent(c, id).await?.ok_or_else(not_found)?;
@@ -1429,9 +1500,10 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
 /// Only unpublished, uncaptured running parents are reset. A published parent (revision 1)
 /// owns durable children, and a parent that captured a tracked receipt waits for its
 /// predecessor; neither is touched by startup or per-tick recovery (the worker re-claims them).
+/// Capture-capacity deferrals also remain scheduled without spending another attempt.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
     c.execute(
-        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0 AND candidate_id IS NULL",
+        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0 AND candidate_id IS NULL AND (error_code IS NOT 'scan_capture_busy' OR cancel_requested=1)",
         params![timestamp, code],
     )
     .await?;
@@ -1451,6 +1523,9 @@ enum Failure {
     /// The captured receipt's predecessor is still finishing; poll again after this delay
     /// without consuming an attempt.
     Waiting(i64),
+    /// Capacity for a blocking capture is busy; poll again after this delay without consuming
+    /// an attempt, so a healthy source is not failed by other stalled captures.
+    Busy(&'static str, i64),
 }
 impl From<libsql::Error> for Failure {
     fn from(error: libsql::Error) -> Self {
@@ -1675,9 +1750,29 @@ async fn discover(
     let tracking = receipt::resolve(&c, claim).await?;
     let carried = receipt::carried_members(&c, claim).await?;
     let path = claim.path.clone();
-    let captured = tokio::task::spawn_blocking(move || Inventory::capture(&path))
-        .await
-        .map_err(|_| Failure::Retry("scan_source_io"))?;
+    // The capture keeps its permit until the blocking walk actually ends, so a timed-out
+    // attempt cannot leave a second walk behind it. The gate belongs to the source path, so a
+    // stalled mount holds only the scans of that path.
+    let permit = match tokio::time::timeout(CAPTURE_WAIT, capture_gate(&path).acquire_owned()).await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return Err(Failure::Busy("scan_capture_busy", CAPTURE_BUSY_DELAY));
+        }
+    };
+    let budget = match tokio::time::timeout(CAPTURE_WAIT, CAPTURE_BUDGET.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            return Err(Failure::Busy("scan_capture_busy", CAPTURE_BUSY_DELAY));
+        }
+    };
+    let captured = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _budget = budget;
+        Inventory::capture(&path)
+    })
+    .await
+    .map_err(|_| Failure::Retry("scan_source_io"))?;
     let inventory = match captured {
         Ok(inventory) => Arc::new(inventory),
         // A valid path that does not exist is a recorded, unsuccessful outcome, not an error.
@@ -1790,7 +1885,7 @@ async fn discover(
             };
             let key = owner_key(&raw, tv);
             let owner = match owners.get(&key) {
-                Some(cached) => cached.clone(),
+                Some(cached) => *cached,
                 None => {
                     let resolved = match resolve_scan_owner(&c, claim.media, &raw).await {
                         Ok(owner) => Ok(owner),
@@ -1799,7 +1894,7 @@ async fn discover(
                             None => Err(code),
                         },
                     };
-                    owners.insert(key, resolved.clone());
+                    owners.insert(key, resolved);
                     resolved
                 }
             };
@@ -2335,8 +2430,8 @@ async fn publish_in(
     }
     let changed = tx
         .execute(
-            "UPDATE downloaded_scan_commands SET inventory_revision=1,inventory_json=?,inventory_count=?,inventory_bytes=? WHERE id=? AND status='running' AND run_generation=? AND cancel_requested=0 AND inventory_revision=0",
-            params![inventory_json, children as i64, bytes, command.clone(), claim.run_generation],
+            "UPDATE downloaded_scan_commands SET inventory_revision=1,inventory_json=?,inventory_count=?,inventory_bytes=?,next_attempt_at=? WHERE id=? AND status='running' AND run_generation=? AND cancel_requested=0 AND inventory_revision=0",
+            params![inventory_json, children as i64, bytes, timestamp, command.clone(), claim.run_generation],
         )
         .await?;
     if changed != 1 {
@@ -2374,6 +2469,17 @@ async fn settle(db: &Arc<Database>, claim: &ScanClaim, failure: Failure) -> Resu
             c.execute(
                 &format!("UPDATE downloaded_scan_commands SET next_attempt_at=? {guard}"),
                 params![timestamp + delay, key, claim.run_generation],
+            )
+            .await?;
+        }
+        Failure::Busy(code, delay) => {
+            // The command stays running and unpublished: the next scheduling generation picks it
+            // up when it is due, without spending a discovery attempt.
+            c.execute(
+                &format!(
+                    "UPDATE downloaded_scan_commands SET next_attempt_at=?,error_code=? {guard}"
+                ),
+                params![timestamp + delay, code, key, claim.run_generation],
             )
             .await?;
         }
@@ -2432,6 +2538,7 @@ pub(super) async fn run(db: &Arc<Database>, claim: ScanClaim) -> Result<()> {
                 Failure::Cancelled => "cancelled",
                 Failure::Stale => "stale_generation",
                 Failure::Waiting(_) => "waiting_predecessor",
+                Failure::Busy(code, _) => code,
             };
             eprintln!(
                 "event=downloaded_scan_unpublished command_id={} media_type={} code={}",

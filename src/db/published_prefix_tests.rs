@@ -1,13 +1,11 @@
-//! The published origin/main prefix continues into this branch's history. A database that ran
-//! those migrations keeps a valid history and upgrades, and the collections checkpoint it created
-//! is superseded with the policy a person configured carried over.
+//! Current-main upgrades and fail-closed protection of the incompatible published history.
 use super::*;
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("hrrdarr-published-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("hrrdarr-prefix-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -17,371 +15,106 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-
-/// How many migrations origin/main published. This branch continues that history instead of
-/// reusing those version slots.
-const PUBLISHED: usize = 53;
-/// Published versions 50–53 are immutable: their names and SQL bytes are part of the installed
-/// migration history, not just the current source tree.
-const PUBLISHED_TAIL: [(usize, &str, &str); 4] = [
-    (
-        50,
-        "torrent_rss_indexer",
-        "f092910a3183e3cb32287dbcf6fe6fe84ace79ddd7d6154af250b2a8095a4a7b",
-    ),
-    (
-        51,
-        "download_client_backoff",
-        "8a89120239b50eb4491ce3ab7ef49e348a30829626f64514975fe3afc77da6af",
-    ),
-    (
-        52,
-        "collections",
-        "c2b4219c28772e266e872e5630c4017618ff8496b1c356d108f0cbe1f479b275",
-    ),
-    (
-        53,
-        "provider_authority",
-        "af70455c64b2872339be34a650c044b5450ad4b8b50dfed6d0fe3588318dcaa0",
-    ),
-];
-
+async fn record(c: &Connection, version: usize, name: &str, sql: &str) -> Result<(), Error> {
+    c.execute_batch(sql).await?;
+    c.execute(
+        "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+        params![version as i64, name, checksum(sql), sql],
+    )
+    .await?;
+    Ok(())
+}
+async fn history(c: &Connection) -> Result<String, Error> {
+    Ok(c.query("SELECT json_group_array(json_array(version,name,checksum,sql)) FROM (SELECT * FROM schema_migrations ORDER BY version)", ()).await?.next().await?.unwrap().get(0)?)
+}
 #[tokio::test]
-async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(), Error> {
+async fn current_main_prefix_upgrades_without_rewriting_history_or_intents() -> Result<(), Error> {
     let files = Scratch::new();
     let path = files.0.join("db");
     let raw = libsql::Builder::new_local(&path).build().await?;
     let c = raw.connect()?;
-    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    // The real runner suspends foreign keys while rebuilding referenced tables.
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(PUBLISHED).enumerate() {
-        c.execute_batch(sql).await?;
-        c.execute(
-            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum(sql), *sql],
-        )
-        .await?;
+    for (i, (name, sql)) in MIGRATIONS.iter().take(78).enumerate() {
+        record(&c, i + 1, name, sql).await?;
     }
-    // The published prefix is the one origin/main recorded.
-    for (version, name, expected_checksum) in PUBLISHED_TAIL {
-        let row = c
-            .query(
-                "SELECT name,checksum FROM schema_migrations WHERE version=?",
-                [version as i64],
-            )
-            .await?
-            .next()
-            .await?
-            .unwrap();
-        assert_eq!(
-            row.get::<String>(0)?,
-            name,
-            "published migration {version} name"
-        );
-        assert_eq!(
-            row.get::<String>(1)?,
-            expected_checksum,
-            "published migration {version} checksum"
-        );
-    }
-    let mut rows = c
-        .query(
-            "SELECT version,name FROM schema_migrations WHERE version>=50 ORDER BY version",
-            (),
-        )
-        .await?;
-    let mut published = Vec::new();
-    while let Some(row) = rows.next().await? {
-        published.push((row.get::<i64>(0)?, row.get::<String>(1)?));
-    }
-    assert_eq!(
-        published,
-        vec![
-            (50, "torrent_rss_indexer".to_owned()),
-            (51, "download_client_backoff".to_owned()),
-            (52, "collections".to_owned()),
-            (53, "provider_authority".to_owned()),
-        ]
-    );
-    // A collection configured under the published checkpoint, with a tag and a local edit.
-    c.execute_batch(
-        "INSERT INTO root_folders(id,media_type,path) VALUES(1,'movies','/movies');
-         INSERT INTO quality_profiles(id,media_type,name) VALUES(1,'movies','Any');
-         INSERT INTO tags(id,media_type,label) VALUES(1,'movies','kept');
-         INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,42,'Kept');
-         INSERT INTO movie_collection_settings(collection_id,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit,snapshot_owned)
-           VALUES(1,1,1,1,'in_cinemas',1,1,0);
-         INSERT INTO movie_collection_tags(collection_id,tag_id) VALUES(1,1);
-         INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason)
-           VALUES(42,7,1,1,'user'),(43,2,0,1,'metadata_missing'),(44,3,1,0,NULL);",
-    )
-    .await?;
-    drop(rows);
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    c.execute("INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(42,7,1,1,'user')",()).await?;
+    let before = history(&c).await?;
     drop(c);
     drop(raw);
-
-    // Reopening runs the pending migrations over the published history.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
+    assert_eq!(version(&c).await?, 81); // Main's 78 migrations plus Wanted, library health and Backup.
+    let recorded: serde_json::Value = serde_json::from_str(&history(&c).await?)?;
     assert_eq!(
-        scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64
+        &recorded.as_array().unwrap()[..78],
+        serde_json::from_str::<Vec<serde_json::Value>>(&before)?.as_slice()
     );
-    // The checkpoint's policy now lives on the collection itself.
-    let row = c
-        .query(
-            "SELECT monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit FROM movie_collections WHERE id=1",
-            (),
-        )
-        .await?
-        .next()
-        .await?
-        .unwrap();
-    assert_eq!(row.get::<i64>(0)?, 1, "monitored");
-    assert_eq!(row.get::<i64>(1)?, 1, "root folder");
-    assert_eq!(row.get::<i64>(2)?, 1, "quality profile");
-    assert_eq!(row.get::<String>(3)?, "in_cinemas", "minimum availability");
-    assert_eq!(row.get::<i64>(4)?, 1, "search on add");
-    assert_eq!(row.get::<i64>(5)?, 1, "local edit");
-    // Intent authority is independent of catalog membership and retains every field and guard.
-    let mut intents = c.query("SELECT tmdb_id,revision,local_edit,removed,removal_reason FROM movie_collection_intents ORDER BY tmdb_id", ()).await?;
-    for (id, revision, local, removed, reason) in [
-        (42, 7, 1, 1, Some("user")),
-        (43, 2, 0, 1, Some("metadata_missing")),
-        (44, 3, 1, 0, None),
-    ] {
-        let row = intents.next().await?.unwrap();
-        assert_eq!(
-            (
-                row.get::<i64>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-                row.get::<i64>(3)?,
-                row.get::<Option<String>>(4)?
-            ),
-            (id, revision, local, removed, reason.map(str::to_owned))
-        );
-    }
-    assert!(intents.next().await?.is_none());
+    assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=42 AND revision=7 AND local_edit=1 AND removed=1 AND removal_reason='user'").await?,1);
     assert!(
         c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
             .await
             .is_err()
     );
-    assert!(
-        c.execute(
-            "UPDATE movie_collection_intents SET local_edit=0,revision=8 WHERE tmdb_id=42",
-            ()
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        c.execute(
-            "UPDATE movie_collection_intents SET removed=0,removal_reason=NULL WHERE tmdb_id=42",
-            ()
-        )
-        .await
-        .is_err()
-    );
-    c.execute("UPDATE movie_collection_intents SET removed=0,removal_reason=NULL,revision=8 WHERE tmdb_id=42", ()).await?;
-    // The tag survived the supersede, and the replaced settings table is gone.
-    assert_eq!(
-        scalar(
-            &c,
-            "SELECT count(*) FROM movie_collection_tags WHERE collection_id=1"
-        )
-        .await?,
-        1
-    );
-    assert_eq!(
-        scalar(
-            &c,
-            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='movie_collection_settings'"
-        )
-        .await?,
-        0
-    );
-    drop(intents);
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(
-        scalar(
-            &reopened.connect().await?,
-            "SELECT count(*) FROM movie_collection_intents"
-        )
-        .await?,
-        3
-    );
+    assert_eq!(version(&reopened.connect().await?).await?, 81); // Reopening preserves the complete history.
     Ok(())
 }
-
-/// The published prefix admits a 'torrentrss' provider, so an installation that configured one
-/// carries that row. The registry the providers table is rebuilt against must know the
-/// implementation, or the upgrade fails on the foreign key.
 #[tokio::test]
-async fn published_prefix_upgrades_with_a_torrentrss_provider() -> Result<(), Error> {
+async fn incompatible_published_history_is_rejected_without_changing_intents_or_history()
+-> Result<(), Error> {
     let files = Scratch::new();
     let path = files.0.join("db");
     let raw = libsql::Builder::new_local(&path).build().await?;
     let c = raw.connect()?;
-    c.execute("PRAGMA foreign_keys=ON", ()).await?;
-    c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(PUBLISHED).enumerate() {
-        c.execute_batch(sql).await?;
-        c.execute(
-            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum(sql), *sql],
-        )
-        .await?;
-    }
-    c.execute(
-        "INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint,credentials)
-           VALUES('11111111-1111-4111-8111-111111111111','torrentrss','Feed',1,50,1,1,'http://feed.example/rss',NULL)",
-        (),
-    )
-    .await?;
-    c.execute(
-        "INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,enable_automatic_search,enable_interactive_search,minimum_seeders)
-           VALUES('11111111-1111-4111-8111-111111111111','torrentrss','tv',NULL,NULL,0,0,7)",
-        (),
-    )
-    .await?;
-    drop(c);
-    drop(raw);
-
-    let db = Database::open_local(&path).await?;
-    let c = db.connect().await?;
-    assert_eq!(
-        scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64
-    );
-    assert_eq!(
-        scalar(
-            &c,
-            "SELECT count(*) FROM providers WHERE implementation='torrentrss'"
-        )
-        .await?,
-        1,
-        "the torrentrss provider survives the upgrade"
-    );
-    assert_eq!(
-        scalar(
-            &c,
-            "SELECT minimum_seeders FROM provider_scopes WHERE provider_id='11111111-1111-4111-8111-111111111111' AND media_type='tv'"
-        )
-        .await?,
-        7,
-        "the published feed's minimum seeders survives the registry rebuild"
-    );
-    Ok(())
-}
-
-async fn write_historical_prefix(c: &Connection, count: usize) -> Result<(), Error> {
+    // The real runner suspends foreign keys while rebuilding referenced tables.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(count).enumerate() {
-        c.execute_batch(sql).await?;
-        c.execute(
-            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum(sql), *sql],
-        )
-        .await?;
+    for (i, (name, sql)) in MIGRATIONS.iter().take(49).enumerate() {
+        record(&c, i + 1, name, sql).await?;
+    }
+    let old = [
+        (
+            "torrent_rss_indexer",
+            include_str!("../../tests/fixtures/published-main-53/0050_torrent_rss_indexer.sql"),
+        ),
+        (
+            "download_client_backoff",
+            include_str!("../../tests/fixtures/published-main-53/0051_download_client_backoff.sql"),
+        ),
+        (
+            "collections",
+            include_str!("../../tests/fixtures/published-main-53/0052_collections.sql"),
+        ),
+        (
+            "provider_authority",
+            include_str!("../../tests/fixtures/published-main-53/0053_provider_authority.sql"),
+        ),
+    ];
+    for (i, (name, sql)) in old.iter().enumerate() {
+        record(&c, i + 50, name, sql).await?;
     }
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn already_superseded_prefix_upgrades_without_inventing_intents() -> Result<(), Error> {
-    let files = Scratch::new();
-    let path = files.0.join("db");
-    let raw = libsql::Builder::new_local(&path).build().await?;
-    let c = raw.connect()?;
-    // The pre-fix build ended at backups (84), after the historical intent table was dropped.
-    write_historical_prefix(&c, 84).await?;
-    assert_eq!(version(&c).await?, 84);
-    assert_eq!(
-        scalar(
-            &c,
-            "SELECT count(*) FROM sqlite_schema WHERE name='movie_collection_intents'"
-        )
-        .await?,
-        0
-    );
-    let history_sql = "SELECT json_group_array(json_array(version,name,checksum,sql)) FROM (SELECT * FROM schema_migrations WHERE version<=84 ORDER BY version)";
-    let before: String = c
-        .query(history_sql, ())
-        .await?
-        .next()
-        .await?
-        .unwrap()
-        .get(0)?;
+    c.execute("INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(42,7,1,1,'user')",()).await?;
+    let before = history(&c).await?;
     drop(c);
     drop(raw);
-
-    let db = Database::open_local(&path).await?;
-    let c = db.connect().await?;
-    assert_eq!(version(&c).await?, MIGRATIONS.len());
-    let after: String = c
-        .query(history_sql, ())
-        .await?
-        .next()
-        .await?
-        .unwrap()
-        .get(0)?;
-    assert_eq!(
-        after, before,
-        "published migration history stays byte-for-byte unchanged"
-    );
-    assert_eq!(
-        scalar(&c, "SELECT count(*) FROM movie_collection_intents").await?,
-        0
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn collection_intents_survive_failed_upgrade_and_retry() -> Result<(), Error> {
-    let files = Scratch::new();
-    let path = files.0.join("db");
-    let raw = libsql::Builder::new_local(&path).build().await?;
-    let c = raw.connect()?;
-    write_historical_prefix(&c, PUBLISHED).await?;
-    c.execute_batch("INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(42,7,1,1,'user');
-        CREATE TABLE backup_settings(injected_failure INTEGER);").await?;
-    drop(c);
-    drop(raw);
-
     let error = match Database::open_local(&path).await {
-        Ok(_) => {
-            panic!("the conflicting backup_settings table must fail a migration after supersede")
-        }
-        Err(error) => error.to_string(),
+        Ok(_) => panic!("incompatible history must not be silently rewritten"),
+        Err(e) => e.to_string(),
     };
     assert!(
-        error.contains("migration 84 (backups)") && error.contains("migration rolled back"),
+        error.contains("migration history mismatch at version 50"),
         "{error}"
     );
     let raw = libsql::Builder::new_local(&path).build().await?;
     let c = raw.connect()?;
-    assert_eq!(version(&c).await?, PUBLISHED);
-    let intent_sql = "SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=42 AND revision=7 AND local_edit=1 AND removed=1 AND removal_reason='user'";
-    assert_eq!(scalar(&c, intent_sql).await?, 1);
-    assert!(
-        c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
-            .await
-            .is_err()
-    );
-    c.execute("DROP TABLE backup_settings", ()).await?;
-    drop(c);
-    drop(raw);
-
-    let db = Database::open_local(&path).await?;
-    let c = db.connect().await?;
-    assert_eq!(version(&c).await?, MIGRATIONS.len());
-    assert_eq!(scalar(&c, intent_sql).await?, 1);
+    assert_eq!(history(&c).await?, before);
+    assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=42 AND revision=7 AND local_edit=1 AND removed=1 AND removal_reason='user'").await?,1);
     assert!(
         c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
             .await

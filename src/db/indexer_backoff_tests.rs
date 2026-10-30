@@ -52,7 +52,7 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(54).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(49).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -83,7 +83,7 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[54].1).await?;
+    tx.execute_batch(MIGRATIONS[49].1).await?;
     failure(&tx, &id, "tv", 1).await?;
     assert!(failure(&tx, &id, "movies", 2).await.is_err());
     tx.rollback().await?;
@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 15 } else { 37 } // Reasoning: the 49-migration prefix is unchanged, so the runner applies 37 further migrations (positions 50 through 86) and schema_migrations grows to 86 rows; Health gains fifteen identities (the published 0051 download_client_backoff pair, 0050 indexer_backoff's four, 0053 path_diagnostics' two, 0060 recycle_bin's two and 0077 library_root_health's five), because the published 0050, 0052 and 0053 files and the reconciliation migrations register no identities of their own.
+                    expected.len() + if *table == "health_checks" { 15 } else { 32 } // Reasoning: versions 50-81 add 32 history rows; 0080 adds five health identities to the ten added by 0050/51/53/60.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
@@ -113,7 +113,7 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
                 }
                 assert_eq!(actual, expected);
             } else if matches!(*table, "series" | "episodes" | "movies") {
-                // 0055 appends unknown runtime and 0076 a NULL episode/movie
+                // 0055 appends unknown runtime and 0079 a NULL episode/movie
                 // native_last_search_at; every predecessor value remains exact.
                 let mut expected = expected.clone();
                 for row in &mut expected {

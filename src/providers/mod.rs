@@ -705,13 +705,13 @@ impl ProviderSettings {
             | Self::Sabnzbd { endpoint, .. }
             | Self::Nzbget { endpoint, .. }
             | Self::Transmission { endpoint, .. }
-            | Self::Torrentrss { endpoint, .. }
             | Self::Deluge { endpoint, .. }
             | Self::Rtorrent { endpoint, .. }
             | Self::Downloadstation { endpoint, .. }
             | Self::Flood { endpoint, .. }
             | Self::Aria2 { endpoint, .. }
-            | Self::Utorrent { endpoint, .. } => endpoint,
+            | Self::Utorrent { endpoint, .. }
+            | Self::Torrentrss { endpoint, .. } => endpoint,
         }
     }
     pub(crate) fn protocol(&self) -> Protocol {
@@ -988,10 +988,10 @@ impl ProviderSettings {
                         return Err(bad());
                     }
                 }
-                if let (Some(tv), Some(movies)) = (tv, movies) {
-                    if tv.category.to_lowercase() == movies.category.to_lowercase() {
-                        return Err(bad());
-                    }
+                if let (Some(tv), Some(movies)) = (tv, movies)
+                    && tv.category.to_lowercase() == movies.category.to_lowercase()
+                {
+                    return Err(bad());
                 }
             }
             Self::Nzbget { tv, movies, .. } => {
@@ -1043,7 +1043,10 @@ impl ProviderSettings {
                         })
                         .map_err(|_| bad())?;
                     }
-                    if !valid_torrent_label(&s.category) {
+                    if !valid_torrent_label(&s.category)
+                        || (matches!(self, Self::Aria2 { .. } | Self::Downloadstation { .. })
+                            && matches!(s.category.as_str(), "." | ".."))
+                    {
                         return Err(bad());
                     }
                 }
@@ -2509,10 +2512,10 @@ fn validate(input: &ProviderInput) -> Result<()> {
         return Err(bad());
     }
     input.settings.validate()?;
-    if let Change::Value(c) = &input.credentials {
-        if !c.valid(input.settings.implementation()) {
-            return Err(bad());
-        }
+    if let Change::Value(c) = &input.credentials
+        && !c.valid(input.settings.implementation())
+    {
+        return Err(bad());
     }
     Ok(())
 }
@@ -2834,6 +2837,19 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
         [id],
     )
     .await?;
+    // Scope tags cascade with their scope row; capture them so an accepted edit that
+    // keeps a domain keeps its tags. Bounded by the 64-per-domain trigger.
+    let mut kept_tags = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT media_type,tag_id FROM provider_scope_tags WHERE provider_id=? ORDER BY media_type,tag_id",
+            [id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        kept_tags.push((row.get::<String>(0)?, row.get::<i64>(1)?));
+    }
+    drop(rows);
     conn.execute("DELETE FROM provider_scopes WHERE provider_id=?", [id])
         .await?;
     match settings {
@@ -2964,6 +2980,14 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             }
         }
         backoff::reconcile(conn, id).await?;
+    }
+    // A domain dropped by this edit loses its tags with its scope.
+    for (domain, tag) in kept_tags {
+        conn.execute(
+            "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=?1 AND media_type=?2)",
+            params![id, domain, tag],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3404,6 +3428,33 @@ mod tests {
         }
     }
     #[test]
+    fn directory_client_categories_reject_dot_components_in_both_domains() {
+        for implementation in [
+            "aria2",
+            "downloadstation",
+            "deluge",
+            "rtorrent",
+            "utorrent",
+            "flood",
+        ] {
+            for media in ["tv", "movies"] {
+                for category in [".", "..", ".tv", "tv..", "tv"] {
+                    let mut value = serde_json::json!({"implementation":implementation,"endpoint":"http://127.0.0.1:1/","tv":null,"movies":null});
+                    value[media] = serde_json::json!({"category":category});
+                    let settings: ProviderSettings = serde_json::from_value(value).unwrap();
+                    let directory_escape = matches!(implementation, "aria2" | "downloadstation")
+                        && matches!(category, "." | "..");
+                    assert_eq!(
+                        settings.validate().is_ok(),
+                        !directory_escape,
+                        "{implementation} {media} {category}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn configuration_wire_and_domain_validation_are_closed() {
         let input = serde_json::json!({"revision":1,"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"newznab","endpoint":"https://example.invalid/api","tv":null,"movies":{"categories":[2147483647]}}});
         let update: ProviderUpdate = serde_json::from_value(input.clone()).unwrap();
@@ -3783,18 +3834,20 @@ async fn run_test(
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
     let is_indexer = !provider.settings.is_download_client();
-    let operation =
-        if is_indexer && !matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
-            transport.indexer_operation(provider.id)
-        } else {
-            transport.operation(provider.id)
-        }
-        .map_err(|e| http_error(e).0)?;
+    let is_feed = matches!(provider.settings, ProviderSettings::Torrentrss { .. });
+    // Reasoning: durable, revision-fenced indexer backoff is scoped to Torznab/Newznab media
+    // scopes; a feed keeps the in-memory provider cooldown it was authored with, so a rate-limited
+    // feed test is answered from shared provider state without requesting the feed again.
+    let operation = if is_indexer && !is_feed {
+        transport.indexer_operation(provider.id)
+    } else {
+        transport.operation(provider.id)
+    }
+    .map_err(|e| http_error(e).0)?;
     let work = async {
         let (result, observation, client_observation) =
             if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
-                // A plain feed has no capability document or search; it is fetched and parsed per scope.
-                // Its failures do not feed indexer backoff (indexer_status is torznab/newznab only).
+                // A feed has no capability document: every configured scope is fetched and parsed.
                 let result = indexer::test_feed(
                     &operation,
                     &provider.settings,
