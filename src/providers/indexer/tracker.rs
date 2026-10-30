@@ -758,8 +758,7 @@ fn parse_btn(body: &[u8], domain: MediaDomain) -> Result<(Vec<Release>, Vec<Inde
     let rows: Vec<&Value> = match result.get("torrents") {
         Some(Value::Object(map)) => map.values().collect(),
         Some(Value::Array(list)) if list.is_empty() => Vec::new(),
-        None | Some(Value::Null) => Vec::new(),
-        Some(_) => return Err(IndexerError::InvalidResponse),
+        _ => return Err(IndexerError::InvalidResponse),
     };
     rows_to_releases(rows.into_iter(), domain, |row| {
         let origin = string(row, "Origin").unwrap_or_default();
@@ -1096,21 +1095,19 @@ fn parse_ptp(
     }
     let auth_key = string(&value, "AuthKey");
     let pass_key = string(&value, "PassKey");
-    let groups = match value.get("Movies") {
-        Some(Value::Array(groups)) => groups.as_slice(),
-        None | Some(Value::Null) => &[],
-        Some(_) => return Err(IndexerError::InvalidResponse),
-    };
+    let groups = value
+        .get("Movies")
+        .and_then(Value::as_array)
+        .ok_or(IndexerError::InvalidResponse)?;
     // Flatten the group -> torrents hierarchy, carrying the group beside each torrent.
     let mut flat: Vec<(&Value, &Value)> = Vec::new();
     for group in groups {
         match group.get("Torrents") {
             Some(Value::Array(torrents)) => flat.extend(torrents.iter().map(|t| (group, t))),
-            None | Some(Value::Null) => {}
-            Some(_) => return Err(IndexerError::InvalidResponse),
+            _ => return Err(IndexerError::InvalidResponse),
         }
     }
-    rows_to_releases(flat.into_iter(), domain, |(group, row)| {
+    let (mut items, warnings) = rows_to_releases(flat.into_iter(), domain, |(group, row)| {
         let id = string(row, "Id").ok_or(IndexerError::InvalidResponse)?;
         let title = string(row, "ReleaseName")
             .or_else(|| {
@@ -1161,7 +1158,17 @@ fn parse_ptp(
             scene: flag(row, "Scene"),
             category: MOVIE_ROOT,
         })
-    })
+    })?;
+    // Download credentials returned by PTP are separate from the configured API credentials.
+    redact_secrets(
+        &mut items,
+        &IndexerAccess {
+            api_key: auth_key.as_deref(),
+            password: pass_key.as_deref(),
+            ..IndexerAccess::default()
+        },
+    );
+    Ok((items, warnings))
 }
 async fn fetch_ptp(
     operation: &HttpOperation<'_>,
@@ -1195,11 +1202,10 @@ fn parse_potato(
     if value.get("error").is_some_and(|e| !e.is_null()) {
         return Err(IndexerError::Authentication);
     }
-    let rows = match value.get("results") {
-        Some(Value::Array(rows)) => rows.as_slice(),
-        None | Some(Value::Null) => &[],
-        Some(_) => return Err(IndexerError::InvalidResponse),
-    };
+    let rows = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or(IndexerError::InvalidResponse)?;
     rows_to_releases(rows.iter(), domain, |row| {
         // The TorrentPotato size field is in megabytes.
         let size = number(row, "size")?
@@ -1279,15 +1285,12 @@ pub(super) async fn fetch(
         return Err(IndexerError::InvalidRequest);
     }
     let t = target(settings, request_domain(request))?;
-    let (offset, query_index, limit) = request_paging(request);
+    let (_, query_index, limit) = request_paging(request);
     if limit == 0 || limit > MAX_ITEMS || query_index != 0 {
         return Err(IndexerError::InvalidRequest);
     }
-    // Fetch one row more than the page needs so the local pager can tell whether more exist.
-    let fetch_size = offset
-        .saturating_add(limit)
-        .saturating_add(1)
-        .clamp(2, FETCH_CEILING);
+    // A fixed document keeps local page boundaries stable after filtering and map ordering.
+    let fetch_size = FETCH_CEILING;
     if matches!(
         request,
         IndexerSearch::Tv { .. } | IndexerSearch::Movie { .. }

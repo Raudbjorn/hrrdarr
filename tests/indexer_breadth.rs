@@ -65,6 +65,7 @@ const REDIRECT: u8 = 4;
 const GARBAGE: u8 = 5;
 const OVERSIZED: u8 = 6;
 const EMPTY: u8 = 7;
+const PAGED: u8 = 8;
 
 #[derive(Clone, Debug)]
 struct Seen {
@@ -374,6 +375,22 @@ async fn remote(
             if empty {
                 return axum::Json(json!({"result":{"results":"0","torrents":[]}})).into_response();
             }
+            if s.mode.load(Ordering::SeqCst) == PAGED {
+                let template = btn_doc(&base)["result"]["torrents"]["4001"].clone();
+                let mut torrents = serde_json::Map::new();
+                for (index, id) in (70..=100)
+                    .rev()
+                    .enumerate()
+                    .take(json_body["params"][2].as_u64().unwrap() as usize)
+                {
+                    let mut row = template.clone();
+                    row["TorrentID"] = json!(id.to_string());
+                    row["ReleaseName"] = json!(format!("Harbor.S01E01.Release{id}"));
+                    row["Seeders"] = json!(if index < 2 { 0 } else { 20 });
+                    torrents.insert(id.to_string(), row);
+                }
+                return axum::Json(json!({"result":{"torrents":torrents}})).into_response();
+            }
             axum::Json(btn_doc(&base)).into_response()
         }
         "/filelist/api.php" => {
@@ -396,6 +413,22 @@ async fn remote(
                 return axum::Json(json!({"status":0,"data":[]})).into_response();
             }
             let tv = json_body["category"] == json!([2]);
+            if s.mode.load(Ordering::SeqCst) == PAGED {
+                let template = hdbits_doc(tv, None)["data"][0].clone();
+                let rows: Vec<_> = (70..=100)
+                    .rev()
+                    .enumerate()
+                    .take(json_body["limit"].as_u64().unwrap() as usize)
+                    .map(|(index, id)| {
+                        let mut row = template.clone();
+                        row["id"] = json!(id);
+                        row["name"] = json!(format!("Harbor.S01E01.Release{id}"));
+                        row["seeders"] = json!(if index < 2 { 0 } else { 20 });
+                        row
+                    })
+                    .collect();
+                return axum::Json(json!({"status":0,"data":rows})).into_response();
+            }
             axum::Json(hdbits_doc(tv, json_body["search"].as_str())).into_response()
         }
         "/ptp/torrents.php" => {
@@ -1768,4 +1801,78 @@ async fn administration_treats_trackers_as_indexers() {
     .await;
     assert_eq!(code, 200, "{clients}");
     assert_eq!(clients["items"], json!([]));
+}
+
+#[tokio::test]
+async fn bounded_json_pages_remain_stable_and_filter_before_local_pagination() {
+    let h = harness().await;
+    h.state.mode(PAGED);
+    for spec in specs()
+        .into_iter()
+        .filter(|s| matches!(s.kind, "broadcasthenet" | "hdbits"))
+    {
+        let created = create(&h, &spec).await;
+        let id = created["id"].as_str().unwrap();
+        let path = format!("/api/v1/providers/{id}/search");
+        let (code, full) = request(
+            &h.base,
+            "POST",
+            &path,
+            json!({"kind":"rss","media_type":"tv","limit":100}),
+        )
+        .await;
+        assert_eq!(code, 200, "{full}");
+        for offset in 0..4 {
+            let (code, page) = request(
+                &h.base,
+                "POST",
+                &path,
+                json!({"kind":"rss","media_type":"tv","limit":1,"offset":offset}),
+            )
+            .await;
+            assert_eq!(code, 200, "{page}");
+            assert_eq!(
+                page["page"]["items"][0]["title"], full["page"]["items"][offset]["title"],
+                "{} offset {offset}",
+                spec.kind
+            );
+        }
+        let mut update = body(&h, &spec);
+        update.as_object_mut().unwrap().remove("credentials");
+        update["revision"] = created["revision"].clone();
+        update["settings"]["tv"]["minimum_seeders"] = json!(10);
+        let (code, updated) =
+            request(&h.base, "PUT", &format!("/api/v1/providers/{id}"), update).await;
+        assert_eq!(code, 200, "{updated}");
+        let (code, first) = request(
+            &h.base,
+            "POST",
+            &path,
+            json!({"kind":"rss","media_type":"tv","limit":25}),
+        )
+        .await;
+        assert_eq!(code, 200, "{first}");
+        assert_eq!(first["page"]["items"].as_array().unwrap().len(), 25);
+        assert_eq!(first["page"]["total"], 29);
+        assert_eq!(first["page"]["next_offset"], 25);
+        let (code, last) = request(
+            &h.base,
+            "POST",
+            &path,
+            json!({"kind":"rss","media_type":"tv","limit":25,"offset":25}),
+        )
+        .await;
+        assert_eq!(code, 200, "{last}");
+        assert_eq!(last["page"]["items"].as_array().unwrap().len(), 4);
+        assert!(last["page"]["next_offset"].is_null());
+        for hit in h.state.hits(spec.path) {
+            let request: Value = serde_json::from_str(&hit.body).unwrap();
+            let count = if spec.kind == "broadcasthenet" {
+                &request["params"][2]
+            } else {
+                &request["limit"]
+            };
+            assert_eq!(count, 100);
+        }
+    }
 }

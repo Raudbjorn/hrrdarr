@@ -71,6 +71,37 @@ async fn remote(
         if q.get("t").is_some_and(|v| v == "caps") {
             return r#"<caps><limits max="100" default="100"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,tvdbid,season,ep"/><movie-search available="yes" supportedParams="q,tmdbid"/></searching><categories><category id="5000"><subcat id="5030"/></category><category id="2000"><subcat id="2030"/></category></categories></caps>"#.into_response();
         }
+        if matches!(s.mode.load(Ordering::SeqCst), 10 | 11) {
+            let hash = hash(true, true);
+            let locator = if s.mode.load(Ordering::SeqCst) == 11 {
+                "http://127.0.0.1:1/valid.nzb".to_string()
+            } else {
+                format!("magnet:?xt=urn:btih:{hash}")
+            };
+            // The missing locator is an item warning; its valid sibling must survive for
+            // tolerant trackers, while Torznab/Newznab keep their strict feed contract.
+            let body = format!(
+                r#"<rss xmlns:torznab="http://torznab.com/schemas/2015/feed" xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel>
+                <item><title>Harbor.S01E01.1080p.WEB-DL</title><guid>PRIVATE_RSS_GUID-{hash}</guid><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><link>{locator}</link><torznab:attr name="category" value="5030"/><torznab:attr name="size" value="1073741824"/><nyaa:size>1 GiB</nyaa:size></item>
+                <item><title>Malformed sibling</title><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate></item>
+                </channel></rss>"#
+            );
+            let parsed = providers::indexer::parse_page(
+                &body,
+                0,
+                100,
+                s.mode.load(Ordering::SeqCst) != 11,
+                hrrdarr::api::MediaDomain::Tv,
+            )
+            .unwrap();
+            assert_eq!(
+                parsed.items.len(),
+                1,
+                "strict fixture has one valid sibling"
+            );
+            assert_eq!(parsed.warnings.len(), 1, "fixture exercises item warnings");
+            return body.into_response();
+        }
         let offset = q
             .get("offset")
             .map(|v| v.parse::<u32>().unwrap())
@@ -339,6 +370,107 @@ async fn offers(base: &str, id: &Value) -> Vec<Value> {
 
 // Actual HTTP production creates every command/result/candidate. Only library fixtures
 // are seeded; neither a candidate nor an observed submission is fabricated in SQL.
+#[tokio::test]
+async fn search_item_warning_policy_preserves_tracker_results_and_strict_feeds() {
+    for implementation in ["nyaa", "torznab", "newznab"] {
+        for mode in ["automatic", "interactive"] {
+            let scratch = Scratch(
+                std::env::temp_dir()
+                    .join(format!("hrrdarr-search-warnings-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+            seed(&db).await;
+            let remote_state = Arc::new(Remote::default());
+            remote_state.mode.store(
+                if implementation == "newznab" { 11 } else { 10 },
+                Ordering::SeqCst,
+            );
+            let (remote_base, remote_server) = serve(
+                axum::Router::new()
+                    .fallback(remote)
+                    .with_state(remote_state.clone()),
+            )
+            .await;
+            let (base, server, client) = app(db.clone()).await;
+            let (_, download) = providers(&base, &remote_base).await;
+            let scope = if implementation == "nyaa" {
+                json!({})
+            } else {
+                json!({"categories":[5030],"anime_categories":[]})
+            };
+            let (code, indexer) = request(&base, "POST", "/api/v1/providers", json!({
+                "name":"mixed feed", "enabled":true, "priority":1,
+                "settings":{"implementation":implementation,"endpoint":remote_base,"tv":scope,"movies":null}
+            })).await;
+            assert_eq!(code, 201, "{implementation}: {indexer}");
+            let runtime = commands::start(db.clone(), client).await.unwrap();
+            let mut intent = input(&indexer, &download, true, mode);
+            // Default selection lets the strict NZB feed reach fetching without binding a
+            // torrent client; invalid feeds must fail before any candidate is published.
+            if implementation == "newznab" {
+                let object = intent.as_object_mut().unwrap();
+                object.remove("client_id");
+                object.remove("client_revision");
+                object.insert("client_selection".into(), json!({"kind":"default"}));
+            }
+            let (code, command) = request(&base, "POST", "/api/v1/search/commands", intent).await;
+            assert_eq!(code, 202, "{implementation}/{mode}: {command}");
+            let done = settled(&base, &command["id"]).await;
+            let results = offers(&base, &command["id"]).await;
+            if implementation == "nyaa" {
+                assert_eq!(done["status"], "succeeded", "{mode}: {done}");
+                assert_eq!(done["fetch_complete"], true);
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "only the valid sibling is retained: {results:?}"
+                );
+                assert_eq!(
+                    results[0]["metadata"]["title"],
+                    "Harbor.S01E01.1080p.WEB-DL"
+                );
+                let candidate_id = if mode == "automatic" {
+                    done["selected_candidate_id"].as_str().unwrap().to_owned()
+                } else {
+                    assert!(
+                        remote_state.adds.lock().unwrap().is_empty(),
+                        "listing must not submit"
+                    );
+                    let (code, receipt) = request(
+                        &base,
+                        "POST",
+                        &format!(
+                            "/api/v1/search/results/{}/grab",
+                            results[0]["id"].as_str().unwrap()
+                        ),
+                        json!({}),
+                    )
+                    .await;
+                    assert!((200..300).contains(&code), "{receipt}");
+                    receipt["id"].as_str().unwrap().to_owned()
+                };
+                observed(&base, &candidate_id).await;
+                assert_eq!(
+                    remote_state.adds.lock().unwrap().as_slice(),
+                    [hash(true, true)]
+                );
+            } else {
+                assert_eq!(done["status"], "failed", "{implementation}/{mode}: {done}");
+                assert_eq!(done["error_code"], "invalid_release", "{done}");
+                assert!(
+                    results.is_empty(),
+                    "strict feeds cannot publish partial results"
+                );
+                assert!(remote_state.adds.lock().unwrap().is_empty());
+            }
+            runtime.shutdown().await;
+            server.stop().await;
+            remote_server.stop().await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn automatic_and_interactive_search_preserve_context_targets_and_replay() {
     for (interactive, selection) in [

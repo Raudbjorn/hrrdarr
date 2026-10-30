@@ -950,7 +950,7 @@ async fn fetch(
                 return Err(Error(StatusCode::BAD_GATEWAY, e.code));
             }
         };
-        if !page.warnings.is_empty() {
+        if !page.warnings.is_empty() && !page.tolerates_item_warnings {
             return Err(Error(StatusCode::BAD_GATEWAY, "invalid_release"));
         }
         if releases.len() + page.items.len() > 1000 {

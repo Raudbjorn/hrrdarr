@@ -612,3 +612,98 @@ fn row_assembly_rejects_unsafe_locators_and_bad_hashes() {
     assert!(ok("https://user:pw@t.example/x", None).is_err());
     assert!(ok("https://t.example/x", Some("zz")).is_err());
 }
+
+#[test]
+fn json_trackers_require_explicit_result_containers() {
+    for value in [
+        json!(null),
+        json!({}),
+        json!({"result":{}}),
+        json!({"result":{"torrents":null}}),
+    ] {
+        assert!(matches!(
+            parse_btn(value.to_string().as_bytes(), MediaDomain::Tv),
+            Err(IndexerError::InvalidResponse)
+        ));
+    }
+    for torrents in [json!({}), json!([])] {
+        let (items, warnings) = parse_btn(
+            json!({"result":{"torrents":torrents}})
+                .to_string()
+                .as_bytes(),
+            MediaDomain::Tv,
+        )
+        .unwrap();
+        assert!(items.is_empty() && warnings.is_empty());
+    }
+    for value in [
+        json!(null),
+        json!({}),
+        json!({"Movies":null}),
+        json!({"Movies":{}}),
+        json!({"Movies":[{}]}),
+    ] {
+        assert!(matches!(
+            parse_ptp(
+                value.to_string().as_bytes(),
+                MediaDomain::Movies,
+                "https://ptp.example"
+            ),
+            Err(IndexerError::InvalidResponse)
+        ));
+    }
+    for value in [
+        json!(null),
+        json!({}),
+        json!({"results":null}),
+        json!({"results":{}}),
+    ] {
+        assert!(matches!(
+            parse_potato(value.to_string().as_bytes(), MediaDomain::Movies),
+            Err(IndexerError::InvalidResponse)
+        ));
+    }
+    assert!(
+        parse_ptp(
+            br#"{"Movies":[]}"#,
+            MediaDomain::Movies,
+            "https://ptp.example"
+        )
+        .unwrap()
+        .0
+        .is_empty()
+    );
+    assert!(
+        parse_potato(br#"{"results":[]}"#, MediaDomain::Movies)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
+#[test]
+fn ptp_response_credentials_are_redacted_from_release_and_group_titles() {
+    let body = json!({"AuthKey":"RESPONSE_AUTH","PassKey":"RESPONSE_PASS","Movies":[{
+        "GroupId":"1","Title":"Harbor RESPONSE_AUTH RESPONSE_PASS","Year":"2020","Torrents":[
+            {"Id":"1","ReleaseName":"Harbor.2020.RESPONSE_AUTH.RESPONSE_PASS","UploadTime":"2024-01-01 00:00:00"},
+            {"Id":"2","UploadTime":"2024-01-01 00:00:00"}
+        ]
+    }]});
+    let (items, warnings) = parse_ptp(
+        body.to_string().as_bytes(),
+        MediaDomain::Movies,
+        "https://ptp.example",
+    )
+    .unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(warnings.is_empty());
+    for item in items {
+        let title = item.metadata.title.unwrap();
+        assert!(!title.contains("RESPONSE_AUTH") && !title.contains("RESPONSE_PASS"));
+        assert_eq!(title.matches("[redacted]").count(), 2);
+        assert!(
+            item.download_url
+                .contains("authkey=RESPONSE_AUTH&torrent_pass=RESPONSE_PASS")
+        );
+    }
+}
