@@ -2810,6 +2810,18 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             }
         }
     }
+    // Legacy indexer tags cascade with scopes; retain assignments for domains kept by the edit.
+    let mut scope_tags = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT media_type,tag_id FROM provider_scope_tags WHERE provider_id=? ORDER BY media_type,tag_id",
+            [id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        scope_tags.push((row.get::<String>(0)?, row.get::<i64>(1)?));
+    }
+    drop(rows);
     // Directory placements reference their scope row; remove them explicitly before the scopes.
     conn.execute(
         "DELETE FROM provider_scope_directories WHERE provider_id=?",
@@ -2934,6 +2946,13 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 }
             }
         }
+    }
+    for (media, tag) in scope_tags {
+        conn.execute(
+            "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM provider_scopes WHERE provider_id=?1 AND media_type=?2)",
+            params![id, media, tag],
+        )
+        .await?;
     }
     if settings.is_download_client() {
         for (media, tags) in retained_tags {

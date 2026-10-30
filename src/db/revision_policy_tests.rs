@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 82); // Published main prefix and reconciliation add six migration positions.
     Ok(())
 }

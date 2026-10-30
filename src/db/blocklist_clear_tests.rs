@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {
@@ -149,7 +149,8 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
-                    // 0069 collection_version starts inactive.
+                    // Published collection_version and provider_authority_version start inactive.
+                    libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                 ]);
             }

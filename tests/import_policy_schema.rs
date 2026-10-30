@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+        82 // Published main prefix and reconciliation add six positions; import_lists is now position 82.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);

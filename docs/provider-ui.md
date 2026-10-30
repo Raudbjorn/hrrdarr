@@ -13,11 +13,22 @@ object, including indexer search flags and qBittorrent imported categories,
 priorities, initial state, content layout, sequential/first-last options and tags.
 The form edits categories, per-domain RSS/automatic/interactive search switches,
 each indexer scope’s download-client preference, and qBittorrent eligibility tags for each domain. Eligibility tags come from the local tag catalog and are separate from tags added to remote torrents. Other options are preserved.
-Client choices include enabled download clients supporting that domain and the indexer's protocol (Torznab with qBittorrent, Transmission, Deluge, rTorrent, uTorrent, Aria2, Flood or Download Station, Newznab with SABnzbd or NZBGet); Deluge, rTorrent, uTorrent, Aria2, Flood and Download Station scopes add a lowercase label, recent/older queue priority and add paused with a Web UI password; NZBGet scopes add a category, NZBGet's six job priorities and add-paused, with username/password credentials and a test result showing version and warnings; SABnzbd scopes add a category plus recent/older priority, and its test result shows version and warnings; Transmission composes its endpoint from Host, Port, Use SSL and URL base (showing the RPC URL), and each scope chooses a category (subfolder and label) or download directory, recent/older queue priority and add paused, with username/password credentials only; use the
+Client choices include enabled download clients supporting that domain and the indexer's protocol (Torznab with qBittorrent, Transmission, Deluge, rTorrent, uTorrent, Aria2, Flood or Download Station, Newznab with SABnzbd or NZBGet); Deluge, rTorrent, uTorrent, Aria2, Flood and Download Station scopes add a lowercase label, recent/older queue priority and add paused; NZBGet scopes add a category, NZBGet's six job priorities and add-paused, with username/password credentials and a test result showing version and warnings; SABnzbd scopes add a category plus recent/older priority, and its test result shows version and warnings; Transmission composes its endpoint from Host, Port, Use SSL and URL base (showing the RPC URL), and each scope chooses a category (subfolder and label) or download directory, recent/older queue priority and add paused, with username/password credentials only; use the
 provider-list pages to browse choices. An existing binding outside the current page
 or no longer available remains visible by ID and is preserved until explicitly
 changed or cleared. Disabling a scope removes its settings when saved. Backend validation
 remains authoritative for categories, endpoint, credentials and domain rules.
+
+Label-client credentials follow each implementation's contract:
+
+| Client | Credentials |
+| --- | --- |
+| Deluge | Required API-key bundle holding the Web UI password; no username |
+| rTorrent | Optional username/password for HTTP Basic authentication |
+| uTorrent | Required username/password |
+| Aria2 | Optional API-key bundle holding the RPC secret |
+| Flood | Optional username/password; omission requires authentication disabled on Flood |
+| Download Station | Required username/password |
 
 Credentials are write-only, never read back or stored by the UI. Preserve omits the
 credential member, retaining the entire encrypted bundle including hidden private
@@ -68,4 +79,4 @@ endpoints and owned mock providers, including authentication failure/success,
 scoped setting preservation and stale revisions. Such checks do not establish live
 provider equivalence or complete settings parity. Draft testing, presets, discovered
 category selection, advanced scope editors, bulk operations, every remaining
-provider and full routes `ui.010`/`ui.013` remain required work. No new backend route is introduced. Migration 0052 supplies scoped eligibility tags and durable selection attempts and rounds. The provider transport directly references the already-locked Rust TLS dependency to distinguish certificate-trust failures without exposing private error text.
+provider and full routes `ui.010`/`ui.013` remain required work. No new backend route is introduced. Migration file `0052_download_client_selection.sql` supplies scoped eligibility tags and durable selection attempts and rounds. The provider transport directly references the already-locked Rust TLS dependency to distinguish certificate-trust failures without exposing private error text.

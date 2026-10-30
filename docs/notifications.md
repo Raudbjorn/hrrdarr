@@ -107,8 +107,8 @@ unverified.
 split on whitespace (double quotes group; no escapes, expansion or shell). Environment is cleared
 to `PATH=/usr/local/bin:/usr/bin:/bin` plus the event variables; cwd `/`, stdin closed, 30 s
 timeout (process group killed), output capped at 8 KiB per stream. Exit status 0 is success.
-stdout is logged at DEBUG and stderr at WARN for both domains (Sonarr logs stderr as an error,
-Radarr as information; hrrdarr deliberately uses one middle level).
+Only captured output byte counts are logged: stdout at DEBUG and stderr at WARN.
+Script output text and the script path are omitted because they can contain private event data.
 
 TV events use `sonarr_*`, movie events `radarr_*`. Every event sets `<app>_eventtype`,
 `<app>_instancename` (`hrrdarr`) and `<app>_applicationurl` (empty). Implemented subset of the

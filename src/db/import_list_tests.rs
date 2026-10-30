@@ -1,4 +1,4 @@
-//! Migration 0080 (import lists, array position 76): upgrade from the previous schema keeps rows,
+//! Migration 0080 (import lists, array position 82): upgrade from the previous schema keeps rows,
 //! the migration is atomic, and the table constraints and triggers hold.
 use super::*;
 
@@ -83,7 +83,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76);
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=9").await,
         1
@@ -94,7 +94,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(db);
     // Reopening is a no-op.
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 76);
+    assert_eq!(version(&db.connect().await?).await?, 82); // Published main prefix and reconciliation add six migration positions.
     Ok(())
 }
 

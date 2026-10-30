@@ -175,11 +175,11 @@ pub fn run_blocking(
     };
     match status {
         None => {
-            log_output(path, &output);
+            log_output(&output, &mut std::io::stderr());
             Err(ScriptError::Timeout)
         }
         Some(status) => {
-            log_output(path, &output);
+            log_output(&output, &mut std::io::stderr());
             if status.success() {
                 Ok(output)
             } else {
@@ -189,19 +189,17 @@ pub fn run_blocking(
     }
 }
 
-/// Script stdout is DEBUG and stderr is WARN for both domains: Sonarr logs stderr as an error and
-/// Radarr as information, so hrrdarr picks one consistent middle level instead of copying either.
-fn log_output(path: &str, output: &Output) {
+// Script text and paths may contain private event data; log only captured byte counts.
+fn log_output(output: &Output, writer: &mut impl std::io::Write) {
     for (level, stream, text) in [
         ("DEBUG", "stdout", &output.stdout),
         ("WARN", "stderr", &output.stderr),
     ] {
-        let text = text.trim();
         if !text.is_empty() {
-            let clipped: String = text.chars().take(2048).collect();
-            eprintln!(
+            let _ = writeln!(
+                writer,
                 "{}",
-                serde_json::json!({"level":level,"event":"notification_script_output","script":path,"stream":stream,"text":clipped})
+                serde_json::json!({"level":level,"event":"notification_script_output","stream":stream,"captured_bytes":text.len()})
             );
         }
     }
@@ -210,6 +208,27 @@ fn log_output(path: &str, output: &Output) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn script_output_logs_only_diagnostic_counts() {
+        let output = Output {
+            stdout: "private title /library/private\n".into(),
+            stderr: "secret-token\n".into(),
+        };
+        let mut log = Vec::new();
+        log_output(&output, &mut log);
+        let records: Vec<serde_json::Value> = String::from_utf8(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records,
+            vec![
+                serde_json::json!({"level":"DEBUG","event":"notification_script_output","stream":"stdout","captured_bytes":output.stdout.len()}),
+                serde_json::json!({"level":"WARN","event":"notification_script_output","stream":"stderr","captured_bytes":output.stderr.len()}),
+            ]
+        );
+    }
     #[test]
     fn arguments_split_without_shell_semantics() {
         assert_eq!(

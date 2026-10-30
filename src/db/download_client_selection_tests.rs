@@ -27,12 +27,12 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<Vec<libsql::Value>>, Erro
     }
     Ok(result)
 }
-async fn seed51(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+async fn seed55(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let db = libsql::Builder::new_local(path).build().await?;
     let c = db.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(51).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(55).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -48,11 +48,11 @@ async fn library(c: &Connection) -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_back()
+async fn selection_upgrade55_preserves_legacy_children_and_late_failure_rolls_back()
 -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
-    let (raw, c) = seed51(&path).await?;
+    let (raw, c) = seed55(&path).await?;
     library(&c).await?;
     let client = super::refresh_tests::provider(&c).await?;
     for media in ["tv", "movies"] {
@@ -102,7 +102,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     }
     // Historical imported data is unrelated to the pending imports but shares their library owners.
     c.execute_batch("INSERT INTO episode_files(id,series_id,path)VALUES(1,1,'/tv/old.mkv'); UPDATE episodes SET episode_file_id=1 WHERE id=1; INSERT INTO operations(id,media_type,episode_id,source,mode,destination,status,message)VALUES('prior-import','episode',1,'/prior','copy','/tv/old.mkv','preview','fixture'); INSERT INTO import_journal(operation_id,plan_json,phase)VALUES('prior-import','{}','preview'); INSERT INTO import_history(operation_id,media_type,episode_id,episode_file_id,source,destination,size,sha256)VALUES('prior-import','episode',1,1,'/prior','/tv/old.mkv',1,printf('%064d',0)); UPDATE import_journal SET phase='complete',stage_json='{}' WHERE operation_id='prior-import';").await?;
-    c.execute("CREATE TRIGGER selection_fail_history BEFORE INSERT ON schema_migrations WHEN NEW.version=52 BEGIN SELECT RAISE(ABORT,'injected late selection migration failure'); END",()).await?;
+    c.execute("CREATE TRIGGER selection_fail_history BEFORE INSERT ON schema_migrations WHEN NEW.version=56 BEGIN SELECT RAISE(ABORT,'injected late selection migration failure'); END",()).await?;
     let tables = [
         "rss_commands",
         "rss_schedules",
@@ -151,7 +151,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     assert!(error.to_string().contains("migration rolled back"));
     let raw = libsql::Builder::new_local(&path).build().await?;
     let c = raw.connect()?;
-    assert_eq!(version(&c).await?, 51);
+    assert_eq!(version(&c).await?, 55); // Failed selection migration preserves the actual predecessor.
     assert_eq!(
         rows(
             &c,
@@ -173,13 +173,13 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {
-                " WHERE version<=51"
+                " WHERE version<=55"
             } else if *table == "health_checks" {
-                // 0053 and 0059 add two identities each; all schema51 observations remain exact.
+                // 0053 and 0059 add two identities each; all schema55 observations remain exact.
                 " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin')"
             } else {
                 ""
@@ -220,7 +220,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
                 libsql::Builder::new_local(db.migration_backup().unwrap().join("database.db"))
                     .build()
                     .await?;
-            assert_eq!(version(&backup.connect()?).await?, 51);
+            assert_eq!(version(&backup.connect()?).await?, 55); // Backup retains the complete pre-selection prefix.
         } else {
             assert!(db.migration_backup().is_none());
         }

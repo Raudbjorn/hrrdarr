@@ -127,6 +127,12 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
         let stopped = self
             .call("aria2.tellStopped", vec![json!(0), json!(WINDOW), keys])
             .await?;
+        // shortcut: a full window may hide downloads; paginate before supporting larger queues.
+        for list in [&waiting, &stopped] {
+            if list.as_array().ok_or(QbitError::InvalidResponse)?.len() >= WINDOW {
+                return Err(HttpError::ResponseTooLarge.into());
+            }
+        }
         let mut out = Vec::new();
         self.gids.clear();
         for list in [&active, &waiting, &stopped] {

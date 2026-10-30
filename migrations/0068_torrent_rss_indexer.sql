@@ -7,13 +7,11 @@
 -- CHECK only admits torznab/newznab bindings), search_commands_admit is deliberately unchanged
 -- (a feed cannot be searched), indexer_status/backoff is not extended, and no health_checks rows are added.
 --
--- The registry makes this additive: one implementation row plus replacement shape/option/admission
--- triggers. Neither providers nor provider_scopes are rebuilt (a rebuild would cascade-delete scopes,
--- test results, schedules and journals under foreign_keys=ON).
-INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('torrentrss','indexer','torrent');
-ALTER TABLE provider_scopes ADD COLUMN minimum_seeders INTEGER DEFAULT NULL CHECK (
-    minimum_seeders IS NULL OR (implementation='torrentrss' AND typeof(minimum_seeders)='integer' AND minimum_seeders BETWEEN 0 AND 1000000)
-);
+-- The registry makes this additive: replacement shape/option/admission triggers. Neither providers
+-- nor provider_scopes are rebuilt (a rebuild would cascade-delete scopes, test results, schedules
+-- and journals under foreign_keys=ON). The 'torrentrss' implementation row is seeded by 0059,
+-- because the registry is immutable and the published 0050 may already hold such a provider, and
+-- `minimum_seeders` was added by that published migration, so it is not added again here.
 
 DROP TRIGGER rss_schedules_admit;
 CREATE TRIGGER rss_schedules_admit BEFORE INSERT ON rss_schedules BEGIN

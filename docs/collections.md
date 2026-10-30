@@ -63,27 +63,26 @@ collection remain assignments: deleting one is a conflict, as before.
 
 ## Reconciliation with origin/main's collections checkpoint
 
-origin/main (PR #1) landed an independent collections foundation as its migrations 0052/0053. This branch's
-0066 model (policy columns, API, UI, RefreshCollections, AutoTagging coupling) is the base; origin's additional
-value was ported onto it and the duplicate parts dropped:
+Main's published migrations 1–53 remain byte-for-byte in the migration registry. Later migrations
+adapt that schema to the inline collection policy used here; filename prefixes identify source files,
+while `src/db/mod.rs` defines schema versions and execution order.
 
-* Ported: snapshot import of collections and exclusions with its replacement rules and regression tests
-  (`tests/snapshot_collections.rs`, retargeted to the columns above), the `origin` membership provenance, the
-  reference-delete fixes for profiles and roots (`tests/collection_reference_deletes.rs`), and the preference for
-  fresh native data (`local_edit`, `metadata_revision`) over old backups.
-* Dropped as duplicate: origin's `movie_collection_settings`, `movie_collection_intents`, `graph_complete`/member
-  revision triggers, companion `movie_with_collection` metadata API and `CollectionAssociation` types (0066 and
-  `src/metadata.rs` already carry the association on `MovieDetails`), its transactional adoption repository, the
-  selected-add `monitor`/`collection_expected_revision` options, and `collection_schema.rs`/`collection_adoption.rs`
-  tests, which assert that schema. Intent tombstones and the retire-empty-collection cleanup are not ported
-  because this branch has no collection deletion and keeps collections as catalog entities.
-* Provider authority (origin 0053) is not added: `provider_scope_tags` is covered by `download_client_tags`
-  (0052), `provider_status` by the durable `indexer_status`/`download_client_status` backoff, and the selection
-  cursor by `src/providers/selection.rs` (volatile per-domain cursors; nothing in either tree consumed origin's
-  persistent cursor table). Origin's tag-preserving `write_scopes` fix is already
-  implemented here (`retained_tags`); `tests/provider_config_api.rs` keeps the retention test for it.
-* The snapshot provider reconciliation (PR #19: `provider_conflicts`, `allow_unmapped_providers`, exact-match
-  binding) is merged as-is and works with download-client tags.
+* Existing collection policy and tags move from `movie_collection_settings` to `movie_collections`
+  and its tag table. The prior settings revision is retained as `checkpoint_settings_revision`;
+  catalog metadata, membership provenance and ownership markers are preserved.
+* `movie_collection_intents` remains authoritative: explicit removals suppress recreation and local
+  edits fence snapshot replacement. Native discovery may revive metadata-missing collections
+  while retaining the local-edit marker.
+* Download-client scope tags move into `download_client_tags`. Indexer scope tags remain in
+  `provider_scope_tags`, survive edits that retain their domain, and prevent tag deletion while used.
+  `provider_status` and `provider_selection_cursors` remain stored; neither main nor this branch
+  consumes those checkpoint tables at runtime. Current backoff and selection behavior uses the
+  existing scoped status tables and selection implementation.
+* Pending download-client health wake-ups transfer to `download_client_status.next_health_at`.
+* Snapshot provider reconciliation retains conflict reporting and exact-match binding.
+
+Upgrade fixtures in `src/db/published_prefix_tests.rs` cover the published schema and populated
+state. These tests use isolated databases; they do not establish production upgrade success.
 
 ## Not claimed
 

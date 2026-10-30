@@ -276,12 +276,11 @@ async fn claim(db: &Database) -> Result<Option<Claimed>> {
         crate::health::sweep(&tx,timestamp).await?;
         recycle_cleanup::schedule_due(&tx,timestamp).await?;
         collection_refresh::schedule_due(&tx,timestamp).await?;
-        if let Some(command)=collection_refresh::claim_due(&tx,timestamp).await? {return Ok(Some(Claimed::CollectionRefresh(command)))}
-        let row=tx.query(&format!("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND (origin!='automatic' OR manual_bypass=1 OR NOT EXISTS(SELECT 1 FROM download_client_status b WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND b.disabled_until>?)) UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,3 kind,priority,created_at FROM rss_commands WHERE status IN ('queued','retry_wait','running') AND next_attempt_at<=? UNION ALL SELECT id,4 kind,0 priority,created_at FROM rss_candidates WHERE status IN ('pending','prepared','reconciling') AND (not_before IS NULL OR not_before<=?) AND (command_id IS NULL OR NOT EXISTS(SELECT 1 FROM rss_commands c WHERE c.id=rss_candidates.command_id AND c.status IN ('queued','running','retry_wait'))) UNION ALL SELECT candidate_id id,5 kind,0 priority,created_at FROM download_processing WHERE ((status='queued' AND NOT {reserved} AND NOT EXISTS(SELECT 1 FROM rescan_commands r JOIN rss_candidates c ON c.id=download_processing.candidate_id WHERE r.status IN ('queued','running','retry_wait') AND ((c.media_type='tv' AND r.media_type='tv' AND r.series_id=c.series_id) OR (c.media_type='movies' AND r.media_type='movies' AND r.movie_id=c.movie_id)))) OR (status='importing' AND (error_code IS NULL OR resume_requested=1))) AND next_attempt_at<=? UNION ALL SELECT id,6 kind,priority,created_at FROM search_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,7 kind,priority,created_at FROM manual_import_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM manual_import_commands r WHERE r.status='running') AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.id=manual_import_commands.operation_id AND EXISTS(SELECT 1 FROM rescan_commands r WHERE r.status IN ('queued','running','retry_wait') AND ((o.media_type='episode' AND r.media_type='tv' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=r.series_id)) OR (o.media_type='movie' AND r.media_type='movies' AND r.movie_id=o.movie_id)))) UNION ALL SELECT id,8 kind,priority,created_at FROM quality_reset_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,9 kind,priority,created_at FROM rescan_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM import_journal j JOIN operations o ON o.id=j.operation_id WHERE j.phase NOT IN ('preview','complete') AND ((rescan_commands.media_type='tv' AND o.media_type='episode' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=rescan_commands.series_id)) OR (rescan_commands.media_type='movies' AND o.media_type='movie' AND o.movie_id=rescan_commands.movie_id))) AND NOT EXISTS(SELECT 1 FROM download_processing dp JOIN rss_candidates r ON r.id=dp.candidate_id WHERE dp.status IN ('checking','importing') AND ((rescan_commands.media_type='tv' AND r.media_type='tv' AND r.series_id=rescan_commands.series_id) OR (rescan_commands.media_type='movies' AND r.media_type='movies' AND r.movie_id=rescan_commands.movie_id))) UNION ALL SELECT id,10 kind,priority,created_at FROM health_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,11 kind,priority,ready_order_at created_at FROM downloaded_scan_commands WHERE (status IN ('queued','retry_wait') OR (status='running' AND (inventory_revision=1 OR candidate_id IS NOT NULL))) AND next_attempt_at<=? UNION ALL SELECT id,12 kind,priority,created_at FROM recycle_bin_cleanup_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,13 kind,priority,created_at FROM rename_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",reserved=processing::SCAN_RESERVED),params![timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp]).await?.next().await?;
+        let row=tx.query(&format!("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND (origin!='automatic' OR manual_bypass=1 OR NOT EXISTS(SELECT 1 FROM download_client_status b WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND b.disabled_until>?)) UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,3 kind,priority,created_at FROM rss_commands WHERE status IN ('queued','retry_wait','running') AND next_attempt_at<=? UNION ALL SELECT id,4 kind,0 priority,created_at FROM rss_candidates WHERE status IN ('pending','prepared','reconciling') AND (not_before IS NULL OR not_before<=?) AND (command_id IS NULL OR NOT EXISTS(SELECT 1 FROM rss_commands c WHERE c.id=rss_candidates.command_id AND c.status IN ('queued','running','retry_wait'))) UNION ALL SELECT candidate_id id,5 kind,0 priority,created_at FROM download_processing WHERE ((status='queued' AND NOT {reserved} AND NOT EXISTS(SELECT 1 FROM rescan_commands r JOIN rss_candidates c ON c.id=download_processing.candidate_id WHERE r.status IN ('queued','running','retry_wait') AND ((c.media_type='tv' AND r.media_type='tv' AND r.series_id=c.series_id) OR (c.media_type='movies' AND r.media_type='movies' AND r.movie_id=c.movie_id)))) OR (status='importing' AND (error_code IS NULL OR resume_requested=1))) AND next_attempt_at<=? UNION ALL SELECT id,6 kind,priority,created_at FROM search_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,7 kind,priority,created_at FROM manual_import_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM manual_import_commands r WHERE r.status='running') AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.id=manual_import_commands.operation_id AND EXISTS(SELECT 1 FROM rescan_commands r WHERE r.status IN ('queued','running','retry_wait') AND ((o.media_type='episode' AND r.media_type='tv' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=r.series_id)) OR (o.media_type='movie' AND r.media_type='movies' AND r.movie_id=o.movie_id)))) UNION ALL SELECT id,8 kind,priority,created_at FROM quality_reset_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,9 kind,priority,created_at FROM rescan_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM import_journal j JOIN operations o ON o.id=j.operation_id WHERE j.phase NOT IN ('preview','complete') AND ((rescan_commands.media_type='tv' AND o.media_type='episode' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=rescan_commands.series_id)) OR (rescan_commands.media_type='movies' AND o.media_type='movie' AND o.movie_id=rescan_commands.movie_id))) AND NOT EXISTS(SELECT 1 FROM download_processing dp JOIN rss_candidates r ON r.id=dp.candidate_id WHERE dp.status IN ('checking','importing') AND ((rescan_commands.media_type='tv' AND r.media_type='tv' AND r.series_id=rescan_commands.series_id) OR (rescan_commands.media_type='movies' AND r.media_type='movies' AND r.movie_id=rescan_commands.movie_id))) UNION ALL SELECT id,10 kind,priority,created_at FROM health_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,11 kind,priority,ready_order_at created_at FROM downloaded_scan_commands WHERE (status IN ('queued','retry_wait') OR (status='running' AND (inventory_revision=1 OR candidate_id IS NOT NULL))) AND next_attempt_at<=? UNION ALL SELECT id,12 kind,priority,created_at FROM recycle_bin_cleanup_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,13 kind,priority,created_at FROM rename_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,14 kind,CASE origin WHEN 'automatic' THEN -1 ELSE 0 END priority,next_attempt_at created_at FROM collection_refresh_commands WHERE status='queued' AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",reserved=processing::SCAN_RESERVED),params![timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp]).await?.next().await?;
         let Some(row)=row else{return Ok(None)};
         let id=Uuid::parse_str(&row.get::<String>(0)?).map_err(|_|bad())?;
-        // Only this arm substitutes ready_order_at for created_at, so scan continuations cannot
-        // starve same-priority work in the other queues.
+        // Sliced scans and collections re-enter by their ready time so other due work interleaves.
+        if row.get::<i64>(1)?==14 {return Ok(Some(Claimed::CollectionRefresh(collection_refresh::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==13 {return Ok(Some(Claimed::Rename(rename::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==12 {return Ok(Some(Claimed::RecycleCleanup(recycle_cleanup::claim(&tx,id,timestamp).await?)))}
         if row.get::<i64>(1)?==11 {return Ok(downloaded_scan::claim(&tx,id,timestamp).await?.map(Claimed::DownloadedScan))}
@@ -1530,5 +1529,82 @@ mod tests {
             panic!("scan continues once nothing else is due")
         };
         assert_eq!(third.id.to_string(), scan);
+    }
+    #[tokio::test]
+    async fn collection_slices_yield_to_due_work_and_automatic_refresh_has_lower_priority() {
+        let path =
+            std::env::temp_dir().join(format!("hrrdarr-collection-fairness-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _scratch = Scratch(path.clone());
+        let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+        let c = db.connect().await.unwrap();
+        let collection = Uuid::new_v4().to_string();
+        let reset = Uuid::new_v4().to_string();
+        c.execute("INSERT INTO collection_refresh_commands(id,name,origin,next_attempt_at,created_at) VALUES(?,'refresh_collections','manual',1000,1000)", [collection.clone()]).await.unwrap();
+        c.execute("INSERT INTO quality_reset_commands(id,media_type,reset_titles,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',0,0,'queued',0,2000,2000)", [reset.clone()]).await.unwrap();
+        for id in 1..=51 {
+            c.execute(
+                "INSERT INTO movie_collections(id,tmdb_id,title) VALUES(?,?,'Fixture')",
+                params![id, id],
+            )
+            .await
+            .unwrap();
+        }
+        let Some(Claimed::CollectionRefresh(first)) = claim(&db).await.unwrap() else {
+            panic!("older manual refresh must compete at normal priority")
+        };
+        assert_eq!(first.id.to_string(), collection);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|| async { StatusCode::NOT_FOUND }),
+            )
+            .await
+            .unwrap();
+        });
+        let client = crate::metadata::MetadataClient::with_origins(&origin, &origin).unwrap();
+        collection_refresh::run(&db, &client, first).await.unwrap();
+        server.abort();
+        assert_eq!(
+            scalar(&c, "SELECT cursor FROM collection_refresh_commands").await,
+            50
+        );
+        let Some(Claimed::QualityReset(second)) = claim(&db).await.unwrap() else {
+            panic!("a continuation must yield to same-priority due work")
+        };
+        assert_eq!(second.id.to_string(), reset);
+        c.execute(
+            "UPDATE quality_reset_commands SET status='cancelled',completed_at=1 WHERE id=?",
+            [reset.clone()],
+        )
+        .await
+        .unwrap();
+        let Some(Claimed::CollectionRefresh(third)) = claim(&db).await.unwrap() else {
+            panic!("the collection cursor must remain resumable")
+        };
+        assert_eq!(third.id.to_string(), collection);
+        // Recovery also re-enters behind ready work, without resetting the durable cursor.
+        collection_refresh::recover(&c, now().unwrap(), "interrupted")
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&c, "SELECT cursor FROM collection_refresh_commands").await,
+            50
+        );
+        c.execute(
+            "UPDATE collection_refresh_commands SET origin='automatic',next_attempt_at=1000",
+            (),
+        )
+        .await
+        .unwrap();
+        // Terminal commands cannot be requeued; enqueue fresh work for the automatic-priority check.
+        let reset = Uuid::new_v4().to_string();
+        c.execute("INSERT INTO quality_reset_commands(id,media_type,reset_titles,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',0,0,'queued',0,2000,2000)", [reset.clone()]).await.unwrap();
+        let Some(Claimed::QualityReset(fourth)) = claim(&db).await.unwrap() else {
+            panic!("older automatic collections must yield to normal-priority work")
+        };
+        assert_eq!(fourth.id.to_string(), reset);
     }
 }

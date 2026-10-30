@@ -28,12 +28,12 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<Vec<libsql::Value>>, Erro
     }
     Ok(result)
 }
-async fn seed50(path: &Path) -> Result<(libsql::Database, Connection), Error> {
+async fn seed53(path: &Path) -> Result<(libsql::Database, Connection), Error> {
     let db = libsql::Builder::new_local(path).build().await?;
     let c = db.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(50).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(53).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -48,10 +48,10 @@ async fn status(c: &Connection, p: &str, media: &str) -> Result<(), libsql::Erro
     Ok(())
 }
 #[tokio::test]
-async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), Error> {
+async fn backoff_upgrade53_rollback_reopen_preserves_authority() -> Result<(), Error> {
     let s = Scratch::new();
     let path = s.0.join("db");
-    let (raw, c) = seed50(&path).await?;
+    let (raw, c) = seed53(&path).await?;
     let p = super::refresh_tests::provider(&c).await?;
     super::refresh_tests::enqueue(&c, &p, "tv").await?;
     super::refresh_tests::enqueue(&c, &p, "movies").await?;
@@ -87,7 +87,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[50].1).await?;
+    tx.execute_batch(MIGRATIONS[53].1).await?;
     assert!(
         tx.execute(
             "INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,next_health_at)VALUES('invalid','tv',1,0,-1)",
@@ -104,27 +104,17 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
-    // 0068 appends the nullable minimum_seeders column to provider_scopes; every predecessor value stays exact.
-    let mut scopes = before[1].clone();
-    for row in &mut scopes {
-        row.push(libsql::Value::Null);
-    }
-    assert_eq!(rows(&c, queries[1]).await?, scopes);
-    let mut commands = before[2].clone();
-    for row in &mut commands {
-        row.extend([
-            libsql::Value::Text("legacy_unknown".into()),
-            libsql::Value::Integer(0),
-        ]);
-    }
-    assert_eq!(rows(&c, queries[2]).await?, commands);
+    // Published version 50 already added minimum_seeders; no scope columns change.
+    assert_eq!(rows(&c, queries[1]).await?, before[1]);
+    // Published 0051 already added command origin/manual_bypass before the schema53 fixture.
+    assert_eq!(rows(&c, queries[2]).await?, before[2]);
     let checks = before[3].clone();
-    // Preserve schema50 rows; 0051, 0053 and 0060 (recycle_bin) add separate registry identities.
-    assert_eq!(rows(&c,"SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?,checks);
+    // Preserve schema53 rows; appended indexer backoff, path diagnostics and recycle-bin checks are new identities.
+    assert_eq!(rows(&c,"SELECT * FROM health_checks WHERE check_key NOT IN ('indexer_status','indexer_failures','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?,checks);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='download_client_backoff' AND scope IN ('tv','movies') AND startup=1 AND scheduled=1 AND compatibility_type='DownloadClientStatusCheck' AND generation=0 AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND severity IS NULL AND last_error IS NULL AND due_at IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM download_client_status").await?,
@@ -133,7 +123,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let backup = libsql::Builder::new_local(db.migration_backup().unwrap().join("database.db"))
         .build()
         .await?;
-    assert_eq!(version(&backup.connect()?).await?, 50);
+    assert_eq!(version(&backup.connect()?).await?, 53);
     drop(backup);
     integrity(&c).await?;
     let schema = rows(&c, queries[8]).await?;
@@ -143,7 +133,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     let c = db.connect().await?;
     assert!(db.migration_backup().is_none());
     assert_eq!(rows(&c, queries[8]).await?, schema);
-    assert_eq!(rows(&c, queries[2]).await?, commands);
+    assert_eq!(rows(&c, queries[2]).await?, before[2]);
     Ok(())
 }
 #[tokio::test]

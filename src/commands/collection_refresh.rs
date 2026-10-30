@@ -204,28 +204,17 @@ pub(super) async fn schedule_due(c: &Connection, timestamp: i64) -> Result<()> {
     }
     Ok(())
 }
-pub(super) async fn claim_due(
+pub(super) async fn claim(
     c: &Connection,
+    id: Uuid,
     timestamp: i64,
-) -> Result<Option<CollectionRefreshCommand>> {
-    let Some(r) = c
-        .query(
-            "SELECT id FROM collection_refresh_commands WHERE status='queued' AND next_attempt_at<=? ORDER BY created_at,id LIMIT 1",
-            [timestamp],
-        )
-        .await?
-        .next()
-        .await?
-    else {
-        return Ok(None);
-    };
-    let id = Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?;
+) -> Result<CollectionRefreshCommand> {
     c.execute(
         "UPDATE collection_refresh_commands SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),error_code=NULL WHERE id=?",
         params![timestamp, id.to_string()],
     )
     .await?;
-    Ok(Some(read(c, id).await?))
+    read(c, id).await
 }
 /// An interrupted slice resumes from its cursor; completed collections are not repeated.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
@@ -298,7 +287,7 @@ pub(super) async fn run(
     let progress = "collections_checked=collections_checked+?,collections_failed=collections_failed+?,movies_added=movies_added+?,searches_pending=searches_pending+?,cursor=?";
     if more {
         c.execute(
-            &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=? WHERE id=? AND status='running'"),
+            &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=max(next_attempt_at+1,?) WHERE id=? AND status='running'"),
             params![checked, failed, added, searches, cursor, now()?, id.to_string()],
         )
         .await?;

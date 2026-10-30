@@ -486,3 +486,74 @@ async fn clear_removes_membership_and_unavailable_peer_fails_the_command() -> Re
     h.finish().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn collection_discovery_preserves_removed_and_local_edit_intents() -> Result<(), Error> {
+    let mut h = harness().await?;
+    h.worker.take().unwrap().shutdown().await;
+    let c = h.db.connect().await?;
+    c.execute_batch("INSERT INTO movie_collection_intents(tmdb_id,local_edit,removed,removal_reason) VALUES(900,1,1,'user'),(901,1,1,'metadata_missing');").await?;
+    {
+        let mut p = h.peer.lock().unwrap();
+        p["movie"]["101"] = film(
+            101,
+            "Removed",
+            2001,
+            json!({"tmdbId":900,"name":"Removed Collection"}),
+        );
+        p["movie"]["102"] = film(
+            102,
+            "Restored",
+            2002,
+            json!({"tmdbId":901,"name":"Restored Collection"}),
+        );
+    }
+    for id in [101, 102] {
+        let (status, body) = h
+            .call(
+                "POST",
+                "/api/v1/movies/lookup",
+                Some(json!({"tmdb_id":id,"path":format!("/library/movies/{id}")})),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    assert_eq!(
+        h.scalar("SELECT count(*) FROM movie_collections WHERE tmdb_id=900")
+            .await,
+        0
+    );
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=900 AND removed=1 AND local_edit=1 AND removal_reason='user' AND revision=1").await, 1);
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collection_members m JOIN movie_collections c ON c.id=m.collection_id WHERE c.tmdb_id=901").await, 1);
+    // Restoration clears lifecycle removal, but the independent snapshot fence must survive.
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=901 AND removed=0 AND local_edit=1 AND removal_reason IS NULL AND revision=2").await, 1);
+    // A rediscovered removed collection must also detach an outdated association.
+    h.peer.lock().unwrap()["movie"]["102"] = film(
+        102,
+        "Restored",
+        2002,
+        json!({"tmdbId":900,"name":"Removed Collection"}),
+    );
+    let movie_id = h.scalar("SELECT m.id FROM movies m JOIN movie_metadata d ON d.id=m.metadata_id WHERE d.tmdb_id=102").await;
+    let target = library::refresh::capture(&c, library::refresh::Target::Movies { movie_id })
+        .await
+        .unwrap();
+    let detail = h.client.movie(102).await.unwrap();
+    let tx = c.transaction().await?;
+    library::refresh::apply(&tx, &target, library::refresh::Details::Movie(detail))
+        .await
+        .unwrap();
+    tx.commit().await?;
+    assert_eq!(
+        h.scalar("SELECT count(*) FROM movie_collection_members")
+            .await,
+        0
+    );
+    assert_eq!(
+        h.scalar("SELECT count(*) FROM movie_collections WHERE tmdb_id=900")
+            .await,
+        0
+    );
+    h.finish().await;
+    Ok(())
+}

@@ -491,7 +491,11 @@ pub(super) async fn write(c: &Connection, plan: &Collections, report: &mut Repor
     }
     let mut owners = BTreeMap::new();
     for (remote, fact) in &plan.facts {
-        // Native authority is local to movie_collections (migration 0066 stores policy inline):
+        if c.query("SELECT 1 FROM movie_collection_intents WHERE tmdb_id=? AND (local_edit=1 OR removed=1)", [*remote]).await?.next().await?.is_some() {
+            issue(&mut report.unsupported, "Collections", "native collection intent retained; source policy inactive");
+            continue;
+        }
+        // Existing inline policy and fetched metadata also fence stale snapshots:
         // local_edit marks an API/UI policy edit, metadata_revision a natively fetched graph or title.
         let existing=c.query("SELECT id,metadata_revision,title,local_edit,snapshot_owned,(monitored=1 OR search_on_add=1 OR quality_profile_id IS NOT NULL OR root_folder_id IS NOT NULL OR minimum_availability IS NOT NULL OR EXISTS(SELECT 1 FROM movie_collection_tags t WHERE t.collection_id=movie_collections.id)) FROM movie_collections WHERE tmdb_id=?",[*remote]).await?.next().await?;
         // Whether the stored policy may be (re)written by this snapshot.

@@ -217,6 +217,8 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
             m.downloads
                 .iter()
                 .filter(|d| matches!(d.status.as_str(), "waiting" | "paused"))
+                .skip(params[0].as_u64().unwrap() as usize)
+                .take(params[1].as_u64().unwrap() as usize)
                 .map(|d| status(d, params[2].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
@@ -224,6 +226,8 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
             m.downloads
                 .iter()
                 .filter(|d| matches!(d.status.as_str(), "complete" | "error" | "removed"))
+                .skip(params[0].as_u64().unwrap() as usize)
+                .take(params[1].as_u64().unwrap() as usize)
                 .map(|d| status(d, params[2].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
@@ -949,4 +953,89 @@ async fn status_mapping_isolation_details_and_controls() {
     );
     assert_eq!(f.calls("aria2.removeDownloadResult").len(), 2);
     task.abort();
+}
+
+#[tokio::test]
+async fn full_inventory_windows_fail_instead_of_hiding_tracked_torrents() {
+    for status in ["waiting", "complete"] {
+        let (f, endpoint, task) = fixture().await;
+        let settings = settings(&endpoint);
+        let client = HttpClient::new().unwrap();
+        let hash = "a".repeat(40);
+        // Unrelated HTTP downloads consume the window before filtering by hash or domain.
+        for n in 0..1000 {
+            f.put(dl(
+                &format!("{n:016x}"),
+                "",
+                "plain.bin",
+                "/downloads/other",
+                status,
+            ));
+        }
+        f.put(dl(
+            "000000000000ffff",
+            &hash,
+            "Tracked",
+            "/downloads/tv-hrr",
+            status,
+        ));
+        let operation = client.operation(Uuid::new_v4()).unwrap();
+        assert_eq!(
+            label_client::query(
+                &operation,
+                &settings,
+                Some(&login()),
+                &query(MediaDomain::Tv)
+            )
+            .await
+            .err()
+            .unwrap(),
+            QbitError::Http(HttpError::ResponseTooLarge)
+        );
+        // The per-hash lookup must fail too, rather than reporting the torrent absent.
+        let operation = client.operation(Uuid::new_v4()).unwrap();
+        assert_eq!(
+            label_client::details(
+                &operation,
+                &settings,
+                Some(&login()),
+                &MediaTarget::Episode(1),
+                &hash
+            )
+            .await
+            .err()
+            .unwrap(),
+            QbitError::Http(HttpError::ResponseTooLarge)
+        );
+        // Exactly a full window is ambiguous; below it a complete inventory is safe.
+        f.0.lock().unwrap().downloads.truncate(1000);
+        let operation = client.operation(Uuid::new_v4()).unwrap();
+        assert_eq!(
+            label_client::query(
+                &operation,
+                &settings,
+                Some(&login()),
+                &query(MediaDomain::Tv)
+            )
+            .await
+            .err()
+            .unwrap(),
+            QbitError::Http(HttpError::ResponseTooLarge)
+        );
+        f.0.lock().unwrap().downloads.pop();
+        let operation = client.operation(Uuid::new_v4()).unwrap();
+        assert!(
+            label_client::query(
+                &operation,
+                &settings,
+                Some(&login()),
+                &query(MediaDomain::Tv)
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+        );
+        task.abort();
+    }
 }

@@ -12,7 +12,7 @@ Download Station reports tasks by its own ids (`dbid_...`) and never an info has
 
 ## Configuration
 
-`ProviderSettings::Downloadstation { endpoint, tv, movies }`, stored by migration 0075 (registry row only; the scope triggers and unique label index came with 0070).
+`ProviderSettings::Downloadstation { endpoint, tv, movies }`, stored by migration file 0075 (registry row only; the scope triggers and unique label index came with 0070).
 
 - `endpoint` is DSM's base URL, for example `https://nas.example:5001`. Use HTTPS: credentials are sent in the login form.
 - Each scope is the shared `TorrentLabelScope`; `category` is the folder name below the default destination (1-64 of lowercase letters, digits, `.`, `_`, `-`; TV and movie values must differ). `add_paused` pauses the task after it is created. `recent_priority`/`older_priority` are stored but not applied.
@@ -41,4 +41,4 @@ Pause, Resume and Remove (`delete` with `force_complete=false`), each followed b
 - Live DSM compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1 over plain HTTP; no NAS was contacted. API names, parameters, `additional` shapes, status strings (DSM may report numeric statuses on newer versions, which would map to `unknown`), error codes and the destination semantics (relative to shared folders, folders created on demand) come from the documentation, not a live run.
 - The save path reported to the importer is the shared-folder path with a leading slash (for example `/downloads/tv/<hash>`); mapping it to the host's real volume path is the job of a remote path mapping. The real volume path is not read from DSM.
 - Two-factor accounts, queue placement, seeding limits and the health classifier are not implemented. The `SYNO.API.Info` path discovery is not performed; the documented fixed paths are used.
-- Migration 0075 is the 75th entry (the file number equals its array position).
+- Migration file `0075` is ordered by the registry in `src/db/mod.rs`; its filename prefix is not the schema version.

@@ -44,7 +44,7 @@ async fn failure(c: &Connection, id: &str, media: &str, revision: i64) -> Result
 }
 
 #[tokio::test]
-async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state() -> Result<(), Error>
+async fn indexer_backoff_upgrade54_rollback_and_reopen_preserve_existing_state() -> Result<(), Error>
 {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
@@ -52,7 +52,7 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(49).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(54).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -83,7 +83,7 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[49].1).await?;
+    tx.execute_batch(MIGRATIONS[54].1).await?;
     failure(&tx, &id, "tv", 1).await?;
     assert!(failure(&tx, &id, "movies", 2).await.is_err());
     tx.rollback().await?;
@@ -96,22 +96,15 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 27 } // Reasoning: 0080 import lists adds one more schema_migrations row (26 -> 27); previously: the 0069 collection snapshot and the six label-torrent client migrations 0070 to 0075 add seven schema_migrations rows beyond the nineteen previously asserted after the fifteen migrations from 49 through 64 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 8 } else { 28 } // Prefix 54 already includes the two download-client health checks; 28 migrations remain.
                 );
-            } else if *table == "provider_scopes" {
-                // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
-                let mut expected = expected.clone();
-                for row in &mut expected {
-                    row.push(libsql::Value::Null);
-                }
-                assert_eq!(actual, expected);
             } else if *table == "series" {
                 // 0055 appends unknown runtime; every predecessor value remains exact.
                 let mut expected = expected.clone();

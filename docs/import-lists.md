@@ -133,10 +133,9 @@ fetch. Failure classes: `invalid_settings`, `authentication`, `rate_limited`, `t
 ## Migration numbering
 
 The registry is migration **file** `0080_import_lists.sql`. The migration runner requires
-`schema_migrations.version == MIGRATIONS array position + 1` with no gaps, and positions 76-79
-(files 0076-0079) are reserved by other sessions, so in this branch the entry sits at array
-position 75 / **version 76**. The parent must renumber when integrating (the version assertions in
-`src/db/*_tests.rs` and `tests/*` carry their reasoning in comments). Contents: `import_lists`,
+`schema_migrations.version == MIGRATIONS array position + 1` with no gaps. File prefixes are
+historical names, not schema versions; `src/db/mod.rs` defines the execution order. The published
+main prefix is preserved byte-for-byte and new schema adaptations follow it. Contents: `import_lists`,
 `import_list_tags`, `import_list_exclusions`, `import_list_runs`, `import_list_items`,
 `import_list_additions`, and triggers for capacity, identity, revision, run retention and
 profile/root deletion.

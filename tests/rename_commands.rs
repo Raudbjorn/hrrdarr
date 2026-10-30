@@ -678,3 +678,140 @@ async fn interrupted_groups_roll_forward_or_back_from_the_journal_at_startup() -
     runtime.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn folder_rename_rejects_declared_overlaps_in_both_domains() -> R {
+    for tv in [true, false] {
+        for same_domain in [true, false] {
+            let (_lock, s, db, c, api) = setup().await?;
+            let owner = if tv { "series" } else { "movies" };
+            let other = if same_domain == tv {
+                "series"
+            } else {
+                "movies"
+            };
+            let other_id = if same_domain { 2 } else { 1 };
+            if tv {
+                seed_series(&c, 1, "Target", &s.s("lib/old"), None).await;
+            } else {
+                seed_movie(&c, 1, "Target", &s.s("lib/old"), None).await;
+            }
+            if other == "series" {
+                seed_series(&c, other_id, "Other", &s.s("other"), None).await;
+            } else {
+                seed_movie(&c, other_id, "Other", &s.s("other"), None).await;
+            }
+            s.write("lib/old/media.mkv");
+            naming_tv(&c, true, "ep", None, None).await;
+            naming_movies(&c, true, "film", Some("{Movie Title}")).await;
+            let domain = if tv { "tv" } else { "movies" };
+            let ids = if tv { "series_ids" } else { "movie_ids" };
+            let route = format!("/api/v1/{domain}/rename-folder-preview?{ids}=1");
+            for (declared, blocked) in [
+                ("lib/TargetExtra", false),
+                ("lib/Target", true),
+                ("lib/Target/", true),
+                ("lib", true),
+                ("lib/Target/child", true),
+            ] {
+                c.execute(
+                    &format!("UPDATE {other} SET path=? WHERE id=?"),
+                    params![s.s(declared), other_id],
+                )
+                .await?;
+                let preview = api.ok("GET", &route, None, 200).await;
+                assert_eq!(
+                    preview["items"][0]["status"],
+                    if blocked { "blocked" } else { "change" },
+                    "{owner} vs {other}: {declared}: {preview}"
+                );
+                if blocked {
+                    assert_eq!(
+                        preview["items"][0]["reasons"],
+                        json!(["destination_in_use"])
+                    );
+                }
+            }
+            let runtime = worker(&db, &api).await;
+            let name = if tv {
+                "rename_series_folder"
+            } else {
+                "rename_movie_folder"
+            };
+            let done = command(
+                &api,
+                json!({"name":name,"target":{"media_type":domain,ids:[1]},"priority":"normal"}),
+            )
+            .await;
+            assert_eq!(
+                done["items"][0]["error_code"], "destination_in_use",
+                "{done}"
+            );
+            assert_eq!(path_of(&c, owner, 1).await, s.s("lib/old"));
+            assert!(s.exists("lib/old/media.mkv") && !s.exists("lib/Target"));
+            runtime.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn folder_rename_recovery_rechecks_declarations_before_committing() -> R {
+    use std::os::unix::fs::MetadataExt;
+    for tv in [true, false] {
+        let (_lock, s, db, c, api) = setup().await?;
+        let (domain, owner, owner_column, name) = if tv {
+            ("tv", "series", "series_id", "rename_series_folder")
+        } else {
+            ("movies", "movies", "movie_id", "rename_movie_folder")
+        };
+        if tv {
+            seed_series(&c, 1, "Target", &s.s("lib/old"), None).await;
+        } else {
+            seed_movie(&c, 1, "Target", &s.s("lib/old"), None).await;
+        }
+        s.write("lib/old/media.mkv");
+        let m = std::fs::metadata(s.0.join("lib/old"))?;
+        let ident = json!({"dev":m.dev() as i64,"ino":m.ino() as i64});
+        let command_id = uuid::Uuid::new_v4().to_string();
+        // Exercise admitted -> claimed -> interrupted states so the recovery fixture obeys queue guards.
+        c.execute("INSERT INTO rename_commands(id,name,media_type,priority,status,attempts,next_attempt_at,created_at) VALUES(?,?,?,0,'queued',0,0,0)", params![command_id.clone(),name,domain]).await?;
+        c.execute(&format!("INSERT INTO rename_command_targets(command_id,ordinal,{owner_column}) VALUES(?,0,1)"), [command_id.clone()]).await?;
+        c.execute(
+            "UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id=?",
+            [command_id.clone()],
+        )
+        .await?;
+        c.execute(&format!("INSERT INTO rename_items(command_id,kind,{owner_column},old_path,new_path,identity_json,state) VALUES(?,'folder',1,?,?,?,'planned')"), params![command_id.clone(),s.s("lib/old"),s.s("lib/Target"),ident.to_string()]).await?;
+        std::fs::rename(s.0.join("lib/old"), s.0.join("lib/Target"))?;
+        c.execute("UPDATE rename_commands SET status='failed',completed_at=2,error_code='interrupted' WHERE id=?", [command_id]).await?;
+        // A new declaration after planning must roll the moved folder back, even without a directory.
+        if tv {
+            seed_movie(&c, 1, "Other", &s.s("lib/Target/child"), None).await;
+        } else {
+            seed_series(&c, 1, "Other", &s.s("lib/Target/child"), None).await;
+        }
+        let runtime = worker(&db, &api).await;
+        let row = c
+            .query("SELECT state,error_code FROM rename_items", ())
+            .await?
+            .next()
+            .await?
+            .unwrap();
+        assert_eq!(row.get::<String>(0)?, "rolled_back");
+        assert_eq!(row.get::<String>(1)?, "destination_in_use");
+        assert_eq!(path_of(&c, owner, 1).await, s.s("lib/old"));
+        assert!(s.exists("lib/old/media.mkv") && !s.exists("lib/Target"));
+        assert_eq!(
+            c.query("SELECT COUNT(*) FROM rename_events", ())
+                .await?
+                .next()
+                .await?
+                .unwrap()
+                .get::<i64>(0)?,
+            0
+        );
+        runtime.shutdown().await;
+    }
+    Ok(())
+}

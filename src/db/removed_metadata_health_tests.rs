@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -436,11 +436,15 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     // 0055/56 append runtime=NULL (series) and inactive activation markers. Keep the
     // complete row witness; rollback and backup above still compare unmodified45.
     let mut upgraded = before.clone();
     for row in &mut upgraded[0] {
+        row.push(Value::Null);
+    }
+    // Published 0051 appends a nullable deadline to the preserved health observations.
+    for row in &mut upgraded[12] {
         row.push(Value::Null);
     }
     // snapshot_imports is witnessed through an explicit column projection, so later inactive

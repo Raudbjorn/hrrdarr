@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/RTorrent/
 
 ## Configuration
 
-`ProviderSettings::Rtorrent { endpoint, tv, movies }`, stored by migration 0071 (registry row only; the scope triggers and unique label index came with 0070).
+`ProviderSettings::Rtorrent { endpoint, tv, movies }`, stored by migration file 0071 (registry row only; the scope triggers and unique label index came with 0070).
 
 - `endpoint` is the full XML-RPC URL, for example `http://rtorrent.example/RPC2`; nothing is appended.
 - Each scope is the shared `TorrentLabelScope`: `category` (the label: 1-64 of lowercase letters, digits, `.`, `_`, `-`), `recent_priority`/`older_priority` (`last` or `first`; `first` loads the torrent with `d.priority.set=3`, high), `add_paused` and optional eligibility `tags`. TV and movie labels must differ.
@@ -38,4 +38,4 @@ Pause (`d.stop`), Resume (`d.start`), Priority (`d.priority.set` 3 or 2) and Rem
 - Direct SCGI (without an HTTP front end) is not supported.
 - Seeding limits, ruTorrent label semantics beyond `d.custom1`, a configured download directory per label and the health classifier are not implemented.
 - The label alphabet is the shared lowercase family rule even though ruTorrent allows more; existing labels with other characters cannot be configured.
-- Migration 0071 is the 71st entry (the file number equals its array position).
+- Migration file `0071` is ordered by the registry in `src/db/mod.rs`; its filename prefix is not the schema version.

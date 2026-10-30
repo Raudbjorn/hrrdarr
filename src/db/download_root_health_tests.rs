@@ -66,7 +66,7 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
     // Two removed-metadata registry entries join the six previously seeded checks.
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
     new_registry(&c).await?;
@@ -180,11 +180,18 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0080 import_lists at position 76 (0076-0079 reserved by other sessions), appended after 0075 downloadstation; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
-            assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");
+            let mut expected = expected.clone();
+            if query.contains("FROM health_checks") {
+                // Published 0051 adds the nullable expiry column after this fixture's predecessor.
+                for row in &mut expected {
+                    row.push(libsql::Value::Null);
+                }
+            }
+            assert_eq!(rows(&c, query).await?, expected, "upgrade/replay {query}");
         }
         assert_eq!(
             scalar(
