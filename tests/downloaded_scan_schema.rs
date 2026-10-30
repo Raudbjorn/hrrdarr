@@ -344,6 +344,11 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .replace(
                 "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
                 "p.implementation IN ('torznab','newznab')",
+            )
+            // Reasoning: 0090 also admits all nine trackers to indexer backoff, excluding torrentrss.
+            .replace(
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+                "p.implementation IN ('torznab','newznab')",
             );
         let actual = actual
             .replace(
