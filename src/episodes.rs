@@ -89,6 +89,7 @@ fn body<T>(b: std::result::Result<Json<T>, JsonRejection>) -> Result<T> {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "EpisodeSeriesProjection")]
 pub struct SeriesProjection {
+    pub runtime: Option<i64>,
     pub id: i64,
     pub tvdb_id: Option<i64>,
     pub title: String,
@@ -217,7 +218,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(db)
 }
-const SELECT: &str = "SELECT e.id,e.series_id,e.season,e.number,e.title,e.monitored,e.episode_file_id,f.path,e.tvdb_id,e.air_date,e.air_date_utc,e.last_search_time,e.runtime,e.finale_type,e.overview,e.absolute_episode_number,e.scene_absolute_episode_number,e.scene_episode_number,e.scene_season_number,e.unverified_scene_numbering,e.images_json,s.tvdb_id,s.title,s.year,s.path,s.poster,s.monitored FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN episode_files f ON f.id=e.episode_file_id AND f.series_id=e.series_id";
+const SELECT: &str = "SELECT e.id,e.series_id,e.season,e.number,e.title,e.monitored,e.episode_file_id,f.path,e.tvdb_id,e.air_date,e.air_date_utc,e.last_search_time,e.runtime,e.finale_type,e.overview,e.absolute_episode_number,e.scene_absolute_episode_number,e.scene_episode_number,e.scene_season_number,e.unverified_scene_numbering,e.images_json,s.tvdb_id,s.title,s.year,s.path,s.poster,s.monitored,s.runtime FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN episode_files f ON f.id=e.episode_file_id AND f.series_id=e.series_id";
 async fn fetch(
     conn: &Connection,
     filter: &str,
@@ -234,8 +235,8 @@ async fn fetch(
     }
     if !includes.include_series {
         select = select.replace(
-            "s.tvdb_id,s.title,s.year,s.path,s.poster,s.monitored",
-            "NULL,NULL,NULL,NULL,NULL,NULL",
+            "s.tvdb_id,s.title,s.year,s.path,s.poster,s.monitored,s.runtime",
+            "NULL,NULL,NULL,NULL,NULL,NULL,NULL",
         );
     }
     let mut rows=conn.query(&format!("{select} WHERE {filter} ORDER BY e.series_id,e.season,e.number,e.id LIMIT ? OFFSET ?"),values).await?;
@@ -298,6 +299,7 @@ async fn fetch(
             images,
             series: if includes.include_series {
                 Some(SeriesProjection {
+                    runtime: row.get(27)?,
                     id: series_id,
                     tvdb_id: row.get(21)?,
                     title: row.get(22)?,

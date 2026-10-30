@@ -1,7 +1,14 @@
 //! Initial manual imports and receipt-bound singleton replacements with durable recovery.
 mod fs;
 mod owned;
+pub(crate) mod probe;
+mod recycle;
+pub(crate) mod scan;
+pub(crate) mod scan_cleanup;
+mod scan_owned;
+pub(crate) use fs::scan as scan_fs;
 pub(crate) use owned::{OwnedImport, prepare_owned};
+pub(crate) use scan_owned::{ScanChildAdmission, ScanChildStart, prepare_scan, start_scan};
 
 // Share the existing descriptor-relative, no-symlink directory walk with root observations.
 pub(crate) fn root_directory(path: &std::path::Path) -> Option<std::fs::File> {
@@ -22,7 +29,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use fs::{Plan, Stage};
+pub(crate) use fs::Plan;
+use fs::Stage;
 use libsql::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -32,12 +40,38 @@ use std::sync::{
 use ts_rs::TS;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PathRole {
+    Source,
+    Root,
+    Destination,
+    Stage,
+    Retirement,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PathKind {
+    Missing,
+    Denied,
+    Changed,
+    Invalid,
+    Io,
+}
+#[derive(Clone, Copy, Debug)]
+enum PathBoundary {
+    Precommit,
+    Cleanup,
+}
+
 #[derive(Debug)]
 pub struct Error {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
     diagnostic: Option<String>,
+    path_kind: Option<PathKind>,
+    path_role: Option<PathRole>,
+    path_boundary: Option<PathBoundary>,
+    started_attempt: bool,
 }
 type Result<T> = std::result::Result<T, Error>;
 const MAX_SOURCE_GUARD_ROWS: usize = 10_000;
@@ -46,12 +80,199 @@ impl Error {
         self.code
     }
 
+    /// Closed, path-free classification of a measured filesystem failure for callers outside
+    /// this module (the downloaded-scan producer). `None` means no filesystem cause was measured.
+    pub(crate) fn path_class(&self) -> Option<&'static str> {
+        self.path_kind.map(|kind| match kind {
+            PathKind::Missing => "missing",
+            PathKind::Denied => "denied",
+            PathKind::Changed => "changed",
+            PathKind::Invalid => "invalid",
+            PathKind::Io => "io",
+        })
+    }
+
+    pub(crate) fn started_attempt(&self) -> bool {
+        self.started_attempt
+    }
+    /// Storage/internal failures may succeed on a later attempt; every other error is a
+    /// measured, deterministic refusal of the current facts.
+    pub(crate) fn transient(&self) -> bool {
+        self.status.is_server_error()
+    }
+    fn at(mut self, role: PathRole) -> Self {
+        if self.path_role.is_none() && self.path_kind.is_some() {
+            self.path_role = Some(role);
+        }
+        self
+    }
+    fn boundary(mut self, boundary: PathBoundary) -> Self {
+        if self.path_boundary.is_none() {
+            self.path_boundary = Some(boundary);
+        }
+        self
+    }
+    pub(crate) fn path_failure_code(&self) -> Option<&'static str> {
+        match (self.path_role?, self.path_kind?, self.path_boundary?) {
+            (PathRole::Source, PathKind::Missing, PathBoundary::Precommit) => {
+                Some("source_missing_precommit")
+            }
+            (PathRole::Source, PathKind::Missing, PathBoundary::Cleanup) => {
+                Some("source_missing_cleanup")
+            }
+            (PathRole::Source, PathKind::Denied, PathBoundary::Precommit) => {
+                Some("source_denied_precommit")
+            }
+            (PathRole::Source, PathKind::Denied, PathBoundary::Cleanup) => {
+                Some("source_denied_cleanup")
+            }
+            (PathRole::Source, PathKind::Changed, PathBoundary::Precommit) => {
+                Some("source_changed_precommit")
+            }
+            (PathRole::Source, PathKind::Changed, PathBoundary::Cleanup) => {
+                Some("source_changed_cleanup")
+            }
+            (PathRole::Source, PathKind::Invalid, PathBoundary::Precommit) => {
+                Some("source_invalid_precommit")
+            }
+            (PathRole::Source, PathKind::Invalid, PathBoundary::Cleanup) => {
+                Some("source_invalid_cleanup")
+            }
+            (PathRole::Source, PathKind::Io, PathBoundary::Precommit) => {
+                Some("source_io_precommit")
+            }
+            (PathRole::Source, PathKind::Io, PathBoundary::Cleanup) => Some("source_io_cleanup"),
+            (PathRole::Root, PathKind::Missing, PathBoundary::Precommit) => {
+                Some("root_missing_precommit")
+            }
+            (PathRole::Root, PathKind::Missing, PathBoundary::Cleanup) => {
+                Some("root_missing_cleanup")
+            }
+            (PathRole::Root, PathKind::Denied, PathBoundary::Precommit) => {
+                Some("root_denied_precommit")
+            }
+            (PathRole::Root, PathKind::Denied, PathBoundary::Cleanup) => {
+                Some("root_denied_cleanup")
+            }
+            (PathRole::Root, PathKind::Changed, PathBoundary::Precommit) => {
+                Some("root_changed_precommit")
+            }
+            (PathRole::Root, PathKind::Changed, PathBoundary::Cleanup) => {
+                Some("root_changed_cleanup")
+            }
+            (PathRole::Root, PathKind::Invalid, PathBoundary::Precommit) => {
+                Some("root_invalid_precommit")
+            }
+            (PathRole::Root, PathKind::Invalid, PathBoundary::Cleanup) => {
+                Some("root_invalid_cleanup")
+            }
+            (PathRole::Root, PathKind::Io, PathBoundary::Precommit) => Some("root_io_precommit"),
+            (PathRole::Root, PathKind::Io, PathBoundary::Cleanup) => Some("root_io_cleanup"),
+            (PathRole::Destination, PathKind::Missing, PathBoundary::Precommit) => {
+                Some("destination_missing_precommit")
+            }
+            (PathRole::Destination, PathKind::Missing, PathBoundary::Cleanup) => {
+                Some("destination_missing_cleanup")
+            }
+            (PathRole::Destination, PathKind::Denied, PathBoundary::Precommit) => {
+                Some("destination_denied_precommit")
+            }
+            (PathRole::Destination, PathKind::Denied, PathBoundary::Cleanup) => {
+                Some("destination_denied_cleanup")
+            }
+            (PathRole::Destination, PathKind::Changed, PathBoundary::Precommit) => {
+                Some("destination_changed_precommit")
+            }
+            (PathRole::Destination, PathKind::Changed, PathBoundary::Cleanup) => {
+                Some("destination_changed_cleanup")
+            }
+            (PathRole::Destination, PathKind::Invalid, PathBoundary::Precommit) => {
+                Some("destination_invalid_precommit")
+            }
+            (PathRole::Destination, PathKind::Invalid, PathBoundary::Cleanup) => {
+                Some("destination_invalid_cleanup")
+            }
+            (PathRole::Destination, PathKind::Io, PathBoundary::Precommit) => {
+                Some("destination_io_precommit")
+            }
+            (PathRole::Destination, PathKind::Io, PathBoundary::Cleanup) => {
+                Some("destination_io_cleanup")
+            }
+            (PathRole::Stage, PathKind::Missing, PathBoundary::Precommit) => {
+                Some("stage_missing_precommit")
+            }
+            (PathRole::Stage, PathKind::Missing, PathBoundary::Cleanup) => {
+                Some("stage_missing_cleanup")
+            }
+            (PathRole::Stage, PathKind::Denied, PathBoundary::Precommit) => {
+                Some("stage_denied_precommit")
+            }
+            (PathRole::Stage, PathKind::Denied, PathBoundary::Cleanup) => {
+                Some("stage_denied_cleanup")
+            }
+            (PathRole::Stage, PathKind::Changed, PathBoundary::Precommit) => {
+                Some("stage_changed_precommit")
+            }
+            (PathRole::Stage, PathKind::Changed, PathBoundary::Cleanup) => {
+                Some("stage_changed_cleanup")
+            }
+            (PathRole::Stage, PathKind::Invalid, PathBoundary::Precommit) => {
+                Some("stage_invalid_precommit")
+            }
+            (PathRole::Stage, PathKind::Invalid, PathBoundary::Cleanup) => {
+                Some("stage_invalid_cleanup")
+            }
+            (PathRole::Stage, PathKind::Io, PathBoundary::Precommit) => Some("stage_io_precommit"),
+            (PathRole::Stage, PathKind::Io, PathBoundary::Cleanup) => Some("stage_io_cleanup"),
+            (PathRole::Retirement, PathKind::Missing, PathBoundary::Cleanup) => {
+                Some("retirement_missing_cleanup")
+            }
+            (PathRole::Retirement, PathKind::Denied, PathBoundary::Cleanup) => {
+                Some("retirement_denied_cleanup")
+            }
+            (PathRole::Retirement, PathKind::Changed, PathBoundary::Cleanup) => {
+                Some("retirement_changed_cleanup")
+            }
+            (PathRole::Retirement, PathKind::Invalid, PathBoundary::Cleanup) => {
+                Some("retirement_invalid_cleanup")
+            }
+            (PathRole::Retirement, PathKind::Io, PathBoundary::Cleanup) => {
+                Some("retirement_io_cleanup")
+            }
+            _ => None,
+        }
+    }
+    pub(crate) fn prepare_failure_code(&self) -> Option<&'static str> {
+        match (self.path_role?, self.path_kind?) {
+            (PathRole::Source, PathKind::Missing) => Some("hc021_source_missing_prepare"),
+            (PathRole::Source, PathKind::Denied) => Some("hc021_source_denied_prepare"),
+            (PathRole::Source, PathKind::Changed) => Some("hc021_source_changed_prepare"),
+            (PathRole::Source, PathKind::Invalid) => Some("hc021_source_invalid_prepare"),
+            (PathRole::Source, PathKind::Io) => Some("hc021_source_io_prepare"),
+            (PathRole::Root, PathKind::Missing) => Some("hc021_root_missing_prepare"),
+            (PathRole::Root, PathKind::Denied) => Some("hc021_root_denied_prepare"),
+            (PathRole::Root, PathKind::Changed) => Some("hc021_root_changed_prepare"),
+            (PathRole::Root, PathKind::Invalid) => Some("hc021_root_invalid_prepare"),
+            (PathRole::Root, PathKind::Io) => Some("hc021_root_io_prepare"),
+            (PathRole::Destination, PathKind::Missing) => Some("hc021_destination_missing_prepare"),
+            (PathRole::Destination, PathKind::Denied) => Some("hc021_destination_denied_prepare"),
+            (PathRole::Destination, PathKind::Changed) => Some("hc021_destination_changed_prepare"),
+            (PathRole::Destination, PathKind::Invalid) => Some("hc021_destination_invalid_prepare"),
+            (PathRole::Destination, PathKind::Io) => Some("hc021_destination_io_prepare"),
+            _ => None,
+        }
+    }
+
     fn bad(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_request",
             message,
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         }
     }
     fn conflict(code: &'static str, message: &'static str) -> Self {
@@ -60,6 +281,10 @@ impl Error {
             code,
             message,
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         }
     }
     /// A failure that may clear on retry; `code` is a processing retry code.
@@ -69,6 +294,10 @@ impl Error {
             code,
             message: "Import naming evaluation is temporarily unavailable; retry",
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         }
     }
     fn missing() -> Self {
@@ -77,6 +306,10 @@ impl Error {
             code: "not_found",
             message: "Import operation or media target was not found",
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         }
     }
     fn internal() -> Self {
@@ -85,6 +318,10 @@ impl Error {
             code: "import_error",
             message: "Import state could not be read or persisted; retry using the same operation ID",
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         }
     }
 }
@@ -165,9 +402,13 @@ struct Record {
     plan: Option<Plan>,
     stage: Option<Stage>,
     error: Option<String>,
+    path_failure: Option<String>,
 }
 impl Record {
     fn response(self) -> Result<Operation> {
+        let recovery_required = self.phase != "complete"
+            && (self.error.is_some() || self.path_failure.is_some())
+            && !operation_active(&self.id)?;
         Ok(Operation {
             id: Uuid::parse_str(&self.id).map_err(|_| Error::internal())?,
             target: self.target,
@@ -176,6 +417,8 @@ impl Record {
                 "Manual import status; execute explicitly authorizes or resumes this operation"
                     .into(),
             error_code: self.error,
+            path_failure_code: self.path_failure,
+            recovery_required,
         })
     }
 }
@@ -218,6 +461,10 @@ fn local(db: &Database) -> Result<()> {
             code: "local_owner_required",
             message: "Physical imports require a locally owned database",
             diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
         })
     }
 }
@@ -322,6 +569,7 @@ async fn committed_owner(c: &Connection, opid: &str, t: &MediaTarget, p: &Plan) 
             "Committed library ownership changed; source cleanup is paused",
         ));
     }
+    scan_owned::committed_members(c, opid).await?;
     source_unmanaged(c, &p.source).await
 }
 fn json<T: Serialize>(v: &T) -> Result<String> {
@@ -367,9 +615,57 @@ pub async fn preview(db: Arc<Database>, input: ImportInput) -> Result<Operation>
     tx.commit().await?;
     status(db, &text).await
 }
+fn checked_text(row: &libsql::Row, index: i32, limit: usize) -> Result<Option<String>> {
+    row.get::<Option<Vec<u8>>>(index)?
+        .map(|bytes| {
+            if bytes.len() > limit || bytes.contains(&0) {
+                return Err(Error::internal());
+            }
+            String::from_utf8(bytes).map_err(|_| Error::internal())
+        })
+        .transpose()
+}
+pub(crate) fn checked_path_failure(row: &libsql::Row, index: i32) -> Result<Option<String>> {
+    let code = checked_text(row, index, 64)?;
+    if let Some(code) = code.as_deref() {
+        let valid = code == "unresolved_attempt" || {
+            let parts: Vec<_> = code.split('_').collect();
+            parts.len() == 3
+                && matches!(
+                    parts[0],
+                    "source" | "root" | "destination" | "stage" | "retirement"
+                )
+                && matches!(
+                    parts[1],
+                    "missing" | "denied" | "changed" | "invalid" | "io"
+                )
+                && (parts[2] == "cleanup" || (parts[2] == "precommit" && parts[0] != "retirement"))
+        };
+        if !valid {
+            return Err(Error::internal());
+        }
+    }
+    Ok(code)
+}
+fn media(target: &MediaTarget) -> crate::api::MediaDomain {
+    match target {
+        MediaTarget::Episode(_) => crate::api::MediaDomain::Tv,
+        MediaTarget::Movie(_) => crate::api::MediaDomain::Movies,
+    }
+}
+async fn diagnostic_changed(
+    c: &Connection,
+    opid: &str,
+    change: crate::health::PathDiagnosticChange,
+) -> Result<()> {
+    let target = load(c, opid).await?.target;
+    crate::health::path_diagnostics_changed(c, media(&target), change)
+        .await
+        .map_err(|_| Error::internal())
+}
 async fn load(c: &Connection, opid: &str) -> Result<Record> {
     Uuid::parse_str(opid).map_err(|_| Error::bad("Operation ID must be a UUID"))?;
-    let row=c.query("SELECT o.media_type,o.episode_id,o.movie_id,coalesce(j.phase,o.status),j.plan_json,j.stage_json,j.error_code FROM operations o LEFT JOIN import_journal j ON j.operation_id=o.id WHERE o.id=?",[opid]).await?.next().await?.ok_or_else(Error::missing)?;
+    let row=c.query("SELECT o.media_type,o.episode_id,o.movie_id,coalesce(j.phase,o.status),CASE WHEN j.plan_json IS NULL THEN NULL WHEN typeof(j.plan_json)='text' THEN substr(CAST(j.plan_json AS BLOB),1,16385) ELSE x'00' END,CASE WHEN j.stage_json IS NULL THEN NULL WHEN typeof(j.stage_json)='text' THEN substr(CAST(j.stage_json AS BLOB),1,4097) ELSE x'00' END,j.error_code,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' THEN substr(CAST(j.path_failure_code AS BLOB),1,65) ELSE x'00' END FROM operations o LEFT JOIN import_journal j ON j.operation_id=o.id WHERE o.id=?",[opid]).await?.next().await?.ok_or_else(Error::missing)?;
     Ok(Record {
         id: opid.into(),
         target: match row.get::<String>(0)?.as_str() {
@@ -378,27 +674,49 @@ async fn load(c: &Connection, opid: &str) -> Result<Record> {
             _ => return Err(Error::internal()),
         },
         phase: row.get(3)?,
-        plan: row
-            .get::<Option<String>>(4)?
+        plan: checked_text(&row, 4, 16384)?
             .map(|s| serde_json::from_str(&s).map_err(|_| Error::internal()))
             .transpose()?,
-        stage: row
-            .get::<Option<String>>(5)?
+        stage: checked_text(&row, 5, 4096)?
             .map(|s| serde_json::from_str(&s).map_err(|_| Error::internal()))
             .transpose()?,
         error: row.get(6)?,
+        path_failure: checked_path_failure(&row, 7)?,
     })
 }
 pub async fn status(db: Arc<Database>, opid: &str) -> Result<Operation> {
     let c = db.connect().await?;
-    let mut response = load(&c, opid).await?.response()?;
+    status_in(&c, opid).await
+}
+// Reuse the canonical projection inside a caller-owned read snapshot.
+pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
+    let mut response = load(c, opid).await?.response()?;
+    if scan_owned::is_scan(c, opid).await? {
+        response.message =
+            "Downloaded scan import; execution and recovery belong to its scan command".into();
+        return Ok(response);
+    }
     if let Some(row)=c.query("SELECT old_file_json IS NOT NULL,retirement_state FROM rss_candidate_imports WHERE operation_id=?",[opid]).await?.next().await? {
         response.message=if row.get::<i64>(0)?==0 {"Owned download import; source bytes retained"} else {match row.get::<String>(1)?.as_str(){"quarantined"=>"Replacement imported; original bytes retained in private recovery artifact","shared_retained"=>"Replacement imported; original still serves other episodes",_=>"Owned replacement; original retirement pending and bytes retained"}}.into();
+        // The recycle outcome refines the quarantined message; the code names a retained cause.
+        if let Some((phase, _)) = recycle::summary(c, opid).await? {
+            response.message = match phase.as_str() {
+                "complete" => "Replacement imported; original moved to the recycle bin",
+                "retained" => "Replacement imported; recycling the original failed, bytes retained in private recovery artifact",
+                _ => "Replacement imported; moving the original to the recycle bin is pending, bytes retained",
+            }
+            .into();
+        }
     }
     Ok(response)
 }
 // ponytail: one import at a time per process; per-library workers when throughput requires it.
 static EXECUTING: AtomicBool = AtomicBool::new(false);
+/// Test-only serialisation for lib tests that reach the process-wide execution permit
+/// (import execution, file deletion, recycle cleanup). Parallel test threads would otherwise
+/// observe each other's permit as `import_busy`.
+#[cfg(test)]
+pub(crate) static PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MAX_FAILED_OWNED: usize = 1024; // Same cap as durable RSS receipts; no eviction of failed work.
 static FAILED_OWNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -455,6 +773,61 @@ fn acquire(db: &Arc<Database>, opid: &str) -> Option<Arc<Permit>> {
         _db: Some(db.clone()),
     }))
 }
+pub(crate) fn operation_active(operation_id: &str) -> Result<bool> {
+    Ok(ACTIVE_OPERATION
+        .lock()
+        .map_err(|_| Error::internal())?
+        .as_deref()
+        == Some(operation_id))
+}
+pub(crate) struct ResumeGuard {
+    _permit: Arc<Permit>,
+}
+pub(crate) fn acquire_resume_guard(db: &Arc<Database>) -> Result<ResumeGuard> {
+    // An empty owner cannot equal an operation UUID; reservation still excludes execution.
+    acquire(db, "")
+        .map(|permit| ResumeGuard { _permit: permit })
+        .ok_or_else(|| {
+            Error::conflict(
+                "import_busy",
+                "Another import is executing; retry this operation",
+            )
+        })
+}
+/// Downloaded-scan directory cleanup runs under the same single global effect permit as every
+/// import, with an owner key that can never equal an operation UUID.
+pub(crate) struct CleanupGuard {
+    _permit: Arc<Permit>,
+}
+pub(crate) fn acquire_cleanup_guard(db: &Arc<Database>, command_id: &str) -> Result<CleanupGuard> {
+    acquire(db, &format!("scan-cleanup-{command_id}"))
+        .map(|permit| CleanupGuard { _permit: permit })
+        .ok_or_else(|| {
+            Error::conflict(
+                "import_busy",
+                "Another import is executing; retry this cleanup",
+            )
+        })
+}
+/// Explicit library-file deletion and recycle-bin cleanup share the single global effect
+/// permit, so no import, scan cleanup or other deletion touches files while they run.
+pub(crate) struct DeletionGuard {
+    _permit: Arc<Permit>,
+}
+/// Worker-startup roll-forward of upgrade recycles interrupted between artifact and bin.
+pub(crate) async fn recover_upgrade_recycles(db: &Database, guard: &DeletionGuard) -> Result<()> {
+    recycle::recover(db, guard).await
+}
+pub(crate) fn acquire_deletion_guard(db: &Arc<Database>, key: &str) -> Result<DeletionGuard> {
+    acquire(db, &format!("file-deletion-{key}"))
+        .map(|permit| DeletionGuard { _permit: permit })
+        .ok_or_else(|| {
+            Error::conflict(
+                "import_busy",
+                "Another import or file operation is executing; retry",
+            )
+        })
+}
 fn launch(
     db: Arc<Database>,
     opid: String,
@@ -464,24 +837,23 @@ fn launch(
     tokio::spawn(async move {
         let result = run(db.clone(), &opid, &permit).await;
         if let Err(e) = &result {
-            if owned {
+            if owned && !matches!(e.code, "rescan_active" | "import_busy") {
                 latch_owned_failure(&opid);
             }
             eprintln!(
                 "{}",
                 serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"code":e.code,"diagnostic":e.diagnostic})
             );
-            // `rescan_active` fires in `run_inner` before any checkpoint/mutation for this
-            // attempt -- the operation is untouched, exactly like `import_busy`'s pre-launch
-            // bail. Unlike every other error here, persisting it would permanently poison the
-            // journal: `manual_import::run` treats any `import_journal.error_code` as a durable
-            // terminal failure and never retries. Leaving it unpersisted lets that same caller's
-            // "journal untouched" fallback retry within its own budget once the rescan clears,
-            // instead of settling a transient, self-resolving conflict as a permanent failure.
-            if e.code != "rescan_active" {
-                let persisted=async{let c=db.connect().await?;c.execute("UPDATE import_journal SET error_code=?,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![e.code,opid.clone()]).await?;Ok::<(),libsql::Error>(())}.await;
+            if e.started_attempt || !matches!(e.code, "rescan_active" | "import_busy") {
+                let persisted = async {
+                    let c = db.connect().await?;
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).await?;
+                    tx.execute("UPDATE import_journal SET error_code=?,path_failure_code=coalesce(?,path_failure_code),updated_at=CURRENT_TIMESTAMP WHERE operation_id=?", params![e.code,e.path_failure_code(),opid.clone()]).await?;
+                    diagnostic_changed(&tx, &opid, crate::health::PathDiagnosticChange::Failure).await?;
+                    tx.commit().await?;
+                    Ok::<(),Error>(())
+                }.await;
                 if let Err(error) = persisted {
-                    let error = Error::from(error);
                     eprintln!(
                         "{}",
                         serde_json::json!({"level":"ERROR","component":"manual_import","operation_id":opid,"condition":"error_status_persistence_failed","diagnostic":error.diagnostic})
@@ -496,8 +868,10 @@ async fn consume_owned_start(c: &Connection, opid: &str, explicit_manual: bool) 
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let r=tx.query("SELECT j.error_code,d.resume_requested FROM import_journal j JOIN rss_candidate_imports i ON i.operation_id=j.operation_id JOIN download_processing d ON d.candidate_id=i.candidate_id WHERE j.operation_id=?",[opid]).await?.next().await?.ok_or_else(Error::missing)?;
-    if (r.get::<Option<String>>(0)?.is_some() || failed_owned(opid)?)
+    let r=tx.query("SELECT j.error_code,d.resume_requested,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' THEN substr(CAST(j.path_failure_code AS BLOB),1,65) ELSE x'00' END,CASE WHEN typeof(d.reasons_json)='text' THEN substr(CAST(d.reasons_json AS BLOB),1,8193) ELSE x'00' END FROM import_journal j JOIN rss_candidate_imports i ON i.operation_id=j.operation_id JOIN download_processing d ON d.candidate_id=i.candidate_id WHERE j.operation_id=?",[opid]).await?.next().await?.ok_or_else(Error::missing)?;
+    if (r.get::<Option<String>>(0)?.is_some()
+        || checked_path_failure(&r, 2)?.is_some()
+        || failed_owned(opid)?)
         && r.get::<i64>(1)? == 0
         && !explicit_manual
     {
@@ -506,7 +880,16 @@ async fn consume_owned_start(c: &Connection, opid: &str, explicit_manual: bool) 
             "Failed owned import requires an explicit retry",
         ));
     }
-    tx.execute("UPDATE download_processing SET resume_requested=0,error_code=NULL,reasons_json='[]' WHERE candidate_id=(SELECT candidate_id FROM rss_candidate_imports WHERE operation_id=?) AND status='importing'",[opid]).await?;
+    let previous: Vec<String> =
+        serde_json::from_str(&checked_text(&r, 3, 8192)?.ok_or_else(Error::internal)?)
+            .map_err(|_| Error::internal())?;
+    let reasons = crate::commands::processing::path_reasons(
+        &previous,
+        &[],
+        crate::commands::processing::PathReasonChange::Preserve,
+    )
+    .map_err(|_| Error::internal())?;
+    tx.execute("UPDATE download_processing SET resume_requested=0,error_code=NULL,reasons_json=? WHERE candidate_id=(SELECT candidate_id FROM rss_candidate_imports WHERE operation_id=?) AND status='importing'",params![json(&reasons)?,opid]).await?;
     tx.execute(
         "UPDATE import_journal SET error_code=NULL WHERE operation_id=?",
         [opid],
@@ -547,8 +930,27 @@ pub(crate) async fn start_owned(db: Arc<Database>, opid: &str) -> Result<StartOw
     Ok(StartOwned::Started)
 }
 pub async fn execute(db: Arc<Database>, opid: &str) -> Result<Operation> {
+    execute_with_authority(db, opid, true).await
+}
+// A queued command authorizes an initial attempt, not recovery of a failure that raced its read.
+pub(crate) async fn execute_command(db: Arc<Database>, opid: &str) -> Result<Operation> {
+    execute_with_authority(db, opid, false).await
+}
+async fn execute_with_authority(
+    db: Arc<Database>,
+    opid: &str,
+    explicit_recovery: bool,
+) -> Result<Operation> {
     local(&db)?;
     Uuid::parse_str(opid).map_err(|_| Error::bad("Operation ID must be a UUID"))?;
+    // Scan ownership is immutable once the operation exists: its child link, parent
+    // cancellation and resume generations are the only authority that may start it.
+    if scan_owned::is_scan(&db.connect().await?, opid).await? {
+        return Err(Error::conflict(
+            "scan_recovery_required",
+            "This import belongs to a downloaded-folder scan; resume it through the scan command",
+        ));
+    }
     let permit = acquire(&db, opid).ok_or_else(|| {
         Error::conflict(
             "import_busy",
@@ -556,9 +958,20 @@ pub async fn execute(db: Arc<Database>, opid: &str) -> Result<Operation> {
         )
     })?;
     let c = db.connect().await?;
+    if !explicit_recovery {
+        // Retain this permit through launch: a separate read followed by execute could race
+        // a direct invocation that arms, fails, and releases its lease between those steps.
+        let record = load(&c, opid).await?;
+        if record.phase != "complete" && (record.error.is_some() || record.path_failure.is_some()) {
+            return Err(Error::conflict(
+                "resume_required",
+                "An admitted or failed import requires explicit recovery",
+            ));
+        }
+    }
     let is_owned = owned::facts(&c, opid).await?.is_some();
     if is_owned {
-        consume_owned_start(&c, opid, true).await?;
+        consume_owned_start(&c, opid, explicit_recovery).await?;
     }
     launch(db, opid.into(), permit, is_owned)
         .await
@@ -568,10 +981,20 @@ async fn checkpoint(c: &Connection, opid: &str, phase: &str, stage: Option<&Stag
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute("UPDATE import_journal SET phase=?,stage_json=?,error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![phase,stage.map(json).transpose()?,opid]).await?;
+    tx.execute("UPDATE import_journal SET phase=?,stage_json=?,error_code=NULL,path_failure_code=CASE WHEN ?='complete' THEN NULL ELSE path_failure_code END,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",params![phase,stage.map(json).transpose()?,phase,opid]).await?;
     tx.execute(
         "UPDATE operations SET status=?,message='Manual import progress' WHERE id=?",
         params![phase, opid],
+    )
+    .await?;
+    diagnostic_changed(
+        &tx,
+        opid,
+        if phase == "complete" {
+            crate::health::PathDiagnosticChange::Completion
+        } else {
+            crate::health::PathDiagnosticChange::Progress
+        },
     )
     .await?;
     tx.commit().await?;
@@ -589,29 +1012,38 @@ async fn leased<T: Send + 'static>(
     .await
 }
 async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Operation> {
-    let outcome = run_inner(db.clone(), opid, lease).await;
-    if outcome.is_err() {
-        if let Err(error) = owned::restore_uncommitted(&db, opid, lease).await {
-            eprintln!(
-                "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
-                opid, error.code, error.diagnostic
-            );
-        }
+    let rec = arm(&db, opid).await?;
+    if rec.phase == "complete" {
+        return status(db, opid).await;
+    }
+    let outcome = run_inner(db.clone(), opid, lease, rec)
+        .await
+        .map_err(|mut error| {
+            error.started_attempt = true;
+            error.boundary(PathBoundary::Precommit)
+        });
+    if outcome.is_err()
+        && let Err(error) = owned::restore_uncommitted(&db, opid, lease).await
+    {
+        eprintln!(
+            "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
+            opid, error.code, error.diagnostic
+        );
     }
     outcome
 }
-async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Operation> {
+async fn arm(db: &Database, opid: &str) -> Result<Record> {
     let c = db.connect().await?;
     let mut rec = load(&c, opid).await?;
-    let plan = rec.plan.take().ok_or_else(|| {
+    if rec.phase == "complete" {
+        return Ok(rec);
+    }
+    let plan = rec.plan.as_ref().ok_or_else(|| {
         Error::conflict(
             "preview_required",
             "Legacy preview lacks validated identities; create a new preview",
         )
     })?;
-    if rec.phase == "complete" {
-        return status(db, opid).await;
-    }
     if matches!(
         rec.phase.as_str(),
         "preview" | "staging" | "staged" | "published"
@@ -626,14 +1058,8 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
                 "Library path changed since preview",
             ));
         }
-        owned::available(&c, opid, &rec.target, &plan).await?;
-        // Re-checked inside the same IMMEDIATE transaction as the phase write below, not just
-        // beforehand: a plain pre-check here would leave a race where a rescan is admitted
-        // between the check and the UPDATE, and rescan_blocks_import_update's RAISE would come
-        // back as a generic error rather than "rescan_active", bypassing launch()'s exemption and
-        // permanently failing the operation via the exact bug this same module already fixed once.
-        // IMMEDIATE acquires the write lock at transaction start, so no concurrent rescan INSERT
-        // can be admitted between this re-check and the UPDATE it guards.
+        owned::available(&c, opid, &rec.target, plan).await?;
+        // Reserve the non-preview phase with the marker so no rescan can enter after admission.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
@@ -645,7 +1071,7 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
             ));
         }
         tx.execute(
-            "UPDATE import_journal SET phase='staging',stage_json=NULL,error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",
+            "UPDATE import_journal SET phase='staging',stage_json=NULL,error_code=NULL,path_failure_code=coalesce(path_failure_code,'unresolved_attempt'),updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",
             [opid],
         )
         .await?;
@@ -654,9 +1080,27 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
             [opid],
         )
         .await?;
+        diagnostic_changed(&tx, opid, crate::health::PathDiagnosticChange::Admission).await?;
         tx.commit().await?;
         rec.phase = "staging".into();
+    } else {
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        tx.execute("UPDATE import_journal SET path_failure_code=coalesce(path_failure_code,'unresolved_attempt') WHERE operation_id=?", [opid]).await?;
+        diagnostic_changed(&tx, opid, crate::health::PathDiagnosticChange::Admission).await?;
+        tx.commit().await?;
     }
+    Ok(rec)
+}
+async fn run_inner(
+    db: Arc<Database>,
+    opid: &str,
+    lease: &Arc<Permit>,
+    mut rec: Record,
+) -> Result<Operation> {
+    let c = db.connect().await?;
+    let plan = rec.plan.take().ok_or_else(Error::internal)?;
     if rec.phase == "staging" {
         if rec.stage.is_none() {
             let p = plan.clone();
@@ -706,17 +1150,31 @@ async fn run_inner(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result
     if rec.phase == "committed" {
         committed_owner(&c, opid, &rec.target, &plan).await?;
         let p = plan.clone();
-        stage = leased(lease, move || p.prepare_cleanup(stage)).await?;
+        stage = leased(lease, move || p.prepare_cleanup(stage))
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
         checkpoint(&c, opid, "committed", Some(&stage)).await?;
         committed_owner(&c, opid, &rec.target, &plan).await?;
         let p = plan.clone();
-        stage = leased(lease, move || p.retire_source(stage)).await?;
+        stage = leased(lease, move || p.retire_source(stage))
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
         checkpoint(&c, opid, "committed", Some(&stage)).await?;
         committed_owner(&c, opid, &rec.target, &plan).await?;
-        owned::retire(&c, opid, &rec.target, &plan, &stage, lease).await?;
+        owned::retire(&c, opid, &rec.target, &plan, &stage, lease)
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
+        // Journaled part of retirement: with a configured bin, each quarantined original moves
+        // into it (or is recorded as retained) before the import can complete.
+        committed_owner(&c, opid, &rec.target, &plan).await?;
+        recycle::settle(&c, opid, &rec.target, &plan, lease)
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
         let p = plan.clone();
         let s = stage.clone();
-        leased(lease, move || p.cleanup(&s)).await?;
+        leased(lease, move || p.cleanup(&s))
+            .await
+            .map_err(|e| e.boundary(PathBoundary::Cleanup))?;
         checkpoint(&c, opid, "complete", Some(&stage)).await?;
     }
     status(db, opid).await
@@ -728,6 +1186,9 @@ async fn commit(
     plan: &Plan,
     stage: &Stage,
 ) -> Result<()> {
+    if scan_owned::is_scan(c, opid).await? {
+        return scan_owned::commit(c, opid, t, plan, stage).await;
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -777,7 +1238,7 @@ async fn commit(
         }
         tx.execute("INSERT INTO import_history(operation_id,media_type,episode_id,movie_id,episode_file_id,movie_file_id,source,destination,size,sha256)VALUES(?,?,?,?,?,?,?,?,?,?)",params![opid,domain,episode,movie,file_episode,file_movie,plan.source.clone(),plan.destination.clone(),size,stage.sha256.clone().ok_or_else(Error::internal)?]).await?;
         tx.execute("UPDATE import_journal SET phase='committed',error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE operation_id=?",[opid]).await?;
-        tx.execute("UPDATE operations SET status='committed' WHERE id=?",[opid]).await?;Ok(())
+        tx.execute("UPDATE operations SET status='committed' WHERE id=?",[opid]).await?;diagnostic_changed(&tx,opid,crate::health::PathDiagnosticChange::Progress).await?;Ok(())
     }.await;
     match outcome {
         Ok(()) => {

@@ -347,6 +347,7 @@ async fn wait_status(base: &str, path: &str, status: &str) -> Value {
 async fn real_add_rss_owned_completed_downloads_import_both_domains_once() {
     // Keep the new end-to-end scenarios in this same serial lease owner, first so
     // fixture failures are reported before the longer established recovery matrix.
+    fallback_import_uses_winning_client_http().await;
     cdh_master_and_receipt_revision_http().await;
     search_revision_import_preserves_durable_origin_http().await;
     legacy_receipt_requires_observed_revision_http().await;
@@ -1516,6 +1517,81 @@ async fn naming_process(ctx: &Ctx, receipt: &Value) -> (u16, Value) {
     )
     .await
 }
+async fn fallback_import_uses_winning_client_http() {
+    let mut ctx = naming_ctx(false, "standard", None).await;
+    let (code, updated) = request(&ctx.base, "PUT", &format!("/api/v1/providers/{}", ctx.download["id"].as_str().unwrap()), json!({"revision":ctx.download["revision"],"name":"winning client","enabled":true,"priority":2,"settings":ctx.download["settings"]})).await;
+    assert_eq!(code, 200, "{updated}");
+    ctx.download = updated;
+    let (failed_origin, _failed_server) =
+        serve(axum::Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE })).await;
+    let (code, failed) = request(&ctx.base, "POST", "/api/v1/providers", json!({"name":"failed first client","enabled":true,"priority":1,"settings":{"implementation":"qbittorrent","endpoint":failed_origin,"tv":ctx.download["settings"]["tv"],"movies":null}})).await;
+    assert_eq!(code, 201, "{failed}");
+    let command = enqueue(&ctx.base, json!({"media_type":"tv","indexer_id":ctx.indexer["id"],"indexer_revision":ctx.indexer["revision"],"client_selection":{"kind":"default"}})).await;
+    let receipt = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (code, rows) = request(
+                &ctx.base,
+                "GET",
+                &format!(
+                    "/api/v1/rss/candidates?command_id={}",
+                    command["id"].as_str().unwrap()
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, 200, "{rows}");
+            if let Some(row) = rows["items"].as_array().unwrap().first() {
+                assert!(
+                    !matches!(row["status"].as_str(), Some("rejected" | "needs_attention")),
+                    "{row}"
+                );
+                if row["status"] == "observed" {
+                    break row.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("fallback receipt deadline");
+    assert_eq!(receipt["source"]["client_id"], ctx.download["id"]);
+    assert_eq!(receipt["client_attempts"][0]["client_id"], failed["id"]);
+    assert_eq!(
+        receipt["client_attempts"][0]["state"],
+        "definitely_not_submitted"
+    );
+    assert_eq!(receipt["client_attempts"][1]["state"], "observed");
+    assert_eq!(receipt["client_attempts"].as_array().unwrap().len(), 2);
+    ctx.state.completed.store(1, Ordering::SeqCst);
+    let (code, rejected) = request(&ctx.base, "POST", "/api/v1/download-processing", json!({"provider_id":failed["id"],"provider_revision":failed["revision"],"media_type":"tv","receipt_ids":[receipt["id"]]})).await;
+    assert_eq!(code, 409, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "invalid_processing_receipt");
+    let (code, accepted) = naming_process(&ctx, &receipt["id"]).await;
+    assert_eq!(code, 202, "{accepted}");
+    let done = wait_status(
+        &ctx.base,
+        &format!(
+            "/api/v1/download-processing/{}",
+            receipt["id"].as_str().unwrap()
+        ),
+        "imported",
+    )
+    .await;
+    assert_eq!(done["import_phase"], "complete");
+    assert_eq!(
+        std::fs::read(ctx.root.join("Harbor.S01E01.1080p.WEB-DL.mkv")).unwrap(),
+        vec![1u8; 1048576]
+    );
+    let c = ctx.db.connect().await.unwrap();
+    let row = c.query("SELECT r.client_id,count(h.operation_id) FROM rss_candidates r JOIN rss_candidate_imports i ON i.candidate_id=r.id JOIN import_history h ON h.operation_id=i.operation_id WHERE r.id=? GROUP BY r.id", [receipt["id"].as_str().unwrap()]).await.unwrap().next().await.unwrap().unwrap();
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        ctx.download["id"].as_str().unwrap()
+    );
+    assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    assert_eq!(ctx.state.adds.lock().unwrap().as_slice(), [TV]);
+    ctx.shutdown().await;
+}
 async fn put_tv_naming(
     base: &str,
     revision: i64,
@@ -1822,9 +1898,13 @@ async fn naming_render_failure_blocks_and_touches_nothing_http() {
     // previously-discovered bug where the raw sentence violated the reasons_json trigger and
     // masked the real outcome as `storage_error` after 3 failed retries.
     assert_eq!(blocked["error_code"], "unsupported_download", "{blocked}");
+    // 0053 retains Admission evidence first until completion, alongside the naming rejection.
     assert_eq!(
         blocked["reasons"].as_array().unwrap(),
-        &vec![serde_json::json!("naming_render_failed")]
+        &vec![
+            serde_json::json!("hc021_unresolved_attempt"),
+            serde_json::json!("naming_render_failed")
+        ]
     );
     assert_eq!(blocked["total_preflight_attempts"], 1, "{blocked}");
     assert!(blocked["operation_id"].is_null());
@@ -2218,9 +2298,14 @@ async fn cross_type_numbering_completed_downloads_preserve_sources_http() {
     // unsupported_download belongs to other admission failures. The fixture also advertises
     // a sample (remote(), above), so preserve its independent rejection in the exact reason list.
     assert_eq!(done["error_code"], "quality_rejected");
+    // 0053 retains Admission evidence first; both ordinary rejection reasons stay exact.
     assert_eq!(
         done["reasons"],
-        json!(["filename_target_mismatch", "sample_file"])
+        json!([
+            "hc021_unresolved_attempt",
+            "filename_target_mismatch",
+            "sample_file"
+        ])
     );
     assert!(
         c.query("SELECT episode_file_id FROM episodes WHERE id=1", ())
@@ -2494,9 +2579,14 @@ async fn legacy_receipt_requires_observed_revision_http() {
         assert_eq!(blocked["error_code"], "quality_rejected", "{blocked}");
         // Processing aggregates every rejected file when none is importable. The
         // real fixture also advertises a sample, which must retain its independent rejection.
+        // 0053 retains Admission evidence first until completion; quality rejection does not clear it.
         assert_eq!(
             blocked["reasons"],
-            json!(["revision_unknown", "sample_file"]),
+            json!([
+                "hc021_unresolved_attempt",
+                "revision_unknown",
+                "sample_file"
+            ]),
             "{blocked}"
         );
         assert_eq!(std::fs::read(&original).unwrap(), vec![1u8; 1048576]);

@@ -1,5 +1,6 @@
 //! Linux descriptor-relative transfers. No path component may be a symlink.
-use super::{Error, Mode, Result};
+pub(crate) mod scan;
+use super::{Error, Mode, PathKind, PathRole, Result};
 use ring::digest::{Context, SHA256};
 use rustix::fs::{self, AtFlags, Mode as Permissions, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,15 @@ fn io(error: impl Into<std::io::Error>) -> Error {
         "filesystem_error",
         "File operation failed; retained files and journal require retry or inspection",
     );
+    result.path_kind = Some(match error.kind() {
+        std::io::ErrorKind::NotFound => PathKind::Missing,
+        std::io::ErrorKind::PermissionDenied => PathKind::Denied,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotADirectory => PathKind::Invalid,
+        _ if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            PathKind::Invalid
+        }
+        _ => PathKind::Io,
+    });
     result.diagnostic = Some(format!(
         "kind={:?}, os_code={:?}",
         error.kind(),
@@ -90,16 +100,30 @@ fn io(error: impl Into<std::io::Error>) -> Error {
     result
 }
 fn changed() -> Error {
-    Error::conflict(
+    let mut error = Error::conflict(
         "identity_changed",
         "A path or file changed since preview; retained or quarantined files require inspection",
-    )
+    );
+    error.path_kind = Some(PathKind::Changed);
+    error
+}
+fn invalid() -> Error {
+    let mut error = changed();
+    error.path_kind = Some(PathKind::Invalid);
+    error
+}
+fn ambiguous(error: impl Into<std::io::Error>) -> Error {
+    let mut error = io(error);
+    error.path_kind = None;
+    error
 }
 fn unowned() -> Error {
-    Error::conflict(
+    let mut error = Error::conflict(
         "unowned_artifact",
         "An unrecorded staging artifact exists; it is retained for inspection",
-    )
+    );
+    error.path_kind = Some(PathKind::Invalid);
+    error
 }
 fn check(ok: bool) -> Result<()> {
     if ok { Ok(()) } else { Err(changed()) }
@@ -163,7 +187,9 @@ fn child(dir: &File, name: &str, flags: OFlags) -> Result<File> {
     )
     .map_err(io)?
     .into();
-    check(f.metadata().map_err(io)?.is_file())?;
+    if !f.metadata().map_err(io)?.is_file() {
+        return Err(invalid());
+    }
     Ok(f)
 }
 fn optional(dir: &File, name: &str) -> Result<Option<File>> {
@@ -175,7 +201,9 @@ fn optional(dir: &File, name: &str) -> Result<Option<File>> {
     ) {
         Ok(fd) => {
             let f: File = fd.into();
-            check(f.metadata().map_err(io)?.is_file())?;
+            if !f.metadata().map_err(io)?.is_file() {
+                return Err(invalid());
+            }
             Ok(Some(f))
         }
         Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -205,277 +233,340 @@ impl Plan {
         id: &str,
         old: Option<&OldFile>,
     ) -> Result<Self> {
-        for path in [&root, &source, &destination] {
-            validate_path(path)?;
-        }
-        check(
-            Path::new(&destination).starts_with(&root)
-                && destination != root
-                && source != destination,
-        )?;
-        let root_fd = directory(Path::new(&root))?;
-        let (sp, sn) = parts(&source)?;
-        let (dp, dn) = parts(&destination)?;
-        let source_parent = directory(sp)?;
-        let destination_parent = directory(dp)?;
-        if let Some(old) = old {
-            check(old.path == destination)?;
-            old.verify_original()?;
-        } else {
-            check(optional(&destination_parent, dn)?.is_none())?;
-        }
-        let source_fd = child(&source_parent, sn, OFlags::RDONLY)?;
-        let source_identity = Identity::read(&source_fd)?;
-        if let Some(old) = old {
-            check(!source_identity.same(&old.file))?;
-        }
-        check(source_identity.size > 0 && source_identity.size <= MAX_FILE_BYTES)?;
-        if mode == Mode::Hardlink {
-            check(source_identity.dev == Identity::read(&destination_parent)?.dev)?;
-        }
-        Ok(Self {
-            owner_id,
-            root,
-            source,
-            destination,
-            mode,
-            root_identity: Identity::read(&root_fd)?,
-            source_parent: Identity::read(&source_parent)?,
-            destination_parent: Identity::read(&destination_parent)?,
-            source_identity,
-            stage_name: format!(".hrrdarr-import-{id}"),
-            quarantine_name: format!(".hrrdarr-move-{id}"),
-        })
+        (|| {
+            for path in [&root, &source, &destination] {
+                validate_path(path)?;
+            }
+            check(
+                Path::new(&destination).starts_with(&root)
+                    && destination != root
+                    && source != destination,
+            )?;
+            let root_fd = directory(Path::new(&root)).map_err(|e| e.at(PathRole::Root))?;
+            let (sp, sn) = parts(&source)?;
+            let (dp, dn) = parts(&destination)?;
+            let source_parent = directory(sp).map_err(|e| e.at(PathRole::Source))?;
+            let destination_parent = directory(dp)?;
+            if let Some(old) = old {
+                check(old.path == destination)?;
+                old.verify_original(PathRole::Destination)?;
+            } else {
+                check(optional(&destination_parent, dn)?.is_none())?;
+            }
+            let source_fd =
+                child(&source_parent, sn, OFlags::RDONLY).map_err(|e| e.at(PathRole::Source))?;
+            let source_identity = Identity::read(&source_fd).map_err(|e| e.at(PathRole::Source))?;
+            if let Some(old) = old {
+                check(!source_identity.same(&old.file))?;
+            }
+            check(source_identity.size > 0 && source_identity.size <= MAX_FILE_BYTES).map_err(
+                |mut e| {
+                    e.path_kind = Some(PathKind::Invalid);
+                    e.at(PathRole::Source)
+                },
+            )?;
+            if mode == Mode::Hardlink {
+                check(source_identity.dev == Identity::read(&destination_parent)?.dev)?;
+            }
+            Ok(Self {
+                owner_id,
+                root,
+                source,
+                destination,
+                mode,
+                root_identity: Identity::read(&root_fd).map_err(|e| e.at(PathRole::Root))?,
+                source_parent: Identity::read(&source_parent)
+                    .map_err(|e| e.at(PathRole::Source))?,
+                destination_parent: Identity::read(&destination_parent)?,
+                source_identity,
+                stage_name: format!(".hrrdarr-import-{id}"),
+                quarantine_name: format!(".hrrdarr-move-{id}"),
+            })
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
     fn parents(&self) -> Result<(File, File)> {
+        let root = directory(Path::new(&self.root)).map_err(|e| e.at(PathRole::Root))?;
         check(
             self.root_identity
-                .same(&Identity::read(&directory(Path::new(&self.root))?)?),
-        )?;
-        let s = directory(parts(&self.source)?.0)?;
-        let d = directory(parts(&self.destination)?.0)?;
+                .same(&Identity::read(&root).map_err(|e| e.at(PathRole::Root))?),
+        )
+        .map_err(|e| e.at(PathRole::Root))?;
+        let s = directory(parts(&self.source)?.0).map_err(|e| e.at(PathRole::Source))?;
+        let d = directory(parts(&self.destination)?.0).map_err(|e| e.at(PathRole::Destination))?;
         check(
-            self.source_parent.same(&Identity::read(&s)?)
-                && self.destination_parent.same(&Identity::read(&d)?),
-        )?;
+            self.source_parent
+                .same(&Identity::read(&s).map_err(|e| e.at(PathRole::Source))?),
+        )
+        .map_err(|e| e.at(PathRole::Source))?;
+        check(
+            self.destination_parent
+                .same(&Identity::read(&d).map_err(|e| e.at(PathRole::Destination))?),
+        )
+        .map_err(|e| e.at(PathRole::Destination))?;
         Ok((s, d))
     }
     fn stage_dir(&self, stage: &Stage, d: &File) -> Result<File> {
-        let f: File = fs::openat(
-            d,
-            self.stage_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        check(stage.directory.same(&Identity::read(&f)?))?;
-        Ok(f)
+        (|| {
+            let f: File = fs::openat(
+                d,
+                self.stage_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
+            )
+            .map_err(io)?
+            .into();
+            check(stage.directory.same(&Identity::read(&f)?))?;
+            Ok(f)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Stage))
     }
     pub fn create_stage(&self) -> Result<Stage> {
-        let (s, d) = self.parents()?;
-        let source = child(&s, parts(&self.source)?.1, OFlags::RDONLY)?;
-        check(self.source_identity.unchanged(&Identity::read(&source)?))?;
-        fs::mkdirat(
-            &d,
-            self.stage_name.as_str(),
-            Permissions::from_bits_truncate(0o700),
-        )
-        .map_err(|e| {
-            if e == rustix::io::Errno::EXIST {
-                unowned()
-            } else {
-                io(e)
+        (|| {
+            let (s, d) = self.parents()?;
+            let source = child(&s, parts(&self.source)?.1, OFlags::RDONLY)
+                .map_err(|e| e.at(PathRole::Source))?;
+            check(
+                self.source_identity
+                    .unchanged(&Identity::read(&source).map_err(|e| e.at(PathRole::Source))?),
+            )
+            .map_err(|e| e.at(PathRole::Source))?;
+            fs::mkdirat(
+                &d,
+                self.stage_name.as_str(),
+                Permissions::from_bits_truncate(0o700),
+            )
+            .map_err(|e| {
+                if e == rustix::io::Errno::EXIST {
+                    unowned()
+                } else {
+                    io(e)
+                }
+            })?;
+            sync(&d).map_err(|e| e.at(PathRole::Destination))?;
+            let dir: File = fs::openat(
+                &d,
+                self.stage_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
+            )
+            .map_err(io)?
+            .into();
+            if self.mode == Mode::Hardlink {
+                fs::linkat(&s, parts(&self.source)?.1, &dir, "media", AtFlags::empty())
+                    .map_err(ambiguous)?;
             }
-        })?;
-        sync(&d)?;
-        let dir: File = fs::openat(
-            &d,
-            self.stage_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        if self.mode == Mode::Hardlink {
-            fs::linkat(&s, parts(&self.source)?.1, &dir, "media", AtFlags::empty()).map_err(io)?;
-        }
-        let file = if self.mode == Mode::Hardlink {
-            child(&dir, "media", OFlags::RDONLY)?
-        } else {
-            child(&dir, "media", OFlags::RDWR | OFlags::CREATE | OFlags::EXCL)?
-        };
-        if self.mode == Mode::Hardlink {
-            check(self.source_identity.content(&Identity::read(&file)?))?;
-        }
-        sync(&dir)?;
-        Ok(Stage {
-            directory: Identity::read(&dir)?,
-            file: Identity::read(&file)?,
-            sha256: None,
-            quarantine: None,
-            source_retired: false,
-        })
+            let file = if self.mode == Mode::Hardlink {
+                child(&dir, "media", OFlags::RDONLY)?
+            } else {
+                child(&dir, "media", OFlags::RDWR | OFlags::CREATE | OFlags::EXCL)?
+            };
+            if self.mode == Mode::Hardlink {
+                check(self.source_identity.content(&Identity::read(&file)?))?;
+            }
+            sync(&dir)?;
+            Ok(Stage {
+                directory: Identity::read(&dir)?,
+                file: Identity::read(&file)?,
+                sha256: None,
+                quarantine: None,
+                source_retired: false,
+            })
+        })()
+        .map_err(|e: Error| e.at(PathRole::Stage))
     }
     pub fn transfer(&self, mut stage: Stage) -> Result<Stage> {
-        let (s, d) = self.parents()?;
-        let dir = self.stage_dir(&stage, &d)?;
-        let mut source = child(&s, parts(&self.source)?.1, OFlags::RDONLY)?;
-        let before = Identity::read(&source)?;
-        check(self.source_identity.content(&before))?;
-        let mut file = child(
-            &dir,
-            "media",
-            if self.mode == Mode::Hardlink {
-                OFlags::RDONLY
+        (|| {
+            let (s, d) = self.parents()?;
+            let dir = self.stage_dir(&stage, &d)?;
+            let mut source = child(&s, parts(&self.source)?.1, OFlags::RDONLY)
+                .map_err(|e| e.at(PathRole::Source))?;
+            let before = Identity::read(&source).map_err(|e| e.at(PathRole::Source))?;
+            check(self.source_identity.content(&before)).map_err(|e| e.at(PathRole::Source))?;
+            let mut file = child(
+                &dir,
+                "media",
+                if self.mode == Mode::Hardlink {
+                    OFlags::RDONLY
+                } else {
+                    OFlags::RDWR
+                },
+            )?;
+            check(stage.file.same(&Identity::read(&file)?))?;
+            let digest = if self.mode == Mode::Hardlink {
+                hash(&mut file)?
             } else {
-                OFlags::RDWR
-            },
-        )?;
-        check(stage.file.same(&Identity::read(&file)?))?;
-        let digest = if self.mode == Mode::Hardlink {
-            hash(&mut file)?
-        } else {
-            file.set_len(0).map_err(io)?;
-            stream(&mut source, Some(&mut file))?
-        };
-        check(before.unchanged(&Identity::read(&source)?))?;
-        file.sync_all().map_err(io)?;
-        sync(&dir)?;
-        stage.file = Identity::read(&file)?;
-        check(stage.file.size == self.source_identity.size)?;
-        stage.sha256 = Some(digest);
-        Ok(stage)
+                file.set_len(0).map_err(io)?;
+                stream(&mut source, Some(&mut file))?
+            };
+            check(before.unchanged(&Identity::read(&source).map_err(|e| e.at(PathRole::Source))?))
+                .map_err(|e| e.at(PathRole::Source))?;
+            file.sync_all().map_err(io)?;
+            sync(&dir)?;
+            stage.file = Identity::read(&file)?;
+            check(stage.file.size == self.source_identity.size)?;
+            stage.sha256 = Some(digest);
+            Ok(stage)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Stage))
     }
     pub fn publish(&self, stage: &Stage) -> Result<()> {
-        let (_, d) = self.parents()?;
-        let dir = self.stage_dir(stage, &d)?;
-        verify(&mut child(&dir, "media", OFlags::RDONLY)?, stage)?;
-        match fs::linkat(
-            &dir,
-            "media",
-            &d,
-            parts(&self.destination)?.1,
-            AtFlags::empty(),
-        ) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(io(e)),
-        }
-        verify(
-            &mut child(&d, parts(&self.destination)?.1, OFlags::RDONLY)?,
-            stage,
-        )?;
-        sync(&d)
+        (|| {
+            let (_, d) = self.parents()?;
+            let dir = self.stage_dir(stage, &d)?;
+            verify(
+                &mut child(&dir, "media", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                stage,
+            )
+            .map_err(|e| e.at(PathRole::Stage))?;
+            match fs::linkat(
+                &dir,
+                "media",
+                &d,
+                parts(&self.destination)?.1,
+                AtFlags::empty(),
+            ) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(ambiguous(e)),
+            }
+            verify(
+                &mut child(&d, parts(&self.destination)?.1, OFlags::RDONLY)?,
+                stage,
+            )?;
+            sync(&d)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
     pub fn verify_destination(&self, stage: &Stage) -> Result<()> {
-        let (_, d) = self.parents()?;
-        verify(
-            &mut child(&d, parts(&self.destination)?.1, OFlags::RDONLY)?,
-            stage,
-        )
+        (|| {
+            let (_, d) = self.parents()?;
+            verify(
+                &mut child(&d, parts(&self.destination)?.1, OFlags::RDONLY)?,
+                stage,
+            )
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
     pub fn prepare_cleanup(&self, mut stage: Stage) -> Result<Stage> {
-        if self.mode != Mode::Move || stage.quarantine.is_some() {
-            return Ok(stage);
-        }
-        let (s, _) = self.parents()?;
-        fs::mkdirat(
-            &s,
-            self.quarantine_name.as_str(),
-            Permissions::from_bits_truncate(0o700),
-        )
-        .map_err(|e| {
-            if e == rustix::io::Errno::EXIST {
-                unowned()
-            } else {
-                io(e)
+        (|| {
+            if self.mode != Mode::Move || stage.quarantine.is_some() {
+                return Ok(stage);
             }
-        })?;
-        sync(&s)?;
-        let dir: File = fs::openat(
-            &s,
-            self.quarantine_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        stage.quarantine = Some(Identity::read(&dir)?);
-        Ok(stage)
+            let (s, _) = self.parents()?;
+            fs::mkdirat(
+                &s,
+                self.quarantine_name.as_str(),
+                Permissions::from_bits_truncate(0o700),
+            )
+            .map_err(|e| {
+                if e == rustix::io::Errno::EXIST {
+                    unowned()
+                } else {
+                    io(e)
+                }
+            })?;
+            sync(&s)?;
+            let dir: File = fs::openat(
+                &s,
+                self.quarantine_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
+            )
+            .map_err(io)?
+            .into();
+            stage.quarantine = Some(Identity::read(&dir)?);
+            Ok(stage)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Source))
     }
     fn quarantine_dir(&self, stage: &Stage, s: &File) -> Result<File> {
-        let dir: File = fs::openat(
-            s,
-            self.quarantine_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        check(
-            stage
-                .quarantine
-                .as_ref()
-                .is_some_and(|i| Identity::read(&dir).is_ok_and(|v| i.same(&v))),
-        )?;
-        Ok(dir)
+        (|| {
+            let dir: File = fs::openat(
+                s,
+                self.quarantine_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
+            )
+            .map_err(io)?
+            .into();
+            let expected = stage.quarantine.as_ref().ok_or_else(Error::internal)?;
+            let observed = Identity::read(&dir)?;
+            check(expected.same(&observed))?;
+            Ok(dir)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Source))
     }
     pub fn retire_source(&self, mut stage: Stage) -> Result<Stage> {
-        if self.mode != Mode::Move || stage.source_retired {
-            return Ok(stage);
-        }
-        self.verify_destination(&stage)?;
-        let (s, _) = self.parents()?;
-        let dir = self.quarantine_dir(&stage, &s)?;
-        if optional(&dir, "source")?.is_none() {
-            let mut original = child(&s, parts(&self.source)?.1, OFlags::RDONLY)?;
-            check(self.source_identity.content(&Identity::read(&original)?))?;
-            check(hash(&mut original)? == *stage.sha256.as_ref().ok_or_else(changed)?)?;
-            fs::renameat_with(
-                &s,
-                parts(&self.source)?.1,
-                &dir,
-                "source",
-                RenameFlags::NOREPLACE,
-            )
-            .map_err(io)?;
-            sync(&s)?;
-            sync(&dir)?;
-        }
-        let mut retired = child(&dir, "source", OFlags::RDONLY)?;
-        check(self.source_identity.content(&Identity::read(&retired)?))?;
-        check(hash(&mut retired)? == *stage.sha256.as_ref().ok_or_else(changed)?)?;
-        stage.source_retired = true;
-        Ok(stage)
-    }
-    pub fn cleanup(&self, stage: &Stage) -> Result<()> {
-        self.verify_destination(stage)?;
-        let (s, d) = self.parents()?;
-        if self.mode == Mode::Move {
-            check(stage.source_retired)?;
-            let dir = self.quarantine_dir(stage, &s)?;
-            if let Some(mut file) = optional(&dir, "source")? {
-                check(self.source_identity.content(&Identity::read(&file)?))?;
-                check(hash(&mut file)? == *stage.sha256.as_ref().ok_or_else(changed)?)?;
-                fs::unlinkat(&dir, "source", AtFlags::empty()).map_err(io)?;
+        (|| {
+            if self.mode != Mode::Move || stage.source_retired {
+                return Ok(stage);
+            }
+            self.verify_destination(&stage)?;
+            let (s, _) = self.parents()?;
+            let dir = self.quarantine_dir(&stage, &s)?;
+            if optional(&dir, "source")?.is_none() {
+                let mut original = child(&s, parts(&self.source)?.1, OFlags::RDONLY)?;
+                check(self.source_identity.content(&Identity::read(&original)?))?;
+                check(hash(&mut original)? == *stage.sha256.as_ref().ok_or_else(Error::internal)?)?;
+                fs::renameat_with(
+                    &s,
+                    parts(&self.source)?.1,
+                    &dir,
+                    "source",
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(io)?;
+                sync(&s)?;
                 sync(&dir)?;
             }
-        }
-        // Keep the empty private directories as durable ownership receipts. Later housekeeping
-        // may retire them after operation retention expires; never guess ownership after restart.
-        let dir = self.stage_dir(stage, &d)?;
-        if let Some(file) = optional(&dir, "media")? {
-            check(stage.file.same(&Identity::read(&file)?))?;
-            fs::unlinkat(&dir, "media", AtFlags::empty()).map_err(io)?;
-            sync(&dir)?;
-        }
-        Ok(())
+            let mut retired = child(&dir, "source", OFlags::RDONLY)?;
+            check(self.source_identity.content(&Identity::read(&retired)?))?;
+            check(hash(&mut retired)? == *stage.sha256.as_ref().ok_or_else(Error::internal)?)?;
+            stage.source_retired = true;
+            Ok(stage)
+        })()
+        .map_err(|e: Error| e.at(PathRole::Source))
+    }
+    pub fn cleanup(&self, stage: &Stage) -> Result<()> {
+        (|| {
+            self.verify_destination(stage)?;
+            let (s, d) = self.parents()?;
+            if self.mode == Mode::Move {
+                if !stage.source_retired {
+                    return Err(Error::internal());
+                }
+                let dir = self.quarantine_dir(stage, &s)?;
+                if let Some(mut file) = optional(&dir, "source")? {
+                    check(self.source_identity.content(&Identity::read(&file)?))?;
+                    check(hash(&mut file)? == *stage.sha256.as_ref().ok_or_else(Error::internal)?)?;
+                    fs::unlinkat(&dir, "source", AtFlags::empty()).map_err(io)?;
+                    sync(&dir)?;
+                }
+            }
+            // Keep the empty private directories as durable ownership receipts. Later housekeeping
+            // may retire them after operation retention expires; never guess ownership after restart.
+            let dir = self.stage_dir(stage, &d)?;
+            if let Some(file) = optional(&dir, "media").map_err(|e| e.at(PathRole::Stage))? {
+                check(
+                    stage
+                        .file
+                        .same(&Identity::read(&file).map_err(|e| e.at(PathRole::Stage))?),
+                )
+                .map_err(|e| e.at(PathRole::Stage))?;
+                fs::unlinkat(&dir, "media", AtFlags::empty())
+                    .map_err(|e| io(e).at(PathRole::Stage))?;
+                sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+            }
+            Ok(())
+        })()
+        .map_err(|e: Error| e.at(PathRole::Source))
     }
 }
 fn verify(file: &mut File, stage: &Stage) -> Result<()> {
+    let expected = stage.sha256.as_ref().ok_or_else(Error::internal)?;
     check(stage.file.content(&Identity::read(file)?))?;
-    check(Some(hash(file)?) == stage.sha256)
+    check(&hash(file)? == expected)
 }
 fn hash(file: &mut File) -> Result<String> {
     let before = Identity::read(file)?;
@@ -496,15 +587,28 @@ fn stream(source: &mut File, mut destination: Option<&mut File>) -> Result<Strin
                 "Transfer time budget exceeded; source is retained",
             ));
         }
-        let n = source.read(&mut buffer).map_err(io)?;
+        let n = source.read(&mut buffer).map_err(|e| {
+            if destination.is_some() {
+                io(e).at(PathRole::Source)
+            } else {
+                io(e)
+            }
+        })?;
         if n == 0 {
             break;
         }
         total += n as u64;
-        check(total <= MAX_FILE_BYTES)?;
+        if total > MAX_FILE_BYTES {
+            return Err(if destination.is_some() {
+                invalid().at(PathRole::Source)
+            } else {
+                invalid()
+            });
+        }
         digest.update(&buffer[..n]);
         if let Some(d) = destination.as_mut() {
-            d.write_all(&buffer[..n]).map_err(io)?;
+            d.write_all(&buffer[..n])
+                .map_err(|e| io(e).at(PathRole::Stage))?;
         }
     }
     Ok(digest
@@ -534,6 +638,17 @@ impl Plan {
     pub(super) fn source_size(&self) -> u64 {
         self.source_identity.size
     }
+    /// True when the previewed source is the same inode with the same content facts
+    /// (size and modification time) as a previously captured scan inventory identity.
+    pub(super) fn source_matches(&self, captured: &serde_json::Value) -> bool {
+        let field = |name: &str| captured.get(name).and_then(serde_json::Value::as_i64);
+        let unsigned = |name: &str| captured.get(name).and_then(serde_json::Value::as_u64);
+        unsigned("dev") == Some(self.source_identity.dev)
+            && unsigned("ino") == Some(self.source_identity.ino)
+            && unsigned("size") == Some(self.source_identity.size)
+            && field("mtime") == Some(self.source_identity.mtime)
+            && field("mtime_ns") == Some(self.source_identity.mtime_ns)
+    }
 }
 impl OldFile {
     pub(super) fn capture(
@@ -543,68 +658,122 @@ impl OldFile {
         root: &str,
         operation: &str,
     ) -> Result<Self> {
-        validate_path(&path)?;
-        check(Path::new(&path).starts_with(root) && path != root)?;
-        let (parent, name) = parts(&path)?;
-        let directory = directory(parent)?;
-        let file = child(&directory, name, OFlags::RDONLY)?;
-        let identity = Identity::read(&file)?;
-        check(identity.unchanged(&Identity::read(&file)?))?;
-        Ok(Self {
-            version: 1,
+        Self::capture_named(
             file_id,
             path,
             metadata,
-            parent: Identity::read(&directory)?,
-            file: identity,
-            quarantine_name: format!(".hrrdarr-replaced-{operation}"),
-        })
+            root,
+            format!(".hrrdarr-replaced-{operation}"),
+        )
     }
-    fn parent(&self) -> Result<File> {
-        let dir = directory(parts(&self.path)?.0)?;
-        check(self.parent.same(&Identity::read(&dir)?))?;
-        Ok(dir)
+    /// A scan operation can replace several originals in one directory, so its recovery
+    /// artifact name carries the typed old-file identity as well as the operation.
+    pub(super) fn capture_scan(
+        file_id: i64,
+        path: String,
+        metadata: serde_json::Value,
+        root: &str,
+        operation: &str,
+    ) -> Result<Self> {
+        Self::capture_named(
+            file_id,
+            path,
+            metadata,
+            root,
+            format!(".hrrdarr-replaced-{operation}-{file_id}"),
+        )
     }
-    fn verify(&self, file: &mut File) -> Result<()> {
-        check(self.file.content(&Identity::read(file)?))
+    fn capture_named(
+        file_id: i64,
+        path: String,
+        metadata: serde_json::Value,
+        root: &str,
+        quarantine_name: String,
+    ) -> Result<Self> {
+        (|| {
+            validate_path(&path)?;
+            check(Path::new(&path).starts_with(root) && path != root)?;
+            let (parent, name) = parts(&path)?;
+            let directory = directory(parent)?;
+            let file = child(&directory, name, OFlags::RDONLY)?;
+            let identity = Identity::read(&file)?;
+            check(identity.unchanged(&Identity::read(&file)?))?;
+            Ok(Self {
+                version: 1,
+                file_id,
+                path,
+                metadata,
+                parent: Identity::read(&directory)?,
+                file: identity,
+                quarantine_name,
+            })
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
-    pub(super) fn verify_original(&self) -> Result<()> {
-        self.verify(&mut child(
-            &self.parent()?,
-            parts(&self.path)?.1,
-            OFlags::RDONLY,
-        )?)
+    fn parent(&self, role: PathRole) -> Result<File> {
+        (|| {
+            let dir = directory(parts(&self.path)?.0)?;
+            check(self.parent.same(&Identity::read(&dir)?))?;
+            Ok(dir)
+        })()
+        .map_err(|e: Error| e.at(role))
+    }
+    fn verify(&self, file: &mut File, role: PathRole) -> Result<()> {
+        (|| check(self.file.content(&Identity::read(file)?)))().map_err(|e: Error| e.at(role))
+    }
+    pub(super) fn verify_original(&self, role: PathRole) -> Result<()> {
+        (|| {
+            self.verify(
+                &mut child(&self.parent(role)?, parts(&self.path)?.1, OFlags::RDONLY)?,
+                role,
+            )
+        })()
+        .map_err(|e: Error| e.at(role))
     }
     pub(super) fn prepare_retirement(&self) -> Result<Retirement> {
-        self.verify_original()?;
+        self.verify_original(PathRole::Retirement)?;
         self.prepare_retirement_directory()
     }
     fn prepare_retirement_directory(&self) -> Result<Retirement> {
-        let parent = self.parent()?;
-        fs::mkdirat(
-            &parent,
-            self.quarantine_name.as_str(),
-            Permissions::from_bits_truncate(0o700),
-        )
-        .map_err(|e| {
-            if e == rustix::io::Errno::EXIST {
-                unowned()
-            } else {
-                io(e)
-            }
-        })?;
-        sync(&parent)?;
-        let dir: File = fs::openat(
-            &parent,
-            self.quarantine_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        Ok(Retirement {
-            directory: Identity::read(&dir)?,
-        })
+        (|| {
+            let parent = self.parent(PathRole::Retirement)?;
+            fs::mkdirat(
+                &parent,
+                self.quarantine_name.as_str(),
+                Permissions::from_bits_truncate(0o700),
+            )
+            .map_err(|e| {
+                if e == rustix::io::Errno::EXIST {
+                    unowned()
+                } else {
+                    io(e)
+                }
+            })?;
+            sync(&parent)?;
+            let dir: File = fs::openat(
+                &parent,
+                self.quarantine_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
+            )
+            .map_err(io)?
+            .into();
+            Ok(Retirement {
+                directory: Identity::read(&dir)?,
+            })
+        })()
+        .map_err(|e: Error| e.at(PathRole::Retirement))
+    }
+    /// Captured device, inode, size and modification time of the original. Renames into the
+    /// recovery artifact keep all four, so the artifact is re-identified by them.
+    pub(super) fn bin_identity(&self) -> crate::recycle_bin::fsops::Identity {
+        crate::recycle_bin::fsops::Identity {
+            dev: self.file.dev,
+            ino: self.file.ino,
+            size: self.file.size,
+            mtime: self.file.mtime,
+            mtime_ns: self.file.mtime_ns,
+        }
     }
     pub(super) fn recovery_path(&self) -> Result<String> {
         let path = parts(&self.path)?
@@ -616,113 +785,155 @@ impl OldFile {
         Ok(path)
     }
     pub(super) fn retire(&self, checkpoint: &Retirement) -> Result<()> {
-        let parent = self.parent()?;
-        let dir: File = fs::openat(
-            &parent,
-            self.quarantine_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        check(checkpoint.directory.same(&Identity::read(&dir)?))?;
-        if optional(&dir, "original")?.is_none() {
-            check(self.file.unchanged(&Identity::read(&child(
+        (|| {
+            let parent = self.parent(PathRole::Retirement)?;
+            let dir: File = fs::openat(
                 &parent,
-                parts(&self.path)?.1,
-                OFlags::RDONLY,
-            )?)?))?;
-            fs::renameat_with(
-                &parent,
-                parts(&self.path)?.1,
-                &dir,
-                "original",
-                RenameFlags::NOREPLACE,
+                self.quarantine_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
             )
-            .map_err(io)?;
-            sync(&parent)?;
-            sync(&dir)?;
-        }
-        // A re-created original pathname is never touched on retry.
-        self.verify(&mut child(&dir, "original", OFlags::RDONLY)?)
+            .map_err(io)?
+            .into();
+            check(checkpoint.directory.same(&Identity::read(&dir)?))?;
+            if optional(&dir, "original")?.is_none() {
+                check(self.file.unchanged(&Identity::read(&child(
+                    &parent,
+                    parts(&self.path)?.1,
+                    OFlags::RDONLY,
+                )?)?))?;
+                fs::renameat_with(
+                    &parent,
+                    parts(&self.path)?.1,
+                    &dir,
+                    "original",
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(io)?;
+                sync(&parent)?;
+                sync(&dir)?;
+            }
+            // A re-created original pathname is never touched on retry.
+            self.verify(
+                &mut child(&dir, "original", OFlags::RDONLY)?,
+                PathRole::Retirement,
+            )
+        })()
+        .map_err(|e: Error| e.at(PathRole::Retirement))
     }
 }
 
 impl Plan {
     /// Stage/media remains the immutable new-byte witness throughout the exchange.
     pub(super) fn exchange(&self, stage: &Stage, old: &OldFile) -> Result<()> {
-        check(old.path == self.destination)?;
-        let (_, parent) = self.parents()?;
-        let dir = self.stage_dir(stage, &parent)?;
-        verify(&mut child(&dir, "media", OFlags::RDONLY)?, stage)?;
-        let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
-        let current = Identity::read(&destination)?;
-        if stage.file.same(&current) {
-            verify(&mut destination, stage)?;
-            old.verify(&mut child(&dir, "original", OFlags::RDONLY)?)?;
-            sync(&dir)?;
-            return sync(&parent);
-        }
-        old.verify(&mut destination)?;
-        if optional(&dir, "original")?.is_none() {
-            fs::linkat(&dir, "media", &dir, "original", AtFlags::empty()).map_err(io)?;
-            sync(&dir)?;
-        }
-        verify(&mut child(&dir, "original", OFlags::RDONLY)?, stage)?;
-        // Catch detectable writes between validation and publication. An external
-        // same-UID writer is outside the exclusive filesystem ownership contract.
-        check(current.unchanged(&Identity::read(&destination)?))?;
-        fs::renameat_with(
-            &dir,
-            "original",
-            &parent,
-            parts(&self.destination)?.1,
-            RenameFlags::EXCHANGE,
-        )
-        .map_err(io)?;
-        sync(&dir)?;
-        sync(&parent)?;
-        verify(
-            &mut child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?,
-            stage,
-        )?;
-        old.verify(&mut child(&dir, "original", OFlags::RDONLY)?)
+        (|| {
+            check(old.path == self.destination)?;
+            let (_, parent) = self.parents()?;
+            let dir = self.stage_dir(stage, &parent)?;
+            verify(
+                &mut child(&dir, "media", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                stage,
+            )
+            .map_err(|e| e.at(PathRole::Stage))?;
+            let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
+            let current = Identity::read(&destination)?;
+            if stage.file.same(&current) {
+                verify(&mut destination, stage)?;
+                old.verify(
+                    &mut child(&dir, "original", OFlags::RDONLY)
+                        .map_err(|e| e.at(PathRole::Stage))?,
+                    PathRole::Stage,
+                )?;
+                sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+                return sync(&parent);
+            }
+            old.verify(&mut destination, PathRole::Destination)?;
+            if optional(&dir, "original")
+                .map_err(|e| e.at(PathRole::Stage))?
+                .is_none()
+            {
+                fs::linkat(&dir, "media", &dir, "original", AtFlags::empty())
+                    .map_err(|e| io(e).at(PathRole::Stage))?;
+                sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+            }
+            verify(
+                &mut child(&dir, "original", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                stage,
+            )
+            .map_err(|e| e.at(PathRole::Stage))?;
+            // Catch detectable writes between validation and publication. An external
+            // same-UID writer is outside the exclusive filesystem ownership contract.
+            check(current.unchanged(&Identity::read(&destination)?))?;
+            fs::renameat_with(
+                &dir,
+                "original",
+                &parent,
+                parts(&self.destination)?.1,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(ambiguous)?;
+            sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+            sync(&parent)?;
+            verify(
+                &mut child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?,
+                stage,
+            )?;
+            old.verify(
+                &mut child(&dir, "original", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                PathRole::Stage,
+            )
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
     pub(super) fn restore_exchange(&self, stage: &Stage, old: &OldFile) -> Result<()> {
-        check(old.path == self.destination)?;
-        let (_, parent) = self.parents()?;
-        let dir = self.stage_dir(stage, &parent)?;
-        verify(&mut child(&dir, "media", OFlags::RDONLY)?, stage)?;
-        let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
-        if old.file.same(&Identity::read(&destination)?) {
-            old.verify(&mut destination)?;
-            if let Some(mut original) = optional(&dir, "original")? {
-                verify(&mut original, stage)?;
+        (|| {
+            check(old.path == self.destination)?;
+            let (_, parent) = self.parents()?;
+            let dir = self.stage_dir(stage, &parent)?;
+            verify(
+                &mut child(&dir, "media", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                stage,
+            )
+            .map_err(|e| e.at(PathRole::Stage))?;
+            let mut destination = child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?;
+            if old.file.same(&Identity::read(&destination)?) {
+                old.verify(&mut destination, PathRole::Destination)?;
+                if let Some(mut original) =
+                    optional(&dir, "original").map_err(|e| e.at(PathRole::Stage))?
+                {
+                    verify(&mut original, stage).map_err(|e| e.at(PathRole::Stage))?;
+                }
+                sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+                return sync(&parent);
             }
-            sync(&dir)?;
-            return sync(&parent);
-        }
-        let mut original = child(&dir, "original", OFlags::RDONLY)?;
-        let before = Identity::read(&original)?;
-        verify(&mut destination, stage)?;
-        old.verify(&mut original)?;
-        check(before.unchanged(&Identity::read(&original)?))?;
-        fs::renameat_with(
-            &dir,
-            "original",
-            &parent,
-            parts(&self.destination)?.1,
-            RenameFlags::EXCHANGE,
-        )
-        .map_err(io)?;
-        sync(&dir)?;
-        sync(&parent)?;
-        old.verify(&mut child(
-            &parent,
-            parts(&self.destination)?.1,
-            OFlags::RDONLY,
-        )?)?;
-        verify(&mut child(&dir, "original", OFlags::RDONLY)?, stage)
+            let mut original =
+                child(&dir, "original", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?;
+            let before = Identity::read(&original).map_err(|e| e.at(PathRole::Stage))?;
+            verify(&mut destination, stage)?;
+            old.verify(&mut original, PathRole::Stage)?;
+            check(before.unchanged(&Identity::read(&original).map_err(|e| e.at(PathRole::Stage))?))
+                .map_err(|e| e.at(PathRole::Stage))?;
+            fs::renameat_with(
+                &dir,
+                "original",
+                &parent,
+                parts(&self.destination)?.1,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(ambiguous)?;
+            sync(&dir).map_err(|e| e.at(PathRole::Stage))?;
+            sync(&parent)?;
+            old.verify(
+                &mut child(&parent, parts(&self.destination)?.1, OFlags::RDONLY)?,
+                PathRole::Destination,
+            )?;
+            verify(
+                &mut child(&dir, "original", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                stage,
+            )
+            .map_err(|e| e.at(PathRole::Stage))
+        })()
+        .map_err(|e: Error| e.at(PathRole::Destination))
     }
 }
 impl OldFile {
@@ -731,10 +942,16 @@ impl OldFile {
         plan: &Plan,
         stage: &Stage,
     ) -> Result<Retirement> {
-        let (_, parent) = plan.parents()?;
-        let dir = plan.stage_dir(stage, &parent)?;
-        self.verify(&mut child(&dir, "original", OFlags::RDONLY)?)?;
-        self.prepare_retirement_directory()
+        (|| {
+            let (_, parent) = plan.parents()?;
+            let dir = plan.stage_dir(stage, &parent)?;
+            self.verify(
+                &mut child(&dir, "original", OFlags::RDONLY).map_err(|e| e.at(PathRole::Stage))?,
+                PathRole::Stage,
+            )?;
+            self.prepare_retirement_directory()
+        })()
+        .map_err(|e: Error| e.at(PathRole::Retirement))
     }
     pub(super) fn retire_exchanged(
         &self,
@@ -742,34 +959,91 @@ impl OldFile {
         stage: &Stage,
         checkpoint: &Retirement,
     ) -> Result<()> {
-        let (_, parent) = plan.parents()?;
-        let source = plan.stage_dir(stage, &parent)?;
-        let destination: File = fs::openat(
-            &self.parent()?,
-            self.quarantine_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Permissions::empty(),
-        )
-        .map_err(io)?
-        .into();
-        check(checkpoint.directory.same(&Identity::read(&destination)?))?;
-        if optional(&destination, "original")?.is_none() {
-            let mut original = child(&source, "original", OFlags::RDONLY)?;
-            let before = Identity::read(&original)?;
-            self.verify(&mut original)?;
-            check(before.unchanged(&Identity::read(&original)?))?;
-            fs::renameat_with(
-                &source,
-                "original",
-                &destination,
-                "original",
-                RenameFlags::NOREPLACE,
+        (|| {
+            let (_, parent) = plan.parents()?;
+            let source = plan.stage_dir(stage, &parent)?;
+            let destination: File = fs::openat(
+                &self.parent(PathRole::Retirement)?,
+                self.quarantine_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Permissions::empty(),
             )
-            .map_err(io)?;
+            .map_err(io)?
+            .into();
+            check(checkpoint.directory.same(&Identity::read(&destination)?))?;
+            if optional(&destination, "original")?.is_none() {
+                let mut original = child(&source, "original", OFlags::RDONLY)
+                    .map_err(|e| e.at(PathRole::Stage))?;
+                let before = Identity::read(&original).map_err(|e| e.at(PathRole::Stage))?;
+                self.verify(&mut original, PathRole::Stage)?;
+                check(
+                    before
+                        .unchanged(&Identity::read(&original).map_err(|e| e.at(PathRole::Stage))?),
+                )
+                .map_err(|e| e.at(PathRole::Stage))?;
+                fs::renameat_with(
+                    &source,
+                    "original",
+                    &destination,
+                    "original",
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(ambiguous)?;
+            }
+            sync(&source).map_err(|e| e.at(PathRole::Stage))?;
+            sync(&destination)?;
+            self.verify(
+                &mut child(&destination, "original", OFlags::RDONLY)?,
+                PathRole::Retirement,
+            )?;
+            check(
+                optional(&source, "original")
+                    .map_err(|e| e.at(PathRole::Stage))?
+                    .is_none(),
+            )
+            .map_err(|e| e.at(PathRole::Stage))
+        })()
+        .map_err(|e: Error| e.at(PathRole::Retirement))
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::import::PathBoundary;
+
+    #[test]
+    fn syscall_classification_and_ambiguous_endpoints_preserve_public_codes() {
+        for (errno, expected) in [
+            (rustix::io::Errno::NOENT, "source_missing_precommit"),
+            (rustix::io::Errno::ACCESS, "source_denied_precommit"),
+            (rustix::io::Errno::LOOP, "source_invalid_precommit"),
+            (rustix::io::Errno::NOTDIR, "source_invalid_precommit"),
+            (rustix::io::Errno::IO, "source_io_precommit"),
+        ] {
+            let error = io(errno)
+                .at(PathRole::Source)
+                .boundary(PathBoundary::Precommit);
+            assert_eq!(error.code(), "filesystem_error");
+            assert_eq!(error.path_failure_code(), Some(expected));
         }
-        sync(&source)?;
-        sync(&destination)?;
-        self.verify(&mut child(&destination, "original", OFlags::RDONLY)?)?;
-        check(optional(&source, "original")?.is_none())
+        let error = ambiguous(rustix::io::Errno::ACCESS)
+            .at(PathRole::Destination)
+            .boundary(PathBoundary::Precommit);
+        assert_eq!(error.code(), "filesystem_error");
+        assert!(error.path_failure_code().is_none());
+        assert!(error.prepare_failure_code().is_none());
+        let error = changed()
+            .at(PathRole::Stage)
+            .at(PathRole::Retirement)
+            .boundary(PathBoundary::Cleanup);
+        assert_eq!(error.path_failure_code(), Some("stage_changed_cleanup"));
+        assert_eq!(
+            unowned()
+                .at(PathRole::Stage)
+                .boundary(PathBoundary::Precommit)
+                .path_failure_code(),
+            Some("stage_invalid_precommit")
+        );
     }
 }

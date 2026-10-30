@@ -294,6 +294,7 @@ pub struct Season {
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(rename = "LibraryItem")]
 pub struct LibraryItem {
+    pub runtime: Option<i64>,
     pub tag_ids: Vec<i64>,
     pub id: i64,
     pub media_type: Domain,
@@ -565,8 +566,13 @@ async fn fetch(
     } else {
         "r.id,r.metadata_id,m.title,m.year,NULL,m.tmdb_id,m.imdb_id,r.path,NULL,r.monitored"
     };
+    let runtime = if d == Domain::Tv {
+        "r.runtime"
+    } else {
+        "m.runtime"
+    };
     let sql = format!(
-        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
+        "SELECT {core},s.quality_profile_id,p.name,s.series_type,s.season_folder,s.use_scene_numbering,s.monitor_new_items,s.minimum_availability,s.added,{runtime} FROM {} r {} LEFT JOIN library_settings s ON s.{}=r.id AND s.media_type='{}' LEFT JOIN quality_profiles p ON p.id=s.quality_profile_id AND p.media_type=s.media_type WHERE {filter} ORDER BY r.id LIMIT ? OFFSET ?",
         d.table(),
         if d == Domain::Movies {
             "JOIN movie_metadata m ON m.id=r.metadata_id"
@@ -583,6 +589,7 @@ async fn fetch(
     let mut bytes = 1024;
     while let Some(r) = rows.next().await? {
         let item = LibraryItem {
+            runtime: r.get(18)?,
             tag_ids: crate::tags::assigned(c, d, r.get(0)?)
                 .await
                 .map_err(tag_error)?,
@@ -970,6 +977,12 @@ async fn persist(ctx: &Context, items: Vec<Update>) -> Result<Vec<LibraryItem>> 
             }
             drop(rows);
             patch(&tx, ctx.domain, item.id, &item.patch, false).await?;
+            // An explicit tag assignment in the same request is the user's decision for that request.
+            if !changed(&item.patch.tags) {
+                crate::autotagging::apply_item(&tx, ctx.domain, item.id)
+                    .await
+                    .map_err(tag_error)?;
+            }
         }
         let include = selected.len() == 1;
         fetch(
@@ -1147,8 +1160,8 @@ async fn create_record(
                 }
                 row.get(0)?
             } else {
-                if let Some(imdb) = &req.imdb_id {
-                    if c.query(
+                if let Some(imdb) = &req.imdb_id
+                    && c.query(
                         "SELECT id FROM movie_metadata WHERE imdb_id=?",
                         [imdb.clone()],
                     )
@@ -1156,9 +1169,8 @@ async fn create_record(
                     .next()
                     .await?
                     .is_some()
-                    {
-                        return Err(conflict());
-                    }
+                {
+                    return Err(conflict());
                 }
                 c.execute(
                     "INSERT INTO movie_metadata(tmdb_id,imdb_id,title,year)VALUES(?,?,?,?)",
@@ -1209,6 +1221,9 @@ async fn create_record(
         [id],
     )
     .await?;
+    crate::autotagging::apply_item(c, d, id)
+        .await
+        .map_err(tag_error)?;
     fetch(c, d, "r.id=?", vec![Value::Integer(id)], 1, 0, true)
         .await?
         .pop()
@@ -1487,6 +1502,8 @@ async fn selected(
         if ctx.domain == Domain::Movies {
             crate::collections::repository::adopt(&tx,item.id,item.metadata_id.ok_or_else(conflict)?,collection,collection_enable).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
+        // Catalog facts now exist, so rules that depend on them can be evaluated for the new item.
+        crate::autotagging::apply_item(&tx,ctx.domain,item.id).await.map_err(tag_error)?;
         for episode in episodes {
             let monitored=monitoring.get(&episode.season).ok_or_else(||bad("Episode season is absent from selected catalog"))?;
             tx.execute("INSERT INTO episodes(series_id,season,number,title,monitored,tvdb_id,air_date,air_date_utc,absolute_episode_number,runtime,overview,finale_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![item.id,episode.season,episode.number,episode.title,i64::from(*monitored),episode.tvdb_id,episode.air_date,episode.air_date_utc,episode.absolute_episode_number,episode.runtime,episode.overview,episode.finale_type]).await?;

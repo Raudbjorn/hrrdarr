@@ -123,7 +123,7 @@ pub fn router(db: Arc<Database>) -> Router {
         let prefix = format!("/api/v1/{media}/quality-definitions");
         router = router.merge(
             Router::new()
-                .route(&format!("{prefix}"), get(list))
+                .route(&prefix.to_string(), get(list))
                 .route(&format!("{prefix}/limits"), get(limits))
                 .route(&format!("{prefix}/defaults"), get(defaults))
                 .route(&format!("{prefix}/bulk"), put(bulk))

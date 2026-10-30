@@ -1,11 +1,19 @@
 //! Persisted first-pair configuration. Saving configuration performs no network requests.
 pub mod administration;
+pub(crate) mod backoff;
 pub mod categories;
 mod credentials;
+pub(crate) mod download;
 pub mod draft;
 pub mod http;
 pub mod indexer;
+mod indexer_backoff;
+pub mod label_client;
+pub mod nzbget;
 pub mod qbittorrent;
+pub mod sabnzbd;
+pub(crate) mod selection;
+pub mod transmission;
 use crate::{
     api::{ApiErrorEnvelope, ApiPage, MediaDomain},
     db::Database,
@@ -23,12 +31,13 @@ use axum::{
 };
 pub use credentials::{CredentialKey, Credentials, IndexerAccess, IndexerParameter};
 use libsql::{Connection, params};
+pub use selection::ClientSelection;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug)]
-enum Error {
+pub(crate) enum Error {
     Plain(StatusCode, &'static str, &'static str),
     RateLimited(u32),
 }
@@ -43,7 +52,7 @@ impl IntoResponse for Error {
                 [(axum::http::header::RETRY_AFTER, seconds.to_string())],
                 Json(ApiErrorEnvelope::new(
                     "rate_limited",
-                    "Provider is rate limited; retry after the indicated interval",
+                    "Provider is temporarily unavailable; retry after the indicated interval",
                 )),
             )
                 .into_response(),
@@ -63,7 +72,7 @@ impl From<libsql::Error> for Error {
         )
     }
 }
-type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 fn bad() -> Error {
     Error::Plain(
         StatusCode::BAD_REQUEST,
@@ -280,6 +289,283 @@ pub struct DownloadScope {
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub add_tags: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// SABnzbd job priority. Wire values are the documented `priority` API parameter integers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum UsenetPriority {
+    /// The category's configured priority (wire -100).
+    #[default]
+    Default,
+    Paused,
+    Low,
+    Normal,
+    High,
+    Force,
+}
+impl UsenetPriority {
+    pub(crate) fn wire(self) -> i64 {
+        match self {
+            Self::Default => -100,
+            Self::Paused => -2,
+            Self::Low => -1,
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::Force => 2,
+        }
+    }
+    fn stored(value: i64) -> Result<Self> {
+        Ok(match value {
+            -100 => Self::Default,
+            -2 => Self::Paused,
+            -1 => Self::Low,
+            0 => Self::Normal,
+            1 => Self::High,
+            2 => Self::Force,
+            _ => return Err(corrupt()),
+        })
+    }
+}
+/// One media domain of a usenet client. The category isolates TV from movies on a shared client.
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct UsenetScope {
+    pub category: String,
+    #[serde(default)]
+    #[ts(as = "Option<UsenetPriority>", optional)]
+    pub recent_priority: UsenetPriority,
+    #[serde(default)]
+    #[ts(as = "Option<UsenetPriority>", optional)]
+    pub older_priority: UsenetPriority,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// NZBGet job priority. Wire values are NZBGet's own integer priorities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NzbgetPriority {
+    VeryLow,
+    Low,
+    #[default]
+    Normal,
+    High,
+    VeryHigh,
+    Force,
+}
+impl NzbgetPriority {
+    pub(crate) fn wire(self) -> i64 {
+        match self {
+            Self::VeryLow => -100,
+            Self::Low => -50,
+            Self::Normal => 0,
+            Self::High => 50,
+            Self::VeryHigh => 100,
+            Self::Force => 900,
+        }
+    }
+    /// Storage code: the scope table's priority CHECK predates NZBGet (see migration 0064).
+    fn code(self) -> i64 {
+        match self {
+            Self::VeryLow => -100,
+            Self::Low => -1,
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::VeryHigh => 2,
+            Self::Force => -2,
+        }
+    }
+    fn stored(value: i64) -> Result<Self> {
+        Ok(match value {
+            -100 => Self::VeryLow,
+            -1 => Self::Low,
+            0 => Self::Normal,
+            1 => Self::High,
+            2 => Self::VeryHigh,
+            -2 => Self::Force,
+            _ => return Err(corrupt()),
+        })
+    }
+}
+/// One media domain of an NZBGet client. The category isolates TV from movies on a shared client.
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct NzbgetScope {
+    pub category: String,
+    #[serde(default)]
+    #[ts(as = "Option<NzbgetPriority>", optional)]
+    pub recent_priority: NzbgetPriority,
+    #[serde(default)]
+    #[ts(as = "Option<NzbgetPriority>", optional)]
+    pub older_priority: NzbgetPriority,
+    /// The job is added paused and must be resumed in NZBGet.
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_paused: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// Transmission queue placement for a new torrent; `first` moves it to the top of the queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentQueuePriority {
+    #[default]
+    Last,
+    First,
+}
+impl TorrentQueuePriority {
+    pub(crate) fn wire(self) -> i64 {
+        match self {
+            Self::Last => 0,
+            Self::First => 1,
+        }
+    }
+    fn stored(value: i64) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Last),
+            1 => Ok(Self::First),
+            _ => Err(corrupt()),
+        }
+    }
+}
+/// One media domain of a label-isolated torrent client (Deluge and similar). The label isolates
+/// TV from movies on a shared client; labels compare case-insensitively.
+#[derive(Clone, Default, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct TorrentLabelScope {
+    pub category: String,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub recent_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub older_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_paused: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// Label rules shared by the label clients: lowercase letters, digits and `_ . -` (Deluge's
+/// Label plugin rejects anything else), so one name works across the family.
+fn valid_torrent_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+/// Where one domain's torrents are placed on a shared Transmission client and how they are
+/// recognised again.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
+#[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TorrentPlacement {
+    /// A subfolder of the client's download directory, also applied as a torrent label when the
+    /// server supports labels (Transmission 4.0+).
+    Category { category: String },
+    /// An absolute remote download directory; ownership is by directory only.
+    Directory { directory: String },
+}
+/// One media domain of a Transmission client.
+#[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct TransmissionScope {
+    pub placement: TorrentPlacement,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub recent_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<TorrentQueuePriority>", optional)]
+    pub older_priority: TorrentQueuePriority,
+    #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
+    pub add_paused: bool,
+    #[serde(
+        default,
+        deserialize_with = "selection::tags_input",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, as = "Option<Vec<i64>>")]
+    pub tags: Option<Vec<i64>>,
+}
+/// Transmission category: a single path segment that is also a label (no separators or commas).
+fn valid_torrent_category(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+/// Absolute remote directory in canonical form: POSIX `/...` or drive `X:/...`/`X:\...`, with no
+/// empty, `.` or `..` segments and no trailing separator. A bare root is rejected.
+fn valid_remote_directory(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let rest = if drive {
+        &value[3..]
+    } else if let Some(rest) = value.strip_prefix('/') {
+        rest
+    } else {
+        return false;
+    };
+    value.len() <= 1024
+        && !rest.is_empty()
+        && !value.chars().any(char::is_control)
+        && !rest.contains(':')
+        && rest
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+/// Release transport shared by an indexer and the clients that may receive its releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    Torrent,
+    Usenet,
+}
+/// Implementations on the shared label-torrent engine, in registry order.
+pub(crate) const LABEL_IMPLEMENTATIONS: [&str; 6] = [
+    "deluge",
+    "rtorrent",
+    "utorrent",
+    "aria2",
+    "flood",
+    "downloadstation",
+];
+impl Protocol {
+    pub(crate) fn of_implementation(implementation: &str) -> Option<Self> {
+        match implementation {
+            "torznab" | "torrentrss" | "qbittorrent" | "transmission" => Some(Self::Torrent),
+            label if LABEL_IMPLEMENTATIONS.contains(&label) => Some(Self::Torrent),
+            "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
 #[serde(tag = "implementation", rename_all = "lowercase", deny_unknown_fields)]
@@ -305,6 +591,86 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<DownloadScope>,
     },
+    /// Endpoint is the SABnzbd base URL (scheme, host, port and URL base); the API is `<endpoint>/api`.
+    Sabnzbd {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<UsenetScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<UsenetScope>,
+    },
+    /// Endpoint is the NZBGet base URL (scheme, host, port and URL base); the API is
+    /// `<endpoint>/jsonrpc`.
+    Nzbget {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<NzbgetScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<NzbgetScope>,
+    },
+    /// Endpoint is the Transmission web base: scheme (SSL), host, port and URL base (default
+    /// `/transmission`); the RPC is `<endpoint>/rpc`.
+    Transmission {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TransmissionScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TransmissionScope>,
+    },
+    /// Endpoint is the Deluge Web UI base URL (the JSON-RPC API is `<endpoint>/json`). The
+    /// credential is the Web UI password. Requires the Label plugin.
+    Deluge {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the rTorrent XML-RPC URL (for example an nginx or ruTorrent `/RPC2` mount).
+    /// Optional HTTP basic credentials. Torrents are labelled with `d.custom1`.
+    Rtorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the uTorrent Web UI base (for example `http://host:8080/gui`). Basic
+    /// credentials are required; torrents are labelled with uTorrent labels.
+    Utorrent {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the aria2 JSON-RPC URL (usually `http://host:6800/jsonrpc`). The optional RPC
+    /// secret is an API-key credential. A domain is the subfolder `<default dir>/<label>`.
+    Aria2 {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the Flood base URL (for example `http://host:3000`). Optional basic credentials
+    /// are the Flood user name and password; torrents are labelled with Flood tags.
+    Flood {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
+    /// Endpoint is the Synology DSM base URL (for example `https://nas.example:5001`). Basic
+    /// credentials are required; a domain is the destination folder `<default>/<label>/<hash>`.
+    Downloadstation {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TorrentLabelScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TorrentLabelScope>,
+    },
     Torrentrss {
         endpoint: String,
         #[serde(deserialize_with = "required_nullable")]
@@ -319,6 +685,15 @@ impl ProviderSettings {
             Self::Torznab { .. } => "torznab",
             Self::Newznab { .. } => "newznab",
             Self::Qbittorrent { .. } => "qbittorrent",
+            Self::Sabnzbd { .. } => "sabnzbd",
+            Self::Nzbget { .. } => "nzbget",
+            Self::Transmission { .. } => "transmission",
+            Self::Deluge { .. } => "deluge",
+            Self::Rtorrent { .. } => "rtorrent",
+            Self::Utorrent { .. } => "utorrent",
+            Self::Aria2 { .. } => "aria2",
+            Self::Flood { .. } => "flood",
+            Self::Downloadstation { .. } => "downloadstation",
             Self::Torrentrss { .. } => "torrentrss",
         }
     }
@@ -327,8 +702,177 @@ impl ProviderSettings {
             Self::Torznab { endpoint, .. }
             | Self::Newznab { endpoint, .. }
             | Self::Qbittorrent { endpoint, .. }
+            | Self::Sabnzbd { endpoint, .. }
+            | Self::Nzbget { endpoint, .. }
+            | Self::Transmission { endpoint, .. }
+            | Self::Deluge { endpoint, .. }
+            | Self::Rtorrent { endpoint, .. }
+            | Self::Downloadstation { endpoint, .. }
+            | Self::Flood { endpoint, .. }
+            | Self::Aria2 { endpoint, .. }
+            | Self::Utorrent { endpoint, .. }
             | Self::Torrentrss { endpoint, .. } => endpoint,
         }
+    }
+    pub(crate) fn protocol(&self) -> Protocol {
+        match self {
+            Self::Torznab { .. }
+            | Self::Torrentrss { .. }
+            | Self::Qbittorrent { .. }
+            | Self::Transmission { .. }
+            | Self::Deluge { .. }
+            | Self::Rtorrent { .. }
+            | Self::Downloadstation { .. }
+            | Self::Flood { .. }
+            | Self::Aria2 { .. }
+            | Self::Utorrent { .. } => Protocol::Torrent,
+            Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
+        }
+    }
+    pub(crate) fn is_download_client(&self) -> bool {
+        matches!(
+            self,
+            Self::Qbittorrent { .. }
+                | Self::Sabnzbd { .. }
+                | Self::Nzbget { .. }
+                | Self::Transmission { .. }
+        ) || self.is_label_torrent()
+    }
+    /// The TV and movie scopes of a label-torrent client (one arm per client of the family).
+    fn label_pair(&self) -> Option<(&Option<TorrentLabelScope>, &Option<TorrentLabelScope>)> {
+        match self {
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
+            | Self::Flood { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => Some((tv, movies)),
+            _ => None,
+        }
+    }
+    /// A label-torrent client by registry name (one arm per client of the family).
+    fn from_label_parts(
+        implementation: &str,
+        endpoint: String,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        Some(match implementation {
+            "deluge" => Self::Deluge {
+                endpoint,
+                tv,
+                movies,
+            },
+            "rtorrent" => Self::Rtorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            "utorrent" => Self::Utorrent {
+                endpoint,
+                tv,
+                movies,
+            },
+            "aria2" => Self::Aria2 {
+                endpoint,
+                tv,
+                movies,
+            },
+            "flood" => Self::Flood {
+                endpoint,
+                tv,
+                movies,
+            },
+            "downloadstation" => Self::Downloadstation {
+                endpoint,
+                tv,
+                movies,
+            },
+            _ => return None,
+        })
+    }
+    /// The same client with other label scopes (one arm per client of the family).
+    fn relabelled(
+        &self,
+        tv: Option<TorrentLabelScope>,
+        movies: Option<TorrentLabelScope>,
+    ) -> Option<Self> {
+        match self {
+            Self::Deluge { endpoint, .. } => Some(Self::Deluge {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Rtorrent { endpoint, .. } => Some(Self::Rtorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Utorrent { endpoint, .. } => Some(Self::Utorrent {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Aria2 { endpoint, .. } => Some(Self::Aria2 {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Flood { endpoint, .. } => Some(Self::Flood {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            Self::Downloadstation { endpoint, .. } => Some(Self::Downloadstation {
+                endpoint: endpoint.clone(),
+                tv,
+                movies,
+            }),
+            _ => None,
+        }
+    }
+    /// Whether this client uses the shared label-torrent engine.
+    pub(crate) fn is_label_torrent(&self) -> bool {
+        self.label_pair().is_some()
+    }
+    /// The label scope of one domain on a label-torrent client.
+    pub(crate) fn label_scope(&self, domain: MediaDomain) -> Option<&TorrentLabelScope> {
+        let (tv, movies) = self.label_pair()?;
+        match domain {
+            MediaDomain::Tv => tv.as_ref(),
+            MediaDomain::Movies => movies.as_ref(),
+        }
+    }
+    /// Copy without eligibility tags, which never change remote submission behaviour.
+    pub(crate) fn without_label_tags(&self) -> Option<Self> {
+        let (tv, movies) = self.label_pair()?;
+        let strip = |scope: &Option<TorrentLabelScope>| {
+            scope.clone().map(|mut s| {
+                s.tags = None;
+                s
+            })
+        };
+        self.relabelled(strip(tv), strip(movies))
+    }
+    /// Whether a download client configures this media domain; indexers always answer false.
+    pub(crate) fn client_scoped(&self, domain: MediaDomain) -> bool {
+        match (self, domain) {
+            (Self::Qbittorrent { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (Self::Qbittorrent { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (Self::Sabnzbd { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (Self::Sabnzbd { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (Self::Nzbget { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (Self::Nzbget { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            (Self::Transmission { tv, .. }, MediaDomain::Tv) => tv.is_some(),
+            (Self::Transmission { movies, .. }, MediaDomain::Movies) => movies.is_some(),
+            _ => self.label_scope(domain).is_some(),
+        }
+    }
+    /// Domains configured by a download client, in TV/movies order.
+    pub(crate) fn client_domains(&self) -> impl Iterator<Item = MediaDomain> + '_ {
+        [MediaDomain::Tv, MediaDomain::Movies]
+            .into_iter()
+            .filter(|domain| self.client_scoped(*domain))
     }
     fn validate(&self) -> Result<()> {
         validate_endpoint(self.endpoint())?;
@@ -387,6 +931,13 @@ impl ProviderSettings {
                         && !c.ends_with('/')
                 };
                 for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
                     if !category(&s.category)
                         || s.imported_category
                             .as_ref()
@@ -406,6 +957,147 @@ impl ProviderSettings {
                         .into_iter()
                         .any(|c| mcats.iter().any(|m| overlaps(c, m)))
                     {
+                        return Err(bad());
+                    }
+                }
+            }
+            Self::Sabnzbd { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                // A comma separates SABnzbd category filters and `*` selects the Default
+                // category; neither can identify one isolated domain.
+                let category = |c: &str| {
+                    !c.is_empty()
+                        && c.trim() == c
+                        && c.len() <= 64
+                        && c != "*"
+                        && !c.chars().any(|ch| {
+                            ch.is_control() || matches!(ch, ',' | '*' | '/' | '\\' | '{' | '}')
+                        })
+                };
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    if !category(&s.category) {
+                        return Err(bad());
+                    }
+                }
+                if let (Some(tv), Some(movies)) = (tv, movies)
+                    && tv.category.to_lowercase() == movies.category.to_lowercase()
+                {
+                    return Err(bad());
+                }
+            }
+            Self::Nzbget { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                // Category names are free text in NZBGet, but a comma or path separator cannot
+                // identify one isolated domain and braces/stars are option syntax.
+                let category = |c: &str| {
+                    !c.is_empty()
+                        && c.trim() == c
+                        && c.len() <= 64
+                        && !c.chars().any(|ch| {
+                            ch.is_control() || matches!(ch, ',' | '*' | '/' | '\\' | '{' | '}')
+                        })
+                };
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    if !category(&s.category) {
+                        return Err(bad());
+                    }
+                }
+                if let (Some(tv), Some(movies)) = (tv, movies) {
+                    if tv.category.to_lowercase() == movies.category.to_lowercase() {
+                        return Err(bad());
+                    }
+                }
+            }
+            Self::Deluge { tv, movies, .. }
+            | Self::Rtorrent { tv, movies, .. }
+            | Self::Downloadstation { tv, movies, .. }
+            | Self::Flood { tv, movies, .. }
+            | Self::Aria2 { tv, movies, .. }
+            | Self::Utorrent { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    if !valid_torrent_label(&s.category)
+                        || (matches!(self, Self::Aria2 { .. } | Self::Downloadstation { .. })
+                            && matches!(s.category.as_str(), "." | ".."))
+                    {
+                        return Err(bad());
+                    }
+                }
+                if let (Some(tv), Some(movies)) = (tv, movies) {
+                    if tv.category == movies.category {
+                        return Err(bad());
+                    }
+                }
+            }
+            Self::Transmission { tv, movies, .. } => {
+                if tv.is_none() && movies.is_none() {
+                    return Err(bad());
+                }
+                for s in tv.iter().chain(movies.iter()) {
+                    if let Some(ids) = &s.tags {
+                        crate::tags::validate(&crate::tags::Assignment {
+                            mode: crate::tags::Mode::Replace,
+                            ids: ids.clone(),
+                        })
+                        .map_err(|_| bad())?;
+                    }
+                    let valid = match &s.placement {
+                        TorrentPlacement::Category { category } => valid_torrent_category(category),
+                        TorrentPlacement::Directory { directory } => {
+                            valid_remote_directory(directory)
+                        }
+                    };
+                    if !valid {
+                        return Err(bad());
+                    }
+                }
+                // Labels compare case-insensitively and directories nest; neither may be shared.
+                if let (Some(tv), Some(movies)) = (tv, movies) {
+                    let conflict = match (&tv.placement, &movies.placement) {
+                        (
+                            TorrentPlacement::Category { category: a },
+                            TorrentPlacement::Category { category: b },
+                        ) => a.eq_ignore_ascii_case(b),
+                        (
+                            TorrentPlacement::Directory { directory: a },
+                            TorrentPlacement::Directory { directory: b },
+                        ) => {
+                            // Case-insensitive, like the storage trigger: conservative on POSIX.
+                            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+                            transmission::within(&a, &b) || transmission::within(&b, &a)
+                        }
+                        // Category directories depend on the client's download directory; Test
+                        // and every operation check the effective locations.
+                        _ => false,
+                    };
+                    if conflict {
                         return Err(bad());
                     }
                 }
@@ -489,6 +1181,10 @@ pub enum ProviderTestOutcome {
     Indexer(indexer::IndexerTest),
     Feed(indexer::FeedTest),
     DownloadClient(qbittorrent::ClientTest),
+    UsenetClient(sabnzbd::SabnzbdTest),
+    NzbgetClient(nzbget::NzbgetTest),
+    TorrentClient(transmission::TransmissionTest),
+    LabelClient(label_client::LabelClientTest),
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct ProviderDownloadResult {
@@ -539,6 +1235,8 @@ struct Context {
     db: Arc<Database>,
     key: Option<Arc<CredentialKey>>,
     transport: Arc<std::result::Result<http::HttpClient, http::HttpError>>,
+    backoff_started: std::time::Instant,
+    selection_cursor: Arc<std::sync::Mutex<[Option<String>; 2]>>,
 }
 pub fn router(db: Arc<Database>, key: Option<Arc<CredentialKey>>) -> Router {
     router_with_refresh(db, key).0
@@ -553,6 +1251,8 @@ pub fn router_with_refresh(
         db,
         key,
         transport: Arc::new(http::HttpClient::new()),
+        backoff_started: std::time::Instant::now(),
+        selection_cursor: Arc::new(std::sync::Mutex::new([None, None])),
     };
     let router = Router::new()
         .route("/api/v1/providers", get(list).post(create))
@@ -589,14 +1289,89 @@ pub(crate) struct RefreshError {
     pub code: &'static str,
     pub retryable: bool,
     pub retry_after_seconds: Option<u32>,
+    pub client_failure: bool,
+    pub definitely_not_submitted: bool,
+    pub client_retry_kind: ClientRetryKind,
+    pub client_retry_eligible: bool,
+}
+/// Pending-release policy, independent of add safety and health attribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ClientRetryKind {
+    #[default]
+    Other = 0,
+    Unavailable = 1,
+    Authentication = 2,
 }
 pub(crate) type AutomationError = RefreshError;
+#[derive(Debug)]
+pub(crate) struct PreparationError {
+    pub error: AutomationError,
+    pub identity: Option<qbittorrent::SubmissionIdentity>,
+    pub client_changed: bool,
+    pub local_storage_failure: bool,
+}
+impl PreparationError {
+    fn release(error: AutomationError) -> Self {
+        Self {
+            error,
+            identity: None,
+            client_changed: false,
+            local_storage_failure: false,
+        }
+    }
+    fn lookup(error: Error) -> Self {
+        let local_storage_failure = matches!(&error, Error::Plain(_, "provider_database_error", _));
+        let mut failure = Self::configuration(refresh_error(error));
+        failure.local_storage_failure = local_storage_failure;
+        failure
+    }
+    fn configuration(error: AutomationError) -> Self {
+        let client_changed = matches!(error.code, "provider_changed" | "provider_unavailable");
+        Self {
+            error,
+            identity: None,
+            client_changed,
+            local_storage_failure: false,
+        }
+    }
+}
+
+// Keep local storage provenance at the lookup boundary; release/client HTTP
+// failures can share refresh_failed and must never acquire this classification.
+fn automation_lookup_error(error: Error) -> AutomationError {
+    if matches!(&error, Error::Plain(_, "provider_database_error", _)) {
+        RefreshError::new("provider_database_error", true)
+    } else {
+        refresh_error(error)
+    }
+}
+fn preparation_error(error: qbittorrent::QbitError) -> PreparationError {
+    let mapped = match error {
+        qbittorrent::QbitError::InvalidRequest => RefreshError::new("invalid_release", false),
+        // These requests fetch release bytes, never communicate with the download client.
+        qbittorrent::QbitError::Http(error) => {
+            let mut mapped = refresh_error(http_error(error).0);
+            if mapped.code == "provider_unavailable" {
+                mapped.code = "refresh_failed";
+            }
+            mapped
+        }
+        other => refresh_error(qbit_error(other).0),
+    };
+    PreparationError::release(mapped)
+}
+
 impl RefreshError {
     fn new(code: &'static str, retryable: bool) -> Self {
         Self {
             code,
             retryable,
             retry_after_seconds: None,
+            client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         }
     }
 }
@@ -606,10 +1381,22 @@ fn refresh_error(error: Error) -> RefreshError {
             code: "refresh_failed",
             retryable: true,
             retry_after_seconds: Some(seconds.clamp(1, 86400)),
+            client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         },
         Error::Plain(_, "provider_revision_conflict", _) => {
             RefreshError::new("provider_changed", false)
         }
+        Error::Plain(
+            _,
+            code @ ("download_client_unavailable"
+            | "unsupported_target"
+            | "refresh_limit"
+            | "protocol_mismatch"),
+            _,
+        ) => RefreshError::new(code, false),
         Error::Plain(_, "timeout", _) => RefreshError::new("refresh_timeout", true),
         Error::Plain(_, "response_too_large", _) => RefreshError::new("refresh_limit", false),
         Error::Plain(status, code, _)
@@ -625,6 +1412,10 @@ fn refresh_error(error: Error) -> RefreshError {
             code: "refresh_failed",
             retryable: true,
             retry_after_seconds: Some(1),
+            client_failure: false,
+            definitely_not_submitted: false,
+            client_retry_kind: ClientRetryKind::Other,
+            client_retry_eligible: false,
         },
         _ => RefreshError::new("refresh_failed", true),
     }
@@ -682,10 +1473,22 @@ fn local_download_root(path: &str) -> Option<String> {
 
 /// Private download paths and file facts; never directly serialize these into an API response.
 pub(crate) struct OwnedDownloadDetails {
-    pub details: qbittorrent::TorrentDetails,
+    pub details: download::DownloadDetails,
     pub host: String,
 }
+pub(crate) enum PathOutput {
+    Local(String),
+    Missing,
+    Invalid,
+}
+pub(crate) struct PathOutputFacts {
+    pub locality: qbittorrent::EndpointLocality,
+    pub output: PathOutput,
+}
 impl RefreshClient {
+    pub(crate) fn backoff_grace_elapsed(&self) -> bool {
+        self.0.backoff_started.elapsed() >= backoff::STARTUP_GRACE
+    }
     /// Read the actual scoped item list; connection/version success alone is insufficient.
     pub(crate) async fn probe_download_communication(
         &self,
@@ -705,13 +1508,7 @@ impl RefreshClient {
             Error::Plain(_, "provider_database_error", _) => Unevaluated("storage_error"),
             _ => Unevaluated("check_failed"),
         })?;
-        let scoped = match &provider.settings {
-            ProviderSettings::Qbittorrent { tv, movies, .. } => match domain {
-                MediaDomain::Tv => tv.is_some(),
-                MediaDomain::Movies => movies.is_some(),
-            },
-            _ => false,
-        };
+        let scoped = provider.settings.client_scoped(domain);
         if provider.revision != revision || !provider.enabled || !scoped {
             return Err(Unevaluated("check_failed"));
         }
@@ -734,15 +1531,11 @@ impl RefreshClient {
                 _ => Unevaluated("check_failed"),
             })?;
         let work = async {
-            let result = qbittorrent::refresh_pages(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                domain,
-            )
-            .await
-            .map(|_| ())
-            .map_err(communication_error);
+            let result =
+                refresh_items(&operation, &provider.settings, credentials.as_ref(), domain)
+                    .await
+                    .map(|_| ())
+                    .map_err(communication_error);
             current_revision(&context.db, &provider)
                 .await
                 .map_err(|error| match error {
@@ -767,7 +1560,12 @@ impl RefreshClient {
     ) -> std::result::Result<qbittorrent::EndpointLocality, AutomationError> {
         self.inspect_client_status_snapshot(provider_id, revision, domain)
             .await
-            .map(|(_, status, _)| status.locality)
+            .and_then(|(_, status, _)| match status {
+                qbittorrent::ClientStatusSnapshot::Status(status) => Ok(status.locality),
+                _ => Err(refresh_error(
+                    qbit_error(qbittorrent::QbitError::InvalidResponse).0,
+                )),
+            })
     }
 
     /// Fresh active-scope output directories in the configured local path namespace.
@@ -781,6 +1579,49 @@ impl RefreshClient {
         let (provider, status, deadline) = self
             .inspect_client_status_snapshot(provider_id, revision, domain)
             .await?;
+        let qbittorrent::ClientStatusSnapshot::Status(status) = status else {
+            return Err(refresh_error(
+                qbit_error(qbittorrent::QbitError::InvalidResponse).0,
+            ));
+        };
+        let output = self
+            .resolve_download_root(&provider, status.remote_root, domain, deadline)
+            .await?;
+        match output {
+            PathOutput::Local(path) => Ok(vec![path]),
+            _ => Err(RefreshError::new("download_root_unresolved", false)),
+        }
+    }
+
+    pub(crate) async fn inspect_path_output(
+        &self,
+        provider_id: &str,
+        revision: i64,
+        domain: MediaDomain,
+    ) -> std::result::Result<PathOutputFacts, AutomationError> {
+        use qbittorrent::ClientStatusSnapshot;
+        let (provider, status, deadline) = self
+            .inspect_client_status_snapshot(provider_id, revision, domain)
+            .await?;
+        let (locality, output) = match status {
+            ClientStatusSnapshot::OutputMissing(locality) => (locality, PathOutput::Missing),
+            ClientStatusSnapshot::OutputInvalid(locality) => (locality, PathOutput::Invalid),
+            ClientStatusSnapshot::Status(status) => (
+                status.locality,
+                self.resolve_download_root(&provider, status.remote_root, domain, deadline)
+                    .await?,
+            ),
+        };
+        Ok(PathOutputFacts { locality, output })
+    }
+
+    async fn resolve_download_root(
+        &self,
+        provider: &Provider,
+        remote_root: String,
+        domain: MediaDomain,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<PathOutput, AutomationError> {
         let endpoint = url::Url::parse(provider.settings.endpoint())
             .map_err(|_| RefreshError::new("provider_unavailable", false))?;
         let host = crate::remote_paths::host(
@@ -802,18 +1643,18 @@ impl RefreshClient {
                 domain,
                 crate::remote_paths::ResolveInput {
                     host,
-                    path: status.remote_root,
+                    path: remote_root,
                     direction: crate::remote_paths::Direction::RemoteToLocal,
                 },
             )
             .await
             .map_err(|_| RefreshError::new("download_root_mapping_failed", false))?;
-            let path = local_download_root(&resolution.output)
-                .ok_or_else(|| RefreshError::new("download_root_unresolved", false))?;
-            current_revision(&self.0.db, &provider)
+            let output = local_download_root(&resolution.output)
+                .map_or(PathOutput::Invalid, PathOutput::Local);
+            current_revision(&self.0.db, provider)
                 .await
                 .map_err(refresh_error)?;
-            Ok::<_, AutomationError>(vec![path])
+            Ok::<_, AutomationError>(output)
         };
         tokio::time::timeout_at(deadline, work)
             .await
@@ -826,7 +1667,11 @@ impl RefreshClient {
         revision: i64,
         domain: MediaDomain,
     ) -> std::result::Result<
-        (Provider, qbittorrent::ClientStatus, tokio::time::Instant),
+        (
+            Provider,
+            qbittorrent::ClientStatusSnapshot,
+            tokio::time::Instant,
+        ),
         AutomationError,
     > {
         let context = &self.0;
@@ -840,7 +1685,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        if !provider.enabled || !provider.settings.is_download_client() {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let transport = context
@@ -852,13 +1697,53 @@ impl RefreshClient {
             .operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
-            let status = qbittorrent::client_status(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                domain,
-            )
-            .await
+            let status = match &provider.settings {
+                ProviderSettings::Sabnzbd { .. } => {
+                    sabnzbd::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
+                ProviderSettings::Nzbget { .. } => {
+                    nzbget::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
+                settings if settings.is_label_torrent() => {
+                    label_client::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
+                ProviderSettings::Transmission { .. } => {
+                    transmission::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
+                _ => {
+                    qbittorrent::client_status_snapshot(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        domain,
+                    )
+                    .await
+                }
+            }
             .map_err(|e| refresh_error(qbit_error(e).0))?;
             current_revision(&context.db, &provider)
                 .await
@@ -892,7 +1777,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        if !provider.enabled || !provider.settings.is_download_client() {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let endpoint = url::Url::parse(provider.settings.endpoint())
@@ -912,15 +1797,66 @@ impl RefreshClient {
             .operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
-            let result = qbittorrent::details(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                target,
-                remote_id,
-            )
-            .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
+            let result = match &provider.settings {
+                ProviderSettings::Sabnzbd { .. } => {
+                    match sabnzbd::job(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        target,
+                        remote_id,
+                    )
+                    .await
+                    {
+                        Ok(job) => self.usenet_details(job, &host, target).await,
+                        Err(e) => Err(refresh_error(qbit_error(e).0)),
+                    }
+                }
+                ProviderSettings::Nzbget { .. } => {
+                    match nzbget::job(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        target,
+                        remote_id,
+                    )
+                    .await
+                    {
+                        Ok(job) => self.usenet_details(job, &host, target).await,
+                        Err(e) => Err(refresh_error(qbit_error(e).0)),
+                    }
+                }
+                settings if settings.is_label_torrent() => label_client::details(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                    target,
+                    remote_id,
+                )
+                .await
+                .map(download::DownloadDetails::from)
+                .map_err(|e| refresh_error(qbit_error(e).0)),
+                ProviderSettings::Transmission { .. } => transmission::details(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                    target,
+                    remote_id,
+                )
+                .await
+                .map(download::DownloadDetails::from)
+                .map_err(|e| refresh_error(qbit_error(e).0)),
+                _ => qbittorrent::details(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                    target,
+                    remote_id,
+                )
+                .await
+                .map(download::DownloadDetails::from)
+                .map_err(|e| refresh_error(qbit_error(e).0)),
+            };
             current_revision(&context.db, &provider)
                 .await
                 .map_err(refresh_error)?;
@@ -969,23 +1905,36 @@ impl RefreshClient {
         provider_id: &str,
         revision: i64,
         target: crate::db::MediaTarget,
-        source: qbittorrent::AddSource,
+        source: download::ReleaseSource,
         recent: bool,
-        options: qbittorrent::QbitOptions,
-    ) -> std::result::Result<qbittorrent::PreparedDownload, AutomationError> {
+    ) -> std::result::Result<download::PreparedSubmission, PreparationError> {
         let context = &self.0;
         let (provider, _credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             network_snapshot(context, provider_id),
         )
         .await
-        .map_err(|_| RefreshError::new("refresh_timeout", true))?
-        .map_err(refresh_error)?;
+        .map_err(|_| PreparationError::release(RefreshError::new("refresh_timeout", true)))?
+        .map_err(PreparationError::lookup)?;
         if provider.revision != revision {
-            return Err(RefreshError::new("provider_changed", false));
+            return Err(PreparationError::configuration(RefreshError::new(
+                "provider_changed",
+                false,
+            )));
         }
-        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-            return Err(RefreshError::new("provider_unavailable", false));
+        if !provider.enabled || !provider.settings.is_download_client() {
+            return Err(PreparationError::configuration(RefreshError::new(
+                "provider_unavailable",
+                false,
+            )));
+        }
+        // Selection is protocol-aware; a mismatch here is a visible terminal rejection, stored
+        // with the closed candidate vocabulary's `unsupported_target` code.
+        if source.protocol() != provider.settings.protocol() {
+            return Err(PreparationError::release(RefreshError::new(
+                "unsupported_target",
+                false,
+            )));
         }
         if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
             let scope = match &target {
@@ -993,83 +1942,218 @@ impl RefreshClient {
                 crate::db::MediaTarget::Movie(_) => movies.as_ref(),
             };
             if scope.is_some_and(|s| s.recent_priority != s.older_priority) {
-                return Err(RefreshError::new("unsupported_target", false));
+                return Err(PreparationError::release(RefreshError::new(
+                    "unsupported_target",
+                    false,
+                )));
             }
         }
         let transport = context
             .transport
             .as_ref()
             .as_ref()
-            .map_err(|e| refresh_error(http_error(*e).0))?;
+            .map_err(|e| PreparationError::release(refresh_error(http_error(*e).0)))?;
         let operation = transport
             .operation(provider.id)
-            .map_err(|e| refresh_error(http_error(e).0))?;
+            .map_err(|e| PreparationError::release(refresh_error(http_error(e).0)))?;
         let work = async {
-            let result = qbittorrent::prepare(
-                &operation,
-                &provider.settings,
-                target,
-                source,
-                recent,
-                options,
-            )
-            .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
-            current_revision(&context.db, &provider)
+            let prepared = match source {
+                download::ReleaseSource::Torrent { source, options }
+                    if provider.settings.is_label_torrent() =>
+                {
+                    label_client::prepare(
+                        &operation,
+                        &provider.settings,
+                        target,
+                        source,
+                        recent,
+                        options,
+                    )
+                    .await
+                    .map(download::PreparedSubmission::Label)
+                }
+                download::ReleaseSource::Torrent { source, options }
+                    if matches!(provider.settings, ProviderSettings::Transmission { .. }) =>
+                {
+                    transmission::prepare(
+                        &operation,
+                        &provider.settings,
+                        target,
+                        source,
+                        recent,
+                        options,
+                    )
+                    .await
+                    .map(download::PreparedSubmission::Transmission)
+                }
+                download::ReleaseSource::Torrent { source, options } => qbittorrent::prepare(
+                    &operation,
+                    &provider.settings,
+                    target,
+                    source,
+                    recent,
+                    options,
+                )
                 .await
-                .map_err(refresh_error)?;
-            operation
-                .ensure_active()
-                .map_err(|e| refresh_error(http_error(e).0))?;
-            result
+                .map(download::PreparedSubmission::Torrent),
+                download::ReleaseSource::Usenet { url, title }
+                    if matches!(provider.settings, ProviderSettings::Nzbget { .. }) =>
+                {
+                    nzbget::prepare(provider.id, &provider.settings, target, url, &title, recent)
+                        .map(download::PreparedSubmission::Nzbget)
+                }
+                download::ReleaseSource::Usenet { url, title } => {
+                    sabnzbd::prepare(provider.id, &provider.settings, target, url, &title, recent)
+                        .map(download::PreparedSubmission::Usenet)
+                }
+            }
+            .map_err(preparation_error)?;
+            if let Err(error) = current_revision(&context.db, &provider).await {
+                let mut failure = PreparationError::lookup(error);
+                failure.identity = Some(prepared.into_identity());
+                return Err(failure);
+            }
+            if let Err(error) = operation.ensure_active() {
+                return Err(PreparationError {
+                    error: refresh_error(http_error(error).0),
+                    identity: Some(prepared.into_identity()),
+                    client_changed: false,
+                    local_storage_failure: false,
+                });
+            }
+            Ok(prepared)
         };
         tokio::time::timeout_at(operation.deadline(), work)
             .await
-            .map_err(|_| RefreshError::new("refresh_timeout", true))?
+            .map_err(|_| PreparationError::release(RefreshError::new("refresh_timeout", true)))?
     }
     pub(crate) async fn submit_download(
         &self,
         provider_id: &str,
         revision: i64,
-        prepared: qbittorrent::PreparedDownload,
+        prepared: download::PreparedSubmission,
     ) -> std::result::Result<qbittorrent::AddOutcome, AutomationError> {
+        fn before_add(mut error: AutomationError) -> AutomationError {
+            error.definitely_not_submitted = true;
+            if matches!(error.code, "provider_changed" | "provider_unavailable") {
+                error.client_retry_eligible = true;
+                error.client_retry_kind = ClientRetryKind::Unavailable;
+            }
+            error
+        }
         let context = &self.0;
         let (provider, credentials) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             network_snapshot(context, provider_id),
         )
         .await
-        .map_err(|_| RefreshError::new("refresh_timeout", true))?
-        .map_err(refresh_error)?;
+        .map_err(|_| before_add(RefreshError::new("refresh_timeout", true)))?
+        .map_err(|e| before_add(automation_lookup_error(e)))?;
         if provider.revision != revision {
-            return Err(RefreshError::new("provider_changed", false));
+            return Err(before_add(RefreshError::new("provider_changed", false)));
         }
-        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
-            return Err(RefreshError::new("provider_unavailable", false));
+        if !provider.enabled || !provider.settings.is_download_client() {
+            return Err(before_add(RefreshError::new("provider_unavailable", false)));
         }
         let transport = context
             .transport
             .as_ref()
             .as_ref()
-            .map_err(|e| refresh_error(http_error(*e).0))?;
+            .map_err(|e| before_add(refresh_error(http_error(*e).0)))?;
         let operation = transport
             .operation(provider.id)
-            .map_err(|e| refresh_error(http_error(e).0))?;
+            .map_err(|e| before_add(refresh_error(http_error(e).0)))?;
         let work = async {
-            let result = qbittorrent::submit(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                prepared,
-            )
-            .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
+            let result = match (&provider.settings, prepared) {
+                (
+                    ProviderSettings::Qbittorrent { .. },
+                    download::PreparedSubmission::Torrent(prepared),
+                ) => {
+                    qbittorrent::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                (
+                    ProviderSettings::Sabnzbd { .. },
+                    download::PreparedSubmission::Usenet(prepared),
+                ) => {
+                    sabnzbd::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                (
+                    ProviderSettings::Nzbget { .. },
+                    download::PreparedSubmission::Nzbget(prepared),
+                ) => {
+                    nzbget::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                (settings, download::PreparedSubmission::Label(prepared))
+                    if settings.is_label_torrent() =>
+                {
+                    label_client::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                (
+                    ProviderSettings::Transmission { .. },
+                    download::PreparedSubmission::Transmission(prepared),
+                ) => {
+                    transmission::submit_classified(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        prepared,
+                    )
+                    .await
+                }
+                _ => Err(qbittorrent::SubmissionError {
+                    error: qbittorrent::QbitError::ScopeConflict,
+                    definitely_not_submitted: true,
+                    client_retry_kind: ClientRetryKind::Other,
+                    client_retry_eligible: false,
+                }),
+            }
+            .map_err(|e| {
+                let attributable = matches!(
+                    communication_error(e.error),
+                    CommunicationProbeError::RemoteFailure
+                );
+                let mut mapped = refresh_error(qbit_error(e.error).0);
+                mapped.definitely_not_submitted = e.definitely_not_submitted;
+                mapped.client_retry_kind = e.client_retry_kind;
+                mapped.client_retry_eligible = e.client_retry_eligible;
+                mapped.client_failure = attributable;
+                mapped
+            });
+            let safe = result.as_ref().is_err_and(|e| e.definitely_not_submitted);
+            let preserve_phase = |mut error: AutomationError| {
+                error.definitely_not_submitted = safe;
+                if safe { before_add(error) } else { error }
+            };
             current_revision(&context.db, &provider)
                 .await
-                .map_err(refresh_error)?;
+                .map_err(|e| preserve_phase(automation_lookup_error(e)))?;
             operation
                 .ensure_active()
-                .map_err(|e| refresh_error(http_error(e).0))?;
+                .map_err(|e| preserve_phase(refresh_error(http_error(e).0)))?;
             result
         };
         tokio::time::timeout_at(operation.deadline(), work)
@@ -1093,7 +2177,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        if !provider.enabled || !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+        if !provider.enabled || !provider.settings.is_download_client() {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let transport = context
@@ -1105,13 +2189,53 @@ impl RefreshClient {
             .operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
-            let result = qbittorrent::reconcile(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                identity,
-            )
-            .await
+            let result = match &provider.settings {
+                ProviderSettings::Sabnzbd { .. } => {
+                    sabnzbd::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                ProviderSettings::Nzbget { .. } => {
+                    nzbget::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                settings if settings.is_label_torrent() => {
+                    label_client::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                ProviderSettings::Transmission { .. } => {
+                    transmission::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+                _ => {
+                    qbittorrent::reconcile(
+                        &operation,
+                        &provider.settings,
+                        credentials.as_ref(),
+                        identity,
+                    )
+                    .await
+                }
+            }
             .map_err(|e| refresh_error(qbit_error(e).0));
             current_revision(&context.db, &provider)
                 .await
@@ -1153,24 +2277,34 @@ impl RefreshClient {
             .as_ref()
             .map_err(|e| refresh_error(http_error(*e).0))?;
         let operation = transport
-            .operation(provider.id)
+            .indexer_operation(provider.id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
+            indexer_backoff::admit(&context.db, &provider, indexer_backoff::domain(request))
+                .await
+                .map_err(refresh_error)?;
             let result = indexer::raw_search(
                 &operation,
                 &provider.settings,
                 &IndexerAccess::from_credentials(&credentials),
                 request,
             )
-            .await
-            .map_err(|e| refresh_error(indexer_error(e, &operation).0));
+            .await;
             current_revision(&context.db, &provider)
                 .await
                 .map_err(refresh_error)?;
             operation
                 .ensure_active()
                 .map_err(|e| refresh_error(http_error(e).0))?;
-            result
+            indexer_backoff::record(
+                &context.db,
+                &provider,
+                indexer_backoff::domain(request),
+                indexer_backoff::observation(&result),
+            )
+            .await
+            .map_err(refresh_error)?;
+            result.map_err(|e| refresh_error(indexer_error(e, &operation).0))
         };
         tokio::time::timeout_at(operation.deadline(), work)
             .await
@@ -1195,14 +2329,7 @@ impl RefreshClient {
         if provider.revision != revision {
             return Err(RefreshError::new("provider_changed", false));
         }
-        let scoped = match &provider.settings {
-            ProviderSettings::Qbittorrent { tv, movies, .. } => match domain {
-                MediaDomain::Tv => tv.is_some(),
-                MediaDomain::Movies => movies.is_some(),
-            },
-            _ => false,
-        };
-        if !provider.enabled || !scoped {
+        if !provider.enabled || !provider.settings.client_scoped(domain) {
             return Err(RefreshError::new("provider_unavailable", false));
         }
         let transport = context
@@ -1214,14 +2341,16 @@ impl RefreshClient {
             .operation(id)
             .map_err(|e| refresh_error(http_error(e).0))?;
         let work = async {
-            let result = qbittorrent::refresh_pages(
-                &operation,
-                &provider.settings,
-                credentials.as_ref(),
-                domain,
-            )
-            .await
-            .map_err(|e| refresh_error(qbit_error(e).0));
+            let result =
+                refresh_items(&operation, &provider.settings, credentials.as_ref(), domain)
+                    .await
+                    .map_err(|error| {
+                        let client_failure =
+                            communication_error(error) == CommunicationProbeError::RemoteFailure;
+                        let mut mapped = refresh_error(qbit_error(error).0);
+                        mapped.client_failure = client_failure;
+                        mapped
+                    });
             // Changed configuration invalidates failed observations too.
             current_revision(&context.db, &provider)
                 .await
@@ -1234,6 +2363,117 @@ impl RefreshClient {
         tokio::time::timeout_at(operation.deadline(), work)
             .await
             .map_err(|_| RefreshError::new("refresh_timeout", true))?
+    }
+}
+/// Bounded scoped item observation for any configured download client.
+async fn refresh_items(
+    operation: &http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    credentials: Option<&Credentials>,
+    domain: MediaDomain,
+) -> std::result::Result<Vec<qbittorrent::DownloadItem>, qbittorrent::QbitError> {
+    match settings {
+        ProviderSettings::Sabnzbd { .. } => {
+            sabnzbd::refresh_pages(operation, settings, credentials, domain).await
+        }
+        ProviderSettings::Nzbget { .. } => {
+            nzbget::refresh_pages(operation, settings, credentials, domain).await
+        }
+        settings if settings.is_label_torrent() => {
+            label_client::refresh_pages(operation, settings, credentials, domain).await
+        }
+        ProviderSettings::Transmission { .. } => {
+            transmission::refresh_pages(operation, settings, credentials, domain).await
+        }
+        _ => qbittorrent::refresh_pages(operation, settings, credentials, domain).await,
+    }
+}
+impl RefreshClient {
+    /// SABnzbd reports only a completed job's final folder. The files beneath it are listed from
+    /// the explicitly mapped local path; an unmapped output is a visible blocker, never a guess.
+    async fn usenet_details(
+        &self,
+        job: sabnzbd::UsenetJob,
+        host: &str,
+        target: &crate::db::MediaTarget,
+    ) -> std::result::Result<download::DownloadDetails, AutomationError> {
+        let Some(storage) = job.storage else {
+            return Ok(download::DownloadDetails {
+                item: job.item,
+                save_path: String::new(),
+                files: Vec::new(),
+            });
+        };
+        let domain = match target {
+            crate::db::MediaTarget::Episode(_) => MediaDomain::Tv,
+            crate::db::MediaTarget::Movie(_) => MediaDomain::Movies,
+        };
+        let connection = self
+            .0
+            .db
+            .connect()
+            .await
+            .map_err(|_| RefreshError::new("storage_error", true))?;
+        let resolution = crate::remote_paths::resolve(
+            &connection,
+            domain,
+            crate::remote_paths::ResolveInput {
+                host: host.to_owned(),
+                path: storage.clone(),
+                direction: crate::remote_paths::Direction::RemoteToLocal,
+            },
+        )
+        .await
+        .map_err(|_| RefreshError::new("path_mapping_missing", false))?;
+        drop(connection);
+        if resolution.mapping_id.is_none() {
+            return Err(RefreshError::new("path_mapping_missing", false));
+        }
+        let local = local_download_root(&resolution.output)
+            .ok_or_else(|| RefreshError::new("path_mapping_missing", false))?;
+        let listing = tokio::task::spawn_blocking(move || {
+            download::list_local_output(std::path::Path::new(&local))
+        })
+        .await
+        .map_err(|_| RefreshError::new("download_unavailable", true))?
+        .map_err(|_| RefreshError::new("download_unavailable", true))?;
+        let separator = if storage.contains('\\') && !storage.starts_with('/') {
+            '\\'
+        } else {
+            '/'
+        };
+        let file = |index: usize, name: String, size_bytes: u64| qbittorrent::TorrentFile {
+            index: index as u32,
+            name,
+            size_bytes,
+            progress: 1.0,
+            priority: 1,
+        };
+        let (save_path, files) = match listing {
+            download::LocalListing::Directory(entries) => (
+                storage,
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (name, size))| file(i, name, size))
+                    .collect(),
+            ),
+            download::LocalListing::File(size) => {
+                let trimmed = storage.trim_end_matches(['/', '\\']);
+                let (parent, name) = trimmed
+                    .rsplit_once(separator)
+                    .ok_or_else(|| RefreshError::new("download_unavailable", false))?;
+                (parent.to_owned(), vec![file(0, name.to_owned(), size)])
+            }
+            download::LocalListing::Missing => {
+                return Err(RefreshError::new("download_unavailable", true));
+            }
+        };
+        Ok(download::DownloadDetails {
+            item: job.item,
+            save_path,
+            files,
+        })
     }
 }
 fn id(value: String) -> Result<String> {
@@ -1250,10 +2490,10 @@ fn validate(input: &ProviderInput) -> Result<()> {
         return Err(bad());
     }
     input.settings.validate()?;
-    if let Change::Value(c) = &input.credentials {
-        if !c.valid(input.settings.implementation()) {
-            return Err(bad());
-        }
+    if let Change::Value(c) = &input.credentials
+        && !c.valid(input.settings.implementation())
+    {
+        return Err(bad());
     }
     Ok(())
 }
@@ -1275,6 +2515,14 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let mut movie_index = None;
     let mut tv_client = None;
     let mut movie_client = None;
+    let mut tv_usenet = None;
+    let mut movie_usenet = None;
+    let mut tv_nzbget = None;
+    let mut movie_nzbget = None;
+    let mut tv_torrent = None;
+    let mut movie_torrent = None;
+    let mut tv_label = None;
+    let mut movie_label = None;
     while let Some(scope) = scopes.next().await? {
         let media: String = scope.get(0)?;
         if implementation == "torrentrss" {
@@ -1298,6 +2546,84 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             } else {
                 movie_feed = Some(item)
             }
+        } else if implementation == "transmission" {
+            let directory: Option<String> = conn
+                .query(
+                    "SELECT directory FROM provider_scope_directories WHERE provider_id=? AND media_type=?",
+                    params![id, media.clone()],
+                )
+                .await?
+                .next()
+                .await?
+                .map(|row| row.get(0))
+                .transpose()?;
+            let placement = match (scope.get::<Option<String>>(3)?, directory) {
+                (Some(category), None) => TorrentPlacement::Category { category },
+                (None, Some(directory)) => TorrentPlacement::Directory { directory },
+                _ => return Err(corrupt()),
+            };
+            let item = TransmissionScope {
+                placement,
+                recent_priority: TorrentQueuePriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: TorrentQueuePriority::stored(scope.get::<i64>(6)?)?,
+                add_paused: match scope.get::<String>(9)?.as_str() {
+                    "started" => false,
+                    "stopped" => true,
+                    _ => return Err(corrupt()),
+                },
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_torrent = Some(item)
+            } else {
+                movie_torrent = Some(item)
+            }
+        } else if LABEL_IMPLEMENTATIONS.contains(&implementation.as_str()) {
+            let item = TorrentLabelScope {
+                category: scope.get(3)?,
+                recent_priority: TorrentQueuePriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: TorrentQueuePriority::stored(scope.get::<i64>(6)?)?,
+                add_paused: match scope.get::<String>(9)?.as_str() {
+                    "started" => false,
+                    "stopped" => true,
+                    _ => return Err(corrupt()),
+                },
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_label = Some(item)
+            } else {
+                movie_label = Some(item)
+            }
+        } else if implementation == "nzbget" {
+            let item = NzbgetScope {
+                category: scope.get(3)?,
+                recent_priority: NzbgetPriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: NzbgetPriority::stored(scope.get::<i64>(6)?)?,
+                add_paused: match scope.get::<String>(9)?.as_str() {
+                    "started" => false,
+                    "stopped" => true,
+                    _ => return Err(corrupt()),
+                },
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_nzbget = Some(item)
+            } else {
+                movie_nzbget = Some(item)
+            }
+        } else if implementation == "sabnzbd" {
+            let item = UsenetScope {
+                category: scope.get(3)?,
+                recent_priority: UsenetPriority::stored(scope.get::<i64>(5)?)?,
+                older_priority: UsenetPriority::stored(scope.get::<i64>(6)?)?,
+                tags: Some(selection::read_tags(conn, id, &media).await?),
+            };
+            if media == "tv" {
+                tv_usenet = Some(item)
+            } else {
+                movie_usenet = Some(item)
+            }
         } else if implementation == "qbittorrent" {
             let item = DownloadScope {
                 category: scope.get(3)?,
@@ -1319,6 +2645,7 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 sequential_order: stored_bool(scope.get(11)?)?,
                 first_last_first: stored_bool(scope.get(12)?)?,
                 add_tags: stored_bool(scope.get(13)?)?,
+                tags: Some(selection::read_tags(conn, id, &media).await?),
             };
             if media == "tv" {
                 tv_client = Some(item)
@@ -1378,7 +2705,23 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_feed,
             movies: movie_feed,
         },
-        _ => return Err(corrupt()),
+        "sabnzbd" => ProviderSettings::Sabnzbd {
+            endpoint,
+            tv: tv_usenet,
+            movies: movie_usenet,
+        },
+        "nzbget" => ProviderSettings::Nzbget {
+            endpoint,
+            tv: tv_nzbget,
+            movies: movie_nzbget,
+        },
+        "transmission" => ProviderSettings::Transmission {
+            endpoint,
+            tv: tv_torrent,
+            movies: movie_torrent,
+        },
+        label => ProviderSettings::from_label_parts(label, endpoint, tv_label, movie_label)
+            .ok_or_else(corrupt)?,
     };
     settings.validate().map_err(|_| corrupt())?;
     let credentials: Option<Vec<u8>> = row.get(6)?;
@@ -1404,27 +2747,6 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
         credentials,
     ))
 }
-/// Backoff history belongs to a provider/domain, so a configuration writer rebinds retained
-/// rows to the final revision and drops domains the final scopes no longer serve. Call after
-/// the revision bump and scope rewrite, inside the writer's transaction.
-pub(crate) async fn reconcile_download_client_status(
-    conn: &Connection,
-    id: &str,
-) -> std::result::Result<(), &'static str> {
-    if conn.is_autocommit() {
-        return Err("invariant");
-    }
-    conn.execute("DELETE FROM download_client_status WHERE provider_id=?1 AND NOT EXISTS(SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=?1 AND p.implementation='qbittorrent' AND s.media_type=download_client_status.media_type)",[id]).await.map_err(|_| "storage_error")?;
-    conn.execute("UPDATE download_client_status SET config_revision=(SELECT revision FROM providers WHERE id=?1) WHERE provider_id=?1 AND config_revision!=(SELECT revision FROM providers WHERE id=?1)",[id]).await.map_err(|_| "storage_error")?;
-    Ok(())
-}
-fn status_reconciliation(code: &'static str) -> Error {
-    Error::Plain(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        code,
-        "Download client status reconciliation failed",
-    )
-}
 async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) -> Result<()> {
     let implementation = settings.implementation();
     if let ProviderSettings::Torznab { tv, movies, .. }
@@ -1437,12 +2759,62 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
             if let Some(client) = client {
                 // Existence and native domain are configuration facts at write time; a later
                 // disabled or removed client stays a stored preference that health reports.
-                if conn.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation='qbittorrent' AND s.media_type=?", params![client.to_string(), domain]).await?.next().await?.is_none() {
+                // A protocol mismatch is likewise stored, not erased (the IndexerDownloadClient
+                // health check, like the references', checks presence only); selection rejects
+                // it at dispatch as `protocol_mismatch`.
+                if conn.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') AND s.media_type=?", params![client.to_string(), domain]).await?.next().await?.is_none() {
                     return Err(bad());
                 }
             }
         }
     }
+    let mut retained_tags = std::collections::BTreeMap::new();
+    let client_tags: [(&str, Option<&Option<Vec<i64>>>); 2] = match settings {
+        ProviderSettings::Qbittorrent { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Sabnzbd { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Nzbget { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Transmission { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
+        | ProviderSettings::Flood { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => [
+            ("tv", tv.as_ref().map(|s| &s.tags)),
+            ("movies", movies.as_ref().map(|s| &s.tags)),
+        ],
+        _ => [("tv", None), ("movies", None)],
+    };
+    if settings.is_download_client() {
+        for (media, scope) in client_tags {
+            if let Some(scope_tags) = scope {
+                let tags = match scope_tags {
+                    Some(tags) => tags.clone(),
+                    None => selection::read_tags(conn, id, media).await?,
+                };
+                selection::validate_tags(conn, media, &tags).await?;
+                retained_tags.insert(media, tags);
+            }
+        }
+    }
+    // Directory placements reference their scope row; remove them explicitly before the scopes.
+    conn.execute(
+        "DELETE FROM provider_scope_directories WHERE provider_id=?",
+        [id],
+    )
+    .await?;
     // Scope tags cascade with their scope row; capture them so an accepted edit that
     // keeps a domain keeps its tags. Bounded by the 64-per-domain trigger.
     let mut kept_tags = Vec::new();
@@ -1523,6 +2895,69 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,imported_category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.imported_category.clone(),i64::from(s.recent_priority),i64::from(s.older_priority),match s.initial_state { DownloadInitialState::Started => "started", DownloadInitialState::Stopped => "stopped", DownloadInitialState::Forced => "forced" },match s.content_layout { DownloadContentLayout::Default => "default", DownloadContentLayout::Original => "original", DownloadContentLayout::Subfolder => "subfolder" },i64::from(s.sequential_order),i64::from(s.first_last_first),i64::from(s.add_tags)]).await?;
             }
         }
+        ProviderSettings::Sabnzbd { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority) VALUES(?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.wire(),s.older_priority.wire()]).await?;
+            }
+        }
+        ProviderSettings::Nzbget { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                let state = if s.add_paused { "stopped" } else { "started" };
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.code(),s.older_priority.code(),state]).await?;
+            }
+        }
+        ProviderSettings::Deluge { tv, movies, .. }
+        | ProviderSettings::Rtorrent { tv, movies, .. }
+        | ProviderSettings::Downloadstation { tv, movies, .. }
+        | ProviderSettings::Flood { tv, movies, .. }
+        | ProviderSettings::Aria2 { tv, movies, .. }
+        | ProviderSettings::Utorrent { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                let state = if s.add_paused { "stopped" } else { "started" };
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,s.category.clone(),s.recent_priority.wire(),s.older_priority.wire(),state]).await?;
+            }
+        }
+        ProviderSettings::Transmission { tv, movies, .. } => {
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                let category = match &s.placement {
+                    TorrentPlacement::Category { category } => Some(category.clone()),
+                    TorrentPlacement::Directory { .. } => None,
+                };
+                let state = if s.add_paused { "stopped" } else { "started" };
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state) VALUES(?,?,?,?,?,?,?)",params![id,implementation,domain,category,s.recent_priority.wire(),s.older_priority.wire(),state]).await?;
+                if let TorrentPlacement::Directory { directory } = &s.placement {
+                    conn.execute("INSERT INTO provider_scope_directories(provider_id,media_type,implementation,directory) VALUES(?,?,?,?)",params![id,domain,implementation,directory.clone()]).await?;
+                }
+            }
+        }
+    }
+    if settings.is_download_client() {
+        for (media, tags) in retained_tags {
+            for tag in tags {
+                conn.execute(
+                    "INSERT INTO download_client_tags(provider_id,media_type,tag_id) VALUES(?,?,?)",
+                    params![id, media, tag],
+                )
+                .await?;
+            }
+        }
+        backoff::reconcile(conn, id).await?;
     }
     // A domain dropped by this edit loses its tags with its scope.
     for (domain, tag) in kept_tags {
@@ -1593,6 +3028,27 @@ impl HealthConfigurationChanges {
                     (&mut self.indexers, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Qbittorrent { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Sabnzbd { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Nzbget { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Transmission { tv, movies, .. } => {
+                    client = true;
+                    (&mut self.clients, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Deluge { tv, movies, .. }
+                | ProviderSettings::Rtorrent { tv, movies, .. }
+                | ProviderSettings::Downloadstation { tv, movies, .. }
+                | ProviderSettings::Flood { tv, movies, .. }
+                | ProviderSettings::Aria2 { tv, movies, .. }
+                | ProviderSettings::Utorrent { tv, movies, .. } => {
                     client = true;
                     (&mut self.clients, tv.is_some(), movies.is_some())
                 }
@@ -1711,9 +3167,6 @@ async fn update(
         return Err(conflict());
     }
     write_scopes(&tx, &id, &input.config.settings).await?;
-    reconcile_download_client_status(&tx, &id)
-        .await
-        .map_err(status_reconciliation)?;
     crate::completed_download_handling::reconcile(&tx, Some(&id), None).await.map_err(|e| Error::Plain(e.0,e.1,"Completed download handling reconciliation failed"))?;
     changes.mark(&tx).await?;
     bounded(read(&tx, &id).await?.0)
@@ -1952,6 +3405,33 @@ mod tests {
             assert!(serde_json::from_value::<ProviderSettings>(malformed).is_err());
         }
     }
+    #[test]
+    fn directory_client_categories_reject_dot_components_in_both_domains() {
+        for implementation in [
+            "aria2",
+            "downloadstation",
+            "deluge",
+            "rtorrent",
+            "utorrent",
+            "flood",
+        ] {
+            for media in ["tv", "movies"] {
+                for category in [".", "..", ".tv", "tv..", "tv"] {
+                    let mut value = serde_json::json!({"implementation":implementation,"endpoint":"http://127.0.0.1:1/","tv":null,"movies":null});
+                    value[media] = serde_json::json!({"category":category});
+                    let settings: ProviderSettings = serde_json::from_value(value).unwrap();
+                    let directory_escape = matches!(implementation, "aria2" | "downloadstation")
+                        && matches!(category, "." | "..");
+                    assert_eq!(
+                        settings.validate().is_ok(),
+                        !directory_escape,
+                        "{implementation} {media} {category}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn configuration_wire_and_domain_validation_are_closed() {
         let input = serde_json::json!({"revision":1,"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"newznab","endpoint":"https://example.invalid/api","tv":null,"movies":{"categories":[2147483647]}}});
@@ -2203,6 +3683,9 @@ async fn record_test(
     db: &Database,
     provider: &Provider,
     code: Option<&'static str>,
+    indexer_observation: Option<(indexer_backoff::Observation, Option<MediaDomain>)>,
+    client_observation: Option<backoff::Observation>,
+    grace_elapsed: bool,
 ) -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2224,19 +3707,33 @@ async fn record_test(
         .as_ref()
         .is_none_or(|(old_status, old_code)| old_status != status || old_code.as_deref() != code);
     if different {
-        if let ProviderSettings::Qbittorrent { tv, movies, .. } = &provider.settings {
-            for (selected, domain) in [
-                (tv.is_some(), MediaDomain::Tv),
-                (movies.is_some(), MediaDomain::Movies),
-            ] {
-                if selected {
-                    crate::health::communication_status_changed(&tx, domain)
-                        .await
-                        .map_err(|e| {
-                            Error::Plain(e.0, e.1, "Health observation could not be recorded")
-                        })?;
-                }
+        for domain in provider.settings.client_domains() {
+            crate::health::communication_status_changed(&tx, domain)
+                .await
+                .map_err(|e| Error::Plain(e.0, e.1, "Health observation could not be recorded"))?;
+        }
+    }
+    if let Some((observation, failed_domain)) = indexer_observation {
+        for media in [MediaDomain::Tv, MediaDomain::Movies] {
+            if indexer_backoff::has_scope(&provider.settings, media)
+                && failed_domain.is_none_or(|domain| domain == media)
+            {
+                indexer_backoff::apply(&tx, provider, media, Some(observation), tested_at).await?;
             }
+        }
+    }
+    if let Some(observation) = client_observation {
+        for domain in provider.settings.client_domains() {
+            backoff::apply(
+                &tx,
+                &provider.id.to_string(),
+                provider.revision,
+                domain,
+                observation,
+                tested_at,
+                grace_elapsed,
+            )
+            .await?;
         }
     }
     tx.commit().await?;
@@ -2259,7 +3756,27 @@ async fn probe(
     settings: &ProviderSettings,
     credentials: &Option<Credentials>,
 ) -> std::result::Result<ProviderTestOutcome, (Error, &'static str)> {
-    if matches!(settings, ProviderSettings::Qbittorrent { .. }) {
+    if matches!(settings, ProviderSettings::Sabnzbd { .. }) {
+        sabnzbd::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::UsenetClient)
+            .map_err(sab_test_error)
+    } else if matches!(settings, ProviderSettings::Nzbget { .. }) {
+        nzbget::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::NzbgetClient)
+            .map_err(nzbget_test_error)
+    } else if settings.is_label_torrent() {
+        label_client::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::LabelClient)
+            .map_err(label_test_error)
+    } else if matches!(settings, ProviderSettings::Transmission { .. }) {
+        transmission::test_connection(operation, settings, credentials.as_ref())
+            .await
+            .map(ProviderTestOutcome::TorrentClient)
+            .map_err(transmission_test_error)
+    } else if matches!(settings, ProviderSettings::Qbittorrent { .. }) {
         qbittorrent::test_connection(operation, settings, credentials.as_ref())
             .await
             .map(ProviderTestOutcome::DownloadClient)
@@ -2294,15 +3811,179 @@ async fn run_test(
         .as_ref()
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
-    let operation = transport
-        .operation(provider.id)
-        .map_err(|e| http_error(e).0)?;
+    let is_indexer = !provider.settings.is_download_client();
+    let is_feed = matches!(provider.settings, ProviderSettings::Torrentrss { .. });
+    // Reasoning: durable, revision-fenced indexer backoff is scoped to Torznab/Newznab media
+    // scopes; a feed keeps the in-memory provider cooldown it was authored with, so a rate-limited
+    // feed test is answered from shared provider state without requesting the feed again.
+    let operation = if is_indexer && !is_feed {
+        transport.indexer_operation(provider.id)
+    } else {
+        transport.operation(provider.id)
+    }
+    .map_err(|e| http_error(e).0)?;
     let work = async {
-        let result = probe(&operation, &provider.settings, &credentials).await;
+        let (result, observation, client_observation) =
+            if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
+                // A feed has no capability document: every configured scope is fetched and parsed.
+                let result = indexer::test_feed(
+                    &operation,
+                    &provider.settings,
+                    &IndexerAccess::from_credentials(&credentials),
+                )
+                .await;
+                (
+                    result
+                        .map(ProviderTestOutcome::Feed)
+                        .map_err(|error| indexer_error(error, &operation)),
+                    None,
+                    None,
+                )
+            } else if is_indexer {
+                let scoped = indexer::test_with_scope(
+                    &operation,
+                    &provider.settings,
+                    &IndexerAccess::from_credentials(&credentials),
+                )
+                .await;
+                let failed_domain = scoped.as_ref().err().and_then(|(_, domain)| *domain);
+                let result = scoped.map_err(|(error, _)| error);
+                let observation =
+                    indexer_backoff::observation(&result).map(|value| (value, failed_domain));
+                (
+                    result
+                        .map(ProviderTestOutcome::Indexer)
+                        .map_err(|error| indexer_error(error, &operation)),
+                    observation,
+                    None,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Nzbget { .. }) {
+                let result =
+                    nzbget::test_connection(&operation, &provider.settings, credentials.as_ref())
+                        .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::NzbgetClient)
+                        .map_err(nzbget_test_error),
+                    None,
+                    observation,
+                )
+            } else if provider.settings.is_label_torrent() {
+                let result = label_client::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::LabelClient)
+                        .map_err(label_test_error),
+                    None,
+                    observation,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Transmission { .. }) {
+                let result = transmission::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::TorrentClient)
+                        .map_err(transmission_test_error),
+                    None,
+                    observation,
+                )
+            } else if matches!(provider.settings, ProviderSettings::Sabnzbd { .. }) {
+                let result =
+                    sabnzbd::test_connection(&operation, &provider.settings, credentials.as_ref())
+                        .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(failure)
+                        if communication_error(failure.error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::UsenetClient)
+                        .map_err(sab_test_error),
+                    None,
+                    observation,
+                )
+            } else {
+                let result = qbittorrent::test_connection(
+                    &operation,
+                    &provider.settings,
+                    credentials.as_ref(),
+                )
+                .await;
+                let observation = match result.as_ref() {
+                    Ok(_) => Some(backoff::Observation::Success),
+                    Err(error)
+                        if communication_error(*error)
+                            == CommunicationProbeError::RemoteFailure =>
+                    {
+                        Some(backoff::Observation::Failure)
+                    }
+                    Err(_) => None,
+                };
+                (
+                    result
+                        .map(ProviderTestOutcome::DownloadClient)
+                        .map_err(qbit_error),
+                    None,
+                    observation,
+                )
+            };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         match result {
             Ok(result) => {
-                let tested_at = record_test(&context.db, &provider, None).await?;
+                let tested_at = record_test(
+                    &context.db,
+                    &provider,
+                    None,
+                    observation,
+                    client_observation,
+                    context.backoff_started.elapsed() >= backoff::STARTUP_GRACE,
+                )
+                .await?;
                 bounded(ProviderTestResult {
                     provider_id: provider.id,
                     revision: provider.revision,
@@ -2312,7 +3993,15 @@ async fn run_test(
             }
             Err(error) => {
                 let (error, code) = error;
-                record_test(&context.db, &provider, Some(code)).await?;
+                record_test(
+                    &context.db,
+                    &provider,
+                    Some(code),
+                    observation,
+                    client_observation,
+                    context.backoff_started.elapsed() >= backoff::STARTUP_GRACE,
+                )
+                .await?;
                 Err(error)
             }
         }
@@ -2329,7 +4018,7 @@ async fn search(
     let id = id(value)?;
     let input = input.map_err(|_| bad())?.0;
     let (provider, credentials) = network_snapshot(&context, &id).await?;
-    if matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+    if provider.settings.is_download_client() {
         return Err(unsupported_operation());
     }
     let intent = match &input {
@@ -2349,9 +4038,10 @@ async fn search(
         .as_ref()
         .map_err(|e| http_error(*e).0)?;
     let operation = transport
-        .operation(provider.id)
+        .indexer_operation(provider.id)
         .map_err(|e| http_error(e).0)?;
     let work = async {
+        indexer_backoff::admit(&context.db, &provider, indexer_backoff::domain(&input)).await?;
         let result = indexer::search(
             &operation,
             &provider.settings,
@@ -2361,6 +4051,13 @@ async fn search(
         .await;
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         current_revision(&context.db, &provider).await?;
+        indexer_backoff::record(
+            &context.db,
+            &provider,
+            indexer_backoff::domain(&input),
+            indexer_backoff::observation(&result),
+        )
+        .await?;
         bounded(ProviderSearchResult {
             provider_id: provider.id,
             revision: provider.revision,
@@ -2372,6 +4069,88 @@ async fn search(
         .map_err(|_| http_error(http::HttpError::Timeout).0)?
 }
 
+/// Usenet test problems keep the stored static code set while giving an actionable message.
+fn sab_test_error(failure: sabnzbd::SabTestFailure) -> (Error, &'static str) {
+    use sabnzbd::SabnzbdProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::CategoryMissing) => (
+            "sabnzbd_category_missing",
+            "A configured SABnzbd category does not exist; create it in SABnzbd",
+        ),
+        Some(P::JobFoldersDisabled) => (
+            "sabnzbd_job_folders_disabled",
+            "A configured SABnzbd category does not create job folders; enable them",
+        ),
+        Some(P::SortingEnabled) => (
+            "sabnzbd_sorting_enabled",
+            "SABnzbd sorting applies to a configured category; disable it so imports find completed files",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
+/// NZBGet test problems keep the stored static code set while giving an actionable message.
+fn nzbget_test_error(failure: nzbget::NzbgetTestFailure) -> (Error, &'static str) {
+    use nzbget::NzbgetProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::CategoryMissing) => (
+            "nzbget_category_missing",
+            "A configured NZBGet category does not exist; create it in NZBGet",
+        ),
+        Some(P::KeepHistoryZero) => (
+            "nzbget_keep_history_zero",
+            "NZBGet KeepHistory is 0; completed downloads vanish before they can be imported",
+        ),
+        Some(P::KeepHistoryOverMax) => (
+            "nzbget_keep_history_over_max",
+            "NZBGet KeepHistory exceeds 25000 days; lower it",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
+/// Label-client test problems keep the stored static code set while giving an actionable message.
+fn label_test_error(failure: label_client::LabelTestFailure) -> (Error, &'static str) {
+    use label_client::LabelProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::LabelsUnavailable) => (
+            "label_plugin_unavailable",
+            "The client cannot hold labels; enable its Label plugin so TV and movies stay isolated",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
+/// Transmission test problems keep the stored static code set while giving an actionable message.
+fn transmission_test_error(
+    failure: transmission::TransmissionTestFailure,
+) -> (Error, &'static str) {
+    use transmission::TransmissionProblem as P;
+    let (code, message) = match failure.problem {
+        None => return qbit_error(failure.error),
+        Some(P::DownloadDirInvalid) => (
+            "transmission_download_dir_invalid",
+            "A category scope needs Transmission's download directory, which is missing or not an absolute path",
+        ),
+        Some(P::DomainsOverlap) => (
+            "transmission_domains_overlap",
+            "TV and movie download locations overlap on this Transmission client; use separate categories or directories",
+        ),
+    };
+    (
+        Error::Plain(StatusCode::UNPROCESSABLE_ENTITY, code, message),
+        "unsupported",
+    )
+}
 fn qbit_error(error: qbittorrent::QbitError) -> (Error, &'static str) {
     use qbittorrent::QbitError as Q;
     match error {
@@ -2415,7 +4194,7 @@ async fn downloads(
     let id = id(value)?;
     let input = input.map_err(|_| bad())?.0;
     let (provider, credentials) = network_snapshot(&context, &id).await?;
-    if !matches!(provider.settings, ProviderSettings::Qbittorrent { .. }) {
+    if !provider.settings.is_download_client() {
         return Err(unsupported_operation());
     }
     let transport = context
@@ -2427,8 +4206,26 @@ async fn downloads(
         .operation(provider.id)
         .map_err(|e| http_error(e).0)?;
     let work = async {
-        let result =
-            qbittorrent::query(&operation, &provider.settings, credentials.as_ref(), &input).await;
+        let result = match &provider.settings {
+            ProviderSettings::Sabnzbd { .. } => {
+                sabnzbd::query(&operation, &provider.settings, credentials.as_ref(), &input).await
+            }
+            ProviderSettings::Nzbget { .. } => {
+                nzbget::query(&operation, &provider.settings, credentials.as_ref(), &input).await
+            }
+            settings if settings.is_label_torrent() => {
+                label_client::query(&operation, &provider.settings, credentials.as_ref(), &input)
+                    .await
+            }
+            ProviderSettings::Transmission { .. } => {
+                transmission::query(&operation, &provider.settings, credentials.as_ref(), &input)
+                    .await
+            }
+            _ => {
+                qbittorrent::query(&operation, &provider.settings, credentials.as_ref(), &input)
+                    .await
+            }
+        };
         operation.ensure_active().map_err(|e| http_error(e).0)?;
         current_revision(&context.db, &provider).await?;
         bounded(ProviderDownloadResult {
@@ -2542,6 +4339,7 @@ pub(crate) async fn import_configuration(
     key: Option<&CredentialKey>,
     input: &ProviderInput,
     download_client_id: Option<Uuid>,
+    download_client_tags: Option<Vec<i64>>,
     changes: &mut HealthConfigurationChanges,
     source: &ImportSource<'_>,
     mapped: Option<&str>,
@@ -2563,6 +4361,10 @@ pub(crate) async fn import_configuration(
         }
     } else if download_client_id.is_some() {
         return Err(INVALID);
+    }
+    if let ProviderSettings::Qbittorrent { tv, movies, .. } = &mut settings {
+        let scope = tv.as_mut().or(movies.as_mut()).ok_or(INVALID)?;
+        scope.tags = download_client_tags;
     }
     if input.enabled {
         return Err(INVALID);
@@ -2716,21 +4518,10 @@ async fn path_preview(
         .await
         .map_err(|_| corrupt().into_response())?;
     let (provider, _) = read(&tx, &id).await.map_err(IntoResponse::into_response)?;
-    let ProviderSettings::Qbittorrent {
-        endpoint,
-        tv,
-        movies,
-    } = &provider.settings
-    else {
-        return Err(bad().into_response());
-    };
-    if match input.media_type {
-        MediaDomain::Tv => tv.is_none(),
-        MediaDomain::Movies => movies.is_none(),
-    } {
+    if !provider.settings.client_scoped(input.media_type) {
         return Err(bad().into_response());
     }
-    let url = url::Url::parse(endpoint).map_err(|_| bad().into_response())?;
+    let url = url::Url::parse(provider.settings.endpoint()).map_err(|_| bad().into_response())?;
     let host = url
         .host_str()
         .ok_or_else(|| bad().into_response())?

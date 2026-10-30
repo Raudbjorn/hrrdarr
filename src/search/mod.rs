@@ -23,6 +23,7 @@ use axum::{
 };
 pub use decision::evaluate;
 pub(crate) use decision::target_ranks;
+pub(crate) use decision::{MovieReleaseFacts, movie_availability_delay, movie_available};
 pub(crate) use decision::{evaluate_with_evidence, evaluate_with_pending};
 use libsql::Connection;
 use serde::{Deserialize, Serialize};
@@ -401,9 +402,9 @@ pub(crate) async fn target_request(
                     tmdb_id: None,
                     numbering,
                     search_mode: TvSearchMode::Default,
-                    offset: offset,
-                    query_index: query_index,
-                    limit: limit,
+                    offset,
+                    query_index,
+                    limit,
                 },
                 MediaDomain::Tv,
             )
@@ -425,9 +426,9 @@ pub(crate) async fn target_request(
                     year: r.get::<Option<i64>>(1)?.and_then(|v| u16::try_from(v).ok()),
                     tmdb_id: r.get::<Option<i64>>(2)?.and_then(|v| u32::try_from(v).ok()),
                     imdb_id: r.get(3)?,
-                    offset: offset,
-                    query_index: query_index,
-                    limit: limit,
+                    offset,
+                    query_index,
+                    limit,
                 },
                 MediaDomain::Movies,
             )

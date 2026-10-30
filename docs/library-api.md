@@ -260,3 +260,11 @@ no legacy eligibility or policy defaults are invented. Existing Sonarr/Radarr sn
 readers still archive/report these newer movie catalog fields as unsupported, rather
 than claiming reconstruction. An actual metadata refresh can populate them. Full
 metadata/status/translation/alias provenance parity remains incomplete.
+
+## Runtime observations
+
+Library items expose nullable `runtime` in minutes: series runtime for TV and movie metadata runtime for movies. Episode `includeSeries` projections also expose the series runtime. TV metadata add/refresh retain explicit zero and preserve a prior value when the provider omits runtime. Conflicting adoption of an existing known value remains a conflict.
+
+The downloaded TV scan decision helper uses each selected episode's positive runtime, falling back to series runtime for missing or zero episode values. An absent series value contributes zero to this policy calculation; only a zero aggregate selects the 45-minute expected-runtime fallback, once per file. This policy default is never written into metadata. Changes to series runtime invalidate an earlier scan decision proof. Sample checking still requires actual measured file duration unless an explicit domain exemption applies.
+
+The downloaded-scan worker consumes this helper while it evaluates each candidate, so the runtime policy already decides which downloaded TV files a scan may import.

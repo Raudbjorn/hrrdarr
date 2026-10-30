@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 53); // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     Ok(())
 }

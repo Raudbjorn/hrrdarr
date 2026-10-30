@@ -129,7 +129,8 @@ async fn remote(
         permit.forget();
         s.active.fetch_sub(1, Ordering::SeqCst);
     }
-    if uri.path().contains("failure") {
+    // Reject the authenticated API request; a support-probe 401 is a generic transport failure.
+    if uri.path().contains("failure") && !uri.path().ends_with("webapiVersion") {
         return (StatusCode::UNAUTHORIZED, PRIVATE).into_response();
     }
     if uri.path().ends_with("webapiVersion") {
@@ -194,8 +195,10 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             .await;
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
-            // Reasoning: 0050 adds the generic torrentrss feed implementation to the indexer template list.
-            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 1 });
+            // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
+            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013) uTorrent (dlc.017) Aria2 (dlc.002) Flood (dlc.006) and DownloadStation (dlc.005);
+            // indexers are Torznab, Newznab and the 0068 torrentrss feed.
+            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 10 });
             assert_eq!(
                 templates
                     .iter()
@@ -204,7 +207,18 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                 if kind == "indexer" {
                     vec!["newznab", "torznab", "torrentrss"]
                 } else {
-                    vec!["qbittorrent"]
+                    vec![
+                        "qbittorrent",
+                        "sabnzbd",
+                        "nzbget",
+                        "transmission",
+                        "deluge",
+                        "rtorrent",
+                        "utorrent",
+                        "aria2",
+                        "flood",
+                        "downloadstation",
+                    ]
                 }
             );
             for t in templates {
@@ -223,6 +237,37 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                     assert_eq!(t["defaults"]["tv"]["categories"], json!([]));
                     assert_eq!(t["defaults"]["tv"]["anime_standard_format_search"], false);
                     assert_eq!(t["defaults"]["movies"]["remove_year"], false);
+                } else if t["implementation"] == "sabnzbd" {
+                    // Usenet defaults: category default priority for both windows, no tags.
+                    assert_eq!(t["defaults"]["kind"], "usenet_client");
+                    assert_eq!(t["defaults"]["recent_priority"], "default");
+                    assert_eq!(t["defaults"]["older_priority"], "default");
+                    assert_eq!(t["defaults"]["tags"], json!([]));
+                    assert!(t["defaults"].get("category").is_none());
+                } else if t["implementation"] == "nzbget" {
+                    assert_eq!(t["defaults"]["kind"], "nzbget_client");
+                    assert_eq!(t["defaults"]["recent_priority"], "normal");
+                    assert_eq!(t["defaults"]["older_priority"], "normal");
+                    assert_eq!(t["defaults"]["add_paused"], false);
+                    assert_eq!(t["defaults"]["tags"], json!([]));
+                    assert!(t["defaults"].get("category").is_none());
+                } else if [
+                    "deluge",
+                    "rtorrent",
+                    "utorrent",
+                    "aria2",
+                    "flood",
+                    "downloadstation",
+                ]
+                .contains(&t["implementation"].as_str().unwrap())
+                {
+                    assert_eq!(t["defaults"]["kind"], "label_torrent_client");
+                    assert_eq!(t["defaults"]["add_paused"], false);
+                    assert!(t["defaults"].get("category").is_none());
+                } else if t["implementation"] == "transmission" {
+                    assert_eq!(t["defaults"]["kind"], "transmission_client");
+                    assert_eq!(t["defaults"]["add_paused"], false);
+                    assert!(t["defaults"].get("category").is_none());
                 } else {
                     assert_eq!(t["defaults"]["initial_state"], "started");
                     assert_eq!(t["defaults"]["content_layout"], "default");

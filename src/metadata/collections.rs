@@ -13,6 +13,7 @@ pub enum CollectionAssociation {
     Present(CollectionSummary),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(rename = "CollectionRef")]
 pub struct CollectionSummary {
     pub tmdb_id: i64,
     pub title: String,
@@ -254,13 +255,13 @@ impl WireCollection {
                     rating(v)?;
                 }
             }
-            let mut movie = part.movie;
-            let collection = std::mem::take(&mut movie.collection).normalize()?;
+            let movie = part.movie.details()?;
+            let collection = movie.collection.clone();
             if matches!(&collection, CollectionAssociation::Present(c) if c.tmdb_id != requested) {
                 return Err(MetadataError::InvalidResponse);
             }
             members.push(CollectionMember {
-                movie: movie.details()?,
+                movie,
                 collection,
                 original_title: optional_text(part.original_title, 1024, false)?,
                 overview: optional_text(part.overview, 65536, true)?,
@@ -288,16 +289,9 @@ impl MetadataClient {
     }
     /// Presence-aware companion preserves existing MovieDetails API and struct literals.
     pub async fn movie_with_collection(&self, id: i64) -> Result<MovieWithCollection> {
-        input_id(id)?;
-        let mut wire: Movie = self.fetch(false, &format!("movie/{id}"), &[]).await?;
-        if wire.tmdb_id != id {
-            return Err(MetadataError::InvalidResponse);
-        }
-        let collection = std::mem::take(&mut wire.collection).normalize()?;
-        Ok(MovieWithCollection {
-            movie: wire.details()?,
-            collection,
-        })
+        let movie = self.movie(id).await?;
+        let collection = movie.collection.clone();
+        Ok(MovieWithCollection { movie, collection })
     }
 }
 
@@ -439,6 +433,12 @@ mod tests {
             v.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
+            // Both the direct movie API and the collection-aware companion retain presence.
+            let movie = serde_json::from_value::<Movie>(v.clone())
+                .unwrap()
+                .details()
+                .unwrap();
+            assert_eq!(movie.collection, expected);
             let mut wire: Movie = serde_json::from_value(v).unwrap();
             assert_eq!(
                 std::mem::take(&mut wire.collection).normalize().unwrap(),

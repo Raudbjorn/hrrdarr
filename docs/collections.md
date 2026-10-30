@@ -1,37 +1,59 @@
-# Collections implementation checkpoint
+# Movie collections (api.036, ui.037, job.012)
 
-This branch contains prerequisites, not a complete Collections feature. Collection API, refresh jobs, automatic additions/search, provider-authority consumers and UI remain unfinished. Migrations 52 (collections) and 53 (provider authority) add persistent state; no dependencies were added. They were renumbered from 47/48 when merging main, whose 0047–0050 landed first. Migration 52 adds no indexer modes or download-client overrides: main's 0048/0049 already store those as `provider_scopes` columns.
+Movies only; there is no TV counterpart. Collections are catalog entities (`movie_collections`) whose members
+reference catalog metadata (`movie_collection_members`), so a collection can list movies that are not in the
+library.
 
-## Metadata protocol
+## Adoption
 
-`MetadataClient::collection(tmdb_id)` requests `movie/collection/{tmdb_id}` from the fixed Radarr metadata service using the existing bounded HTTP client. Owned fixture injection is restricted to explicit `http://127.0.0.1:PORT/`. The client keeps the existing 10-second transport deadline, 1 MiB body cap, cooldown/operation admission, and no redirects/proxies. A 404 is `MetadataError::NotFound`; invalid identity, malformed graph and resource excess are static `InvalidResponse` errors. Response content and image URLs never enter error messages.
+`MovieDetails` carries a tri-state `collection` association from the movie metadata service: absent preserves the
+stored membership, explicit `null` clears it, an object sets it. It is persisted by the shared fact writer (library
+add via lookup and metadata refresh) in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
+Collection adoption retains local removal intent and protects it from stale snapshot replay.
 
-The complete response requires `tmdbId`, nonblank `name`, and a non-null `parts` array. An empty array is a complete empty graph; missing parts are not. Maximum 1000 unique positive member TMDB IDs. Collection names are limited to 512 UTF-8 bytes, overviews to 64 KiB, images to 32, URL text to 2048 bytes, image kinds to 64 bytes, and ratings to 16 sources. Each private image array must also fit 65536 bytes of compact JSON encoded as exact `{cover_type,source_url}` pairs, including escaping. Member movie facts reuse existing runtime/language/date/genre/title validation and date-derived availability. Ratings retain source/count/value, including null source entries; legacy rating lists are retained separately. Unknown image kinds remain private facts. Duplicate recognized JSON fields and duplicate rating-source keys are invalid.
+## API (`/api/v1/movies/collections`)
 
-`CollectionDetails` contains collection identity/title/overview, optional private images and a complete vector of `CollectionMember` facts. Each member holds existing `MovieDetails`, original title, overview, ratings and images. Missing optional facts stay absent, including missing images versus an explicitly empty image list. The DTOs carrying image source URLs deliberately do not implement Serialize or TypeScript export. Debug output redacts image URLs. Image facts do not authorize network requests; a future artwork consumer must independently admit origins and apply its own bounds.
+* `GET ?limit&offset&monitored&q` paged list with `movie_count`, `library_movie_count`, `missing_movie_count`
+  (members empty); `GET /{id}` includes members with `movie_id` (null when not in the library).
+* `PUT /{id}` and `PUT /` (bulk `{ids, patch}`, at most 200, all-or-nothing): `monitored`, `search_on_add`,
+  `quality_profile_id`, `root_folder_id`, `minimum_availability`, `tag_ids` (replace), `monitor_movies` (one-shot
+  monitoring toggle for library members). Monitoring requires profile, root folder and availability (409
+  `collection_policy_incomplete`; the invariant is also enforced by triggers). Profiles/roots/tags must be movie-domain.
+  A collection's assigned quality profile cannot be deleted (`409 profile_in_use`), even without library members;
+  clear or reassign the collection's profile first. Migration 0077 preserves that guard on the shared collection settings table.
+* Monitoring a collection immediately adds its known missing members to the library at
+  `<root>/<Title (Year)>` with the collection's profile, availability and tags (then AutoTagging). Existing paths,
+  nested paths and existing library movies are skipped, never replaced.
 
-`movie_with_collection(id)` returns `MovieWithCollection { movie, collection }`. `CollectionAssociation` distinguishes `Absent`, `Clear` (wire null) and `Present(CollectionSummary {tmdb_id,title})`. Zero is invalid, not an invented removal sentinel. A member summary naming another collection is rejected. Existing `movie(id)` keeps its existing `MovieDetails` response and validates supplied collection summaries; existing constructors and struct literals are unchanged. Library add/refresh consumers must explicitly adopt the companion API before collection associations are persisted.
+## RefreshCollections (job.012)
 
-The metadata protocol layer itself implements no collection API router, database writer, snapshot activation, refresh scheduler, movie adoption, exclusions UI, image download or search-on-add; adoption and snapshot consumers are described below. The collection lifecycle contract remains in the ignored iteration 87 requirements report. Tests colocated in `metadata/collections.rs` exercise real owned HTTP routing/status/body bounds and pure graph/presence validation; execution belongs to parent verification, not this source handoff.
+`POST /api/v1/movies/collections/refresh-commands` (202) queues one command (one active at a time; a duplicate
+returns the active one); `GET` list/detail. The worker also schedules it every 24 hours while collections exist.
+Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 parts) outside any transaction, then
+applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
+missing members are added. A run spans worker slices through a cursor and survives restarts. Per-collection fetch
+failures are counted; if nothing succeeded and the service was unavailable the command fails
+(`metadata_unavailable`). Migration `0067_collections.sql`.
 
-## Transactional movie adoption
+## Schema integration
 
-Selected movie adds and durable metadata refresh now fetch the companion API before opening their writer transaction. Association publication occurs inside the same fenced transaction as movie facts; ordinary sparse responses preserve membership. Explicit null clears only membership, followed by last-library-member policy cleanup. Existing movie files, catalog facts and history are never deleted by collection cleanup. Unidentified legacy memberships (collections without a TMDB id) are left untouched rather than reconciled by title, and they do not block refresh. A user-removal tombstone on the newly discovered collection prevents re-adding it but still detaches the movie from its previous collections.
-
-Movie selected-add accepts optional `monitor` (`movie_only`, default; `movie_and_collection`; `none`) and `collection_expected_revision`. The collection choice requires complete saved root/profile/availability defaults. Existing policies require the exact captured revision and retain their defaults/tags; new discovery is unmonitored with search-on-add false. Root inheritance uses the longest containing movie root, with path-component containment. Ordinary discovery with incomplete defaults remains unmonitored. Existing policy—including empty tags—wins on later discovery.
-
-Explicit enable records retained local intent as well as live settings. Last-member or association cleanup retains a removal intent before deleting collection rows, protecting against snapshot resurrection. Fresh authoritative discovery may restore lifecycle/metadata_missing removal while retaining local_edit against snapshot replay. Actual user-removal tombstones remain protected. There is no new destructive library-delete endpoint; the reusable cleanup helper must be called within a future actual movie-deletion transaction, never for mere file disappearance.
-
-The adoption repository requires an existing transaction and performs no HTTP/filesystem effects. Callers must roll back on every error. Public transport fields cannot enable search-on-add here; no search command is admitted in this prerequisite. Collection refresh/snapshot/UI/search consumers remain separate required work. The new integration source exercises repository transactions/reopen/stale targets and real selected-add HTTP using an owned metadata peer; test execution remains parent-owned.
+Migrations 0001–0076 retain the PR branch history and checksums. Migration 0077 moves
+existing collection policy into `movie_collection_settings`, preserving meaningful
+local settings and tags, and adds metadata provenance, retained removal intent,
+exclusions and snapshot replay state. Migration 0078 adds provider authority state.
+Databases from the divergent main migration history are not an accepted upgrade baseline.
 
 ## Snapshot reconstruction
 
 Collections and import exclusions can be reconstructed from supported Radarr 206 and 242 backups. Version 206 retains inline collection identity/title without inventing missing policy. Version 242 also maps catalog-only membership, facts, movie root/profile/tag references and available defaults. Unresolved references stay inactive with diagnostics. Unsupported source fields remain in private archives. Preview runs the same transaction and rolls back; applying repeats is idempotent. Native collection intent, settings and exclusion removal tombstones take precedence over old snapshots. A title that differs from an existing collection with the same TMDB id is retained with a diagnostic rather than failing the import. Snapshot-origin memberships the newer backup no longer lists are replaced; only native associations are protected, and a movie whose collection reference the backup cannot resolve keeps its memberships. Collection settings a snapshot wrote (`snapshot_owned=1`) and nobody edited since (`local_edit=0`) are replaced in place by a newer backup's policy, with the settings revision advanced; discovery-created or locally edited settings are retained. When a backup carries an ImportExclusions table, snapshot-owned exclusions it omits are removed; native exclusion tombstones (`local_edit=1`) are retained. Import performs no metadata requests, movie additions, searches or media access; source collections are not treated as complete freshly fetched graphs. Sonarr imports remain separate.
 
-## Checkpoint verification
-
-Parent verification passed 84 focused Rust tests (41 integration, 38 database, 5 metadata), 69 frontend tests, Svelte checking with zero errors/warnings, frontend build, formatting and generated API drift checks. Two initial test defects were corrected before this successful run.
-
 ## Not claimed
 
-The full Rust suite and browser workflows were not rerun for this checkpoint. Collections API, refresh/add/search automation, provider-authority consumers and UI are incomplete; these tests do not establish full Collections parity. New collection/provider tables and snapshot replay markers are introduced by migrations 52/53. Provider status covers indexers only; 0051 `download_client_status` owns download-client backoff. No new dependencies or live-service access.
+* `search_on_add` is stored and counted as `searches_pending`; no search is submitted by this feature.
+* No artwork/poster delivery, no import-exclusion editor, no TV analogue, and no discovery/"popular" collection lists.
+  Private image facts and supported snapshot exclusions are retained; they do not authorize artwork downloads.
+* The command table is not part of the shared 1024-row command pool and is not covered by housekeeping; it prunes
+  itself to 100 terminal rows. It does not appear in the generic Activity/command views.
+* Added movies use a simple portable folder name (not the naming-template engine), and are added monitored.
+* Collection graph parts carry identity only (title/year/IMDb); richer facts arrive when the movie is refreshed.
+* Verified against mock metadata and an owned fixture only; no live TMDB/SkyHook access.

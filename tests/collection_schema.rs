@@ -43,210 +43,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0052_collections.sql");
-const PREDECESSORS: &[(&str, &str)] = &[
-    (
-        "prototype",
-        include_str!("../migrations/0001_prototype.sql"),
-    ),
-    (
-        "media_relations",
-        include_str!("../migrations/0002_media_relations.sql"),
-    ),
-    (
-        "snapshot_imports",
-        include_str!("../migrations/0003_snapshot_imports.sql"),
-    ),
-    (
-        "quality_definitions",
-        include_str!("../migrations/0004_quality_definitions.sql"),
-    ),
-    (
-        "episode_metadata",
-        include_str!("../migrations/0005_episode_metadata.sql"),
-    ),
-    (
-        "file_metadata",
-        include_str!("../migrations/0006_file_metadata.sql"),
-    ),
-    (
-        "library_settings",
-        include_str!("../migrations/0007_library_settings.sql"),
-    ),
-    (
-        "manual_import_journal",
-        include_str!("../migrations/0008_manual_import_journal.sql"),
-    ),
-    (
-        "provider_configuration",
-        include_str!("../migrations/0009_provider_configuration.sql"),
-    ),
-    (
-        "provider_test_results",
-        include_str!("../migrations/0010_provider_test_results.sql"),
-    ),
-    (
-        "indexer_scope_options",
-        include_str!("../migrations/0011_indexer_scope_options.sql"),
-    ),
-    (
-        "qbittorrent_options",
-        include_str!("../migrations/0012_qbittorrent_options.sql"),
-    ),
-    (
-        "snapshot_provider_mappings",
-        include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
-    ),
-    (
-        "root_folders",
-        include_str!("../migrations/0014_root_folders.sql"),
-    ),
-    (
-        "remote_path_mappings",
-        include_str!("../migrations/0015_remote_path_mappings.sql"),
-    ),
-    (
-        "download_refresh",
-        include_str!("../migrations/0016_download_refresh.sql"),
-    ),
-    (
-        "import_history_order",
-        include_str!("../migrations/0017_import_history_order.sql"),
-    ),
-    (
-        "snapshot_history",
-        include_str!("../migrations/0018_snapshot_history.sql"),
-    ),
-    (
-        "profile_policy",
-        include_str!("../migrations/0019_profile_policy.sql"),
-    ),
-    (
-        "snapshot_profiles",
-        include_str!("../migrations/0020_snapshot_profiles.sql"),
-    ),
-    (
-        "metadata_refresh_commands",
-        include_str!("../migrations/0021_metadata_refresh_commands.sql"),
-    ),
-    (
-        "snapshot_blocklist",
-        include_str!("../migrations/0022_snapshot_blocklist.sql"),
-    ),
-    (
-        "blocklist_clear_commands",
-        include_str!("../migrations/0023_blocklist_clear_commands.sql"),
-    ),
-    (
-        "release_catalog_policy",
-        include_str!("../migrations/0024_release_catalog_policy.sql"),
-    ),
-    (
-        "rss_grab_journal",
-        include_str!("../migrations/0025_rss_grab_journal.sql"),
-    ),
-    (
-        "download_processing",
-        include_str!("../migrations/0026_download_processing.sql"),
-    ),
-    (
-        "targeted_search",
-        include_str!("../migrations/0027_targeted_search.sql"),
-    ),
-    (
-        "same_path_replacements",
-        include_str!("../migrations/0028_same_path_replacements.sql"),
-    ),
-    (
-        "naming_settings",
-        include_str!("../migrations/0029_naming_settings.sql"),
-    ),
-    (
-        "manual_import_commands",
-        include_str!("../migrations/0030_manual_import_commands.sql"),
-    ),
-    (
-        "quality_reset_commands",
-        include_str!("../migrations/0031_quality_reset_commands.sql"),
-    ),
-    (
-        "rescan_commands",
-        include_str!("../migrations/0032_rescan_commands.sql"),
-    ),
-    (
-        "command_capacity_active_only",
-        include_str!("../migrations/0033_command_capacity_active_only.sql"),
-    ),
-    (
-        "custom_formats",
-        include_str!("../migrations/0034_custom_formats.sql"),
-    ),
-    (
-        "candidate_comparison_facts",
-        include_str!("../migrations/0035_candidate_comparison_facts.sql"),
-    ),
-    (
-        "snapshot_custom_formats",
-        include_str!("../migrations/0036_snapshot_custom_formats.sql"),
-    ),
-    ("tags", include_str!("../migrations/0037_tags.sql")),
-    (
-        "revision_policy",
-        include_str!("../migrations/0038_revision_policy.sql"),
-    ),
-    (
-        "delay_profiles",
-        include_str!("../migrations/0039_delay_profiles.sql"),
-    ),
-    (
-        "release_profiles",
-        include_str!("../migrations/0040_release_profiles.sql"),
-    ),
-    (
-        "completed_download_handling",
-        include_str!("../migrations/0041_completed_download_handling.sql"),
-    ),
-    (
-        "health_checks",
-        include_str!("../migrations/0042_health_checks.sql"),
-    ),
-    (
-        "health_communication",
-        include_str!("../migrations/0043_health_communication.sql"),
-    ),
-    (
-        "health_download_client_roots",
-        include_str!("../migrations/0044_health_download_client_roots.sql"),
-    ),
-    (
-        "autotagging_metadata",
-        include_str!("../migrations/0045_autotagging_metadata.sql"),
-    ),
-    (
-        "removed_metadata_health",
-        include_str!("../migrations/0046_removed_metadata_health.sql"),
-    ),
-    (
-        "movie_credits",
-        include_str!("../migrations/0047_movie_credits.sql"),
-    ),
-    (
-        "indexer_operation_policy",
-        include_str!("../migrations/0048_indexer_operation_policy.sql"),
-    ),
-    (
-        "indexer_client_binding",
-        include_str!("../migrations/0049_indexer_client_binding.sql"),
-    ),
-    (
-        "torrent_rss_indexer",
-        include_str!("../migrations/0050_torrent_rss_indexer.sql"),
-    ),
-    (
-        "download_client_backoff",
-        include_str!("../migrations/0051_download_client_backoff.sql"),
-    ),
-];
+const MIGRATION: &str = include_str!("../migrations/0077_collection_authority.sql");
 const OBJECTS: &[&str] = &[
     "movie_collection_settings",
     "movie_collection_tags",
@@ -276,28 +73,45 @@ const OBJECTS: &[&str] = &[
 ];
 
 async fn predecessor(s: &Scratch) -> Result<libsql::Database, Error> {
+    // Replay the real prefix: later registry rebuilds cannot be undone by dropping columns.
+    let template = Database::open_local(s.0.join("migration-source.db")).await?;
+    let source = template.connect().await?;
+    let mut migrations = source.query(
+        "SELECT version,name,checksum,sql FROM schema_migrations WHERE version<=76 ORDER BY version", (),
+    ).await?;
     let db = libsql::Builder::new_local(s.database()).build().await?;
     let c = db.connect()?;
-    c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    c.execute_batch("PRAGMA foreign_keys=OFF; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    for (i, (name, sql)) in PREDECESSORS.iter().enumerate() {
-        tx.execute_batch(sql).await?;
-        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+    let mut applied = 0;
+    while let Some(row) = migrations.next().await? {
+        let version = row.get::<i64>(0)?;
+        let name = row.get::<String>(1)?;
+        let checksum = row.get::<String>(2)?;
+        let sql = row.get::<String>(3)?;
+        tx.execute_batch(&sql).await?;
         tx.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum, *sql],
+            params![version, name, checksum, sql],
         )
         .await?;
+        applied += 1;
     }
+    assert_eq!(applied, 76);
     tx.commit().await?;
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    assert!(
+        c.query("PRAGMA foreign_key_check", ())
+            .await?
+            .next()
+            .await?
+            .is_none()
+    );
     Ok(db)
 }
+
 async fn seed(c: &Connection) -> Result<(), Error> {
     c.execute_batch("INSERT INTO series(id,tvdb_id,title,path) VALUES(1,100,'TV','/tv/one');
      INSERT INTO seasons(series_id,number) VALUES(1,1);
@@ -345,36 +159,99 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='collection_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade51_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
+async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     seed(&c).await?;
+    c.execute_batch("INSERT INTO quality_profiles(id,media_type,name)VALUES(50,'movies','Retained profile');
+        INSERT INTO root_folders(id,media_type,path)VALUES(50,'movies','/collection-root');
+        INSERT INTO tags(id,media_type,label)VALUES(50,'movies','retained');
+        UPDATE movie_collections SET monitored=1,search_on_add=1,quality_profile_id=50,root_folder_id=50,minimum_availability='released' WHERE id=1;
+        INSERT INTO movie_collection_tags(collection_id,tag_id)VALUES(1,50);
+        INSERT INTO root_folders(id,media_type,path)VALUES(51,'movies','/removed-root');
+        INSERT INTO movie_collections(id,tmdb_id,title)VALUES(3,203,'Orphaned policy');
+        UPDATE movie_collections SET monitored=1,quality_profile_id=50,root_folder_id=51,minimum_availability='released' WHERE id=3;
+        DELETE FROM root_folders WHERE id=51;").await?;
+    let old_policy = rows(&c,"SELECT id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collections WHERE id=1").await;
+    let old_tags = rows(
+        &c,
+        "SELECT * FROM movie_collection_tags ORDER BY collection_id,tag_id",
+    )
+    .await;
     let before = preserved(&c).await;
     drop(c);
     drop(raw);
     let db = Database::open_local(s.database()).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
+    // The old SET NULL root FK permits monitored-but-incomplete policy; preserve it disabled.
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=3 AND monitored=0 AND root_folder_id IS NULL AND quality_profile_id=50 AND minimum_availability='released' AND local_edit=1").await,1);
     objects(&c).await;
     assert_eq!(preserved(&c).await, before);
-    assert_eq!(number(&c,"SELECT count(*) FROM movie_collections WHERE metadata_revision=0 AND graph_complete=0 AND images_json IS NULL AND last_info_sync IS NULL AND added IS NULL").await,2);
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collections WHERE metadata_revision=0 AND graph_complete=0 AND images_json IS NULL AND last_info_sync IS NULL AND added IS NULL").await,3);
     assert_eq!(number(&c,"SELECT count(*) FROM movie_collection_members WHERE origin='legacy' AND metadata_revision=0").await,3);
     assert_eq!(
         number(&c, "SELECT count(*) FROM movie_collection_settings").await,
-        0
+        2 // Reasoning: populated and orphaned policies migrate; bare catalog id2 stays policy-free.
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        53 // Reasoning: latest runner adds provider authority 0053 after collections 0052 (renumbered behind main's 0047-0051).
+        78 // Reasoning: the merged runner appends collections and provider authority after the original 76 migrations.
     );
+    assert_eq!(rows(&c,"SELECT collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collection_settings WHERE collection_id=1").await, old_policy);
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT * FROM movie_collection_tags ORDER BY collection_id,tag_id"
+        )
+        .await,
+        old_tags
+    );
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND local_edit=1 AND snapshot_owned=0").await,1);
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collections WHERE monitored=0 AND search_on_add=0 AND root_folder_id IS NULL AND quality_profile_id IS NULL AND minimum_availability IS NULL").await,3);
+    assert!(
+        c.execute("DELETE FROM quality_profiles WHERE id=50", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        c.execute("DELETE FROM root_folders WHERE id=50", ())
+            .await
+            .is_err()
+    );
+    assert!(c.execute("DELETE FROM tags WHERE id=50", ()).await.is_err());
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
     drop(db);
     let db = Database::open_local(s.database()).await?;
     let c = db.connect().await?;
     assert_eq!(preserved(&c).await, before);
+    assert_eq!(rows(&c,"SELECT collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collection_settings WHERE collection_id=1").await, old_policy);
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT * FROM movie_collection_tags ORDER BY collection_id,tag_id"
+        )
+        .await,
+        old_tags
+    );
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND local_edit=1 AND snapshot_owned=0").await,1);
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collections WHERE monitored=0 AND search_on_add=0 AND root_folder_id IS NULL AND quality_profile_id IS NULL AND minimum_availability IS NULL").await,3);
+    assert!(
+        c.execute("DELETE FROM quality_profiles WHERE id=50", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        c.execute("DELETE FROM root_folders WHERE id=50", ())
+            .await
+            .is_err()
+    );
+    assert!(c.execute("DELETE FROM tags WHERE id=50", ()).await.is_err());
+    // The old SET NULL root FK permits monitored-but-incomplete policy; preserve it disabled.
+    assert_eq!(number(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=3 AND monitored=0 AND root_folder_id IS NULL AND quality_profile_id=50 AND minimum_availability='released' AND local_edit=1").await,1);
     objects(&c).await;
     Ok(())
 }
@@ -402,7 +279,7 @@ async fn late_failure_rolls_back_all_collections_ddl_and_facts() -> Result<(), E
     .await?;
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=51",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=76",
             ()
         )
         .await
@@ -424,7 +301,7 @@ async fn late_failure_rolls_back_all_collections_ddl_and_facts() -> Result<(), E
     let c = db.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        51 // Reasoning: predecessor chain now ends at main's 0051 download-client backoff.
+        76 // Reasoning: collections authority now follows the preserved branch history through 0076.
     );
     assert_eq!(preserved(&c).await, before);
     Ok(())

@@ -249,10 +249,10 @@ pub(crate) fn decode_private(bytes: &[u8]) -> Result<Release> {
     }
     let mut value: PrivateRelease =
         serde_json::from_slice(bytes).map_err(|_| IndexerError::InvalidResponse)?;
-    if let Some(facts) = value.facts.torrent.as_mut() {
-        if facts.magnet_url.is_none() {
-            facts.magnet_url = selected_magnet(&value.download_url)?;
-        }
+    if let Some(facts) = value.facts.torrent.as_mut()
+        && facts.magnet_url.is_none()
+    {
+        facts.magnet_url = selected_magnet(&value.download_url)?;
     }
     Ok(Release {
         metadata: value.metadata,
@@ -1968,26 +1968,28 @@ async fn fetch(
     }
     let bytes = operation.get(endpoint, &params).await?;
     let body = String::from_utf8(bytes).map_err(|_| IndexerError::InvalidResponse)?;
-    if api_key.is_none() && body.len() <= XML_BYTES && depth_within(&body, XML_DEPTH) {
-        if let Ok(doc) = Document::parse_with_options(
+    if api_key.is_none()
+        && body.len() <= XML_BYTES
+        && depth_within(&body, XML_DEPTH)
+        && let Ok(doc) = Document::parse_with_options(
             &body,
             ParsingOptions {
                 allow_dtd: false,
                 nodes_limit: 20_000,
                 entity_resolver: None,
             },
-        ) {
-            let root = doc.root_element();
-            let description = root
-                .attribute("description")
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if root.has_tag_name("error")
-                && !description.contains("request limit reached")
-                && (description.contains("missing parameter") || description.contains("apikey"))
-            {
-                return Err(IndexerError::Authentication);
-            }
+        )
+    {
+        let root = doc.root_element();
+        let description = root
+            .attribute("description")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if root.has_tag_name("error")
+            && !description.contains("request limit reached")
+            && (description.contains("missing parameter") || description.contains("apikey"))
+        {
+            return Err(IndexerError::Authentication);
         }
     }
     Ok(body)
@@ -2038,44 +2040,62 @@ pub async fn test(
     settings: &ProviderSettings,
     access: &IndexerAccess<'_>,
 ) -> Result<IndexerTest> {
+    test_with_scope(operation, settings, access)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// A shared caps failure applies to all configured scopes; a feed failure belongs to its domain.
+pub(crate) async fn test_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<IndexerTest, (IndexerError, Option<MediaDomain>)> {
     if !access.validate() {
-        return Err(IndexerError::InvalidRequest);
+        return Err((IndexerError::InvalidRequest, None));
     }
-    let (endpoint, torrent) = endpoint(settings)?;
-    let caps = capabilities(operation, endpoint, access.api_key).await?;
-    let (tv, movies) = scopes(settings)?;
+    let (endpoint, torrent) = endpoint(settings).map_err(|e| (e, None))?;
+    let caps = capabilities(operation, endpoint, access.api_key)
+        .await
+        .map_err(|e| (e, None))?;
+    let (tv, movies) = scopes(settings).map_err(|e| (e, None))?;
     let mut domains = vec![];
     for domain in tv
         .map(|_| MediaDomain::Tv)
         .into_iter()
         .chain(movies.map(|_| MediaDomain::Movies))
     {
-        let plan = plan_search(
-            settings,
-            &caps,
-            &IndexerSearch::Rss {
-                media_type: domain,
-                offset: 0,
-                query_index: 0,
-                limit: 1,
-            },
-        )?;
-        cooldown(
-            operation,
-            parse_page(
-                &fetch(
-                    operation,
-                    endpoint,
-                    access.api_key,
-                    private_parameters(access, domain, plan.parameters),
-                )
-                .await?,
-                0,
-                plan.limit,
-                torrent,
-                domain,
-            ),
-        )?;
+        let result: Result<()> = async {
+            let plan = plan_search(
+                settings,
+                &caps,
+                &IndexerSearch::Rss {
+                    media_type: domain,
+                    offset: 0,
+                    query_index: 0,
+                    limit: 1,
+                },
+            )?;
+            cooldown(
+                operation,
+                parse_page(
+                    &fetch(
+                        operation,
+                        endpoint,
+                        access.api_key,
+                        private_parameters(access, domain, plan.parameters),
+                    )
+                    .await?,
+                    0,
+                    plan.limit,
+                    torrent,
+                    domain,
+                ),
+            )?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error| (error, Some(domain)))?;
         domains.push(domain);
     }
     Ok(IndexerTest {

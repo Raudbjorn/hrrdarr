@@ -117,8 +117,9 @@ committed to disk.
 (`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
 are not rendered anywhere; the automated path's destination parent directory
 is always the library root, unchanged, because there is no journaled
-directory-creation capability yet. Multi-episode rendering
-(`multi_episode_style`) is still not consumed. Manual import
+directory-creation capability yet. Multi-episode rendering and its read-only
+destination resolver are described below; scan execution has separate acceptance
+requirements. Manual import
 (`src/import/mod.rs`'s `preview`/`ManualImportRequest`, the
 caller-supplied-destination path) is untouched by this renderer entirely.
 
@@ -153,9 +154,9 @@ four plus `standard_movie_format`, `movie_folder_format`. `colon_replacement`
 is one of `delete`, `dash`, `space_dash`, `space_dash_space`, `smart`,
 `custom`. `custom_colon_replacement` must be present iff `colon_replacement`
 is `custom`, 1–16 bytes, and free of control characters, `/`, `\`, and `:`.
-`multi_episode_style` (TV only) is `0`–`5` if present; the migration reserves
-the column but no multi-episode rendering exists yet (single episode/movie
-only — see Renderer below).
+`multi_episode_style` (TV only) is nullable: `0` Extend, `1` Duplicate,
+`2` Repeat, `3` Scene, `4` Range, `5` Prefixed range. Historical NULL remains
+unknown; no migration supplies a default. See multi-episode previews below.
 
 On a fresh install `GET` returns `rename_enabled: false`,
 `replace_illegal_characters: true`, `colon_replacement: "smart"`,
@@ -168,10 +169,9 @@ rows exactly. No default template is ever invented.
 (`rename_enabled`, `replace_illegal_characters`, `colon_replacement`,
 `custom_colon_replacement`, and the domain's format fields). A present
 parameter overrides the stored value for this preview only; nothing is
-persisted. An absent parameter falls back to the stored config. **A query
-string cannot express an explicit override to `null`** — there is no way to
-force a field to null through this endpoint; omit the parameter to use
-whatever is currently stored. Unknown or wrong-domain query parameters (for
+persisted. An absent parameter falls back to the stored config. **Single-example fields cannot express an explicit NULL override**; omission
+uses stored values. The additive multi-episode draft mode below gives its six
+specimens explicit NULL semantics without changing the single-example contract. Unknown or wrong-domain query parameters (for
 example a movie field on the TV route) fail 400. Overrides are validated with
 the same parser/validator as `PUT`, returning the same error codes on failure.
 The preview renders even when `rename_enabled` (stored or overridden) is
@@ -287,12 +287,12 @@ parser before touching any fact:
   built entirely from token output is instead checked at render time (below),
   since its content isn't known until then.
 
-## Renderer and sanitization (render time, `examples` only this iteration)
+## Renderer and sanitization
 
 The renderer (`src/naming/render.rs`) is a pure function — facts in, a
-sanitized string out, no I/O — deliberately structured so a later iteration
-can call it from the automated import path without change. It only renders a
-single episode or a single movie; `multi_episode_style` is not yet consumed.
+sanitized string out, no I/O. Single-episode and movie callers keep their existing
+rendering behavior. The set-aware TV entry point consumes complete membership
+and the stored multi-episode style.
 
 Per substituted token value, in order:
 
@@ -376,8 +376,8 @@ exercised only indirectly today, through whichever integration tests cover
 
 Outstanding: folder-format rendering
 (`series_folder_format`/`season_folder_format`/`specials_folder_format`/`movie_folder_format`)
-and the directory-creation it would require; multi-episode rendering; full naming
-UI parity. `NamingPanel.svelte` already provides configuration, previews and token help.
+and the directory-creation it would require; downloaded-scan execution and
+complete membership integration; full naming UI parity. `NamingPanel.svelte` already provides configuration, previews and token help.
 No live services, network calls, or fixed ports are used anywhere in
 this module.
 
@@ -423,4 +423,52 @@ Movie detail offers an explicit **Preview filenames** control, then reload and c
 
 The verified closed-vocabulary foundation and this preview capability do not claim the full upstream grammar. Required remaining families stay under broader naming/config parity: clean/article/first-character/original/translated/certification/collection titles; IMDb/TMDb tokens; original filename/title/release-group tokens; standalone Quality Proper/Real; media-info codec/depth/channels/language/3D/HDR tokens and filters; general token separator/case/optional punctuation/truncation and nested filename-template behavior. Original/translated/certification/collection metadata authority, certification-country selection, 3D normalization and their producers require separate schema/metadata contracts. Current preview never fabricates those facts or silently treats unsupported stored templates as no change. Future accepted grammar must be shared with this preview rather than implemented in a second parser.
 
-No V3 wire compatibility, full source naming equivalence, TV multi-episode previews, movie-folder moves, rename execution or filesystem safety is claimed. Parent verification evidence, not this documentation, establishes observed coverage; this feature adds no persistent state or dependency.
+No V3 wire compatibility, full source naming equivalence, movie-folder moves, rename execution or filesystem safety is claimed. Parent verification evidence, not this documentation, establishes observed coverage; this feature adds no persistent state or dependency.
+
+
+## Multi-episode naming and draft previews
+
+`render_episode_set` accepts the complete sorted episode set for one series and
+season. Exact duplicate members are deduplicated; conflicting IDs/coordinates,
+missing required dates or absolute numbers, and cross-season sets fail explicitly.
+`{absolute:0}` through `{absolute:0000}` are accepted only in anime filename
+formats. One minimum episode ID is never used as a substitute for the member set.
+
+For episodes 7, 8 and 9 with `S{season:00}E{episode:00}`, the six modes produce:
+
+| Stored value | Mode | Number block |
+| --- | --- | --- |
+| 0 | Extend | S03E07-08-09 |
+| 1 | Duplicate | S03E07 - S03E08 - S03E09 |
+| 2 | Repeat | S03E07E08E09 |
+| 3 | Scene | S03E07-E08-E09 |
+| 4 | Range | S03E07-09 |
+| 5 | Prefixed range | S03E07-E09 |
+
+Distinct ranges use `+` where needed to preserve gaps; Range for 7, 8 and 10
+is `S03E07-08+10`, never a range that invents episode 9. Titles and dates use
+complete validated member facts. Multi-member filenames fail if the complete
+name exceeds 255 bytes rather than truncating away membership. The destination
+resolver validates the basename, reads membership and settings in the caller's
+transaction, and returns the captured naming revision. The scan producer must
+still reserve collisions and revalidate that revision before effects.
+
+TV `GET .../examples` additionally accepts `multi_episode_style` and
+`multi_episode_draft`. With `multi_episode_draft=true`, `rename_enabled` is
+required, and omitted style/filename templates mean NULL for the multi-episode
+specimens. Without draft mode, omitted fields use saved settings. The six
+`multi_episode_examples` cover standard/daily/anime formats with consecutive
+and nonconsecutive episodes. Each contains `field`, `contiguous`, `episodes`,
+`status`, `filename`, and `reason`; statuses are `rendered`, `preserved`,
+`needs_policy`, or `invalid`.
+
+Rename disabled or a NULL applicable template preserves the validated complete
+specimen basename. An enabled configured multi-episode template with NULL style
+requires a policy choice. These are read-only examples; a successful preview does
+not authorize an import or prove filesystem safety. The naming editor displays
+all six modes and invalidates older responses when the draft changes.
+
+Regression sources: `tests/downloaded_scan_naming.rs`, naming destination module
+tests, `frontend/tests/api.test.mjs`, and
+`frontend/tests/multi-episode-naming-browser.mjs`. Their presence is not a test
+result; the iteration acceptance report records which checks actually passed.

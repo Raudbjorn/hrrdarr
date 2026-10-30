@@ -348,6 +348,37 @@ async fn recognized_raw_text_is_validated_before_lossy_driver_extraction() {
                 .unwrap()
                 .applied
         );
+        let c = isolated.connect().await.unwrap();
+        assert_eq!(
+            c.query("SELECT title FROM movie_collections", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "Ísland collection"
+        );
+        let archived: String = c
+            .query(
+                "SELECT record_json FROM snapshot_records WHERE source_table='Collections'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(&archived).unwrap();
+        assert_eq!(
+            row["Title"],
+            serde_json::json!(["text", "Ísland collection"])
+        );
     }
     let tv = source(
         &s,

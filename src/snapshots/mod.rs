@@ -7,6 +7,7 @@ mod completed_download_handling;
 mod custom_formats;
 mod delay_profiles;
 mod history;
+mod import_policy;
 mod profiles;
 mod providers;
 mod readers;
@@ -25,6 +26,7 @@ use std::{
 
 pub const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ROWS: usize = 100_000;
+const MAX_CELL_BYTES: usize = 1024 * 1024;
 const MAX_TABLES: usize = 128;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 // ponytail: one importer per process; per-database permits if concurrent library imports are needed.
@@ -264,6 +266,7 @@ async fn import_inner(
     let collection_plan = collections::read(&source, app, &mut plan.unsupported)?;
     let cdh_plan = completed_download_handling::read(&source, &mut plan.unsupported)?;
     let revision_policy_plan = revision_policy::read(&source, &mut plan.unsupported)?;
+    let import_policy_plan = import_policy::read(&source, &mut plan.unsupported)?;
     let release_profile_plan = release_profiles::read(&source, app, &mut plan.unsupported).await?;
     let delay_plan = delay_profiles::read(&source, app, &mut plan.unsupported)?;
     let tag_plan = tags::read(&source, app, &mut plan.unsupported)?;
@@ -288,13 +291,13 @@ async fn import_inner(
         missing_file_records: plan.missing,
         unsupported: plan.unsupported,
         provider_conflicts: Vec::new(),
-        policy: "Core library, supported Radarr collections/exclusions and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
+        policy: "Core library, supported Radarr collections/exclusions and tags/assignments, supported custom formats, whole profiles and assignments, supported revision/delay/release-profile/CDH/import-policy settings, and supported source History and managed Blocklist facts only. Unsupported records/fields including credentials are retained privately and remain inactive. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. Media existence, permissions, mounts and path mappings are unverified; no media was accessed. Upload must be an exported consistent backup, not a live database copy.",
     };
     if let Some(options) = provider_options {
         report.policy = if options.allow_unmapped {
-            "Supported Radarr collections/exclusions, tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Unresolved source providers stay unmapped, are listed in provider_conflicts and do not block the rest of the import; indexers bound to them are not reconstructed. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
+            "Supported Radarr collections/exclusions, tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH/import-policy settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Unresolved source providers stay unmapped, are listed in provider_conflicts and do not block the rest of the import; indexers bound to them are not reconstructed. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
         } else {
-            "Supported Radarr collections/exclusions, tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Any unresolved source provider is a blocking conflict listed in provider_conflicts. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
+            "Supported Radarr collections/exclusions, tags/assignments, custom formats and whole profiles/assignments, supported revision/delay/release-profile/CDH/import-policy settings, source History/Blocklist facts and provider configurations are reconstructed. A source provider binds to the one existing configuration that exactly matches it, unchanged whatever its enabled or test state; otherwise it is created disabled and untested. Any unresolved source provider is a blocking conflict listed in provider_conflicts. Credentials require the configured encryption key. Unsupported fields and all raw source rows remain private archives. No source clients, jobs or sessions are resumed. Supported CDH settings may reconcile existing enabled native scopes. No network or media access occurs."
         };
     }
     let conn = db.connect().await?;
@@ -304,11 +307,20 @@ async fn import_inner(
     let result = async {
         let prepared =
             profiles::prepare(&tx, &profile_plan, &mut plan.entities, &mut report).await?;
-        write(&tx, &source, &plan.entities, &plan.seasons, &mut report).await?;
+        write(
+            &tx,
+            &source,
+            &plan.entities,
+            &plan.seasons,
+            &mut report,
+            true,
+        )
+        .await?;
         profiles::finish(&tx, prepared, &mut report).await?;
         tags::write(&tx, &tag_plan, &mut report).await?;
         collections::write(&tx, &collection_plan, &mut report).await?;
         revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
+        import_policy::write(&tx, import_policy_plan.as_ref(), &mut report).await?;
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
         history::write(&tx, &history_plan, &mut report).await?;
         blocklist::write(&tx, &blocklist_plan, &mut report).await?;
@@ -413,7 +425,7 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
         );
     }
     // Reject computed columns; expression indexes are valid in Sonarr233 and are never used below.
-    for name in tables.keys() {
+    for (name, table) in &mut tables {
         let mut columns = conn
             .query(&format!("PRAGMA table_xinfo({})", identifier(name)?), ())
             .await?;
@@ -423,6 +435,12 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
                     "generated or hidden snapshot columns are unsupported",
                 ));
             }
+            if table.columns.len() >= 256 {
+                return Err(ImportError("snapshot exceeds column limit"));
+            }
+            let column: String = row.get(1)?;
+            identifier(&column)?;
+            table.columns.push(column);
         }
     }
     // quick_check omits index-content verification; ignore_check_constraints prevents
@@ -444,28 +462,33 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
             collections::preflight(&conn, name, &mut collection_bytes).await?;
         }
     }
+    let encoding: String = conn
+        .query("PRAGMA encoding", ())
+        .await?
+        .next()
+        .await?
+        .ok_or(ImportError("missing source encoding"))?
+        .get(0)?;
     let mut row_count = 0;
     let mut archive_bytes = 0;
     for (name, table) in &mut tables {
+        // libSQL 0.9.30 reads TEXT via CStr, which truncates at embedded NUL.
+        // Project bounded byte payloads alongside original storage types instead.
+        // Names were validated once above; at most 512 result columns are produced.
+        let projection = table.columns.iter().map(|column| {
+            let quoted = identifier(column)?;
+            Ok(format!("typeof({quoted}),CASE WHEN typeof({quoted}) IN ('text','blob') THEN coalesce(substr(CAST({quoted} AS BLOB),1,{}),X'') ELSE {quoted} END",MAX_CELL_BYTES+1))
+        }).collect::<Result<Vec<_>>>()?.join(",");
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT * FROM {} NOT INDEXED LIMIT {}",
+                    "SELECT {projection} FROM {} NOT INDEXED LIMIT {}",
                     identifier(name)?,
                     MAX_ROWS + 1
                 ),
                 (),
             )
             .await?;
-        if rows.column_count() > 256 {
-            return Err(ImportError("snapshot exceeds column limit"));
-        }
-        table.columns = (0..rows.column_count())
-            .map(|i| rows.column_name(i).unwrap_or("").to_owned())
-            .collect();
-        for col in &table.columns {
-            identifier(col)?;
-        }
         while let Some(row) = rows.next().await? {
             row_count += 1;
             if row_count > MAX_ROWS {
@@ -473,12 +496,26 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
             }
             let mut record = BTreeMap::new();
             for (i, col) in table.columns.iter().enumerate() {
-                let value = row.get_value(i as i32)?;
-                if matches!(&value, Value::Text(s) if s.len() > 1024*1024)
-                    || matches!(&value, Value::Blob(b) if b.len() > 1024*1024)
-                {
-                    return Err(ImportError("snapshot exceeds cell limit"));
-                }
+                let kind: String = row.get((i * 2) as i32)?;
+                let payload = row.get_value((i * 2 + 1) as i32)?;
+                let value = match (kind.as_str(), payload) {
+                    ("text" | "blob", Value::Blob(bytes)) => {
+                        if bytes.len() > MAX_CELL_BYTES {
+                            return Err(ImportError("snapshot exceeds cell limit"));
+                        }
+                        if kind == "text" {
+                            Value::Text(decode_source_text(bytes, &encoding)?)
+                        } else {
+                            Value::Blob(bytes)
+                        }
+                    }
+                    ("integer", value @ Value::Integer(_)) | ("null", value @ Value::Null) => value,
+                    ("real", Value::Real(value)) if value.is_finite() => Value::Real(value),
+                    ("real", Value::Real(_)) => {
+                        return Err(ImportError("unsupported non-finite source value"));
+                    }
+                    _ => return Err(ImportError("invalid source storage type")),
+                };
                 record.insert(col.clone(), value);
             }
             archive_bytes += archive(&record)?.len();
@@ -500,6 +537,34 @@ async fn read_upload(bytes: Vec<u8>, app: Application) -> Result<Source> {
         .max()
         .ok_or(ImportError("snapshot has no schema version"))?;
     Ok(Source { tables, version })
+}
+
+// CAST(TEXT AS BLOB) preserves source bytes in the database encoding, including NULs.
+fn decode_source_text(raw: Vec<u8>, encoding: &str) -> Result<String> {
+    let invalid = ImportError("invalid source text encoding");
+    let decoded = match encoding {
+        "UTF-8" => String::from_utf8(raw).map_err(|_| invalid)?,
+        "UTF-16le" | "UTF-16be" => {
+            if raw.len() % 2 != 0 {
+                return Err(invalid);
+            }
+            let units = raw.chunks_exact(2).map(|v| {
+                if encoding == "UTF-16le" {
+                    u16::from_le_bytes([v[0], v[1]])
+                } else {
+                    u16::from_be_bytes([v[0], v[1]])
+                }
+            });
+            std::char::decode_utf16(units)
+                .collect::<std::result::Result<String, _>>()
+                .map_err(|_| invalid)?
+        }
+        _ => return Err(invalid),
+    };
+    if decoded.len() > MAX_CELL_BYTES {
+        return Err(ImportError("snapshot exceeds cell limit"));
+    }
+    Ok(decoded)
 }
 
 fn archive(record: &Record) -> Result<String> {
@@ -558,9 +623,17 @@ async fn write(
     entities: &[Entity],
     seasons: &[(i64, i64, i64)],
     report: &mut Report,
+    series_runtime_supported: bool,
 ) -> Result<()> {
     let app = report.application.name();
-    conn.execute("INSERT INTO snapshot_imports (application,fingerprint,schema_version,episode_metadata_version) VALUES (?1,?2,?3,1) ON CONFLICT DO NOTHING", params![app, report.fingerprint.clone(), source.version]).await?;
+    // Production always requires 0055. Only the historical fixture entrypoint
+    // explicitly disables the new field when constructing a predecessor schema.
+    if series_runtime_supported {
+        conn.execute("INSERT INTO snapshot_imports (application,fingerprint,schema_version,episode_metadata_version,series_runtime_version) VALUES (?1,?2,?3,1,1) ON CONFLICT DO NOTHING", params![app, report.fingerprint.clone(), source.version]).await?;
+    } else {
+        conn.execute("INSERT INTO snapshot_imports (application,fingerprint,schema_version,episode_metadata_version) VALUES (?1,?2,?3,1) ON CONFLICT DO NOTHING", params![app, report.fingerprint.clone(), source.version]).await?;
+    }
+    let old_series_runtime = series_runtime_supported && conn.query("SELECT series_runtime_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let old_metadata=conn.query("SELECT episode_metadata_version FROM snapshot_imports WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?.next().await?.ok_or(ImportError("snapshot mapping disappeared"))?.get::<i64>(0)?==0;
     let mut ids = BTreeMap::new();
     let mut seasons_done = false;
@@ -584,6 +657,9 @@ async fn write(
         let mut fields = Vec::new();
         let mut unresolved = false;
         for (col, field) in &entity.fields {
+            if entity.table == "series" && *col == "runtime" && !series_runtime_supported {
+                continue;
+            }
             let value = match field {
                 Field::Value(v) => v.clone(),
                 Field::Reference(table, id) => match ids.get(&(*table, *id)) {
@@ -621,11 +697,14 @@ async fn write(
                 row.get_value((i + 1) as i32)
                     .is_ok_and(|actual| actual == *v)
             });
-            let can_backfill = old_metadata
-                && entity.table == "episodes"
+            let can_backfill = ((old_metadata && entity.table == "episodes")
+                || (old_series_runtime && entity.table == "series"))
                 && fields.iter().enumerate().all(|(i, (col, value))| {
                     row.get_value((i + 1) as i32).is_ok_and(|actual| {
-                        if crate::episodes::METADATA_COLUMNS.contains(col) {
+                        if (entity.table == "episodes"
+                            && crate::episodes::METADATA_COLUMNS.contains(col))
+                            || (entity.table == "series" && *col == "runtime")
+                        {
                             actual == Value::Null
                         } else {
                             actual == *value
@@ -670,13 +749,18 @@ async fn write(
             {
                 let metadata = fields
                     .iter()
-                    .filter(|(c, _)| crate::episodes::METADATA_COLUMNS.contains(c))
+                    .filter(|(c, _)| {
+                        (entity.table == "episodes"
+                            && crate::episodes::METADATA_COLUMNS.contains(c))
+                            || (entity.table == "series" && *c == "runtime")
+                    })
                     .collect::<Vec<_>>();
                 let mut values = metadata.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
                 values.push(Value::Integer(*id));
                 conn.execute(
                     &format!(
-                        "UPDATE episodes SET {} WHERE id=?",
+                        "UPDATE {} SET {} WHERE id=?",
+                        entity.table,
                         metadata
                             .iter()
                             .map(|(c, _)| format!("{c}=?"))
@@ -745,6 +829,9 @@ async fn write(
         }
     }
     conn.execute("UPDATE snapshot_imports SET episode_metadata_version=1 WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?;
+    if series_runtime_supported {
+        conn.execute("UPDATE snapshot_imports SET series_runtime_version=1 WHERE application=?1 AND fingerprint=?2",params![app,report.fingerprint.clone()]).await?;
+    }
     Ok(())
 }
 async fn write_seasons(
@@ -810,7 +897,24 @@ pub(crate) async fn write_core_snapshot_fixture(
         provider_conflicts: Vec::new(),
         policy: "test predecessor",
     };
-    write(conn, &source, &plan.entities, &plan.seasons, &mut report).await?;
+    let series_runtime_supported = conn
+        .query(
+            "SELECT 1 FROM pragma_table_info('series') WHERE name='runtime'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    write(
+        conn,
+        &source,
+        &plan.entities,
+        &plan.seasons,
+        &mut report,
+        series_runtime_supported,
+    )
+    .await?;
     assert_eq!(report.conflicts, 0);
     Ok(())
 }

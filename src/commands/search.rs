@@ -33,8 +33,15 @@ pub struct SearchCommandInput {
     pub target: MediaTarget,
     pub indexer_id: Uuid,
     pub indexer_revision: i64,
-    pub client_id: Uuid,
-    pub client_revision: i64,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_selection: Option<crate::providers::ClientSelection>,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "super::present")]
+    #[ts(optional)]
+    pub client_revision: Option<i64>,
     pub priority: CommandPriority,
 }
 #[derive(Serialize, ts_rs::TS)]
@@ -53,6 +60,8 @@ pub struct SearchCommand {
     pub error_code: Option<String>,
     pub fetched: u32,
     pub fetch_complete: bool,
+    pub selected_client_id: Option<Uuid>,
+    pub selected_client_attempts: Vec<rss::ClientAttempt>,
     pub selected_candidate_id: Option<Uuid>,
     pub selected_candidate_status: Option<String>,
     pub selected_candidate_error_code: Option<String>,
@@ -108,7 +117,7 @@ struct Context {
     db: Arc<Database>,
     client: RefreshClient,
 }
-const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id)";
+const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),c.selection_kind,(SELECT r.client_id FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),coalesce((SELECT json_group_array(json_object('ordinal',a.ordinal,'selection_round',a.selection_round,'client_id',a.client_id,'client_revision',a.client_revision,'state',a.state,'error_code',a.error_code,'created_at',a.created_at,'updated_at',a.updated_at)) FROM (SELECT a.* FROM rss_client_attempts a JOIN search_results s ON s.selected_candidate_id=a.candidate_id WHERE s.command_id=c.id ORDER BY a.ordinal) a),'[]')";
 fn parse_mode(s: &str) -> Result<SearchMode> {
     match s {
         "automatic" => Ok(SearchMode::Automatic),
@@ -138,7 +147,8 @@ fn command_row(r: libsql::Row) -> Result<SearchCommand> {
             media_type: media,
             indexer_id: uuid(r.get(5)?)?,
             indexer_revision: r.get(6)?,
-            client_id: uuid(r.get(7)?)?,
+            selection_kind: rss::SelectionKind::parse(&r.get::<String>(23)?)?,
+            client_id: r.get::<Option<String>>(7)?.map(uuid).transpose()?,
             client_revision: r.get(8)?,
         },
         priority: if r.get::<i64>(9)? == 1 {
@@ -155,6 +165,8 @@ fn command_row(r: libsql::Row) -> Result<SearchCommand> {
         error_code: r.get(16)?,
         fetched: r.get::<i64>(17)? as u32,
         fetch_complete: r.get::<i64>(18)? == 1,
+        selected_client_id: r.get::<Option<String>>(24)?.map(uuid).transpose()?,
+        selected_client_attempts: serde_json::from_str(&r.get::<String>(25)?).map_err(|_| bad())?,
         selected_candidate_id: r.get::<Option<String>>(19)?.map(uuid).transpose()?,
         selected_candidate_status: r.get(20)?,
         selected_candidate_error_code: r.get(21)?,
@@ -290,23 +302,46 @@ async fn evaluate(
     if !matches_target(&command.target, &decision.target) {
         decision.deny("requested_target_mismatch")
     }
-    if release.facts.torrent.is_none() {
+    // Torrent indexers must supply torrent facts; usenet releases are dispatched to usenet clients.
+    if release.facts.torrent.is_none()
+        && rss::indexer_protocol(c, command.source.indexer_id).await?
+            != Some(crate::providers::Protocol::Usenet)
+    {
         decision.deny("unsupported_protocol")
     }
     decision.not_before = None;
     Ok(decision)
 }
 fn envelope(id: Uuid, command: &SearchCommand) -> String {
-    format!(
-        "search-result/{}/{}/{}/{}/{}/{}/{}",
-        id,
-        command.id,
-        command.source.indexer_id,
-        command.source.indexer_revision,
-        command.source.client_id,
-        command.source.client_revision,
-        domain(command.source.media_type)
-    )
+    if matches!(
+        command.source.selection_kind,
+        rss::SelectionKind::LegacyFixed
+    ) {
+        format!(
+            "search-result/{}/{}/{}/{}/{}/{}/{}",
+            id,
+            command.id,
+            command.source.indexer_id,
+            command.source.indexer_revision,
+            command
+                .source
+                .client_id
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            command.source.client_revision.unwrap_or_default(),
+            domain(command.source.media_type)
+        )
+    } else {
+        format!(
+            "search-result-v2/{}/{}/{}/{}/{}/{}",
+            id,
+            command.id,
+            command.source.indexer_id,
+            command.source.indexer_revision,
+            domain(command.source.media_type),
+            command.source.selection_kind.text()
+        )
+    }
 }
 pub(crate) fn router(db: Arc<Database>, client: RefreshClient) -> Router {
     Router::new()
@@ -334,32 +369,304 @@ async fn create(
     let input = input.map_err(|_| bad())?.0;
     let (media, episode, movie) = target_parts(&input.target);
     let id = episode.or(movie).ok_or_else(bad)?;
-    if !(1..=MAX_REVISION).contains(&id)
-        || !(1..=MAX_REVISION).contains(&input.indexer_revision)
-        || !(1..=MAX_REVISION).contains(&input.client_revision)
-    {
+    if !(1..=MAX_REVISION).contains(&id) || !(1..=MAX_REVISION).contains(&input.indexer_revision) {
         return Err(bad());
     }
+    let source = rss::RssTargetInput {
+        media_type: media,
+        indexer_id: input.indexer_id,
+        indexer_revision: input.indexer_revision,
+        client_selection: input.client_selection,
+        client_id: input.client_id,
+        client_revision: input.client_revision,
+    }
+    .normalize()?;
     let c = connection(&s.db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
- match read(&tx,input.request_id).await { Ok(existing)=>{
- if existing.mode!=input.mode||existing.target!=input.target||existing.source.indexer_id!=input.indexer_id||existing.source.indexer_revision!=input.indexer_revision||existing.source.client_id!=input.client_id||existing.source.client_revision!=input.client_revision||existing.priority.number()!=input.priority.number(){return Err(conflict())}
- return bounded(existing)
- },Err(Error(StatusCode::NOT_FOUND,"search_command_not_found"))=>(),Err(e)=>return Err(e)}
- let source=rss::RssTarget{media_type:media,indexer_id:input.indexer_id,indexer_revision:input.indexer_revision,client_id:input.client_id,client_revision:input.client_revision};
- if !rss::valid_target(&tx,source,input.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}
- // A selected offer must never depend on an unencrypted locator fallback.
- s.client.seal_release("search-key-preflight",b"configured").map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?;
- let captured=identity(&tx,&input.target).await?;let timestamp=now()?;
- if command_capacity(&tx).await?>=MAX_COMMANDS{return Err(Error(StatusCode::TOO_MANY_REQUESTS,"command_history_full"))}
- tx.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0)",params![input.request_id.to_string(),input.mode.text(),domain(media),episode,movie,captured,input.indexer_id.to_string(),input.indexer_revision,input.client_id.to_string(),input.client_revision,input.priority.number(),timestamp,timestamp]).await?;
- bounded(read(&tx,input.request_id).await?)
- }.await;
+    let outcome = async {
+        match read(&tx, input.request_id).await {
+            Ok(existing) => {
+                if existing.mode != input.mode
+                    || existing.target != input.target
+                    || !same_source(&existing, source)
+                    || existing.priority.number() != input.priority.number()
+                {
+                    return Err(conflict());
+                }
+                return bounded(existing);
+            }
+            Err(Error(StatusCode::NOT_FOUND, "search_command_not_found")) => (),
+            Err(e) => return Err(e),
+        }
+        preflight(&tx, &s.client, source, input.mode).await?;
+        let captured = identity(&tx, &input.target).await?;
+        let timestamp = now()?;
+        if command_capacity(&tx).await? >= MAX_COMMANDS {
+            return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
+        }
+        insert(
+            &tx,
+            input.request_id,
+            input.mode,
+            &input.target,
+            &captured,
+            source,
+            input.priority,
+            timestamp,
+        )
+        .await?;
+        bounded(read(&tx, input.request_id).await?)
+    }
+    .await;
     Ok((StatusCode::ACCEPTED, finish(tx, outcome).await?))
 }
+fn same_source(existing: &SearchCommand, source: rss::RssTarget) -> bool {
+    existing.source.media_type == source.media_type
+        && existing.source.indexer_id == source.indexer_id
+        && existing.source.indexer_revision == source.indexer_revision
+        && existing.source.selection_kind == source.selection_kind
+        && existing.source.client_id == source.client_id
+        && existing.source.client_revision == source.client_revision
+}
+/// Provider scope, protocol and key readiness shared by single and Wanted admission.
+async fn preflight(
+    c: &Connection,
+    client: &RefreshClient,
+    source: rss::RssTarget,
+    mode: SearchMode,
+) -> Result<()> {
+    if rss::protocol_mismatch(c, source).await? {
+        return Err(rss::protocol_rejection());
+    }
+    if !rss::valid_target(c, source, mode.operation()).await? {
+        return Err(Error(StatusCode::CONFLICT, "provider_changed"));
+    }
+    // A selected offer must never depend on an unencrypted locator fallback.
+    client
+        .seal_release("search-key-preflight", b"configured")
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code))?;
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+async fn insert(
+    c: &Connection,
+    id: Uuid,
+    mode: SearchMode,
+    target: &MediaTarget,
+    captured: &str,
+    source: rss::RssTarget,
+    priority: CommandPriority,
+    timestamp: i64,
+) -> Result<()> {
+    let (media, episode, movie) = target_parts(target);
+    c.execute("INSERT INTO search_commands(id,mode,decision_context,media_type,requested_episode_id,requested_movie_id,captured_target_json,indexer_id,indexer_revision,client_id,client_revision,priority,status,attempts,next_attempt_at,created_at,fetched,fetch_complete,selection_kind)VALUES(?,?,'user_search',?,?,?,?,?,?,?,?,?,'queued',0,?,?,0,0,?)",params![id.to_string(),mode.text(),domain(media),episode,movie,captured.to_owned(),source.indexer_id.to_string(),source.indexer_revision,source.client_id.map(|v|v.to_string()),source.client_revision,priority.number(),timestamp,timestamp,source.selection_kind.text()]).await?;
+    Ok(())
+}
+
+/// Most targets one Wanted request may capture; it equals the shared active-command pool.
+pub(crate) const MAX_WANTED_TARGETS: usize = MAX_COMMANDS as usize;
+pub(crate) struct WantedChild {
+    pub target: MediaTarget,
+    pub command_id: Uuid,
+}
+pub(crate) struct WantedAdmission {
+    pub replayed: bool,
+    pub matched: Option<u32>,
+    pub skipped_active: Option<u32>,
+    pub children: Vec<WantedChild>,
+}
+fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(context.finish().as_ref());
+    out
+}
+/// Children of one Wanted request share a 64-bit prefix derived from the request UUID alone,
+/// so an exact replay finds its original capture by an indexed range read. The suffix binds
+/// the canonical request digest and target; a different body under the same UUID conflicts.
+fn child_id(request: Uuid, digest: &[u8; 32], media: MediaDomain, target: i64) -> Uuid {
+    let prefix = sha256(&[b"hrrdarr-wanted-request-v1", request.as_bytes()]);
+    let suffix = sha256(&[
+        b"hrrdarr-wanted-child-v1",
+        request.as_bytes(),
+        digest,
+        domain(media).as_bytes(),
+        &target.to_be_bytes(),
+    ]);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&prefix[..8]);
+    bytes[8..].copy_from_slice(&suffix[..8]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+fn child_range(request: Uuid) -> (String, String) {
+    let prefix = child_id(request, &[0; 32], MediaDomain::Tv, 0).to_string()[..18].to_owned();
+    (
+        format!("{prefix}-0000-000000000000"),
+        format!("{prefix}-ffff-ffffffffffff"),
+    )
+}
+fn target_id(target: &MediaTarget) -> i64 {
+    match target {
+        MediaTarget::Episode(id) | MediaTarget::Movie(id) => *id,
+    }
+}
+/// Atomically admits every target `select` captures inside one Immediate transaction as
+/// ordinary durable user-search commands (no batch table, no second worker). Whole requests
+/// beyond the target bound or the remaining shared pool are refused; nothing is partially
+/// admitted. `skip_active` omits targets that already have an active search command.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn admit_wanted<F>(
+    db: &Database,
+    client: &RefreshClient,
+    request_id: Uuid,
+    digest: [u8; 32],
+    source: rss::RssTargetInput,
+    priority: CommandPriority,
+    skip_active: bool,
+    select: F,
+) -> Result<WantedAdmission>
+where
+    F: AsyncFnOnce(&Connection, i64) -> Result<Vec<i64>>,
+{
+    let media = source.media_type;
+    let source = source.normalize()?;
+    let mode = SearchMode::Automatic;
+    let c = connection(db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let (low, high) = child_range(request_id);
+        let mut rows = tx
+            .query(
+                &format!("SELECT {COLUMNS} FROM search_commands c WHERE c.id BETWEEN ? AND ? ORDER BY c.id LIMIT ?"),
+                params![low, high, MAX_WANTED_TARGETS as i64 + 1],
+            )
+            .await?;
+        let mut existing = Vec::new();
+        while let Some(row) = rows.next().await? {
+            existing.push(command_row(row)?);
+        }
+        drop(rows);
+        if !existing.is_empty() {
+            let mut children = Vec::with_capacity(existing.len());
+            for command in existing {
+                if child_id(request_id, &digest, media, target_id(&command.target)) != command.id
+                    || command.mode != mode
+                    || !same_source(&command, source)
+                    || command.priority.number() != priority.number()
+                {
+                    return Err(conflict());
+                }
+                children.push(WantedChild {
+                    target: command.target,
+                    command_id: command.id,
+                });
+            }
+            children.sort_by_key(|child| target_id(&child.target));
+            return Ok(WantedAdmission {
+                replayed: true,
+                matched: None,
+                skipped_active: None,
+                children,
+            });
+        }
+        preflight(&tx, client, source, mode).await?;
+        let timestamp = now()?;
+        let mut ids = select(&*tx, timestamp).await?;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() > MAX_WANTED_TARGETS {
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "wanted_search_target_limit"));
+        }
+        if ids.iter().any(|id| !(1..=MAX_REVISION).contains(id)) {
+            return Err(bad());
+        }
+        let matched = ids.len();
+        if skip_active {
+            let column = match media {
+                MediaDomain::Tv => "requested_episode_id",
+                MediaDomain::Movies => "requested_movie_id",
+            };
+            let mut rows = tx
+                .query(
+                    &format!("SELECT DISTINCT {column} FROM search_commands WHERE media_type=? AND status IN ('queued','running','retry_wait') AND {column} IS NOT NULL LIMIT ?"),
+                    params![domain(media), MAX_COMMANDS + 1],
+                )
+                .await?;
+            let mut active = std::collections::BTreeSet::new();
+            while let Some(row) = rows.next().await? {
+                active.insert(row.get::<i64>(0)?);
+            }
+            ids.retain(|id| !active.contains(id));
+        }
+        if command_capacity(&tx).await? + ids.len() as i64 > MAX_COMMANDS {
+            return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
+        }
+        let mut children = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let target = match media {
+                MediaDomain::Tv => MediaTarget::Episode(*id),
+                MediaDomain::Movies => MediaTarget::Movie(*id),
+            };
+            let captured = identity(&tx, &target).await?;
+            let command_id = child_id(request_id, &digest, media, *id);
+            insert(&tx, command_id, mode, &target, &captured, source, priority, timestamp).await?;
+            children.push(WantedChild { target, command_id });
+        }
+        Ok(WantedAdmission {
+            replayed: false,
+            matched: Some(matched as u32),
+            skipped_active: Some((matched - ids.len()) as u32),
+            children,
+        })
+    }
+    .await;
+    finish(tx, outcome).await
+}
+
+#[cfg(test)]
+mod wanted_child_tests {
+    use super::*;
+    #[test]
+    fn children_share_a_request_prefix_and_bind_body_and_target() {
+        let request = Uuid::new_v4();
+        let (low, high) = child_range(request);
+        let a = child_id(request, &[1; 32], MediaDomain::Tv, 7).to_string();
+        let b = child_id(request, &[1; 32], MediaDomain::Tv, 8).to_string();
+        let c = child_id(request, &[2; 32], MediaDomain::Tv, 7).to_string();
+        let movie = child_id(request, &[1; 32], MediaDomain::Movies, 7).to_string();
+        for id in [&a, &b, &c, &movie] {
+            assert!(
+                low.as_str() <= id.as_str() && id.as_str() <= high.as_str(),
+                "{id}"
+            );
+            assert_eq!(
+                &id[14..15],
+                "8",
+                "version 8 never collides with client v4 ids"
+            );
+        }
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, movie);
+        assert_eq!(
+            a,
+            child_id(request, &[1; 32], MediaDomain::Tv, 7).to_string()
+        );
+        let other = child_id(Uuid::new_v4(), &[1; 32], MediaDomain::Tv, 7).to_string();
+        assert_ne!(&a[..18], &other[..18]);
+    }
+}
+
 async fn detail(
     State(s): State<Context>,
     Path(id): Path<String>,
@@ -484,14 +791,13 @@ async fn grab(
     let c = connection(&s.db).await?;
     let mut operation = crate::search::operation_evidence()
         .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
-    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await? {
-        if let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
+    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await?
+        && let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
             let command=read(&c,uuid(row.get::<String>(0)?)?).await?;
             let mut bytes=s.client.open_release(&envelope(id,&command),&payload).map_err(|e|Error(StatusCode::CONFLICT,e.code))?;
             let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::CONFLICT,"invalid_release"))?;
             evaluate(&c,&command,&release, &mut operation).await?;
         }
-    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -589,7 +895,7 @@ async fn select(
     {
         return Err(Error(StatusCode::TOO_MANY_REQUESTS, "candidate_limit"));
     }
-    c.execute("INSERT INTO rss_candidates(id,command_id,search_result_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at)VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?,?,'pending','[]',?,?)",params![candidate_id.to_string(),id.to_string(),domain(command.source.media_type),command.source.indexer_id.to_string(),command.source.indexer_revision,command.source.client_id.to_string(),command.source.client_revision,fingerprint,title,sealed,series,movie,timestamp,timestamp]).await?;
+    c.execute("INSERT INTO rss_candidates(id,command_id,search_result_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,movie_id,status,decision_reasons_json,created_at,updated_at,selection_kind)VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?,?,'pending','[]',?,?,?)",params![candidate_id.to_string(),id.to_string(),domain(command.source.media_type),command.source.indexer_id.to_string(),command.source.indexer_revision,command.source.client_id.map(|v|v.to_string()),command.source.client_revision,fingerprint,title,sealed,series,movie,timestamp,timestamp,command.source.selection_kind.text()]).await?;
     if let Some(episode) = episode {
         c.execute(
             "INSERT INTO rss_candidate_episodes(candidate_id,series_id,episode_id)VALUES(?,?,?)",

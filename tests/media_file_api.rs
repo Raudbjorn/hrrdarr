@@ -207,11 +207,28 @@ async fn media_file_http_domains_patch_semantics_and_atomicity() -> Result<(), E
             .get::<i64>(0)?,
         2
     );
+    // Explicit quality v0 is source-supported and must survive both write and readback.
+    for domain in ["tv", "movies"] {
+        let quality = json!({"quality_id":20,"revision":{"version":0,"real":0,"is_repack":false}});
+        let (code, changed) = request(
+            address,
+            "PUT",
+            &path(domain, "/7"),
+            &json!({"quality":quality}).to_string(),
+        )
+        .await;
+        assert_eq!(code, 200, "{changed}");
+        assert_eq!(changed["quality"], quality);
+        assert_eq!(
+            request(address, "GET", &path(domain, "/7"), "").await.1["quality"],
+            quality
+        );
+    }
     for (domain, bad) in [
         ("tv", json!({"quality":{"quality_id":31}})),
         (
             "tv",
-            json!({"quality":{"quality_id":20,"revision":{"version":0,"real":0,"is_repack":false}}}),
+            json!({"quality":{"quality_id":20,"revision":{"version":-1,"real":0,"is_repack":false}}}),
         ),
         (
             "tv",

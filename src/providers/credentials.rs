@@ -1,18 +1,18 @@
 use ring::{
-    aead,
+    aead, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
 
 /// Intentionally neither Debug nor serializable: only the secret facility supplies this key.
-pub struct CredentialKey(aead::LessSafeKey);
+pub struct CredentialKey(aead::LessSafeKey, hmac::Key);
 impl CredentialKey {
     pub fn from_hex(value: &str) -> Result<Self, &'static str> {
         if value.len() != 64 {
             return Err("Provider key must contain 64 hexadecimal characters");
         }
         let mut bytes = [0u8; 32];
-        for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (i, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let digit = |c: u8| (c as char).to_digit(16).map(|n| n as u8);
             bytes[i] = digit(pair[0])
                 .zip(digit(pair[1]))
@@ -21,8 +21,16 @@ impl CredentialKey {
         }
         let key = aead::UnboundKey::new(&aead::AES_256_GCM, &bytes)
             .map_err(|_| "Invalid provider key")?;
+        // A separate, labelled MAC key: the AEAD key is never used for another primitive.
+        let parts = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, &bytes),
+            b"hrrdarr/notification-delivery-part/v1",
+        );
         bytes.fill(0);
-        Ok(Self(aead::LessSafeKey::new(key)))
+        Ok(Self(
+            aead::LessSafeKey::new(key),
+            hmac::Key::new(hmac::HMAC_SHA256, parts.as_ref()),
+        ))
     }
     /// Separate AEAD purpose from provider credentials; payloads never have a plaintext fallback.
     pub(super) fn seal_release(
@@ -68,6 +76,68 @@ impl CredentialKey {
                 &mut body,
             )
             .map_err(|_| "key_unavailable")?
+            .len();
+        body.truncate(length);
+        Ok(body)
+    }
+    /// Keyed 64-bit identity of one notification request. Requests can carry secrets, so a plain
+    /// digest stored beside them would let anyone reading the database test guessed secrets
+    /// offline; without this key the identity is useless for that.
+    pub(crate) fn delivery_part_id(&self, request: &[u8]) -> String {
+        hmac::sign(&self.1, request).as_ref()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    /// Notification secrets: a distinct AEAD purpose bound to the notification identity, so an
+    /// envelope cannot be replayed onto another notification or into the provider registry.
+    pub(crate) fn seal_notification(
+        &self,
+        id: &str,
+        implementation: &str,
+        plain: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if plain.len() > 8192 {
+            return Err("Notification credentials are too large");
+        }
+        let mut nonce = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "Credential encryption failed")?;
+        let mut body = plain.to_vec();
+        self.0
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(notification_context(id, implementation)),
+                &mut body,
+            )
+            .map_err(|_| "Credential encryption failed")?;
+        let mut envelope = vec![1];
+        envelope.extend_from_slice(&nonce);
+        envelope.extend(body);
+        Ok(envelope)
+    }
+    pub(crate) fn open_notification(
+        &self,
+        id: &str,
+        implementation: &str,
+        value: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if !(29..=16384).contains(&value.len()) || value[0] != 1 {
+            return Err("Notification credentials cannot be unlocked");
+        }
+        let nonce: [u8; 12] = value[1..13]
+            .try_into()
+            .map_err(|_| "Notification credentials cannot be unlocked")?;
+        let mut body = value[13..].to_vec();
+        let length = self
+            .0
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(notification_context(id, implementation)),
+                &mut body,
+            )
+            .map_err(|_| "Notification credentials cannot be unlocked")?
             .len();
         body.truncate(length);
         Ok(body)
@@ -121,6 +191,9 @@ impl CredentialKey {
         body.fill(0);
         result
     }
+}
+fn notification_context(id: &str, implementation: &str) -> String {
+    format!("hrrdarr/notification-credentials/v1/{implementation}/{id}")
 }
 fn context(id: &str, implementation: &str) -> String {
     format!("hrrdarr/provider-credentials/v1/{implementation}/{id}")
@@ -292,7 +365,20 @@ impl Credentials {
             return false;
         }
         match self {
-            Self::ApiKey { api_key } => implementation != "torrentrss" && valid(api_key),
+            // Transmission, NZBGet, the cookie-based torrent feed and the basic-auth label clients do not
+            // take an API key (Aria2's RPC secret and Deluge's Web UI password are API-key credentials).
+            Self::ApiKey { api_key } => {
+                !matches!(
+                    implementation,
+                    "transmission"
+                        | "nzbget"
+                        | "torrentrss"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(api_key)
+            }
             Self::Feed {
                 cookie,
                 tv_parameters,
@@ -320,7 +406,17 @@ impl Credentials {
                     && valid_parameters(movie_parameters)
             }
             Self::UsernamePassword { username, password } => {
-                implementation == "qbittorrent" && valid(username) && valid(password)
+                matches!(
+                    implementation,
+                    "qbittorrent"
+                        | "transmission"
+                        | "nzbget"
+                        | "rtorrent"
+                        | "utorrent"
+                        | "flood"
+                        | "downloadstation"
+                ) && valid(username)
+                    && valid(password)
             }
         }
     }

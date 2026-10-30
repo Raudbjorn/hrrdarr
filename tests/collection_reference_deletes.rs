@@ -1,5 +1,5 @@
 //! Collection defaults hold RESTRICT references; deleting the referenced root folder,
-//! quality profile or tag must disable or drop that policy, never fail on the FK.
+//! quality profiles and tags stay protected; deleting a root disables its collection policy.
 use hrrdarr::db::Database;
 use libsql::Connection;
 use std::sync::Arc;
@@ -69,19 +69,19 @@ async fn deleting_collection_defaults_disables_policy_and_provider_tags_stay_in_
 
     assert_eq!(
         delete(&client, &base, "/api/v1/movies/quality-profiles/1").await,
-        204
+        409 // Reasoning: a collection reference protects its quality profile until explicitly cleared.
     );
-    assert_eq!(number(&c, "SELECT count(*) FROM movie_collection_settings WHERE quality_profile_id IS NULL AND monitored=0 AND settings_revision=3").await, 1);
+    assert_eq!(number(&c, "SELECT count(*) FROM movie_collection_settings WHERE quality_profile_id=1 AND monitored=1 AND settings_revision=2").await, 1);
     assert_eq!(
         delete(&client, &base, "/api/v1/movies/root-folders/1").await,
         204
     );
-    assert_eq!(number(&c, "SELECT count(*) FROM movie_collection_settings WHERE root_folder_id IS NULL AND monitored=0 AND settings_revision=4").await, 1);
-    // A copied collection tag follows its tag out; its delete trigger advances the revision.
-    assert_eq!(delete(&client, &base, "/api/v1/movies/tags/1").await, 204);
+    assert_eq!(number(&c, "SELECT count(*) FROM movie_collection_settings WHERE root_folder_id IS NULL AND monitored=0 AND settings_revision=3").await, 1);
+    // Reasoning: retain branch tag-in-use behavior; deletion cannot silently discard collection policy.
+    assert_eq!(delete(&client, &base, "/api/v1/movies/tags/1").await, 409);
     assert_eq!(
         number(&c, "SELECT count(*) FROM movie_collection_tags").await,
-        0
+        1
     );
     assert_eq!(
         number(
@@ -89,7 +89,7 @@ async fn deleting_collection_defaults_disables_policy_and_provider_tags_stay_in_
             "SELECT settings_revision FROM movie_collection_settings"
         )
         .await,
-        5
+        3 // Reasoning: rejected profile/tag deletions do not consume a settings revision.
     );
     // A provider scope tag is an assignment: conflict, not a storage failure.
     assert_eq!(delete(&client, &base, "/api/v1/movies/tags/2").await, 409);

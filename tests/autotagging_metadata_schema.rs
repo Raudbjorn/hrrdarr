@@ -238,6 +238,8 @@ async fn scalar(c: &Connection, sql: &str) -> Result<i64, Error> {
     Ok(c.query(sql, ()).await?.next().await?.unwrap().get(0)?)
 }
 
+const PRESERVED_SCHEMA: &str = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','indexer_status','download_client_status') AND name NOT IN ('indexer_status_configuration_reset','commands_transition','commands_backoff_identity') AND NOT (type='table' AND name IN ('provider_scopes','commands')) AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name";
+
 // Named projections deliberately avoid assuming runtime retains its old ordinal.
 async fn rows(c: &Connection, sql: &str) -> Result<Vec<String>, Error> {
     let mut result = c.query(sql, ()).await?;
@@ -253,10 +255,15 @@ async fn rows(c: &Connection, sql: &str) -> Result<Vec<String>, Error> {
 }
 
 async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
+    witness_with_schema(c, PRESERVED_SCHEMA).await
+}
+
+async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<String>>, Error> {
     let mut out = Vec::new();
     for sql in [
         "SELECT id,tmdb_id,imdb_id,title,year,runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language FROM movie_metadata ORDER BY id",
         "SELECT * FROM movies ORDER BY id",
+        // Reasoning: 0065 appends collection policy columns; the predecessor columns are preserved exactly.
         "SELECT id,tmdb_id,title FROM movie_collections ORDER BY id",
         "SELECT collection_id,metadata_id FROM movie_collection_members ORDER BY collection_id,metadata_id",
         "SELECT * FROM movie_alternative_titles ORDER BY metadata_id,title",
@@ -282,23 +289,11 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         // one CREATE TABLE text. Its predecessor columns are still compared exactly via the table_info row below;
         // every other provider_scopes object (indexes/triggers) stays in the exact sqlite_schema comparison.
         // Reasoning: migration 0049 likewise appends the nullable download_client_id column, so it joins the exclusion list.
-        // Reasoning: migration 0050 appends the nullable minimum_seeders column and widens the implementation
-        // CHECK lists in place (providers table text) and in nine guard triggers; those objects change text by
-        // design and are compared exactly in src/db/torrent_rss_tests.rs, so they join the exclusion lists by name.
         "SELECT * FROM pragma_table_info('provider_scopes') WHERE name NOT IN ('enable_rss','enable_automatic_search','enable_interactive_search','download_client_id','minimum_seeders') ORDER BY cid",
-        // Collections 0052 appends facts to two existing tables and adds precisely the named
-        // objects below; collection_schema independently asserts every new object and
-        // legacy row/FK preservation. Provider authority 0053 adds only the explicitly named
-        // tables/triggers below; provider_authority_schema checks them and old facts.
-        // Reasoning: 0053's indexer modes and client overrides were dropped because
-        // 0048/0049 already store them as provider_scopes columns.
-        // Reasoning: migration 0051 adds download_client_status (table + triggers), appends next_expiry_at to
-        // health_checks and origin/manual_bypass to commands (rewriting those two CREATE TABLE texts), recreates
-        // commands_transition and adds commands_backoff_identity. Predecessor columns of both altered tables are
-        // compared exactly below; backoff objects are covered by src/db/backoff_tests.rs.
-        "SELECT * FROM pragma_table_info('health_checks') WHERE name!='next_expiry_at' ORDER BY cid",
+        // Reasoning: 0051 appends command origin/bypass and replaces its transition trigger; preserve predecessor columns exactly.
         "SELECT * FROM pragma_table_info('commands') WHERE name NOT IN ('origin','manual_bypass') ORDER BY cid",
-        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name NOT IN ('movie_metadata','series','snapshot_imports','movie_credits','download_client_status','movie_collections','movie_collection_members','movie_collection_settings','movie_collection_tags','movie_collection_intents','movie_import_exclusions','provider_scope_tags','provider_status','provider_selection_cursors') AND NOT (type='table' AND name IN ('provider_scopes','providers','health_checks','commands')) AND name NOT IN ('provider_test_insert_owner','provider_test_update_owner','provider_scope_options_insert','provider_scope_options_update','provider_client_options_insert','provider_client_options_update','rss_commands_admit','rss_schedules_admit','rss_schedules_update','commands_transition','commands_backoff_identity','provider_scope_tags','provider_scope_tags_tag','provider_tags_limit','provider_tags_identity','provider_tags_insert_invalidates_test','provider_tags_delete_invalidates_test','provider_status','provider_status_insert','provider_status_update','provider_selection_cursors','provider_cursor_insert','provider_cursor_update','movie_collection_settings','movie_collection_tags','movie_collection_tags_tag','movie_collection_intents','movie_import_exclusions','collections_identity_insert','collections_identity_update','collections_generated_id','collections_metadata_revision','collections_images_insert','collections_images_update','collection_settings_root_insert','collection_settings_root_update','collection_root_domain_update','collection_settings_revision','collection_tags_insert','collection_tags_update','collection_tags_revision_insert','collection_tags_revision_delete','collection_members_insert','collection_members_update','movie_collection_intents_revision','movie_collection_intents_retain','movie_import_exclusions_revision','movie_import_exclusions_retain') AND NOT (tbl_name='movies' AND name IN ('removed_metadata_movie_insert','removed_metadata_movie_delete','removed_metadata_movie_update')) ORDER BY type,name",
+        // Reasoning: 0050 adds only indexer_status objects and its provider reset trigger; its dedicated migration tests cover them.
+        schema,
         "PRAGMA foreign_key_list(movies)",
         "PRAGMA foreign_key_list(movie_collection_members)",
         "PRAGMA foreign_key_list(movie_alternative_titles)",
@@ -306,6 +301,45 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<String>>, Error> {
         out.push(rows(c, sql).await?);
     }
     Ok(out)
+}
+
+// Only successful upgrades omit deliberate additions; rollback/backup/reopen witnesses stay exact.
+async fn upgrade_witness(
+    c: &Connection,
+    predecessor_names: &str,
+) -> Result<Vec<Vec<String>>, Error> {
+    // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
+    // 0053 appends one journal column and two indexes; preserve old columns separately below.
+    // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
+    // 0059 resolves client kind through provider_implementations: map only that predicate back
+    // to the qBittorrent literal, and exclude the provider tables/guards it rebuilds (their rows
+    // and constraints are covered by db::download_client_registry_tests).
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(replace(sql,'+(SELECT count(*) FROM rename_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+        name IN ({predecessor_names}) AND
+        NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections','movie_collection_members')) AND
+        name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
+        NOT (type='table' AND name IN ('import_journal','download_processing')) AND
+        name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND
+        tbl_name NOT IN ('download_client_tags','rss_client_attempts') AND name NOT IN (
+        'rss_commands','search_commands','rss_schedules','rss_candidates',
+        'rss_commands_active','rss_candidate_selection_identity','rss_schedules_selection',
+        'sqlite_autoindex_rss_candidates_3','sqlite_autoindex_rss_schedules_2',
+        'rss_commands_transition','rss_commands_admit','search_commands_transition','search_commands_admit',
+        'rss_schedules_admit','rss_schedules_update','rss_candidate_admit','rss_candidate_transition',
+        'rss_comparison_facts_update','rss_hash_retained','rss_candidate_local_storage_retry',
+        'rss_candidate_selection_admit','rss_candidate_selection_transition',
+        'rss_selected_episode_insert','rss_selected_episode_delete',
+        'import_journal_path_unresolved','download_processing_path_unresolved') ORDER BY type,name")).await?;
+    // 0054 adds new producer objects (outside the actual44 object set), extends only
+    // the exact capacity term above, and rebuilds processing / ownership guards.
+    // Its dedicated migration tests exercise those changed guards; retain every
+    // predecessor processing column definition here rather than dropping its shape.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('download_processing') WHERE name!='scan_command_id' ORDER BY cid").await?);
+    // Compare every predecessor journal column definition exactly despite the additive column.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
+    // Reasoning: 0077 appends membership origin/revision; compare original columns, rows and FKs exactly.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('movie_collection_members') WHERE name NOT IN ('origin','metadata_revision') ORDER BY cid").await?);
+    Ok(result)
 }
 
 async fn seed(c: &Connection) -> Result<(), Error> {
@@ -503,6 +537,16 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = raw_connection(&old).await?;
     seed(&c).await?;
     let before = witness(&c).await?;
+    let mut names = c
+        .query("SELECT name FROM sqlite_schema ORDER BY name", ())
+        .await?;
+    let mut predecessor_names = Vec::new();
+    while let Some(row) = names.next().await? {
+        predecessor_names.push(format!("'{}'", row.get::<String>(0)?.replace('\'', "''")));
+    }
+    let predecessor_names = predecessor_names.join(",");
+    drop(names);
+    let upgrade_before = upgrade_witness(&c, &predecessor_names).await?;
     drop(c);
     drop(old);
     let db = Database::open_local(scratch.database()).await?;
@@ -513,9 +557,25 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
-    assert_eq!(witness(&c).await?, before);
+    assert_eq!(
+        upgrade_witness(&c, &predecessor_names).await?,
+        upgrade_before
+    );
+    // 0055 only appends unknown runtime / pending exact-replay activation defaults.
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM series WHERE runtime IS NOT NULL").await?,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT sum(series_runtime_version) FROM snapshot_imports"
+        )
+        .await?,
+        0
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM series WHERE network IS NULL AND original_country IS NULL AND status IS NULL AND genres_json IS NULL").await?, 1);
     assert_eq!(scalar(&c, "SELECT count(*) FROM movie_metadata WHERE studio IS NULL AND genres_json IS NULL AND keywords_json IS NULL").await?, 3);
     assert_eq!(
@@ -639,7 +699,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        53 // Reasoning: latest migration is now 0053 provider authority (collections 0052 and provider authority 0053 renumbered after main's 0051 download-client backoff); historical migration prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

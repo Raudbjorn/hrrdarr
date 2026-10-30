@@ -105,26 +105,7 @@ pub(super) async fn preflight(c: &Connection, table: &str, bytes: &mut usize) ->
             if raw.len() != len as usize {
                 return Err(INVALID);
             }
-            let decoded = match encoding.as_str() {
-                "UTF-8" => String::from_utf8(raw).map_err(|_| INVALID)?,
-                "UTF-16le" | "UTF-16be" => {
-                    if raw.len() % 2 != 0 {
-                        return Err(INVALID);
-                    }
-                    let units = raw
-                        .chunks_exact(2)
-                        .map(|v| {
-                            if encoding == "UTF-16le" {
-                                u16::from_le_bytes([v[0], v[1]])
-                            } else {
-                                u16::from_be_bytes([v[0], v[1]])
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    String::from_utf16(&units).map_err(|_| INVALID)?
-                }
-                _ => return Err(INVALID),
-            };
+            let decoded = decode_source_text(raw, &encoding).map_err(|_| INVALID)?;
             if decoded.contains('\0') || decoded.len() > 1048576 {
                 return Err(INVALID);
             }

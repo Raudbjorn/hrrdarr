@@ -1,6 +1,109 @@
 //! Completed owned downloads use one immutable import operation per submission receipt.
 use super::*;
 use crate::search::ReleaseTarget;
+const PATH_MARKER: &str = "hc021_unresolved_attempt";
+/// A downloaded-folder scan that captured a receipt owns it until its settled handback (and
+/// a handed-back receipt stays scan-owned). Only an exact captured predecessor operation may
+/// continue through the singleton path. Mirrors the 0054 `scan_processing_legacy_guard`.
+pub(crate) const SCAN_RESERVED: &str = "(download_processing.scan_command_id IS NOT NULL OR EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=download_processing.candidate_id AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports i WHERE i.candidate_id=s.candidate_id AND i.operation_id=s.predecessor_operation_id)))";
+fn reserved_by_scan() -> Error {
+    Error(StatusCode::CONFLICT, "processing_reserved_by_scan")
+}
+async fn scan_reserved(c: &Connection, id: Uuid) -> Result<bool> {
+    Ok(c.query(
+        &format!("SELECT 1 FROM download_processing WHERE candidate_id=? AND {SCAN_RESERVED}"),
+        [id.to_string()],
+    )
+    .await?
+    .next()
+    .await?
+    .is_some())
+}
+
+pub(crate) enum PathReasonChange<'a> {
+    Preserve,
+    Admission,
+    Failure(&'a str),
+    Complete,
+}
+fn measured_marker(code: &str) -> bool {
+    if matches!(
+        code,
+        "hc021_mapping_missing"
+            | "hc021_mapping_changed"
+            | "hc021_output_missing"
+            | "hc021_output_invalid"
+    ) {
+        return true;
+    }
+    let parts: Vec<_> = code.split('_').collect();
+    parts.len() == 4
+        && parts[0] == "hc021"
+        && matches!(parts[1], "source" | "root" | "destination")
+        && matches!(
+            parts[2],
+            "missing" | "denied" | "changed" | "invalid" | "io"
+        )
+        && parts[3] == "prepare"
+}
+fn validate_reasons(reasons: &[String], reserved: bool) -> Result<Option<&str>> {
+    if reasons.len() > 64 || serde_json::to_vec(reasons).map_err(|_| bad())?.len() > 8192 {
+        return Err(bad());
+    }
+    let mut marker = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, reason) in reasons.iter().enumerate() {
+        if !seen.insert(reason)
+            || reason.len() > 128
+            || !reason
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(bad());
+        }
+        if reason.starts_with("hc021_") {
+            if !reserved || index != 0 || (reason != PATH_MARKER && !measured_marker(reason)) {
+                return Err(bad());
+            }
+            marker = Some(reason.as_str());
+        }
+    }
+    Ok(marker)
+}
+pub(crate) fn path_reasons(
+    previous: &[String],
+    ordinary: &[String],
+    change: PathReasonChange<'_>,
+) -> Result<Vec<String>> {
+    let previous = validate_reasons(previous, true)?;
+    validate_reasons(ordinary, false)?;
+    let marker = match change {
+        PathReasonChange::Preserve => previous,
+        PathReasonChange::Admission => Some(previous.unwrap_or(PATH_MARKER)),
+        PathReasonChange::Failure(code) if measured_marker(code) => Some(code),
+        PathReasonChange::Failure(_) => return Err(bad()),
+        PathReasonChange::Complete => None,
+    };
+    let mut result = Vec::with_capacity(ordinary.len() + usize::from(marker.is_some()));
+    if let Some(marker) = marker {
+        result.push(marker.to_owned());
+    }
+    result.extend_from_slice(ordinary);
+    validate_reasons(&result, true)?;
+    Ok(result)
+}
+fn encoded_reasons(reasons: &[String]) -> Result<String> {
+    serde_json::to_string(reasons).map_err(|_| bad())
+}
+async fn changed(
+    c: &Connection,
+    item: &DownloadProcessing,
+    change: crate::health::PathDiagnosticChange,
+) -> Result<()> {
+    crate::health::path_diagnostics_changed(c, media(&item.target), change)
+        .await
+        .map_err(|e| Error(e.0, e.1))
+}
 #[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessingMode {
@@ -73,11 +176,24 @@ pub struct DownloadProcessing {
     pub import_phase: Option<String>,
     pub resume_requested: bool,
     pub retirement_state: Option<String>,
+    // Upgrade recycle of the replaced file: admitted/copied (moving to the recycle bin),
+    // complete (in the bin) or retained (recycling failed; kept in the recovery artifact).
+    // Null when no recycle bin was configured at retirement.
+    pub recycle_state: Option<String>,
+    // Original bytes remain in the private recovery artifact inside the library folder.
     pub recovery_bytes_retained: bool,
     pub error_code: Option<String>,
+    pub path_failure_code: Option<String>,
+    pub recovery_required: bool,
     pub reasons: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    // Newest downloaded-folder scan that reserved, settled or continues (explicit successor)
+    // this receipt, or the latest scan that read its linked predecessor.
+    pub scan_command_id: Option<Uuid>,
+    // The receipt is owned by scan coverage proof: singleton retry/cancel are refused
+    // (`409 processing_reserved_by_scan`); only a coverage-aware scan successor continues it.
+    pub scan_reserved: bool,
 }
 #[derive(Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -135,7 +251,7 @@ impl ProcessingStatus {
         }
     }
 }
-const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,d.reasons_json,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END";
+const COLUMNS: &str = "d.candidate_id,r.media_type,r.series_id,r.movie_id,e.episode_id,r.client_id,r.client_revision,r.observed_hash,d.policy_revision,d.status,d.preflight_attempts,d.total_preflight_attempts,d.next_attempt_at,i.operation_id,j.phase,d.error_code,CASE WHEN typeof(d.reasons_json)='text' AND length(CAST(d.reasons_json AS BLOB))<=8192 THEN CAST(d.reasons_json AS BLOB) ELSE x'00' END,d.created_at,d.updated_at,d.resume_requested,CASE WHEN i.old_file_json IS NOT NULL THEN i.retirement_state ELSE NULL END,CASE WHEN j.path_failure_code IS NULL THEN NULL WHEN typeof(j.path_failure_code)='text' AND length(CAST(j.path_failure_code AS BLOB))<=64 THEN CAST(j.path_failure_code AS BLOB) ELSE x'00' END,j.error_code IS NOT NULL,coalesce((SELECT s.id FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id ORDER BY s.created_at DESC,s.id DESC LIMIT 1),d.scan_command_id),(d.scan_command_id IS NOT NULL OR EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=d.candidate_id AND NOT EXISTS(SELECT 1 FROM rss_candidate_imports ri WHERE ri.candidate_id=s.candidate_id AND ri.operation_id=s.predecessor_operation_id))),(SELECT u.phase FROM upgrade_recycles u WHERE u.operation_id=i.operation_id ORDER BY CASE u.phase WHEN 'retained' THEN 0 WHEN 'complete' THEN 2 ELSE 1 END,u.created_at,u.id LIMIT 1)";
 const FROM: &str = "download_processing d JOIN rss_candidates r ON r.id=d.candidate_id LEFT JOIN rss_candidate_episodes e ON e.candidate_id=r.id LEFT JOIN rss_candidate_imports i ON i.candidate_id=r.id LEFT JOIN import_journal j ON j.operation_id=i.operation_id";
 fn positive(value: i64) -> Result<i64> {
     if (1..=MAX_REVISION).contains(&value) {
@@ -155,6 +271,25 @@ fn row(r: libsql::Row) -> Result<DownloadProcessing> {
         },
         _ => return Err(bad()),
     };
+    let reasons: Vec<String> = serde_json::from_slice(&r.get::<Vec<u8>>(16)?).map_err(|_| bad())?;
+    validate_reasons(&reasons, true)?;
+    let operation_id = r
+        .get::<Option<String>>(13)?
+        .map(|s| Uuid::parse_str(&s).map_err(|_| bad()))
+        .transpose()?;
+    let import_phase: Option<String> = r.get(14)?;
+    let error_code: Option<String> = r.get(15)?;
+    let journal_error = r.get::<i64>(22)? == 1;
+    let journal_path = crate::import::checked_path_failure(&r, 21).map_err(|_| bad())?;
+    let recovery_required = if let Some(operation_id) = operation_id {
+        import_phase.as_deref() != Some("complete")
+            && (journal_path.is_some() || journal_error || error_code.is_some())
+            && !crate::import::operation_active(&operation_id.to_string())
+                .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code()))?
+    } else {
+        false
+    };
+    let path_failure_code = journal_path;
     Ok(DownloadProcessing {
         receipt_id: Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?,
         target,
@@ -166,20 +301,26 @@ fn row(r: libsql::Row) -> Result<DownloadProcessing> {
         preflight_attempts: r.get::<i64>(10)? as u8,
         total_preflight_attempts: r.get(11)?,
         next_attempt_at: r.get(12)?,
-        operation_id: r
-            .get::<Option<String>>(13)?
-            .map(|s| Uuid::parse_str(&s).map_err(|_| bad()))
-            .transpose()?,
-        import_phase: r.get(14)?,
-        error_code: r.get(15)?,
-        reasons: serde_json::from_str(&r.get::<String>(16)?).map_err(|_| bad())?,
+        operation_id,
+        import_phase,
+        error_code,
+        path_failure_code,
+        recovery_required,
+        reasons,
         created_at: r.get(17)?,
         updated_at: r.get(18)?,
         resume_requested: r.get::<i64>(19)? == 1,
         retirement_state: r.get(20)?,
+        recycle_state: r.get(25)?,
         recovery_bytes_retained: r
             .get::<Option<String>>(20)?
-            .is_some_and(|v| v == "quarantined" || v == "shared_retained"),
+            .is_some_and(|v| v == "quarantined" || v == "shared_retained")
+            && r.get::<Option<String>>(25)?.as_deref() != Some("complete"),
+        scan_command_id: r
+            .get::<Option<String>>(23)?
+            .map(|s| Uuid::parse_str(&s).map_err(|_| bad()))
+            .transpose()?,
+        scan_reserved: r.get::<i64>(24)? == 1,
     })
 }
 async fn read(c: &Connection, id: Uuid) -> Result<DownloadProcessing> {
@@ -382,31 +523,57 @@ async fn process(
         return Err(bad());
     }
     let c = connection(&db).await?;
+    // The reservation outlives transaction cleanup, including cancellation of this future.
+    let mut resume_guard = None;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{
-        let timestamp=now()?;let mut rows=Vec::new();
+    let outcome = async {
+        let timestamp = now()?;
+        let mut rows = Vec::new();
         for id in input.receipt_ids {
             let valid=tx.query("SELECT 1 FROM rss_candidates WHERE id=? AND status='observed' AND client_id=? AND client_revision=? AND media_type=?",params![id.to_string(),input.provider_id.to_string(),input.provider_revision,domain(input.media_type)]).await?.next().await?.is_some();
-            if !valid{return Err(Error(StatusCode::CONFLICT,"invalid_processing_receipt"))}
-            let existing=match read(&tx,id).await{Ok(row)=>Some(row),Err(Error(StatusCode::NOT_FOUND,"processing_not_found"))=>None,Err(e)=>return Err(e)};
-            if existing.as_ref().is_some_and(|r|r.operation_id.is_some()){
-                if existing.as_ref().is_some_and(|r|matches!(r.status,ProcessingStatus::Importing)) && tx.query("SELECT 1 FROM download_processing d JOIN rss_candidate_imports i ON i.candidate_id=d.candidate_id JOIN import_journal j ON j.operation_id=i.operation_id WHERE d.candidate_id=? AND (d.error_code IS NOT NULL OR j.error_code IS NOT NULL)",[id.to_string()]).await?.next().await?.is_some(){tx.execute("UPDATE download_processing SET resume_requested=1,next_attempt_at=?,updated_at=? WHERE candidate_id=?",params![timestamp,timestamp,id.to_string()]).await?;}
-            }else{
-                let p=policy(&tx,input.provider_id,input.media_type).await?;
-                if !p.enabled||p.provider_revision!=input.provider_revision{return Err(Error(StatusCode::CONFLICT,"processing_disabled"))}
-                let revision=p.revision.ok_or_else(bad)?;
-                if let Some(existing)=existing {
-                    if matches!(existing.status,ProcessingStatus::Blocked|ProcessingStatus::Cancelled){tx.execute("UPDATE download_processing SET status='queued',policy_revision=?,preflight_attempts=0,error_code=NULL,reasons_json='[]',next_attempt_at=?,updated_at=? WHERE candidate_id=?",params![revision,timestamp,timestamp,id.to_string()]).await?;}
-                }else{tx.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at)VALUES(?,?,'queued',?,?,?)",params![id.to_string(),revision,timestamp,timestamp,timestamp]).await?;}
+            if !valid { return Err(Error(StatusCode::CONFLICT,"invalid_processing_receipt")); }
+            // A scan-reserved receipt is retried only through coverage-aware scan authority.
+            if scan_reserved(&tx,id).await? || tx.query("SELECT 1 FROM downloaded_scan_commands WHERE candidate_id=? AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=downloaded_scan_commands.candidate_id)",[id.to_string()]).await?.next().await?.is_some() { return Err(reserved_by_scan()); }
+            let existing = match read(&tx,id).await {
+                Ok(row) => Some(row),
+                Err(Error(StatusCode::NOT_FOUND,"processing_not_found")) => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(item) = existing.as_ref().filter(|r| r.operation_id.is_some()) {
+                if item.import_phase.as_deref() != Some("complete") {
+                    if !matches!(item.status,ProcessingStatus::Importing) || !item.recovery_required { return Err(conflict()); }
+                    if resume_guard.is_none() {
+                        resume_guard = Some(crate::import::acquire_resume_guard(&db).map_err(|e| Error(StatusCode::CONFLICT,e.code()))?);
+                    }
+                    // A linked journal retains recovery authority when new-import policy is disabled.
+                    if tx.execute("UPDATE download_processing SET resume_requested=1,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='importing' AND total_preflight_attempts=?",params![timestamp,timestamp,id.to_string(),item.total_preflight_attempts]).await? != 1 { return Err(conflict()); }
+                    changed(&tx,item,crate::health::PathDiagnosticChange::Progress).await?;
+                }
+            } else {
+                let policy = policy(&tx,input.provider_id,input.media_type).await?;
+                if !policy.enabled || policy.provider_revision!=input.provider_revision { return Err(Error(StatusCode::CONFLICT,"processing_disabled")); }
+                let revision = policy.revision.ok_or_else(bad)?;
+                if let Some(item) = existing {
+                    if matches!(item.status,ProcessingStatus::Blocked|ProcessingStatus::Cancelled) {
+                        let reasons = path_reasons(&item.reasons,&[],PathReasonChange::Preserve)?;
+                        tx.execute("UPDATE download_processing SET status='queued',policy_revision=?,preflight_attempts=0,error_code=NULL,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=?",params![revision,encoded_reasons(&reasons)?,timestamp,timestamp,id.to_string()]).await?;
+                        changed(&tx,&item,crate::health::PathDiagnosticChange::Progress).await?;
+                    }
+                } else {
+                    tx.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at)VALUES(?,?,'queued',?,?,?)",params![id.to_string(),revision,timestamp,timestamp,timestamp]).await?;
+                }
             }
             rows.push(read(&tx,id).await?);
         }
         bounded(rows)
     }.await;
-    Ok((StatusCode::ACCEPTED, finish(tx, outcome).await?))
+    let result = finish(tx, outcome).await;
+    drop(resume_guard);
+    Ok((StatusCode::ACCEPTED, result?))
 }
+
 async fn list(
     State(db): State<Arc<Database>>,
     q: std::result::Result<Query<ProcessingQuery>, QueryRejection>,
@@ -453,7 +620,15 @@ async fn cancel(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let outcome=async{if read(&tx,id).await?.operation_id.is_some(){return Err(conflict())}tx.execute("UPDATE download_processing SET status='cancelled',error_code=NULL,reasons_json='[]',updated_at=? WHERE candidate_id=?",params![now()?,id.to_string()]).await?;bounded(read(&tx,id).await?)}.await;
+    let outcome = async {
+        let item = read(&tx,id).await?;
+        if item.operation_id.is_some() { return Err(conflict()); }
+        if scan_reserved(&tx,id).await? { return Err(reserved_by_scan()); }
+        let reasons = path_reasons(&item.reasons,&[],PathReasonChange::Preserve)?;
+        tx.execute("UPDATE download_processing SET status='cancelled',error_code=NULL,reasons_json=?,updated_at=? WHERE candidate_id=?",params![encoded_reasons(&reasons)?,now()?,id.to_string()]).await?;
+        changed(&tx,&item,crate::health::PathDiagnosticChange::Progress).await?;
+        bounded(read(&tx,id).await?)
+    }.await;
     finish(tx, outcome).await
 }
 
@@ -465,38 +640,171 @@ pub(super) async fn observe(
     timestamp: i64,
 ) -> Result<()> {
     for item in items.iter().filter(|item| item.completed) {
-        c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) SELECT r.id,p.revision,'queued',?,?,? FROM rss_candidates r JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type WHERE r.status='observed' AND r.client_id=? AND r.client_revision=? AND r.media_type=? AND r.observed_hash=? AND p.enabled=1 AND p.provider_revision=r.client_revision AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=r.id)",params![timestamp,timestamp,timestamp,scope.provider_id.to_string(),revision,domain(scope.media_type),item.hash.clone()]).await?;
+        c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) SELECT r.id,p.revision,'queued',?,?,? FROM rss_candidates r JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type WHERE r.status='observed' AND r.client_id=? AND r.client_revision=? AND r.media_type=? AND r.observed_hash=? AND p.enabled=1 AND p.provider_revision=r.client_revision AND NOT EXISTS(SELECT 1 FROM download_processing d WHERE d.candidate_id=r.id) AND NOT EXISTS(SELECT 1 FROM downloaded_scan_commands s WHERE s.candidate_id=r.id)",params![timestamp,timestamp,timestamp,scope.provider_id.to_string(),revision,domain(scope.media_type),item.hash.clone()]).await?;
     }
     Ok(())
 }
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
-    // Only preflight reads repeat automatically. A linked transfer has its own durable authority.
-    let mut rows = c
-        .query(
-            "SELECT candidate_id FROM download_processing WHERE status='checking'",
-            (),
-        )
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    let mut ids = Vec::new();
-    while let Some(r) = rows.next().await? {
-        ids.push(Uuid::parse_str(&r.get::<String>(0)?).map_err(|_| bad())?)
-    }
-    drop(rows);
-    for id in ids {
-        let item = read(c, id).await?;
-        preflight_failure(c, &item, code, vec![code.into()]).await?;
-    }
-    c.execute("UPDATE download_processing SET status='blocked',error_code='processing_disabled',reasons_json='[]',updated_at=? WHERE status='queued' AND NOT EXISTS(SELECT 1 FROM rss_candidates r JOIN download_processing_policies p ON p.provider_id=r.client_id AND p.media_type=r.media_type JOIN providers v ON v.id=p.provider_id JOIN provider_scopes s ON s.provider_id=v.id AND s.media_type=p.media_type WHERE r.id=download_processing.candidate_id AND p.enabled=1 AND p.revision=download_processing.policy_revision AND p.provider_revision=r.client_revision AND v.revision=r.client_revision AND v.enabled=1)",[timestamp]).await?;
-    Ok(())
+    let outcome = async {
+        let mut rows = tx.query(&format!("SELECT candidate_id FROM download_processing WHERE status IN ('checking','queued') AND NOT {SCAN_RESERVED} ORDER BY candidate_id LIMIT 1025"),()).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if ids.len() == 1024 { return Err(bad()); }
+            ids.push(Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| bad())?);
+        }
+        drop(rows);
+        for id in ids {
+            let item = read(&tx,id).await?;
+            if matches!(item.status,ProcessingStatus::Checking) {
+                failure_in(&tx,&item,code,vec![code.into()],None,true,None).await?;
+            } else if let Err(error) = authorization(&tx,&item).await {
+                if !matches!(error.1,"provider_changed"|"processing_disabled") { return Err(error); }
+                let reasons = path_reasons(&item.reasons,&[],PathReasonChange::Preserve)?;
+                tx.execute("UPDATE download_processing SET status='blocked',error_code='processing_disabled',reasons_json=?,updated_at=? WHERE candidate_id=? AND status='queued' AND total_preflight_attempts=?",params![encoded_reasons(&reasons)?,timestamp,id.to_string(),item.total_preflight_attempts]).await?;
+                changed(&tx,&item,crate::health::PathDiagnosticChange::Progress).await?;
+            }
+        }
+        Ok(())
+    }.await;
+    finish(tx, outcome).await
 }
 pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<DownloadProcessing> {
-    c.execute("UPDATE download_processing SET status='checking',preflight_attempts=preflight_attempts+1,total_preflight_attempts=total_preflight_attempts+1,error_code=NULL,reasons_json='[]',updated_at=? WHERE candidate_id=? AND status='queued'",params![timestamp,id.to_string()]).await?;
+    if c.is_autocommit() {
+        return Err(bad());
+    }
+    let item = read(c, id).await?;
+    if matches!(item.status, ProcessingStatus::Importing) {
+        return Ok(item);
+    }
+    if !matches!(item.status, ProcessingStatus::Queued)
+        || item.total_preflight_attempts >= MAX_REVISION
+    {
+        return Err(conflict());
+    }
+    if scan_reserved(c, id).await? {
+        return Err(reserved_by_scan());
+    }
+    authorization(c, &item).await?;
+    let reasons = path_reasons(&item.reasons, &[], PathReasonChange::Admission)?;
+    if c.execute("UPDATE download_processing SET status='checking',preflight_attempts=preflight_attempts+1,total_preflight_attempts=total_preflight_attempts+1,error_code=NULL,reasons_json=?,updated_at=? WHERE candidate_id=? AND status='queued' AND total_preflight_attempts=?",params![encoded_reasons(&reasons)?,timestamp,id.to_string(),item.total_preflight_attempts]).await? != 1 { return Err(conflict()); }
+    changed(c, &item, crate::health::PathDiagnosticChange::Admission).await?;
     read(c, id).await
 }
-async fn blocked(c: &Connection, id: Uuid, code: &str, reasons: Vec<String>) -> Result<()> {
-    let reasons: Vec<_> = reasons.into_iter().take(64).collect();
-    c.execute("UPDATE download_processing SET status='blocked',error_code=?,reasons_json=?,updated_at=? WHERE candidate_id=? AND status='checking'",params![code,serde_json::to_string(&reasons).map_err(|_|bad())?,now()?,id.to_string()]).await?;
-    Ok(())
+fn same_attempt(current: &DownloadProcessing, captured: &DownloadProcessing) -> bool {
+    current.receipt_id == captured.receipt_id
+        && current.target == captured.target
+        && current.provider_id == captured.provider_id
+        && current.provider_revision == captured.provider_revision
+        && current.policy_revision == captured.policy_revision
+        && current.remote_id == captured.remote_id
+        && current.total_preflight_attempts == captured.total_preflight_attempts
+        && current.operation_id == captured.operation_id
+}
+struct MappingFence {
+    id: i64,
+    revision: i64,
+    host: String,
+}
+async fn blocked(
+    c: &Connection,
+    item: &DownloadProcessing,
+    code: &str,
+    reasons: Vec<String>,
+    marker: Option<&str>,
+) -> Result<()> {
+    persist_failure(c, item, code, reasons, marker, false, None).await
+}
+async fn persist_failure(
+    c: &Connection,
+    item: &DownloadProcessing,
+    code: &str,
+    reasons: Vec<String>,
+    marker: Option<&str>,
+    allow_retry: bool,
+    mapping: Option<&MappingFence>,
+) -> Result<()> {
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = failure_in(&tx, item, code, reasons, marker, allow_retry, mapping).await;
+    finish(tx, outcome).await
+}
+async fn failure_in(
+    c: &Connection,
+    item: &DownloadProcessing,
+    code: &str,
+    mut reasons: Vec<String>,
+    mut marker: Option<&str>,
+    allow_retry: bool,
+    mapping: Option<&MappingFence>,
+) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(bad());
+    }
+    let current = read(c, item.receipt_id).await?;
+    if !same_attempt(&current, item)
+        || current.operation_id.is_some()
+        || !matches!(current.status, ProcessingStatus::Checking)
+    {
+        return Ok(());
+    }
+    let mut code = match code {
+        "command_storage_error" | "invalid_command_request" => "storage_error",
+        other => other,
+    };
+    // A changed authority is a current generic fact, not evidence about the old mapped path.
+    let authorized = match authorization(c, &current).await {
+        Ok(_) => true,
+        Err(error) if matches!(error.1, "provider_changed" | "processing_disabled") => {
+            code = error.1;
+            reasons = vec![code.into()];
+            marker = None;
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    if authorized && let Some(mapping) = mapping {
+        let matches = c.query("SELECT 1 FROM remote_path_mappings WHERE id=? AND revision=? AND host=? AND media_type=?",params![mapping.id,mapping.revision,mapping.host.clone(),domain(media(&item.target))]).await?.next().await?.is_some();
+        if !matches {
+            code = "path_mapping_changed";
+            reasons = vec![code.into()];
+            marker = Some("hc021_mapping_changed");
+        }
+    }
+    let reasons = path_reasons(
+        &current.reasons,
+        &reasons,
+        match marker {
+            Some(code) => PathReasonChange::Failure(code),
+            None => PathReasonChange::Preserve,
+        },
+    )?;
+    let retry = authorized
+        && allow_retry
+        && matches!(
+            code,
+            "interrupted"
+                | "storage_error"
+                | "download_timeout"
+                | "download_unavailable"
+                | "custom_format_busy"
+                | "custom_format_timeout"
+                | "custom_format_worker_failed"
+                | "custom_format_state_changed"
+        )
+        && current.preflight_attempts < 3;
+    let timestamp = now()?;
+    let status = if retry { "queued" } else { "blocked" };
+    let next = if retry {
+        timestamp + (1i64 << current.preflight_attempts)
+    } else {
+        current.next_attempt_at
+    };
+    if c.execute("UPDATE download_processing SET status=?,error_code=?,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='checking' AND total_preflight_attempts=?",params![status,code,encoded_reasons(&reasons)?,next,timestamp,item.receipt_id.to_string(),item.total_preflight_attempts]).await? != 1 { return Err(conflict()); }
+    changed(c, &current, crate::health::PathDiagnosticChange::Failure).await
 }
 fn processing_error(code: &str) -> &'static str {
     match code {
@@ -525,34 +833,6 @@ fn preflight_evaluation_error(code: &'static str) -> Error {
         _ => Error(StatusCode::CONFLICT, "quality_rejected"),
     }
 }
-async fn preflight_failure(
-    c: &Connection,
-    item: &DownloadProcessing,
-    code: &str,
-    reasons: Vec<String>,
-) -> Result<()> {
-    let code = match code {
-        "command_storage_error" | "invalid_command_request" => "storage_error",
-        other => other,
-    };
-    let retry = matches!(
-        code,
-        "interrupted"
-            | "storage_error"
-            | "download_timeout"
-            | "download_unavailable"
-            | "custom_format_busy"
-            | "custom_format_timeout"
-            | "custom_format_worker_failed"
-            | "custom_format_state_changed"
-    ) && item.preflight_attempts < 3;
-    if retry && authorization(c, item).await.is_ok() {
-        c.execute("UPDATE download_processing SET status='queued',error_code=?,reasons_json=?,next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='checking'",params![code,serde_json::to_string(&reasons).map_err(|_|bad())?,now()?+(1i64<<item.preflight_attempts),now()?,item.receipt_id.to_string()]).await?;
-    } else {
-        blocked(c, item.receipt_id, code, reasons).await?;
-    }
-    Ok(())
-}
 pub(super) async fn run(
     db: &Arc<Database>,
     client: &crate::providers::RefreshClient,
@@ -562,13 +842,8 @@ pub(super) async fn run(
     if item.operation_id.is_some() {
         return advance_import(db, &c, item).await;
     }
-    let outcome = preflight(db, client, &item).await;
-    if let Err(Error(_, code)) = outcome {
-        let current = read(&c, item.receipt_id).await?;
-        if current.operation_id.is_some() {
-            return Ok(());
-        }
-        preflight_failure(&c, &current, code, vec![code.into()]).await?;
+    if let Err(Error(_, code)) = preflight(db, client, &item).await {
+        persist_failure(&c, &item, code, vec![code.into()], None, true, None).await?;
     }
     Ok(())
 }
@@ -580,7 +855,7 @@ async fn preflight(
     let c = connection(db).await?;
     let mode = authorization(&c, item).await?;
     let target = target(&item.target)?;
-    let observed = client
+    let observed = match client
         .inspect_download(
             &item.provider_id.to_string(),
             item.provider_revision,
@@ -588,16 +863,31 @@ async fn preflight(
             &item.remote_id,
         )
         .await
-        .map_err(|e| {
-            Error(
+    {
+        Ok(observed) => observed,
+        // Usenet output folders are listed locally, so an unmapped output blocks like an unmapped file.
+        Err(e) if e.code == "path_mapping_missing" => {
+            blocked(
+                &c,
+                item,
+                "path_mapping_missing",
+                vec!["path_mapping_missing".into()],
+                Some("hc021_mapping_missing"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Error(
                 StatusCode::CONFLICT,
                 match e.code {
                     "provider_changed" => "provider_changed",
                     "refresh_timeout" => "download_timeout",
                     _ => "download_unavailable",
                 },
-            )
-        })?;
+            ));
+        }
+    };
     let details = observed.details;
     if matches!(
         details.item.status,
@@ -660,12 +950,19 @@ async fn preflight(
             )
             .await
             .map_err(|_| Error(StatusCode::CONFLICT, "path_mapping_missing"))?;
-            let mapping_id = mapped
-                .mapping_id
-                .ok_or(Error(StatusCode::CONFLICT, "path_mapping_missing"))?;
-            let mapping_revision = mapped
-                .mapping_revision
-                .ok_or(Error(StatusCode::CONFLICT, "path_mapping_missing"))?;
+            let (Some(mapping_id), Some(mapping_revision)) =
+                (mapped.mapping_id, mapped.mapping_revision)
+            else {
+                blocked(
+                    &c,
+                    item,
+                    "path_mapping_missing",
+                    vec!["path_mapping_missing".into()],
+                    Some("hc021_mapping_missing"),
+                )
+                .await?;
+                return Ok(());
+            };
             let destination = match crate::naming::destination::resolve_owned_destination(
                 &c,
                 &target,
@@ -688,9 +985,10 @@ async fn preflight(
                     );
                     blocked(
                         &c,
-                        item.receipt_id,
+                        item,
                         "unsupported_download",
                         vec!["naming_render_failed".to_string()],
+                        None,
                     )
                     .await?;
                     return Ok(());
@@ -726,27 +1024,45 @@ async fn preflight(
                 revision_json: facts.revision_json,
                 edition: facts.edition,
                 policy_revision: item.policy_revision,
+                total_preflight_attempts: item.total_preflight_attempts,
                 mapping_id,
                 mapping_revision,
                 host: observed.host.clone(),
             });
         } else {
-            reasons.extend(
-                result
-                    .reasons
-                    .into_iter()
-                    .take(64usize.saturating_sub(reasons.len())),
-            );
+            for reason in result.reasons {
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+                if reasons.len() > 64 {
+                    return Err(bad());
+                }
+            }
         }
     }
     let Some(input) = accepted else {
-        blocked(&c, item.receipt_id, "quality_rejected", reasons).await?;
+        blocked(&c, item, "quality_rejected", reasons, None).await?;
         return Ok(());
     };
-    // prepare_owned atomically rechecks policy, mapping, target, filename/profile and cancellation.
-    crate::import::prepare_owned(db.clone(), input)
-        .await
-        .map_err(|e| Error(StatusCode::CONFLICT, processing_error(e.code())))?;
+    // Recheck captured mapping facts inside failure persistence; old mapped failures cannot replace newer facts.
+    let mapping = MappingFence {
+        id: input.mapping_id,
+        revision: input.mapping_revision,
+        host: input.host.clone(),
+    };
+    if let Err(error) = crate::import::prepare_owned(db.clone(), input).await {
+        let code = processing_error(error.code());
+        persist_failure(
+            &c,
+            item,
+            code,
+            vec![code.into()],
+            error.prepare_failure_code(),
+            false,
+            Some(&mapping),
+        )
+        .await?;
+    }
     Ok(())
 }
 async fn advance_import(
@@ -755,43 +1071,43 @@ async fn advance_import(
     item: DownloadProcessing,
 ) -> Result<()> {
     let operation = item.operation_id.ok_or_else(bad)?.to_string();
-    let journal = c
-        .query(
-            "SELECT phase,error_code FROM import_journal WHERE operation_id=?",
-            [operation.clone()],
-        )
-        .await?
-        .next()
-        .await?
-        .ok_or_else(bad)?;
-    let phase: String = journal.get(0)?;
-    let error: Option<String> = journal.get(1)?;
-    drop(journal);
-    if phase == "complete" {
-        c.execute("UPDATE download_processing SET status='imported',resume_requested=0,error_code=NULL,reasons_json='[]',updated_at=? WHERE candidate_id=?",params![now()?,item.receipt_id.to_string()]).await?;
+    let mut reservation = None;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let current = read(&tx,item.receipt_id).await?;
+        if !same_attempt(&current,&item) || !matches!(current.status,ProcessingStatus::Importing) { return Ok(None); }
+        if current.import_phase.as_deref() == Some("complete") {
+            let reasons = path_reasons(&current.reasons,&[],PathReasonChange::Complete)?;
+            if tx.execute("UPDATE download_processing SET status='imported',resume_requested=0,error_code=NULL,reasons_json=?,updated_at=? WHERE candidate_id=? AND status='importing' AND total_preflight_attempts=?",params![encoded_reasons(&reasons)?,now()?,item.receipt_id.to_string(),item.total_preflight_attempts]).await? != 1 { return Err(conflict()); }
+            changed(&tx,&current,crate::health::PathDiagnosticChange::Completion).await?;
+            return Ok(None);
+        }
+        if crate::import::operation_active(&operation).map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE,e.code()))? { return Ok(None); }
+        if current.recovery_required && !current.resume_requested {
+            if current.error_code.is_none() {
+                reservation = match crate::import::acquire_resume_guard(db) {
+                    Ok(guard)=>Some(guard),
+                    Err(error) if error.code()=="import_busy"=>return Ok(None),
+                    Err(error)=>return Err(Error(StatusCode::SERVICE_UNAVAILABLE,error.code())),
+                };
+                import_failed(&tx,&current).await?;
+            }
+            return Ok(None);
+        }
+        let generation = tx.query("SELECT generation FROM health_checks WHERE scope=? AND check_key='remote_path_mapping'",[domain(media(&current.target))]).await?.next().await?.ok_or_else(bad)?.get::<i64>(0)?;
+        Ok(Some(generation))
+    }.await;
+    let generation = finish(tx, outcome).await;
+    drop(reservation);
+    let Some(generation) = generation? else {
         return Ok(());
-    }
-    let resume = c
-        .query(
-            "SELECT resume_requested FROM download_processing WHERE candidate_id=?",
-            [item.receipt_id.to_string()],
-        )
-        .await?
-        .next()
-        .await?
-        .ok_or_else(bad)?
-        .get::<i64>(0)?
-        == 1;
-    if item.error_code.is_some() && !resume {
-        return Ok(());
-    }
-    if error.is_some() && !resume {
-        c.execute("UPDATE download_processing SET resume_requested=0,error_code='import_failed',reasons_json='[\"import_failed\"]',updated_at=? WHERE candidate_id=?",params![now()?,item.receipt_id.to_string()]).await?;
-        return Ok(());
-    }
+    };
     match crate::import::start_owned(db.clone(), &operation).await {
         Ok(_) => {
-            c.execute("UPDATE download_processing SET next_attempt_at=?,updated_at=? WHERE candidate_id=?",params![now()?+2,now()?,item.receipt_id.to_string()]).await?;
+            // Scheduling does not change evidence or authorization; fence it to this linked lifetime.
+            c.execute("UPDATE download_processing SET next_attempt_at=?,updated_at=? WHERE candidate_id=? AND status='importing' AND total_preflight_attempts=? AND EXISTS(SELECT 1 FROM rss_candidate_imports WHERE candidate_id=download_processing.candidate_id AND operation_id=?)",params![now()?+2,now()?,item.receipt_id.to_string(),item.total_preflight_attempts,operation]).await?;
         }
         Err(error) => {
             eprintln!(
@@ -799,10 +1115,466 @@ async fn advance_import(
                 item.receipt_id,
                 error.code()
             );
-            c.execute("UPDATE download_processing SET resume_requested=0,error_code='import_failed',reasons_json='[\"import_failed\"]',updated_at=? WHERE candidate_id=?",params![now()?,item.receipt_id.to_string()]).await?;
+            let guard = match crate::import::acquire_resume_guard(db) {
+                Ok(guard) => guard,
+                Err(error) if error.code() == "import_busy" => return Ok(()),
+                Err(error) => return Err(Error(StatusCode::SERVICE_UNAVAILABLE, error.code())),
+            };
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await?;
+            let outcome = async {
+                let current = read(&tx,item.receipt_id).await?;
+                let unchanged=tx.query("SELECT 1 FROM health_checks WHERE scope=? AND check_key='remote_path_mapping' AND generation=?",params![domain(media(&current.target)),generation]).await?.next().await?.is_some();
+                // A later admission/resume wins; do not consume its permission with this old failure.
+                if unchanged && same_attempt(&current,&item) && matches!(current.status,ProcessingStatus::Importing) && current.import_phase.as_deref()!=Some("complete") {
+                    import_failed(&tx,&current).await?;
+                }
+                Ok(())
+            }.await;
+            let result = finish(tx, outcome).await;
+            drop(guard);
+            result?;
         }
     }
     Ok(())
+}
+async fn import_failed(c: &Connection, item: &DownloadProcessing) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(bad());
+    }
+    let reasons = path_reasons(
+        &item.reasons,
+        &["import_failed".into()],
+        PathReasonChange::Preserve,
+    )?;
+    if c.execute("UPDATE download_processing SET resume_requested=0,error_code='import_failed',reasons_json=?,updated_at=? WHERE candidate_id=? AND status='importing' AND total_preflight_attempts=?",params![encoded_reasons(&reasons)?,now()?,item.receipt_id.to_string(),item.total_preflight_attempts]).await? != 1 { return Err(conflict()); }
+    changed(c, item, crate::health::PathDiagnosticChange::Failure).await
+}
+
+#[cfg(test)]
+mod path_diagnostics_tests {
+    use super::*;
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn fixture() -> std::result::Result<(Scratch, Arc<Database>, Connection), crate::db::Error>
+    {
+        let dir = std::env::temp_dir().join(format!("hrrdarr-path-processing-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let scratch = Scratch(dir);
+        let db = Arc::new(Database::open_local(scratch.0.join("db")).await?);
+        let c = db.connect().await?;
+        seed(&c).await?;
+        Ok((scratch, db, c))
+    }
+    async fn seed(c: &Connection) -> std::result::Result<(), crate::db::Error> {
+        c.execute_batch("PRAGMA foreign_keys=ON;
+      INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'Series','/tv/one');
+      INSERT INTO seasons(series_id,number) VALUES(1,1);
+      INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Episode');
+      INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,201,'Film');
+      INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movies/one');
+      INSERT INTO operations VALUES('tv','episode',1,NULL,'/source/tv','copy','/tv/one/a.mkv','preview','kept');
+      INSERT INTO operations VALUES('movie','movie',NULL,1,'/source/movie','copy','/movies/one/a.mkv','preview','kept');
+      INSERT INTO import_journal(operation_id,plan_json,phase,error_code) VALUES('tv','{\"private\":\"tv\"}','preview','import_error'),('movie','{\"private\":\"movie\"}','staging',NULL);
+      INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(2,202,'Completed Film');
+      INSERT INTO movies(id,metadata_id,path) VALUES(2,2,'/movies/completed');
+      INSERT INTO movie_files(id,movie_id,path) VALUES(2,2,'/movies/completed/a.mkv');
+      INSERT INTO operations VALUES('done','movie',NULL,2,'/source/done','copy','/movies/completed/a.mkv','complete','kept history');
+      INSERT INTO import_journal(operation_id,plan_json,stage_json,phase) VALUES('done','{}','{}','staging');
+      INSERT INTO import_history(operation_id,media_type,movie_id,movie_file_id,source,destination,size,sha256) VALUES('done','movie',2,2,'/source/done','/movies/completed/a.mkv',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      UPDATE import_journal SET phase='complete' WHERE operation_id='done';
+      INSERT INTO remote_path_mappings(media_type,host,remote_path,remote_kind,remote_key,local_path) VALUES('tv','fixture.invalid','/remote','posix','/remote','/source/tv'),('movies','fixture.invalid','/remote','posix','/remote','/source/movie');
+      UPDATE health_checks SET generation=1,observed_generation=1,observed_epoch='00000000-0000-0000-0000-000000000001',checked_at=100,severity=0 WHERE check_key='completed_download_handling';").await?;
+        let indexer = uuid::Uuid::new_v4().to_string();
+        let client = uuid::Uuid::new_v4().to_string();
+        for (id, implementation) in [(&indexer, "torznab"), (&client, "qbittorrent")] {
+            c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,?,?,1,1,1,1,'http://fixture.invalid')", params![id.clone(),implementation,implementation]).await?;
+        }
+        // Add both scopes before policy rows: scope changes intentionally invalidate existing policy.
+        for media in ["tv", "movies"] {
+            let (anime, year, categories) = if media == "tv" {
+                (Some(0), None, "[5000]")
+            } else {
+                (None, Some(0), "[2000]")
+            };
+            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab',?,?,'[]',?,?)", params![indexer.clone(),media,categories,anime,year]).await?;
+            c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags) VALUES(?,'qbittorrent',?,?,0,0,'started','default',0,0,0)", params![client.clone(),media,media]).await?;
+        }
+        for (media, digit) in [("tv", "a"), ("movies", "b")] {
+            c.execute("INSERT INTO download_processing_policies(provider_id,media_type,provider_revision,revision,enabled,mode) VALUES(?,?,1,1,1,'copy')", params![client.clone(),media]).await?;
+            let command = uuid::Uuid::new_v4().to_string();
+            let candidate = uuid::Uuid::new_v4().to_string();
+            c.execute("INSERT INTO rss_commands(id,name,media_type,indexer_id,indexer_revision,client_id,client_revision,next_attempt_at,created_at) VALUES(?,'rss_sync',?,?,1,?,1,100,100)", params![command.clone(),media,indexer.clone(),client.clone()]).await?;
+            c.execute("INSERT INTO rss_candidates(id,command_id,media_type,indexer_id,indexer_revision,client_id,client_revision,fingerprint,title,private_payload,series_id,status,decision_reasons_json,created_at,updated_at) SELECT ?,id,media_type,indexer_id,indexer_revision,client_id,client_revision,?,'Release',?,?,'pending','[]',100,100 FROM rss_commands WHERE id=?", params![candidate.clone(),digit.repeat(64),vec![1u8;29],if media=="tv" {Some(1)} else {None},command]).await?;
+            if media == "tv" {
+                c.execute(
+                    "INSERT INTO rss_candidate_episodes VALUES(?,1,1)",
+                    [candidate.clone()],
+                )
+                .await?;
+            }
+            let hash = digit.repeat(40);
+            let identity = serde_json::json!({"version":1,"target":{"media_type":if media=="tv" {"episode"} else {"movie"},"id":1},"hashes":[hash],"settings_fingerprint":"c".repeat(64),"payload_sha256":"d".repeat(64)}).to_string();
+            c.execute("UPDATE rss_candidates SET status='prepared',submission_identity_json=?,movie_id=? WHERE id=?", params![identity,if media=="movies" {Some(1)} else {None},candidate.clone()]).await?;
+            c.execute(
+                "INSERT INTO rss_hash_claims VALUES(?,?,?)",
+                params![client.clone(), hash.clone(), candidate.clone()],
+            )
+            .await?;
+            c.execute(
+                "UPDATE rss_candidates SET status='submitting',private_payload=NULL WHERE id=?",
+                [candidate.clone()],
+            )
+            .await?;
+            c.execute(
+                "UPDATE rss_candidates SET status='observed',observed_hash=? WHERE id=?",
+                params![hash, candidate.clone()],
+            )
+            .await?;
+            c.execute("INSERT INTO download_processing(candidate_id,policy_revision,status,next_attempt_at,created_at,updated_at) VALUES(?,1,'queued',100,100,100)", [candidate.clone()]).await?;
+            c.execute("UPDATE download_processing SET status='checking',preflight_attempts=1,total_preflight_attempts=1 WHERE candidate_id=?", [candidate.clone()]).await?;
+            c.execute("UPDATE download_processing SET status='blocked',error_code='source_unavailable',reasons_json='[\"source_unavailable\"]' WHERE candidate_id=?", [candidate]).await?;
+        }
+        Ok(())
+    }
+
+    async fn receipt(c: &Connection, media: MediaDomain) -> Result<DownloadProcessing> {
+        let row = c
+            .query(
+                "SELECT id FROM rss_candidates WHERE media_type=?",
+                [domain(media)],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(bad)?;
+        read(
+            c,
+            Uuid::parse_str(&row.get::<String>(0)?).map_err(|_| bad())?,
+        )
+        .await
+    }
+    async fn retry(db: &Arc<Database>, item: &DownloadProcessing) -> Result<()> {
+        let _ = process(
+            State(db.clone()),
+            Ok(Query(Empty {})),
+            Ok(Json(ProcessingInput {
+                provider_id: item.provider_id,
+                provider_revision: item.provider_revision,
+                media_type: media(&item.target),
+                receipt_ids: vec![item.receipt_id],
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn admitted(c: &Connection, id: Uuid) -> Result<DownloadProcessing> {
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let result = claim(&tx, id, now()?).await;
+        finish(tx, result).await
+    }
+    async fn generation(c: &Connection, media: MediaDomain) -> Result<i64> {
+        Ok(c.query("SELECT generation FROM health_checks WHERE scope=? AND check_key='remote_path_mapping'",[domain(media)]).await?.next().await?.ok_or_else(bad)?.get(0)?)
+    }
+    #[test]
+    fn reason_lifecycle_rejects_duplicates_malformed_markers_and_overflow() {
+        let prior = vec![
+            "hc021_source_missing_prepare".into(),
+            "source_unavailable".into(),
+        ];
+        assert_eq!(
+            path_reasons(&prior, &[], PathReasonChange::Preserve).unwrap(),
+            vec!["hc021_source_missing_prepare"]
+        );
+        assert_eq!(
+            path_reasons(&prior, &[], PathReasonChange::Admission).unwrap(),
+            vec!["hc021_source_missing_prepare"]
+        );
+        assert_eq!(
+            path_reasons(&[], &[], PathReasonChange::Admission).unwrap(),
+            vec![PATH_MARKER]
+        );
+        assert_eq!(
+            path_reasons(
+                &prior,
+                &[],
+                PathReasonChange::Failure("hc021_root_denied_prepare")
+            )
+            .unwrap(),
+            vec!["hc021_root_denied_prepare"]
+        );
+        assert!(
+            path_reasons(&prior, &[], PathReasonChange::Complete)
+                .unwrap()
+                .is_empty()
+        );
+        for malformed in [
+            vec!["hc021_unknown".into()],
+            vec!["ordinary".into(), PATH_MARKER.into()],
+            vec!["ordinary".into(), "ordinary".into()],
+            vec![PATH_MARKER.into(), PATH_MARKER.into()],
+        ] {
+            assert!(path_reasons(&malformed, &[], PathReasonChange::Preserve).is_err());
+            assert!(path_reasons(&malformed, &[], PathReasonChange::Complete).is_err());
+        }
+        assert!(
+            path_reasons(
+                &[],
+                &["ordinary".into(), "ordinary".into()],
+                PathReasonChange::Complete
+            )
+            .is_err()
+        );
+        assert!(path_reasons(&[], &[PATH_MARKER.into()], PathReasonChange::Preserve).is_err());
+        assert!(path_reasons(&prior, &[], PathReasonChange::Failure(PATH_MARKER)).is_err());
+        assert!(
+            path_reasons(
+                &prior,
+                &[],
+                PathReasonChange::Failure("hc021_stage_missing_prepare")
+            )
+            .is_err()
+        );
+        let ordinary: Vec<_> = (0..64).map(|i| format!("reason_{i}")).collect();
+        assert!(path_reasons(&[], &ordinary, PathReasonChange::Admission).is_err());
+        assert!(path_reasons(&[], &["x".repeat(129)], PathReasonChange::Preserve).is_err());
+    }
+    #[tokio::test]
+    async fn both_domains_retain_markers_and_reject_old_lifetime_failures()
+    -> std::result::Result<(), crate::db::Error> {
+        let (_scratch, db, c) = fixture().await?;
+        for media in [MediaDomain::Tv, MediaDomain::Movies] {
+            let initial = receipt(&c, media).await?;
+            retry(&db, &initial).await?;
+            let first = admitted(&c, initial.receipt_id).await?;
+            assert_eq!(first.reasons, vec![PATH_MARKER]);
+            assert_eq!(first.total_preflight_attempts, 2);
+            assert!(first.path_failure_code.is_none());
+            persist_failure(
+                &c,
+                &first,
+                "source_unavailable",
+                vec!["source_unavailable".into()],
+                Some("hc021_source_missing_prepare"),
+                false,
+                None,
+            )
+            .await?;
+            let failed = read(&c, first.receipt_id).await?;
+            assert_eq!(failed.reasons[0], "hc021_source_missing_prepare");
+            retry(&db, &failed).await?;
+            let second = admitted(&c, failed.receipt_id).await?;
+            assert_eq!(second.total_preflight_attempts, 3);
+            assert_eq!(second.reasons, vec!["hc021_source_missing_prepare"]);
+            let before = generation(&c, media).await?;
+            persist_failure(
+                &c,
+                &first,
+                "source_unavailable",
+                vec![],
+                Some("hc021_root_denied_prepare"),
+                false,
+                None,
+            )
+            .await?;
+            assert_eq!(read(&c, second.receipt_id).await?.reasons, second.reasons);
+            assert_eq!(generation(&c, media).await?, before);
+            let _ = cancel(
+                State(db.clone()),
+                Path(second.receipt_id.to_string()),
+                Ok(Query(Empty {})),
+            )
+            .await?;
+            let cancelled = read(&c, second.receipt_id).await?;
+            assert!(matches!(cancelled.status, ProcessingStatus::Cancelled));
+            assert_eq!(cancelled.reasons, second.reasons);
+            let before = generation(&c, media).await?;
+            persist_failure(
+                &c,
+                &second,
+                "source_unavailable",
+                vec![],
+                Some("hc021_destination_denied_prepare"),
+                false,
+                None,
+            )
+            .await?;
+            assert_eq!(generation(&c, media).await?, before);
+            retry(&db, &cancelled).await?;
+            let resumed = admitted(&c, cancelled.receipt_id).await?;
+            assert_eq!(resumed.total_preflight_attempts, 4);
+            assert_eq!(resumed.reasons, second.reasons);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn storage_failure_rolls_back_admission_and_failure_keeps_durable_marker()
+    -> std::result::Result<(), crate::db::Error> {
+        let (_scratch, db, c) = fixture().await?;
+        let item = receipt(&c, MediaDomain::Tv).await?;
+        retry(&db, &item).await?;
+        c.execute_batch("CREATE TRIGGER reject_path_health BEFORE UPDATE ON health_checks WHEN OLD.scope='tv' AND OLD.check_key='remote_path_mapping' BEGIN SELECT RAISE(ABORT,'fixture generation write failure'); END;").await?;
+        assert!(admitted(&c, item.receipt_id).await.is_err());
+        let untouched = read(&c, item.receipt_id).await?;
+        assert!(matches!(untouched.status, ProcessingStatus::Queued));
+        assert_eq!(untouched.total_preflight_attempts, 1);
+        assert!(untouched.reasons.is_empty());
+        c.execute("DROP TRIGGER reject_path_health", ()).await?;
+        let admitted = admitted(&c, item.receipt_id).await?;
+        c.execute_batch("CREATE TRIGGER reject_path_health BEFORE UPDATE ON health_checks WHEN OLD.scope='tv' AND OLD.check_key='remote_path_mapping' BEGIN SELECT RAISE(ABORT,'fixture generation write failure'); END;").await?;
+        assert!(
+            persist_failure(
+                &c,
+                &admitted,
+                "source_unavailable",
+                vec![],
+                Some("hc021_source_denied_prepare"),
+                false,
+                None
+            )
+            .await
+            .is_err()
+        );
+        let retained = read(&c, item.receipt_id).await?;
+        assert!(matches!(retained.status, ProcessingStatus::Checking));
+        assert_eq!(retained.reasons, vec![PATH_MARKER]);
+        assert!(retained.error_code.is_none());
+        c.execute("DROP TRIGGER reject_path_health", ()).await?;
+        recover(&c, now()?, "interrupted").await?;
+        assert_eq!(read(&c, item.receipt_id).await?.reasons[0], PATH_MARKER);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn captured_mapping_change_wins_over_obsolete_source_failure()
+    -> std::result::Result<(), crate::db::Error> {
+        let (_scratch, db, c) = fixture().await?;
+        let item = receipt(&c, MediaDomain::Tv).await?;
+        retry(&db, &item).await?;
+        let item = admitted(&c, item.receipt_id).await?;
+        let mapping = MappingFence {
+            id: 1,
+            revision: 1,
+            host: "fixture.invalid".into(),
+        };
+        c.execute(
+            "UPDATE remote_path_mappings SET revision=2,local_path='/source/repaired' WHERE id=1",
+            (),
+        )
+        .await?;
+        persist_failure(
+            &c,
+            &item,
+            "source_unavailable",
+            vec!["source_unavailable".into()],
+            Some("hc021_source_missing_prepare"),
+            false,
+            Some(&mapping),
+        )
+        .await?;
+        let current = read(&c, item.receipt_id).await?;
+        assert_eq!(current.error_code.as_deref(), Some("path_mapping_changed"));
+        assert_eq!(current.reasons[0], "hc021_mapping_changed");
+        Ok(())
+    }
+    async fn linked(c: &Connection, item: &DownloadProcessing) -> Result<String> {
+        let operation = Uuid::new_v4().to_string();
+        c.execute("INSERT INTO operations(id,media_type,movie_id,source,mode,destination,status,message)VALUES(?,'movie',1,'/source/new','copy','/movies/one/new.mkv','preview','fixture')",[operation.clone()]).await?;
+        c.execute("INSERT INTO import_journal(operation_id,plan_json,phase,path_failure_code)VALUES(?,'{}','preview','unresolved_attempt')",[operation.clone()]).await?;
+        c.execute("INSERT INTO rss_candidate_imports(candidate_id,operation_id,quality_id,revision_json,provenance_json)VALUES(?,?,1,'{\"version\":1,\"real\":0,\"is_repack\":false}','{}')",params![item.receipt_id.to_string(),operation.clone()]).await?;
+        c.execute(
+            "UPDATE download_processing SET status='importing' WHERE candidate_id=?",
+            [item.receipt_id.to_string()],
+        )
+        .await?;
+        Ok(operation)
+    }
+    #[tokio::test]
+    async fn linked_resume_reservation_rolls_back_mixed_batch_and_complete_clears_only_its_receipt()
+    -> std::result::Result<(), crate::db::Error> {
+        let (_scratch, db, c) = fixture().await?;
+        let movie = receipt(&c, MediaDomain::Movies).await?;
+        retry(&db, &movie).await?;
+        let movie = admitted(&c, movie.receipt_id).await?;
+        let operation = linked(&c, &movie).await?;
+        let linked = read(&c, movie.receipt_id).await?;
+        assert_eq!(
+            linked.path_failure_code.as_deref(),
+            Some("unresolved_attempt")
+        );
+        assert!(linked.recovery_required);
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let settings = crate::completed_download_handling::read(&tx, MediaDomain::Movies)
+            .await
+            .map_err(|e| e.1.to_owned())?;
+        crate::completed_download_handling::set(
+            &tx,
+            MediaDomain::Movies,
+            false,
+            true,
+            settings.revision,
+            true,
+        )
+        .await
+        .map_err(|e| e.1.to_owned())?;
+        tx.commit().await?;
+        assert!(
+            !policy(&c, linked.provider_id, MediaDomain::Movies)
+                .await?
+                .enabled
+        );
+        // Disabling new admission cannot revoke the existing operation's explicit recovery.
+        let guard = crate::import::acquire_resume_guard(&db).map_err(|e| e.code().to_owned())?;
+        assert!(retry(&db, &linked).await.is_err());
+        assert!(!read(&c, movie.receipt_id).await?.resume_requested);
+        drop(guard);
+        let result = process(
+            State(db.clone()),
+            Ok(Query(Empty {})),
+            Ok(Json(ProcessingInput {
+                provider_id: linked.provider_id,
+                provider_revision: linked.provider_revision,
+                media_type: MediaDomain::Movies,
+                receipt_ids: vec![linked.receipt_id, Uuid::new_v4()],
+            })),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!read(&c, movie.receipt_id).await?.resume_requested);
+        // The failed batch released its reservation, allowing exactly one explicit request.
+        retry(&db, &linked).await?;
+        assert!(read(&c, movie.receipt_id).await?.resume_requested);
+        let tv = receipt(&c, MediaDomain::Tv).await?;
+        retry(&db, &tv).await?;
+        let tv = admitted(&c, tv.receipt_id).await?;
+        c.execute(
+            "INSERT INTO movie_files(id,movie_id,path)VALUES(1,1,'/movies/one/new.mkv')",
+            (),
+        )
+        .await?;
+        c.execute(
+            "UPDATE import_journal SET phase='staging',stage_json='{}' WHERE operation_id=?",
+            [operation.clone()],
+        )
+        .await?;
+        c.execute("INSERT INTO import_history(operation_id,media_type,movie_id,movie_file_id,source,destination,size,sha256)VALUES(?,'movie',1,1,'/source/new','/movies/one/new.mkv',1,?)",params![operation.clone(),"a".repeat(64)]).await?;
+        c.execute("UPDATE import_journal SET phase='complete',path_failure_code=NULL WHERE operation_id=?",[operation]).await?;
+        advance_import(&db, &c, linked).await?;
+        let completed = read(&c, movie.receipt_id).await?;
+        assert!(matches!(completed.status, ProcessingStatus::Imported));
+        assert!(completed.reasons.is_empty());
+        assert!(!completed.recovery_required);
+        assert_eq!(read(&c, tv.receipt_id).await?.reasons, vec![PATH_MARKER]);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

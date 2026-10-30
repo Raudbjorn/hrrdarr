@@ -46,214 +46,7 @@ async fn rows(c: &Connection, sql: &str) -> Vec<String> {
     }
     out
 }
-const MIGRATION: &str = include_str!("../migrations/0053_provider_authority.sql");
-const PREDECESSORS: &[(&str, &str)] = &[
-    (
-        "prototype",
-        include_str!("../migrations/0001_prototype.sql"),
-    ),
-    (
-        "media_relations",
-        include_str!("../migrations/0002_media_relations.sql"),
-    ),
-    (
-        "snapshot_imports",
-        include_str!("../migrations/0003_snapshot_imports.sql"),
-    ),
-    (
-        "quality_definitions",
-        include_str!("../migrations/0004_quality_definitions.sql"),
-    ),
-    (
-        "episode_metadata",
-        include_str!("../migrations/0005_episode_metadata.sql"),
-    ),
-    (
-        "file_metadata",
-        include_str!("../migrations/0006_file_metadata.sql"),
-    ),
-    (
-        "library_settings",
-        include_str!("../migrations/0007_library_settings.sql"),
-    ),
-    (
-        "manual_import_journal",
-        include_str!("../migrations/0008_manual_import_journal.sql"),
-    ),
-    (
-        "provider_configuration",
-        include_str!("../migrations/0009_provider_configuration.sql"),
-    ),
-    (
-        "provider_test_results",
-        include_str!("../migrations/0010_provider_test_results.sql"),
-    ),
-    (
-        "indexer_scope_options",
-        include_str!("../migrations/0011_indexer_scope_options.sql"),
-    ),
-    (
-        "qbittorrent_options",
-        include_str!("../migrations/0012_qbittorrent_options.sql"),
-    ),
-    (
-        "snapshot_provider_mappings",
-        include_str!("../migrations/0013_snapshot_provider_mappings.sql"),
-    ),
-    (
-        "root_folders",
-        include_str!("../migrations/0014_root_folders.sql"),
-    ),
-    (
-        "remote_path_mappings",
-        include_str!("../migrations/0015_remote_path_mappings.sql"),
-    ),
-    (
-        "download_refresh",
-        include_str!("../migrations/0016_download_refresh.sql"),
-    ),
-    (
-        "import_history_order",
-        include_str!("../migrations/0017_import_history_order.sql"),
-    ),
-    (
-        "snapshot_history",
-        include_str!("../migrations/0018_snapshot_history.sql"),
-    ),
-    (
-        "profile_policy",
-        include_str!("../migrations/0019_profile_policy.sql"),
-    ),
-    (
-        "snapshot_profiles",
-        include_str!("../migrations/0020_snapshot_profiles.sql"),
-    ),
-    (
-        "metadata_refresh_commands",
-        include_str!("../migrations/0021_metadata_refresh_commands.sql"),
-    ),
-    (
-        "snapshot_blocklist",
-        include_str!("../migrations/0022_snapshot_blocklist.sql"),
-    ),
-    (
-        "blocklist_clear_commands",
-        include_str!("../migrations/0023_blocklist_clear_commands.sql"),
-    ),
-    (
-        "release_catalog_policy",
-        include_str!("../migrations/0024_release_catalog_policy.sql"),
-    ),
-    (
-        "rss_grab_journal",
-        include_str!("../migrations/0025_rss_grab_journal.sql"),
-    ),
-    (
-        "download_processing",
-        include_str!("../migrations/0026_download_processing.sql"),
-    ),
-    (
-        "targeted_search",
-        include_str!("../migrations/0027_targeted_search.sql"),
-    ),
-    (
-        "same_path_replacements",
-        include_str!("../migrations/0028_same_path_replacements.sql"),
-    ),
-    (
-        "naming_settings",
-        include_str!("../migrations/0029_naming_settings.sql"),
-    ),
-    (
-        "manual_import_commands",
-        include_str!("../migrations/0030_manual_import_commands.sql"),
-    ),
-    (
-        "quality_reset_commands",
-        include_str!("../migrations/0031_quality_reset_commands.sql"),
-    ),
-    (
-        "rescan_commands",
-        include_str!("../migrations/0032_rescan_commands.sql"),
-    ),
-    (
-        "command_capacity_active_only",
-        include_str!("../migrations/0033_command_capacity_active_only.sql"),
-    ),
-    (
-        "custom_formats",
-        include_str!("../migrations/0034_custom_formats.sql"),
-    ),
-    (
-        "candidate_comparison_facts",
-        include_str!("../migrations/0035_candidate_comparison_facts.sql"),
-    ),
-    (
-        "snapshot_custom_formats",
-        include_str!("../migrations/0036_snapshot_custom_formats.sql"),
-    ),
-    ("tags", include_str!("../migrations/0037_tags.sql")),
-    (
-        "revision_policy",
-        include_str!("../migrations/0038_revision_policy.sql"),
-    ),
-    (
-        "delay_profiles",
-        include_str!("../migrations/0039_delay_profiles.sql"),
-    ),
-    (
-        "release_profiles",
-        include_str!("../migrations/0040_release_profiles.sql"),
-    ),
-    (
-        "completed_download_handling",
-        include_str!("../migrations/0041_completed_download_handling.sql"),
-    ),
-    (
-        "health_checks",
-        include_str!("../migrations/0042_health_checks.sql"),
-    ),
-    (
-        "health_communication",
-        include_str!("../migrations/0043_health_communication.sql"),
-    ),
-    (
-        "health_download_client_roots",
-        include_str!("../migrations/0044_health_download_client_roots.sql"),
-    ),
-    (
-        "autotagging_metadata",
-        include_str!("../migrations/0045_autotagging_metadata.sql"),
-    ),
-    (
-        "removed_metadata_health",
-        include_str!("../migrations/0046_removed_metadata_health.sql"),
-    ),
-    (
-        "movie_credits",
-        include_str!("../migrations/0047_movie_credits.sql"),
-    ),
-    (
-        "indexer_operation_policy",
-        include_str!("../migrations/0048_indexer_operation_policy.sql"),
-    ),
-    (
-        "indexer_client_binding",
-        include_str!("../migrations/0049_indexer_client_binding.sql"),
-    ),
-    (
-        "torrent_rss_indexer",
-        include_str!("../migrations/0050_torrent_rss_indexer.sql"),
-    ),
-    (
-        "download_client_backoff",
-        include_str!("../migrations/0051_download_client_backoff.sql"),
-    ),
-    (
-        "collections",
-        include_str!("../migrations/0052_collections.sql"),
-    ),
-];
+const MIGRATION: &str = include_str!("../migrations/0078_provider_authority.sql");
 const OBJECTS: &[&str] = &[
     "provider_scope_tags",
     "provider_scope_tags_tag",
@@ -269,26 +62,42 @@ const OBJECTS: &[&str] = &[
     "provider_cursor_update",
 ];
 async fn predecessor(s: &Scratch) -> Result<libsql::Database, Error> {
+    // Replay the real prefix: later registry rebuilds cannot be undone by dropping columns.
+    let template = Database::open_local(s.0.join("migration-source.db")).await?;
+    let source = template.connect().await?;
+    let mut migrations = source.query(
+        "SELECT version,name,checksum,sql FROM schema_migrations WHERE version<=77 ORDER BY version", (),
+    ).await?;
     let db = libsql::Builder::new_local(s.database()).build().await?;
     let c = db.connect()?;
-    c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    c.execute_batch("PRAGMA foreign_keys=OFF; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    for (i, (name, sql)) in PREDECESSORS.iter().enumerate() {
-        tx.execute_batch(sql).await?;
-        let checksum: String = ring::digest::digest(&ring::digest::SHA256, sql.as_bytes())
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+    let mut applied = 0;
+    while let Some(row) = migrations.next().await? {
+        let version = row.get::<i64>(0)?;
+        let name = row.get::<String>(1)?;
+        let checksum = row.get::<String>(2)?;
+        let sql = row.get::<String>(3)?;
+        tx.execute_batch(&sql).await?;
         tx.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum, *sql],
+            params![version, name, checksum, sql],
         )
         .await?;
+        applied += 1;
     }
+    assert_eq!(applied, 77);
     tx.commit().await?;
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    assert!(
+        c.query("PRAGMA foreign_key_check", ())
+            .await?
+            .next()
+            .await?
+            .is_none()
+    );
     Ok(db)
 }
 
@@ -360,7 +169,7 @@ async fn objects(c: &Connection) {
     assert_eq!(number(c,"SELECT count(*) FROM pragma_table_info('snapshot_imports') WHERE name='provider_authority_version'").await,1);
 }
 #[tokio::test]
-async fn upgrade52_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
+async fn upgrade77_preserves_test_evidence_domains_and_reopens() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -391,7 +200,7 @@ async fn upgrade52_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        53 // Reasoning: provider authority is 0053 after collections 0052.
+        78 // Reasoning: provider authority is appended after collections authority 0077.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
@@ -403,7 +212,7 @@ async fn upgrade52_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     Ok(())
 }
 #[tokio::test]
-async fn migration_late_failure_restores52_schema_and_evidence() -> Result<(), Error> {
+async fn migration_late_failure_restores77_schema_and_evidence() -> Result<(), Error> {
     let s = Scratch::new();
     let raw = predecessor(&s).await?;
     let c = raw.connect()?;
@@ -422,7 +231,7 @@ async fn migration_late_failure_restores52_schema_and_evidence() -> Result<(), E
     assert_eq!(number(&tx, "SELECT count(*) FROM provider_tests").await, 3);
     assert!(
         tx.execute(
-            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=52",
+            "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE version=77",
             ()
         )
         .await
@@ -444,7 +253,7 @@ async fn migration_late_failure_restores52_schema_and_evidence() -> Result<(), E
     let c = raw.connect()?;
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        52 // Reasoning: predecessor chain now ends at collections 0052.
+        77 // Reasoning: provider authority follows collections authority 0077.
     );
     assert_eq!(witness(&c).await, before);
     Ok(())
