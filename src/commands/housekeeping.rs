@@ -113,12 +113,12 @@ const TABLES: [Table; 10] = [
         domain: MEDIA,
         protect: "1",
     },
-    // Rename history (0067): items cascade with the command; events are retained separately.
+    // Preserve current recovery handles and legacy incomplete rollbacks awaiting explicit repair.
     Table {
         name: "rename_commands",
         terminal: TERMINAL,
         domain: MEDIA,
-        protect: "1",
+        protect: "NOT EXISTS(SELECT 1 FROM rename_items i WHERE i.command_id=t.id AND (i.state='planned' OR (i.state='failed' AND i.error_code='rollback_incomplete')))",
     },
 ];
 

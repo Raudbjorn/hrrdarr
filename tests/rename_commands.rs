@@ -642,7 +642,9 @@ async fn interrupted_groups_roll_forward_or_back_from_the_journal_at_startup() -
         c.execute("INSERT INTO rename_items(command_id,kind,series_id,file_id,old_path,new_path,identity_json,sidecars_json,state) VALUES('00000000-0000-4000-8000-000000000001','file',1,?,?,?,?,?,'planned')",
             params![n, s.s(&format!("lib/Show/old{n}.mkv")), s.s(&format!("lib/Show/new{n}.mkv")), m.to_string(), json!([{"old": s.s(&format!("lib/Show/old{n}.srt")), "new": s.s(&format!("lib/Show/new{n}.srt")), "ident": sc}]).to_string()]).await?;
     }
-    c.execute("UPDATE rename_commands SET status='failed',attempts=1,started_at=1,completed_at=2,error_code='interrupted' WHERE id='00000000-0000-4000-8000-000000000001'", ()).await.ok();
+    // Follow real transitions so the fixture is terminal and only startup recovery can finish it.
+    c.execute("UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id='00000000-0000-4000-8000-000000000001'", ()).await?;
+    c.execute("UPDATE rename_commands SET status='failed',completed_at=2,error_code='interrupted' WHERE id='00000000-0000-4000-8000-000000000001'", ()).await?;
     let runtime = worker(&db, &api).await;
     let states: Vec<(i64, String, Option<String>)> = {
         let mut rows = c
@@ -667,8 +669,11 @@ async fn interrupted_groups_roll_forward_or_back_from_the_journal_at_startup() -
         path_of(&c, "episode_files", 1).await,
         s.s("lib/Show/new1.mkv")
     );
-    assert_eq!(states[1].0, 2);
-    assert_ne!(states[1].1, "committed", "{states:?}");
+    // A collision prevents rollback; retain the planned journal until that obstacle is removed.
+    assert_eq!(
+        states[1],
+        (2, "planned".into(), Some("rollback_incomplete".into()))
+    );
     assert_eq!(
         path_of(&c, "episode_files", 2).await,
         s.s("lib/Show/old2.mkv")
@@ -676,5 +681,70 @@ async fn interrupted_groups_roll_forward_or_back_from_the_journal_at_startup() -
     assert!(s.exists("lib/Show/old2.srt") && !s.exists("lib/Show/new2.srt"));
     assert_eq!(std::fs::read(s.0.join("lib/Show/old2.mkv"))?, b"intruder");
     runtime.shutdown().await;
+    // Repeated recovery attempts neither discard the journal nor inflate terminal item failures.
+    worker(&db, &api).await.shutdown().await;
+    let failures: i64 = c
+        .query("SELECT items_failed FROM rename_commands", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    assert_eq!(failures, 0);
+    let policy = commands::housekeeping::Policy {
+        retention_seconds: 1000,
+        min_keep: 0,
+        ..Default::default()
+    };
+    let pruned = commands::housekeeping::prune(&db, &policy, 2_000_000_000).await?;
+    assert_eq!(
+        pruned.deleted_from("rename_commands", "tv"),
+        0,
+        "pending journal protects terminal history"
+    );
+
+    // Start while blocked, then remove the obstacle: a newly enqueued command must recover its
+    // terminal predecessor, without another restart or resetting the predecessor's status.
+    let runtime = worker(&db, &api).await;
+    std::fs::remove_file(s.0.join("lib/Show/old2.mkv"))?;
+    naming_tv(&c, false, "x", None, None).await;
+    let retry = command(&api, json!({"name":"rename_series","target":{"media_type":"tv","series_ids":[1]},"priority":"normal"})).await;
+    assert_eq!(
+        retry["status"], "succeeded",
+        "disabled naming leaves recovered files unchanged instead of planning another move"
+    );
+    assert_eq!(retry["items_unchanged"], 2);
+    assert_eq!(retry["items_renamed"], 0);
+    runtime.shutdown().await;
+    assert_eq!(
+        path_of(&c, "episode_files", 2).await,
+        s.s("lib/Show/new2.mkv")
+    );
+    assert!(s.exists("lib/Show/new2.mkv") && s.exists("lib/Show/new2.srt"));
+    assert!(!s.exists("lib/Show/old2.mkv") && !s.exists("lib/Show/old2.srt"));
+    let committed: i64 = c
+        .query(
+            "SELECT count(*) FROM rename_items WHERE state='committed' AND error_code IS NULL",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    assert_eq!(committed, 2);
+    let row = c
+        .query("SELECT items_renamed,items_failed FROM rename_commands WHERE id='00000000-0000-4000-8000-000000000001'", ())
+        .await?
+        .next()
+        .await?
+        .unwrap();
+    assert_eq!((row.get::<i64>(0)?, row.get::<i64>(1)?), (2, 0));
+    let pruned = commands::housekeeping::prune(&db, &policy, 2_000_000_000).await?;
+    assert_eq!(
+        pruned.deleted_from("rename_commands", "tv"),
+        2,
+        "settled journals no longer pin either command's history"
+    );
     Ok(())
 }

@@ -44,10 +44,13 @@ and each sidecar), move with `renameat2(RENAME_NOREPLACE)` through descriptor-re
 no-symlink directory walks (`src/rename/fsops.rs`, built on the recycle-bin/importer
 primitives), then commit the new path, journal state, event row and counters in one
 transaction. Sidecars (same stem followed by `.`, extensions srt ass ssa sub idx sup vtt nfo
-jpg jpeg png tbn, not tracked as media) move with the media file. Any failure rolls the whole
-group back. After a crash the journal row's true state is read back from the disk: all pairs at
-source or already moved roll forward; any anomaly rolls moved pairs back and records the item as
-failed. This runs at worker start and at the start of each run. Cross-device moves are refused
+jpg jpeg png tbn, not tracked as media) move with the media file. A failure attempts to roll the
+whole group back. If rollback cannot restore the layout, the item stays `planned` with
+`rollback_incomplete`, remains protected from history pruning, and stops that command attempt.
+After a crash the journal row's true state is read back from disk: all pairs at source or already
+moved roll forward; anomalies attempt rollback and become `rolled_back` only once restoration
+succeeds. Recovery runs at worker start and before each command, including terminal predecessors
+for the same TV/movie owners. Unresolved items are logged and retained for another recovery pass. Cross-device moves are refused
 (`EXDEV` -> `cross_device`), never copied. Case-only renames work on case-sensitive filesystems
 as ordinary renames and on case-insensitive ones via a plain rename when no distinct entry has
 the target name. When both path lookups return the recorded identity, journal recovery uses the
@@ -66,6 +69,11 @@ transaction, then calls observers registered with
 
 ## Not claimed
 
+* Older binaries may already have stored unfinished rollbacks as `failed` with
+  `rollback_incomplete`. This change does not reopen those historical rows or repair their
+  counters. Their journals are retained by housekeeping as recovery evidence, but automatic
+  recovery applies only to `planned` journals. Historical recovery is tracked in
+  [issue #63](https://github.com/Raudbjorn/hrrdarr/issues/63).
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
   second filesystem was exercised. Case-insensitive filesystems were not exercised (the
   alias observations are simulated against real directory listings; file/folder moves and reverse
@@ -79,5 +87,5 @@ transaction, then calls observers registered with
   (cause not established; observed-once).
 * Source-faithful Sonarr/Radarr runtime equivalence, V3 wire shapes, scene/absolute edge cases
   beyond the renderer's tested grammar, and extra-file tracking tables are not claimed.
-* The command pool admits `rename_commands`; the schema migration is file 0067 but sits at
-  position 63 on this branch, so merging needs renumbering with the other lanes.
+* The command pool admits `rename_commands`; its schema is preserved from main as migration
+  `0065_rename_commands.sql` at ordinal 65.

@@ -552,6 +552,8 @@ async fn bind_root(c: &Connection, j: &mut Journal) -> Result<bool> {
 }
 const JOURNAL_COLUMNS: &str =
     "id,command_id,kind,series_id,movie_id,file_id,old_path,new_path,identity_json,sidecars_json";
+// A new command also recovers terminal predecessors for its owners, before replanning their paths.
+const JOURNAL_SCOPE: &str = "state='planned' AND (?1 IS NULL OR command_id=?1 OR EXISTS(SELECT 1 FROM rename_command_targets t WHERE t.command_id=?1 AND (t.series_id=rename_items.series_id OR t.movie_id=rename_items.movie_id)))";
 async fn settle_journal(
     c: &Connection,
     j: &Journal,
@@ -627,13 +629,18 @@ async fn commit(db: &Database, j: &Journal) -> std::result::Result<RenameEvent, 
         }
     }
 }
-async fn fail_item(db: &Database, j: &Journal, state: &str, code: &str) -> Result<()> {
+async fn fail_item(db: &Database, j: &Journal, restored: bool, code: &str) -> Result<()> {
     let c = connection(db).await?;
+    if !restored {
+        // Only a settled layout may lose its recovery handle or count as a failed item.
+        settle_journal(&c, j, "planned", Some("rollback_incomplete")).await?;
+        return Err(Error(StatusCode::CONFLICT, "rollback_incomplete"));
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let r = async {
-        settle_journal(&tx, j, state, Some(code)).await?;
+        settle_journal(&tx, j, "rolled_back", Some(code)).await?;
         tx.execute(
             "UPDATE rename_commands SET items_failed=items_failed+1 WHERE id=?",
             [j.command_id.clone()],
@@ -644,7 +651,7 @@ async fn fail_item(db: &Database, j: &Journal, state: &str, code: &str) -> Resul
     .await;
     finish(tx, r).await
 }
-/// Finishes one journaled group whatever state the disk is in. Never leaves a half-moved group.
+/// Finishes a journaled group, retaining the recovery handle if the layout cannot be restored.
 async fn drive(db: &Arc<Database>, j: Journal) -> Result<bool> {
     let j = Arc::new(j);
     let jf = j.clone();
@@ -656,17 +663,7 @@ async fn drive(db: &Arc<Database>, j: Journal) -> Result<bool> {
         let restored = tokio::task::spawn_blocking(move || rollback(&jr))
             .await
             .unwrap_or(false);
-        fail_item(
-            db,
-            &j,
-            if restored { "rolled_back" } else { "failed" },
-            if restored {
-                code
-            } else {
-                "rollback_incomplete"
-            },
-        )
-        .await?;
+        fail_item(db, &j, restored, code).await?;
         return Ok(false);
     }
     match commit(db, &j).await {
@@ -683,26 +680,16 @@ async fn drive(db: &Arc<Database>, j: Journal) -> Result<bool> {
             let restored = tokio::task::spawn_blocking(move || rollback(&jr))
                 .await
                 .unwrap_or(false);
-            fail_item(
-                db,
-                &j,
-                if restored { "rolled_back" } else { "failed" },
-                if restored {
-                    code
-                } else {
-                    "rollback_incomplete"
-                },
-            )
-            .await?;
+            fail_item(db, &j, restored, code).await?;
             Ok(false)
         }
     }
 }
-/// Resolves journal rows left `planned` by an interrupted run (all commands, or one).
+/// Resolves planned journals globally, or for a command and its owners' prior commands.
 pub(crate) async fn reconcile(db: &Arc<Database>, only: Option<&str>) -> Result<usize> {
     let c = connection(db).await?;
     let mut rows = c
-        .query(&format!("SELECT {JOURNAL_COLUMNS} FROM rename_items WHERE state='planned' AND (? IS NULL OR command_id=?) ORDER BY id LIMIT 1000"), params![only, only])
+        .query(&format!("SELECT {JOURNAL_COLUMNS} FROM rename_items WHERE {JOURNAL_SCOPE} ORDER BY id LIMIT 1000"), params![only])
         .await?;
     let mut parsed = vec![];
     while let Some(r) = rows.next().await? {
@@ -719,7 +706,15 @@ pub(crate) async fn reconcile(db: &Arc<Database>, only: Option<&str>) -> Result<
     let n = journals.len();
     for j in journals {
         // Anomalous pairs are rolled back by `drive` through the same forward/rollback logic.
-        drive(db, j).await?;
+        let id = j.id;
+        match drive(db, j).await {
+            Err(Error(_, "rollback_incomplete")) => {
+                eprintln!("event=rename_recovery_pending journal_id={id} code=rollback_incomplete");
+            }
+            outcome => {
+                outcome?;
+            }
+        }
     }
     Ok(n)
 }
@@ -990,6 +985,17 @@ pub(super) async fn run(db: &Arc<Database>, command: RenameCommand) -> Result<()
     };
     // Finish what an interrupted attempt left half done before planning anything new.
     reconcile(db, Some(&sid)).await?;
+    if c.query(
+        &format!("SELECT 1 FROM rename_items WHERE {JOURNAL_SCOPE} LIMIT 1"),
+        [sid.clone()],
+    )
+    .await?
+    .next()
+    .await?
+    .is_some()
+    {
+        return Err(Error(StatusCode::CONFLICT, "rollback_incomplete"));
+    }
     let fail = |code: &'static str| {
         format!(
             "UPDATE rename_commands SET status='failed',completed_at=?,error_code='{code}' {running}"

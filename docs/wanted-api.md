@@ -72,7 +72,7 @@ TV search-all enqueues one episode search per episode: the existing search comma
 - **Last-search time**: no native producer updates `episodes.last_search_time`, and movies have no last-search column. The TV field shows imported snapshot values only; no `last_search` sort, no oldest-searched-first ordering of search-all.
 - **Sort title**: no persisted series/movie sort-title authority; title sorts are case-insensitive literal titles.
 - **Grouped TV search-all** (series/season cohorts, season-pack search) and the **eligible tagged indexer union** per execution unit are not implemented; Wanted searches use one explicit indexer and the existing single-target command.
-- **No durable batch receipt**: replay is reconstructed from child commands. Deleting a child's terminal history weakens replay; an empty capture is not durable, so replaying it re-evaluates the list.
+- **No durable batch receipt**: replay is reconstructed from child commands. Deleting a child's terminal history weakens replay; an empty capture is not durable, so replaying it re-evaluates the list. Durable receipt storage and retry acceptance criteria are tracked in [issue #61](https://github.com/Raudbjorn/hrrdarr/issues/61).
 - **Download-queue exclusion**: search-all skips targets with active search commands only, not targets with an in-flight download.
 - **V5 filters** (series IDs, profile IDs, series type, tags, include-specials, quality) and saved custom filters, persisted column/display options, per-row interactive search, detail navigation and manual import from Wanted rows are not implemented.
 - Retired/quarantined replacement files are excluded through the shared active-file predicate, but no Wanted test seeds a retired file.

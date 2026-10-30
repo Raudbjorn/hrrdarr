@@ -897,3 +897,45 @@ async fn started_worker_runs_the_recurring_job_once_and_keeps_the_floor() {
     );
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn rename_recovery_journals_and_legacy_incomplete_rollbacks_survive_pruning() {
+    let f = fixture().await;
+    let old = NOW - 100_000;
+    let mut ids = Vec::new();
+    for (state, error) in [
+        ("planned", "rollback_incomplete"),
+        ("failed", "rollback_incomplete"),
+        ("failed", "source_missing"),
+    ] {
+        let id = Uuid::new_v4().to_string();
+        f.c.execute("INSERT INTO rename_commands(id,name,media_type,next_attempt_at,created_at) VALUES(?,'rename_series','tv',0,?)", params![id.clone(), old]).await.unwrap();
+        f.c.execute(
+            "UPDATE rename_commands SET status='running',attempts=1,started_at=? WHERE id=?",
+            params![old, id.clone()],
+        )
+        .await
+        .unwrap();
+        f.c.execute("UPDATE rename_commands SET status='failed',completed_at=?,error_code='items_failed',items_failed=1 WHERE id=?", params![old, id.clone()]).await.unwrap();
+        f.c.execute("INSERT INTO rename_items(command_id,kind,series_id,file_id,old_path,new_path,identity_json,state,error_code) VALUES(?,'file',1,1,'/tv/s/old.mkv','/tv/s/new.mkv',json_object('dev',1,'ino',1),?,?)", params![id.clone(),state,error]).await.unwrap();
+        ids.push(id);
+    }
+    let report = housekeeping::prune(&f.db, &policy(1000, 0), NOW)
+        .await
+        .unwrap();
+    assert_eq!(report.failed_groups, 0);
+    assert_eq!(report.deleted_from("rename_commands", "tv"), 1);
+    // Legacy failure evidence must survive even though automatically reopening it is deferred.
+    assert!(exists(&f.c, "rename_commands", &ids[0]).await);
+    assert!(exists(&f.c, "rename_commands", &ids[1]).await);
+    assert!(!exists(&f.c, "rename_commands", &ids[2]).await);
+    let row = f.c.query("SELECT i.state,i.error_code,c.items_failed FROM rename_items i JOIN rename_commands c ON c.id=i.command_id WHERE c.id=?", [ids[1].clone()]).await.unwrap().next().await.unwrap().unwrap();
+    assert_eq!(
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<i64>(2).unwrap()
+        ),
+        ("failed".into(), "rollback_incomplete".into(), 1)
+    );
+}
