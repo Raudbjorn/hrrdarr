@@ -560,7 +560,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        84 // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        86 // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -702,7 +702,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        84 // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        86 // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

@@ -63,6 +63,10 @@ notification has the matching trigger for that domain.
 the process that owns the database) polls every 2 s: it fans events out to one
 `notification_deliveries` row per matching notification (enabled, domain, trigger flag, tag scope),
 then claims due deliveries under a 120 s lease and sends them (max 4 concurrent).
+Migration `0079_notification_delivery_scope.sql` records the matching domain on each delivery,
+including system events. Retries retain that choice even if trigger or warning filters change.
+Legacy rows without a recorded domain select a currently matching scope once before sending;
+if no scope matches, they fail with `notification_scope_disabled`.
 
 Delivery is **at least once**. Retryable failures (timeout, transport error, 5xx, 429) back off
 30 s, 2 min, 8 min, 32 min... capped at 6 h (a server `Retry-After` can lengthen it) up to 5

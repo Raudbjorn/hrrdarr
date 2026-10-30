@@ -287,9 +287,32 @@ pub(crate) enum PairState {
 pub(crate) fn pair_state(old: &str, new: &str, kind: Kind, expect: Ident) -> R<PairState> {
     let o = observe(old, kind)?;
     let n = observe(new, kind)?;
+    observed_pair_state(old, new, o, n, expect)
+}
+fn observed_pair_state(
+    old: &str,
+    new: &str,
+    o: Option<Ident>,
+    n: Option<Ident>,
+    expect: Ident,
+) -> R<PairState> {
     Ok(match (o, n) {
         (Some(i), None) if i == expect => PairState::Source,
         (None, Some(i)) if i == expect => PairState::Moved,
+        (Some(i), Some(j)) if i == expect && j == expect => {
+            let (op, on) = parent_and_name(old)?;
+            let (np, nn) = parent_and_name(new)?;
+            if op != np || on == nn || on.to_lowercase() != nn.to_lowercase() {
+                return Ok(PairState::Anomaly);
+            }
+            // Alias lookup cannot reveal which spelling survived a case-only move.
+            let entries = names(&open_dir(&op)?)?;
+            match (entries.contains(&on), entries.contains(&nn)) {
+                (true, false) => PairState::Source,
+                (false, true) => PairState::Moved,
+                _ => PairState::Anomaly,
+            }
+        }
         _ => PairState::Anomaly,
     })
 }
@@ -464,6 +487,39 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert!(names.contains(&"Show.mkv".into()) && !names.contains(&"show.mkv".into()));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn case_alias_journal_states_follow_directory_spelling() {
+        let d = scratch();
+        for kind in [Kind::File, Kind::Dir] {
+            let old = s(&d, "show");
+            let new = s(&d, "Show");
+            match kind {
+                Kind::File => std::fs::write(&old, b"a").unwrap(),
+                Kind::Dir => std::fs::create_dir(&old).unwrap(),
+            }
+            let ident = observe(&old, kind).unwrap();
+            // Simulate alias lookup on a case-insensitive mount; directory spelling is real.
+            let state = || observed_pair_state(&old, &new, ident, ident, ident.unwrap()).unwrap();
+            assert_eq!(state(), PairState::Source);
+            std::fs::rename(&old, &new).unwrap();
+            assert_eq!(state(), PairState::Moved);
+            std::fs::rename(&new, &old).unwrap();
+            assert_eq!(state(), PairState::Source);
+            if kind == Kind::File {
+                std::fs::hard_link(&old, &new).unwrap();
+                assert_eq!(
+                    pair_state(&old, &new, kind, ident.unwrap()).unwrap(),
+                    PairState::Anomaly
+                );
+                std::fs::remove_file(&new).unwrap();
+                std::fs::remove_file(&old).unwrap();
+            } else {
+                std::fs::remove_dir(&old).unwrap();
+            }
+            assert_eq!(state(), PairState::Anomaly);
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]

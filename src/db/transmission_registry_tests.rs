@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -285,6 +285,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&db.connect().await?).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     Ok(())
 }

@@ -359,6 +359,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     // Backup command and policy (job.002), appended at position 84 after 0077 library_root_health.
     ("backups", include_str!("../../migrations/0078_backups.sql")),
+    (
+        "notification_delivery_scope",
+        include_str!("../../migrations/0079_notification_delivery_scope.sql"),
+    ),
+    (
+        "retain_collection_intents",
+        include_str!("../../migrations/0080_retain_collection_intents.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -766,6 +774,10 @@ async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<P
         if current == 0 { tx.execute(HISTORY_SQL, ()).await?; }
         for (index, &(name, sql)) in MIGRATIONS.iter().enumerate().skip(current) {
             if index == 1 { validate_legacy_paths(&tx).await?; }
+            // Preserve intents across the historical DROP without changing its recorded checksum.
+            if name == "collections_checkpoint_supersede" {
+                tx.execute_batch("CREATE TEMP TABLE retained_collection_intents AS SELECT * FROM movie_collection_intents").await?;
+            }
             tx.execute_batch(sql).await.map_err(|e| format!("migration {} ({name}) failed; reconcile legacy relationships before retrying: {e}", index + 1))?;
             integrity(&tx).await?;
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",

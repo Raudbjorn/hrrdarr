@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     Ok(())
 }

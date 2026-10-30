@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {

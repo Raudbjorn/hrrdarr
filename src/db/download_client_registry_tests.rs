@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(84)]] // Reasoning: the runner applies through latest 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations (0077 library_root_health; 0076 wanted_last_search; 0075 downloadstation registry; 0074 flood registry; 0073 aria2 registry; 0072 utorrent registry; 0071 rtorrent registry; 0070 deluge registry and label-family triggers; 0069 collection snapshot ownership; 0068 torrent RSS indexer; 0064 NZBGet registry; 0063 notifications; the recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
+        vec![vec![libsql::Value::Integer(86)]] // Reasoning: the runner applies through latest 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations (0077 library_root_health; 0076 wanted_last_search; 0075 downloadstation registry; 0074 flood registry; 0073 aria2 registry; 0072 utorrent registry; 0071 rtorrent registry; 0070 deluge registry and label-family triggers; 0069 collection snapshot ownership; 0068 torrent RSS indexer; 0064 NZBGet registry; 0063 notifications; the recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();

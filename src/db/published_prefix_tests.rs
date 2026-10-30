@@ -111,7 +111,9 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
          INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,42,'Kept');
          INSERT INTO movie_collection_settings(collection_id,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit,snapshot_owned)
            VALUES(1,1,1,1,'in_cinemas',1,1,0);
-         INSERT INTO movie_collection_tags(collection_id,tag_id) VALUES(1,1);",
+         INSERT INTO movie_collection_tags(collection_id,tag_id) VALUES(1,1);
+         INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason)
+           VALUES(42,7,1,1,'user'),(43,2,0,1,'metadata_missing'),(44,3,1,0,NULL);",
     )
     .await?;
     drop(rows);
@@ -141,7 +143,49 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
     assert_eq!(row.get::<String>(3)?, "in_cinemas", "minimum availability");
     assert_eq!(row.get::<i64>(4)?, 1, "search on add");
     assert_eq!(row.get::<i64>(5)?, 1, "local edit");
-    // The tag survived the supersede, and the checkpoint's own tables are gone.
+    // Intent authority is independent of catalog membership and retains every field and guard.
+    let mut intents = c.query("SELECT tmdb_id,revision,local_edit,removed,removal_reason FROM movie_collection_intents ORDER BY tmdb_id", ()).await?;
+    for (id, revision, local, removed, reason) in [
+        (42, 7, 1, 1, Some("user")),
+        (43, 2, 0, 1, Some("metadata_missing")),
+        (44, 3, 1, 0, None),
+    ] {
+        let row = intents.next().await?.unwrap();
+        assert_eq!(
+            (
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<Option<String>>(4)?
+            ),
+            (id, revision, local, removed, reason.map(str::to_owned))
+        );
+    }
+    assert!(intents.next().await?.is_none());
+    assert!(
+        c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE movie_collection_intents SET local_edit=0,revision=8 WHERE tmdb_id=42",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE movie_collection_intents SET removed=0,removal_reason=NULL WHERE tmdb_id=42",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    c.execute("UPDATE movie_collection_intents SET removed=0,removal_reason=NULL,revision=8 WHERE tmdb_id=42", ()).await?;
+    // The tag survived the supersede, and the replaced settings table is gone.
     assert_eq!(
         scalar(
             &c,
@@ -157,6 +201,18 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
         )
         .await?,
         0
+    );
+    drop(intents);
+    drop(c);
+    drop(db);
+    let reopened = Database::open_local(&path).await?;
+    assert_eq!(
+        scalar(
+            &reopened.connect().await?,
+            "SELECT count(*) FROM movie_collection_intents"
+        )
+        .await?,
+        3
     );
     Ok(())
 }
@@ -218,6 +274,118 @@ async fn published_prefix_upgrades_with_a_torrentrss_provider() -> Result<(), Er
         .await?,
         7,
         "the published feed's minimum seeders survives the registry rebuild"
+    );
+    Ok(())
+}
+
+async fn write_historical_prefix(c: &Connection, count: usize) -> Result<(), Error> {
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
+    c.execute(HISTORY_SQL, ()).await?;
+    for (i, (name, sql)) in MIGRATIONS.iter().take(count).enumerate() {
+        c.execute_batch(sql).await?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![i as i64 + 1, *name, checksum(sql), *sql],
+        )
+        .await?;
+    }
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn already_superseded_prefix_upgrades_without_inventing_intents() -> Result<(), Error> {
+    let files = Scratch::new();
+    let path = files.0.join("db");
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    // The pre-fix build ended at backups (84), after the historical intent table was dropped.
+    write_historical_prefix(&c, 84).await?;
+    assert_eq!(version(&c).await?, 84);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sqlite_schema WHERE name='movie_collection_intents'"
+        )
+        .await?,
+        0
+    );
+    let history_sql = "SELECT json_group_array(json_array(version,name,checksum,sql)) FROM (SELECT * FROM schema_migrations WHERE version<=84 ORDER BY version)";
+    let before: String = c
+        .query(history_sql, ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(&path).await?;
+    let c = db.connect().await?;
+    assert_eq!(version(&c).await?, MIGRATIONS.len());
+    let after: String = c
+        .query(history_sql, ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    assert_eq!(
+        after, before,
+        "published migration history stays byte-for-byte unchanged"
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM movie_collection_intents").await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn collection_intents_survive_failed_upgrade_and_retry() -> Result<(), Error> {
+    let files = Scratch::new();
+    let path = files.0.join("db");
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    write_historical_prefix(&c, PUBLISHED).await?;
+    c.execute_batch("INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(42,7,1,1,'user');
+        CREATE TABLE backup_settings(injected_failure INTEGER);").await?;
+    drop(c);
+    drop(raw);
+
+    let error = match Database::open_local(&path).await {
+        Ok(_) => {
+            panic!("the conflicting backup_settings table must fail a migration after supersede")
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("migration 84 (backups)") && error.contains("migration rolled back"),
+        "{error}"
+    );
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    assert_eq!(version(&c).await?, PUBLISHED);
+    let intent_sql = "SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=42 AND revision=7 AND local_edit=1 AND removed=1 AND removal_reason='user'";
+    assert_eq!(scalar(&c, intent_sql).await?, 1);
+    assert!(
+        c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
+            .await
+            .is_err()
+    );
+    c.execute("DROP TABLE backup_settings", ()).await?;
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(&path).await?;
+    let c = db.connect().await?;
+    assert_eq!(version(&c).await?, MIGRATIONS.len());
+    assert_eq!(scalar(&c, intent_sql).await?, 1);
+    assert!(
+        c.execute("DELETE FROM movie_collection_intents WHERE tmdb_id=42", ())
+            .await
+            .is_err()
     );
     Ok(())
 }

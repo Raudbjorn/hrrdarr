@@ -212,11 +212,11 @@ impl Dispatcher {
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
             let t = now();
-            for id in &targets {
+            for (id, domain) in &targets {
                 created += tx
                     .execute(
-                        "INSERT OR IGNORE INTO notification_deliveries(event_sequence,notification_id,next_attempt_at,created_at) VALUES(?,?,?,?)",
-                        params![sequence, id.clone(), t, t],
+                        "INSERT OR IGNORE INTO notification_deliveries(event_sequence,notification_id,media_type,next_attempt_at,created_at) VALUES(?,?,?,?,?)",
+                        params![sequence, id.clone(), Scope::Domain(*domain).as_str(), t, t],
                     )
                     .await? as usize;
             }
@@ -354,8 +354,8 @@ impl Dispatcher {
         }
         let mut rows = c
             .query(
-                "SELECT kind,scope,subject_id,payload_json,tag_ids_json FROM notification_events WHERE sequence=?",
-                [sequence],
+                "SELECT e.kind,e.scope,e.subject_id,e.payload_json,e.tag_ids_json,d.media_type FROM notification_events e JOIN notification_deliveries d ON d.event_sequence=e.sequence WHERE e.sequence=? AND d.notification_id=?",
+                params![sequence, notification],
             )
             .await
             .map_err(|_| storage())?;
@@ -375,14 +375,26 @@ impl Dispatcher {
                 .map_err(|_| permanent("event_invalid"))?,
             tag_ids: None,
         };
-        let domain = match event.scope {
-            Scope::Domain(d) => d,
-            Scope::System => {
-                if rt.notification.tv.is_some() {
-                    MediaDomain::Tv
-                } else {
-                    MediaDomain::Movies
-                }
+        let domain = match r.get::<Option<String>>(5).map_err(|_| storage())? {
+            Some(media) => MediaDomain::parse(&media).map_err(|_| permanent("event_invalid"))?,
+            None => {
+                // Legacy deliveries did not record the match; select once and retain it for retries.
+                let domain = match event.scope {
+                    Scope::Domain(domain) => domain,
+                    Scope::System => matching(c, &event)
+                        .await
+                        .map_err(|_| storage())?
+                        .into_iter()
+                        .find_map(|(id, domain)| (id == notification).then_some(domain))
+                        .ok_or_else(|| permanent("notification_scope_disabled"))?,
+                };
+                c.execute(
+                    "UPDATE notification_deliveries SET media_type=? WHERE event_sequence=? AND notification_id=? AND media_type IS NULL",
+                    params![Scope::Domain(domain).as_str(), sequence, notification],
+                )
+                .await
+                .map_err(|_| storage())?;
+                domain
             }
         };
         let message = events::build(c, &event, domain)
@@ -417,9 +429,12 @@ async fn catalog_plex(
     Ok(n > 0)
 }
 
-/// Notification ids that should receive this event: enabled, scoped to the event domain, trigger
+/// Notification ids and matching domains: enabled, scoped to the event domain, trigger
 /// flag set, tag scope satisfied. One id per notification even when several scopes match.
-pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, libsql::Error> {
+pub async fn matching(
+    c: &Connection,
+    event: &EventRow,
+) -> Result<Vec<(String, MediaDomain)>, libsql::Error> {
     let flag = match event.kind {
         EventKind::Grab => "on_grab",
         EventKind::Import => "on_import",
@@ -474,9 +489,9 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
             }
             _ => None,
         };
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, MediaDomain)> = Vec::new();
     for (id, media, on_upgrade, on_delete_upgrade, warnings) in candidates {
-        if out.contains(&id) {
+        if out.iter().any(|(matched, _)| *matched == id) {
             continue;
         }
         if upgrade && !on_upgrade {
@@ -503,7 +518,8 @@ pub async fn matching(c: &Connection, event: &EventRow) -> Result<Vec<String>, l
                 continue;
             }
         }
-        out.push(id);
+        let domain = MediaDomain::parse(&media).map_err(|_| libsql::Error::InvalidColumnType)?;
+        out.push((id, domain));
     }
     Ok(out)
 }

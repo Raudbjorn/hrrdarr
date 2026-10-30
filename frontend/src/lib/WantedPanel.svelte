@@ -55,7 +55,7 @@
     ++readVersion; page = null; selection = new Set(); confirmAll = false; monitorNotice = ''; monitorError = '';
   }
   function changeDomain(next: MediaDomain) {
-    if (next === domain || busy) return;
+    if (next === domain || busy || pending !== null) return;
     domain = next; options = defaultOptions(next); indexerId = ''; clientId = '';
     receipt = null; statuses = []; searchError = ''; resetScope(); void load();
   }
@@ -144,7 +144,7 @@
   <h1 id="wanted-heading">Wanted</h1>
   <div class="bar">
     <nav aria-label="Wanted lists"><button aria-pressed={kind === 'missing'} disabled={busy} onclick={() => onkind('missing')}>Missing</button><button aria-pressed={kind === 'cutoff'} disabled={busy} onclick={() => onkind('cutoff')}>Cutoff unmet</button></nav>
-    <nav aria-label="Wanted media type"><button aria-pressed={domain === 'tv'} disabled={busy} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} disabled={busy} onclick={() => changeDomain('movies')}>Movies</button></nav>
+    <nav aria-label="Wanted media type"><button aria-pressed={domain === 'tv'} disabled={busy || pending !== null} onclick={() => changeDomain('tv')}>TV</button><button aria-pressed={domain === 'movies'} disabled={busy || pending !== null} onclick={() => changeDomain('movies')}>Movies</button></nav>
   </div>
   <p class="muted">{kind === 'missing'
     ? domain === 'tv' ? 'Episodes without an associated file whose air time plus series runtime has passed. Specials are included.' : 'Library movies with a known year and no associated file, including movies not yet available.'

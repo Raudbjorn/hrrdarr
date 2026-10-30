@@ -1266,3 +1266,132 @@ async fn plex_refreshes_only_sections_containing_the_changed_path() {
     );
     assert_eq!(refreshes[0].headers["x-plex-token"], "plextok");
 }
+
+#[tokio::test]
+async fn system_notification_scope_survives_restart_filter_edits_and_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness().await;
+    let out = h._dir.join("system-env.txt");
+    let script = h._dir.join("system-hook.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nenv > {}\n", out.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, implementation, settings, secrets, tv) in [
+        (
+            "Webhook",
+            "webhook",
+            json!({"url":format!("{}/fail", h.fake_base)}),
+            json!({}),
+            json!({}),
+        ),
+        (
+            "Notifiarr",
+            "notifiarr",
+            json!({}),
+            json!({"api_key":"nk"}),
+            json!({"on_health_issue":true,"include_health_warnings":false}),
+        ),
+        (
+            "Script",
+            "custom_script",
+            json!({"path":script.to_str().unwrap()}),
+            json!({}),
+            json!({}),
+        ),
+    ] {
+        let (code, body) = h
+            .call(
+                "POST",
+                "/api/v1/notifications",
+                input(
+                    name,
+                    implementation,
+                    settings,
+                    secrets,
+                    both(
+                        tv,
+                        json!({"on_health_issue":true,"include_health_warnings":true}),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(code, 201, "{body}");
+    }
+    h.sql("INSERT INTO notification_events(kind,scope,payload_json,created_at) VALUES('health_issue','system','{\"severity\":2,\"message\":\"Warning\"}',100);").await;
+    assert_eq!(h.dispatcher.fan_out().await.unwrap(), 3);
+    assert_eq!(
+        h.count("SELECT count(*) FROM notification_deliveries WHERE media_type='movies'")
+            .await,
+        3
+    );
+    // Editing filters after fan-out must not change the durable choice on delivery or retry.
+    h.sql("UPDATE notification_scopes SET on_health_issue=(media_type='tv'),include_health_warnings=(media_type='tv');").await;
+    let restarted = Dispatcher::new(
+        h.db.clone(),
+        Some(Arc::new(CredentialKey::from_hex(KEY_HEX).unwrap())),
+        Transport::new().unwrap().with_origin_map(
+            FIXED_ORIGINS
+                .iter()
+                .map(|o| ((*o).to_owned(), h.fake_base.clone()))
+                .collect(),
+        ),
+    );
+    assert_eq!(restarted.deliver_due().await.unwrap(), 3);
+    let seen = h.seen();
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|c| c.json()["mediaType"] == "movies"));
+    assert!(
+        seen.iter()
+            .any(|c| c.target == "/api/v1/notification/radarr")
+    );
+    let env = std::fs::read_to_string(out).unwrap();
+    assert!(env.contains("radarr_eventtype=HealthIssue"), "{env}");
+    assert!(!env.contains("sonarr_"), "{env}");
+    *h.fake.fail_status.lock().unwrap() = 200;
+    h.sql("UPDATE notification_deliveries SET next_attempt_at=0 WHERE state='pending';")
+        .await;
+    h.clear();
+    assert_eq!(restarted.deliver_due().await.unwrap(), 1);
+    assert_eq!(h.seen()[0].json()["mediaType"], "movies");
+    assert_eq!(
+        h.count("SELECT count(*) FROM notification_deliveries WHERE state='delivered'")
+            .await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn legacy_system_delivery_selects_matching_scope_once() {
+    let h = harness().await;
+    let (code, _) = h
+        .call(
+            "POST",
+            "/api/v1/notifications",
+            input(
+                "Legacy",
+                "webhook",
+                json!({"url":format!("{}/fail", h.fake_base)}),
+                json!({}),
+                both(
+                    json!({}),
+                    json!({"on_health_issue":true,"include_health_warnings":true}),
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(code, 201);
+    h.sql("INSERT INTO notification_events(kind,scope,payload_json,created_at,fanned_out) VALUES('health_issue','system','{\"severity\":2}',100,1);
+        INSERT INTO notification_deliveries(event_sequence,notification_id,next_attempt_at,created_at) SELECT 1,id,0,100 FROM notifications;").await;
+    h.dispatcher.deliver_due().await.unwrap();
+    assert_eq!(h.seen()[0].json()["mediaType"], "movies");
+    assert_eq!(
+        h.count("SELECT count(*) FROM notification_deliveries WHERE media_type='movies'")
+            .await,
+        1
+    );
+    h.sql("UPDATE notification_scopes SET on_health_issue=(media_type='tv'),include_health_warnings=(media_type='tv');
+        UPDATE notification_deliveries SET next_attempt_at=0;").await;
+    *h.fake.fail_status.lock().unwrap() = 200;
+    h.clear();
+    h.dispatcher.deliver_due().await.unwrap();
+    assert_eq!(h.seen()[0].json()["mediaType"], "movies");
+}

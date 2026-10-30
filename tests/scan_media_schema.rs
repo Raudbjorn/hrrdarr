@@ -184,7 +184,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        84 // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        86 // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

@@ -73,12 +73,17 @@ value was ported onto it and the duplicate parts dropped:
   (`tests/snapshot_collections.rs`, retargeted to the columns above), the `origin` membership provenance, the
   reference-delete fixes for profiles and roots (`tests/collection_reference_deletes.rs`), and the preference for
   fresh native data (`local_edit`, `metadata_revision`) over old backups.
-* Dropped as duplicate: origin's `movie_collection_settings`, `movie_collection_intents`, `graph_complete`/member
+* Dropped as duplicate: origin's `movie_collection_settings`, `graph_complete`/member
   revision triggers, companion `movie_with_collection` metadata API and `CollectionAssociation` types (0066 and
   `src/metadata.rs` already carry the association on `MovieDetails`), its transactional adoption repository, the
   selected-add `monitor`/`collection_expected_revision` options, and `collection_schema.rs`/`collection_adoption.rs`
-  tests, which assert that schema. Intent tombstones and the retire-empty-collection cleanup are not ported
-  because this branch has no collection deletion and keeps collections as catalog entities.
+  tests, which assert that schema. The retire-empty-collection cleanup is not ported because this branch
+  has no collection deletion and keeps collections as catalog entities.
+* Preserved: `movie_collection_intents`, including all revisions, removal reasons and local-retention
+  guards. Upgrade snapshots these rows inside the migration transaction before the historical supersede
+  and restores their authority in 0080. Existing migration SQL/checksums stay unchanged. Databases that
+  already ran the destructive supersede need an older backup to recover previously lost intent rows.
+  This branch retains the intent state; its collection API does not yet consume it.
 * Provider authority (origin 0053) is not added: `provider_scope_tags` is covered by `download_client_tags`
   (0052), `provider_status` by the durable `indexer_status`/`download_client_status` backoff, and the selection
   cursor by `src/providers/selection.rs` (volatile per-domain cursors; nothing in either tree consumed origin's

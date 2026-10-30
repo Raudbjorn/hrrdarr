@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

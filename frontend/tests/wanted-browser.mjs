@@ -39,6 +39,29 @@ async function admitted(click){
  const response=page.waitForResponse(r=>r.request().method()==='POST'&&/^\/api\/v1\/(tv|movies)\/wanted\/search$/.test(new URL(r.url()).pathname));
  await click();const reply=await response;assert.equal(reply.status(),202,await reply.text());return reply.json();
 }
+// Both failure boundaries retain the original TV endpoint and body, including search-all.
+async function uncertainAdmission(click, admittedBeforeLoss){
+ const endpoint='**/api/v1/tv/wanted/search';let originalBody,originalReceipt;
+ const loseResponse=async route=>{
+  originalBody=route.request().postDataJSON();
+  if(admittedBeforeLoss){const response=await route.fetch();assert.equal(response.status(),202);originalReceipt=await response.json();}
+  await route.abort('failed');
+ };
+ await page.route(endpoint,loseResponse);
+ try{
+  await click();
+  await search.getByRole('button',{name:'Retry same search request',exact:true}).waitFor();
+  const moviesSwitch=wanted.getByRole('navigation',{name:'Wanted media type'}).getByRole('button',{name:'Movies',exact:true});
+  assert.equal(await moviesSwitch.isDisabled(),true,'An uncertain TV request must prevent changing its target domain');
+  await moviesSwitch.dispatchEvent('click');
+  assert.equal(await moviesSwitch.getAttribute('aria-pressed'),'false','The handler also rejects domain changes while pending');
+ }finally{await page.unroute(endpoint,loseResponse);}
+ const request=page.waitForRequest(r=>r.method()==='POST'&&new URL(r.url()).pathname==='/api/v1/tv/wanted/search');
+ const receipt=await admitted(()=>search.getByRole('button',{name:'Retry same search request',exact:true}).click());
+ assert.deepEqual((await request).postDataJSON(),originalBody,'Retry preserves the exact request identity and selection');
+ assert.equal(receipt.replayed,admittedBeforeLoss);
+ return originalReceipt??receipt;
+}
 async function commandsFor(type,id){return (await api('get',`/api/v1/search/commands?target_type=${type}&target_id=${id}`)).items;}
 try{
  // Stop the shared worker first: admitted searches must stay queued in this owned fixture.
@@ -81,7 +104,7 @@ try{
  const pilot=table('Missing episodes').getByRole('checkbox',{name:/^Select Wanted Harbor S01E01 Wanted pilot$/});
  await pilot.focus();await page.keyboard.press('Space');assert.equal(await pilot.isChecked(),true);
  await chooseProviders(indexer);
- const selected=await admitted(()=>search.getByRole('button',{name:'Search selected (1)',exact:true}).click());
+ const selected=await uncertainAdmission(()=>search.getByRole('button',{name:'Search selected (1)',exact:true}).click(),false);
  assert.deepEqual(selected.commands.map(c=>c.target),[{media_type:'episode',id:episodes.pilot}]);
  await search.getByText('Queued 1 episode for automatic search; 1 matched.',{exact:true}).waitFor();
  let stored=await commandsFor('episode',episodes.pilot);
@@ -98,10 +121,11 @@ try{
  assert.equal(await confirm.count(),0);
  assert.equal((await commandsFor('episode',episodes.second)).length,0,'Cancelling confirmation admits nothing');
  await search.getByRole('button',{name:'Search all',exact:true}).click();
- const all=await admitted(()=>confirm.getByRole('button',{name:'Confirm search all',exact:true}).click());
+ const all=await uncertainAdmission(()=>confirm.getByRole('button',{name:'Confirm search all',exact:true}).click(),true);
  assert.deepEqual([all.matched,all.skipped_active,all.admitted],[2,1,1]);
  assert.deepEqual(all.commands.map(c=>c.target),[{media_type:'episode',id:episodes.second}]);
- await search.getByText('Queued 1 episode for automatic search; 2 matched; 1 skipped because a search is already active.',{exact:true}).waitFor();
+ // The retry returns the durable receipt, so its summary reports replay rather than fresh admission counts.
+ await search.getByText('Earlier identical request read back: 1 episode already queued for search.',{exact:true}).waitFor();
  assert.equal((await commandsFor('episode',episodes.pilot)).length,1);
  assert.equal((await commandsFor('episode',episodes.second)).length,1);
 

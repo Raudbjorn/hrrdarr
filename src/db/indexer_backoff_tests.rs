@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 84); // Reasoning: latest is migration file 0078 backups at runner position 84, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 86); // Reasoning: latest is migration file 0080 retain_collection_intents at runner position 86, after the published 50-53 prefix and the reconciliation migrations; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 15 } else { 35 } // Reasoning: the 49-migration prefix is unchanged, so the runner applies 35 further migrations (positions 50 through 84) and schema_migrations grows to 84 rows; Health gains fifteen identities (the published 0051 download_client_backoff pair, 0050 indexer_backoff's four, 0053 path_diagnostics' two, 0060 recycle_bin's two and 0077 library_root_health's five), because the published 0050, 0052 and 0053 files and the reconciliation migrations register no identities of their own.
+                    expected.len() + if *table == "health_checks" { 15 } else { 37 } // Reasoning: the 49-migration prefix is unchanged, so the runner applies 37 further migrations (positions 50 through 86) and schema_migrations grows to 86 rows; Health gains fifteen identities (the published 0051 download_client_backoff pair, 0050 indexer_backoff's four, 0053 path_diagnostics' two, 0060 recycle_bin's two and 0077 library_root_health's five), because the published 0050, 0052 and 0053 files and the reconciliation migrations register no identities of their own.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
