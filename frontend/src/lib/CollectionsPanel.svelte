@@ -103,8 +103,10 @@
       if (result.status !== undefined) await reloadAfterWrite(false);
       return false;
     }
-    write = 'idle'; notice = done;
+    // Keep the editor locked until readback has replaced the submitted draft.
     await reloadAfterWrite(resetDraft);
+    if (!alive) return false;
+    write = 'idle'; notice = done;
     return true;
   }
   async function reconcile() {
