@@ -731,7 +731,8 @@ async fn snapshot_raw_cells_preserve_types_and_reject_invalid_or_hidden_oversize
     );
 
     for (i, (value, expected_error)) in [
-        ("CAST(X'610080' AS TEXT)", "invalid UTF-8 source text"),
+        // Reasoning: the shared UTF-8/UTF-16 decoder reports malformed text with one encoding error.
+        ("CAST(X'610080' AS TEXT)", "invalid source text encoding"),
         (
             "char(0)||printf('%1048576s','x')",
             "snapshot exceeds cell limit",
