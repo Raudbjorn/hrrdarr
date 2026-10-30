@@ -573,3 +573,56 @@ async fn download_client_tags_are_scoped_retained_and_revision_guarded() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn provider_update_keeps_scope_tags_for_retained_domains() -> Result<(), Error> {
+    let scratch = Sandbox::new();
+    let db = Arc::new(Database::open_local(&scratch.0.join("db")).await?);
+    let c = db.connect().await?;
+    let key = Arc::new(providers::CredentialKey::from_hex(&"12".repeat(32)).unwrap());
+    let (address, server) = serve(db.clone(), Some(key)).await;
+    let route = "/api/v1/providers";
+    let base = json!({"name":"Tagged indexer","enabled":true,"priority":10,"settings":{"implementation":"torznab","endpoint":format!("http://{address}/not-provider-api"),"tv":{"categories":[5030],"anime_categories":[5070]},"movies":{"categories":[2000]}},"credentials":{"kind":"api_key","api_key":"tag-key"}});
+    let (status, created) = request(address, "POST", route, &base.to_string()).await;
+    assert_eq!(status, 201, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let detail = format!("{route}/{id}");
+    c.execute_batch(&format!(
+        "INSERT INTO tags(id,media_type,label) VALUES(1,'tv','tv-tag'),(2,'movies','movie-tag');
+         INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES('{id}','tv',1),('{id}','movies',2);"
+    ))
+    .await?;
+    let tags = |c: libsql::Connection, id: String| async move {
+        let mut rows = c
+            .query(
+                "SELECT media_type,tag_id FROM provider_scope_tags WHERE provider_id=? ORDER BY media_type",
+                [id],
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        out
+    };
+    // A name-only edit rebuilds every scope row; tags must survive the rebuild.
+    let mut update = base.clone();
+    update.as_object_mut().unwrap().remove("credentials");
+    update["revision"] = json!(1);
+    update["name"] = json!("Renamed");
+    let (status, changed) = request(address, "PUT", &detail, &update.to_string()).await;
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(
+        tags(c.clone(), id.clone()).await,
+        [("movies".to_owned(), 2), ("tv".to_owned(), 1)]
+    );
+    // Dropping a domain drops that domain's tags with its scope, and only those.
+    update["revision"] = json!(2);
+    update["settings"]["movies"] = Value::Null;
+    let (status, changed) = request(address, "PUT", &detail, &update.to_string()).await;
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(tags(c.clone(), id.clone()).await, [("tv".to_owned(), 1)]);
+    server.abort();
+    Ok(())
+}

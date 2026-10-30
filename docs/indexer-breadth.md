@@ -37,7 +37,7 @@ Nine tracker-specific indexers share one registry family, one settings shape (`T
 
 ## Migration
 
-`migrations/0090_indexer_breadth.sql` registers the nine implementations, creates `tracker_scope_options` (cascade on the scope row, owner and identity triggers) and replaces the triggers that enumerate indexer implementations: scope shape and options, RSS schedule/command admission, search command admission and the two `indexer_status` triggers. The file is numbered 0090 but sits at array position 76 of `MIGRATIONS` because the runner needs a contiguous history; the integrating branch renumbers it and must re-derive the replaced triggers if another branch changed them.
+`migrations/0090_indexer_breadth.sql` registers the nine implementations, creates `tracker_scope_options` (cascade on the scope row, owner and identity triggers) and replaces the triggers that enumerate indexer implementations: scope shape and options, RSS schedule/command admission, search command admission and the two `indexer_status` triggers. The file is numbered 0090 but sits at array position 79 of `MIGRATIONS` because the runner needs a contiguous history; the preceding 78 entries retain the selected main history, including its separate provider scope integrity guards.
 
 ## Not claimed
 

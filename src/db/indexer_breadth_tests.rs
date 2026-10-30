@@ -38,10 +38,25 @@ const SEARCHABLE: [&str; 7] = [
     "passthepopcorn",
     "torrentpotato",
 ];
-const BREADTH_MIGRATION: usize = 75;
+// Main's 78 published entries remain unchanged; tracker breadth is appended.
+const BREADTH_MIGRATION: usize = 78;
 
 async fn count(c: &Connection, sql: &str) -> Result<i64, Error> {
     Ok(c.query(sql, ()).await?.next().await?.unwrap().get(0)?)
+}
+async fn rows(c: &Connection, table: &str) -> Result<Vec<Vec<libsql::Value>>, Error> {
+    let mut cursor = c
+        .query(&format!("SELECT * FROM {table} ORDER BY rowid"), ())
+        .await?;
+    let mut values = Vec::new();
+    while let Some(row) = cursor.next().await? {
+        values.push(
+            (0..row.column_count())
+                .map(|i| row.get_value(i))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(values)
 }
 async fn rejects(c: &Connection, sql: &str, args: impl libsql::params::IntoParams) -> bool {
     c.execute(sql, args).await.is_err()
@@ -229,6 +244,30 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     let feed = uuid::Uuid::new_v4().to_string();
     c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torrentrss','Feed',1,1,1,1,'http://127.0.0.1:9/feed')", [feed.clone()]).await?;
     c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_rss,enable_automatic_search,enable_interactive_search,minimum_seeders) VALUES(?,'torrentrss','movies',1,0,0,7)", [feed.clone()]).await?;
+    c.execute_batch("INSERT INTO tags(id,media_type,label) VALUES(1,'tv','kept');
+        INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,123,'Kept collection');
+        INSERT INTO movie_collection_settings(collection_id,search_on_add,local_edit) VALUES(1,1,1);
+        INSERT INTO movie_collection_intents(tmdb_id,local_edit,removed,removal_reason) VALUES(456,1,1,'user');").await?;
+    c.execute(
+        "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES(?,'tv',1)",
+        [native.clone()],
+    )
+    .await?;
+    c.execute("INSERT INTO provider_status(provider_id,escalation_level,status_version,last_observed_config_revision,initial_failure,most_recent_failure,disabled_until) VALUES(?,1,1,3,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:05:00Z')", [native.clone()]).await?;
+    let preserved = [
+        "schema_migrations",
+        "providers",
+        "provider_scopes",
+        "provider_scope_tags",
+        "provider_status",
+        "movie_collections",
+        "movie_collection_settings",
+        "movie_collection_intents",
+    ];
+    let mut before = Vec::new();
+    for table in preserved {
+        before.push(rows(&c, table).await?);
+    }
     assert_eq!(
         count(&c, "SELECT count(*) FROM schema_migrations").await?,
         BREADTH_MIGRATION as i64
@@ -246,13 +285,23 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     drop(c);
     drop(raw);
     let db = Database::open_local(&path).await?;
+    assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
+    for (table, expected) in preserved.iter().zip(&before) {
+        let actual = rows(&c, table).await?;
+        if *table == "schema_migrations" {
+            assert_eq!(&actual[..BREADTH_MIGRATION], expected);
+        } else {
+            assert_eq!(&actual, expected, "changed main authority in {table}");
+        }
+    }
+    integrity(&c).await?;
     assert_eq!(
         count(&c, "SELECT count(*) FROM schema_migrations").await?,
         BREADTH_MIGRATION as i64 + 1
     );
     assert_eq!(
-        c.query("SELECT name FROM schema_migrations WHERE version=76", ())
+        c.query("SELECT name FROM schema_migrations WHERE version=79", ())
             .await?
             .next()
             .await?
@@ -303,6 +352,7 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
+    assert!(reopened.migration_backup().is_none());
     assert_eq!(
         count(
             &reopened.connect().await?,

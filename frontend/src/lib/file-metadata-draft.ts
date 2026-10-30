@@ -93,8 +93,8 @@ export function buildFileMetadataPatch(domain: MediaDomain, draft: FileMetadataD
   return Object.keys(patch).length ? { ok: true, data: patch } : fail('Choose at least one metadata change.');
 }
 
-export function validFileIds(ids: unknown): ids is number[] {
-  return Array.isArray(ids) && ids.length > 0 && ids.length <= FILE_PAGE_SIZE && ids.every(id => integer(id, 1)) && new Set(ids).size === ids.length;
+export function validFileIds(ids: unknown, limit = FILE_PAGE_SIZE): ids is number[] {
+  return Array.isArray(ids) && ids.length > 0 && ids.length <= limit && ids.every(id => integer(id, 1)) && new Set(ids).size === ids.length;
 }
 
 // Validate the resource boundary without rejecting unknown retained catalog values.

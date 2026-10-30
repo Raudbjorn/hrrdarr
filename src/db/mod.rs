@@ -272,15 +272,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     (
         "rename_commands",
-        include_str!("../../migrations/0067_rename_commands.sql"),
+        include_str!("../../migrations/0065_rename_commands.sql"),
     ),
     (
         "autotagging_rules",
-        include_str!("../../migrations/0065_autotagging_rules.sql"),
+        include_str!("../../migrations/0066_autotagging_rules.sql"),
     ),
     (
         "collections",
-        include_str!("../../migrations/0066_collections.sql"),
+        include_str!("../../migrations/0067_collections.sql"),
     ),
     // Generic torrent RSS feed indexer: origin/main authored this as 0050 before the registry
     // migrations; it is appended here and written against the registry shape.
@@ -288,35 +288,45 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
     ),
-    // origin/main's collections checkpoint (its 0052/0053) reconciled onto 0066: snapshot facts and
-    // ownership markers only; see docs/collections.md.
-    (
-        "collection_snapshot",
-        include_str!("../../migrations/0069_collection_snapshot.sql"),
-    ),
-    // Deluge registry plus label-family scope triggers, file 0070.
-    ("deluge", include_str!("../../migrations/0070_deluge.sql")),
-    // rTorrent registry, file 0071.
+    // Deluge registry plus label-family scope triggers, file 0069.
+    ("deluge", include_str!("../../migrations/0069_deluge.sql")),
+    // rTorrent registry row, file 0070.
     (
         "rtorrent",
-        include_str!("../../migrations/0071_rtorrent.sql"),
+        include_str!("../../migrations/0070_rtorrent.sql"),
     ),
-    // uTorrent registry row, file 0072.
+    // uTorrent registry row, file 0071.
     (
         "utorrent",
-        include_str!("../../migrations/0072_utorrent.sql"),
+        include_str!("../../migrations/0071_utorrent.sql"),
     ),
-    // Aria2 registry row, file 0073.
-    ("aria2", include_str!("../../migrations/0073_aria2.sql")),
-    // Flood registry, file 0074.
-    ("flood", include_str!("../../migrations/0074_flood.sql")),
-    // Download Station registry, file 0075.
+    // Aria2 registry row, file 0072.
+    ("aria2", include_str!("../../migrations/0072_aria2.sql")),
+    // Flood registry row, file 0073.
+    ("flood", include_str!("../../migrations/0073_flood.sql")),
+    // Download Station registry row, file 0074.
     (
         "downloadstation",
-        include_str!("../../migrations/0075_downloadstation.sql"),
+        include_str!("../../migrations/0074_downloadstation.sql"),
     ),
-    // Indexer breadth (nine tracker implementations). The file is numbered 0090 (reserved range);
-    // it occupies array position 76 because the runner requires a contiguous history.
+    // Provider scope shapes for every registered implementation, file 0075.
+    (
+        "provider_scope_union",
+        include_str!("../../migrations/0075_provider_scope_union.sql"),
+    ),
+    (
+        "review_integrity",
+        include_str!("../../migrations/0076_review_integrity.sql"),
+    ),
+    (
+        "collection_authority",
+        include_str!("../../migrations/0077_collection_authority.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0078_provider_authority.sql"),
+    ),
+    // File 0090 extends the preserved main history at ordinal 79.
     (
         "indexer_breadth",
         include_str!("../../migrations/0090_indexer_breadth.sql"),
@@ -967,6 +977,8 @@ mod indexer_client_tests;
 
 #[cfg(test)]
 mod indexer_backoff_tests;
+#[cfg(test)]
+mod indexer_breadth_tests;
 
 #[cfg(test)]
 mod aria2_registry_tests;
@@ -983,9 +995,10 @@ mod downloadstation_registry_tests;
 #[cfg(test)]
 mod flood_registry_tests;
 #[cfg(test)]
-mod indexer_breadth_tests;
-#[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
+mod review_integrity_tests;
+#[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]
 mod torrent_rss_tests;

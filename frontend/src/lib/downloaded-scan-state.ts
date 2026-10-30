@@ -4,7 +4,8 @@ import type { Result } from './api';
 import { isDownloadClient } from './provider-draft.ts';
 import type {
   CommandPriority, CommandStatus, DownloadedScanCommand, DownloadedScanInput, MediaDomain, Provider,
-  ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupResumeInput, ScanCoverage, ScanMode, ScanPhase, ScanTracked,
+  ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupPhase, ScanCleanupResumeInput, ScanCleanupState, ScanCoverage,
+  ScanCoverageState, ScanMode, ScanPhase, ScanSource, ScanTracked, ScanTracking,
 } from './api.generated';
 
 export const SCAN_PENDING_KEY = 'hrrdarr.downloaded-scan.pending.v1';
@@ -29,6 +30,11 @@ const PRIORITIES: readonly CommandPriority[] = ['normal', 'high'];
 const STATUSES: readonly CommandStatus[] = ['queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled'];
 const PHASES: readonly ScanPhase[] = ['queued', 'inventory', 'waiting_predecessor', 'awaiting_import', 'importing', 'recovery_required', 'cleanup', 'settled'];
 const TERMINAL: readonly CommandStatus[] = ['succeeded', 'failed', 'cancelled'];
+const TRACKING: readonly ScanTracking[] = ['untracked', 'pending', 'unknown_fallback', 'receipt'];
+const SOURCES: readonly ScanSource[] = ['found', 'missing'];
+const COVERAGE_STATES: readonly ScanCoverageState[] = ['untracked', 'pending', 'complete', 'incomplete'];
+const CLEANUP_STATES: readonly ScanCleanupState[] = ['not_needed', 'pending', 'complete', 'retained'];
+const CLEANUP_PHASES: readonly ScanCleanupPhase[] = ['observed', 'remove_intent', 'settled'];
 
 /** `providerId`/`remoteId` are both empty for an untracked scan, or both set for a tracked one. */
 export type ScanForm = { path: string; mode: ScanMode; priority: CommandPriority; providerId?: string; remoteId?: string };
@@ -170,7 +176,7 @@ export function commandMatches(entry: PendingScan, command: unknown): boolean {
 
 /** 409 codes that reject the request inside the admission transaction: nothing was created. */
 const REJECTING_CONFLICTS = new Set([
-  'downloaded_scan_provider_unknown', 'downloaded_scan_successor_invalid', 'downloaded_scan_successor_not_settled',
+  'downloaded_scan_provider_unknown', 'downloaded_scan_provider_not_client', 'downloaded_scan_successor_invalid', 'downloaded_scan_successor_not_settled',
   'downloaded_scan_successor_not_incomplete', 'downloaded_scan_successor_conflict', 'downloaded_scan_successor_receipt_unavailable',
 ]);
 /** Only explicit request rejections settle an admission; anything else may have committed. */
@@ -195,6 +201,17 @@ function validCounts(v: unknown): boolean {
     .every(name => count(v[name]));
 }
 
+/** The coverage the panel renders; a partial row must not be accepted as a parent. */
+function validCoverage(v: unknown): boolean {
+  return object(v) && member(v.state, COVERAGE_STATES) && count(v.expected) && count(v.covered) && count(v.missing);
+}
+/** The cleanup state the panel renders; every consumed field is checked before the row is used. */
+function validCleanup(v: unknown): boolean {
+  return object(v) && member(v.state, CLEANUP_STATES) && (v.phase === null || member(v.phase, CLEANUP_PHASES))
+    && (v.reason === null || typeof v.reason === 'string') && count(v.removed)
+    && (v.error_code === null || typeof v.error_code === 'string')
+    && count(v.resume_generation) && typeof v.resume_requested === 'boolean' && typeof v.recovery_required === 'boolean';
+}
 /** Structural check of a parent for the requested domain; rejects cross-domain rows. */
 export function validScanCommand(v: unknown, domain: MediaDomain): v is DownloadedScanCommand {
   return object(v) && scanUuid(v.id) && v.media_type === domain && typeof v.path === 'string'
@@ -204,6 +221,12 @@ export function validScanCommand(v: unknown, domain: MediaDomain): v is Download
     && (v.phase === 'settled') === isTerminalScan(v.status as CommandStatus)
     && typeof v.successor_allowed === 'boolean' && (v.supersedes_command_id === null || scanUuid(v.supersedes_command_id))
     && (v.successor_command_id === null || scanUuid(v.successor_command_id))
+    && member(v.tracking, TRACKING) && (v.source === null || member(v.source, SOURCES))
+    && (v.error_code === null || typeof v.error_code === 'string')
+    && (v.completed_at === null || count(v.completed_at)) && count(v.created_at) && count(v.next_attempt_at)
+    && (v.receipt_id === null || scanUuid(v.receipt_id))
+    && (v.predecessor_operation_id === null || scanUuid(v.predecessor_operation_id))
+    && validCoverage(v.coverage) && validCleanup(v.cleanup)
     && (v.tracked === null || (object(v.tracked) && scanUuid(v.tracked.provider_id) && typeof v.tracked.remote_id === 'string'));
 }
 
@@ -362,12 +385,12 @@ export function admissionFailureMessage(result: Failure): string {
     case 'downloaded_scan_successor_conflict': return 'Another scan already continues this tracked download. Open the newest scan instead.';
     case 'downloaded_scan_successor_receipt_unavailable': return 'The tracked download is no longer available from an enabled download client for this library type.';
     case 'downloaded_scan_provider_unknown': return 'The chosen download client is not configured for this library type.';
+    case 'downloaded_scan_provider_not_client': return 'A tracked scan needs a download client; the chosen provider is an indexer.';
     default: return result.error;
   }
 }
 
 /** Download clients (not indexers) that are configured for the given library type. */
 export function trackingProviders(providers: readonly Provider[], domain: MediaDomain): Provider[] {
-  return providers.filter(p => isDownloadClient(p)
-    && p.settings[domain] !== null && scanUuid(p.id));
+  return providers.filter(p => isDownloadClient(p) && p.settings[domain] !== null && scanUuid(p.id));
 }

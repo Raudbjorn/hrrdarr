@@ -20,6 +20,7 @@ pub struct CapturedTarget {
 pub enum Details {
     Series(SeriesDetails),
     Movie(MovieDetails),
+    MovieWithCollection(crate::metadata::MovieWithCollection),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -89,15 +90,31 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
         {
             series(c, series_id, details).await?
         }
-        (Target::Movies { .. }, Details::Movie(details))
+        (Target::Movies { movie_id }, Details::Movie(details))
             if details.tmdb_id == captured.external_id =>
         {
-            movie(
+            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
+            let association = details.collection.clone();
+            let changed = movie(c, metadata_id, details).await?;
+            let associated =
+                crate::collections::repository::adopt(c, movie_id, metadata_id, association, None)
+                    .await?;
+            changed.max(u16::from(associated))
+        }
+        (Target::Movies { movie_id }, Details::MovieWithCollection(details))
+            if details.movie.tmdb_id == captured.external_id =>
+        {
+            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
+            let changed = movie(c, metadata_id, details.movie).await?;
+            let associated = crate::collections::repository::adopt(
                 c,
-                captured.metadata_id.ok_or(Error::TargetChanged)?,
-                details,
+                movie_id,
+                metadata_id,
+                details.collection,
+                None,
             )
-            .await?
+            .await?;
+            changed.max(u16::from(associated))
         }
         _ => return Err(Error::TargetChanged),
     };
@@ -119,8 +136,8 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
 }
 async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
     let detail = detail.validated().map_err(|_| Error::Conflict)?;
-    if let Some(imdb) = &detail.imdb_id {
-        if c.query(
+    if let Some(imdb) = &detail.imdb_id
+        && c.query(
             "SELECT 1 FROM movie_metadata WHERE imdb_id=? AND id!=? LIMIT 1",
             params![imdb.clone(), id],
         )
@@ -128,9 +145,8 @@ async fn movie(c: &Connection, id: i64, detail: MovieDetails) -> Result<u16> {
         .next()
         .await?
         .is_some()
-        {
-            return Err(Error::Conflict);
-        }
+    {
+        return Err(Error::Conflict);
     }
     let facts_changed = movie_facts(c, id, &detail, true).await?;
     let changed=c.execute("UPDATE movie_metadata SET title=?1,year=COALESCE(?2,year),imdb_id=COALESCE(?3,imdb_id) WHERE id=?4 AND (title IS NOT ?1 OR year IS NOT COALESCE(?2,year) OR imdb_id IS NOT COALESCE(?3,imdb_id))",params![detail.title,detail.year,detail.imdb_id,id]).await?;
@@ -206,7 +222,6 @@ pub(crate) async fn movie_facts(
     } else {
         None
     };
-    let collection_changed = crate::collections::associate(c, id, &detail.collection).await?;
     let credits_changed = match &detail.credits {
         Some(credits) => credits_replace(c, id, credits, replace).await?,
         None => false,
@@ -229,7 +244,7 @@ pub(crate) async fn movie_facts(
             .await?;
         }
     }
-    Ok(changed || aliases_changed || credits_changed || collection_changed)
+    Ok(changed || aliases_changed || credits_changed)
 }
 
 type CreditRow = (
@@ -484,10 +499,10 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
         return Err(Error::Conflict);
     }
     for episode in &detail.episodes {
-        if let Some(stored) = old.get(&episode.tvdb_id) {
-            if stored.season != episode.season || stored.number != episode.number {
-                return Err(Error::Conflict);
-            }
+        if let Some(stored) = old.get(&episode.tvdb_id)
+            && (stored.season != episode.season || stored.number != episode.number)
+        {
+            return Err(Error::Conflict);
         }
     }
     // Enforce global catalog ownership even where a legacy database has a nonunique index.
@@ -515,7 +530,7 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
     }
     let mut additions = Vec::new();
     for number in incoming_seasons {
-        if !seasons.contains_key(&number) {
+        if let std::collections::btree_map::Entry::Vacant(e) = seasons.entry(number) {
             let monitored = if number == 0 {
                 0
             } else {
@@ -526,7 +541,7 @@ async fn series(c: &Connection, id: i64, detail: SeriesDetails) -> Result<u16> {
                 }
             };
             additions.push((number, monitored));
-            seasons.insert(number, monitored);
+            e.insert(monitored);
         }
     }
     // All ambiguous identities and monitoring policy are checked before modifying any row.

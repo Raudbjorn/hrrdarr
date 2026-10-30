@@ -5,7 +5,7 @@ use crate::api::MediaDomain;
 use crate::notifications::{
     events::{EventKind, Message},
     model::{Field, ImplementationKind},
-    transport::{Outgoing, basic_auth},
+    transport::{MAX_URL_BYTES, Outgoing, basic_auth},
 };
 use serde_json::json;
 
@@ -14,6 +14,27 @@ fn url_with_query(base: &str, query: &[(&str, &str)]) -> Result<String, &'static
     url.query_pairs_mut().extend_pairs(query);
     Ok(url.into())
 }
+fn encoded_len(value: &str) -> usize {
+    url::form_urlencoded::byte_serialize(value.as_bytes())
+        .map(str::len)
+        .sum()
+}
+
+fn clip_encoded(value: &str, max_bytes: usize) -> &str {
+    let mut used = 0;
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        let mut encoded = [0u8; 4];
+        let len = encoded_len(ch.encode_utf8(&mut encoded));
+        if used + len > max_bytes {
+            break;
+        }
+        used += len;
+        end = index + ch.len_utf8();
+    }
+    &value[..end]
+}
+
 fn join_path(base: &str, tail: &str) -> String {
     format!(
         "{}/{}",
@@ -75,6 +96,8 @@ fn slack(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
 }
 
 fn telegram(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
+    // sendMessage allows 4096 characters *after entity parsing*: `&amp;` counts as one, so the
+    // escaped text fits whenever the clipped plain text (256 + 1 + 3500) does.
     let text = format!(
         "<b>{}</b>\n{}",
         html_escape::encode_text(&clip(&m.title, 256)),
@@ -238,24 +261,44 @@ fn prowl(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
 }
 
 fn join(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
+    const BASE: &str = "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush";
+
     let title = clip(&m.title, 250);
     let text = clip(&m.text, 1000);
+    let api_key = c.text("api_key");
+    let priority = c.opt("priority").unwrap_or("0");
+    let names = c.list("device_names").join(",");
+    let device = if names.is_empty() {
+        ("deviceId", "group.all")
+    } else {
+        ("deviceNames", names.as_str())
+    };
+
     let mut query = vec![
-        ("apikey", c.text("api_key")),
+        ("apikey", api_key),
         ("title", title.as_str()),
         ("text", text.as_str()),
-        ("priority", c.opt("priority").unwrap_or("0")),
+        ("priority", priority),
+        device,
     ];
-    let names = c.list("device_names").join(",");
-    if names.is_empty() {
-        query.push(("deviceId", "group.all"));
-    } else {
-        query.push(("deviceNames", names.as_str()));
+    let encoded_query_len = query
+        .iter()
+        .map(|(key, value)| encoded_len(key) + 1 + encoded_len(value))
+        .sum::<usize>()
+        + query.len()
+        - 1;
+    // The `?` and the `text` value are excluded; every other query byte is fixed.
+    let fixed_len = BASE.len() + 1 + encoded_query_len - encoded_len(&text);
+    let text_budget = MAX_URL_BYTES.saturating_sub(fixed_len);
+    if encoded_len(&text) > text_budget {
+        let clipped = clip_encoded(&text, text_budget);
+        query[2] = ("text", clipped);
     }
-    Ok(vec![Outgoing::get(url_with_query(
-        "https://joinjoaomgcd.appspot.com/_ah/api/messaging/v1/sendPush",
-        &query,
-    )?)])
+    let url = url_with_query(BASE, &query)?;
+    if url.len() > MAX_URL_BYTES {
+        return Err("invalid_url");
+    }
+    Ok(vec![Outgoing::get(url)])
 }
 
 fn pushcut(c: &Config, m: &Message) -> Result<Vec<Outgoing>, &'static str> {
@@ -288,7 +331,7 @@ pub fn implementations() -> Vec<Implementation> {
             domains: BOTH,
             fields: || {
                 vec![
-                    Field::secret("webhook_url", "Webhook URL")
+                    Field::secret_url("webhook_url", "Webhook URL")
                         .required()
                         .help("Channel webhook; treated as a secret."),
                     Field::text("username", "Username").default_text("hrrdarr"),
@@ -305,7 +348,7 @@ pub fn implementations() -> Vec<Implementation> {
             domains: BOTH,
             fields: || {
                 vec![
-                    Field::secret("webhook_url", "Webhook URL")
+                    Field::secret_url("webhook_url", "Webhook URL")
                         .required()
                         .help("Incoming webhook; treated as a secret."),
                     Field::text("username", "Username").default_text("hrrdarr"),
@@ -480,4 +523,121 @@ pub fn implementations() -> Vec<Implementation> {
             build: Build::Http(pushcut),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notifications::{events::test_message, model::SettingValue};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn join_truncates_non_ascii_message_to_fit_transport_url_limit() {
+        let settings = BTreeMap::from([
+            (
+                "device_names".to_owned(),
+                SettingValue::Text("phone".to_owned()),
+            ),
+            ("priority".to_owned(), SettingValue::Text("2".to_owned())),
+        ]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "join-key".to_owned())]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let message = Message {
+            kind: EventKind::Test,
+            domain: MediaDomain::Tv,
+            title: "标题".to_owned(),
+            text: "通".repeat(333),
+            json: json!({}),
+            env: Vec::new(),
+            paths: Vec::new(),
+            severity: None,
+        };
+
+        let requests = join(&config, &message).expect("Join request should be built");
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.len() <= MAX_URL_BYTES);
+        let parsed = url::Url::parse(&requests[0].url).unwrap();
+        let text = url::form_urlencoded::parse(parsed.query().unwrap().as_bytes())
+            .find_map(|(key, value)| (key.as_ref() == "text").then_some(value.into_owned()))
+            .unwrap();
+        assert!(!text.is_empty());
+        assert!(text.len() < 999);
+        assert!(text.chars().count() < 333);
+        assert!(text.chars().all(|ch| ch == '通'));
+    }
+
+    #[test]
+    fn join_truncates_text_for_long_api_key_and_device_names() {
+        let settings = BTreeMap::from([(
+            "device_names".to_owned(),
+            SettingValue::Text("手机".repeat(40)),
+        )]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "k".repeat(1024))]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let message = Message {
+            kind: EventKind::Test,
+            domain: MediaDomain::Tv,
+            title: "题".to_owned(),
+            text: "内容".repeat(500),
+            json: json!({}),
+            env: Vec::new(),
+            paths: Vec::new(),
+            severity: None,
+        };
+
+        let requests = join(&config, &message).expect("Join request should be built");
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.len() <= MAX_URL_BYTES);
+        let parsed = url::Url::parse(&requests[0].url).unwrap();
+        let text = url::form_urlencoded::parse(parsed.query().unwrap().as_bytes())
+            .find_map(|(key, value)| (key.as_ref() == "text").then_some(value.into_owned()))
+            .unwrap();
+        assert!(!text.is_empty());
+        assert!(text.len() < 1000);
+    }
+    fn join_url(text: &str, names: &str) -> String {
+        let settings = BTreeMap::from([(
+            "device_names".to_owned(),
+            SettingValue::Text(names.to_owned()),
+        )]);
+        let secrets = BTreeMap::from([("api_key".to_owned(), "k".repeat(32))]);
+        let config = Config {
+            settings: &settings,
+            secrets: &secrets,
+        };
+        let mut message = test_message(MediaDomain::Tv);
+        message.text = text.to_owned();
+        let mut requests = join(&config, &message).unwrap();
+        assert_eq!(requests.len(), 1);
+        requests.remove(0).url
+    }
+
+    /// The message is percent-encoded into the query, so a raw 1000-byte clip of 3-byte characters
+    /// would be a ~3 KB URL the transport rejects as a permanent failure.
+    #[test]
+    fn join_message_is_budgeted_against_the_encoded_url() {
+        let url = join_url(&"漢".repeat(400), "");
+        assert!(url.len() <= MAX_URL_BYTES, "{}", url.len());
+        let parsed = url::Url::parse(&url).unwrap();
+        let text = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "text")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(text.chars().count() > 100 && text.chars().all(|c| c == '漢'));
+        // Device names spend the same budget.
+        let names = ["Phone-漢"; 20].join(",");
+        assert!(join_url(&"漢".repeat(400), &names).len() <= MAX_URL_BYTES);
+        // Short ASCII is untouched.
+        assert!(join_url("hello", "").contains("text=hello"));
+    }
 }

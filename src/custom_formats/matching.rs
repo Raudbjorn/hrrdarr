@@ -461,12 +461,11 @@ pub(crate) fn parsed(
         .collect::<Vec<_>>();
     let mut languages = Vec::new();
     for token in tokens {
-        if token.len() > 2 {
-            if let Some(id) = language(token, tv) {
-                if !languages.contains(&id) {
-                    languages.push(id);
-                }
-            }
+        if token.len() > 2
+            && let Some(id) = language(token, tv)
+            && !languages.contains(&id)
+        {
+            languages.push(id);
         }
     }
     Evidence {

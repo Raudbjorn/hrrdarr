@@ -1,21 +1,27 @@
 <script lang="ts">
   import {onMount} from 'svelte';
-  import type {Notification,NotificationImplementation,Tag,NotificationDelivery} from './api.generated';
+  import type {Notification,NotificationImplementation,Tag,NotificationDelivery,MediaDomain} from './api.generated';
   import {listNotifications,getNotificationSchema,createNotification,updateNotification,deleteNotification,testNotificationDraft,testSavedNotification,listTags,listNotificationDeliveries,type SettingsWriteState} from './api';
   import {blankDraft,draftFromNotification,buildInput,describeTest,triggersOn,SCOPE_DEFS,type NotificationDraft} from './notification-draft';
+
+  // The tag catalog version comes from Settings -> Tags: a tag created there must reach the
+  // scope choices here without a page reload.
+  let { tagVersions = {tv:0,movies:0} }: { tagVersions?: Record<MediaDomain, number> } = $props();
 
   let schema=$state<NotificationImplementation[]>([]),items=$state<Notification[]>([]),tags=$state<{tv:Tag[];movies:Tag[]}>({tv:[],movies:[]});
   let deliveries=$state<NotificationDelivery[]>([]);
   let draft=$state<NotificationDraft|null>(null),editing=$state<Notification|null>(null);
   let loading=$state(false),write=$state<SettingsWriteState>('idle'),error=$state(''),notice=$state(''),testing=$state(false),testNote=$state('');
-  let alive=true;
+  let alive=true,epoch=0;
   const busy=$derived(write==='busy'||testing);
   const impl=$derived(draft?schema.find(s=>s.implementation===draft!.implementation)??null:null);
 
   async function load() {
+    // A superseded read is dropped: a catalog refresh must not overwrite newer state.
+    const token=++epoch;
     loading=true;error='';
     const [s,l,tv,mv,d]=await Promise.all([getNotificationSchema(),listNotifications(),listTags('tv'),listTags('movies'),listNotificationDeliveries(10)]);
-    if(!alive)return;
+    if(!alive||token!==epoch)return;
     loading=false;
     if(!s.ok){error=s.error;return;}
     if(!l.ok){error=l.error;return;}
@@ -23,6 +29,16 @@
     tags={tv:tv.ok?tv.data:[],movies:mv.ok?mv.data:[]};
     deliveries=d.ok?d.data.items:[];
   }
+  // A tag created in Settings -> Tags bumps the catalog version: reload through the same path
+  // used after a write, so the scope choices list the new tag. The draft in progress is kept.
+  let seenTagVersions:{tv:number,movies:number}|null=null;
+  $effect(()=>{
+    const tv=tagVersions.tv,movies=tagVersions.movies;
+    if(!seenTagVersions){seenTagVersions={tv,movies};return;}
+    if(tv===seenTagVersions.tv&&movies===seenTagVersions.movies)return;
+    seenTagVersions={tv,movies};
+    void load();
+  });
   function startAdd(name:string) {
     const found=schema.find(s=>s.implementation===name);
     if(!found||busy)return;

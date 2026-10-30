@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 79); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {
@@ -136,7 +136,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
             }
         }
         if *table == "snapshot_imports" {
-            // Migrations36 through41,45,55 and56 append nine inactive metadata markers.
+            // Migrations36 through41,45,55,56,77 and78 append eleven inactive metadata markers.
             // Preserve every predecessor field and assert both new activation markers start at0.
             for row in &mut expected {
                 row.extend([
@@ -149,7 +149,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
-                    // 0069 collection_version starts inactive.
+                    libsql::Value::Integer(0),
                     libsql::Value::Integer(0),
                 ]);
             }

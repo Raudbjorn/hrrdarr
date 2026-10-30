@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 79); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     for op in &operations {
         let r = c
             .query(

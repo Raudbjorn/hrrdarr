@@ -870,7 +870,7 @@ async fn delete(
         }
         if tx
             .query(
-                "SELECT 1 FROM library_settings WHERE quality_profile_id=? LIMIT 1",
+                "SELECT 1 FROM library_settings WHERE quality_profile_id=?1 UNION ALL SELECT 1 FROM movie_collection_settings WHERE quality_profile_id=?1 LIMIT 1",
                 [id],
             )
             .await?
@@ -881,16 +881,9 @@ async fn delete(
             return Err(Error(
                 StatusCode::CONFLICT,
                 "profile_in_use",
-                "Quality profile is assigned to a library item",
+                "Quality profile is assigned to a library item or collection",
             ));
         }
-        // Collection defaults are policy, not library assignments: deleting their
-        // profile disables the policy instead of blocking on the RESTRICT reference.
-        tx.execute(
-            "UPDATE movie_collections SET quality_profile_id=NULL,monitored=0 WHERE quality_profile_id=? AND ?='movies'",
-            params![id, media.clone()],
-        )
-        .await?;
         tx.execute(
             "DELETE FROM quality_profiles WHERE id=? AND media_type=?",
             params![id, media],

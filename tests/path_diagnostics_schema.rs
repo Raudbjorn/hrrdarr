@@ -212,7 +212,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let c = fresh.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks WHERE check_key='remote_path_mapping' AND startup=1 AND scheduled=1 AND compatibility_type='RemotePathMappingCheck' AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND severity IS NULL AND observed_generation IS NULL AND checked_at IS NULL").await?, 2);
     let path = scratch.0.join("upgrade");
@@ -241,7 +241,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let after = upgraded.connect().await?;
     assert_eq!(
         scalar(&after, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     );
     assert_eq!(data_with(&after, &queries).await?, rows);
     assert_eq!(

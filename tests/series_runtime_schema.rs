@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

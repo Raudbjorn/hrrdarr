@@ -766,14 +766,12 @@ async fn failure_in(
         }
         Err(error) => return Err(error),
     };
-    if authorized {
-        if let Some(mapping) = mapping {
-            let matches = c.query("SELECT 1 FROM remote_path_mappings WHERE id=? AND revision=? AND host=? AND media_type=?",params![mapping.id,mapping.revision,mapping.host.clone(),domain(media(&item.target))]).await?.next().await?.is_some();
-            if !matches {
-                code = "path_mapping_changed";
-                reasons = vec![code.into()];
-                marker = Some("hc021_mapping_changed");
-            }
+    if authorized && let Some(mapping) = mapping {
+        let matches = c.query("SELECT 1 FROM remote_path_mappings WHERE id=? AND revision=? AND host=? AND media_type=?",params![mapping.id,mapping.revision,mapping.host.clone(),domain(media(&item.target))]).await?.next().await?.is_some();
+        if !matches {
+            code = "path_mapping_changed";
+            reasons = vec![code.into()];
+            marker = Some("hc021_mapping_changed");
         }
     }
     let reasons = path_reasons(

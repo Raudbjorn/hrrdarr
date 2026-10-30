@@ -121,6 +121,35 @@ impl Harness {
             other => panic!("{sql} -> {other:?}"),
         }
     }
+    async fn sql(&self, sql: &str) {
+        self.db
+            .connect()
+            .await
+            .unwrap()
+            .execute_batch(sql)
+            .await
+            .unwrap();
+    }
+    /// Recorded file-delete events for one domain, oldest first.
+    async fn file_delete_events(&self, scope: &str) -> Vec<Value> {
+        let c = self.db.connect().await.unwrap();
+        let mut rows = c
+            .query(
+                "SELECT subject_id,payload_json FROM notification_events WHERE kind='file_delete' AND scope=? ORDER BY sequence",
+                [scope],
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            let payload: String = r.get(1).unwrap();
+            out.push(json!({
+                "subject_id": r.get::<Option<i64>>(0).unwrap(),
+                "payload": serde_json::from_str::<Value>(&payload).unwrap(),
+            }));
+        }
+        out
+    }
     async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
         let mut request = reqwest::Client::builder()
             .no_proxy()
@@ -163,6 +192,16 @@ fn text(v: &str) -> libsql::Value {
 #[tokio::test]
 async fn scan_upgrades_recycle_each_original_once_in_both_domains_and_expire_by_cleanup() {
     let mut h = Harness::new().await;
+    // An enabled file-delete scope for both domains: the retirement of a replaced original is
+    // recorded as a file delete, because the original leaves the library without a row delete.
+    h.sql(
+        "INSERT INTO notifications(id,name,implementation,enabled,revision,settings_json,secret_names,created_at,updated_at)\
+         VALUES('11111111-1111-4111-8111-111111111111','Upgrade','webhook',1,1,'{}','[]',100,100);\
+         INSERT INTO notification_scopes(notification_id,media_type,on_file_delete,on_file_delete_for_upgrade)\
+         VALUES('11111111-1111-4111-8111-111111111111','tv',1,1),\
+                ('11111111-1111-4111-8111-111111111111','movies',1,1);",
+    )
+    .await;
     let tv_root = h.dir("lib/tv");
     let movie_root = h.dir("lib/movie");
     let c = h.db.connect().await.unwrap();
@@ -258,6 +297,32 @@ async fn scan_upgrades_recycle_each_original_once_in_both_domains_and_expire_by_
         );
         assert_eq!(done["counts"]["imported"], 1, "{done}");
     }
+    // The replaced originals leave the library by retirement, not by a row delete: the enabled
+    // scope records one file delete per domain with the Upgrade reason and the original path.
+    let tv_events = h.file_delete_events("tv").await;
+    assert_eq!(tv_events.len(), 1, "{tv_events:?}");
+    assert_eq!(tv_events[0]["subject_id"], 1, "{tv_events:?}");
+    assert_eq!(
+        tv_events[0]["payload"]["reason"], "Upgrade",
+        "{tv_events:?}"
+    );
+    assert_eq!(
+        tv_events[0]["payload"]["path"],
+        old_tv.to_str().unwrap(),
+        "{tv_events:?}"
+    );
+    let movie_events = h.file_delete_events("movies").await;
+    assert_eq!(movie_events.len(), 1, "{movie_events:?}");
+    assert_eq!(movie_events[0]["subject_id"], 1, "{movie_events:?}");
+    assert_eq!(
+        movie_events[0]["payload"]["reason"], "Upgrade",
+        "{movie_events:?}"
+    );
+    assert_eq!(
+        movie_events[0]["payload"]["path"],
+        old_movie.to_str().unwrap(),
+        "{movie_events:?}"
+    );
     // New files are in the library; each original is in the bin under its owner folder layout,
     // as the same inode, and no library copy or recovery artifact remains.
     assert_eq!(
@@ -390,5 +455,96 @@ async fn scan_upgrades_recycle_each_original_once_in_both_domains_and_expire_by_
             .await,
         3
     );
+    h.stop_worker().await;
+}
+
+/// One bin shared by both domains has no per-entry domain marker, so the longest retention wins
+/// and a domain that disables cleanup disables it for the whole path.
+#[tokio::test]
+async fn shared_recycle_bin_keeps_the_longest_retention_and_zero_disables_cleanup() {
+    let mut h = Harness::new().await;
+    let bin = h.dir("bin");
+    for (domain, days) in [("tv", 7), ("movies", 30)] {
+        let (code, current) = h
+            .call("GET", &format!("/api/v1/{domain}/recycle-bin"), Value::Null)
+            .await;
+        assert_eq!(code, 200, "{current}");
+        let (code, saved) = h
+            .call(
+                "PUT",
+                &format!("/api/v1/{domain}/recycle-bin"),
+                json!({"revision":current["revision"],"path":bin,"cleanup_days":days}),
+            )
+            .await;
+        assert_eq!(code, 200, "{saved}");
+    }
+    // Older than the TV retention, younger than the movie retention.
+    let artifact = bin.join("tv/Season 1/old.mkv");
+    write(&artifact, &payload(1));
+    let expired = SystemTime::now() - Duration::from_secs(10 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&artifact)
+        .unwrap()
+        .set_modified(expired)
+        .unwrap();
+    h.start_worker().await;
+    let (code, command) = h
+        .call(
+            "POST",
+            "/api/v1/recycle-bin/cleanup-commands",
+            json!({"target":{"media_type":"tv"},"priority":"normal"}),
+        )
+        .await;
+    assert_eq!(code, 202, "{command}");
+    let cleaned = h
+        .wait(
+            &format!(
+                "/api/v1/recycle-bin/cleanup-commands/{}",
+                command["id"].as_str().unwrap()
+            ),
+            |v| v["status"] == "succeeded",
+        )
+        .await;
+    assert_eq!(cleaned["outcome"], "cleaned", "{cleaned}");
+    assert_eq!(cleaned["cleanup_days"], 30, "{cleaned}");
+    assert_eq!(cleaned["files_removed"], 0, "{cleaned}");
+    assert!(
+        artifact.exists(),
+        "the longer movie retention keeps the shared file"
+    );
+    // A domain that disables cleanup disables it for the shared path.
+    let (code, current) = h
+        .call("GET", "/api/v1/movies/recycle-bin", Value::Null)
+        .await;
+    assert_eq!(code, 200, "{current}");
+    let (code, saved) = h
+        .call(
+            "PUT",
+            "/api/v1/movies/recycle-bin",
+            json!({"revision":current["revision"],"path":bin,"cleanup_days":0}),
+        )
+        .await;
+    assert_eq!(code, 200, "{saved}");
+    let (code, command) = h
+        .call(
+            "POST",
+            "/api/v1/recycle-bin/cleanup-commands",
+            json!({"target":{"media_type":"tv"},"priority":"normal"}),
+        )
+        .await;
+    assert_eq!(code, 202, "{command}");
+    let cleaned = h
+        .wait(
+            &format!(
+                "/api/v1/recycle-bin/cleanup-commands/{}",
+                command["id"].as_str().unwrap()
+            ),
+            |v| v["status"] == "succeeded",
+        )
+        .await;
+    assert_eq!(cleaned["outcome"], "disabled", "{cleaned}");
+    assert_eq!(cleaned["cleanup_days"], 0, "{cleaned}");
+    assert!(artifact.exists(), "cleanup is disabled for the shared path");
     h.stop_worker().await;
 }

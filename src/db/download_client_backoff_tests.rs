@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76); // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 79); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

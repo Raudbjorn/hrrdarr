@@ -50,8 +50,11 @@ source or already moved roll forward; any anomaly rolls moved pairs back and rec
 failed. This runs at worker start and at the start of each run. Cross-device moves are refused
 (`EXDEV` -> `cross_device`), never copied. Case-only renames work on case-sensitive filesystems
 as ordinary renames and on case-insensitive ones via a plain rename when no distinct entry has
-the target name. Cancel stops before the next item; finished renames stay. A run handles at most
-1000 items (`bounded`); rerunning continues, since renamed files then plan as unchanged.
+the target name. When both path lookups return the recorded identity, journal recovery uses the
+directory entry's exact spelling to distinguish the source from the destination; two distinct
+entries sharing an inode remain a conflict. Cancel stops before the next item; finished renames
+stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
+plan as unchanged.
 
 ## OnRename seam
 
@@ -65,7 +68,8 @@ transaction, then calls observers registered with
 
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
   second filesystem was exercised. Case-insensitive filesystems were not exercised (the
-  classifier logic is unit-tested on a case-sensitive one).
+  alias observations are simulated against real directory listings; file/folder moves and reverse
+  moves are tested on a case-sensitive filesystem).
 * Journalled moves are atomic renames, not the importer's stage/copy/hash pipeline; file
   bytes are not hashed. Identity is device+inode.
 * Empty source folders are not removed; other tables holding paths under a renamed folder (for

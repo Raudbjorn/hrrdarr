@@ -75,10 +75,10 @@ pub(crate) fn reconcile(
     if let Some(file) = &file {
         file.validate()?;
     }
-    if let (Some(release), Some(file)) = (release, file.as_ref()) {
-        if release.value != file.value {
-            return Err("revision_evidence_conflict");
-        }
+    if let (Some(release), Some(file)) = (release, file.as_ref())
+        && release.value != file.value
+    {
+        return Err("revision_evidence_conflict");
     }
     let effective = file
         .as_ref()

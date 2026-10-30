@@ -63,6 +63,12 @@ fn round_trip<T: DeserializeOwned + Serialize>(input: Value) -> Value {
 #[test]
 fn deterministic_contract_and_stale_cli_check() {
     assert_eq!(api_contract::render(), api_contract::render());
+    // ts-rs inserts spaces before multiline field docs; generated changes must pass diff --check.
+    assert!(
+        api_contract::render()
+            .lines()
+            .all(|line| line == line.trim_end())
+    );
     api_contract::check().expect("committed TypeScript must match actual Rust DTOs");
     let dir = Sandbox::new();
     let path = dir.0.join("contract.ts");

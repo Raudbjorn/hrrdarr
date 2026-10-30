@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Flood/` i
 
 ## Configuration
 
-`ProviderSettings::Flood { endpoint, tv, movies }`, stored by migration 0074 (registry row only; the scope triggers and unique label index came with 0070).
+`ProviderSettings::Flood { endpoint, tv, movies }`, stored by migration 0073 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is Flood's base URL including any URL base, for example `http://flood.example:3000`.
 - Each scope is the shared `TorrentLabelScope`; `category` is a Flood tag (1-64 of lowercase letters, digits, `.`, `_`, `-`; TV and movie tags must differ). `add_paused` adds the torrent stopped. `recent_priority`/`older_priority` are accepted and stored but not applied (see Controls).
@@ -20,7 +20,7 @@ With credentials, each operation posts them to `/api/auth/authenticate` and send
 
 ## Ownership and status
 
-A torrent belongs to a domain when one of its tags equals the domain tag (case-insensitive); of several tags the configured one wins. Status flags map: `checking`, `error`, size 0 is a magnet awaiting metadata, `stopped` is paused, `complete`/`seeding` or all bytes present is completed, `downloading` is downloading, anything else stalled. The save path is `directory`; when it ends with the torrent's own name (a multi-file folder) the parent is used, and file paths from `/contents` are prefixed with the torrent name for multi-file torrents.
+A torrent belongs to a domain when one of its tags equals the domain tag (case-insensitive); of several tags the configured one wins. Status flags map: `checking`, `error`, size 0 is a magnet awaiting metadata, `stopped` is paused, `complete`/`seeding` or all bytes present is completed (a torrent Flood itself reports `complete` counts as having all its bytes, since skipped files leave `bytesDone` below `sizeBytes`), `downloading` is downloading, anything else stalled. The save path is `directory` and file paths are the `/contents` paths, both exactly as reported: Flood resolves a content path with `path.join(torrent.directory, content.path)` (read from its `server/routes/api/torrents.ts`), so the pair stays correct for torrents moved to a directory whose name differs from the torrent's.
 
 ## Submission
 
@@ -34,4 +34,4 @@ Pause (`stop`), Resume (`start`) and Remove (`delete`, with `deleteData`), each 
 
 - Live Flood compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed Flood was contacted. Paths, JSON shapes (including the `directory` and `contents` path semantics for multi-file torrents) and the cookie name come from the API description, not a live run. The behaviour of the different backends behind Flood is not distinguished.
 - Queue placement (`first`), tag edits on existing torrents (PATCH), seeding limits and the health classifier are not implemented.
-- Migration 0074 is the 74th entry (the file number equals its array position).
+- Migration 0073 is the 73rd entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).

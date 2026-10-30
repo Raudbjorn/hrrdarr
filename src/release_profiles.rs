@@ -305,8 +305,7 @@ pub(crate) fn validate_shape(m: MediaDomain, v: &Definition) -> Result<()> {
             fingerprint,
             source_id,
         } = reference
-        {
-            if v.enabled
+            && (v.enabled
                 || application.name()
                     != if matches!(m, MediaDomain::Tv) {
                         "sonarr"
@@ -317,10 +316,9 @@ pub(crate) fn validate_shape(m: MediaDomain, v: &Definition) -> Result<()> {
                 || !fingerprint
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                || !(1..=MAX_ID).contains(source_id)
-            {
-                return Err(invalid());
-            }
+                || !(1..=MAX_ID).contains(source_id))
+        {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -872,10 +870,10 @@ fn proposed(all: &Catalog, id: Option<i64>, value: Option<&Definition>) -> Resul
     if !found {
         return Err(missing());
     }
-    if id.is_none() {
-        if let Some(v) = value {
-            definitions.push(v.clone())
-        }
+    if id.is_none()
+        && let Some(v) = value
+    {
+        definitions.push(v.clone())
     }
     Ok(definitions)
 }

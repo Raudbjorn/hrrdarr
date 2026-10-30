@@ -7,7 +7,7 @@
 -- Fanzub is a Usenet indexer (NZB enclosures); every other tracker is a torrent indexer. The shared
 -- indexer_status backoff and the RSS/search admission triggers are widened to the new implementations.
 -- Neither providers nor provider_scopes is rebuilt. The live definitions of every replaced trigger are
--- 0050 (indexer_status), 0067 (search_commands_admit), 0068 (rss_*), 0070 (scope shape/options).
+-- 0050 (indexer_status), 0065 (search_commands_admit), 0068 (rss_*), 0075 (scope shape/options).
 
 INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('nyaa','indexer','torrent');
 INSERT INTO provider_implementations(implementation,kind,protocol) VALUES ('fanzub','indexer','usenet');

@@ -555,7 +555,18 @@ async fn delete(
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
         .await?;
     let t = find(&tx, domain(&m)?, id(&raw)?).await?;
-    if usage(&tx, t.clone()).await?.in_use {
+    // Provider scope tags are assignments too; their RESTRICT reference must surface as
+    // the same conflict rather than a storage failure.
+    let provider_owned = tx
+        .query(
+            "SELECT 1 FROM provider_scope_tags WHERE tag_id=? LIMIT 1",
+            [t.id],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    if provider_owned || usage(&tx, t.clone()).await?.in_use {
         return Err(Error(
             StatusCode::CONFLICT,
             "tag_in_use",

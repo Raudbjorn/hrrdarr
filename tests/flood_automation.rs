@@ -223,14 +223,10 @@ fn flood(s: &Remote, method: &Method, path: &str, headers: &HeaderMap, body: &[u
                 },
                 tags,
                 complete: false,
-                files: vec![(
-                    if tv {
-                        format!("{name}/{name}.mkv")
-                    } else {
-                        format!("{name}.mkv")
-                    },
-                    FILE_BYTES as i64,
-                )],
+                // Reasoning: Flood resolves a content path by joining it onto the torrent's
+                // `directory`, so for the multi-file torrent (directory is its own folder) the
+                // path is relative to that folder and does not repeat the folder name.
+                files: vec![(format!("{name}.mkv"), FILE_BYTES as i64)],
             });
             if s.lose_add_response.load(Ordering::SeqCst) {
                 return StatusCode::BAD_GATEWAY.into_response();

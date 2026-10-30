@@ -8,7 +8,7 @@ independently; equal numeric file IDs in the two domains never select each other
 ## Settings
 
 `GET`/`PUT /api/v1/{tv|movies}/recycle-bin` reads and writes
-`{media_type, revision, path, cleanup_days, next_cleanup_at}`. A write must send the current
+`{media_type, revision, path, cleanup_days}`. A write must send the current
 `revision` (compare-and-swap; a stale revision returns 409 `recycle_bin_conflict`) and an explicit
 `path` (`null` clears the bin). `cleanup_days` is 0–36500; 0 disables automatic cleanup.
 
@@ -157,6 +157,11 @@ Cleanup opens the bin without following symlinks and walks descriptor-relative. 
 files whose mtime is at least `cleanup_days` old, then empty subfolders. It never follows or removes
 symlinks, special files, entries on another mount or in-progress `.partial` files, and never touches
 anything outside the bin. Everything already in the bin counts, not only files hrrdarr moved there.
+When TV and movies share one bin path, the cleanup uses the longest applicable retention across
+both domains. A domain with `cleanup_days=0` disables cleanup for the shared path because the
+filesystem layout does not identify ownership per entry; use separate bins when independent
+retention or cleanup-disabled behavior is required. This is an hrrdarr rule: upstream keeps one
+global cleanup-days setting for the whole bin.
 Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 60 s); a bounded run reports
 `bounded` and leaves the rest for the next run. Outcomes: `cleaned`, `not_configured`, `disabled`;
 a missing bin fails with `recycle_bin_unavailable`. Cleanup waits (retry) while a file operation

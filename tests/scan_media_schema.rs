@@ -149,19 +149,11 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         } else {
             ""
         };
-        // Reasoning: 0069 appends snapshot_imports.collection_version after this predecessor; every
-        // predecessor column stays in the witness and the new inactive marker is excluded.
+        // Reasoning: 0077/0078 append authority markers; compare every predecessor field.
         let columns = if table == "snapshot_imports" {
-            let mut names = Vec::new();
-            let mut rows = c
-                .query("SELECT name FROM pragma_table_info('snapshot_imports') WHERE name!='collection_version' ORDER BY cid", ())
-                .await?;
-            while let Some(row) = rows.next().await? {
-                names.push(row.get::<String>(0)?);
-            }
-            names.join(",")
+            "application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version,autotag_metadata_version,series_runtime_version,import_policy_version"
         } else {
-            "*".to_owned()
+            "*"
         };
         out.push(
             dump(
@@ -182,7 +174,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: latest is migration file 0090 indexer_breadth at array position 76, appended after 0075 downloadstation; historical prefixes stay fixed.
+        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

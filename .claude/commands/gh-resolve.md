@@ -37,6 +37,9 @@ blocks GraphQL, so the script switches to REST plus the proxy's `/ccr/`
 review-thread routes. Thread IDs then look like `RT_<pr>_<comment id>` instead
 of `PRRT_…`; the two are not interchangeable, so take IDs from a listing in the
 same environment. Force either with `GH_RESOLVE_BACKEND=graphql|rest`.
+REST CI output retains the first page of checks/statuses and reports overall
+`UNKNOWN` when either response is incomplete; partial passing rows do not establish
+that the whole commit passed.
 
 ## Related: gh-comment (local only)
 
@@ -82,8 +85,16 @@ bot reviews — broken down by who said what before diving into `gh-resolve agen
   current file before acting; their line numbers are stale.
 - `suggestions --apply` refuses to run unless local HEAD matches the PR head and
   the target files are clean. Do not reach for `--force` to get past that —
-  check out the right commit instead.
+  check out the right commit instead. Applying requires `python3`; symlink targets
+  and parent directories are rejected even with `--force`. Only plain suggestion
+  fences are supported: offset-bearing fences are excluded from suggestions and
+  must be reviewed/applied manually from the full thread.
 - Reply in the author's voice: say what changed and where, not that an assistant
   did it. Push back when the comment is wrong, with the reasoning.
 - Bulk mutations sleep 0.5s apart and stop on secondary rate limits. If a run
   reports threads left unprocessed, re-run rather than tightening the loop.
+  Any failed requested resolution returns a nonzero exit status, including partial
+  success and quiet mode.
+
+Run `.claude/bin/gh-resolve-test` for isolated mocked-API and disposable-checkout
+regression tests; it performs no GitHub mutations.

@@ -278,34 +278,41 @@ pub(crate) fn move_path(root: &str, old: &str, new: &str, kind: Kind, expect: Id
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PairState {
-    /// Old entry present with the recorded identity and new spelling absent.
+    /// Old entry spelling present with the recorded identity and no distinct new entry.
     Source,
-    /// New entry present with the recorded identity and old spelling absent.
+    /// New entry spelling present with the recorded identity and no distinct old entry.
     Moved,
     Anomaly,
 }
 pub(crate) fn pair_state(old: &str, new: &str, kind: Kind, expect: Ident) -> R<PairState> {
     let o = observe(old, kind)?;
     let n = observe(new, kind)?;
+    classify_pair(old, new, o, n, expect)
+}
+fn classify_pair(
+    old: &str,
+    new: &str,
+    o: Option<Ident>,
+    n: Option<Ident>,
+    expect: Ident,
+) -> R<PairState> {
     Ok(match (o, n) {
         (Some(i), None) if i == expect => PairState::Source,
         (None, Some(i)) if i == expect => PairState::Moved,
-        (Some(o), Some(n)) if o == expect && n == expect => case_only_pair_state(old, new)?,
-        _ => PairState::Anomaly,
-    })
-}
-
-fn case_only_pair_state(old: &str, new: &str) -> R<PairState> {
-    let (op, on) = parent_and_name(old)?;
-    let (np, nn) = parent_and_name(new)?;
-    if op != np || on == nn || on.to_lowercase() != nn.to_lowercase() {
-        return Ok(PairState::Anomaly);
-    }
-    // Case-insensitive lookup aliases both paths; two actual entries remain a conflict.
-    let listing = names(&open_dir(&op)?)?;
-    Ok(match (listing.contains(&on), listing.contains(&nn)) {
-        (true, false) => PairState::Source,
-        (false, true) => PairState::Moved,
+        (Some(o), Some(n)) if o == expect && n == expect => {
+            let (op, on) = parent_and_name(old)?;
+            let (np, nn) = parent_and_name(new)?;
+            if op != np || on == nn || on.to_lowercase() != nn.to_lowercase() {
+                return Ok(PairState::Anomaly);
+            }
+            // Case-insensitive lookup sees both aliases; the actual entry spelling records the move.
+            let listing = names(&open_dir(&op)?)?;
+            match (listing.contains(&on), listing.contains(&nn)) {
+                (true, false) => PairState::Source,
+                (false, true) => PairState::Moved,
+                _ => PairState::Anomaly,
+            }
+        }
         _ => PairState::Anomaly,
     })
 }
@@ -491,33 +498,84 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
-    fn case_only_pair_uses_entry_spelling_and_rejects_hardlink_ambiguity() {
+    fn case_only_pair_state_tracks_file_and_folder_moves_and_rollback() {
+        let d = scratch();
+        let root = d.display().to_string();
+        for (old_name, new_name, kind) in [
+            ("show.mkv", "Show.mkv", Kind::File),
+            ("folder", "Folder", Kind::Dir),
+        ] {
+            let old = s(&d, old_name);
+            let new = s(&d, new_name);
+            match kind {
+                Kind::File => std::fs::write(&old, b"media").unwrap(),
+                Kind::Dir => std::fs::create_dir(&old).unwrap(),
+            }
+            let ident = observe(&old, kind).unwrap().unwrap();
+            assert_eq!(pair_state(&old, &new, kind, ident), Ok(PairState::Source));
+            move_path(&root, &old, &new, kind, ident).unwrap();
+            assert_eq!(pair_state(&old, &new, kind, ident), Ok(PairState::Moved));
+            move_path(&root, &new, &old, kind, ident).unwrap();
+            assert_eq!(pair_state(&old, &new, kind, ident), Ok(PairState::Source));
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn case_insensitive_alias_observations_use_exact_spelling_and_reject_collisions() {
         let d = scratch();
         let old = s(&d, "show.mkv");
         let new = s(&d, "Show.mkv");
         std::fs::write(&old, b"media").unwrap();
         let ident = observe(&old, Kind::File).unwrap().unwrap();
-        // Exercise the aliased-inode classifier without requiring a case-insensitive mount.
-        assert_eq!(case_only_pair_state(&old, &new), Ok(PairState::Source));
+        // Simulate case-insensitive lookup only; exact directory entries are read from disk.
+        let classify = || classify_pair(&old, &new, Some(ident), Some(ident), ident);
+        assert_eq!(classify(), Ok(PairState::Source));
+        assert_eq!(
+            classify_pair(&old, &old, Some(ident), Some(ident), ident),
+            Ok(PairState::Anomaly)
+        );
+        assert_eq!(
+            classify_pair(&old, &s(&d, "other.mkv"), Some(ident), Some(ident), ident),
+            Ok(PairState::Anomaly)
+        );
+        assert_eq!(
+            classify_pair(
+                &old,
+                &s(&d, "other/Show.mkv"),
+                Some(ident),
+                Some(ident),
+                ident
+            ),
+            Ok(PairState::Anomaly)
+        );
+        assert_eq!(
+            classify_pair(
+                &old,
+                &new,
+                Some(ident),
+                Some(ident),
+                Ident {
+                    ino: !ident.ino,
+                    ..ident
+                }
+            ),
+            Ok(PairState::Anomaly)
+        );
         std::fs::rename(&old, &new).unwrap();
-        assert_eq!(case_only_pair_state(&old, &new), Ok(PairState::Moved));
-        std::fs::hard_link(&new, &old).unwrap();
+        assert_eq!(classify(), Ok(PairState::Moved));
+        std::fs::rename(&new, &old).unwrap();
+        assert_eq!(classify(), Ok(PairState::Source));
+
+        // Two distinct directory entries sharing an inode must never be treated as a case alias.
+        std::fs::hard_link(&old, &new).unwrap();
+        assert_eq!(classify(), Ok(PairState::Anomaly));
         assert_eq!(
             pair_state(&old, &new, Kind::File, ident),
             Ok(PairState::Anomaly)
         );
-        assert_eq!(case_only_pair_state(&old, &old), Ok(PairState::Anomaly));
-        assert_eq!(
-            case_only_pair_state(&old, &s(&d, "other.mkv")),
-            Ok(PairState::Anomaly)
-        );
-        assert_eq!(
-            case_only_pair_state(&old, &s(&d, "other/Show.mkv")),
-            Ok(PairState::Anomaly)
-        );
         std::fs::remove_file(&old).unwrap();
         std::fs::remove_file(&new).unwrap();
-        assert_eq!(case_only_pair_state(&old, &new), Ok(PairState::Anomaly));
+        assert_eq!(classify(), Ok(PairState::Anomaly));
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]

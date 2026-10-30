@@ -132,6 +132,10 @@ try {
   await files.getByRole('button', {name: `Delete file ${shared.id}`, exact: true}).click();
   await dialog.getByRole('heading', {name: `Move file ${shared.id} to the recycle bin?`, exact: true}).waitFor();
   await dialog.getByText(new RegExp(`moved to ${tvBin.replaceAll('/', '\\/')}, inside a folder named after the series or movie`)).waitFor();
+  // A pending confirmation locks the library owner. The colliding movie ID must remain untouched.
+  const moviesTab = domains.getByRole('button', {name: 'Movies', exact: true});
+  assert.equal(await moviesTab.isDisabled(), true, 'Pending deletion blocks a media-domain switch');
+  assert.ok(await exists(movieFile.path), 'The colliding movie file remains before confirmation');
   // Escape and Cancel both leave everything untouched.
   await page.keyboard.press('Escape'); await files.getByText('Deletion cancelled; nothing was changed.', {exact: true}).waitFor();
   assert.ok(await exists(shared.path));

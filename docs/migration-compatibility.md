@@ -1,60 +1,65 @@
-# Migration compatibility blocker in PR #32
+# Migration compatibility for the merged indexer branch
 
-PR #32 does **not** upgrade databases created by its base revision,
-`6298f0e0d1403c68c1b4e7e61c2ba5d44eba2c50`, once migration 50 has been applied.
-Startup refuses them with `migration history mismatch at version 50` before
-applying migrations. Do not delete or rewrite migration-history rows to bypass
-this check: the underlying schemas and persisted authority also differ.
+The selected upgrade baseline is main at
+`fff552ad8516270091378807491cbc2a13601bbc`. Its first 78 migration identities and
+SQL are preserved byte for byte. The nine-tracker migration file
+`0090_indexer_breadth.sql` is appended at ordinal 79. File numbering and persisted
+ordinal are distinct; the runner requires a contiguous history.
 
-The first 49 registered migrations match the base byte for byte. The first
-divergent entries are:
+## Supported baseline and historical blockers
 
-| Version | Published base | PR #32 |
+Fresh databases and databases carrying the selected main history can apply the
+appended tracker migration. This does not reconcile other historical ledgers:
+
+| Historical source | First divergence from the merged registry | Status |
 | --- | --- | --- |
-| 50 | `torrent_rss_indexer` | `indexer_backoff` |
-| 51 | `download_client_backoff`, health expiry on `health_checks.next_expiry_at` | Same name, changed SQL/checksum, expiry on `download_client_status.next_health_at` |
-| 52 | `collections` | `download_client_selection` |
-| 53 | `provider_authority` | `path_diagnostics` |
+| Original main `6298f0e0d1403c68c1b4e7e61c2ba5d44eba2c50` | Version 50: `torrent_rss_indexer` versus `indexer_backoff` | Rejected before migration writes; conversion remains tracked in [#35](https://github.com/Raudbjorn/hrrdarr/issues/35). |
+| Pre-merge PR #32 `eb08c2ba9adf0df14dd7be2fb6d933f26ffb3889` | Version 63: different `notifications` SQL/checksum; later ordinals also differ | Rejected before migration writes; conversion is tracked in [#47](https://github.com/Raudbjorn/hrrdarr/issues/47). |
 
-This is more than a numbering conflict. The base stores collection policy in
-`movie_collection_settings`, removal intent in `movie_collection_intents`, and
-metadata revisions on collection memberships. This branch uses inline policy
-on `movie_collections` and does not read those former tables. Likewise, the
-base's `provider_scope_tags`, `provider_status`, and `provider_selection_cursors`
-are not read by this branch. Its replacement indexer backoff is scoped per
-domain and resets with configuration changes; the base status is provider-wide
-and retains versioned observations. Preserving unused tables alone would not
-preserve the meaning of existing settings, exclusions, or backoff.
+Do not delete or rewrite migration-history rows to bypass these checks. The
+underlying schemas and persisted policy differ, not only their version numbers.
+The original PR #32 analysis remains available at
+[its reviewed commit](https://github.com/Raudbjorn/hrrdarr/blob/eb08c2ba9adf0df14dd7be2fb6d933f26ffb3889/docs/migration-compatibility.md).
 
-A complete reconciliation must:
+Current main's migrations 77 and 78 introduce collection and provider authority.
+Collection policy lives in `movie_collection_settings`, removal intent in
+`movie_collection_intents`, and provider authority has dedicated tags, status and
+selection-cursor tables. The pre-merge PR instead added collection snapshot
+fields at ordinal 69 and used a different notification delivery shape. Retaining
+unused legacy tables would not preserve the meaning of their settings.
+
+## Requirements for a historical conversion
 
 - Preserve published ordinal/name/SQL/checksum history, or recognize the exact
-  historical lineage through an explicit validated transition without accepting
-  arbitrary altered history.
-- Define and test mappings for collection monitoring, roots, profiles, tags,
-  removal intent, ownership and revisions; provider tag restrictions, selection
-  cursors, backoff observations and pending health deadlines; and torrent RSS
-  configuration, including `minimum_seeders`.
-- Preserve existing TV/movie libraries and active commands/download receipts;
-  reject unsupported state before mutation rather than silently dropping it.
-- Cover populated base databases through versions 50–53, existing branch
-  databases, fresh creation, repeat opens, transaction failure, backup recovery
-  and foreign-key integrity using the actual libSQL driver.
+  lineage through an explicit validated transition without accepting arbitrary
+  altered history. Preserve the selected current-main upgrade path.
+- Map collection monitoring, roots, profiles, tags, removal intent, ownership
+  and revisions; provider tag restrictions, selection cursors, backoff and
+  pending health deadlines; and Torrent RSS settings such as `minimum_seeders`.
+- For pre-merge PR databases, also reconcile notification delivery domain,
+  multi-request progress and trigger changes without inventing delivery success.
+- Preserve TV/movie libraries, file relationships, active commands and download
+  receipts. Report unsupported/conflicting state before mutation rather than
+  silently dropping it.
+- Validate a recoverable backup before any conversion writes. Test transaction
+  failure, restore, repeat opens/reruns and foreign-key integrity with libSQL.
+- Cover populated original-main versions 50–53, pre-merge PR histories, selected
+  current-main databases and fresh creation. Historical-runner fixtures must
+  supplement SQL-only fixtures before claiming production upgrade support.
 
-The focused test
+## Focused evidence
+
 `db::indexer_backoff_tests::published_torrent_rss_history_is_rejected_without_changing_data`
-constructs the unchanged 1–49 prefix plus the exact base migration 50, then
-checks repeated startup rejection and unchanged schema/history/provider/TV/movie
-rows. Its SQL fixture is copied verbatim from the base commit's
-`migrations/0050_torrent_rss_indexer.sql` into
+constructs the unchanged first 49 entries plus the exact original-main migration
+50, then checks repeated startup refusal and unchanged schema/history/provider/
+TV/movie rows. Its SQL fixture is copied verbatim from the original commit into
 `tests/fixtures/migrations/6298f0e_0050_torrent_rss_indexer.sql`.
-
-Run it with:
 
 ```sh
 cargo test --locked --lib published_torrent_rss_history_is_rejected_without_changing_data
 ```
 
-This evidence protects the current refusal behavior; it does not repair the
-upgrade path or exercise a complete version-53 database. Both migration review
-threads remain open until reconciliation is implemented and verified.
+That test protects refusal behavior. It does not repair historical upgrades or
+exercise the complete original-main version-53 schema. The tracker schema tests
+separately cover the selected main-to-tracker upgrade. Neither establishes live
+provider compatibility or filesystem/media recovery.
