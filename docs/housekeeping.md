@@ -1,9 +1,9 @@
 # Command-history housekeeping
 
-`src/commands/housekeeping.rs` prunes terminal rows from the nine shared-capacity command
+`src/commands/housekeeping.rs` prunes terminal rows from the ten shared-capacity command
 tables: `commands`, `metadata_refresh_commands`, `blocklist_clear_commands`, `rss_commands`,
-`search_commands`, `manual_import_commands`, `quality_reset_commands`, `rescan_commands` and
-`recycle_bin_cleanup_commands` (0060).
+`search_commands`, `manual_import_commands`, `quality_reset_commands`, `rescan_commands`,
+`recycle_bin_cleanup_commands` (0060) and `rename_commands` (0067).
 Since migration 0033 only active rows count toward the 1024-row pool, so history never
 exhausts capacity; this job bounds disk use and query cost instead. `health_commands` already
 retains 128 terminal rows through its own triggers and is not touched.

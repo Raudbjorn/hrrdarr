@@ -44,6 +44,76 @@ async fn failure(c: &Connection, id: &str, media: &str, revision: i64) -> Result
 }
 
 #[tokio::test]
+async fn published_torrent_rss_history_is_rejected_without_changing_data() -> Result<(), Error> {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("db");
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    c.execute(HISTORY_SQL, ()).await?;
+    // The first 49 migrations are byte-identical to 6298f0e; pin its first divergent entry.
+    let published = (
+        "torrent_rss_indexer",
+        include_str!("../../tests/fixtures/migrations/6298f0e_0050_torrent_rss_indexer.sql"),
+    );
+    for (i, &(name, sql)) in MIGRATIONS[..49]
+        .iter()
+        .chain([published].iter())
+        .enumerate()
+    {
+        c.execute_batch(sql).await?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
+            params![i as i64 + 1, name, checksum(sql), sql],
+        )
+        .await?;
+    }
+    indexer(&c, "torznab").await?;
+    super::refresh_tests::provider(&c).await?;
+    let feed = uuid::Uuid::new_v4().to_string();
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES(?,'torrentrss','Published feed',1,1,1,1,'http://127.0.0.1:9/feed')", [feed.clone()]).await?;
+    c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_automatic_search,enable_interactive_search,minimum_seeders)VALUES(?,'torrentrss','tv',0,0,3)", [feed]).await?;
+    c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies');").await?;
+    integrity(&c).await?;
+    let tables = [
+        "sqlite_schema",
+        "schema_migrations",
+        "providers",
+        "provider_scopes",
+        "series",
+        "episodes",
+        "movie_metadata",
+        "movies",
+    ];
+    let mut before = Vec::new();
+    for table in tables {
+        before.push(rows(&c, table).await?);
+    }
+    drop(c);
+    drop(raw);
+    // This records the unresolved upgrade blocker, not successful compatibility. Replace the
+    // refusal assertion with preservation checks once a complete reconciliation is delivered.
+    for _ in 0..2 {
+        let error = match Database::open_local(&path).await {
+            Ok(_) => panic!("published history unexpectedly accepted without reconciliation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("migration history mismatch at version 50")
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        for (table, expected) in tables.iter().zip(&before) {
+            assert_eq!(&rows(&c, table).await?, expected, "changed {table}");
+        }
+        integrity(&c).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state() -> Result<(), Error>
 {
     let scratch = Scratch::new();
