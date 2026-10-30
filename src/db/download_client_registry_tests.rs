@@ -60,7 +60,7 @@ const TABLES: [&str; 8] = [
 ];
 
 #[tokio::test]
-async fn registry_upgrade62_preserves_provider_rows_rolls_back_and_enforces_protocols()
+async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_protocols()
 -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
@@ -69,7 +69,7 @@ async fn registry_upgrade62_preserves_provider_rows_rolls_back_and_enforces_prot
     // Like the runner, rebuild migrations (0052, 0059) execute with foreign keys off.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(62).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(58).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -104,7 +104,7 @@ async fn registry_upgrade62_preserves_provider_rows_rolls_back_and_enforces_prot
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[62].1).await?;
+    tx.execute_batch(MIGRATIONS[58].1).await?;
     // The registry immutability trigger exists inside the migration transaction.
     assert!(tx.execute("UPDATE provider_implementations SET protocol='usenet' WHERE implementation='qbittorrent'",()).await.is_err());
     tx.rollback().await?;
@@ -128,11 +128,16 @@ async fn registry_upgrade62_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(82)]] // Published main prefix and reconciliation add six positions; import_lists is now position 82.
+        vec![vec![libsql::Value::Integer(79)]] // Reasoning: the runner applies through latest 0078 (0077/0078 collection/provider authority, 0076 review integrity, 0075 provider scope union, 0074 downloadstation, 0073 flood, 0072 aria2, 0071 utorrent, 0070 rtorrent, 0069 deluge, 0068 torrent RSS indexer, 0064 NZBGet registry, 0063 notifications; recycle bin 0060, upgrade recycle 0061 and the 0062 transmission registry row follow the 0059 registry).
     );
-    for (sql, expected) in TABLES.iter().zip(&before) {
-        let expected = expected.clone();
-        // The published prefix already has minimum_seeders; every column stays exact.
+    for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
+        let mut expected = expected.clone();
+        if index == 1 {
+            // 0068 appends the nullable minimum_seeders column to provider_scopes.
+            for row in &mut expected {
+                row.push(libsql::Value::Null);
+            }
+        }
         assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     assert!(rows(&c, "PRAGMA foreign_key_check").await?.is_empty());

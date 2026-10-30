@@ -212,34 +212,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "indexer_client_binding",
         include_str!("../../migrations/0049_indexer_client_binding.sql"),
     ),
-    // The published origin/main prefix continues here. These four migrations are restored
-    // verbatim, so a database that already ran them keeps a valid history and upgrades instead
-    // of failing the checksum comparison; the schema work this branch adds follows them.
     (
-        "torrent_rss_indexer",
-        include_str!("../../migrations/0050_torrent_rss_indexer.sql"),
+        "indexer_backoff",
+        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_backoff",
         include_str!("../../migrations/0051_download_client_backoff.sql"),
-    ),
-    (
-        "collections",
-        include_str!("../../migrations/0052_collections.sql"),
-    ),
-    (
-        "provider_authority",
-        include_str!("../../migrations/0053_provider_authority.sql"),
-    ),
-    // The published backoff migration carries no health deadline; this branch's engine reads
-    // one, so it is added here instead of inside the published migration.
-    (
-        "download_client_health_deadline",
-        include_str!("../../migrations/reconcile_download_client_health_deadline.sql"),
-    ),
-    (
-        "indexer_backoff",
-        include_str!("../../migrations/0050_indexer_backoff.sql"),
     ),
     (
         "download_client_selection",
@@ -293,15 +272,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("nzbget", include_str!("../../migrations/0064_nzbget.sql")),
     (
         "rename_commands",
-        include_str!("../../migrations/0067_rename_commands.sql"),
+        include_str!("../../migrations/0065_rename_commands.sql"),
     ),
     (
         "autotagging_rules",
-        include_str!("../../migrations/0065_autotagging_rules.sql"),
+        include_str!("../../migrations/0066_autotagging_rules.sql"),
     ),
     (
         "collections",
-        include_str!("../../migrations/0066_collections.sql"),
+        include_str!("../../migrations/0067_collections.sql"),
     ),
     // Generic torrent RSS feed indexer: origin/main authored this as 0050 before the registry
     // migrations; it is appended here and written against the registry shape.
@@ -309,44 +288,44 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "torrent_rss_indexer",
         include_str!("../../migrations/0068_torrent_rss_indexer.sql"),
     ),
-    // The published checkpoint (its 0052/0053) stored the collection policy in its own settings
-    // table; this branch keeps it inline on movie_collections, so the checkpoint is superseded
-    // here and its policy and tags are carried across. See docs/collections.md.
-    (
-        "collections_checkpoint_supersede",
-        include_str!("../../migrations/reconcile_collections_checkpoint_supersede.sql"),
-    ),
-    // Snapshot facts and ownership markers only, reconciled onto 0066.
-    (
-        "collection_snapshot",
-        include_str!("../../migrations/0069_collection_snapshot.sql"),
-    ),
-    (
-        "collections_checkpoint_carry",
-        include_str!("../../migrations/reconcile_collections_checkpoint_carry.sql"),
-    ),
-    // Deluge registry plus label-family scope triggers, file 0070.
-    ("deluge", include_str!("../../migrations/0070_deluge.sql")),
-    // rTorrent registry, file 0071.
+    // Deluge registry plus label-family scope triggers, file 0069.
+    ("deluge", include_str!("../../migrations/0069_deluge.sql")),
+    // rTorrent registry row, file 0070.
     (
         "rtorrent",
-        include_str!("../../migrations/0071_rtorrent.sql"),
+        include_str!("../../migrations/0070_rtorrent.sql"),
     ),
-    // uTorrent registry row, file 0072.
+    // uTorrent registry row, file 0071.
     (
         "utorrent",
-        include_str!("../../migrations/0072_utorrent.sql"),
+        include_str!("../../migrations/0071_utorrent.sql"),
     ),
-    // Aria2 registry row, file 0073.
-    ("aria2", include_str!("../../migrations/0073_aria2.sql")),
-    // Flood registry, file 0074.
-    ("flood", include_str!("../../migrations/0074_flood.sql")),
-    // Download Station registry, file 0075.
+    // Aria2 registry row, file 0072.
+    ("aria2", include_str!("../../migrations/0072_aria2.sql")),
+    // Flood registry row, file 0073.
+    ("flood", include_str!("../../migrations/0073_flood.sql")),
+    // Download Station registry row, file 0074.
     (
         "downloadstation",
-        include_str!("../../migrations/0075_downloadstation.sql"),
+        include_str!("../../migrations/0074_downloadstation.sql"),
     ),
-    // Import lists follows the published-prefix reconciliation at position 82.
+    // Provider scope shapes for every registered implementation, file 0075.
+    (
+        "provider_scope_union",
+        include_str!("../../migrations/0075_provider_scope_union.sql"),
+    ),
+    (
+        "review_integrity",
+        include_str!("../../migrations/0076_review_integrity.sql"),
+    ),
+    (
+        "collection_authority",
+        include_str!("../../migrations/0077_collection_authority.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0078_provider_authority.sql"),
+    ),
     (
         "import_lists",
         include_str!("../../migrations/0080_import_lists.sql"),
@@ -591,36 +570,44 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn version(conn: &Connection) -> Result<usize, Error> {
-    let exists = scalar(
+type Migration = (&'static str, &'static str);
+
+async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migration]), Error> {
+    if scalar(
         conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
     )
-    .await?;
-    if exists == 0 {
+    .await?
+        == 0
+    {
         validate_prototype(conn).await?;
-        return Ok(0);
+        return Ok((0, MIGRATIONS));
     }
     let mut rows = conn
         .query(
-            "SELECT version, name, checksum, sql FROM schema_migrations ORDER BY version",
+            "SELECT version,name,checksum,sql FROM schema_migrations ORDER BY version",
             (),
         )
         .await?;
     let mut count = 0;
+    let mut main_matches = true;
+    let mut legacy_matches = true;
     while let Some(row) = rows.next().await? {
         let n: i64 = row.get(0)?;
-        let Some(&(name, sql)) = MIGRATIONS.get(count) else {
-            return Err(format!(
-                "unknown migration version {n}; use the matching application version"
-            )
-            .into());
+        let name: String = row.get(1)?;
+        let recorded_checksum: String = row.get(2)?;
+        let recorded_sql: String = row.get(3)?;
+        let matches = |history: &[Migration]| {
+            history.get(count).is_some_and(|&(expected_name, sql)| {
+                n == (count + 1) as i64
+                    && name == expected_name
+                    && recorded_checksum == checksum(sql)
+                    && recorded_sql == sql
+            })
         };
-        if n != (count + 1) as i64
-            || row.get::<String>(1)? != name
-            || row.get::<String>(2)? != checksum(sql)
-            || row.get::<String>(3)? != sql
-        {
+        main_matches &= matches(MIGRATIONS);
+        legacy_matches &= matches(LEGACY_MIGRATIONS);
+        if !main_matches && !legacy_matches {
             return Err(format!("migration history mismatch at version {n}; restore or reconcile the schema before startup").into());
         }
         count += 1;
@@ -628,7 +615,19 @@ async fn version(conn: &Connection) -> Result<usize, Error> {
     if count == 0 {
         return Err("empty migration history is not a recognized schema".into());
     }
-    Ok(count)
+    // An exact shared prefix through 49 can safely continue along the current main lineage.
+    Ok((
+        count,
+        if main_matches {
+            MIGRATIONS
+        } else {
+            LEGACY_MIGRATIONS
+        },
+    ))
+}
+
+async fn version(conn: &Connection) -> Result<usize, Error> {
+    Ok(migration_history(conn).await?.0)
 }
 
 async fn validate_prototype(conn: &Connection) -> Result<(), Error> {
@@ -719,8 +718,8 @@ async fn integrity(conn: &Connection) -> Result<(), Error> {
 
 async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
     integrity(&conn).await?;
-    let current = version(&conn).await?;
-    if current == MIGRATIONS.len() {
+    let (current, migrations) = migration_history(&conn).await?;
+    if current == migrations.len() {
         return Ok(None);
     }
     let path = local_path.ok_or("pending remote schema migrations require a verified remote backup/recovery strategy; database unchanged")?;
@@ -745,10 +744,15 @@ async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<P
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let result: Result<(), Error> = async {
-        if version(&tx).await? != current { return Err("schema changed during migration preflight".into()); }
+        let (checked_version, checked_migrations)=migration_history(&tx).await?;
+        if checked_version != current || migrations != checked_migrations { return Err("schema changed during migration preflight".into()); }
         if current == 0 { tx.execute(HISTORY_SQL, ()).await?; }
-        for (index, &(name, sql)) in MIGRATIONS.iter().enumerate().skip(current) {
+        for (index, &(name, sql)) in migrations.iter().enumerate().skip(current) {
             if index == 1 { validate_legacy_paths(&tx).await?; }
+            // Keep nullable source authority before the immutable PR31 migration normalizes it.
+            if name == "collections_checkpoint_supersede" {
+                tx.execute_batch("CREATE TEMP TABLE pr31_absent_search_on_add AS SELECT collection_id FROM movie_collection_settings WHERE search_on_add IS NULL").await?;
+            }
             tx.execute_batch(sql).await.map_err(|e| format!("migration {} ({name}) failed; reconcile legacy relationships before retrying: {e}", index + 1))?;
             integrity(&tx).await?;
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
@@ -1013,9 +1017,10 @@ mod downloadstation_registry_tests;
 #[cfg(test)]
 mod flood_registry_tests;
 #[cfg(test)]
-mod import_list_tests;
-#[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
+mod review_integrity_tests;
+#[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]
 mod torrent_rss_tests;
@@ -1024,5 +1029,8 @@ mod transmission_registry_tests;
 #[cfg(test)]
 mod utorrent_registry_tests;
 
+include!("legacy_migrations.rs");
+#[cfg(test)]
+mod import_list_tests;
 #[cfg(test)]
 mod published_prefix_tests;

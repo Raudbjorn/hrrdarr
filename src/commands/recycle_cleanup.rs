@@ -8,10 +8,23 @@ use crate::recycle_bin::fsops;
 const MAX_DEPTH: usize = 32;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_REMOVALS: u64 = 10_000;
-const RUN_SECONDS: u64 = 60;
-// The global effect permit is held only for the duration of one file operation; poll again soon
-// (matches the downloaded-scan cleanup), so one overlapping operation cannot stall cleanup for 30 s.
-const BUSY_RETRY_SECONDS: i64 = 5;
+// Keep the walk below the worker's 45 s step timeout.
+const RUN_SECONDS: u64 = 30;
+const BUSY_RETRY_SECONDS: i64 = 30;
+/// Returns the retention applied to one bin. A shared bin has no per-entry domain marker, so the
+/// longest retention wins; zero disables cleanup for the shared path.
+fn effective_cleanup_days(own: i64, other: Option<i64>, shared: bool) -> Option<i64> {
+    if !shared {
+        return (own > 0).then_some(own);
+    }
+    let Some(other) = other else {
+        return (own > 0).then_some(own);
+    };
+    if own == 0 || other == 0 {
+        return None;
+    }
+    Some(own.max(other))
+}
 
 #[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
@@ -376,15 +389,27 @@ pub(super) async fn run(db: &Arc<Database>, command: RecycleBinCleanupCommand) -
     let settings = crate::recycle_bin::read(&c, media)
         .await
         .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code()))?;
-    drop(c);
     let running = "WHERE id=? AND status='running'";
     let Some(bin) = settings.path.clone() else {
         // Upstream logs and returns when no bin is configured.
         return settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status='succeeded',completed_at=?,outcome='not_configured' {running}"), params![now()?, id.to_string()]).await;
     };
-    if settings.cleanup_days == 0 {
+    let other_media = match media {
+        MediaDomain::Tv => MediaDomain::Movies,
+        MediaDomain::Movies => MediaDomain::Tv,
+    };
+    let other_settings = crate::recycle_bin::read(&c, other_media)
+        .await
+        .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.code()))?;
+    drop(c);
+    let shared = other_settings.path.as_deref() == Some(bin.as_str());
+    let Some(days) = effective_cleanup_days(
+        settings.cleanup_days,
+        Some(other_settings.cleanup_days),
+        shared,
+    ) else {
         return settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status='succeeded',completed_at=?,outcome='disabled',bin_path=?,cleanup_days=0 {running}"), params![now()?, bin, id.to_string()]).await;
-    }
+    };
     // Serialize with imports and explicit deletions; never walk a bin a transfer is writing.
     let guard = match crate::import::acquire_deletion_guard(db, &id.to_string()) {
         Ok(guard) => guard,
@@ -392,7 +417,6 @@ pub(super) async fn run(db: &Arc<Database>, command: RecycleBinCleanupCommand) -
             return settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status=CASE WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?,completed_at=CASE WHEN attempts<3 THEN NULL ELSE ? END,error_code='import_busy' {running}"), params![now()? + BUSY_RETRY_SECONDS, now()?, id.to_string()]).await;
         }
     };
-    let days = settings.cleanup_days;
     let walk_bin = bin.clone();
     let report = tokio::task::spawn_blocking(move || {
         let _guard = guard;

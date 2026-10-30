@@ -60,6 +60,10 @@ struct Task {
     done: u64,
     /// (filename, size, size_downloaded, priority)
     files: Vec<(String, u64, u64, &'static str)>,
+    /// Emit byte counts as decimal strings, as Synology's API guide documents them.
+    strings: bool,
+    /// Emit an unparseable `size`.
+    bad_size: bool,
 }
 fn mk_task(id: &str, title: &str, destination: &str, uri: &str, status: &'static str) -> Task {
     Task {
@@ -71,6 +75,8 @@ fn mk_task(id: &str, title: &str, destination: &str, uri: &str, status: &'static
         size: 1048576,
         done: 524288,
         files: vec![(title.into(), 1048576, 524288, "normal")],
+        strings: false,
+        bad_size: false,
     }
 }
 struct Mock {
@@ -122,6 +128,14 @@ fn param<'a>(p: &'a [(String, String)], key: &str) -> &'a str {
         .unwrap_or("")
 }
 fn view(t: &Task, additional: &str) -> Value {
+    // Numbers or decimal strings, per the task.
+    let n = |v: u64| {
+        if t.strings {
+            json!(v.to_string())
+        } else {
+            json!(v)
+        }
+    };
     let mut add = serde_json::Map::new();
     if additional.contains("detail") {
         add.insert(
@@ -130,12 +144,13 @@ fn view(t: &Task, additional: &str) -> Value {
         );
     }
     if additional.contains("transfer") {
-        add.insert("transfer".into(), json!({"size_downloaded":t.done,"size_uploaded":524288,"speed_download":2048,"speed_upload":64}));
+        add.insert("transfer".into(), json!({"size_downloaded":n(t.done),"size_uploaded":n(524288),"speed_download":n(2048),"speed_upload":n(64)}));
     }
     if additional.contains("file") {
-        add.insert("file".into(), json!(t.files.iter().map(|(n, s, d, p)| json!({"filename":n,"size":s,"size_downloaded":d,"priority":p})).collect::<Vec<_>>()));
+        add.insert("file".into(), json!(t.files.iter().map(|(name, s, d, p)| json!({"filename":name,"size":n(*s),"size_downloaded":n(*d),"priority":p})).collect::<Vec<_>>()));
     }
-    json!({"id":t.id,"title":t.title,"size":t.size,"status":t.status,"type":"bt","username":USER,"additional":add})
+    let size = if t.bad_size { json!("12x") } else { n(t.size) };
+    json!({"id":t.id,"title":t.title,"size":size,"status":t.status,"type":"bt","username":USER,"additional":add})
 }
 fn fail(code: i64) -> Response {
     axum::Json(json!({"success":false,"error":{"code":code}})).into_response()
@@ -846,5 +861,68 @@ async fn status_mapping_isolation_details_and_controls() {
         Ok(())
     );
     assert!(f.by_hash(&h(1)).is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn byte_counts_are_read_as_documented_strings_and_malformed_values_fail_closed() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let h = |n: u8| format!("{:040}", n);
+    // Reasoning: Synology's API guide types sizes and transfer counters as strings; a finished
+    // task whose size parsed as zero could never satisfy the engine's completion predicate.
+    let mut done = mk_task(
+        "dbid_1",
+        "StringsDone",
+        &dest("tv-hrr", &h(1)),
+        "",
+        "finished",
+    );
+    done.strings = true;
+    done.done = done.size;
+    done.files = vec![("StringsDone/ep.mkv".into(), 1048576, 1048576, "normal")];
+    f.put(done);
+    let page = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await
+    .unwrap();
+    let item = page.items.iter().find(|i| i.name == "StringsDone").unwrap();
+    assert_eq!(item.size_bytes, 1048576);
+    assert!(
+        item.completed,
+        "a finished task with string counts is complete"
+    );
+    let details = label_client::details(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &MediaTarget::Episode(1),
+        &h(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(details.files.len(), 1);
+    assert_eq!(details.files[0].size_bytes, 1048576);
+    // A present but unparseable size is a malformed response, not a silent zero.
+    let mut bad = mk_task("dbid_2", "BadSize", &dest("tv-hrr", &h(2)), "", "finished");
+    bad.bad_size = true;
+    f.put(bad);
+    let result = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(QbitError::InvalidResponse)),
+        "got {:?}",
+        result.map(|p| p.items.len())
+    );
     task.abort();
 }

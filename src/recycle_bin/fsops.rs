@@ -83,8 +83,8 @@ pub(crate) struct Identity {
 impl Identity {
     fn of(stat: &fs::Stat) -> Self {
         Self {
-            dev: stat.st_dev as u64,
-            ino: stat.st_ino as u64,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
             size: stat.st_size as u64,
             mtime: stat.st_mtime as i64,
             mtime_ns: stat.st_mtime_nsec as i64,
@@ -169,10 +169,10 @@ pub(crate) fn root_available(root: &str) -> Result<bool> {
         if matches!(name, "." | "..") {
             continue;
         }
-        if let Ok(stat) = stat_child(&dir, name) {
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-                return Ok(true);
-            }
+        if let Ok(stat) = stat_child(&dir, name)
+            && FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -296,25 +296,40 @@ fn verify_source(source: &Present) -> Result<File> {
     }
     Ok(file)
 }
-fn touch(file: &File) {
-    // Retention ages from deletion time, as upstream does; failures are tolerated there too.
-    if let Err(error) = file.set_modified(SystemTime::now()) {
-        eprintln!(
-            "event=recycle_mtime_failed kind={:?} os_code={:?}",
-            error.kind(),
-            error.raw_os_error()
-        );
-    }
+#[cfg(test)]
+thread_local! {
+    static DENY_RETENTION_TIMESTAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RETENTION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-fn touch_child(dir: &File, name: &str) {
-    if let Ok(fd) = fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    ) {
-        touch(&File::from(fd));
+fn restore_modified(file: &File, touched: &Identity, original: SystemTime) -> Result<()> {
+    // Do not hide another writer's change while undoing our unpublished timestamp.
+    if !Identity::file(file)?.same_content(touched) {
+        return Err(FsError::Changed);
     }
+    file.set_modified(original).map_err(ioerr)?;
+    file.sync_all().map_err(ioerr)
+}
+fn touch(file: &File) -> Result<Identity> {
+    #[cfg(test)]
+    if DENY_RETENTION_TIMESTAMP.with(|deny| deny.replace(false)) {
+        return Err(FsError::Denied);
+    }
+    // Cleanup trusts mtime, so establish and persist retention before publishing the file.
+    let original = file.metadata().map_err(ioerr)?.modified().map_err(ioerr)?;
+    file.set_modified(SystemTime::now()).map_err(ioerr)?;
+    let touched = Identity::file(file)?;
+    let synced = file.sync_all().map_err(ioerr);
+    #[cfg(test)]
+    let synced = if FAIL_RETENTION_SYNC.with(|fail| fail.replace(false)) {
+        Err(FsError::Io)
+    } else {
+        synced
+    };
+    if let Err(error) = synced {
+        restore_modified(file, &touched, original)?;
+        return Err(error);
+    }
+    Ok(touched)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +353,11 @@ pub(crate) fn move_into_bin(
     deletion_id: &str,
 ) -> Result<Moved> {
     let file = verify_source(source)?;
-    drop(file);
+    if destination.dir.metadata().map_err(ioerr)?.dev() != source.identity.dev {
+        return copy_into_bin(source, destination, deletion_id);
+    }
+    let original_modified = file.metadata().map_err(ioerr)?.modified().map_err(ioerr)?;
+    let identity = touch(&file)?;
     match fs::renameat_with(
         &source.dir,
         source.name.as_str(),
@@ -351,34 +370,37 @@ pub(crate) fn move_into_bin(
             if let Err(error) = sync_pair(&source.dir, &destination.dir) {
                 eprintln!("event=recycle_sync_failed code={}", error.code());
             }
-            touch_child(&destination.dir, &destination.name);
-            return Ok(Moved::Rename);
+            Ok(Moved::Rename)
         }
-        Err(rustix::io::Errno::XDEV) => {}
+        Err(rustix::io::Errno::XDEV) => {
+            // Bind mounts can share a device; copy cleanup must still match the journal's mtime.
+            restore_modified(&file, &identity, original_modified)?;
+            copy_into_bin(source, destination, deletion_id)
+        }
         Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
-            fs::linkat(
+            if let Err(error) = fs::linkat(
                 &source.dir,
                 source.name.as_str(),
                 &destination.dir,
                 destination.name.as_str(),
                 AtFlags::empty(),
-            )
-            .map_err(|e| match e {
-                rustix::io::Errno::XDEV => FsError::Io,
-                other => errno(other),
-            })?;
+            ) {
+                restore_modified(&file, &identity, original_modified)?;
+                return Err(errno(error));
+            }
             // Both names now refer to one inode; recovery recognises this state by inode.
             destination.dir.sync_all().map_err(ioerr)?;
-            remove_verified(&source.dir, &source.name, &source.identity)?;
+            remove_verified(&source.dir, &source.name, &identity)?;
             if let Err(error) = source.dir.sync_all() {
                 eprintln!("event=recycle_sync_failed code={}", ioerr(error).code());
             }
-            touch_child(&destination.dir, &destination.name);
-            return Ok(Moved::Link);
+            Ok(Moved::Link)
         }
-        Err(e) => return Err(errno(e)),
+        Err(error) => {
+            restore_modified(&file, &identity, original_modified)?;
+            Err(errno(error))
+        }
     }
-    copy_into_bin(source, destination, deletion_id)
 }
 fn sync_pair(a: &File, b: &File) -> Result<()> {
     a.sync_all().map_err(ioerr)?;
@@ -456,8 +478,7 @@ fn copy_into_bin(source: &Present, destination: &Destination, deletion_id: &str)
         if seen != copied || verify.finish().as_ref() != hash.finish().as_ref() {
             return Err(FsError::Changed);
         }
-        touch(&output);
-        let published = Identity::file(&output)?;
+        let published = touch(&output)?;
         match fs::renameat_with(
             &destination.dir,
             partial.as_str(),
@@ -622,9 +643,11 @@ struct Cleanup<'a> {
     report: CleanupReport,
 }
 impl Cleanup<'_> {
+    /// Removal and time bounds end the run. The entry bound only limits how many names are read;
+    /// names already read are still processed, so a directory larger than the bound makes progress
+    /// instead of being enumerated and abandoned on every run.
     fn stop(&mut self) -> bool {
-        if self.visited >= self.limits.max_entries
-            || self.report.files_removed + self.report.folders_removed >= self.limits.max_removals
+        if self.report.files_removed + self.report.folders_removed >= self.limits.max_removals
             || Instant::now() >= self.limits.deadline
         {
             self.report.bounded = true;
@@ -648,10 +671,16 @@ impl Cleanup<'_> {
             if matches!(name, "." | "..") {
                 continue;
             }
-            self.visited += 1;
+            if self.visited >= self.limits.max_entries {
+                // Unread names are kept for a later run; this directory is not known to be empty.
+                self.report.bounded = true;
+                empty = false;
+                break;
+            }
             if self.stop() {
                 return Ok(false);
             }
+            self.visited += 1;
             names.push(name.to_owned());
         }
         for name in names {
@@ -667,7 +696,7 @@ impl Cleanup<'_> {
                     continue;
                 }
             };
-            if stat.st_dev as u64 != self.root_dev {
+            if stat.st_dev != self.root_dev {
                 // A different mount inside the bin is never entered or removed.
                 self.report.skipped += 1;
                 empty = false;
@@ -707,7 +736,7 @@ impl Cleanup<'_> {
                         }
                     };
                     let opened = Identity::file(&nested)?;
-                    if !opened.same_inode(stat.st_dev as u64, stat.st_ino as u64) {
+                    if !opened.same_inode(stat.st_dev, stat.st_ino) {
                         self.report.skipped += 1;
                         empty = false;
                         continue;
@@ -835,6 +864,7 @@ mod tests {
             prepare_destination(bin.to_str().unwrap(), &["library".to_owned()], "movie.mkv")
                 .unwrap();
         std::fs::write(&file, b"rewritten bytes").unwrap();
+        age(&file, 30);
         assert_eq!(
             move_into_bin(&source, &destination, &uuid::Uuid::new_v4().to_string()).err(),
             Some(FsError::Changed)
@@ -851,6 +881,65 @@ mod tests {
             std::fs::read(&destination.path).unwrap(),
             b"rewritten bytes"
         );
+        let report = cleanup(bin.to_str().unwrap(), 7, SystemTime::now(), &limits()).unwrap();
+        assert_eq!(
+            report.files_removed, 0,
+            "retention starts at recycling, not the old mtime"
+        );
+        assert!(Path::new(&destination.path).exists());
+    }
+    #[test]
+    fn failed_retention_timestamp_keeps_source_and_never_publishes() {
+        let s = scratch();
+        let file = s.0.join("movie.mkv");
+        let bin = s.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(&file, b"old movie bytes").unwrap();
+        age(&file, 30);
+        let Source::Present(source) = inspect(file.to_str().unwrap()).unwrap() else {
+            panic!("present")
+        };
+        let destination = prepare_destination(bin.to_str().unwrap(), &[], "movie.mkv").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        for (copy, sync_failure) in [(false, false), (true, false), (false, true), (true, true)] {
+            if sync_failure {
+                FAIL_RETENTION_SYNC.with(|fail| fail.set(true));
+            } else {
+                DENY_RETENTION_TIMESTAMP.with(|deny| deny.set(true));
+            }
+            let result = if copy {
+                copy_into_bin(&source, &destination, &id)
+            } else {
+                move_into_bin(&source, &destination, &id)
+            };
+            assert_eq!(
+                result,
+                Err(if sync_failure {
+                    FsError::Io
+                } else {
+                    FsError::Denied
+                })
+            );
+            assert_eq!(
+                observe(file.to_str().unwrap()).unwrap(),
+                Some(source.identity)
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"old movie bytes");
+            assert!(!Path::new(&destination.path).exists());
+            assert!(!bin.join(partial_name(&id)).exists());
+        }
+        // A competing file can appear after destination planning; failure must preserve the journal identity.
+        std::fs::write(&destination.path, b"occupied").unwrap();
+        assert_eq!(
+            move_into_bin(&source, &destination, &id),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            observe(file.to_str().unwrap()).unwrap(),
+            Some(source.identity)
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"old movie bytes");
+        assert_eq!(std::fs::read(&destination.path).unwrap(), b"occupied");
     }
     #[test]
     fn cleanup_removes_only_expired_regular_files_inside_the_bin() {
@@ -913,6 +1002,32 @@ mod tests {
         assert!(report.bounded);
         assert_eq!(report.files_removed, 2);
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 3);
+    }
+    #[test]
+    fn cleanup_processes_names_read_before_the_entry_bound() {
+        let s = scratch();
+        let nested = s.0.join("season");
+        std::fs::create_dir(&nested).unwrap();
+        for i in 0..5 {
+            let path = nested.join(format!("{i}.mkv"));
+            std::fs::write(&path, b"x").unwrap();
+            age(&path, 30);
+        }
+        let mut bounded = limits();
+        // Reasoning: the bin root and three of the five files fit in the entry bound. Before the
+        // fix, reaching the bound while reading `season` abandoned it with nothing removed, on
+        // every run; now the names already read are removed and the rest wait for the next run.
+        bounded.max_entries = 4;
+        let report = cleanup(s.0.to_str().unwrap(), 1, SystemTime::now(), &bounded).unwrap();
+        assert!(report.bounded);
+        assert_eq!(report.files_removed, 3);
+        assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 2);
+        let report = cleanup(s.0.to_str().unwrap(), 1, SystemTime::now(), &bounded).unwrap();
+        assert_eq!(
+            report.files_removed, 2,
+            "the next run finishes the directory"
+        );
+        assert!(!nested.exists(), "then removes it once empty");
     }
     #[test]
     fn writability_probe_leaves_no_artifact() {

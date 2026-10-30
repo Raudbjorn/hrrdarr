@@ -70,7 +70,7 @@ A claimed run does this, with no database transaction held across any network ca
 2. **Record the snapshot** (`import_list_items`, at most 5000 rows per list) atomically: duplicates
    (by the list's canonical identity) collapse, items that left the list are dropped, finished
    items keep their state, failed items are retried after one hour and unresolved after one day.
-3. **Process pending items**, at most 25 per claim, then re-queue the run if more remain. Per item:
+3. **Process pending items**, at most 25 per claim, then re-queue the run if more remain. Continuations advance their persisted ready time so other queued lists receive a pass. Per item:
    resolve the library identity (the list's own TVDB/TMDb id, else for movies the IMDb id through
    the metadata catalog, else an *exact* normalised-title match, with the year when both sides
    know it; an ambiguous or missing match is left `unresolved`, never guessed), skip it when it is
@@ -132,13 +132,21 @@ fetch. Failure classes: `invalid_settings`, `authentication`, `rate_limited`, `t
 
 ## Migration numbering
 
-The registry is migration **file** `0080_import_lists.sql`. The migration runner requires
-`schema_migrations.version == MIGRATIONS array position + 1` with no gaps. File prefixes are
-historical names, not schema versions; `src/db/mod.rs` defines the execution order. The published
-main prefix is preserved byte-for-byte and new schema adaptations follow it. Contents: `import_lists`,
-`import_list_tags`, `import_list_exclusions`, `import_list_runs`, `import_list_items`,
-`import_list_additions`, and triggers for capacity, identity, revision, run retention and
-profile/root deletion.
+The registry is migration **file** `0080_import_lists.sql`. Filename prefixes are historical
+names, not execution ordinals. Fresh databases and the current main history through version 78
+finish at version **79**, which adds import lists. The earlier published main checkpoint through
+versions 50–53 follows the preserved PR #31 history through version 82, then the compatibility
+bridge at **83**. Existing PR #31 version-82 databases take that same bridge to the current
+separate collection settings and shared provider authority model. Common prefixes through 49
+can follow the current main path.
+
+`src/db/mod.rs` and `src/db/legacy_migrations.rs` define the two accepted execution histories.
+Every recorded name, SQL body and checksum must match one complete prefix; mixed or tampered
+histories are rejected. Historical SQL variants remain under `migrations/pr31/`.
+
+The registry creates `import_lists`, `import_list_tags`, `import_list_exclusions`,
+`import_list_runs`, `import_list_items`, `import_list_additions`, and triggers for capacity,
+identity, revision, run retention and profile/root deletion.
 
 ## UI
 

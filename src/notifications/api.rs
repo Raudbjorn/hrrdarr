@@ -1,6 +1,6 @@
 //! HTTP surface: `/api/v1/notifications` (the Sonarr "Connections" resource, domain-qualified).
 use super::{
-    dispatcher::Dispatcher,
+    dispatcher::{self, Dispatcher},
     error::{ApiError, Result},
     model::*,
     store::{self, Runtime},
@@ -149,28 +149,44 @@ async fn test_draft(
     Ok(Json(run_test(&d, &rt).await))
 }
 
+/// Tests every enabled notification concurrently (bounded by the dispatcher's test slots) within
+/// one overall deadline, so the request ends before the client gives up. A notification that has
+/// not finished by then reports `timeout`; its send may still have been delivered.
 async fn test_all(State(d): State_) -> Result<Json<TestAllResult>> {
+    let deadline = tokio::time::Instant::now() + dispatcher::TEST_ALL_DEADLINE;
     let c = d.store.db.connect().await?;
-    let mut items = Vec::new();
-    for n in d.store.list().await? {
-        if !n.enabled {
-            continue;
-        }
+    let enabled: Vec<Notification> = d
+        .store
+        .list()
+        .await?
+        .into_iter()
+        .filter(|n| n.enabled)
+        .collect();
+    let mut items: Vec<TestResult> = enabled
+        .iter()
+        .map(|n| TestResult {
+            id: Some(n.id),
+            name: n.name.clone(),
+            results: dispatcher::failed_notification_tests(n, "timeout"),
+        })
+        .collect();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, n) in enabled.iter().enumerate() {
         match d.store.runtime(&c, &n.id.to_string()).await {
-            Ok(Some(rt)) => items.push(run_test(&d, &rt).await),
-            _ => items.push(TestResult {
-                id: Some(n.id),
-                name: n.name,
-                results: vec![DomainTestResult {
-                    media_type: if n.tv.is_some() {
-                        MediaDomain::Tv
-                    } else {
-                        MediaDomain::Movies
-                    },
-                    status: TestStatus::Failed,
-                    error: Some("credentials_unavailable".into()),
-                }],
-            }),
+            Ok(Some(rt)) => {
+                let d = d.clone();
+                tasks.spawn(async move { (index, d.test_until(&rt, deadline).await) });
+            }
+            _ => {
+                items[index].results =
+                    dispatcher::failed_notification_tests(n, "credentials_unavailable")
+            }
+        }
+    }
+    // Each task stops itself at the deadline; a task that panicked keeps its timeout entry.
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((index, results)) = joined {
+            items[index].results = results;
         }
     }
     Ok(Json(TestAllResult { items }))
@@ -192,7 +208,7 @@ async fn deliveries(
     let c = d.store.db.connect().await?;
     let mut rows = c
         .query(
-            "SELECT d.id,d.event_sequence,d.notification_id,e.kind,e.scope,d.state,d.attempts,d.next_attempt_at,d.last_error,d.created_at,d.completed_at FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence ORDER BY d.id DESC LIMIT ?",
+            "SELECT d.id,d.event_sequence,d.notification_id,e.kind,d.media_type,d.state,d.attempts,d.next_attempt_at,d.last_error,d.created_at,d.completed_at FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence ORDER BY d.id DESC LIMIT ?",
             [limit],
         )
         .await?;

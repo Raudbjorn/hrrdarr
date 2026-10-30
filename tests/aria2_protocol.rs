@@ -213,6 +213,7 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
                 .map(|d| status(d, params[0].as_array().unwrap()))
                 .collect::<Vec<_>>()
         )),
+        // Like aria2, honour the `[offset, offset + num)` window of these two listings.
         "aria2.tellWaiting" => ok(json!(
             m.downloads
                 .iter()
@@ -955,87 +956,105 @@ async fn status_mapping_isolation_details_and_controls() {
     task.abort();
 }
 
-#[tokio::test]
-async fn full_inventory_windows_fail_instead_of_hiding_tracked_torrents() {
-    for status in ["waiting", "complete"] {
-        let (f, endpoint, task) = fixture().await;
-        let settings = settings(&endpoint);
-        let client = HttpClient::new().unwrap();
-        let hash = "a".repeat(40);
-        // Unrelated HTTP downloads consume the window before filtering by hash or domain.
-        for n in 0..1000 {
-            f.put(dl(
-                &format!("{n:016x}"),
-                "",
-                "plain.bin",
-                "/downloads/other",
-                status,
-            ));
-        }
+/// Unrelated HTTP and torrent downloads still consume inventory windows.
+fn fill(f: &Fixture, count: u32, status: &str) {
+    for n in 0..count {
         f.put(dl(
-            "000000000000ffff",
-            &hash,
-            "Tracked",
-            "/downloads/tv-hrr",
+            &format!("{:016x}", 0x1000 + n),
+            &if n % 2 == 0 {
+                String::new()
+            } else {
+                format!("{:040x}", 0x1000 + n)
+            },
+            "Filler",
+            "/downloads/other",
             status,
         ));
-        let operation = client.operation(Uuid::new_v4()).unwrap();
-        assert_eq!(
-            label_client::query(
-                &operation,
-                &settings,
-                Some(&login()),
-                &query(MediaDomain::Tv)
-            )
-            .await
-            .err()
-            .unwrap(),
-            QbitError::Http(HttpError::ResponseTooLarge)
-        );
-        // The per-hash lookup must fail too, rather than reporting the torrent absent.
-        let operation = client.operation(Uuid::new_v4()).unwrap();
-        assert_eq!(
-            label_client::details(
-                &operation,
-                &settings,
-                Some(&login()),
-                &MediaTarget::Episode(1),
-                &hash
-            )
-            .await
-            .err()
-            .unwrap(),
-            QbitError::Http(HttpError::ResponseTooLarge)
-        );
-        // Exactly a full window is ambiguous; below it a complete inventory is safe.
-        f.0.lock().unwrap().downloads.truncate(1000);
-        let operation = client.operation(Uuid::new_v4()).unwrap();
-        assert_eq!(
-            label_client::query(
-                &operation,
-                &settings,
-                Some(&login()),
-                &query(MediaDomain::Tv)
-            )
-            .await
-            .err()
-            .unwrap(),
-            QbitError::Http(HttpError::ResponseTooLarge)
-        );
-        f.0.lock().unwrap().downloads.pop();
-        let operation = client.operation(Uuid::new_v4()).unwrap();
-        assert!(
-            label_client::query(
-                &operation,
-                &settings,
-                Some(&login()),
-                &query(MediaDomain::Tv)
-            )
-            .await
-            .unwrap()
-            .items
-            .is_empty()
-        );
-        task.abort();
     }
+}
+#[tokio::test]
+async fn listings_page_through_every_window_and_fail_beyond_the_resource_bound() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let tv = "/downloads/tv-hrr";
+    // Reasoning: aria2 answers tellWaiting/tellStopped with at most `num` entries from `offset`;
+    // a download that sits past the first 1000 must still be listed, not silently dropped.
+    fill(&f, 1500, "waiting");
+    f.put(dl(
+        "00000000000000a1",
+        &format!("{:040}", 1),
+        "LateQueued",
+        tv,
+        "waiting",
+    ));
+    fill(&f, 1100, "complete");
+    let mut late = dl(
+        "00000000000000a2",
+        &format!("{:040}", 2),
+        "LateDone",
+        tv,
+        "complete",
+    );
+    late.completed = late.total;
+    f.put(late);
+    let page = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await
+    .unwrap();
+    let names: Vec<_> = page.items.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"LateQueued"), "{names:?}");
+    assert!(names.contains(&"LateDone"), "{names:?}");
+    assert!(
+        f.calls("aria2.tellWaiting")
+            .iter()
+            .any(|p| p[0].as_u64() == Some(1000)),
+        "the second waiting window is requested"
+    );
+    assert!(
+        f.calls("aria2.tellStopped")
+            .iter()
+            .any(|p| p[0].as_u64() == Some(1000)),
+        "the second stopped window is requested"
+    );
+    // The per-hash path must find the completed torrent past the first window too.
+    let late_details = label_client::details(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &MediaTarget::Episode(1),
+        &format!("{:040}", 2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(late_details.item.name, "LateDone");
+    // Past the resource bound the inventory is refused instead of returned partially.
+    fill(&f, 7000, "waiting");
+    let result = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(QbitError::Http(HttpError::ResponseTooLarge))),
+        "an oversized listing must fail closed"
+    );
+    assert!(matches!(
+        label_client::details(
+            &client.operation(Uuid::new_v4()).unwrap(),
+            &settings,
+            Some(&login()),
+            &MediaTarget::Episode(1),
+            &format!("{:040}", 2),
+        )
+        .await,
+        Err(QbitError::Http(HttpError::ResponseTooLarge))
+    ));
+    task.abort();
 }

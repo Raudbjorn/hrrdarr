@@ -56,10 +56,10 @@ async fn enqueue(
         return Ok(None);
     }
     let old = active(c).await?;
-    if let Some(cmd) = &old {
-        if !matches!(cmd.status, CommandStatus::Queued) {
-            return Ok(Some((cmd.id, false)));
-        }
+    if let Some(cmd) = &old
+        && !matches!(cmd.status, CommandStatus::Queued)
+    {
+        return Ok(Some((cmd.id, false)));
     }
     let id = if let Some(cmd) = &old {
         if priority.number() > cmd.priority.number() {
@@ -313,10 +313,10 @@ pub(crate) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Resul
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let result = async {
-        if let Some(cmd) = active(&tx).await? {
-            if matches!(cmd.status, CommandStatus::Running) {
-                fail(&tx, &cmd, timestamp, code).await?;
-            }
+        if let Some(cmd) = active(&tx).await?
+            && matches!(cmd.status, CommandStatus::Running)
+        {
+            fail(&tx, &cmd, timestamp, code).await?;
         }
         Ok(())
     }

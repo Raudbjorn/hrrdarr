@@ -29,10 +29,26 @@ async fn movie(State(p): State<Peer>, Path(id): Path<i64>) -> (StatusCode, Json<
         v => (StatusCode::OK, Json(v)),
     }
 }
-async fn collection(State(p): State<Peer>, Path(id): Path<i64>) -> (StatusCode, Json<Value>) {
-    match p.lock().unwrap()["collection"][id.to_string()].clone() {
-        Value::Null => (StatusCode::NOT_FOUND, Json(Value::Null)),
-        v => (StatusCode::OK, Json(v)),
+async fn collection(State(p): State<Peer>, Path(id): Path<i64>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (limited, body) = {
+        let p = p.lock().unwrap();
+        (
+            p["rate_limit"].clone(),
+            p["collection"][id.to_string()].clone(),
+        )
+    };
+    // `rate_limit` is the Retry-After seconds the peer answers 429 with while it is set.
+    if let Some(seconds) = limited.as_i64() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", seconds.to_string())],
+        )
+            .into_response();
+    }
+    match body {
+        Value::Null => (StatusCode::NOT_FOUND, Json(Value::Null)).into_response(),
+        v => (StatusCode::OK, Json(v)).into_response(),
     }
 }
 async fn server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -464,7 +480,7 @@ async fn clear_removes_membership_and_unavailable_peer_fails_the_command() -> Re
         ),
         (Some(0), Some(1))
     );
-    // Explicit null on a refresh clears membership but keeps the collection and the movie.
+    // Explicit null clears membership and retires a collection with no library members; the movie remains.
     h.peer.lock().unwrap()["movie"]["101"] = film(101, "Saga One", 2001, Value::Null);
     let c = h.db.connect().await?;
     let detail = h.client.movie(101).await.unwrap();
@@ -481,8 +497,141 @@ async fn clear_removes_membership_and_unavailable_peer_fails_the_command() -> Re
             .await,
         0
     );
-    assert_eq!(h.scalar("SELECT count(*) FROM movie_collections").await, 1);
+    // Reasoning: main's lifecycle retirement retains removal intent instead of an empty live collection.
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collections").await, 0);
+    assert_eq!(
+        h.scalar("SELECT count(*) FROM movie_collection_settings")
+            .await,
+        0
+    );
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=900 AND removed=1 AND removal_reason='metadata_missing'").await,1);
     assert_eq!(h.scalar("SELECT count(*) FROM movies").await, 1);
+    h.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rate_limited_refresh_is_requeued_and_completes_once_the_peer_recovers()
+-> Result<(), Error> {
+    let h = harness().await?;
+    {
+        let mut p = h.peer.lock().unwrap();
+        let saga = json!({"tmdbId":900,"name":"Saga"});
+        p["movie"]["101"] = film(101, "Saga One", 2001, saga);
+        p["collection"]["900"] = json!({"tmdbId":900,"name":"Saga","overview":"One film","parts":[
+            {"tmdbId":101,"title":"Saga One","year":2001}]});
+    }
+    let (s, _) = h
+        .call(
+            "POST",
+            "/api/v1/movies/lookup",
+            Some(json!({"tmdb_id":101,"path":"/m/Saga One"})),
+        )
+        .await;
+    assert_eq!(s, 201);
+    h.peer.lock().unwrap()["rate_limit"] = json!(1);
+    let (s, cmd) = h
+        .call(
+            "POST",
+            "/api/v1/movies/collections/refresh-commands",
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s, 202, "{cmd}");
+    let command_id = cmd["id"].as_str().unwrap().to_owned();
+    // The throttled collection is not counted as failed: the run goes back to the queue.
+    let mut requeued = false;
+    for _ in 0..200 {
+        if h.scalar("SELECT count(*) FROM collection_refresh_commands WHERE status='queued' AND attempts>=1")
+            .await
+            == 1
+        {
+            requeued = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(requeued, "a 429 must requeue the command");
+    assert_eq!(
+        h.scalar(
+            "SELECT collections_failed+collections_checked+cursor FROM collection_refresh_commands"
+        )
+        .await,
+        0
+    );
+    h.peer.lock().unwrap()["rate_limit"] = Value::Null;
+    let mut settled = Value::Null;
+    for _ in 0..200 {
+        let (_, v) = h
+            .call(
+                "GET",
+                &format!("/api/v1/movies/collections/refresh-commands/{command_id}"),
+                None,
+            )
+            .await;
+        if v["status"] == "succeeded" || v["status"] == "failed" {
+            settled = v;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(settled["status"], "succeeded", "{settled}");
+    assert_eq!(
+        (
+            settled["collections_checked"].as_i64(),
+            settled["collections_failed"].as_i64()
+        ),
+        (Some(1), Some(0))
+    );
+    h.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn collection_tag_readback_matches_the_accepted_capacity_and_exposes_revision()
+-> Result<(), Error> {
+    let h = harness().await?;
+    let c = h.db.connect().await?;
+    let tx = c.transaction().await?;
+    tx.execute(
+        "INSERT INTO movie_collections(id,title) VALUES(1,'Tags')",
+        (),
+    )
+    .await?;
+    for id in 1..=201 {
+        tx.execute(
+            "INSERT INTO tags(id,media_type,label) VALUES(?,'movies',?)",
+            libsql::params![id, format!("tag-{id}")],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    let path = "/api/v1/movies/collections/1";
+    let (_, before) = h.call("GET", path, None).await;
+    assert!(before["settings_revision"].is_null());
+    let ids: Vec<i64> = (1..=200).collect();
+    let (status, saved) = h.call("PUT", path, Some(json!({"tag_ids":ids}))).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["tag_ids"], json!(ids));
+    assert_eq!(
+        saved["settings_revision"].as_i64(),
+        Some(
+            h.scalar(
+                "SELECT settings_revision FROM movie_collection_settings WHERE collection_id=1"
+            )
+            .await
+        )
+    );
+    let (_, readback) = h.call("GET", path, None).await;
+    assert_eq!(readback, saved);
+    let too_many: Vec<i64> = (1..=201).collect();
+    assert_eq!(
+        h.call("PUT", path, Some(json!({"tag_ids":too_many})))
+            .await
+            .0,
+        400
+    );
+    assert_eq!(h.call("GET", path, None).await.1, saved);
     h.finish().await;
     Ok(())
 }

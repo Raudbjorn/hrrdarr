@@ -31,6 +31,12 @@ export function eligibleDownloadClient(provider:Provider|null,domain:MediaDomain
   const indexerImplementation=typeof indexer==='string'?indexer:indexer?.settings.implementation;
   return !indexerImplementation || protocolOf(indexerImplementation)===protocolOf(provider.settings.implementation);
 }
+/** Keep provider records from every loaded page so selections survive pagination. */
+export function mergeProviderPages(seen: readonly Provider[], page: readonly Provider[]): Provider[] {
+  const byId = new Map(seen.map((provider) => [provider.id, provider]));
+  for (const provider of page) byId.set(provider.id, provider);
+  return [...byId.values()];
+}
 const clientAttemptLabels:Record<string,string>={selected:'Client selected',prepared:'Ready to send',dispatching:'Sending',definitely_not_submitted:'Not submitted',observed:'Confirmed in client',unknown:'Outcome uncertain'};
 export const clientAttemptLabel=(state:string)=>clientAttemptLabels[state]??state;
 
@@ -60,7 +66,8 @@ export function parseTransmissionEndpoint(endpoint:string):TransmissionAddress|n
   try{url=new URL(endpoint);}catch{return null;}
   if((url.protocol!=='http:'&&url.protocol!=='https:')||url.username||url.password||url.search||url.hash||!url.hostname)return null;
   const useSsl=url.protocol==='https:';
-  const base=normalizeUrlBase(decodeURI(url.pathname));
+  // The saved pathname is already encoded; decoding breaks spaces and malformed escapes on reopen.
+  const base=normalizeUrlBase(url.pathname);
   if(base===null)return null;
   return {host:url.hostname,port:url.port?Number(url.port):useSsl?443:80,useSsl,urlBase:base};
 }

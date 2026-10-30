@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -361,8 +361,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         "health_command_checks",
         "health_transitions",
     ] {
-        // Collections50/provider51 add inactive markers; compare every pre50 field exactly.
-        // Its initial zero is asserted independently after the real upgrade below.
+        // Reasoning: 0055/56/77/78 add inactive markers; compare every schema45 field exactly.
+        // New activation defaults are covered by their dedicated migration tests.
         let projection = if table == "snapshot_imports" {
             "application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version,autotag_metadata_version"
         } else {
@@ -436,19 +436,13 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
-    // 0055/56 append runtime=NULL (series) and inactive activation markers. Keep the
-    // complete row witness; rollback and backup above still compare unmodified45.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+    // 0055 appends runtime=NULL; the snapshot witness projects schema45 fields.
+    // Rollback and backup above still compare unmodified45.
     let mut upgraded = before.clone();
     for row in &mut upgraded[0] {
         row.push(Value::Null);
     }
-    // Published 0051 appends a nullable deadline to the preserved health observations.
-    for row in &mut upgraded[12] {
-        row.push(Value::Null);
-    }
-    // snapshot_imports is witnessed through an explicit column projection, so later inactive
-    // markers (0055/56 and 0069 collection_version) never enter the comparison.
     assert_eq!(witness(&c).await?, upgraded);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);

@@ -196,7 +196,8 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
             // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
-            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013), uTorrent (dlc.017), Aria2 (dlc.002), Flood (dlc.006) and DownloadStation (dlc.005); indexers are Torznab, Newznab and the 0068 torrentrss feed.
+            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013) uTorrent (dlc.017) Aria2 (dlc.002) Flood (dlc.006) and DownloadStation (dlc.005);
+            // indexers are Torznab, Newznab and the 0068 torrentrss feed.
             assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 10 });
             assert_eq!(
                 templates

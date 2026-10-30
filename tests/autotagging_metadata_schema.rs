@@ -309,8 +309,6 @@ async fn upgrade_witness(
     predecessor_names: &str,
 ) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
-    // 0069 appends the membership origin column, which rewrites that CREATE TABLE text; its predecessor
-    // columns and foreign keys are compared exactly by the rows and foreign_key_list witnesses.
     // 0053 appends one journal column and two indexes; preserve old columns separately below.
     // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
     // 0059 resolves client kind through provider_implementations: map only that predicate back
@@ -339,6 +337,8 @@ async fn upgrade_witness(
     result.push(rows(c, "SELECT * FROM pragma_table_info('download_processing') WHERE name!='scan_command_id' ORDER BY cid").await?);
     // Compare every predecessor journal column definition exactly despite the additive column.
     result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
+    // Reasoning: 0077 appends membership origin/revision; compare original columns, rows and FKs exactly.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('movie_collection_members') WHERE name NOT IN ('origin','metadata_revision') ORDER BY cid").await?);
     Ok(result)
 }
 
@@ -557,7 +557,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        82 // Published main prefix and reconciliation add six positions; import_lists is now position 82.
+        79 // Import lists appends position 79 without changing main history.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -699,7 +699,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        82 // Published main prefix and reconciliation add six positions; import_lists is now position 82.
+        79 // Import lists appends position 79 without changing main history.
     );
     integrity(&c).await?;
     drop(c);

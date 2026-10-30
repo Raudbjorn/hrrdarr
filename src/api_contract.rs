@@ -311,7 +311,13 @@ pub fn render() -> String {
     );
     for declaration in registry.declarations.into_values() {
         output.push_str("export ");
-        output.push_str(&declaration);
+        output.push_str(
+            &declaration
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         output.push_str("\n\n");
     }
     // Keep declaration spacing internally, but end the artifact with one newline.

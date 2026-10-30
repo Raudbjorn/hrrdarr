@@ -1388,3 +1388,71 @@ async fn background_scheduler_syncs_due_lists_without_a_manual_trigger_and_shuts
         Value::Null
     );
 }
+
+#[tokio::test]
+async fn unfinished_list_pass_yields_to_another_queued_sync() {
+    let h = Harness::new().await;
+    for i in 1..=30 {
+        h.meta.show(1000 + i, &format!("Show {i}"), None);
+    }
+    h.feed.json("/large.json", feed_items(30));
+    h.feed.json("/small.json", json!([]));
+    let large = h
+        .create(h.input(
+            "Large",
+            "custom",
+            "tv",
+            json!({"url": format!("{}/large.json", h.feed_base)}),
+        ))
+        .await;
+    let small = h
+        .create(h.input(
+            "Small",
+            "custom",
+            "tv",
+            json!({"url": format!("{}/small.json", h.feed_base)}),
+        ))
+        .await;
+    for id in [&large, &small] {
+        let (status, _) = h
+            .call(
+                "POST",
+                &format!("/api/v1/importlist/{id}/sync"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, 202);
+    }
+    // Equal enqueue times exercise the tie that otherwise lets the oldest row monopolize passes.
+    h.sql("UPDATE import_list_runs SET created_at=1,next_attempt_at=1")
+        .await;
+    assert_eq!(h.engine.tick(1).await.unwrap(), 1);
+    assert_eq!(
+        h.count("SELECT count(*) FROM import_list_runs WHERE status='queued' AND added=25")
+            .await,
+        1
+    );
+    assert_eq!(h.engine.tick(1).await.unwrap(), 1);
+    let (_, runs) = h
+        .call(
+            "GET",
+            &format!("/api/v1/importlist/{small}/runs"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(runs["items"][0]["status"], "succeeded");
+    let (_, runs) = h
+        .call(
+            "GET",
+            &format!("/api/v1/importlist/{large}/runs"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(runs["items"][0]["added"], 25);
+    assert_eq!(runs["items"][0]["pending"], 5);
+    assert_eq!(
+        h.feed.requests().len(),
+        2,
+        "one fetch per source; continuation retains its snapshot"
+    );
+}

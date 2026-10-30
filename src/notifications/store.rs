@@ -1,6 +1,6 @@
 //! Validation and persistence of notification definitions.
 use super::{
-    catalog::{self, Implementation},
+    catalog::{self},
     error::{ApiError, Result},
     model::*,
 };
@@ -160,6 +160,11 @@ pub fn validate(input: &NotificationInput, stored_secrets: &BTreeSet<String>) ->
                         return Err(ApiError::invalid(format!(
                             "Secret {key} is too long or contains control characters or surrounding whitespace"
                         )));
+                    }
+                    // Secret URLs get the same scheme and host policy as plain URL settings, at
+                    // write time rather than as a permanent failure on the first delivery.
+                    if f.kind == FieldKind::Url {
+                        validate_setting(f, &SettingValue::Text(value.clone()))?;
                     }
                 }
             }

@@ -54,7 +54,7 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(PUBLISHED).enumerate() {
+    for (i, (name, sql)) in LEGACY_MIGRATIONS.iter().take(PUBLISHED).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
@@ -123,12 +123,12 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64
+        LEGACY_MIGRATIONS.len() as i64
     );
-    // The checkpoint's policy now lives on the collection itself.
+    // Both supported histories converge on the separate settings authority.
     let row = c
         .query(
-            "SELECT monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit FROM movie_collections WHERE id=1",
+            "SELECT monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit FROM movie_collection_settings WHERE collection_id=1",
             (),
         )
         .await?
@@ -141,7 +141,7 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
     assert_eq!(row.get::<String>(3)?, "in_cinemas", "minimum availability");
     assert_eq!(row.get::<i64>(4)?, 1, "search on add");
     assert_eq!(row.get::<i64>(5)?, 1, "local edit");
-    // The tag survived the supersede, and the checkpoint's own tables are gone.
+    // The tag and separate settings authority survive convergence.
     assert_eq!(
         scalar(
             &c,
@@ -156,7 +156,7 @@ async fn published_prefix_upgrades_and_keeps_its_collection_policy() -> Result<(
             "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='movie_collection_settings'"
         )
         .await?,
-        0
+        1
     );
     Ok(())
 }
@@ -172,7 +172,7 @@ async fn published_prefix_upgrades_with_a_torrentrss_provider() -> Result<(), Er
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(PUBLISHED).enumerate() {
+    for (i, (name, sql)) in LEGACY_MIGRATIONS.iter().take(PUBLISHED).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
@@ -199,7 +199,7 @@ async fn published_prefix_upgrades_with_a_torrentrss_provider() -> Result<(), Er
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64
+        LEGACY_MIGRATIONS.len() as i64
     );
     assert_eq!(
         scalar(
@@ -226,7 +226,7 @@ async fn published(path: &Path, count: usize) -> Result<(libsql::Database, Conne
     let raw = libsql::Builder::new_local(path).build().await?;
     let c = raw.connect()?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(count).enumerate() {
+    for (i, (name, sql)) in LEGACY_MIGRATIONS.iter().take(count).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
@@ -264,7 +264,7 @@ async fn every_published_tail_prefix_upgrades_without_rewriting_history() -> Res
         drop(raw);
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, MIGRATIONS.len());
+        assert_eq!(version(&c).await?, LEGACY_MIGRATIONS.len());
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM series WHERE id=123").await?,
             1
@@ -279,7 +279,7 @@ async fn every_published_tail_prefix_upgrades_without_rewriting_history() -> Res
             if count >= 51 { 2 } else { 0 }
         );
         assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=42 AND local_edit=1 AND removed=1 AND removal_reason='user'").await?,if count >= 52 {1} else {0});
-        for (i, (name, sql)) in MIGRATIONS.iter().take(count).enumerate() {
+        for (i, (name, sql)) in LEGACY_MIGRATIONS.iter().take(count).enumerate() {
             let row = c
                 .query(
                     "SELECT name,checksum,sql FROM schema_migrations WHERE version=?",
@@ -336,7 +336,7 @@ async fn populated_published_authority_survives_rollback_upgrade_and_reopen() ->
     c.execute("INSERT INTO provider_status(provider_id,escalation_level,status_version,last_observed_config_revision,initial_failure,most_recent_failure,disabled_until) VALUES(?,2,1,1,'2026-01-01T00:00:00Z','2026-01-02T00:00:00Z','2026-01-03T00:00:00Z')",[indexer.clone()]).await?;
     c.execute("INSERT INTO provider_tests(provider_id,config_revision,tested_at,status,error_code) VALUES(?,1,100,'success',NULL)",[client.clone()]).await?;
     // A late publication failure must roll back both schema and transferred authority.
-    c.execute("CREATE TRIGGER reject_upgrade BEFORE INSERT ON schema_migrations WHEN NEW.version=82 BEGIN SELECT RAISE(ABORT,'fixture rollback'); END",()).await?;
+    c.execute("CREATE TRIGGER reject_upgrade BEFORE INSERT ON schema_migrations WHEN NEW.version=83 BEGIN SELECT RAISE(ABORT,'fixture rollback'); END",()).await?;
     drop(c);
     drop(raw);
     assert!(
@@ -368,6 +368,7 @@ async fn populated_published_authority_survives_rollback_upgrade_and_reopen() ->
         assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_intents WHERE (tmdb_id=42 AND revision=7 AND local_edit=1 AND removed=1 AND removal_reason='user') OR (tmdb_id=43 AND revision=9 AND local_edit=0 AND removed=1 AND removal_reason='metadata_missing')").await?,2);
         assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collections WHERE id=1 AND sort_title='kept' AND overview='Overview' AND images_json='[]' AND metadata_revision=8 AND graph_complete=1 AND added='2026-01-01T00:00:00Z' AND last_info_sync='2026-01-02T00:00:00Z' AND local_edit=1 AND snapshot_owned=1 AND checkpoint_settings_revision=6").await?,1);
         assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_members WHERE metadata_revision=8 AND origin='graph'").await?,1);
+        assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND search_on_add IS NULL AND settings_revision=6 AND local_edit=1 AND snapshot_owned=1").await?,1,"old main nullable policy survives the intermediate PR31 normalization");
         assert_eq!(scalar(&c,"SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=123 AND revision=4 AND local_edit=1 AND excluded=1").await?,1);
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM download_client_tags").await?,
@@ -382,6 +383,228 @@ async fn populated_published_authority_survives_rollback_upgrade_and_reopen() ->
         integrity(&c).await?;
         drop(c);
         drop(db);
+    }
+    Ok(())
+}
+
+#[test]
+fn both_published_ledgers_remain_byte_identical() {
+    for (history, count, expected) in [
+        (
+            MIGRATIONS,
+            78,
+            "81efce8d5576fe49297b04045592f33bdb13383fff48d870cfea00a6cb4e5d5b",
+        ),
+        (
+            LEGACY_MIGRATIONS,
+            82,
+            "20895f2847f8bbcbc721880479a35f50003a138b1ac35c87b723de14c0607497",
+        ),
+    ] {
+        let mut bytes = String::new();
+        for (name, sql) in &history[..count] {
+            bytes.push_str(name);
+            bytes.push('\0');
+            bytes.push_str(sql);
+            bytes.push('\0');
+        }
+        assert_eq!(
+            checksum(&bytes),
+            expected,
+            "published names and SQL from b34874c / 9d989d5 must never change"
+        );
+    }
+}
+
+async fn seed_lineage(
+    path: &Path,
+    history: &[Migration],
+    count: usize,
+) -> Result<(libsql::Database, Connection), Error> {
+    let raw = libsql::Builder::new_local(path).build().await?;
+    let c = raw.connect()?;
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
+    c.execute(HISTORY_SQL, ()).await?;
+    for (i, (name, sql)) in history.iter().take(count).enumerate() {
+        c.execute_batch(sql).await?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(?,?,?,?)",
+            params![i as i64 + 1, *name, checksum(sql), *sql],
+        )
+        .await?;
+    }
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    Ok((raw, c))
+}
+
+async fn delivery_rows(c: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
+    let mut rows=c.query("SELECT id,event_sequence,notification_id,state,attempts,next_attempt_at,lease_until,last_error,created_at,completed_at FROM notification_deliveries ORDER BY id",()).await?;
+    let mut values = vec![];
+    while let Some(row) = rows.next().await? {
+        values.push(
+            (0..row.column_count())
+                .map(|i| row.get_value(i))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(values)
+}
+
+#[tokio::test]
+async fn both_lineage_tips_preserve_delivery_progress_policy_and_atomicity() -> Result<(), Error> {
+    for (history, count) in [(MIGRATIONS, 78), (LEGACY_MIGRATIONS, 82)] {
+        let files = Scratch::new();
+        let path = files.0.join("db");
+        let (raw, c) = seed_lineage(&path, history, count).await?;
+        c.execute_batch("INSERT INTO root_folders(id,media_type,path) VALUES(1,'movies','/movies');
+            INSERT INTO quality_profiles(id,media_type,name) VALUES(1,'movies','Kept');
+            INSERT INTO tags(id,media_type,label) VALUES(1,'movies','kept');
+            INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,42,'Collection'),(2,43,'Catalog only');
+            INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(44,7,1,1,'user');
+            INSERT INTO notifications(id,name,implementation,settings_json,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000001','Both','webhook','{}',1,1),('00000000-0000-4000-8000-000000000002','Movies','webhook','{}',1,1);
+            INSERT INTO notification_scopes(notification_id,media_type) VALUES('00000000-0000-4000-8000-000000000001','tv'),('00000000-0000-4000-8000-000000000001','movies'),('00000000-0000-4000-8000-000000000002','movies');
+            INSERT INTO notification_events(sequence,kind,scope,payload_json,created_at,fanned_out) VALUES(1,'health_issue','tv','{}',1,1),(2,'health_issue','movies','{}',1,1),(3,'health_issue','system','{}',1,1),(4,'health_issue','system','{}',1,1);").await?;
+        if count == 82 {
+            c.execute("UPDATE movie_collections SET monitored=1,root_folder_id=1,quality_profile_id=1,minimum_availability='released',search_on_add=1,local_edit=1,snapshot_owned=1,checkpoint_settings_revision=6 WHERE id=1",()).await?;
+        } else {
+            c.execute("INSERT INTO movie_collection_settings(collection_id,settings_revision,monitored,root_folder_id,quality_profile_id,minimum_availability,search_on_add,local_edit,snapshot_owned) VALUES(1,5,1,1,1,'released',1,1,1)",()).await?;
+        }
+        c.execute(
+            "INSERT INTO movie_collection_tags(collection_id,tag_id) VALUES(1,1)",
+            (),
+        )
+        .await?;
+        for (event, state, domain) in [
+            (1, "pending", "tv"),
+            (2, "delivered", "movies"),
+            (3, "failed", "tv"),
+            (4, "pending", "movies"),
+        ] {
+            let notification = if event == 4 {
+                "00000000-0000-4000-8000-000000000002"
+            } else {
+                "00000000-0000-4000-8000-000000000001"
+            };
+            let (columns, values) = if count == 82 {
+                ("", String::new())
+            } else {
+                (
+                    ",media_type,sent_parts,lease_owner",
+                    format!(",'{domain}','[\"acknowledged\"]','owned'"),
+                )
+            };
+            c.execute(&format!("INSERT INTO notification_deliveries(id,event_sequence,notification_id,state,attempts,next_attempt_at,lease_until,last_error,created_at,completed_at{columns}) VALUES(?,?,?, ?,3,100,200,'prior_failure',1,?{values})"),params![event*10,event,notification,state,if state=="pending" {None}else{Some(5)}]).await?;
+        }
+        c.execute(
+            "UPDATE sqlite_sequence SET seq=99 WHERE name='notification_deliveries'",
+            (),
+        )
+        .await?;
+        let before = delivery_rows(&c).await?;
+        c.execute(&format!("CREATE TRIGGER fail_alignment BEFORE INSERT ON schema_migrations WHEN NEW.version={} BEGIN SELECT RAISE(ABORT,'alignment fixture failure'); END",history.len()),()).await?;
+        drop(c);
+        drop(raw);
+        assert!(
+            Database::open_local(&path)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rolled back")
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        assert_eq!(version(&c).await?, count);
+        assert_eq!(delivery_rows(&c).await?, before);
+        c.execute("DROP TRIGGER fail_alignment", ()).await?;
+        drop(c);
+        drop(raw);
+        for reopen in 0..2 {
+            let db = Database::open_local(&path).await?;
+            let c = db.connect().await?;
+            assert_eq!(version(&c).await?, history.len());
+            assert_eq!(db.migration_backup().is_some(), reopen == 0);
+            assert_eq!(
+                delivery_rows(&c).await?,
+                before,
+                "delivery progress never resets during convergence"
+            );
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT seq FROM sqlite_sequence WHERE name='notification_deliveries'"
+                )
+                .await?,
+                99
+            );
+            assert_eq!(scalar(&c,"SELECT count(*) FROM notification_deliveries WHERE (id=10 AND media_type='tv') OR (id=20 AND media_type='movies') OR (id=30 AND media_type='tv') OR (id=40 AND media_type='movies')").await?,4);
+            assert_eq!(scalar(&c,if count==82 {"SELECT count(*) FROM notification_deliveries WHERE sent_parts='[]' AND lease_owner IS NULL"}else{"SELECT count(*) FROM notification_deliveries WHERE sent_parts='[\"acknowledged\"]' AND lease_owner='owned'"}).await?,4);
+            assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND settings_revision=6 AND monitored=1 AND root_folder_id=1 AND quality_profile_id=1 AND minimum_availability='released' AND search_on_add=1 AND local_edit=1 AND snapshot_owned=1").await?,1);
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM movie_collection_tags WHERE collection_id=1 AND tag_id=1"
+                )
+                .await?,
+                1
+            );
+            assert_eq!(scalar(&c,"SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=44 AND local_edit=1 AND removed=1 AND revision=7").await?,1);
+            assert_eq!(scalar(&c, "SELECT count(*) FROM import_lists").await?, 0);
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM movie_collection_settings WHERE collection_id=2"
+                )
+                .await?,
+                0,
+                "catalog-only rows remain eligible for later policy adoption"
+            );
+            integrity(&c).await?;
+            drop(c);
+            drop(db);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_or_tampered_lineages_fail_before_backup() -> Result<(), Error> {
+    for history in [MIGRATIONS, LEGACY_MIGRATIONS] {
+        let files = Scratch::new();
+        let path = files.0.join("db");
+        let (raw, c) = seed_lineage(&path, history, 53).await?;
+        let other = if history[49].0 == MIGRATIONS[49].0 {
+            LEGACY_MIGRATIONS
+        } else {
+            MIGRATIONS
+        };
+        let (name, sql) = other[50];
+        c.execute(
+            "UPDATE schema_migrations SET name=?,checksum=?,sql=? WHERE version=51",
+            params![name, checksum(sql), sql],
+        )
+        .await?;
+        assert!(
+            migration_history(&c).await.is_err(),
+            "matching one ordinal cannot select a lineage"
+        );
+        drop(c);
+        drop(raw);
+        assert!(
+            Database::open_local(&path)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("migration history mismatch")
+        );
+        assert!(
+            !std::fs::read_dir(&files.0)?.any(|entry| entry.is_ok_and(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hrrdarr-migration-"))),
+            "invalid history must not create backups or migrate"
+        );
     }
     Ok(())
 }

@@ -199,7 +199,7 @@ impl Engine {
         let found = {
             let mut rows = tx
                 .query(
-                    "SELECT id,list_id,fetched_at FROM import_list_runs WHERE (status='queued' AND next_attempt_at<=?1) OR (status='running' AND lease_until<?1) ORDER BY created_at,rowid LIMIT 1",
+                    "SELECT id,list_id,fetched_at FROM import_list_runs WHERE (status='queued' AND next_attempt_at<=?1) OR (status='running' AND lease_until<?1) ORDER BY next_attempt_at,created_at,rowid LIMIT 1",
                     [t],
                 )
                 .await?;
@@ -293,9 +293,9 @@ impl Engine {
             settle(&c, run_id, list_id, &item.key, &outcome).await?;
         }
         if count_pending(&c, list_id).await? > 0 {
-            // Resume on the next claim: the snapshot and item states are already durable.
+            // Advance readiness even within the same second so other queued lists get a pass.
             c.execute(
-                "UPDATE import_list_runs SET status='queued',lease_until=0,next_attempt_at=? WHERE id=?",
+                "UPDATE import_list_runs SET status='queued',lease_until=0,next_attempt_at=max(next_attempt_at+1,?) WHERE id=?",
                 params![now(), run_id],
             )
             .await?;

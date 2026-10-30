@@ -1022,13 +1022,13 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
             error.started_attempt = true;
             error.boundary(PathBoundary::Precommit)
         });
-    if outcome.is_err() {
-        if let Err(error) = owned::restore_uncommitted(&db, opid, lease).await {
-            eprintln!(
-                "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
-                opid, error.code, error.diagnostic
-            );
-        }
+    if outcome.is_err()
+        && let Err(error) = owned::restore_uncommitted(&db, opid, lease).await
+    {
+        eprintln!(
+            "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
+            opid, error.code, error.diagnostic
+        );
     }
     outcome
 }
@@ -1058,7 +1058,7 @@ async fn arm(db: &Database, opid: &str) -> Result<Record> {
                 "Library path changed since preview",
             ));
         }
-        owned::available(&c, opid, &rec.target, &plan).await?;
+        owned::available(&c, opid, &rec.target, plan).await?;
         // Reserve the non-preview phase with the marker so no rescan can enter after admission.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)

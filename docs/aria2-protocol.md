@@ -8,15 +8,19 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Aria2/` i
 
 ## Configuration
 
-`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration file 0073 (registry row only; the scope triggers and unique label index came with 0070).
+`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration file 0072 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is the full JSON-RPC URL; nothing is appended.
-- Each scope is the shared `TorrentLabelScope`. aria2 has no labels, so `category` names a subfolder of aria2's own download directory (1-64 of lowercase letters, digits, `.`, `_`, `-`; TV and movie values must differ). `recent_priority`/`older_priority` (`first` moves a new download to the queue front), `add_paused` and `tags` behave as for the other clients.
+- Each scope is the shared `TorrentLabelScope`. aria2 has no labels, so `category` names a subfolder of aria2's own download directory (1-64 of lowercase letters, digits, `.`, `_`, `-`; the complete names `.` and `..` are forbidden; TV and movie values must differ). Migration file 0076 adds the directory-component guard for Aria2 and Download Station. `recent_priority`/`older_priority` (`first` moves a new download to the queue front), `add_paused` and `tags` behave as for the other clients.
 - Credentials are optional and are only `{"kind":"api_key"}`, the RPC secret sent as the leading `token:<secret>` parameter. `username_password` is rejected. The secret is redacted from projected strings.
+
+Before upgrading to migration file 0076, correct any existing Aria2 or Download Station category equal to `.` or `..` using the previous version. The migration refuses those unsafe values transactionally and retains the pre-upgrade backup; it does not choose a replacement directory or leave an invalid provider inaccessible in the new API.
 
 ## Ownership
 
 A download belongs to a domain when its `dir` is `<aria2 default dir>/<label>` (default dir from `aria2.getGlobalOption`). Downloads elsewhere, in a deeper subfolder, without an info hash (HTTP/FTP) or that are metadata stubs with a non-empty `followedBy` are not listed. A hash that exists outside the domain's folder is a `ScopeConflict`; aria2's own duplicate refusal is never worked around.
+
+Waiting and stopped inventories are fetched in 1,000-entry windows, including unrelated HTTP/FTP downloads. Each paged inventory is bounded at 8,192 entries; exceeding that bound returns a resource-limit error instead of a successful partial inventory.
 
 ## Test
 
@@ -30,11 +34,6 @@ A download belongs to a domain when its `dir` is `<aria2 default dir>/<label>` (
 
 Same flow as the other label clients (lookup by info hash first; never a second add). `addUri` (magnet) or `addTorrent` (base64 `.torrent`) with options `dir=<default>/<label>` and `pause=true` when the scope adds paused, then a best-effort `changePosition` to 0 for a `first` placement. The domain is part of the add, so a lost reply needs no repair: reconcile finds the download in the label folder by hash. `adopt` is not supported.
 
-Inventory reads are bounded. A waiting or stopped result window containing 1,000 entries
-(including unrelated HTTP downloads and other-domain torrents) returns an explicit resource-limit
-error; it is never treated as a complete inventory or evidence that a tracked torrent is absent.
-Pagination beyond that window is not implemented.
-
 ## Controls
 
 Pause, Resume, Priority (`changePosition`) and Remove (`remove`, falling back to `removeDownloadResult` for finished downloads). Deleting files is `unsupported_feature` because aria2 has no RPC for it. No API route or UI invokes controls yet.
@@ -43,4 +42,4 @@ Pause, Resume, Priority (`changePosition`) and Remove (`remove`, falling back to
 
 - Live aria2 compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed aria2c was contacted. Field names, string typing and the `Unauthorized` error come from the RPC manual, not a live run.
 - WebSocket and XML-RPC transports, per-file selection, seeding limits (`seed-ratio`, `seed-time`) and the health classifier are not implemented.
-- Migration file `0073` is ordered by the registry in `src/db/mod.rs`; its filename prefix is not the schema version.
+- Migration file `0072` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

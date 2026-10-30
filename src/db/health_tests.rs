@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -235,7 +235,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&db.connect().await?).await?, 79); // Import lists appends position 79 without changing main history.
     Ok(())
 }
 #[tokio::test]
@@ -667,22 +667,13 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
     }
     let registry = rows(&c, "health_checks").await?;
-    // Published 0051 appends NULL next_expiry_at; the original health observations remain exact.
-    let expected_health: Vec<_> = original[0]
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            row.push(libsql::Value::Null);
-            row
-        })
-        .collect();
-    assert_eq!(&registry[..2], expected_health.as_slice());
+    assert_eq!(&registry[..2], &original[0]);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND check_key='download_client_communication' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL AND compatibility_type='DownloadClientCheck'").await?, 2);
     let migrated = rows(&c, "health_transitions").await?;
     assert_eq!(migrated.len(), 1);
@@ -761,7 +752,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+        assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
         assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).

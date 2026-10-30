@@ -100,7 +100,7 @@ async fn blocklist_schema21_backfill_rollback_reopen_and_complete_target_constra
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

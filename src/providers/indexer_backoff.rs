@@ -77,11 +77,6 @@ pub(super) fn now() -> Result<i64> {
 }
 
 pub(super) async fn admit(db: &Database, provider: &Provider, media: MediaDomain) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
-    // it keeps the transport's in-memory rate-limit cooldown instead.
-    if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
-        return Ok(());
-    }
     let c = db.connect().await?;
     let row = c.query("SELECT disabled_until FROM indexer_status WHERE provider_id=? AND media_type=? AND config_revision=?", params![provider.id.to_string(),media_name(media),provider.revision]).await?.next().await?;
     if let Some(row) = row {
@@ -99,11 +94,6 @@ pub(super) async fn record(
     media: MediaDomain,
     observation: Option<Observation>,
 ) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
-    // it keeps the transport's in-memory rate-limit cooldown instead.
-    if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
-        return Ok(());
-    }
     let c = db.connect().await?;
     let tx = c
         .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
@@ -120,11 +110,6 @@ pub(super) async fn apply(
     observation: Option<Observation>,
     timestamp: i64,
 ) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
-    // it keeps the transport's in-memory rate-limit cooldown instead.
-    if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
-        return Ok(());
-    }
     if c.is_autocommit() {
         return Err(corrupt());
     }

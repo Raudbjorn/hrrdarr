@@ -12,10 +12,13 @@ import {
 const id = (n = 1) => `c0000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const form = {path: '/downloads/Harbor.S01.1080p.WEB-DL', mode: 'auto', priority: 'normal'};
 const counts = {entries: 0, ready: 0, importing: 0, imported: 0, already_imported: 0, rejected: 0, failed: 0, cancelled: 0, recovery_required: 0};
+const scanCoverage = {state: 'untracked', expected: 0, covered: 0, missing: 0};
+const scanCleanup = {state: 'not_needed', phase: null, reason: null, removed: 0, error_code: null, resume_generation: 0, resume_requested: false, recovery_required: false};
 const parent = (overrides = {}) => ({
   id: id(), media_type: 'tv', path: form.path, mode: 'auto', priority: 'normal', tracked: null, tracking: 'untracked',
   status: 'queued', phase: 'queued', outcome: null, error_code: null, attempts: 0, run_generation: 0, cancel_requested: false,
   inventory_revision: 0, source: null, next_attempt_at: 1, created_at: 1, started_at: null, completed_at: null, counts: {...counts},
+  receipt_id: null, predecessor_operation_id: null, coverage: {...scanCoverage}, cleanup: {...scanCleanup},
   supersedes_command_id: null, successor_command_id: null, successor_allowed: false, ...overrides,
 });
 const child = (overrides = {}) => ({
@@ -100,6 +103,14 @@ test('parent validation rejects cross-domain and inconsistent rows', () => {
   assert.equal(validScanCommand(parent({phase: 'settled'}), 'tv'), false);
   assert.equal(validScanCommand(parent({counts: {...counts, imported: -1}}), 'tv'), false);
   assert.equal(validScanCommand(parent({id: 'x'}), 'tv'), false);
+  // The panel renders coverage and cleanup; a row without them is not a usable parent.
+  assert.equal(validScanCommand(parent({coverage: undefined}), 'tv'), false);
+  assert.equal(validScanCommand(parent({coverage: {...scanCoverage, missing: 'two'}}), 'tv'), false);
+  assert.equal(validScanCommand(parent({cleanup: undefined}), 'tv'), false);
+  assert.equal(validScanCommand(parent({cleanup: {...scanCleanup, recovery_required: 'yes'}}), 'tv'), false);
+  assert.equal(validScanCommand(parent({cleanup: {...scanCleanup, phase: 'removed'}}), 'tv'), false);
+  assert.equal(validScanCommand(parent({tracking: 'tracked'}), 'tv'), false);
+  assert.equal(validScanCommand(parent({source: 'other'}), 'tv'), false);
 });
 
 test('polling runs only while visible work can change, pauses when hidden and backs off on errors', () => {
@@ -248,10 +259,13 @@ test('tracking choices are download clients configured for the library type only
   const settings = (implementation, tv, movies) => ({implementation, endpoint: 'http://x', tv, movies});
   const providers = [
     {id: id(20), name: 'Indexer', settings: settings('torznab', {}, {})},
+    // The expanded registry includes RSS indexers; only actual download clients may track scans.
+    {id: id(23), name: 'RSS indexer', settings: settings('torrentrss', {}, {})},
+    {id: id(24), name: 'NZBGet', settings: settings('nzbget', null, {category: 'movies'})},
     {id: id(21), name: 'TV client', settings: settings('qbittorrent', {category: 'tv'}, null)},
     {id: id(22), name: 'Both', settings: settings('qbittorrent', {category: 'tv'}, {category: 'movies'})},
     {id: 'bad', name: 'Malformed', settings: settings('qbittorrent', {}, {})},
   ];
   assert.deepEqual(trackingProviders(providers, 'tv').map(p => p.name), ['TV client', 'Both']);
-  assert.deepEqual(trackingProviders(providers, 'movies').map(p => p.name), ['Both']);
+  assert.deepEqual(trackingProviders(providers, 'movies').map(p => p.name), ['NZBGet', 'Both']);
 });

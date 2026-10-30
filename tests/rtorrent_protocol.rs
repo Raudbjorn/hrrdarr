@@ -947,7 +947,7 @@ async fn status_mapping_isolation_details_and_controls() {
         vec![h(10)]
     );
 
-    // Details: a multi-file torrent's save path is the folder that contains its own directory.
+    // d.directory already owns the content root; f.path stays relative to it even for multi-file torrents.
     let details = label_client::details(
         &operation,
         &settings,
@@ -957,17 +957,14 @@ async fn status_mapping_isolation_details_and_controls() {
     )
     .await
     .unwrap();
-    assert_eq!(details.save_path, "/downloads");
+    assert_eq!(details.save_path, "/downloads/Multi.Pack");
     assert_eq!(
         details
             .files
             .iter()
             .map(|file| (file.name.as_str(), file.priority))
             .collect::<Vec<_>>(),
-        vec![
-            ("Multi.Pack/Multi.Pack.S01E01.mkv", 1),
-            ("Multi.Pack/sample.mkv", 0)
-        ]
+        vec![("Multi.Pack.S01E01.mkv", 1), ("sample.mkv", 0)]
     );
     let single = label_client::details(
         &operation,
@@ -1062,5 +1059,41 @@ async fn status_mapping_isolation_details_and_controls() {
         Ok(())
     );
     assert_eq!(f.calls("d.erase").len(), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn renamed_content_directories_keep_relative_files_for_both_domains() {
+    let (f, endpoint, task) = fixture("/RPC2").await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    for (hash, label, target) in [
+        ("a".repeat(40), "tv-hrr", MediaTarget::Episode(1)),
+        ("b".repeat(40), "movies-hrr", MediaTarget::Movie(1)),
+    ] {
+        let mut torrent = item(&hash, "Original", label);
+        torrent.multi = true;
+        torrent.directory = format!("/downloads/{label}/Renamed");
+        torrent.complete = 1;
+        torrent.done = torrent.size;
+        torrent.files = vec![("season/episode.mkv".into(), 1024, 1, 1, 1)];
+        let expected = format!("{}/season/episode.mkv", torrent.directory);
+        f.put(torrent);
+        let details = label_client::details(
+            &client.operation(Uuid::new_v4()).unwrap(),
+            &settings,
+            Some(&login()),
+            &target,
+            &hash,
+        )
+        .await
+        .unwrap();
+        assert_eq!(details.files.len(), 1);
+        // The importer joins this pair; the original display name must not become a directory.
+        assert_eq!(
+            format!("{}/{}", details.save_path, details.files[0].name),
+            expected
+        );
+    }
     task.abort();
 }

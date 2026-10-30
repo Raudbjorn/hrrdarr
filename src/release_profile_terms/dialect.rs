@@ -29,15 +29,15 @@ pub(super) enum Term<'a> {
 // Escaping a slash changes the regex body, not which final delimiter is recognized.
 pub(super) fn recognize(term: &str) -> Term<'_> {
     for line in term.split('\n') {
-        if let (Some(first), Some(last)) = (line.find('/'), line.rfind('/')) {
-            if first != last {
-                let suffix = &line[last + 1..];
-                let end = suffix.bytes().take_while(u8::is_ascii_lowercase).count();
-                return Term::Regex {
-                    pattern: &line[first + 1..last],
-                    flags: &suffix[..end],
-                };
-            }
+        if let (Some(first), Some(last)) = (line.find('/'), line.rfind('/'))
+            && first != last
+        {
+            let suffix = &line[last + 1..];
+            let end = suffix.bytes().take_while(u8::is_ascii_lowercase).count();
+            return Term::Regex {
+                pattern: &line[first + 1..last],
+                flags: &suffix[..end],
+            };
         }
     }
     Term::Literal(term)

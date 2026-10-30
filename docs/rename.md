@@ -50,8 +50,17 @@ source or already moved roll forward; any anomaly rolls moved pairs back and rec
 failed. This runs at worker start and at the start of each run. Cross-device moves are refused
 (`EXDEV` -> `cross_device`), never copied. Case-only renames work on case-sensitive filesystems
 as ordinary renames and on case-insensitive ones via a plain rename when no distinct entry has
-the target name. Cancel stops before the next item; finished renames stay. A run handles at most
-1000 items (`bounded`); rerunning continues, since renamed files then plan as unchanged.
+the target name. When both path lookups return the recorded identity, journal recovery uses the
+directory entry's exact spelling to distinguish the source from the destination; two distinct
+entries sharing an inode remain a conflict. Cancel stops before the next item; finished renames
+stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
+plan as unchanged.
+
+Folder destinations are checked against both declared series and movie paths, including equal
+paths and ancestor/descendant overlaps at directory boundaries. An absent destination directory
+does not make a declared path available. The commit transaction repeats this check; a newly
+claimed destination causes the existing journal recovery path to roll the move back. Equal
+numeric movie and series IDs remain distinct owners.
 
 ## OnRename seam
 
@@ -65,7 +74,8 @@ transaction, then calls observers registered with
 
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
   second filesystem was exercised. Case-insensitive filesystems were not exercised (the
-  classifier logic is unit-tested on a case-sensitive one).
+  alias observations are simulated against real directory listings; file/folder moves and reverse
+  moves are tested on a case-sensitive filesystem).
 * Journalled moves are atomic renames, not the importer's stage/copy/hash pipeline; file
   bytes are not hashed. Identity is device+inode.
 * Empty source folders are not removed; other tables holding paths under a renamed folder (for
@@ -75,5 +85,5 @@ transaction, then calls observers registered with
   (cause not established; observed-once).
 * Source-faithful Sonarr/Radarr runtime equivalence, V3 wire shapes, scene/absolute edge cases
   beyond the renderer's tested grammar, and extra-file tracking tables are not claimed.
-* The command pool admits `rename_commands`; the schema migration is file 0067 but sits at
-  position 63 on this branch, so merging needs renumbering with the other lanes.
+* The command pool admits `rename_commands`. Migration files and execution positions depend on
+  the validated history lineage; `src/db/mod.rs` defines the accepted prefixes and upgrade paths.

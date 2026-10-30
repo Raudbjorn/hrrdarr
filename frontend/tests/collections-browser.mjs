@@ -61,8 +61,25 @@ try{
  await form.getByLabel('Minimum availability').selectOption('released');
  await form.getByLabel(/Search on add/).check();
  await form.getByLabel('saga-added').check();
+ // A saved-policy readback must finish before a new draft can be edited.
+ let releaseReadback, readbackStarted;
+ const readbackGate=new Promise(resolve=>{releaseReadback=resolve;});
+ const readbackPending=new Promise(resolve=>{readbackStarted=resolve;});
+ const detailUrl=`**/api/v1/movies/collections/${CID}`;
+ const delayReadback=async route=>{
+  if(route.request().method()!=='GET'){await route.continue();return;}
+  const response=await route.fetch();readbackStarted();
+  await readbackGate;await route.fulfill({response});
+ };
+ await page.route(detailUrl,delayReadback);
  await form.getByRole('button',{name:'Save settings'}).click();
+ await readbackPending;
+ assert.equal(await form.getByLabel('Minimum availability').isDisabled(),true);
+ assert.equal(await form.getByRole('button',{name:'Save settings'}).isDisabled(),true);
+ releaseReadback();
  await region.getByRole('status').filter({hasText:'Collection settings saved.'}).waitFor();
+ await page.unroute(detailUrl,delayReadback);
+ assert.equal(await form.getByLabel('Minimum availability').isEnabled(),true);
  const configured=await collection();
  assert.equal(configured.quality_profile_id,seed.quality_profile_id);
  assert.equal(configured.root_folder_path,seed.movie_root);

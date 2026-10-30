@@ -3,7 +3,7 @@
   import type { ApiPage, FilePatch, FileResource, MediaDomain } from './api.generated';
   import type { SettingsWriteState } from './api';
   import { listMediaFiles, readMediaFiles, updateMediaFile, editMediaFiles, listQualityDefinitions, getCustomFormatSchema, getRecycleBin, deleteMediaFile, deleteMediaFiles } from './api';
-  import { deletionPlan, describeDeletionFailure, describeDeletions, MAX_DELETE_FILES, type DeletionPlan } from './recycle-bin-draft';
+  import { deletionOwnerMatches, deletionPlan, describeDeletionFailure, describeDeletions, MAX_DELETE_FILES, type DeletionPlan } from './recycle-bin-draft';
   import { emptyFileMetadataDraft, fileMetadataCatalogs, buildFileMetadataPatch, validateFileReadback, mixedFileValue, fileValueLabel, type FileMetadataCatalogs } from './file-metadata-draft';
 
   type Owner = { domain: MediaDomain; id: number; title: string };
@@ -25,8 +25,8 @@
   let loading = $state(false), busy = $state(false), uncertain = $state(false), error = $state(''), notice = $state(''), contextError = $state('');
   let attempted = $state<{ ids: number[]; patch: FilePatch } | null>(null), reconciled = $state(false);
   let seenRefresh = $state(0);
-  // Deletion: confirmation is built from a fresh settings read and states recycle vs permanent.
-  let confirming = $state<{ ids: number[]; paths: string[]; plan: DeletionPlan } | null>(null), deleting = $state(false), preparing = $state(false);
+  // Deletion: confirmation is bound to the owner whose files were prepared.
+  let confirming = $state<{ owner: Owner; ids: number[]; paths: string[]; plan: DeletionPlan } | null>(null), deleting = $state(false), preparing = $state(false);
   let confirmButton = $state<HTMLButtonElement | null>(null);
   const stale = $derived(refreshVersion !== seenRefresh);
   let alive = true, epoch = 0, seenDiscard = -1, wasActive = false;
@@ -37,7 +37,7 @@
     { key: 'release_group', label: 'Release group' }, { key: 'indexer_flags', label: 'Indexer flags' },
     ...(owner?.domain === 'tv' ? [{ key: 'release_type' as const, label: 'Release type' }] : [{ key: 'edition' as const, label: 'Edition' }]),
   ]);
-  $effect(() => onwrite(busy || deleting ? 'busy' : uncertain ? 'uncertain' : 'idle'));
+  $effect(() => onwrite(busy || deleting || preparing || confirming ? 'busy' : uncertain ? 'uncertain' : 'idle'));
   $effect(() => { if (confirming && confirmButton) confirmButton.focus(); });
   $effect(() => ondirty(dirty));
   $effect(() => {
@@ -58,12 +58,14 @@
     const next = target, shown = active, version = discardVersion;
     untrack(() => {
       if (next && !same(owner, next)) {
-        if (busy || uncertain || (dirty && version === seenDiscard)) {
-          contextError = 'Finish or reconcile the retained file edit before changing its library owner.';
+        if (busy || uncertain || preparing || confirming || deleting || (dirty && version === seenDiscard)) {
+          contextError = preparing || confirming || deleting
+            ? 'Finish or cancel the pending deletion before changing its library owner.'
+            : 'Finish or reconcile the retained file edit before changing its library owner.';
           return;
         }
         ++epoch; owner = { ...next }; offset = 0; page = null; catalogs = null; selected = []; inspected = null;
-        loading = false; clearDraft(); error = ''; notice = ''; contextError = ''; seenDiscard = version;
+        loading = false; preparing = false; confirming = null; clearDraft(); error = ''; notice = ''; contextError = ''; seenDiscard = version;
         wasActive = shown; if (shown) void load(); return;
       }
       if (next && same(owner, next)) { owner = { ...next }; contextError = ''; }
@@ -174,21 +176,27 @@
     if (!owner || locked || editing.length || !files.length || files.length > MAX_DELETE_FILES) return;
     const captured = { ...owner }, token = ++epoch; preparing = true; error = ''; notice = '';
     const settings = await getRecycleBin(captured.domain);
-    if (!current(token, captured)) return;
     preparing = false;
+    if (!current(token, captured)) return;
     if (!settings.ok) { error = `Recycle bin settings could not be read, so nothing will be deleted. ${settings.error}`; return; }
     if (settings.data.media_type !== captured.domain) { error = 'Recycle bin settings did not match this media type; nothing will be deleted.'; return; }
     const ids = files.map(file => file.id);
-    confirming = { ids, paths: files.map(file => file.path), plan: deletionPlan(settings.data, ids) };
+    confirming = { owner: captured, ids, paths: files.map(file => file.path), plan: deletionPlan(settings.data, ids) };
   }
   function cancelDelete() { if (!deleting) { confirming = null; notice = 'Deletion cancelled; nothing was changed.'; } }
   async function confirmDelete() {
     if (!owner || !confirming || deleting) return;
-    const captured = { ...owner }, token = ++epoch, request = confirming; deleting = true; error = '';
+    const request = confirming;
+    if (!deletionOwnerMatches(request.owner, owner)) {
+      confirming = null;
+      error = 'The library item changed while the deletion was pending; nothing was deleted.';
+      return;
+    }
+    const captured = { ...request.owner }, token = ++epoch; deleting = true; error = '';
     const result = request.ids.length === 1
       ? await deleteMediaFile(captured.domain, request.ids[0], request.plan.mode)
       : await deleteMediaFiles(captured.domain, request.ids, request.plan.mode);
-    if (!current(token, captured)) return;
+    if (!current(token, captured)) { deleting = false; confirming = null; return; }
     deleting = false; confirming = null;
     if (!result.ok) {
       const failure = describeDeletionFailure(result); error = failure.message;

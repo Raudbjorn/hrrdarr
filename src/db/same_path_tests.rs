@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     for op in &operations {
         let r = c
             .query(

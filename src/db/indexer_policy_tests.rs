@@ -118,7 +118,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     // ADD COLUMN supplies logical defaults without firing scope mutation/invalidation triggers.
     for (table, expected) in tables.iter().zip(&before) {
         if !matches!(*table, "health_checks" | "schema_migrations") {
@@ -158,18 +158,10 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
         );
     }
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
-    // Published 0051 appends NULL next_expiry_at to all eight predecessor health rows.
-    let expected_health: Vec<_> = before[2]
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            row.push(libsql::Value::Null);
-            row
-        })
-        .collect();
+    // Reasoning: the preserved predecessor prefix is all 8 schema47 health rows (was 4 at schema43).
     assert_eq!(
         rows(&c, "SELECT * FROM health_checks ORDER BY rowid LIMIT 8").await?,
-        expected_health
+        before[2]
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE scope IN ('tv','movies') AND ((check_key='indexer_search' AND compatibility_type='IndexerSearchCheck') OR (check_key='indexer_rss' AND compatibility_type='IndexerRssCheck')) AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND observed_epoch IS NULL AND checked_at IS NULL AND last_error IS NULL AND severity IS NULL AND reason IS NULL AND message IS NULL AND wiki_url IS NULL").await?,4);
     provider(&c, "torznab").await?;
@@ -284,7 +276,7 @@ async fn indexer_policy_upgrade43_rollback_defaults_false_reopen_and_registry() 
     integrity(&c).await?;
     // The normal fresh runner traverses all migrations, not just the predecessor upgrade.
     let fresh = Database::open_local(scratch.0.join("fresh")).await?;
-    assert_eq!(version(&fresh.connect().await?).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&fresh.connect().await?).await?, 79); // Import lists appends position 79 without changing main history.
     assert_eq!(
         scalar(
             &fresh.connect().await?,

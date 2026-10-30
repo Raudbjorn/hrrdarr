@@ -39,10 +39,10 @@ existing Playwright installation as for `revision-policy-browser.mjs`.
 
 ## Not claimed
 
-Import-worker consumption is pending. Saving these settings currently records
-configuration; it does not establish free-space enforcement or working-folder
-filtering during imports. These controls and tests do not establish consumer
-integration, filesystem safety under low disk space, full Media Management parity,
+Downloaded-folder scans consume the saved domain policy: observation rejects
+working-folder prefixes and insufficient free space before discovery admits a file.
+The settings-editor tests do not establish enforcement in every other import path,
+filesystem safety under low disk space, full Media Management parity,
 or Sonarr/Radarr runtime equivalence. Browser tests use isolated local state, not
 production providers or media. Adding tests does not itself establish that they ran;
 record execution results separately.

@@ -1,12 +1,12 @@
 //! Custom script execution. No shell, a cleared environment holding only `PATH` plus the event
-//! variables, `/` as working directory, closed stdin, bounded output, and a hard timeout that kills
-//! the whole process group. The environment contract is documented in `docs/notifications.md`.
+//! variables, `/` as working directory, closed stdin, bounded output, and a hard timeout. The whole
+//! process group is killed when the script exits or times out, and output is read without helper
+//! threads. The environment contract is documented in `docs/notifications.md`.
 use std::{
     io::Read,
     os::unix::process::CommandExt,
     path::Path,
     process::{Command, Stdio},
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -89,24 +89,63 @@ pub fn validate_path(path: &str) -> Result<(), ScriptError> {
     Ok(())
 }
 
-fn capture(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
+/// One captured stream, read without blocking so no reader thread can outlive the script.
+struct Capture<R> {
+    stream: Option<R>,
+    kept: Vec<u8>,
+}
+impl<R: Read + std::os::fd::AsFd> Capture<R> {
+    fn new(stream: R) -> Result<Self, ScriptError> {
+        let flags = rustix::fs::fcntl_getfl(&stream).map_err(|_| ScriptError::Spawn)?;
+        rustix::fs::fcntl_setfl(&stream, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(|_| ScriptError::Spawn)?;
+        Ok(Self {
+            stream: Some(stream),
+            kept: Vec::new(),
+        })
+    }
+    /// Reads whatever is available; the stream is dropped at end of file or on error.
+    fn drain(&mut self) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
         let mut buffer = [0u8; 4096];
         loop {
             match stream.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     // Keep draining past the cap so the child never blocks on a full pipe.
-                    let room = MAX_CAPTURE_BYTES.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buffer[..n.min(room)]);
+                    let room = MAX_CAPTURE_BYTES.saturating_sub(self.kept.len());
+                    self.kept.extend_from_slice(&buffer[..n.min(room)]);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => break,
             }
         }
-        let _ = tx.send(kept);
-    });
-    rx
+        self.stream = None;
+    }
+    fn open(&self) -> bool {
+        self.stream.is_some()
+    }
+    /// Closes the read end, so a writer that escaped the process group gets EPIPE, not a reader.
+    fn finish(mut self) -> String {
+        self.stream = None;
+        String::from_utf8_lossy(&self.kept).into_owned()
+    }
+}
+
+/// Whether the leader has exited, without reaping it: the zombie keeps its PID, and so the process
+/// group ID, reserved until the group has been signalled.
+fn leader_exited(pid: rustix::process::Pid) -> Option<bool> {
+    use rustix::process::{WaitId, WaitidOptions, waitid};
+    match waitid(
+        WaitId::Pid(pid),
+        WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+    ) {
+        Ok(status) => Some(status.is_some()),
+        Err(_) => None,
+    }
 }
 
 pub struct Output {
@@ -147,31 +186,50 @@ pub fn run_blocking(
         command.env(name, value);
     }
     let mut child = command.spawn().map_err(|_| ScriptError::Spawn)?;
-    let out = capture(child.stdout.take().ok_or(ScriptError::Spawn)?);
-    let err = capture(child.stderr.take().ok_or(ScriptError::Spawn)?);
-    let deadline = Instant::now() + SCRIPT_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => break None,
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => break None,
+    let pid = rustix::process::Pid::from_child(&child);
+    let pipes = child
+        .stdout
+        .take()
+        .zip(child.stderr.take())
+        .ok_or(ScriptError::Spawn)
+        .and_then(|(out, err)| Ok((Capture::new(out)?, Capture::new(err)?)));
+    let (mut out, mut err) = match pipes {
+        Ok(pipes) => pipes,
+        Err(e) => {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
         }
     };
-    let finished = status.is_some();
-    if !finished {
-        if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+    let deadline = Instant::now() + SCRIPT_TIMEOUT;
+    let exited = loop {
+        out.drain();
+        err.drain();
+        match leader_exited(pid) {
+            Some(true) => break true,
+            Some(false) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => break false,
         }
+    };
+    // Whether the leader finished or timed out, nothing it started outlives the event: work it
+    // backgrounded would otherwise accumulate on every delivery. A script that must leave a
+    // daemon behind has to detach it (setsid) and close its output.
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+    if !exited {
         let _ = child.kill();
-        let _ = child.wait();
     }
-    // A grandchild may keep a pipe open past the leader's exit; do not wait for it forever.
-    let stdout = out.recv_timeout(OUTPUT_GRACE).unwrap_or_default();
-    let stderr = err.recv_timeout(OUTPUT_GRACE).unwrap_or_default();
+    let status = child.wait().ok().filter(|_| exited);
+    // Collect what was already written, bounded; a writer outside the group is cut off.
+    let grace = Instant::now() + OUTPUT_GRACE;
+    while (out.open() || err.open()) && Instant::now() < grace {
+        out.drain();
+        err.drain();
+        std::thread::sleep(POLL_INTERVAL);
+    }
     let output = Output {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: out.finish(),
+        stderr: err.finish(),
     };
     match status {
         None => {
@@ -238,6 +296,71 @@ mod tests {
         assert!(split_arguments("\"unterminated").is_err());
         assert!(split_arguments("a\nb").is_err());
         assert!(split_arguments(&"a ".repeat(33)).is_err());
+    }
+    /// A process is gone once it no longer exists or is only a zombie awaiting its reaper.
+    fn gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+    #[test]
+    fn exit_kills_backgrounded_work_and_returns_output_promptly() {
+        let dir = std::env::temp_dir().join(format!("hrrdarr-script-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("hook.sh");
+        let pid_file = dir.join("pid");
+        // The background sleep inherits stdout/stderr, which used to pin two reader threads, and
+        // stays in the script's process group, which used to survive a successful exit.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho visible\necho warned >&2\nsleep 30 &\necho $! > \"$1\"\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let started = Instant::now();
+        let output = run_blocking(
+            script.to_str().unwrap(),
+            &format!("\"{}\"", pid_file.display()),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.stdout.trim(), "visible");
+        assert_eq!(output.stderr.trim(), "warned");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(pid), "backgrounded process {pid} survived the script");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn failing_scripts_report_failure_with_output() {
+        let dir = std::env::temp_dir().join(format!("hrrdarr-script-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\necho before-failure >&2\nexit 3\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            run_blocking(script.to_str().unwrap(), "", &[]).err(),
+            Some(ScriptError::Failed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn paths_must_be_absolute_and_normalized() {

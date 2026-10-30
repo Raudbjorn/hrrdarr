@@ -1037,9 +1037,8 @@ async fn reconcile_episode_candidate(
                 if path!=file.absolute && present.contains(&path) {return Ok((false,vec![]))}
             }
         }
-        if let Some(fid)=replace {
-            if !clear_episode_file(&tx,fid).await? {return Ok((false,vec![]))}
-        }
+        if let Some(fid)=replace
+            && !clear_episode_file(&tx,fid).await? {return Ok((false,vec![]))}
         let quality=quality_for(&tx,"tv",parsed.quality_name.as_deref()).await?;
         let size=storage_size(file.size)?;
         tx.execute("INSERT INTO episode_files(series_id,path)VALUES(?,?)",params![series_id,file.absolute.clone()]).await?;

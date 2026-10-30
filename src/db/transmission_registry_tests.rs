@@ -62,7 +62,7 @@ const TABLES: [&str; 6] = [
 ];
 
 #[tokio::test]
-async fn transmission_upgrade65_preserves_rows_rolls_back_and_enforces_placement()
+async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement()
 -> Result<(), Error> {
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
@@ -71,7 +71,7 @@ async fn transmission_upgrade65_preserves_rows_rolls_back_and_enforces_placement
     // Like the runner, rebuild migrations execute with foreign keys off.
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     c.execute(HISTORY_SQL, ()).await?;
-    for (i, (name, sql)) in MIGRATIONS.iter().take(65).enumerate() {
+    for (i, (name, sql)) in MIGRATIONS.iter().take(61).enumerate() {
         c.execute_batch(sql).await?;
         c.execute(
             "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
@@ -102,8 +102,8 @@ async fn transmission_upgrade65_preserves_rows_rolls_back_and_enforces_placement
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
-    tx.execute_batch(MIGRATIONS[65].1).await?;
-    assert_eq!(MIGRATIONS[65].0, "transmission");
+    tx.execute_batch(MIGRATIONS[61].1).await?;
+    assert_eq!(MIGRATIONS[61].0, "transmission");
     tx.rollback().await?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     assert_eq!(
@@ -123,25 +123,30 @@ async fn transmission_upgrade65_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
-    for (sql, expected) in TABLES[..5].iter().zip(&before) {
-        let expected = expected.clone();
-        // The published prefix already has minimum_seeders; every column stays exact.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+    for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
+        let mut expected = expected.clone();
+        if index == 1 {
+            // 0068 appends the nullable minimum_seeders column to provider_scopes.
+            for row in &mut expected {
+                row.push(libsql::Value::Null);
+            }
+        }
         assert_eq!(rows(&c, sql).await?, expected, "{sql}");
     }
     // Reasoning: the runner continues through the later nzbget migration, so the registry holds
     // all appended rows, ordered by implementation name.
-    // The predecessor registry already contains torrentrss to preserve published feed providers.
     let mut registry = before[5].clone();
     for (name, kind, protocol) in [
-        ("deluge", "download_client", "torrent"),
-        ("rtorrent", "download_client", "torrent"),
-        ("utorrent", "download_client", "torrent"),
         ("aria2", "download_client", "torrent"),
-        ("flood", "download_client", "torrent"),
+        ("deluge", "download_client", "torrent"),
         ("downloadstation", "download_client", "torrent"),
+        ("flood", "download_client", "torrent"),
         ("nzbget", "download_client", "usenet"),
+        ("rtorrent", "download_client", "torrent"),
+        ("torrentrss", "indexer", "torrent"),
         ("transmission", "download_client", "torrent"),
+        ("utorrent", "download_client", "torrent"),
     ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),
@@ -280,6 +285,6 @@ async fn transmission_upgrade65_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&db.connect().await?).await?, 79); // Import lists appends position 79 without changing main history.
     Ok(())
 }

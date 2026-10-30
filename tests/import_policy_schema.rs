@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        82 // Published main prefix and reconciliation add six positions; import_lists is now position 82.
+        79 // Import lists appends position 79 without changing main history.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);

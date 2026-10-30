@@ -279,7 +279,7 @@
   {#if view === 'autotagging'}<AutoTaggingPanel />{/if}
   {#if view === 'wanted-missing' || view === 'wanted-cutoff'}<WantedPanel kind={view === 'wanted-cutoff' ? 'cutoff' : 'missing'} onkind={(next) => navigate(next === 'cutoff' ? 'wanted-cutoff' : 'wanted-missing')} />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={providerRelatedWrite} {tagVersions} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
-  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state} onscan={openScan}/></div>{/if}
+  {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined or its readback failed. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state} onscan={openScan}/></div>{/if}
   {#if healthVisited}<div hidden={view!=='health'}><HealthPanel active={view==='health'} onsettings={openHealthSettings}/></div>{/if}
   {#if healthNavigation&&view==='activity'}<p role="status">{healthNavigation}</p>{/if}
   {#if view === 'blocklist'}<BlocklistPanel />{/if}
@@ -292,7 +292,7 @@
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
   {#if importListsVisited}<div hidden={view!=='import-lists'}><h1>Import lists</h1><ImportListsPanel /></div>{/if}
-  {#if notificationsVisited}<div hidden={view!=='notifications'}><h1>Connect</h1><NotificationsPanel /></div>{/if}
+  {#if notificationsVisited}<div hidden={view!=='notifications'}><h1>Connect</h1><NotificationsPanel {tagVersions} /></div>{/if}
   {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);if(scope!==domain)return;view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>

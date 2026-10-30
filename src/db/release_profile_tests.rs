@@ -46,7 +46,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     assert_eq!(
         c.query(
             "SELECT release_profile_version FROM snapshot_imports WHERE fingerprint='kept'",
@@ -93,7 +93,7 @@ async fn release_profile_upgrade39_rollback_constraints_and_reopen() -> Result<(
     drop(db);
     assert_eq!(
         version(&Database::open_local(&path).await?.connect().await?).await?,
-        82 // Published main prefix and reconciliation add six positions; import_lists is now position 82.
+        79 // Import lists appends position 79 without changing main history.
     );
     Ok(())
 }

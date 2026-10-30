@@ -96,7 +96,7 @@ async fn metadata_commands_preserve_download_state_upgrade_rollback_and_shared_c
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 82); // Published main prefix and reconciliation add six migration positions.
+    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
     // Reasoning: 0051 adds explicit legacy provenance to every preserved command.
     for row in &mut before[0] {
         row.extend([
