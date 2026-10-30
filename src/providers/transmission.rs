@@ -22,6 +22,7 @@ use super::{
     },
 };
 use crate::{api::MediaDomain, db::MediaTarget};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -169,25 +170,11 @@ pub(crate) fn settings_fingerprint(settings: &ProviderSettings) -> Result<String
     Ok(digest_hex(&ring::digest::SHA256, &bytes))
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-/// Standard padded base64 (RFC 4648 §4), used for basic authentication and `metainfo`.
-fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for (index, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
-            if index <= chunk.len() {
-                out.push(BASE64[((n >> shift) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+/// Standard padded base64 (RFC 4648 §4) for `metainfo` and for the label clients' uploads; one
+/// shared encoder (the `base64` crate) instead of a hand-written copy per client.
+pub(super) fn base64(bytes: &[u8]) -> String {
+    BASE64.encode(bytes)
 }
-
 /// Path segments of a rooted remote path; drive-letter paths compare case-insensitively.
 fn segments(path: &str) -> Option<(bool, Vec<String>)> {
     let drive = path.len() >= 3
@@ -265,10 +252,7 @@ impl<'o, 'a> Rpc<'o, 'a> {
                     return Err(QbitError::InvalidRequest);
                 }
                 (
-                    Some(format!(
-                        "Basic {}",
-                        base64(format!("{username}:{password}").as_bytes())
-                    )),
+                    Some(super::http::basic_auth(username, password)),
                     [username, password]
                         .into_iter()
                         .filter(|s| !s.is_empty())
@@ -464,10 +448,10 @@ struct Owner {
 }
 impl Owner {
     fn owns(&self, directory: &str, labels: &[String]) -> bool {
-        if let (Some(label), true) = (&self.label, self.labels_supported) {
-            if !labels.is_empty() {
-                return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
-            }
+        if let (Some(label), true) = (&self.label, self.labels_supported)
+            && !labels.is_empty()
+        {
+            return labels.iter().any(|l| l.eq_ignore_ascii_case(label));
         }
         within(directory, &self.directory)
     }
@@ -512,13 +496,13 @@ impl Owners {
         };
         let tv = tv.as_ref().map(|s| owner(s, session)).transpose()?;
         let movies = movies.as_ref().map(|s| owner(s, session)).transpose()?;
-        if let (Some(a), Some(b)) = (&tv, &movies) {
-            if within(&a.directory, &b.directory) || within(&b.directory, &a.directory) {
-                return Err(TransmissionTestFailure {
-                    error: QbitError::ScopeConflict,
-                    problem: Some(TransmissionProblem::DomainsOverlap),
-                });
-            }
+        if let (Some(a), Some(b)) = (&tv, &movies)
+            && (within(&a.directory, &b.directory) || within(&b.directory, &a.directory))
+        {
+            return Err(TransmissionTestFailure {
+                error: QbitError::ScopeConflict,
+                problem: Some(TransmissionProblem::DomainsOverlap),
+            });
         }
         Ok(Self { tv, movies })
     }
@@ -1047,7 +1031,7 @@ async fn submit_inner(
             }
             arguments["filename"] = json!(value);
         }
-        AddSource::Torrent { bytes, .. } => arguments["metainfo"] = json!(base64(bytes)),
+        AddSource::Torrent { bytes, .. } => arguments["metainfo"] = json!(BASE64.encode(bytes)),
         AddSource::Url(_) => return Err(QbitError::InvalidRequest),
     }
     let labelled = owner.label.is_some() && session.labels_supported();
@@ -1081,10 +1065,10 @@ async fn submit_inner(
     } else {
         return Err(QbitError::Rejected);
     };
-    if let Some(returned) = returned {
-        if torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash {
-            return Err(QbitError::MutationUnknown);
-        }
+    if let Some(returned) = returned
+        && torrent_hash(returned).map_err(|_| QbitError::MutationUnknown)? != hash
+    {
+        return Err(QbitError::MutationUnknown);
     }
     if duplicate {
         // Someone else added it between the lookup and add: never mutate a torrent this call

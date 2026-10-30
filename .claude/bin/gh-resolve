@@ -1,0 +1,1911 @@
+#!/bin/bash
+# gh-resolve - Manage PR review thread resolution and CI status via GitHub GraphQL API
+#
+# Lists resolvable threads, resolves them individually or in bulk,
+# and shows CI check status as PR issues.
+#
+# Auth: gh honors GH_TOKEN / GITHUB_TOKEN; GITHUB_PAT is mapped to GH_TOKEN
+# as a fallback. API failures (rate limits, auth, bad repo) are classified
+# and surfaced — never silently reported as empty results.
+#
+# Backends: GraphQL by default; REST inside Claude Code cloud sessions, whose
+# proxy blocks GraphQL but serves review threads on /ccr/ REST routes.
+# Override with GH_RESOLVE_BACKEND=graphql|rest.
+
+set -euo pipefail
+
+VERSION="2.5.0"
+SCRIPT_NAME="gh-resolve"
+BACKEND=""      # graphql|rest, set by main via select_backend
+ACTIVE_REPO=""  # OWNER/REPO, set by main; REST mutations need it
+
+# Colors and formatting (fallback if gum unavailable)
+has_gum() { command -v gum &>/dev/null; }
+
+info()    { has_gum && gum style --foreground 214 "$*" || echo "INFO: $*"; }
+success() { has_gum && gum style --foreground 82 "$*" || echo "OK: $*"; }
+error()   { has_gum && gum style --foreground 196 "$*" >&2 || echo "ERROR: $*" >&2; }
+warn()    { has_gum && gum style --foreground 208 "$*" || echo "WARN: $*"; }
+dim()     { has_gum && gum style --foreground 245 "$*" || echo "$*"; }
+
+# ---------------------------------------------------------------------------
+# API error handling
+# ---------------------------------------------------------------------------
+
+# Detect rate-limit signatures in gh/GraphQL output (primary + secondary)
+is_rate_limited() {
+    grep -qiE 'rate limit|RATE_LIMITED|secondary rate|abuse detection' <<< "$1"
+}
+
+# Classify and report a failed gh api call. Args: <captured output> <context>
+api_error() {
+    local output="$1" context="$2"
+    if is_rate_limited "$output"; then
+        error "GitHub API rate limit hit while trying to ${context}."
+        error "Inspect quota: gh api rate_limit --jq '.resources'"
+    elif grep -q 'GraphQL is not available' <<< "$output"; then
+        error "This session's proxy blocks GraphQL (Claude Code cloud) while trying to ${context}."
+        error "Re-run with GH_RESOLVE_BACKEND=rest; list threads again to get RT_ thread IDs."
+    elif grep -q 'NOT_FOUND' <<< "$output"; then
+        error "GitHub reports NOT_FOUND while trying to ${context}."
+        error "This means the resource doesn't exist OR your token can't see it —"
+        error "private repos return NOT_FOUND to tokens without access."
+        if [ -n "${GH_TOKEN:-}" ]; then
+            error "Note: GH_TOKEN is set and OVERRIDES 'gh auth login' credentials."
+        elif [ -n "${GITHUB_TOKEN:-}" ]; then
+            error "Note: GITHUB_TOKEN is set and OVERRIDES 'gh auth login' credentials."
+        fi
+        error "Check the active identity and token source: gh auth status"
+    else
+        error "GitHub API error while trying to ${context}:"
+        error "  ${output:0:300}"
+    fi
+}
+
+# Abort if the active backend's quota is exhausted; warn if nearly so.
+# The /rate_limit endpoint itself does not count against quota.
+check_quota() {
+    local remaining="" reset="" resource="graphql"
+    [ "$BACKEND" = "rest" ] && resource="core"
+    read -r remaining reset < <(gh api rate_limit \
+        --jq "\"\(.resources.$resource.remaining) \(.resources.$resource.reset)\"" 2>/dev/null) || true
+    [ -z "${remaining:-}" ] && return 0  # couldn't check; let real calls report
+
+    if [ "$remaining" -eq 0 ]; then
+        error "$resource rate limit exhausted. Resets at $(date -d "@$reset" -Iseconds)"
+        exit 1
+    elif [ "$remaining" -lt 50 ]; then
+        warn "Only $remaining $resource requests remaining (resets $(date -d "@$reset" -Iseconds))"
+    fi
+}
+
+# auto → rest inside Claude Code cloud sessions (GraphQL is blocked there).
+select_backend() {
+    local choice="${GH_RESOLVE_BACKEND:-auto}"
+    case "$choice" in
+        graphql|rest) echo "$choice" ;;
+        auto)
+            if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then echo "rest"; else echo "graphql"; fi ;;
+        *)
+            error "GH_RESOLVE_BACKEND must be auto, graphql or rest (got: $choice)"
+            exit 1 ;;
+    esac
+}
+
+usage() {
+    cat << 'EOF'
+gh-resolve - Manage PR review thread resolution and CI status
+
+USAGE:
+    gh-resolve [OPTIONS] [PR_NUMBER|PR_URL]
+    gh-resolve list [OPTIONS] [PR_NUMBER|PR_URL]
+    gh-resolve resolve <THREAD_ID> [OPTIONS]
+    gh-resolve resolve --all [OPTIONS] [PR_NUMBER|PR_URL]
+    gh-resolve resolve --outdated [OPTIONS] [PR_NUMBER|PR_URL]
+    gh-resolve unresolve <THREAD_ID> [OPTIONS]
+    gh-resolve reply <THREAD_ID> -m <BODY> [OPTIONS]
+    gh-resolve checks [OPTIONS] [PR_NUMBER|PR_URL]
+    gh-resolve suggestions [OPTIONS] [PR_NUMBER|PR_URL]
+
+COMMANDS:
+    list              List unresolved threads (default if no command given)
+    resolve           Resolve thread(s) by ID, --all, or --outdated
+    unresolve         Unresolve a thread by ID
+    reply             Post a comment into a review thread; --resolve closes
+                      the thread after the reply lands
+    checks            Show CI check status (failures, pending, errors)
+    suggestions       List review ```suggestion blocks; --apply patches them
+                      into the local checkout
+    agent             Emit a self-contained bundle (markdown, or JSON with -j)
+                      with everything an LLM agent needs to analyse and fix
+                      each unresolved issue: diff hunks, full conversations,
+                      line ranges pinned to the head commit, thread IDs
+
+OPTIONS:
+    -r, --repo OWNER/REPO   Specify repository (default: current repo)
+    -o, --outdated          Filter to outdated threads only
+    -a, --all               Resolve all unresolved threads
+        --resolved          Show resolved threads instead of unresolved
+        --apply             (suggestions) Apply suggestions to the working tree
+    -m, --message BODY      (reply) Comment body; "-" reads stdin
+        --resolve           (suggestions) Resolve threads whose suggestion applied
+                            (reply) Resolve the thread after replying
+        --force             (suggestions) Apply despite HEAD mismatch / dirty files
+    -f, --full              Show every comment in a thread (default: the
+                            first). Bodies are never truncated either way.
+    -j, --json              Output as JSON (for scripting)
+    -q, --quiet             Minimal output
+    -n, --dry-run           Show what would be done without doing it
+    -h, --help              Show this help
+    -v, --version           Show version
+
+EXAMPLES:
+    # List all unresolved threads for PR #42
+    gh-resolve 42
+    gh-resolve list 42
+
+    # List resolved threads (audit what was closed)
+    gh-resolve --resolved 42
+
+    # Whole conversation of every thread, as JSON
+    gh-resolve -j --full 42
+
+    # Resolve all unresolved threads (flags work anywhere)
+    gh-resolve resolve --all 42
+    gh-resolve -r owner/repo resolve --all 42
+    gh-resolve resolve -a -r owner/repo 42
+
+    # Reply to a review thread (then optionally close it)
+    gh-resolve reply PRRT_kwDOABCDEF12345 -m "Fixed in a1b2c3d, thanks."
+    gh-resolve reply PRRT_kwDOABCDEF12345 -m "Done." --resolve
+    printf 'Multi-line\nreply body\n' | gh-resolve reply PRRT_... -m -
+
+    # Show CI check failures
+    gh-resolve checks 42
+    gh-resolve checks -j 42
+
+    # List suggested changes; preview; apply into the local checkout
+    gh-resolve suggestions 42
+    gh-resolve suggestions --apply -n 42     # dry run: show the splice plan
+    gh-resolve suggestions --apply --resolve 42
+
+    # Hand the review to an agent (full context: hunks, threads, line ranges)
+    gh-resolve agent 42 | claude -p "$(cat -)"
+    gh-resolve agent 42 > review-issues.md
+    gh-resolve agent -j 42 | jq '.threads[0]'
+    gh-resolve agent -o 42                   # outdated threads only
+
+    # From a PR URL
+    gh-resolve https://github.com/owner/repo/pull/42
+
+THREAD IDs:
+    Thread IDs are GraphQL node IDs (e.g., PRRT_kwDOABCDEF12345), or
+    RT_<pr>_<comment id> under the REST backend. They are not
+    interchangeable. Use 'gh-resolve list' to get thread IDs for a PR.
+
+BACKENDS:
+    GH_RESOLVE_BACKEND=auto|graphql|rest (default: auto). auto picks rest
+    inside Claude Code cloud sessions (CLAUDE_CODE_REMOTE=true), whose proxy
+    blocks GraphQL but serves review threads on /ccr/ REST routes; graphql
+    everywhere else. The /ccr/ routes exist only behind that proxy.
+
+NOTE:
+    This tool uses GitHub's GraphQL API because the REST API does not
+    support resolving/unresolving review threads.
+
+    GitHub has NO public API for applying suggestions ("Commit suggestion"
+    is web-UI only). 'suggestions --apply' therefore patches your local
+    checkout: it requires HEAD to match the PR head commit (line numbers
+    are only valid there), applies bottom-up per file, and leaves the
+    result uncommitted so you can review with git diff and commit once.
+    Only plain suggestion fences are supported; offset-bearing fences are
+    excluded. Applying requires python3 and rejects symlinks in every path
+    component, even with --force.
+EOF
+}
+
+check_deps() {
+    local missing=()
+    command -v gh &>/dev/null || missing+=("gh")
+    command -v jq &>/dev/null || missing+=("jq")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        error "Missing required dependencies: ${missing[*]}"
+        echo "Install with: sudo pacman -S ${missing[*]}" >&2
+        exit 1
+    fi
+
+    # gh's own auth (GH_TOKEN > GITHUB_TOKEN > keyring) takes priority.
+    # GITHUB_PAT is a LAST-RESORT fallback, tried only when gh has no working
+    # auth — promoting it unconditionally would override keyring credentials
+    # with a possibly narrower token (fine-grained PATs scoped to other repos
+    # produce NOT_FOUND on private repos, indistinguishable from absence).
+    # Cloud sessions' gh reports the proxied token invalid although REST
+    # calls succeed, so the REST backend skips this and lets calls report.
+    if [ "$BACKEND" = "graphql" ] && ! gh auth status &>/dev/null; then
+        if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_PAT:-}" ]; then
+            export GH_TOKEN="$GITHUB_PAT"
+            dim "No gh auth found; falling back to GITHUB_PAT"
+        fi
+        if ! gh auth status &>/dev/null; then
+            error "Not authenticated with GitHub CLI"
+            echo "Run: gh auth login   (or set GH_TOKEN / GITHUB_TOKEN / GITHUB_PAT)" >&2
+            exit 1
+        fi
+    fi
+
+    check_quota
+}
+
+parse_pr_input() {
+    local input="$1"
+
+    if [[ "$input" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+        return 0
+    fi
+
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        echo ":$input"
+        return 0
+    fi
+
+    error "Invalid PR reference: $input"
+    return 1
+}
+
+get_current_repo() {
+    # gh repo view uses GraphQL; the REST backend reads the origin remote
+    if [ "$BACKEND" = "rest" ]; then
+        local url
+        url=$(git remote get-url origin 2>/dev/null || true)
+        url="${url%.git}"
+        if [[ "$url" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+            return 0
+        fi
+        error "Could not determine repository from the origin remote. Use --repo flag or provide a full GitHub URL."
+        exit 1
+    fi
+    gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || {
+        error "Could not determine repository. Use --repo flag or provide a full GitHub URL."
+        exit 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# GraphQL queries
+# ---------------------------------------------------------------------------
+
+# Fetches ALL review threads via cursor pagination; later pages are merged
+# into the first response so callers see one document with complete .nodes.
+fetch_threads() {
+    local owner="$1" repo="$2" pr_number="$3"
+    local cursor="" response merged=""
+    if [ "$BACKEND" = "rest" ]; then
+        fetch_threads_rest "$owner" "$repo" "$pr_number"
+        return
+    fi
+    local query='
+        query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                    title
+                    number
+                    url
+                    headRefOid
+                    headRefName
+                    reviewThreads(first: 100, after: $cursor) {
+                        totalCount
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                            id
+                            isResolved
+                            isOutdated
+                            path
+                            line
+                            startLine
+                            diffSide
+                            # 100 (the per-connection max): suggestions are
+                            # often buried deep in a long thread, and anything
+                            # past this page is invisible to suggestions/agent.
+                            comments(first: 100) {
+                                totalCount
+                                nodes {
+                                    author { login }
+                                    body
+                                    createdAt
+                                    url
+                                    diffHunk
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }'
+
+    while :; do
+        local -a cursor_arg=()
+        [ -n "$cursor" ] && cursor_arg=(-f cursor="$cursor")
+
+        if ! response=$(gh api graphql -f query="$query" \
+                -f owner="$owner" -f repo="$repo" -F pr="$pr_number" \
+                "${cursor_arg[@]}" 2>&1); then
+            api_error "$response" "fetch review threads for PR #$pr_number"
+            return 1
+        fi
+
+        if [ -z "$merged" ]; then
+            merged="$response"
+        else
+            merged=$(jq --argjson extra \
+                "$(jq '.data.repository.pullRequest.reviewThreads.nodes' <<< "$response")" \
+                '.data.repository.pullRequest.reviewThreads.nodes += $extra' <<< "$merged")
+        fi
+
+        if [ "$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' <<< "$response")" != "true" ]; then
+            break
+        fi
+        cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<< "$response")
+    done
+
+    printf '%s\n' "$merged"
+}
+
+fetch_checks() {
+    local owner="$1" repo="$2" pr_number="$3" response
+    if [ "$BACKEND" = "rest" ]; then
+        fetch_checks_rest "$owner" "$repo" "$pr_number"
+        return
+    fi
+
+    if ! response=$(gh api graphql -f query='
+        query($owner: String!, $repo: String!, $pr: Int!) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                    title
+                    number
+                    url
+                    commits(last: 1) {
+                        nodes {
+                            commit {
+                                oid
+                                statusCheckRollup {
+                                    state
+                                    contexts(first: 100) {
+                                        totalCount
+                                        nodes {
+                                            __typename
+                                            ... on CheckRun {
+                                                name
+                                                status
+                                                conclusion
+                                                detailsUrl
+                                                startedAt
+                                                completedAt
+                                                checkSuite {
+                                                    app { name slug }
+                                                }
+                                            }
+                                            ... on StatusContext {
+                                                context
+                                                state
+                                                targetUrl
+                                                description
+                                                creator { login }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }' -f owner="$owner" -f repo="$repo" -F pr="$pr_number" 2>&1); then
+        api_error "$response" "fetch CI checks for PR #$pr_number"
+        return 1
+    fi
+    printf '%s\n' "$response"
+}
+
+# ---------------------------------------------------------------------------
+# REST backend — Claude Code cloud sessions block GraphQL (HTTP 403) but
+# proxy REST, plus /ccr/ routes for review threads. These adapters emit the
+# same document shape as the GraphQL queries, so every formatter is shared.
+# Thread IDs are RT_<pr>_<root comment id>: /ccr/ addresses a thread by PR
+# number and comment ID, and exposes no PRRT_ node ID.
+# Documents are piped to jq on stdin: one review comment's diffHunk can be
+# >10 KB, and a single argv string is capped at 128 KiB on Linux.
+# ---------------------------------------------------------------------------
+
+# GET via gh api, classifying failures. Args: <context> <gh api args...>
+rest_get() {
+    local context="$1" out
+    shift
+    if ! out=$(gh api "$@" 2>&1); then
+        api_error "$out" "$context"
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+fetch_threads_rest() {
+    local owner="$1" repo="$2" pr_number="$3"
+    local base="repos/$owner/$repo/pulls/$pr_number" pr threads comments
+
+    pr=$(rest_get "fetch PR #$pr_number" "$base") || return 1
+    # /ccr/review_threads: [{resolved, outdated, path, line, comment_ids}],
+    # unpaginated. Bodies, authors and hunks come from the comments listing.
+    threads=$(rest_get "fetch review threads for PR #$pr_number" "$base/ccr/review_threads") || return 1
+    comments=$(rest_get "fetch review comments for PR #$pr_number" \
+        --paginate "$base/comments?per_page=100" | jq -s 'add // []') || return 1
+
+    printf '%s\n%s\n%s\n' "$pr" "$threads" "$comments" | jq -s --arg prn "$pr_number" '
+        .[0] as $pr | .[1] as $threads
+        | (.[2] | map({key: (.id | tostring), value: .}) | from_entries) as $byid
+        | {data: {repository: {pullRequest: {
+            title: $pr.title,
+            number: $pr.number,
+            url: $pr.html_url,
+            headRefOid: $pr.head.sha,
+            headRefName: $pr.head.ref,
+            reviewThreads: {
+                totalCount: ($threads | length),
+                pageInfo: {hasNextPage: false, endCursor: null},
+                nodes: [$threads[] | . as $t
+                    | ($t.comment_ids | map($byid[tostring] // empty)
+                       | sort_by(.created_at)) as $cs
+                    | {
+                        id: "RT_\($prn)_\(($cs | map(select(.in_reply_to_id == null)) | .[0].id) // $t.comment_ids[0])",
+                        isResolved: $t.resolved,
+                        isOutdated: $t.outdated,
+                        path: $t.path,
+                        line: $t.line,
+                        startLine: ($cs[0].start_line // null),
+                        diffSide: ($cs[0].side // "RIGHT"),
+                        comments: {
+                            totalCount: ($t.comment_ids | length),
+                            nodes: [$cs[] | {
+                                author: {login: .user.login},
+                                body: .body,
+                                createdAt: .created_at,
+                                url: .html_url,
+                                diffHunk: .diff_hunk
+                            }]
+                        }
+                      }]
+            }
+        }}}}'
+}
+
+fetch_checks_rest() {
+    local owner="$1" repo="$2" pr_number="$3"
+    local base="repos/$owner/$repo" pr sha runs statuses
+
+    pr=$(rest_get "fetch PR #$pr_number" "$base/pulls/$pr_number") || return 1
+    sha=$(jq -r '.head.sha' <<< "$pr")
+    runs=$(rest_get "fetch check runs for PR #$pr_number" \
+        "$base/commits/$sha/check-runs?per_page=100") || return 1
+    statuses=$(rest_get "fetch commit statuses for PR #$pr_number" \
+        "$base/commits/$sha/status?per_page=100") || return 1
+
+    # REST enums are lowercase; GraphQL's are uppercase. The rollup mirrors
+    # GitHub's: any failure → FAILURE, else any pending → PENDING. A partial
+    # REST page cannot establish the aggregate; retain its rows but report UNKNOWN.
+    printf '%s\n%s\n%s\n' "$pr" "$runs" "$statuses" | jq -s '
+        .[0] as $pr | .[1] as $runs | .[2] as $st
+        | ([$runs.check_runs[] | {
+              __typename: "CheckRun",
+              name: .name,
+              status: (.status | ascii_upcase),
+              conclusion: (.conclusion | if . then ascii_upcase else null end),
+              detailsUrl: .details_url,
+              startedAt: .started_at,
+              completedAt: .completed_at,
+              checkSuite: {app: {name: .app.name, slug: .app.slug}}
+           }]
+           + [$st.statuses[] | {
+              __typename: "StatusContext",
+              context: .context,
+              state: (.state | ascii_upcase),
+              targetUrl: .target_url,
+              description: .description,
+              creator: {login: .creator.login}
+           }]) as $nodes
+        | ([$nodes[]
+            | if .__typename == "CheckRun" then
+                if .conclusion == null then "PENDING"
+                elif (.conclusion | IN("FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED")) then "FAILURE"
+                else "SUCCESS" end
+              else
+                if (.state | IN("PENDING", "EXPECTED")) then "PENDING"
+                elif .state == "SUCCESS" then "SUCCESS"
+                else "FAILURE" end
+              end]) as $states
+        | (($runs.total_count // 0) > ($runs.check_runs | length)
+           or ($st.total_count // 0) > ($st.statuses | length)) as $incomplete
+        | {data: {repository: {pullRequest: {
+            title: $pr.title,
+            number: $pr.number,
+            url: $pr.html_url,
+            commits: {nodes: [{commit: {
+                oid: $pr.head.sha,
+                statusCheckRollup: (if ($nodes | length) == 0 and ($incomplete | not) then null else {
+                    state: (if $incomplete then "UNKNOWN"
+                            elif any($states[]; . == "FAILURE") then "FAILURE"
+                            elif any($states[]; . == "PENDING") then "PENDING"
+                            else "SUCCESS" end),
+                    contexts: {
+                        totalCount: (($runs.total_count // 0) + ($st.total_count // 0)),
+                        nodes: $nodes
+                    }
+                } end)
+            }}]}
+        }}}}'
+}
+
+# RT_<pr>_<comment id> → "<pr> <comment id>"
+parse_rest_thread_id() {
+    [[ "$1" =~ ^RT_([0-9]+)_([0-9]+)$ ]] || return 1
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+}
+
+# POST /ccr/.../resolve|unresolve, then re-read the thread list to confirm:
+# the route's response body is not a documented contract. On success prints
+# the GraphQL mutation's shape; on failure prints the error text.
+ccr_set_resolved() {
+    local thread_id="$1" action="$2"
+    local pr cid out state want key
+
+    if ! read -r pr cid < <(parse_rest_thread_id "$thread_id"); then
+        echo "Not a REST thread ID (want RT_<pr>_<comment id>): $thread_id"
+        return 1
+    fi
+    if ! out=$(gh api -X POST "repos/$ACTIVE_REPO/pulls/$pr/ccr/comments/$cid/$action" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+    if ! out=$(gh api "repos/$ACTIVE_REPO/pulls/$pr/ccr/review_threads" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+
+    # Not `.resolved // "missing"`: jq's // also replaces false
+    state=$(jq -r --argjson cid "$cid" \
+        '[.[] | select(any(.comment_ids[]; . == $cid))][0]
+         | if . == null then "missing" else .resolved end' <<< "$out")
+    want="true"; key="resolveReviewThread"
+    [ "$action" = "unresolve" ] && { want="false"; key="unresolveReviewThread"; }
+    if [ "$state" != "$want" ]; then
+        echo "$action of $thread_id returned 2xx but the thread reads resolved=$state"
+        return 1
+    fi
+    jq -n --arg key "$key" --arg id "$thread_id" --argjson resolved "$want" \
+        '{data: {($key): {thread: {id: $id, isResolved: $resolved}}}}'
+}
+
+ccr_reply() {
+    local thread_id="$1" body="$2" pr cid out
+
+    if ! read -r pr cid < <(parse_rest_thread_id "$thread_id"); then
+        echo "Not a REST thread ID (want RT_<pr>_<comment id>): $thread_id"
+        return 1
+    fi
+    if ! out=$(gh api -X POST "repos/$ACTIVE_REPO/pulls/$pr/comments/$cid/replies" \
+            -f body="$body" 2>&1); then
+        printf '%s\n' "$out"
+        return 1
+    fi
+    jq '{data: {addPullRequestReviewThreadReply: {comment: {
+        id: (.id | tostring), url: .html_url, createdAt: .created_at,
+        author: {login: .user.login}}}}}' <<< "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Mutations — dispatch on thread ID shape: RT_ IDs only come from the REST
+# backend, PRRT_ node IDs only from GraphQL.
+# ---------------------------------------------------------------------------
+
+resolve_thread() {
+    local thread_id="$1" dry_run="${2:-false}"
+
+    if [ "$dry_run" = "true" ]; then
+        dim "  [DRY RUN] Would resolve: $thread_id" >&2
+        return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_set_resolved "$thread_id" resolve
+        return
+    fi
+
+    # stderr folded into stdout: on failure, callers classify the captured text
+    gh api graphql -f query='
+        mutation($threadId: ID!) {
+            resolveReviewThread(input: {threadId: $threadId}) {
+                thread { id isResolved }
+            }
+        }' -f threadId="$thread_id" 2>&1
+}
+
+reply_thread() {
+    local thread_id="$1" body="$2" dry_run="${3:-false}"
+
+    if [ "$dry_run" = "true" ]; then
+        dim "  [DRY RUN] Would reply to $thread_id with:" >&2
+        printf '%s\n' "$body" | sed 's/^/    | /' >&2
+        return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_reply "$thread_id" "$body"
+        return
+    fi
+
+    # Body passed as a GraphQL variable with -f (always a string; -F would
+    # coerce a numeric-looking body to a number and fail type-checking).
+    gh api graphql -f query='
+        mutation($threadId: ID!, $body: String!) {
+            addPullRequestReviewThreadReply(
+                input: {pullRequestReviewThreadId: $threadId, body: $body}
+            ) {
+                comment { id url createdAt author { login } }
+            }
+        }' -f threadId="$thread_id" -f body="$body" 2>&1
+}
+
+unresolve_thread() {
+    local thread_id="$1" dry_run="${2:-false}"
+
+    if [ "$dry_run" = "true" ]; then
+        dim "  [DRY RUN] Would unresolve: $thread_id" >&2
+        return 0
+    fi
+    if [[ "$thread_id" == RT_* ]]; then
+        ccr_set_resolved "$thread_id" unresolve
+        return
+    fi
+
+    gh api graphql -f query='
+        mutation($threadId: ID!) {
+            unresolveReviewThread(input: {threadId: $threadId}) {
+                thread { id isResolved }
+            }
+        }' -f threadId="$thread_id" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Formatters — threads
+# ---------------------------------------------------------------------------
+
+print_pr_header() {
+    local pr_number="$1" pr_title="$2" pr_url="$3" extra="${4:-}"
+
+    echo ""
+    if has_gum; then
+        local lines=("PR #$pr_number: $pr_title" "$pr_url")
+        [ -n "$extra" ] && lines+=("$extra")
+        gum style --border double --border-foreground 39 --padding "0 2" "${lines[@]}"
+    else
+        echo "╔══════════════════════════════════════════════════════════════════════════╗"
+        printf "║  PR #%s: %s\n" "$pr_number" "$pr_title"
+        printf "║  %s\n" "$pr_url"
+        [ -n "$extra" ] && printf "║  %s\n" "$extra"
+        echo "╚══════════════════════════════════════════════════════════════════════════╝"
+    fi
+    echo ""
+}
+
+format_threads_human() {
+    local data="$1" show_outdated_only="$2" show_resolved="$3" full_bodies="$4"
+
+    local pr_title pr_number pr_url
+    pr_title=$(echo "$data" | jq -r '.data.repository.pullRequest.title')
+    pr_number=$(echo "$data" | jq -r '.data.repository.pullRequest.number')
+    pr_url=$(echo "$data" | jq -r '.data.repository.pullRequest.url')
+
+    print_pr_header "$pr_number" "$pr_title" "$pr_url"
+
+    # Build jq filter and label
+    local jq_filter label
+    if [ "$show_resolved" = "true" ]; then
+        if [ "$show_outdated_only" = "true" ]; then
+            jq_filter='select(.isResolved == true and .isOutdated == true)'
+            label="resolved outdated"
+        else
+            jq_filter='select(.isResolved == true)'
+            label="resolved"
+        fi
+    else
+        if [ "$show_outdated_only" = "true" ]; then
+            jq_filter='select(.isResolved == false and .isOutdated == true)'
+            label="unresolved outdated"
+        else
+            jq_filter='select(.isResolved == false)'
+            label="unresolved"
+        fi
+    fi
+
+    local threads
+    threads=$(echo "$data" | jq -c ".data.repository.pullRequest.reviewThreads.nodes[] | $jq_filter")
+
+    if [ -z "$threads" ]; then
+        success "No $label threads found"
+        return 0
+    fi
+
+    local count=0
+    while IFS= read -r thread; do
+        [ -z "$thread" ] && continue
+        count=$((count + 1))
+
+        local id path line start_line is_outdated is_resolved author body
+        id=$(echo "$thread" | jq -r '.id')
+        path=$(echo "$thread" | jq -r '.path')
+        line=$(echo "$thread" | jq -r '.line')
+        start_line=$(echo "$thread" | jq -r '.startLine // empty')
+        is_outdated=$(echo "$thread" | jq -r '.isOutdated')
+        is_resolved=$(echo "$thread" | jq -r '.isResolved')
+        author=$(echo "$thread" | jq -r '.comments.nodes[0].author.login // "unknown"')
+        body=$(echo "$thread" | jq -r '.comments.nodes[0].body // ""')
+
+        # GitHub returns line: null once a thread's anchor is rebased away
+        [ "$line" = "null" ] && line="?"
+        local line_info="L$line"
+        [ -n "$start_line" ] && [ "$start_line" != "null" ] && line_info="L${start_line}-${line}"
+
+        local status_icon
+        if [ "$is_resolved" = "true" ]; then
+            status_icon="✅ "
+        elif [ "$is_outdated" = "true" ]; then
+            status_icon="📝 "
+        else
+            status_icon="⚠️  "
+        fi
+
+        echo "${status_icon}${path}:${line_info}"
+        echo "   ID: $id"
+        # Bodies print in full — a clipped review comment can't be acted on.
+        # --full additionally walks the rest of the conversation.
+        if [ "$full_bodies" = "true" ]; then
+            local shown total_comments comment cauthor cbody cdate seen=0
+            total_comments=$(echo "$thread" | jq -r '.comments.totalCount // 0')
+            shown=$(echo "$thread" | jq -r '.comments.nodes | length')
+            while IFS= read -r comment; do
+                [ -z "$comment" ] && continue
+                [ "$seen" -gt 0 ] && echo "   ---"
+                seen=$((seen + 1))
+                cauthor=$(echo "$comment" | jq -r '.author.login // "unknown"')
+                cdate=$(echo "$comment" | jq -r '.createdAt // ""')
+                cbody=$(echo "$comment" | jq -r '.body // ""')
+                echo "   @${cauthor}${cdate:+ ($cdate)}:"
+                printf '%s\n' "$cbody" | sed 's/^/   /'
+            done < <(echo "$thread" | jq -c '.comments.nodes[]')
+            [ "$total_comments" -gt "$shown" ] \
+                && dim "   (showing $shown of $total_comments comments)"
+        else
+            echo "   @$author:"
+            printf '%s\n' "$body" | sed 's/^/   /'
+        fi
+        [ "$is_outdated" = "true" ] && [ "$is_resolved" != "true" ] && echo "   (outdated - code has changed)"
+        echo ""
+    done <<< "$threads"
+
+    echo "---"
+    info "Found $count $label thread(s)"
+
+    if [ "$show_resolved" != "true" ]; then
+        echo ""
+        dim "To resolve a thread:"
+        dim "  gh-resolve resolve <THREAD_ID>"
+        dim ""
+        dim "To resolve all outdated threads:"
+        dim "  gh-resolve resolve --outdated $pr_number"
+    fi
+}
+
+format_threads_json() {
+    local data="$1" show_outdated_only="$2" show_resolved="$3" full_bodies="$4"
+
+    local jq_filter
+    if [ "$show_resolved" = "true" ]; then
+        if [ "$show_outdated_only" = "true" ]; then
+            jq_filter='select(.isResolved == true and .isOutdated == true)'
+        else
+            jq_filter='select(.isResolved == true)'
+        fi
+    else
+        if [ "$show_outdated_only" = "true" ]; then
+            jq_filter='select(.isResolved == false and .isOutdated == true)'
+        else
+            jq_filter='select(.isResolved == false)'
+        fi
+    fi
+
+    local body_expr extra_expr
+    if [ "$full_bodies" = "true" ]; then
+        body_expr='[.comments.nodes[] | {author: .author.login, body: .body, createdAt: .createdAt, url: .url}]'
+        extra_expr='url: (.comments.nodes[0].url // null), diffHunk: (.comments.nodes[0].diffHunk // null),'
+    else
+        body_expr='[.comments.nodes[0] | {author: .author.login, createdAt: .createdAt, body: .body}]'
+        extra_expr=''
+    fi
+
+    echo "$data" | jq "{
+        pr: {
+            number: .data.repository.pullRequest.number,
+            title: .data.repository.pullRequest.title,
+            url: .data.repository.pullRequest.url
+        },
+        totalThreads: .data.repository.pullRequest.reviewThreads.totalCount,
+        threads: [.data.repository.pullRequest.reviewThreads.nodes[] | $jq_filter | {
+            id: .id,
+            path: .path,
+            line: .line,
+            startLine: .startLine,
+            isOutdated: .isOutdated,
+            isResolved: .isResolved,
+            $extra_expr
+            comments: ($body_expr)
+        }]
+    }"
+}
+
+# ---------------------------------------------------------------------------
+# Formatters — CI checks
+# ---------------------------------------------------------------------------
+
+format_checks_human() {
+    local data="$1"
+
+    local pr_title pr_number pr_url commit_oid rollup_state
+    pr_title=$(echo "$data" | jq -r '.data.repository.pullRequest.title')
+    pr_number=$(echo "$data" | jq -r '.data.repository.pullRequest.number')
+    pr_url=$(echo "$data" | jq -r '.data.repository.pullRequest.url')
+    commit_oid=$(echo "$data" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.oid // "unknown"')
+    rollup_state=$(echo "$data" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state // "UNKNOWN"')
+
+    print_pr_header "$pr_number" "$pr_title" "$pr_url" "HEAD: ${commit_oid:0:12}"
+
+    case "$rollup_state" in
+        SUCCESS)  info "✅ Overall: PASSING" ;;
+        FAILURE)  error "❌ Overall: FAILING" ;;
+        PENDING)  warn "⏳ Overall: PENDING" ;;
+        ERROR)    error "💥 Overall: ERROR" ;;
+        EXPECTED) dim "⏸️  Overall: EXPECTED" ;;
+        *)        warn "❓ Overall: $rollup_state" ;;
+    esac
+    echo ""
+
+    local contexts
+    contexts=$(echo "$data" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [] | .[]')
+
+    if [ -z "$contexts" ]; then
+        dim "No CI checks found"
+        return 0
+    fi
+
+    local fail_count=0 pass_count=0 pending_count=0 other_count=0
+    local failures="" pending="" successes="" others=""
+
+    while IFS= read -r ctx; do
+        [ -z "$ctx" ] && continue
+
+        local typename
+        typename=$(echo "$ctx" | jq -r '.__typename')
+
+        if [ "$typename" = "CheckRun" ]; then
+            local name conclusion status details_url app_name
+            name=$(echo "$ctx" | jq -r '.name // "unknown"')
+            conclusion=$(echo "$ctx" | jq -r '.conclusion // "null"')
+            status=$(echo "$ctx" | jq -r '.status // "UNKNOWN"')
+            details_url=$(echo "$ctx" | jq -r '.detailsUrl // ""')
+            app_name=$(echo "$ctx" | jq -r '.checkSuite.app.name // ""')
+
+            local display_name="$name"
+            [ -n "$app_name" ] && display_name="$name ($app_name)"
+
+            case "$conclusion" in
+                FAILURE|TIMED_OUT|CANCELLED|STARTUP_FAILURE)
+                    fail_count=$((fail_count + 1))
+                    failures+="  ❌ ${display_name}"$'\n'
+                    [ -n "$details_url" ] && failures+="     ${details_url}"$'\n'
+                    ;;
+                SUCCESS)
+                    pass_count=$((pass_count + 1))
+                    successes+="  ✅ ${display_name}"$'\n'
+                    ;;
+                ACTION_REQUIRED)
+                    other_count=$((other_count + 1))
+                    others+="  ⚡ ${display_name} — action required"$'\n'
+                    [ -n "$details_url" ] && others+="     ${details_url}"$'\n'
+                    ;;
+                NEUTRAL|SKIPPED|STALE)
+                    other_count=$((other_count + 1))
+                    others+="  ⏭️  ${display_name} — ${conclusion,,}"$'\n'
+                    ;;
+                null|"null")
+                    if [[ "$status" =~ ^(IN_PROGRESS|QUEUED|WAITING|REQUESTED|PENDING)$ ]]; then
+                        pending_count=$((pending_count + 1))
+                        pending+="  ⏳ ${display_name} — ${status,,}"$'\n'
+                    else
+                        other_count=$((other_count + 1))
+                        others+="  ❓ ${display_name} — status: ${status}"$'\n'
+                    fi
+                    ;;
+                *)
+                    other_count=$((other_count + 1))
+                    others+="  ❓ ${display_name} — ${conclusion}"$'\n'
+                    ;;
+            esac
+        elif [ "$typename" = "StatusContext" ]; then
+            local ctx_name state target_url description
+            ctx_name=$(echo "$ctx" | jq -r '.context // "unknown"')
+            state=$(echo "$ctx" | jq -r '.state // "UNKNOWN"')
+            target_url=$(echo "$ctx" | jq -r '.targetUrl // ""')
+            description=$(echo "$ctx" | jq -r '.description // ""')
+
+            local desc_suffix=""
+            [ -n "$description" ] && desc_suffix=" — $description"
+
+            case "$state" in
+                FAILURE|ERROR)
+                    fail_count=$((fail_count + 1))
+                    failures+="  ❌ ${ctx_name}${desc_suffix}"$'\n'
+                    [ -n "$target_url" ] && failures+="     ${target_url}"$'\n'
+                    ;;
+                SUCCESS)
+                    pass_count=$((pass_count + 1))
+                    successes+="  ✅ ${ctx_name}${desc_suffix}"$'\n'
+                    ;;
+                PENDING|EXPECTED)
+                    pending_count=$((pending_count + 1))
+                    pending+="  ⏳ ${ctx_name}${desc_suffix}"$'\n'
+                    ;;
+                *)
+                    other_count=$((other_count + 1))
+                    others+="  ❓ ${ctx_name} — ${state}${desc_suffix}"$'\n'
+                    ;;
+            esac
+        fi
+    done <<< "$contexts"
+
+    # Print grouped: failures first, then pending, then others, then passing
+    [ -n "$failures" ] && { error "Failures ($fail_count):"; echo "$failures"; }
+    [ -n "$pending" ]  && { warn "Pending ($pending_count):"; echo "$pending"; }
+    [ -n "$others" ]   && { dim "Other ($other_count):"; echo "$others"; }
+    [ -n "$successes" ] && { success "Passing ($pass_count):"; echo "$successes"; }
+
+    echo "---"
+    local total=$((fail_count + pass_count + pending_count + other_count))
+    info "$total check(s): $pass_count passed, $fail_count failed, $pending_count pending, $other_count other"
+
+    local contexts_total
+    contexts_total=$(echo "$data" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount // 0')
+    if [ "$contexts_total" -gt "$total" ]; then
+        warn "⚠️  Showing $total of $contexts_total checks (API page limit) — some checks are not listed"
+    fi
+}
+
+format_checks_json() {
+    local data="$1"
+
+    echo "$data" | jq '{
+        pr: {
+            number: .data.repository.pullRequest.number,
+            title: .data.repository.pullRequest.title,
+            url: .data.repository.pullRequest.url
+        },
+        head: .data.repository.pullRequest.commits.nodes[0].commit.oid,
+        rollupState: .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state,
+        contextsTotal: .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount,
+        checks: [
+            .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]
+            | if .__typename == "CheckRun" then {
+                type: "check_run",
+                name: .name,
+                status: .status,
+                conclusion: .conclusion,
+                app: .checkSuite.app.name,
+                url: .detailsUrl,
+                startedAt: .startedAt,
+                completedAt: .completedAt
+              } elif .__typename == "StatusContext" then {
+                type: "status",
+                name: .context,
+                state: .state,
+                description: .description,
+                url: .targetUrl,
+                creator: .creator.login
+              } else {
+                type: .__typename,
+                raw: .
+              } end
+        ],
+        summary: (
+            .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes as $n |
+            {
+                total: ($n | length),
+                passed: ([$n[] | select(
+                    (.__typename == "CheckRun" and .conclusion == "SUCCESS")
+                    or (.__typename == "StatusContext" and .state == "SUCCESS")
+                )] | length),
+                failed: ([$n[] | select(
+                    (.__typename == "CheckRun" and (.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "CANCELLED"))
+                    or (.__typename == "StatusContext" and (.state == "FAILURE" or .state == "ERROR"))
+                )] | length),
+                pending: ([$n[] | select(
+                    (.__typename == "CheckRun" and .conclusion == null and (.status == "IN_PROGRESS" or .status == "QUEUED" or .status == "WAITING" or .status == "REQUESTED" or .status == "PENDING"))
+                    or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED"))
+                )] | length)
+            }
+        )
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# Suggestions — extract ```suggestion blocks and apply them locally.
+# GitHub exposes suggestion CONTENT via comment bodies, but has no public API
+# to APPLY them (web-UI only), so --apply splices the local checkout instead.
+# ---------------------------------------------------------------------------
+
+# TSV per unresolved thread carrying a suggestion:
+#   threadId  path  startLine  endLine  b64:<replacement>  isOutdated  diffSide
+# Empty fields use "-" / a "b64:" prefix — tab is IFS whitespace, and bash
+# read collapses runs of it, so a truly empty field would shift all columns.
+suggestions_tsv() {
+    jq -r '
+        .data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | . as $t
+        | ([$t.comments.nodes[]?
+            | ((.body // "")
+               | capture("```suggestion[ \\t]*\\r?\\n(?<sug>.*?)\\n?```"; "m").sug)]
+           | .[0]) as $sug
+        | select($sug != null)
+        | [$t.id,
+           (($t.path // "-") | if . == "" then "-" else . end),
+           (($t.startLine // $t.line) // "-"),
+           ($t.line // "-"),
+           ("b64:" + ($sug | @base64)),
+           ($t.isOutdated | tostring),
+           ($t.diffSide // "RIGHT")]
+        | @tsv'
+}
+
+# Undo the TSV sentinels from suggestions_tsv into normal shell values.
+decode_tsv_fields() {
+    [ "$path"  = "-" ] && path=""
+    [ "$start" = "-" ] && start=""
+    [ "$end"   = "-" ] && end=""
+    b64="${b64#b64:}"
+}
+
+# Reject traversal and symlinks, including directory components, before any edit.
+path_is_safe() {
+    local root="$1" path="$2" part current="$1"
+    case "$path" in
+        ''|/*|../*|*/../*|*/..|..) return 1 ;;
+    esac
+    local -a parts
+    IFS='/' read -r -a parts <<< "$path"
+    for part in "${parts[@]}"; do
+        current+="/$part"
+        [ ! -L "$current" ] || return 1
+    done
+    [ -f "$root/$path" ]
+}
+
+# Open relative to pinned directory descriptors without following symlinks. Rechecking
+# with -L alone would leave a race between preflight and the final write.
+splice_lines() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY_SPLICE'
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+root, path, start, end = sys.argv[1:]
+start, end = int(start), int(end)
+parts = path.split("/")
+if not path or path.startswith("/") or ".." in parts or start < 1 or end < start:
+    sys.exit("Unsafe suggestion path or range")
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for part in parts[:-1]:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    fd = os.open(parts[-1], os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    with os.fdopen(fd, "r+b") as target, tempfile.TemporaryFile() as staged:
+        if not stat.S_ISREG(os.fstat(target.fileno()).st_mode):
+            sys.exit("Suggestion target is not a regular file")
+        replacement = os.environ["SUGGESTION"].encode()
+        total = 0
+        for total, line in enumerate(target, 1):
+            if total == start and replacement:
+                staged.write(replacement + b"\n")
+            if total < start or total > end:
+                staged.write(line)
+        if end > total:
+            sys.exit(f"Range L{start}-L{end} exceeds {path} ({total} lines)")
+        staged.seek(0)
+        target.seek(0)
+        shutil.copyfileobj(staged, target)
+        target.truncate()
+finally:
+    os.close(directory)
+PY_SPLICE
+}
+
+cmd_suggestions() {
+    local repo="$1" pr_number="$2" do_apply="$3" do_resolve="$4" dry_run="$5" json_output="$6" quiet="$7" force="$8"
+    local owner repo_name
+    IFS='/' read -r owner repo_name <<< "$repo"
+
+    [ "$json_output" != "true" ] && [ "$quiet" != "true" ] && info "Fetching threads for PR #$pr_number..."
+
+    local data
+    data=$(fetch_threads "$owner" "$repo_name" "$pr_number") || {
+        error "Failed to fetch PR data"
+        exit 1
+    }
+    if ! echo "$data" | jq -e '.data.repository.pullRequest' &>/dev/null; then
+        error "PR #$pr_number not found in $repo"
+        exit 1
+    fi
+
+    local head_oid head_ref
+    head_oid=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefOid // ""')
+    head_ref=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefName // ""')
+
+    if [ "$json_output" = "true" ]; then
+        echo "$data" | jq '{
+            pr: {
+                number: .data.repository.pullRequest.number,
+                url: .data.repository.pullRequest.url,
+                headRefOid: .data.repository.pullRequest.headRefOid,
+                headRefName: .data.repository.pullRequest.headRefName
+            },
+            suggestions: [
+                .data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved == false)
+                | . as $t
+                | ([$t.comments.nodes[]?
+                    | ((.body // "")
+                       | capture("```suggestion[ \\t]*\\r?\\n(?<sug>.*?)\\n?```"; "m").sug)]
+                   | .[0]) as $sug
+                | select($sug != null)
+                | {
+                    threadId: $t.id,
+                    path: $t.path,
+                    startLine: ($t.startLine // $t.line),
+                    endLine: $t.line,
+                    isOutdated: $t.isOutdated,
+                    diffSide: ($t.diffSide // "RIGHT"),
+                    suggestion: $sug
+                  }
+            ]
+        }'
+        return 0
+    fi
+
+    local rows
+    rows=$(echo "$data" | suggestions_tsv)
+    if [ -z "$rows" ]; then
+        [ "$quiet" != "true" ] && success "No supported unresolved suggestions found"
+        return 0
+    fi
+
+    # ------------------------------------------------------------------ list
+    if [ "$do_apply" != "true" ]; then
+        local n=0
+        while IFS=$'\t' read -r tid path start end b64 outdated side; do
+            [ -z "$tid" ] && continue
+            decode_tsv_fields
+            n=$((n + 1))
+            local range="L${start:-?}"
+            [ -n "$end" ] && [ "$end" != "$start" ] && range="L${start}-L${end}"
+            echo "💡 ${path:-unknown}:${range}"
+            echo "   Thread: $tid"
+            [ "$outdated" = "true" ] && warn "   (outdated — not applicable)"
+            # Full body, never elided: a partial suggestion is unreviewable,
+            # and blank output would otherwise be ambiguous with a deletion.
+            local preview
+            preview=$(base64 -d <<< "$b64")
+            if [ -z "$preview" ]; then
+                dim "   | (empty — deletes L${start:-?}${end:+-L$end})"
+            else
+                printf '%s\n' "$preview" | sed 's/^/   | /'
+            fi
+            echo ""
+        done <<< "$rows"
+        info "Found $n suggestion(s). Apply with: gh-resolve suggestions --apply $pr_number"
+        return 0
+    fi
+
+    # ----------------------------------------------------------------- apply
+    command -v python3 >/dev/null || { error "suggestions --apply requires python3"; return 1; }
+    local toplevel
+    toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        error "suggestions --apply must run inside a git checkout of $repo"
+        exit 1
+    }
+
+    local local_head
+    local_head=$(git -C "$toplevel" rev-parse HEAD 2>/dev/null || echo "")
+    if [ "$local_head" != "$head_oid" ]; then
+        if [ "$force" != "true" ]; then
+            error "Local HEAD does not match PR head — line numbers would be unreliable."
+            error "  local:   ${local_head:-none}"
+            error "  PR head: $head_oid ($head_ref)"
+            error "Check out the PR branch (gh pr checkout $pr_number) or pass --force."
+            exit 1
+        fi
+        warn "HEAD mismatch overridden with --force — verify the result carefully."
+    fi
+
+    # Sort: path ascending, start line DESCENDING — bottom-up keeps earlier
+    # line numbers valid as splices land.
+    local sorted
+    sorted=$(sort -t "$(printf '\t')" -k2,2 -k3,3rn <<< "$rows")
+
+    # Pre-flight every target before touching anything
+    local -A seen_paths=()
+    local preflight_failed=false
+    while IFS=$'\t' read -r tid path start end b64 outdated side; do
+        [ -z "$tid" ] && continue
+        decode_tsv_fields
+        [ "$outdated" = "true" ] && continue
+        [ -z "$start" ] || [ -z "$end" ] && continue
+        [ "$side" = "LEFT" ] && continue
+        if ! path_is_safe "$toplevel" "$path"; then
+            error "Refusing missing, non-regular or unsafe path from API: '$path'"
+            preflight_failed=true
+            continue
+        fi
+        if [ -z "${seen_paths[$path]:-}" ]; then
+            seen_paths[$path]=1
+            if ! git -C "$toplevel" diff --quiet -- "$path" 2>/dev/null \
+               || ! git -C "$toplevel" diff --cached --quiet -- "$path" 2>/dev/null; then
+                if [ "$force" != "true" ]; then
+                    error "$path has uncommitted changes — commit/stash first, or pass --force"
+                    preflight_failed=true
+                fi
+            fi
+        fi
+    done <<< "$sorted"
+    if [ "$preflight_failed" = "true" ]; then
+        error "Pre-flight failed; nothing was modified."
+        exit 1
+    fi
+
+    local applied=0 skipped=0 applied_tids="" apply_failed=false
+    local prev_path="" prev_start=""
+
+    while IFS=$'\t' read -r tid path start end b64 outdated side; do
+        [ -z "$tid" ] && continue
+        decode_tsv_fields
+
+        if [ "$outdated" = "true" ]; then
+            warn "  ⏭️  $tid: outdated — line numbers stale, skipping"
+            skipped=$((skipped + 1)); continue
+        fi
+        if [ -z "$start" ] || [ -z "$end" ]; then
+            warn "  ⏭️  $tid: no line information, skipping"
+            skipped=$((skipped + 1)); continue
+        fi
+        if [ "$side" = "LEFT" ]; then
+            warn "  ⏭️  $tid: comment on deleted lines (LEFT side), skipping"
+            skipped=$((skipped + 1)); continue
+        fi
+        # Overlap: sorted bottom-up, so a previously applied splice in this
+        # file started at prev_start; anything reaching into it overlaps.
+        if [ "$path" = "$prev_path" ] && [ -n "$prev_start" ] && [ "$end" -ge "$prev_start" ]; then
+            warn "  ⏭️  $tid: overlaps an already-applied suggestion in $path, skipping"
+            skipped=$((skipped + 1)); continue
+        fi
+
+        local replacement
+        replacement=$(base64 -d <<< "$b64")
+
+        if [ "$dry_run" = "true" ]; then
+            dim "  [DRY RUN] $path:L$start-L$end ($tid)"
+            sed -n "${start},${end}p" "$toplevel/$path" | sed 's/^/    - /'
+            [ -n "$replacement" ] && printf '%s\n' "$replacement" | sed 's/^/    + /'
+            applied=$((applied + 1))
+        else
+            if SUGGESTION="$replacement" splice_lines "$toplevel" "$path" "$start" "$end"; then
+                [ "$quiet" != "true" ] && success "  ✓ Applied: $path:L$start-L$end"
+                applied=$((applied + 1))
+                applied_tids+="$tid"$'\n'
+            else
+                error "  ✗ Failed: $path:L$start-L$end ($tid)"
+                apply_failed=true
+                skipped=$((skipped + 1))
+                continue
+            fi
+        fi
+        prev_path="$path"; prev_start="$start"
+    done <<< "$sorted"
+
+    echo ""
+    if [ "$dry_run" = "true" ]; then
+        info "[DRY RUN] Would apply $applied suggestion(s); $skipped skipped"
+        return 0
+    fi
+    success "Applied $applied suggestion(s); $skipped skipped"
+    [ "$applied" -gt 0 ] && dim "Review with: git -C $toplevel diff   — then commit once."
+
+    # Optionally resolve the threads whose suggestions landed
+    if [ "$do_resolve" = "true" ] && [ -n "$applied_tids" ]; then
+        local resolved=0 rfailed=0
+        while IFS= read -r tid; do
+            [ -z "$tid" ] && continue
+            local result
+            if result=$(resolve_thread "$tid" "false") \
+               && [ "$(echo "$result" | jq -r '.data.resolveReviewThread.thread.isResolved' 2>/dev/null)" = "true" ]; then
+                resolved=$((resolved + 1))
+            else
+                if is_rate_limited "$result"; then
+                    error "  ✗ Rate limited resolving $tid — stopping"
+                    break
+                fi
+                rfailed=$((rfailed + 1))
+                error "  ✗ Failed to resolve $tid (${result:0:120})"
+            fi
+            sleep 0.5
+        done <<< "$applied_tids"
+        success "Resolved $resolved thread(s)"
+        [ "$rfailed" -gt 0 ] && warn "Failed to resolve $rfailed thread(s)"
+    fi
+    [ "$apply_failed" = "false" ]
+}
+
+# ---------------------------------------------------------------------------
+# Agent bundle — everything an LLM agent needs to analyse and fix each issue:
+# code context (diffHunk), full thread conversation, line range pinned to the
+# head commit, thread IDs for resolution, and framing instructions.
+# jq programs live in single-quoted heredocs: no bash escaping of backticks.
+# ---------------------------------------------------------------------------
+
+format_agent_markdown() {
+    local data="$1" repo="$2" outdated_only="$3"
+
+    local prog
+    prog=$(cat <<'JQ'
+        .data.repository.pullRequest as $pr
+        | ($pr.reviewThreads.nodes
+           | map(select(.isResolved == false)
+                 | select($outdated_only != "true" or .isOutdated == true))
+           | sort_by([(.path // "~"), (.line // 0)])) as $threads
+        | if ($threads | length) == 0 then
+            "No unresolved review threads. Nothing to fix."
+          else
+        [
+        "# Review issues — \($repo)#\($pr.number): \($pr.title)",
+        "",
+        "- PR: \($pr.url)",
+        "- Head commit: \($pr.headRefOid) (branch: \($pr.headRefName))",
+        "- Unresolved threads: \($threads | length) (\([$threads[] | select(.isOutdated)] | length) outdated)",
+        "",
+        "Instructions: you are given GitHub PR review threads. For each thread,",
+        "decide whether the issue is valid, explain the fix, and produce an exact",
+        "patch against the head commit above — line numbers refer to that commit",
+        "unless the thread is marked OUTDATED. Address each thread by its ID; do",
+        "not conflate nearby threads. Where a comment contains a ```suggestion",
+        "block, audit it for semantic correctness before adopting it. After a fix",
+        "lands, the thread can be resolved with: gh-resolve resolve <THREAD_ID>",
+        "",
+        "---",
+        ($threads | to_entries[] | (.key + 1) as $n | .value as $t |
+            ($t.comments.nodes // []) as $cs |
+            ([
+            "",
+            "## \($n). \($t.id) — \($t.path // "unknown file"):L\($t.startLine // $t.line // "?")\(if $t.line and $t.startLine and ($t.line != $t.startLine) then "-L\($t.line)" else "" end)",
+            "",
+            "- URL: \($cs[0].url // $pr.url)",
+            "- Side: \($t.diffSide // "RIGHT")"
+            ]
+            + (if $t.isOutdated then ["- ⚠ OUTDATED: code changed since; line numbers refer to an older commit"] else [] end)
+            + (if ($t.comments.totalCount // 0) > ($cs | length) then ["- Note: showing \($cs | length) of \($t.comments.totalCount) comments"] else [] end)
+            + [
+            "",
+            "### Code context",
+            "",
+            "````diff",
+            ($cs[0].diffHunk // "(no diff hunk available)"),
+            "````",
+            "",
+            "### Thread"
+            ]
+            + [$cs[] |
+                "\n**@\(.author.login // "unknown")** (\(.createdAt // "?")):\n\n"
+                + ((.body // "") | split("\n") | map("> " + .) | join("\n"))
+            ]
+            | join("\n"))
+        )
+        ] | join("\n")
+        end
+JQ
+)
+    echo "$data" | jq -r --arg repo "$repo" --arg outdated_only "$outdated_only" "$prog"
+}
+
+format_agent_json() {
+    local data="$1" repo="$2" outdated_only="$3"
+
+    local prog
+    prog=$(cat <<'JQ'
+        .data.repository.pullRequest as $pr
+        | ($pr.reviewThreads.nodes
+           | map(select(.isResolved == false)
+                 | select($outdated_only != "true" or .isOutdated == true))
+           | sort_by([(.path // "~"), (.line // 0)])) as $threads
+        | {
+            schema: "gh-resolve-agent/v1",
+            repository: $repo,
+            pr: {
+                number: $pr.number,
+                title: $pr.title,
+                url: $pr.url,
+                headRefOid: $pr.headRefOid,
+                headRefName: $pr.headRefName
+            },
+            instructions: "For each thread: judge validity, explain the fix, produce an exact patch against pr.headRefOid. Line numbers refer to that commit unless isOutdated. Audit any suggestion block before adopting it. Resolve fixed threads by threadId.",
+            threadCount: ($threads | length),
+            threads: [$threads[] | {
+                threadId: .id,
+                path: .path,
+                startLine: (.startLine // .line),
+                endLine: .line,
+                diffSide: (.diffSide // "RIGHT"),
+                isOutdated: .isOutdated,
+                url: (.comments.nodes[0].url // null),
+                diffHunk: (.comments.nodes[0].diffHunk // null),
+                commentsTotal: (.comments.totalCount // (.comments.nodes | length)),
+                comments: [.comments.nodes[] | {
+                    author: (.author.login // "unknown"),
+                    createdAt: .createdAt,
+                    body: .body
+                }],
+                suggestion: ([.comments.nodes[]?
+                    | ((.body // "")
+                       | capture("```suggestion[ \\t]*\\r?\\n(?<sug>.*?)\\n?```"; "m").sug)]
+                    | .[0])
+            }]
+        }
+JQ
+)
+    echo "$data" | jq --arg repo "$repo" --arg outdated_only "$outdated_only" "$prog"
+}
+
+cmd_agent() {
+    local repo="$1" pr_number="$2" outdated_only="$3" json_output="$4" quiet="$5"
+    local owner repo_name
+    IFS='/' read -r owner repo_name <<< "$repo"
+
+    [ "$json_output" != "true" ] && [ "$quiet" != "true" ] && info "Fetching threads for PR #$pr_number..." >&2
+
+    local data
+    data=$(fetch_threads "$owner" "$repo_name" "$pr_number") || {
+        error "Failed to fetch PR data"
+        exit 1
+    }
+    if ! echo "$data" | jq -e '.data.repository.pullRequest' &>/dev/null; then
+        error "PR #$pr_number not found in $repo"
+        exit 1
+    fi
+
+    if [ "$json_output" = "true" ]; then
+        format_agent_json "$data" "$repo" "$outdated_only"
+    else
+        format_agent_markdown "$data" "$repo" "$outdated_only"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+    local repo="$1" pr_number="$2" outdated_only="$3" json_output="$4" show_resolved="$5" full_bodies="$6"
+
+    IFS='/' read -r owner repo_name <<< "$repo"
+
+    [ "$json_output" != "true" ] && info "Fetching threads for PR #$pr_number..."
+
+    local data
+    data=$(fetch_threads "$owner" "$repo_name" "$pr_number") || {
+        error "Failed to fetch PR data"
+        exit 1
+    }
+
+    if ! echo "$data" | jq -e '.data.repository.pullRequest' &>/dev/null; then
+        error "PR #$pr_number not found in $repo"
+        exit 1
+    fi
+
+    if [ "$json_output" = "true" ]; then
+        format_threads_json "$data" "$outdated_only" "$show_resolved" "$full_bodies"
+    else
+        format_threads_human "$data" "$outdated_only" "$show_resolved" "$full_bodies"
+    fi
+}
+
+cmd_checks() {
+    local repo="$1" pr_number="$2" json_output="$3"
+
+    IFS='/' read -r owner repo_name <<< "$repo"
+
+    [ "$json_output" != "true" ] && info "Fetching CI checks for PR #$pr_number..."
+
+    local data
+    data=$(fetch_checks "$owner" "$repo_name" "$pr_number") || {
+        error "Failed to fetch CI check data"
+        exit 1
+    }
+
+    if ! echo "$data" | jq -e '.data.repository.pullRequest' &>/dev/null; then
+        error "PR #$pr_number not found in $repo"
+        exit 1
+    fi
+
+    if [ "$json_output" = "true" ]; then
+        format_checks_json "$data"
+    else
+        format_checks_human "$data"
+    fi
+}
+
+cmd_resolve() {
+    local repo="$1" pr_number="$2" thread_id="$3" resolve_all="$4" resolve_outdated="$5" dry_run="$6" quiet="$7"
+
+    IFS='/' read -r owner repo_name <<< "$repo"
+
+    # Single thread
+    if [ -n "$thread_id" ]; then
+        [ "$quiet" != "true" ] && info "Resolving thread: $thread_id"
+
+        local result
+        result=$(resolve_thread "$thread_id" "$dry_run") || {
+            api_error "$result" "resolve thread $thread_id"
+            exit 1
+        }
+
+        if [ "$dry_run" != "true" ]; then
+            local resolved
+            resolved=$(echo "$result" | jq -r '.data.resolveReviewThread.thread.isResolved')
+            if [ "$resolved" = "true" ]; then
+                success "Thread resolved successfully"
+            else
+                error "Thread resolution failed"
+                exit 1
+            fi
+        fi
+        return 0
+    fi
+
+    # Bulk — requires PR number
+    if [ -z "$pr_number" ]; then
+        error "PR number required for bulk resolution"
+        exit 1
+    fi
+
+    [ "$quiet" != "true" ] && info "Fetching threads for PR #$pr_number..."
+
+    local data
+    data=$(fetch_threads "$owner" "$repo_name" "$pr_number") || {
+        error "Failed to fetch PR data"
+        exit 1
+    }
+
+    local jq_filter
+    if [ "$resolve_outdated" = "true" ]; then
+        jq_filter='select(.isResolved == false and .isOutdated == true)'
+        [ "$quiet" != "true" ] && info "Resolving outdated threads..."
+    else
+        jq_filter='select(.isResolved == false)'
+        [ "$quiet" != "true" ] && info "Resolving all unresolved threads..."
+    fi
+
+    local threads
+    threads=$(echo "$data" | jq -r ".data.repository.pullRequest.reviewThreads.nodes[] | $jq_filter | .id")
+
+    if [ -z "$threads" ]; then
+        [ "$quiet" != "true" ] && success "No threads to resolve"
+        return 0
+    fi
+
+    local total_pending resolved_count=0 failed_count=0 rate_limited=false
+    total_pending=$(grep -c . <<< "$threads" || true)
+
+    while IFS= read -r tid; do
+        [ -z "$tid" ] && continue
+
+        local result
+        if result=$(resolve_thread "$tid" "$dry_run") \
+           && { [ "$dry_run" = "true" ] || [ "$(jq -r ".data.resolveReviewThread.thread.isResolved" <<< "$result")" = "true" ]; }; then
+            resolved_count=$((resolved_count + 1))
+            [ "$quiet" != "true" ] && [ "$dry_run" != "true" ] && success "  ✓ Resolved: $tid"
+        else
+            if is_rate_limited "$result"; then
+                rate_limited=true
+                error "  ✗ Rate limited at $tid — stopping to avoid making it worse"
+                break
+            fi
+            failed_count=$((failed_count + 1))
+            [ "$quiet" != "true" ] && error "  ✗ Failed: $tid (${result:0:120})"
+        fi
+        # GitHub asks for spacing between mutation requests (secondary limits)
+        [ "$dry_run" != "true" ] && sleep 0.5
+    done <<< "$threads"
+
+    echo ""
+    if [ "$dry_run" = "true" ]; then
+        info "[DRY RUN] Would resolve $resolved_count thread(s)"
+    else
+        success "Resolved $resolved_count thread(s)"
+        [ "$failed_count" -gt 0 ] && warn "Failed to resolve $failed_count thread(s)"
+        if [ "$rate_limited" = "true" ]; then
+            local remaining=$((total_pending - resolved_count - failed_count))
+            warn "$remaining thread(s) left unprocessed due to rate limiting. Re-run after the limit resets."
+            exit 1
+        fi
+    fi
+    [ "$failed_count" -eq 0 ]
+}
+
+cmd_reply() {
+    local thread_id="$1" message="$2" resolve_after="$3" dry_run="$4" quiet="$5"
+
+    if [ -z "$thread_id" ]; then
+        error "Thread ID required"
+        echo "Usage: gh-resolve reply <THREAD_ID> -m <BODY>" >&2
+        exit 1
+    fi
+
+    # "-" (or an omitted -m with piped stdin) reads the body from stdin
+    local body="$message"
+    if [ "$body" = "-" ] || { [ -z "$body" ] && [ ! -t 0 ]; }; then
+        body=$(cat)
+    fi
+    if [ -z "$body" ]; then
+        error "Reply body required: -m <BODY>, or pipe it on stdin"
+        exit 1
+    fi
+
+    [ "$quiet" != "true" ] && info "Replying to thread: $thread_id"
+
+    local result
+    result=$(reply_thread "$thread_id" "$body" "$dry_run") || {
+        api_error "$result" "reply to thread $thread_id"
+        exit 1
+    }
+
+    if [ "$dry_run" = "true" ]; then
+        [ "$resolve_after" = "true" ] && dim "  [DRY RUN] Would then resolve: $thread_id"
+        return 0
+    fi
+
+    local url
+    url=$(echo "$result" | jq -r '.data.addPullRequestReviewThreadReply.comment.url // empty' 2>/dev/null)
+    if [ -z "$url" ]; then
+        api_error "$result" "reply to thread $thread_id"
+        exit 1
+    fi
+    success "Reply posted"
+    [ "$quiet" != "true" ] && dim "  $url"
+
+    [ "$resolve_after" != "true" ] && return 0
+
+    local rresult
+    if rresult=$(resolve_thread "$thread_id" "false") \
+       && [ "$(echo "$rresult" | jq -r '.data.resolveReviewThread.thread.isResolved' 2>/dev/null)" = "true" ]; then
+        success "Thread resolved"
+    else
+        api_error "$rresult" "resolve thread $thread_id after replying"
+        exit 1
+    fi
+}
+
+cmd_unresolve() {
+    local thread_id="$1" dry_run="$2" quiet="$3"
+
+    if [ -z "$thread_id" ]; then
+        error "Thread ID required"
+        exit 1
+    fi
+
+    [ "$quiet" != "true" ] && info "Unresolving thread: $thread_id"
+
+    local result
+    result=$(unresolve_thread "$thread_id" "$dry_run") || {
+        api_error "$result" "unresolve thread $thread_id"
+        exit 1
+    }
+
+    if [ "$dry_run" != "true" ]; then
+        local resolved
+        resolved=$(echo "$result" | jq -r '.data.unresolveReviewThread.thread.isResolved')
+        if [ "$resolved" = "false" ]; then
+            success "Thread unresolved successfully"
+        else
+            error "Thread unresolution failed"
+            exit 1
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing — single pass, flags work anywhere
+# ---------------------------------------------------------------------------
+
+main() {
+    local command=""
+    local repo=""
+    local pr_number=""
+    local thread_id=""
+    local outdated_only=false
+    local resolve_all=false
+    local show_resolved=false
+    local full_bodies=false
+    local json_output=false
+    local quiet=false
+    local dry_run=false
+    local apply_suggestions=false
+    local resolve_after=false
+    local force=false
+    local message=""
+    local positionals=()
+
+    # Single pass: extract all flags and collect positionals
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--repo)
+                if [[ $# -lt 2 ]]; then error "--repo requires a value"; exit 1; fi
+                repo="$2"; shift 2 ;;
+            -r=*|--repo=*)
+                repo="${1#*=}"; shift ;;
+            -m|--message|--body)
+                if [[ $# -lt 2 ]]; then error "$1 requires a value"; exit 1; fi
+                message="$2"; shift 2 ;;
+            -m=*|--message=*|--body=*)
+                message="${1#*=}"; shift ;;
+            -o|--outdated)  outdated_only=true; shift ;;
+            -a|--all)       resolve_all=true; shift ;;
+            --resolved)     show_resolved=true; shift ;;
+            --apply)        apply_suggestions=true; shift ;;
+            --resolve)      resolve_after=true; shift ;;
+            --force)        force=true; shift ;;
+            -f|--full)      full_bodies=true; shift ;;
+            -j|--json)      json_output=true; shift ;;
+            -q|--quiet)     quiet=true; shift ;;
+            -n|--dry-run)   dry_run=true; shift ;;
+            -h|--help)      usage; exit 0 ;;
+            -v|--version)   echo "$SCRIPT_NAME v$VERSION"; exit 0 ;;
+            -*)             error "Unknown option: $1"; usage; exit 1 ;;
+            *)              positionals+=("$1"); shift ;;
+        esac
+    done
+
+    # Classify positionals: command, PR number/URL, thread ID
+    for pos in "${positionals[@]+"${positionals[@]}"}"; do
+        case "$pos" in
+            list|resolve|unresolve|reply|checks|suggestions|agent)
+                if [ -z "$command" ]; then
+                    command="$pos"
+                else
+                    error "Multiple commands: $command and $pos"
+                    exit 1
+                fi
+                ;;
+            PRRT_*|PR_*|RT_*)
+                thread_id="$pos"
+                ;;
+            *)
+                if [[ "$pos" =~ ^[0-9]+$ ]] || [[ "$pos" =~ github\.com ]]; then
+                    local parsed
+                    parsed=$(parse_pr_input "$pos")
+                    if [[ "$parsed" =~ ^([^:]+):([0-9]+)$ ]]; then
+                        [ -z "$repo" ] && repo="${BASH_REMATCH[1]}"
+                        pr_number="${BASH_REMATCH[2]}"
+                    elif [[ "$parsed" =~ ^:([0-9]+)$ ]]; then
+                        pr_number="${BASH_REMATCH[1]}"
+                    fi
+                else
+                    thread_id="$pos"
+                fi
+                ;;
+        esac
+    done
+
+    # Default command
+    [ -z "$command" ] && command="list"
+
+    BACKEND=$(select_backend)
+
+    # Deps/auth/quota checked here — after parsing, so -h/-v stay dependency-free
+    check_deps
+
+    # Get repo if not specified
+    [ -z "$repo" ] && repo=$(get_current_repo)
+
+    if [[ ! "$repo" =~ ^[^/]+/[^/]+$ ]]; then
+        error "Repository must be in format OWNER/REPO"
+        exit 1
+    fi
+    ACTIVE_REPO="$repo"
+
+    # Dispatch
+    case "$command" in
+        list)
+            if [ -z "$pr_number" ]; then
+                error "PR number or URL required"
+                echo "Usage: gh-resolve [list] <PR_NUMBER>" >&2
+                exit 1
+            fi
+            cmd_list "$repo" "$pr_number" "$outdated_only" "$json_output" "$show_resolved" "$full_bodies"
+            ;;
+        checks)
+            if [ -z "$pr_number" ]; then
+                error "PR number or URL required"
+                echo "Usage: gh-resolve checks <PR_NUMBER>" >&2
+                exit 1
+            fi
+            cmd_checks "$repo" "$pr_number" "$json_output"
+            ;;
+        suggestions)
+            if [ -z "$pr_number" ]; then
+                error "PR number or URL required"
+                echo "Usage: gh-resolve suggestions [--apply] <PR_NUMBER>" >&2
+                exit 1
+            fi
+            cmd_suggestions "$repo" "$pr_number" "$apply_suggestions" "$resolve_after" "$dry_run" "$json_output" "$quiet" "$force"
+            ;;
+        agent)
+            if [ -z "$pr_number" ]; then
+                error "PR number or URL required"
+                echo "Usage: gh-resolve agent <PR_NUMBER>" >&2
+                exit 1
+            fi
+            cmd_agent "$repo" "$pr_number" "$outdated_only" "$json_output" "$quiet"
+            ;;
+        resolve)
+            if [ -n "$thread_id" ]; then
+                cmd_resolve "$repo" "" "$thread_id" "" "" "$dry_run" "$quiet"
+            elif [ "$resolve_all" = "true" ] || [ "$outdated_only" = "true" ]; then
+                if [ -z "$pr_number" ]; then
+                    error "PR number required for bulk resolution"
+                    exit 1
+                fi
+                cmd_resolve "$repo" "$pr_number" "" "$resolve_all" "$outdated_only" "$dry_run" "$quiet"
+            else
+                error "Specify a thread ID, --all, or --outdated"
+                echo "Usage: gh-resolve resolve <THREAD_ID>" >&2
+                echo "       gh-resolve resolve --all <PR_NUMBER>" >&2
+                echo "       gh-resolve resolve --outdated <PR_NUMBER>" >&2
+                exit 1
+            fi
+            ;;
+        reply)
+            cmd_reply "$thread_id" "$message" "$resolve_after" "$dry_run" "$quiet"
+            ;;
+        unresolve)
+            if [ -z "$thread_id" ]; then
+                error "Thread ID required"
+                echo "Usage: gh-resolve unresolve <THREAD_ID>" >&2
+                exit 1
+            fi
+            cmd_unresolve "$thread_id" "$dry_run" "$quiet"
+            ;;
+        *)
+            error "Unknown command: $command"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

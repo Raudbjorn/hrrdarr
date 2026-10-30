@@ -1448,7 +1448,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
         // not taken over while it still runs.
         let deferred = c
             .execute(
-                "UPDATE downloaded_scan_commands SET run_generation=run_generation+1,ready_order_at=max(ready_order_at,?1),next_attempt_at=max(next_attempt_at,?3) WHERE id=?2 AND status='running' AND inventory_revision=0 AND candidate_id IS NULL AND next_attempt_at<=?4",
+                "UPDATE downloaded_scan_commands SET run_generation=run_generation+1,ready_order_at=max(ready_order_at,?1),next_attempt_at=max(next_attempt_at,?3),error_code=NULL WHERE id=?2 AND status='running' AND inventory_revision=0 AND candidate_id IS NULL AND next_attempt_at<=?4",
                 params![timestamp, key, timestamp + DISCOVERY_LEASE, timestamp],
             )
             .await?;
@@ -1500,9 +1500,10 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Op
 /// Only unpublished, uncaptured running parents are reset. A published parent (revision 1)
 /// owns durable children, and a parent that captured a tracked receipt waits for its
 /// predecessor; neither is touched by startup or per-tick recovery (the worker re-claims them).
+/// Capture-capacity deferrals also remain scheduled without spending another attempt.
 pub(super) async fn recover(c: &Connection, timestamp: i64, code: &str) -> Result<()> {
     c.execute(
-        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0 AND candidate_id IS NULL",
+        "UPDATE downloaded_scan_commands SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,next_attempt_at=?1,completed_at=CASE WHEN cancel_requested=1 OR attempts>=3 THEN ?1 ELSE NULL END,error_code=CASE WHEN cancel_requested=1 THEN NULL ELSE ?2 END WHERE status='running' AND inventory_revision=0 AND candidate_id IS NULL AND (error_code IS NOT 'scan_capture_busy' OR cancel_requested=1)",
         params![timestamp, code],
     )
     .await?;
@@ -1884,7 +1885,7 @@ async fn discover(
             };
             let key = owner_key(&raw, tv);
             let owner = match owners.get(&key) {
-                Some(cached) => cached.clone(),
+                Some(cached) => *cached,
                 None => {
                     let resolved = match resolve_scan_owner(&c, claim.media, &raw).await {
                         Ok(owner) => Ok(owner),
@@ -1893,7 +1894,7 @@ async fn discover(
                             None => Err(code),
                         },
                     };
-                    owners.insert(key, resolved.clone());
+                    owners.insert(key, resolved);
                     resolved
                 }
             };
@@ -2311,6 +2312,9 @@ async fn publish_in(
                 }
                 Err(crate::naming::destination::DestinationError::Db(error)) => {
                     return Err(error.into());
+                }
+                Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+                    return Err(Failure::Retry(code));
                 }
                 Err(crate::naming::destination::DestinationError::Internal(_)) => {
                     return Err(Failure::Fail("scan_facts_invalid"));

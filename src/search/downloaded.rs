@@ -274,14 +274,7 @@ async fn evaluate_bound(
             &receipt,
         )
         .map_err(SearchError)?;
-        evidence.title = receipt.title;
-        evidence.indexer_flags = receipt.indexer_flags;
-        if evidence.languages.is_none() {
-            evidence.languages = receipt.languages;
-        }
-        if evidence.release_group.is_none() {
-            evidence.release_group = receipt.release_group;
-        }
+        merge_receipt(&mut evidence, receipt);
     }
     crate::custom_formats::populate_quality(c, &mut evidence, parsed.quality_name.as_deref(), tv)
         .await?;
@@ -445,6 +438,62 @@ async fn match_absolute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_facts_outrank_renamed_path_tokens() {
+        let evidence =
+            |title: &str, languages, group: Option<&str>| crate::custom_formats::Evidence {
+                version: 1,
+                revision: None,
+                title: title.into(),
+                filename: None,
+                languages,
+                release_group: group.map(str::to_owned),
+                indexer_flags: None,
+                release_type: None,
+                size: None,
+                year: Some(2020),
+                edition: None,
+                source: 0,
+                resolution: 0,
+                modifier: 0,
+            };
+        let mut renamed = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(
+            &mut renamed,
+            evidence(
+                "Harbor.2020.French.1080p-GROUP",
+                Some(vec![2]),
+                Some("GROUP"),
+            ),
+        );
+        assert_eq!(renamed.languages, Some(vec![2]));
+        assert_eq!(renamed.release_group.as_deref(), Some("GROUP"));
+        // The path still fills facts the receipt never recorded.
+        let mut sparse = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(&mut sparse, evidence("Harbor.2020.1080p", None, None));
+        assert_eq!(sparse.languages, Some(vec![4]));
+        assert_eq!(sparse.release_group.as_deref(), Some("RENAMED"));
+        assert_eq!(sparse.title, "Harbor.2020.1080p");
+        // A measured empty list must not be refilled from a renamed path's language token.
+        let mut measured = evidence(
+            "Harbor.2020.German.1080p-RENAMED",
+            Some(vec![4]),
+            Some("RENAMED"),
+        );
+        merge_receipt(
+            &mut measured,
+            evidence("Harbor.2020.1080p", Some(vec![]), None),
+        );
+        assert_eq!(measured.languages, Some(vec![]));
+    }
     struct Scratch(std::path::PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -1020,6 +1069,22 @@ pub(crate) async fn original_language(
         .flatten())
 }
 
+/// Facts frozen at submission outrank tokens in a (possibly renamed) downloaded path;
+/// the filename only fills what the receipt did not record. A recorded empty language
+/// list is a measurement, not an absence, so it is kept as-is.
+fn merge_receipt(
+    evidence: &mut crate::custom_formats::Evidence,
+    receipt: crate::custom_formats::Evidence,
+) {
+    evidence.title = receipt.title;
+    evidence.indexer_flags = receipt.indexer_flags;
+    if receipt.languages.is_some() {
+        evidence.languages = receipt.languages;
+    }
+    if receipt.release_group.is_some() {
+        evidence.release_group = receipt.release_group;
+    }
+}
 pub(crate) async fn evaluate_receipt(
     c: &Connection,
     target: &MediaTarget,
@@ -1775,22 +1840,21 @@ fn scan_path_excluded(file: ScanFileInput<'_>, tv: bool) -> bool {
     {
         return true;
     }
-    if let Some((stem, _)) = basename.rsplit_once('.') {
-        if let Some((_, suffix)) = stem.rsplit_once('-') {
-            if matches!(
-                suffix,
-                "trailer"
-                    | "other"
-                    | "behindthescenes"
-                    | "deleted"
-                    | "featurette"
-                    | "interview"
-                    | "scene"
-                    | "short"
-            ) {
-                return true;
-            }
-        }
+    if let Some((stem, _)) = basename.rsplit_once('.')
+        && let Some((_, suffix)) = stem.rsplit_once('-')
+        && matches!(
+            suffix,
+            "trailer"
+                | "other"
+                | "behindthescenes"
+                | "deleted"
+                | "featurette"
+                | "interview"
+                | "scene"
+                | "short"
+        )
+    {
+        return true;
     }
     let Some((parents, _)) = file.relative_path.rsplit_once('/') else {
         return false;
@@ -1897,15 +1961,14 @@ pub(crate) async fn evaluate_scan_file(
     if c.is_autocommit() {
         return Err(SearchError("scan_snapshot_required"));
     }
-    if let Some(proof) = expected {
-        if proof.version != 1
+    if let Some(proof) = expected
+        && (proof.version != 1
             || serde_json::to_vec(proof)
                 .map_err(|_| SearchError("scan_proof_invalid"))?
                 .len()
-                > SCAN_PROOF_BYTES
-        {
-            return Err(SearchError("scan_proof_invalid"));
-        }
+                > SCAN_PROOF_BYTES)
+    {
+        return Err(SearchError("scan_proof_invalid"));
     }
     let mut rejected_quality = None;
     let result = tokio::time::timeout(
@@ -1923,11 +1986,10 @@ pub(crate) async fn evaluate_scan_file(
     )
     .await
     .map_err(|_| SearchError("scan_decision_timeout"))??;
-    if let Some(expected) = expected {
-        if !matches!(&result,ScanFileDecision::PolicyEligible(current) if &current.proof==expected)
-        {
-            return Err(SearchError("scan_preflight_changed"));
-        }
+    if let Some(expected) = expected
+        && !matches!(&result,ScanFileDecision::PolicyEligible(current) if &current.proof==expected)
+    {
+        return Err(SearchError("scan_preflight_changed"));
     }
     Ok(result)
 }

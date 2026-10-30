@@ -57,12 +57,31 @@ pub fn render() -> String {
     registry.visit::<crate::recycle_bin::deletion::BulkDeleteInput>();
     registry.visit::<crate::recycle_bin::deletion::Deletion>();
     registry.visit::<crate::recycle_bin::deletion::Batch>();
+    registry.visit::<crate::notifications::model::NotificationInput>();
+    registry.visit::<crate::notifications::model::Notification>();
+    registry.visit::<crate::notifications::model::NotificationList>();
+    registry.visit::<crate::notifications::model::ImplementationList>();
+    registry.visit::<crate::notifications::model::TestInput>();
+    registry.visit::<crate::notifications::model::TestResult>();
+    registry.visit::<crate::notifications::model::TestAllResult>();
+    registry.visit::<crate::notifications::model::DeliveryList>();
     registry.visit::<crate::tags::Input>();
     registry.visit::<crate::tags::Tag>();
     registry.visit::<crate::tags::Assignment>();
     registry.visit::<crate::tags::Detail>();
     registry.visit::<crate::tags::Owners>();
     registry.visit::<crate::tags::Page>();
+    registry.visit::<crate::autotagging::Input>();
+    registry.visit::<crate::autotagging::Rule>();
+    registry.visit::<crate::autotagging::SchemaEntry>();
+    registry.visit::<crate::collections::Collection>();
+    registry.visit::<crate::collections::Patch>();
+    registry.visit::<crate::collections::BulkPatch>();
+    registry.visit::<crate::collections::ListQuery>();
+    registry.visit::<crate::api::ApiPage<crate::collections::Collection>>();
+    registry.visit::<crate::commands::collection_refresh::CollectionRefreshInput>();
+    registry.visit::<crate::commands::collection_refresh::ListParams>();
+    registry.visit::<crate::api::ApiPage<crate::commands::collection_refresh::CollectionRefreshCommand>>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
         crate::custom_formats::Input,
@@ -179,6 +198,25 @@ pub fn render() -> String {
         crate::naming::movie_preview::MovieRenamePreviewItem,
         crate::naming::movie_preview::MovieRenamePreviewStatus,
         crate::naming::movie_preview::MovieRenamePreviewReason,
+        crate::naming::plan::TvRenamePreview,
+        crate::naming::plan::TvRenamePreviewItem,
+        crate::naming::plan::FolderRenamePreview,
+        crate::naming::plan::FolderRenamePreviewItem,
+        crate::naming::plan::RenameStatus,
+        crate::naming::plan::RenameReason,
+        crate::commands::rename::RenameInput,
+        crate::commands::rename::RenameTarget,
+        crate::commands::rename::RenameName,
+        crate::commands::rename::RenameCommand,
+        crate::commands::rename::RenameCommandDetail,
+        crate::commands::rename::RenameItem,
+        crate::commands::rename::RenameItemState,
+        crate::api::ApiPage<crate::commands::rename::RenameCommand>,
+        crate::rename::events::RenameEvent,
+        crate::rename::events::RenameEventKind,
+        crate::rename::events::RenameOwner,
+        crate::rename::events::RenameEventQuery,
+        crate::api::ApiPage<crate::rename::events::RenameEvent>,
         crate::api::ApiErrorEnvelope,
         crate::api::LegacyError,
         crate::api::ImportRequest,
@@ -249,6 +287,10 @@ pub fn render() -> String {
         crate::wanted::WantedPage<crate::wanted::MovieWantedItem>,
         crate::wanted::WantedSearchInput,
         crate::wanted::WantedSearchReceipt,
+        crate::calendar::CalendarQuery,
+        crate::calendar::CalendarFeedQuery,
+        crate::calendar::CalendarPage<crate::calendar::TvCalendarEntry>,
+        crate::calendar::CalendarPage<crate::calendar::MovieCalendarEntry>,
     );
     let mut output = String::from(
         "// Generated from the Rust HTTP DTOs by ts-rs. Do not edit.\n// Regenerate: cargo run --locked --bin generate-api\n// JSON i64/u64 remain numbers on the wire. Reject integers outside Number.isSafeInteger\n// at the API boundary before using IDs, sizes or duration ticks; these types are not validators.\n// URL-query properties are omittable scalars; nullability below describes JSON bodies/resources.\n\n",

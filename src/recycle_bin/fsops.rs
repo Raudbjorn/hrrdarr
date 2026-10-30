@@ -83,8 +83,8 @@ pub(crate) struct Identity {
 impl Identity {
     fn of(stat: &fs::Stat) -> Self {
         Self {
-            dev: stat.st_dev as u64,
-            ino: stat.st_ino as u64,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
             size: stat.st_size as u64,
             mtime: stat.st_mtime as i64,
             mtime_ns: stat.st_mtime_nsec as i64,
@@ -169,10 +169,10 @@ pub(crate) fn root_available(root: &str) -> Result<bool> {
         if matches!(name, "." | "..") {
             continue;
         }
-        if let Ok(stat) = stat_child(&dir, name) {
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-                return Ok(true);
-            }
+        if let Ok(stat) = stat_child(&dir, name)
+            && FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -675,7 +675,7 @@ impl Cleanup<'_> {
                     continue;
                 }
             };
-            if stat.st_dev as u64 != self.root_dev {
+            if stat.st_dev != self.root_dev {
                 // A different mount inside the bin is never entered or removed.
                 self.report.skipped += 1;
                 empty = false;
@@ -715,7 +715,7 @@ impl Cleanup<'_> {
                         }
                     };
                     let opened = Identity::file(&nested)?;
-                    if !opened.same_inode(stat.st_dev as u64, stat.st_ino as u64) {
+                    if !opened.same_inode(stat.st_dev, stat.st_ino) {
                         self.report.skipped += 1;
                         empty = false;
                         continue;

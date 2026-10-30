@@ -1,0 +1,197 @@
+#!/bin/bash
+# Hermetic tests for gh-resolve's REST backend: a fake `gh` on PATH serves
+# fixtures shaped like the REST and /ccr/ responses observed on 2026-10-18,
+# so mutations and multi-comment threads are covered without touching GitHub.
+set -euo pipefail
+
+SCRIPT="$(cd "$(dirname "$0")" && pwd)/gh-resolve"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+mkdir "$WORK/bin"
+export FAKE_STATE="$WORK/state"
+echo false > "$FAKE_STATE"
+echo false > "$FAKE_STATE.second"
+
+cat > "$WORK/bin/gh" << 'FAKE'
+#!/bin/bash
+args="$*"
+case "$args" in
+    "auth status"*) exit 0 ;;
+    "api rate_limit"*) exit 0 ;;
+    *graphql*) echo 'gh: GitHub GraphQL is not available from Claude Code sessions; use the REST API (HTTP 403)'; exit 1 ;;
+    *"/ccr/comments/101/resolve") [ -f "$FAKE_STATE.sticky" ] || echo true > "$FAKE_STATE"; echo '{}' ;;
+    *"/ccr/comments/201/resolve")
+        case "${FAKE_RESOLVE_FAIL:-}" in
+            api) echo 'mutation failed' >&2; exit 1 ;;
+            rate) echo 'secondary rate limit' >&2; exit 1 ;;
+            sticky) echo '{}' ;;
+            *) echo true > "$FAKE_STATE.second"; echo '{}' ;;
+        esac ;;
+    *"/ccr/comments/101/unresolve") echo false > "$FAKE_STATE"; echo '{}' ;;
+    *"/comments/101/replies"*)
+        printf '%s' "${args##*body=}" > "$FAKE_STATE.body"
+        echo '{"id":103,"html_url":"https://github.com/o/r/pull/7#discussion_r103","created_at":"2026-10-18T02:00:00Z","user":{"login":"me"}}' ;;
+    *"/ccr/review_threads")
+        if [ -n "${FAKE_THREADS_FILE:-}" ]; then cat "$FAKE_THREADS_FILE"; exit; fi
+        echo "[{\"resolved\":$(cat "$FAKE_STATE"),\"outdated\":false,\"path\":\"a.rs\",\"line\":12,\"comment_ids\":[102,101]},
+              {\"resolved\":$(cat "$FAKE_STATE.second"),\"outdated\":true,\"path\":\"b.rs\",\"line\":null,\"comment_ids\":[201]}]" ;;
+    # Two pages, as gh --paginate emits them: concatenated JSON arrays
+    *"/pulls/7/comments?per_page=100")
+        if [ -n "${FAKE_COMMENTS_FILE:-}" ]; then cat "$FAKE_COMMENTS_FILE"; exit; fi
+        echo '[{"id":102,"in_reply_to_id":101,"user":{"login":"bot"},"body":"Fix:\n```suggestion\nlet x = 2;\n```","created_at":"2026-10-18T01:00:00Z","html_url":"u102","diff_hunk":"@@ h","start_line":null,"side":"RIGHT"}]'
+        echo '[{"id":101,"in_reply_to_id":null,"user":{"login":"alice"},"body":"Off by one","created_at":"2026-10-18T00:00:00Z","html_url":"u101","diff_hunk":"@@ h","start_line":10,"side":"RIGHT"},
+               {"id":201,"in_reply_to_id":null,"user":{"login":"bob"},"body":"stale","created_at":"2026-10-17T00:00:00Z","html_url":"u201","diff_hunk":"@@ g","start_line":null,"side":"LEFT"}]' ;;
+    *"/pulls/7")
+        if [ -n "${FAKE_HEAD:-}" ]; then jq -n --arg head "$FAKE_HEAD" '{number:7,title:"T",html_url:"u",head:{sha:$head,ref:"feat"}}'; exit; fi
+        echo '{"number":7,"title":"T","html_url":"https://github.com/o/r/pull/7","head":{"sha":"abc123","ref":"feat"}}' ;;
+    *"/check-runs"*)
+        if [ "${FAKE_CHECK_MODE:-}" = runs ]; then
+            jq -n '{total_count:101,check_runs:[range(100)|{name:("pass-"+tostring),status:"completed",conclusion:"success",app:{name:"ci",slug:"ci"}}]}'
+            exit
+        elif [ "${FAKE_CHECK_MODE:-}" = statuses ]; then
+            echo '{"total_count":0,"check_runs":[]}'; exit
+        fi
+        echo '{"total_count":3,"check_runs":[
+            {"name":"test","status":"completed","conclusion":"failure","details_url":"d1","app":{"name":"GitHub Actions","slug":"github-actions"}},
+            {"name":"lint","status":"in_progress","conclusion":null,"details_url":"d2","app":{"name":"GitHub Actions","slug":"github-actions"}},
+            {"name":"fmt","status":"completed","conclusion":"success","details_url":"d3","app":{"name":"GitHub Actions","slug":"github-actions"}}]}' ;;
+    *"/status"*)
+        if [ "${FAKE_CHECK_MODE:-}" = statuses ]; then
+            jq -n '{state:"failure",total_count:101,statuses:[range(100)|{context:("pass-"+tostring),state:"success",creator:{login:"ci"}}]}'
+            exit
+        fi
+        echo '{"state":"success","total_count":1,"statuses":[{"context":"ci/x","state":"success","description":"ok","target_url":"t","creator":{"login":"x"}}]}' ;;
+    *) echo "fake gh: unhandled: $args" >&2; exit 99 ;;
+esac
+FAKE
+chmod +x "$WORK/bin/gh"
+
+export PATH="$WORK/bin:$PATH" GH_RESOLVE_BACKEND=rest
+run() { "$SCRIPT" -r o/r "$@"; }
+pass=0 fail=0
+check() {  # <name> <expected> <actual>
+    if [ "$2" = "$3" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $1: want [$2] got [$3]"; fi
+}
+
+# Root comment (no in_reply_to_id) names the thread even though /ccr/ lists
+# the reply's ID first; comments sort chronologically across pages.
+t=$(run -j -f 7 | jq -c '.threads[0] | [.id, .startLine, [.comments[].author]]')
+check "thread id/order" '["RT_7_101",10,["alice","bot"]]' "$t"
+check "outdated null line" '[true,null]' "$(run -j 7 | jq -c '.threads[1] | [.isOutdated, .line]')"
+check "suggestion from reply" '"let x = 2;"' "$(run suggestions -j 7 | jq -c '.suggestions[0].suggestion')"
+# The outdated thread's LEFT side survives the mapping
+check "diffSide" '"LEFT"' "$(run agent -j 7 | jq -c '.threads[1].diffSide')"
+
+# One failure outranks one pending; REST lowercase enums become uppercase
+c=$(run checks -j 7 | jq -c '[.rollupState, .contextsTotal, .summary.failed, .summary.pending, .summary.passed]')
+check "checks rollup" '["FAILURE",4,1,1,2]' "$c"
+
+check "resolve exit" 0 "$(run resolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+check "resolve state" true "$(cat "$FAKE_STATE")"
+check "unresolve exit" 0 "$(run unresolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+# A 2xx whose effect is not visible on re-read must count as failure
+touch "$FAKE_STATE.sticky"
+check "sticky resolve fails" 1 "$(run resolve RT_7_101 -q >/dev/null 2>&1; echo $?)"
+rm "$FAKE_STATE.sticky"
+
+# -f keeps a numeric-looking body a string (the GraphQL path's -F pitfall)
+run reply RT_7_101 -m 42 -q >/dev/null 2>&1
+check "reply body" 42 "$(cat "$FAKE_STATE.body")"
+
+check "graphql blocked hint" 1 \
+    "$(GH_RESOLVE_BACKEND=graphql run 7 2>&1 | grep -c 'GH_RESOLVE_BACKEND=rest' || true)"
+check "bad backend" 1 "$(GH_RESOLVE_BACKEND=bogus run 7 >/dev/null 2>&1; echo $?)"
+
+# An unobserved check/status can fail: neither human nor JSON output may claim success.
+for mode in runs statuses; do
+    check "$mode partial rollup" UNKNOWN "$(FAKE_CHECK_MODE=$mode run checks -j 7 | jq -r '.rollupState')"
+    check "$mode human partial rollup" 0 "$(FAKE_CHECK_MODE=$mode run checks 7 2>&1 | grep -c 'Overall: PASSING' || true)"
+done
+
+# Bulk operations retain partial accounting and fail even in quiet mode.
+for mode in api sticky rate; do
+    echo false > "$FAKE_STATE"; echo false > "$FAKE_STATE.second"
+    check "$mode bulk exit" 1 "$(FAKE_RESOLVE_FAIL=$mode run resolve --all -q 7 >"$WORK/bulk-output" 2>&1; echo $?)"
+    check "$mode first mutation succeeded" true "$(cat "$FAKE_STATE")"
+    check "$mode failed mutation retained" false "$(cat "$FAKE_STATE.second")"
+done
+check "outdated bulk failure" 1 "$(FAKE_RESOLVE_FAIL=api run resolve --outdated -q 7 >/dev/null 2>&1; echo $?)"
+check "bulk successful exit" 0 "$(run resolve --all -q 7 >/dev/null 2>&1; echo $?)"
+check "bulk dry run exit" 0 "$(run resolve --all --dry-run -q 7 >/dev/null 2>&1; echo $?)"
+
+# Suggestion writes are confined to this disposable repository, with no real gh calls.
+REAL_GIT=$(command -v git)
+export REAL_GIT
+mkdir "$WORK/repo" "$WORK/outside"
+cd "$WORK/repo"
+git init -q
+git config user.name Fixture
+git config user.email fixture@example.invalid
+seq 30 > a.rs
+printf 'outside\n' > "$WORK/outside/secret.rs"
+ln -s "$WORK/outside/secret.rs" external.rs
+ln -s "$WORK/outside" linked
+# Pin symlinks in HEAD so clean-file checks alone cannot protect their referents.
+git add a.rs external.rs linked
+git -c commit.gpgsign=false commit -qm fixture
+export FAKE_HEAD=$(git rev-parse HEAD)
+export FAKE_THREADS_FILE="$WORK/threads.json" FAKE_COMMENTS_FILE="$WORK/comments.json"
+suggestion() {
+    local path="$1" fence="$2" start="${3:-20}" end="${4:-20}" replacement="${5-replacement}"
+    echo false > "$FAKE_STATE"
+    jq -n --arg path "$path" --argjson end "$end" \
+        '[{resolved:false,outdated:false,path:$path,line:$end,comment_ids:[101]}]' > "$FAKE_THREADS_FILE"
+    jq -n --arg body "$(printf '%s\n%s\n%s' "$fence" "$replacement" '```')" --argjson start "$start" \
+        '[{id:101,user:{login:"reviewer"},body:$body,created_at:"2026-10-30",start_line:$start,side:"RIGHT"}]' > "$FAKE_COMMENTS_FILE"
+}
+plain='```suggestion'
+suggestion a.rs "$plain"
+original_stat=$(stat -c "%i:%a" a.rs)
+check "plain apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
+check "plain preserves inode/mode" "$original_stat" "$(stat -c "%i:%a" a.rs)"
+check "plain applies anchor" replacement "$(sed -n '20p' a.rs)"
+check "plain keeps surrounding line" 21 "$(sed -n '21p' a.rs)"
+git restore a.rs
+suggestion a.rs "$plain" 18 20
+check "multiline apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
+check "multiline range" 'replacement,21' "$(sed -n '18,19p' a.rs | paste -sd ,)"
+git restore a.rs
+suggestion a.rs "$plain" 18 20 ''
+check "empty apply exit" 0 "$(run suggestions --apply -q 7 >/dev/null 2>&1; echo $?)"
+check "empty suggestion deletes range" 21 "$(sed -n '18p' a.rs)"
+git restore a.rs
+for fence in "${plain}:-2+0" "${plain}:-0+2" "${plain}:unsupported"; do
+    suggestion a.rs "$fence"
+    check "unsupported fence excluded" 0 "$(run suggestions -j 7 | jq '.suggestions|length')"
+    run suggestions --apply --resolve -q 7 >/dev/null 2>&1
+    check "unsupported fence leaves file" 20 "$(sed -n '20p' a.rs)"
+    check "unsupported fence leaves thread" false "$(cat "$FAKE_STATE")"
+done
+for path in external.rs linked/secret.rs; do
+    for force in '' --force; do
+        suggestion "$path" "$plain" 1 1
+        check "symlink $path $force exit" 1 "$(run suggestions --apply --resolve $force -q 7 >/dev/null 2>&1; echo $?)"
+        check "symlink $path $force preserves outside" outside "$(cat "$WORK/outside/secret.rs")"
+        check "symlink $path $force leaves thread" false "$(cat "$FAKE_STATE")"
+    done
+done
+
+# Swap after preflight: the actual splice must independently refuse to follow the link.
+cat > "$WORK/bin/git" <<'FAKE_GIT'
+#!/bin/bash
+if [[ "$*" == *'diff --cached --quiet -- a.rs' ]] && [ -n "${FAKE_RACE_TARGET:-}" ]; then
+    rm a.rs
+    ln -s "$FAKE_RACE_TARGET" a.rs
+    exit 0
+fi
+exec "$REAL_GIT" "$@"
+FAKE_GIT
+chmod +x "$WORK/bin/git"
+suggestion a.rs "$plain" 1 1
+check "post-preflight symlink fails" 1 "$(FAKE_RACE_TARGET="$WORK/outside/secret.rs" run suggestions --apply --resolve -q 7 >/dev/null 2>&1; echo $?)"
+check "post-preflight race exercised" 0 "$(test -L a.rs; echo $?)"
+check "post-preflight symlink preserves outside" outside "$(cat "$WORK/outside/secret.rs")"
+check "post-preflight symlink leaves thread" false "$(cat "$FAKE_STATE")"
+
+echo "gh-resolve REST backend: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

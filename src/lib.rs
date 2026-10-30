@@ -1,4 +1,6 @@
 pub mod api;
+pub mod autotagging;
+pub mod collections;
 pub mod credits;
 pub mod db;
 pub mod episodes;
@@ -54,3 +56,8 @@ pub mod health_detectors;
 pub mod host;
 
 pub mod wanted;
+
+pub mod calendar;
+
+pub mod notifications;
+pub mod rename;

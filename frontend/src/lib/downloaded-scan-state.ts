@@ -1,6 +1,7 @@
 // Pure state rules for the downloaded-folder scan panel. Nothing here performs I/O.
 // Persisted state is identity + immutable request only: a saved receipt never grants an action.
 import type { Result } from './api';
+import { isDownloadClient } from './provider-draft.ts';
 import type {
   CommandPriority, CommandStatus, DownloadedScanCommand, DownloadedScanInput, MediaDomain, Provider,
   ScanChild, ScanChildResumeInput, ScanCleanup, ScanCleanupPhase, ScanCleanupResumeInput, ScanCleanupState, ScanCoverage,
@@ -391,6 +392,5 @@ export function admissionFailureMessage(result: Failure): string {
 
 /** Download clients (not indexers) that are configured for the given library type. */
 export function trackingProviders(providers: readonly Provider[], domain: MediaDomain): Provider[] {
-  return providers.filter(p => p.settings.implementation !== 'torznab' && p.settings.implementation !== 'newznab'
-    && p.settings[domain] !== null && scanUuid(p.id));
+  return providers.filter(p => isDownloadClient(p) && p.settings[domain] !== null && scanUuid(p.id));
 }

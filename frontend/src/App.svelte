@@ -1,11 +1,13 @@
 <script lang="ts">
   import MediaFilesPanel from './lib/MediaFilesPanel.svelte';
   import MovieRenamePreviewPanel from './lib/MovieRenamePreviewPanel.svelte';
+  import SeriesRenamePanel from './lib/SeriesRenamePanel.svelte';
   import ReleaseProfilesPanel from './lib/ReleaseProfilesPanel.svelte';
   import DelayProfilesPanel from './lib/DelayProfilesPanel.svelte';
   import RevisionPolicyPanel from './lib/RevisionPolicyPanel.svelte';
   import ImportPolicyPanel from './lib/ImportPolicyPanel.svelte';
   import RecycleBinPanel from './lib/RecycleBinPanel.svelte';
+  import NotificationsPanel from './lib/NotificationsPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
   import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
   import CreateTags from './lib/CreateTags.svelte';
@@ -36,6 +38,9 @@
   import CustomFormatPanel from './lib/CustomFormatPanel.svelte';
   import ImportExistingLibraryPanel from './lib/ImportExistingLibraryPanel.svelte';
   import WantedPanel from './lib/WantedPanel.svelte';
+  import CalendarPanel from './lib/CalendarPanel.svelte';
+  import CollectionsPanel from './lib/CollectionsPanel.svelte';
+  import AutoTaggingPanel from './lib/AutoTaggingPanel.svelte';
   let healthVisited=$state(false),healthSettingsRequest=$state<{domain:MediaDomain;nonce:number}|null>(null),healthSettingsNonce=0,healthNavigation=$state('');
   // A receipt's scan link opens that scan in the library view; it never starts or retries anything.
   let scanRequest=$state<{domain:MediaDomain;id:string;nonce:number}|null>(null),scanNonce=0;
@@ -52,7 +57,7 @@
     else if (next === 'custom-formats') customFormatsVisited = true; else if (next === 'qualities') qualitiesVisited = true;
     else if (next === 'profiles') profilesVisited = true; else if (next === 'media-management') revisionVisited = true;
     else if (next === 'history') historyVisited = true; else if (next === 'general') generalVisited = true;
-    else if (next === 'import-existing') importVisited = true;
+    else if (next === 'import-existing') importVisited = true; else if (next === 'notifications') notificationsVisited = true;
     view = next;
   }
   function applyHash() {
@@ -67,7 +72,7 @@
     showView(next);
   }
   let historyVisited=$state(false);
-  let generalVisited=$state(false);
+  let generalVisited=$state(false), notificationsVisited=$state(false);
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
@@ -162,6 +167,16 @@
     }
     detailLoading = false;
   }
+  // A rename changes stored paths: reread detail and file lists without remounting the rename panel.
+  async function renamed() {
+    const current = selected, scope = domain;
+    if (!current || !fileTarget || fileTarget.domain !== scope || fileTarget.id !== current.id) return;
+    fileRefresh = {domain: scope, id: current.id, version: fileRefresh.version + 1};
+    const result = await getLibrary(scope, current.id);
+    if (!alive || !selected || selected.id !== current.id || domain !== scope || !result.ok) return;
+    selected = result.data;
+    void load(page?.offset ?? 0);
+  }
   async function search() {
     if(libraryLocked)return;const version = ++searchVersion, scope = domain; searching = true; searched = false; results = []; choice = null; error = '';
     const result = await lookupLibrary(scope, term);
@@ -253,10 +268,13 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#/" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='wanted-missing'||view==='wanted-cutoff'} onclick={()=>navigate('wanted-missing')}>Wanted</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='wanted-missing'||view==='wanted-cutoff'} onclick={()=>navigate('wanted-missing')}>Wanted</button><button aria-pressed={view==='calendar'} onclick={()=>navigate('calendar')}>Calendar</button><button aria-pressed={view==='collections'} onclick={()=>navigate('collections')}>Collections</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='autotagging'} onclick={()=>navigate('autotagging')}>Auto tagging</button><button aria-pressed={view==='notifications'} onclick={()=>navigate('notifications')}>Connect</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
   {#if view === 'settings-index'}<SettingsIndex />{/if}
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
+  {#if view === 'calendar'}<CalendarPanel />{/if}
+  {#if view === 'collections'}<CollectionsPanel />{/if}
+  {#if view === 'autotagging'}<AutoTaggingPanel />{/if}
   {#if view === 'wanted-missing' || view === 'wanted-cutoff'}<WantedPanel kind={view === 'wanted-cutoff' ? 'cutoff' : 'missing'} onkind={(next) => navigate(next === 'cutoff' ? 'wanted-cutoff' : 'wanted-missing')} />{/if}
   {#if providersVisited}<div hidden={view!=='providers'}><ProviderPanel relatedWrite={providerRelatedWrite} {tagVersions} onwrite={state=>providerWrite=state} onchange={()=>providerVersion++}/></div>{/if}
   {#if activityVisited}<div hidden={view!=='activity'}><ActivityPanel request={healthSettingsRequest} onnavigate={(nonce,accepted)=>{if(nonce===healthSettingsRequest?.nonce)healthNavigation=accepted?'':'Requested settings navigation was declined. Return to Health to request it again.';}} active={view==='activity'} relatedWrite={providerWrite} {providerVersion} onwrite={state=>activityWrite=state} onscan={openScan}/></div>{/if}
@@ -271,6 +289,7 @@
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
+  {#if notificationsVisited}<div hidden={view!=='notifications'}><h1>Connect</h1><NotificationsPanel {tagVersions} /></div>{/if}
   {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);if(scope!==domain)return;view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>
   <div class="toolbar"><nav aria-label="Library type"><button disabled={libraryLocked} aria-pressed={domain === 'tv'} onclick={() => changeDomain('tv')}>TV</button><button disabled={libraryLocked} aria-pressed={domain === 'movies'} onclick={() => changeDomain('movies')}>Movies</button></nav><button class="primary" disabled={libraryLocked} onclick={() => {creationIds=[];creationReady=true;adding = !adding; ++searchVersion; searching = false; results = []; choice = null; searched = false;}}>{adding ? 'Close add form' : domain === 'tv' ? 'Add series' : 'Add movie'}</button></div>
@@ -313,10 +332,11 @@
           <button disabled={libraryLocked || profilesLoading}>Save settings</button></form></details>
         {#if domain === 'movies'}
           {#if fileWrite==='idle'}
-            {#key `${selected.id}:${movieFileVersion.id===selected.id?movieFileVersion.version:0}`}<MovieRenamePreviewPanel movieId={selected.id} />{/key}
+            {#key `${selected.id}:${movieFileVersion.id===selected.id?movieFileVersion.version:0}`}<MovieRenamePreviewPanel movieId={selected.id} onrenamed={() => void renamed()} />{/key}
           {:else}<p role="status">Filename previews are available after the file metadata write is reconciled.</p>{/if}
         {/if}
         {#if domain === 'tv'}
+          {#key `tv:${selected.id}`}<SeriesRenamePanel seriesId={selected.id} onrenamed={() => void renamed()} />{/key}
           <h2>Seasons</h2><p class="muted">Changing a season updates its episodes. Series monitoring leaves individual flags intact.</p><div class="seasons">{#each selected.seasons ?? [] as season (season.number)}<button disabled={libraryLocked} aria-pressed={season.monitored} onclick={() => patch({seasons:[{number:season.number,monitored:!season.monitored}]})}>{season.number === 0 ? 'Specials' : `Season ${season.number}`}: {season.monitored ? 'monitored' : 'unmonitored'}</button>{/each}</div>
           <h2>Episodes</h2><div class="table-scroll"><table><thead><tr><th scope="col">Episode</th><th scope="col">Monitoring</th><th scope="col">File / import</th></tr></thead><tbody>{#each episodes as episode (episode.id)}<tr><td><strong>S{episode.season} E{episode.number}</strong><br />{episode.title}</td><td><button disabled={libraryLocked} aria-pressed={episode.monitored} onclick={() => monitor(episode)}>{episode.monitored ? 'Unmonitor' : 'Monitor'} {episode.title}</button></td><td><button onclick={() => searchTarget = {media_type:'episode',id:episode.id}}>Search releases for {episode.title}</button>{#if episode.has_file}<span class="path">{episode.file_path ?? 'File associated'}</span>{:else}<button aria-pressed={episodeId === episode.id} onclick={() => episodeId = episode.id}>Import {episode.title}</button>{/if}</td></tr>{:else}<tr><td colspan="3">No episodes in this catalogue.</td></tr>{/each}</tbody></table></div>
           <div class="pagination"><button disabled={libraryLocked || episodeOffset === 0} onclick={() => select(selected!.id, Math.max(0, episodeOffset - 25))}>Previous episodes</button><span>{episodeTotal} episodes</span><button disabled={libraryLocked || episodeOffset + 25 >= episodeTotal} onclick={() => select(selected!.id, episodeOffset + 25)}>Next episodes</button></div>

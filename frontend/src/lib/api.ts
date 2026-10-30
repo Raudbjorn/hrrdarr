@@ -1,3 +1,4 @@
+import type { CalendarPage, MovieCalendarEntry, TvCalendarEntry } from './api.generated';
 import type { WantedKind, WantedPage, TvWantedItem, MovieWantedItem, WantedSearchInput, WantedSearchReceipt } from './api.generated';
 import type { Tag, TagDetail, TagOwners, TagAssignment } from './api.generated';
 import type { ManualImportBatchInput, ManualImportCommand, ManualImportReconciliation } from './api.generated';
@@ -526,3 +527,76 @@ export const monitorEpisodes = (ids: number[], monitored: boolean) => validMonit
   ? request<Episode[]>('/api/v1/episodes/monitor', { episode_ids: ids, monitored }, 'PUT', true) : invalid<Episode[]>();
 export const monitorMovies = (ids: number[], monitored: boolean) => validMonitorIds(ids)
   ? request<LibraryItem[]>('/api/v1/movies/editor', { ids, patch: { monitored } }, 'PUT', true) : invalid<LibraryItem[]>();
+
+// Calendar reads are bounded GETs; the query string is built by calendar-view helpers.
+export const listCalendar = <T extends TvCalendarEntry | MovieCalendarEntry>(domain: MediaDomain, query: string) =>
+  (domain === 'tv' || domain === 'movies') && query.length > 0 && query.length <= 4096
+    ? request<CalendarPage<T>>(`/api/v1/${domain}/calendar?${query}`, undefined, undefined, true)
+    : Promise.resolve<Result<CalendarPage<T>>>({ ok: false, error: 'Invalid calendar request.' });
+
+// AutoTagging rules (per media domain) and movie collections; native errors carry status/code.
+const autoTagPath = (domain: MediaDomain) => `/api/v1/${domain}/autotagging`;
+export const listAutoTags = (domain: MediaDomain) => request<import('./api.generated').AutoTag[]>(autoTagPath(domain), undefined, undefined, true);
+export const getAutoTagSchema = (domain: MediaDomain) => request<import('./api.generated').AutoTagSchemaEntry[]>(`${autoTagPath(domain)}/schema`, undefined, undefined, true);
+export const createAutoTag = (domain: MediaDomain, input: import('./api.generated').AutoTagInput) => request<import('./api.generated').AutoTag>(autoTagPath(domain), input, 'POST', true);
+export const updateAutoTag = (domain: MediaDomain, id: number, input: import('./api.generated').AutoTagInput) => validId(id) ? request<import('./api.generated').AutoTag>(`${autoTagPath(domain)}/${id}`, input, 'PUT', true) : invalid<import('./api.generated').AutoTag>();
+export const deleteAutoTag = (domain: MediaDomain, id: number) => validId(id) ? request<void>(`${autoTagPath(domain)}/${id}`, undefined, 'DELETE', true) : invalid<void>();
+
+const COLLECTIONS = '/api/v1/movies/collections';
+export const listCollections = (query: { limit?: number; offset?: number; monitored?: boolean; q?: string } = {}) => {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+  if (query.offset !== undefined) params.set('offset', String(query.offset));
+  if (query.monitored !== undefined) params.set('monitored', String(query.monitored));
+  if (query.q) params.set('q', query.q);
+  const text = params.toString();
+  return request<ApiPage<import('./api.generated').MovieCollection>>(text ? `${COLLECTIONS}?${text}` : COLLECTIONS, undefined, undefined, true);
+};
+export const getCollection = (id: number) => validId(id) ? request<import('./api.generated').MovieCollection>(`${COLLECTIONS}/${id}`, undefined, undefined, true) : invalid<import('./api.generated').MovieCollection>();
+export const updateCollection = (id: number, patch: import('./api.generated').CollectionPatch) => validId(id) ? request<import('./api.generated').MovieCollection>(`${COLLECTIONS}/${id}`, patch, 'PUT', true) : invalid<import('./api.generated').MovieCollection>();
+export const bulkUpdateCollections = (ids: number[], patch: import('./api.generated').CollectionPatch) => ids.length > 0 && ids.length <= 200 && ids.every(validId) ? request<import('./api.generated').MovieCollection[]>(COLLECTIONS, { ids, patch }, 'PUT', true) : invalid<import('./api.generated').MovieCollection[]>();
+export const startCollectionRefresh = () => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands`, {}, 'POST', true);
+export const getCollectionRefresh = (id: string) => request<import('./api.generated').CollectionRefreshCommand>(`${COLLECTIONS}/refresh-commands/${encodeURIComponent(id)}`, undefined, undefined, true);
+export const listCollectionRefreshes = (limit = 5) => request<ApiPage<import('./api.generated').CollectionRefreshCommand>>(`${COLLECTIONS}/refresh-commands?limit=${limit}`, undefined, undefined, true);
+// ---- rename (cmd.011/cmd.012, api.044) ------------------------------------------------------
+import type { TvRenamePreview, FolderRenamePreview, RenameInput, RenameCommand, RenameCommandDetail } from './api.generated';
+const posId = (id: number) => Number.isSafeInteger(id) && id > 0;
+const idList = (ids: number[], max: number) => Array.isArray(ids) && ids.length > 0 && ids.length <= max && new Set(ids).size === ids.length && ids.every(posId);
+const invalidRename = <T>(error = 'Invalid rename request.'): Result<T> => ({ ok: false, error });
+export const getTvRenamePreview = (seriesId: number, season?: number): Promise<Result<TvRenamePreview>> => {
+  if (!posId(seriesId) || (season !== undefined && !(Number.isSafeInteger(season) && season >= 0))) return Promise.resolve(invalidRename('Select one series with a positive safe ID.'));
+  const query = new URLSearchParams({ series_id: String(seriesId), ...(season === undefined ? {} : { season: String(season) }) });
+  return request<TvRenamePreview>(`/api/v1/tv/rename-preview?${query}`, undefined, undefined, true);
+};
+export const getFolderRenamePreview = (media: MediaDomain, ids: number[]): Promise<Result<FolderRenamePreview>> => {
+  if (!idList(ids, 50)) return Promise.resolve(invalidRename('Select up to 50 distinct positive IDs.'));
+  const key = media === 'tv' ? 'series_ids' : 'movie_ids';
+  const query = new URLSearchParams({ [key]: [...ids].sort((a, b) => a - b).join(',') });
+  return request<FolderRenamePreview>(`/api/v1/${media}/rename-folder-preview?${query}`, undefined, undefined, true);
+};
+export const createRenameCommand = (input: RenameInput): Promise<Result<RenameCommand>> => {
+  const t = input?.target;
+  const tv = t?.media_type === 'tv';
+  const owners = tv ? t.series_ids : t?.movie_ids;
+  const files = input?.name === 'rename_files';
+  if (!t || !['tv', 'movies'].includes(t.media_type) || !idList(owners ?? [], files ? 1 : 50) || (files ? !idList(t.file_ids, 200) : t.file_ids.length !== 0) || (tv ? t.movie_ids.length : t.series_ids.length) !== 0)
+    return Promise.resolve(invalidRename());
+  return request<RenameCommand>('/api/v1/rename/commands', input, 'POST', true);
+};
+export const getRenameCommand = (id: string): Promise<Result<RenameCommandDetail>> => validOperation(id) ? request<RenameCommandDetail>(`/api/v1/rename/commands/${id}`, undefined, undefined, true) : Promise.resolve(invalidRename('Invalid command ID.'));
+export const cancelRenameCommand = (id: string): Promise<Result<RenameCommand>> => validOperation(id) ? request<RenameCommand>(`/api/v1/rename/commands/${id}/cancel`, undefined, 'POST', true) : Promise.resolve(invalidRename('Invalid command ID.'));
+// Notifications (Connect): registry, schema-driven forms, test and delivery journal.
+import type { NotificationList, NotificationImplementationList, Notification, NotificationInput, NotificationTestInput, NotificationTestResult, NotificationTestAllResult, NotificationDeliveryList } from './api.generated';
+const validUuid = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+const badUuid = <T>(): Promise<Result<T>> => Promise.resolve({ ok: false, error: 'Notification ID must be a UUID.' });
+export const listNotifications = () => request<NotificationList>('/api/v1/notifications', undefined, undefined, true);
+export const getNotificationSchema = () => request<NotificationImplementationList>('/api/v1/notifications/schema', undefined, undefined, true);
+export const createNotification = (input: NotificationInput) => request<Notification>('/api/v1/notifications', input, 'POST', true);
+export const updateNotification = (id: string, input: NotificationInput) => validUuid(id) ? request<Notification>(`/api/v1/notifications/${id}`, input, 'PUT', true) : badUuid<Notification>();
+export const deleteNotification = (id: string) => validUuid(id) ? request<void>(`/api/v1/notifications/${id}`, undefined, 'DELETE', true) : badUuid<void>();
+export const testNotificationDraft = (input: NotificationTestInput) => request<NotificationTestResult>('/api/v1/notifications/test', input, 'POST', true, 60_000);
+export const testSavedNotification = (id: string) => validUuid(id) ? request<NotificationTestResult>(`/api/v1/notifications/${id}/test`, undefined, 'POST', true, 60_000) : badUuid<NotificationTestResult>();
+export const testAllNotifications = () => request<NotificationTestAllResult>('/api/v1/notifications/testall', {}, 'POST', true, 120_000);
+export const listNotificationDeliveries = (limit = 20) => Number.isInteger(limit) && limit >= 1 && limit <= 200
+  ? request<NotificationDeliveryList>(`/api/v1/notifications/deliveries?limit=${limit}`, undefined, undefined, true)
+  : Promise.resolve<Result<NotificationDeliveryList>>({ ok: false, error: 'Limit must be 1 to 200.' });

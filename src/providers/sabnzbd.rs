@@ -229,10 +229,8 @@ impl<'o, 'a> Api<'o, 'a> {
         let mut query = vec![("mode".to_owned(), mode.to_owned())];
         query.extend(parameters.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
         query.push(("output".into(), "json".into()));
-        if authenticated {
-            if let Some(key) = self.key {
-                query.push(("apikey".into(), key.to_owned()));
-            }
+        if authenticated && let Some(key) = self.key {
+            query.push(("apikey".into(), key.to_owned()));
         }
         let response = self
             .operation
@@ -1157,7 +1155,7 @@ pub async fn job(
 }
 /// Completed output: the final destination, widened to an enclosing folder named after the job
 /// (sorting or nested unpacking can report a file or subfolder beneath the job folder).
-fn output_path(storage: &str, name: &str) -> Result<String> {
+pub(super) fn output_path(storage: &str, name: &str) -> Result<String> {
     validate_remote_path(storage)?;
     let rooted = storage.starts_with('/')
         || storage.starts_with("\\\\")

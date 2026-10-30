@@ -653,6 +653,74 @@ async fn seed_wanted(
     tx.commit().await.unwrap();
     Json(json!({"series_id":series,"episodes":episodes,"movies":movie_ids})).into_response()
 }
+// Calendar rows relative to the fixture's UTC today. Episode and movie IDs deliberately
+// collide (7101); the same movie has three release types. No production route.
+const CALENDAR_SHARED_ID: i64 = 7101;
+async fn seed_calendar(State(db): State<Arc<Database>>) -> Response {
+    let today = chrono::Utc::now().date_naive();
+    let day = |offset: i64| {
+        (today + chrono::Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    let id = CALENDAR_SHARED_ID;
+    let (daily, second, hidden, date_only, quiet) = (id + 1, id + 1, id + 2, id + 3, id + 1);
+    let sql = format!(
+        "INSERT INTO series(id,tvdb_id,title,path,monitored,runtime,network) VALUES ({id},97101,'Calendar Harbor','/owned-calendar/tv/harbor',1,45,'Harbor Net'),({daily},97102,'Calendar Daily','/owned-calendar/tv/daily',0,NULL,NULL);
+         INSERT INTO seasons(series_id,number,monitored) VALUES ({id},1,1),({daily},2026,1);
+         INSERT INTO library_settings(media_type,series_id,series_type) VALUES ('tv',{id},'standard'),('tv',{daily},'daily');
+         INSERT INTO episode_files(id,series_id,path) VALUES ({id},{id},'/owned-calendar/tv/harbor/s01e02.mkv');
+         INSERT INTO episodes(id,series_id,season,number,title,monitored,air_date,air_date_utc,episode_file_id) VALUES
+          ({id},{id},1,1,'Calendar pilot',1,'{d0}','{d1}T02:30:00Z',NULL),
+          ({second},{id},1,2,'Calendar second',1,'{d2}','{d2} 20:00:00',{id}),
+          ({hidden},{daily},2026,1,'Calendar hidden',1,'{d1}','{d1}T12:00:00Z',NULL),
+          ({date_only},{id},1,3,'Calendar date only',1,'{d3}',NULL,NULL);
+         INSERT INTO movie_metadata(id,tmdb_id,title,year,in_cinemas,digital_release,physical_release,studio) VALUES
+          ({id},97101,'Calendar Movie',2026,'{d0} 00:00:00','{d0} 00:00:00','{d5} 00:00:00','Harbor Studio'),
+          ({quiet},97102,'Calendar Unmonitored Movie',2026,NULL,'{d1} 00:00:00',NULL,NULL);
+         INSERT INTO movies(id,metadata_id,path,monitored) VALUES ({id},{id},'/owned-calendar/movies/m',1),({quiet},{quiet},'/owned-calendar/movies/u',0);",
+        d0 = day(0), d1 = day(1), d2 = day(2), d3 = day(3), d5 = day(5),
+    );
+    db.connect()
+        .await
+        .unwrap()
+        .execute_batch(&sql)
+        .await
+        .unwrap();
+    Json(json!({"today":day(0),"dates":{"d1":day(1),"d2":day(2),"d3":day(3),"d5":day(5)},"series":{"harbor":id,"daily":daily},"episodes":{"pilot":id,"second":second,"hidden":hidden,"date_only":date_only},"movies":{"triple":id,"unmonitored":quiet}})).into_response()
+}
+// AutoTagging/Collections facts. Library ids are high and distinct per domain; the collection graph
+// (tmdb 7000) is served by the metadata mock below. No production route.
+const COLLECTION_TMDB_ID: i64 = 7000;
+async fn seed_collections(State(db): State<Arc<Database>>) -> Response {
+    let sql = "INSERT OR IGNORE INTO root_folders(media_type,path) VALUES ('movies','/owned-collections/movies'),('tv','/owned-collections/tv');
+         INSERT OR IGNORE INTO quality_profiles(id,media_type,name) VALUES (7801,'movies','Collection profile');
+         INSERT INTO series(id,tvdb_id,title,path,monitored,runtime,network,status,genres_json,original_country) VALUES (7801,97801,'Autotag Series',  '/owned-collections/tv/autotag',1,45,'Fixture Net','continuing','[\"Drama\",\"Anime\"]','USA');
+         INSERT INTO seasons(series_id,number,monitored) VALUES (7801,1,1);
+         INSERT INTO library_settings(media_type,series_id,series_type) VALUES ('tv',7801,'anime');
+         INSERT INTO movie_metadata(id,tmdb_id,title,year,runtime,status,studio,genres_json,keywords_json) VALUES (7801,7001,'Fixture Saga One',2001,101,'released','Fixture Studio','[\"Drama\"]','[\"saga\"]');
+         INSERT INTO movies(id,metadata_id,path,monitored) VALUES (7801,7801,'/owned-collections/movies/Fixture Saga One (2001)',1);
+         INSERT INTO library_settings(media_type,movie_id,minimum_availability) VALUES ('movies',7801,'released');
+         INSERT INTO movie_collections(id,tmdb_id,title) VALUES (7801,7000,'Fixture Saga');
+         INSERT INTO movie_collection_members(collection_id,metadata_id) VALUES (7801,7801);";
+    db.connect()
+        .await
+        .unwrap()
+        .execute_batch(sql)
+        .await
+        .unwrap();
+    Json(json!({"series_id":7801,"movie_id":7801,"collection_id":7801,"collection_tmdb_id":COLLECTION_TMDB_ID,"quality_profile_id":7801,"movie_root":"/owned-collections/movies","tv_root":"/owned-collections/tv"})).into_response()
+}
+async fn collection_detail(Path(id): Path<String>) -> Response {
+    if id != COLLECTION_TMDB_ID.to_string() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(json!({"tmdbId":COLLECTION_TMDB_ID,"name":"Fixture Saga","overview":"Fixture collection overview","parts":[
+        {"tmdbId":7001,"title":"Fixture Saga One","year":2001},
+        {"tmdbId":7002,"title":"Fixture Saga Two","year":2003},
+        {"tmdbId":7003,"title":"Fixture Saga Three","year":2005}]}))
+    .into_response()
+}
 // This one-use hook has no production route and is inert in existing browser flows.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1262,6 +1330,7 @@ async fn library_ui_fixture() {
             .route("/fixture-metadata-mode", post(metadata_mode))
             .route("/shows/en/{id}", get(tv_detail))
             .route("/movie/{id}", get(movie_detail))
+            .route("/movie/collection/{id}", get(collection_detail))
             .route("/search/en", get(search))
             .route("/search", get(search))
             .with_state(Arc::new(AtomicU8::new(0))),
@@ -1282,7 +1351,7 @@ async fn library_ui_fixture() {
     let (provider_origin, _providers) = serve(provider_router()).await;
     let (alternate_provider_origin, alternate_providers) = serve(provider_router()).await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
-    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key));
+    let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key.clone()));
     let release_fixture = release_profile_fixture(db.clone(), &scratch.0).await;
     let snapshot_fixture = blocklist_fixture(db.clone(), &scratch.0, 901).await;
     let clear_root = scratch.0.join("clear-source");
@@ -1300,8 +1369,14 @@ async fn library_ui_fixture() {
             StatusCode::NO_CONTENT
         );
     }
+    // Production starts the outbox worker next to the command worker; the fixture does the same.
+    let _notifier = hrrdarr::notifications::start(db.clone(), Some(key.clone()));
     let (api, _api) = serve(
         library::router(db.clone())
+            .merge(hrrdarr::notifications::router(
+                db.clone(),
+                Some(key.clone()),
+            ))
             .merge(
                 Router::new()
                     .route(
@@ -1324,9 +1399,12 @@ async fn library_ui_fixture() {
             .merge(hrrdarr::completed_download_handling::router(db.clone()))
             .merge(releases::router(db.clone(), refresh.clone()))
             .merge(hrrdarr::wanted::router(db.clone(), refresh))
+            .merge(hrrdarr::calendar::router(db.clone()))
             .merge(quality_profiles::router(db.clone()))
             .merge(hrrdarr::qualities::router(db.clone()))
             .merge(hrrdarr::tags::router(db.clone()))
+            .merge(hrrdarr::autotagging::router(db.clone()))
+            .merge(hrrdarr::collections::router(db.clone()))
             .merge(hrrdarr::release_profiles::router(db.clone()))
             .merge(
                 Router::new()
@@ -1354,6 +1432,8 @@ async fn library_ui_fixture() {
                     )
                     .route("/api/fixture/client-backoff/age", post(age_client_failure))
                     .route("/api/fixture/wanted-seed", post(seed_wanted))
+                    .route("/api/fixture/calendar-seed", post(seed_calendar))
+                    .route("/api/fixture/collections-seed", post(seed_collections))
                     .route(
                         "/api/fixture/client-backoff/pending",
                         post(pending_client_refreshes),

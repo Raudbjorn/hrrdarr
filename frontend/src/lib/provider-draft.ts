@@ -13,10 +13,10 @@ export function matchesPendingProvider(provider:Provider,pending:PendingProvider
 // Transfer protocol per implementation; mirrors the server's provider_implementations registry.
 // The server remains authoritative: a mismatched grab or binding is rejected with protocol_mismatch.
 export type TransferProtocol='torrent'|'usenet';
-const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',qbittorrent:'torrent',transmission:'torrent',newznab:'usenet',sabnzbd:'usenet'};
+const protocols:Record<ProviderImplementation,TransferProtocol>={torznab:'torrent',torrentrss:'torrent',qbittorrent:'torrent',transmission:'torrent',deluge:'torrent',rtorrent:'torrent',utorrent:'torrent',aria2:'torrent',flood:'torrent',downloadstation:'torrent',newznab:'usenet',sabnzbd:'usenet',nzbget:'usenet'};
 export const protocolOf=(implementation:ProviderImplementation):TransferProtocol=>protocols[implementation];
 export const isIndexerImplementation=(implementation:ProviderImplementation):implementation is 'torznab'|'newznab'=>implementation==='torznab'||implementation==='newznab';
-export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'transmission'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='transmission';
+export const isClientImplementation=(implementation:ProviderImplementation):implementation is 'qbittorrent'|'sabnzbd'|'nzbget'|'transmission'|'deluge'|'rtorrent'|'utorrent'|'aria2'|'flood'|'downloadstation'=>implementation==='qbittorrent'||implementation==='sabnzbd'||implementation==='nzbget'||implementation==='transmission'||implementation==='deluge'||implementation==='rtorrent'||implementation==='utorrent'||implementation==='aria2'||implementation==='flood'||implementation==='downloadstation';
 export const isIndexer=(provider:Provider)=>isIndexerImplementation(provider.settings.implementation);
 export const isDownloadClient=(provider:Provider)=>isClientImplementation(provider.settings.implementation);
 export function indexerScope(provider:Provider|null,domain:MediaDomain) {
@@ -66,8 +66,7 @@ export function parseTransmissionEndpoint(endpoint:string):TransmissionAddress|n
   try{url=new URL(endpoint);}catch{return null;}
   if((url.protocol!=='http:'&&url.protocol!=='https:')||url.username||url.password||url.search||url.hash||!url.hostname)return null;
   const useSsl=url.protocol==='https:';
-  // The pathname is already in the encoded form the base was saved (and the server sends) in;
-  // decoding it would reject a valid %20 on reopen and throw on a malformed escape.
+  // The saved pathname is already encoded; decoding breaks spaces and malformed escapes on reopen.
   const base=normalizeUrlBase(url.pathname);
   if(base===null)return null;
   return {host:url.hostname,port:url.port?Number(url.port):useSsl?443:80,useSsl,urlBase:base};

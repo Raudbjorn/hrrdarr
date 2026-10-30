@@ -533,6 +533,7 @@ async fn settings_validate_paths_overlap_revision_and_both_domain_isolation() {
         .await;
     assert_eq!(status, 409, "stale revision: {body}");
     assert_eq!(body["error"]["code"], "recycle_bin_conflict");
+    // Movies are independent; the same folder is allowed, nesting is not.
     assert_eq!(
         app.get("/api/v1/movies/recycle-bin").await["path"],
         Value::Null
@@ -540,11 +541,7 @@ async fn settings_validate_paths_overlap_revision_and_both_domain_isolation() {
     let (status, body) = app.settings("movies", Some(&bin.join("nested")), 7).await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"]["code"], "recycle_bin_nested");
-    // Shared bins use one retention because cleanup has no domain marker in the path.
-    let (status, body) = app.settings("movies", Some(&bin), 7).await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"]["code"], "recycle_bin_retention_conflict");
-    assert_eq!(app.settings("movies", Some(&bin), 0).await.0, 200);
+    assert_eq!(app.settings("movies", Some(&bin), 7).await.0, 200);
     // Inverse guard: a new library declaration inside the bin is refused by storage.
     let c = app.db.connect().await.unwrap();
     assert!(

@@ -56,7 +56,7 @@ async fn profile_policy_upgrade_rollback_constraints_and_reopen() -> Result<(), 
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
-    assert_eq!(version(&conn).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&conn).await?, 76); // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM quality_profile_policies").await?,
         0,

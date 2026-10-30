@@ -791,14 +791,13 @@ async fn grab(
     let c = connection(&s.db).await?;
     let mut operation = crate::search::operation_evidence()
         .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
-    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await? {
-        if let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
+    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await?
+        && let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
             let command=read(&c,uuid(row.get::<String>(0)?)?).await?;
             let mut bytes=s.client.open_release(&envelope(id,&command),&payload).map_err(|e|Error(StatusCode::CONFLICT,e.code))?;
             let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::CONFLICT,"invalid_release"))?;
             evaluate(&c,&command,&release, &mut operation).await?;
         }
-    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;

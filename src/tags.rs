@@ -53,6 +53,8 @@ pub struct Detail {
     pub release_profile_ids: Vec<i64>,
     pub excluded_release_profile_ids: Vec<i64>,
     pub download_client_ids: Vec<uuid::Uuid>,
+    pub auto_tagging_ids: Vec<i64>,
+    pub collection_ids: Vec<i64>,
 }
 #[derive(Serialize, ts_rs::TS)]
 #[ts(rename = "TagOwners")]
@@ -422,8 +424,59 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
             "Tag reference graph exceeds its bound",
         ));
     }
+    let mut auto_tagging_ids = Vec::new();
+    let mut rows = c
+        .query(
+            "SELECT rule_id FROM autotagging_rule_tags WHERE tag_id=? ORDER BY rule_id LIMIT 257",
+            [t.id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        auto_tagging_ids.push(row.get(0)?);
+    }
+    drop(rows);
+    if auto_tagging_ids.len() > 256 {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tag_reference_invariant",
+            "Tag reference graph exceeds its bound",
+        ));
+    }
+    let mut collection_ids = Vec::new();
+    if t.media_type == MediaDomain::Movies {
+        let mut rows = c
+            .query(
+                "SELECT collection_id FROM movie_collection_tags WHERE tag_id=? ORDER BY collection_id LIMIT 1025",
+                [t.id],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            collection_ids.push(row.get(0)?);
+        }
+        drop(rows);
+        if collection_ids.len() > 1024 {
+            return Err(Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tag_reference_invariant",
+                "Tag reference graph exceeds its bound",
+            ));
+        }
+    }
+    // Notification scopes also reference tags; a referenced tag cannot be deleted.
+    let notification_scoped = c
+        .query(
+            "SELECT 1 FROM notification_tags WHERE tag_id=? LIMIT 1",
+            [t.id],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
     Ok(Detail {
-        in_use: !download_client_ids.is_empty()
+        in_use: notification_scoped
+            || !download_client_ids.is_empty()
+            || !collection_ids.is_empty()
+            || !auto_tagging_ids.is_empty()
             || count > 0
             || !delay_profile_ids.is_empty()
             || !release_profile_ids.is_empty()
@@ -431,6 +484,8 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
         release_profile_ids,
         excluded_release_profile_ids,
         download_client_ids,
+        auto_tagging_ids,
+        collection_ids,
         delay_profile_ids,
         tag: t,
         owner_count: count,

@@ -287,6 +287,19 @@ impl Error {
             started_attempt: false,
         }
     }
+    /// A failure that may clear on retry; `code` is a processing retry code.
+    fn unavailable(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: "Import naming evaluation is temporarily unavailable; retry",
+            diagnostic: None,
+            path_kind: None,
+            path_role: None,
+            path_boundary: None,
+            started_attempt: false,
+        }
+    }
     fn missing() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -1009,13 +1022,13 @@ async fn run(db: Arc<Database>, opid: &str, lease: &Arc<Permit>) -> Result<Opera
             error.started_attempt = true;
             error.boundary(PathBoundary::Precommit)
         });
-    if outcome.is_err() {
-        if let Err(error) = owned::restore_uncommitted(&db, opid, lease).await {
-            eprintln!(
-                "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
-                opid, error.code, error.diagnostic
-            );
-        }
+    if outcome.is_err()
+        && let Err(error) = owned::restore_uncommitted(&db, opid, lease).await
+    {
+        eprintln!(
+            "event=import_restore_failed operation_id={} code={} diagnostic={:?}",
+            opid, error.code, error.diagnostic
+        );
     }
     outcome
 }
@@ -1045,7 +1058,7 @@ async fn arm(db: &Database, opid: &str) -> Result<Record> {
                 "Library path changed since preview",
             ));
         }
-        owned::available(&c, opid, &rec.target, &plan).await?;
+        owned::available(&c, opid, &rec.target, plan).await?;
         // Reserve the non-preview phase with the marker so no rescan can enter after admission.
         let tx = c
             .transaction_with_behavior(TransactionBehavior::Immediate)

@@ -259,10 +259,13 @@ test('tracking choices are download clients configured for the library type only
   const settings = (implementation, tv, movies) => ({implementation, endpoint: 'http://x', tv, movies});
   const providers = [
     {id: id(20), name: 'Indexer', settings: settings('torznab', {}, {})},
+    // The expanded registry includes RSS indexers; only actual download clients may track scans.
+    {id: id(23), name: 'RSS indexer', settings: settings('torrentrss', {}, {})},
+    {id: id(24), name: 'NZBGet', settings: settings('nzbget', null, {category: 'movies'})},
     {id: id(21), name: 'TV client', settings: settings('qbittorrent', {category: 'tv'}, null)},
     {id: id(22), name: 'Both', settings: settings('qbittorrent', {category: 'tv'}, {category: 'movies'})},
     {id: 'bad', name: 'Malformed', settings: settings('qbittorrent', {}, {})},
   ];
   assert.deepEqual(trackingProviders(providers, 'tv').map(p => p.name), ['TV client', 'Both']);
-  assert.deepEqual(trackingProviders(providers, 'movies').map(p => p.name), ['Both']);
+  assert.deepEqual(trackingProviders(providers, 'movies').map(p => p.name), ['NZBGet', 'Both']);
 });

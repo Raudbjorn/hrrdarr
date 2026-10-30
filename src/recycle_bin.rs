@@ -215,25 +215,15 @@ pub(crate) async fn set(
             MediaDomain::Tv => MediaDomain::Movies,
             MediaDomain::Movies => MediaDomain::Tv,
         };
-        let other_settings = read(c, other).await?;
-        if let Some(other_bin) = other_settings.path {
-            if other_bin != *bin && overlaps(&other_bin, bin) {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "recycle_bin_nested",
-                    "TV and movie recycle bins may be the same folder but cannot be nested",
-                ));
-            }
-            // Recycled files carry no domain in their path, so one cleanup serves the whole
-            // folder. A shared folder therefore has one retention: with different retentions one
-            // domain would remove files the other domain still keeps.
-            if other_bin == *bin && other_settings.cleanup_days != input.cleanup_days {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "recycle_bin_retention_conflict",
-                    "TV and movie recycle bins that share a folder must use the same cleanup days",
-                ));
-            }
+        if let Some(other_bin) = read(c, other).await?.path
+            && other_bin != *bin
+            && overlaps(&other_bin, bin)
+        {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "recycle_bin_nested",
+                "TV and movie recycle bins may be the same folder but cannot be nested",
+            ));
         }
     }
     let changed = c.execute("UPDATE recycle_bin_settings SET path=?1,cleanup_days=?2,revision=revision+1,next_cleanup_at=CASE WHEN ?1 IS NULL THEN NULL WHEN path IS ?1 THEN next_cleanup_at ELSE ?3 END WHERE media_type=?4 AND revision=?5", params![path.clone(), input.cleanup_days, now + CLEANUP_INTERVAL_SECONDS, domain(media), input.revision]).await?;

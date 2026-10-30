@@ -121,7 +121,7 @@ fn parse(row: &Record, items: &J, formats: &J, tv: bool, old: bool) -> Option<Pr
     let count = roots_json.len().checked_add(
         roots_json
             .iter()
-            .filter_map(|v| object(v))
+            .filter_map(object)
             .filter_map(|obj| obj.get("items").and_then(|v| v.as_array()).map(Vec::len))
             .sum::<usize>(),
     )?;
@@ -450,16 +450,14 @@ pub(super) async fn prepare(
             if prior.is_some() && conn.query("SELECT 1 FROM snapshot_mappings WHERE application=? AND fingerprint=? AND destination_table='library_settings' AND source_id=?",params![app,report.fingerprint.clone(),*owner]).await?.next().await?.is_none() {report.conflicts+=1;continue;}
             if old && conn.query("SELECT 1 FROM snapshot_mappings m JOIN library_settings s ON s.id=m.destination_id WHERE m.application=? AND m.fingerprint=? AND m.destination_table='library_settings' AND m.source_id=? AND s.quality_profile_id IS NULL",params![app,report.fingerprint.clone(),*owner]).await?.next().await?.is_none() {report.conflicts+=1;continue;}
             assignments.push((*owner, *id));
-            if !old {
-                if let Some(index) = settings_indices.get(owner) {
-                    if let Some((_, field)) = entities[*index]
-                        .fields
-                        .iter_mut()
-                        .find(|(name, _)| *name == "quality_profile_id")
-                    {
-                        *field = Field::Value((*id).into());
-                    }
-                }
+            if !old
+                && let Some(index) = settings_indices.get(owner)
+                && let Some((_, field)) = entities[*index]
+                    .fields
+                    .iter_mut()
+                    .find(|(name, _)| *name == "quality_profile_id")
+            {
+                *field = Field::Value((*id).into());
             }
         } else if profiles
             .profiles

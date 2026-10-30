@@ -192,7 +192,7 @@ pub(crate) async fn evaluate_with_pending(
                     air_dates.push(
                         e.get::<Option<String>>(12)?
                             .as_deref()
-                            .and_then(super::restrictions::instant),
+                            .and_then(super::restrictions::stored_instant),
                     );
                     files.push(e.get(7)?);
                     monitored &= e.get::<i64>(5)? == 1 && e.get::<i64>(11)? == 1;
@@ -376,10 +376,10 @@ pub(crate) async fn evaluate_with_pending(
             .await?
             .next()
             .await?;
-        if let Some(policy) = availability {
-            if !available(&candidate, now, policy.get(0)?) {
-                result.deny("movie_unavailable");
-            }
+        if let Some(policy) = availability
+            && !available(&candidate, now, policy.get(0)?)
+        {
+            result.deny("movie_unavailable");
         }
     }
     super::delay::apply(

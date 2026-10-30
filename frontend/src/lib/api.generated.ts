@@ -10,6 +10,32 @@ export type ApiErrorEnvelope = { error: ApiErrorDetail, };
 
 export type ApiPage<T> = { items: Array<T>, total: number, limit: number, offset: number, };
 
+export type AutoTag = { id: number, media_type: MediaDomain, name: string, remove_tags_automatically: boolean, tag_ids: Array<number>, specifications: Array<AutoTagSpecification>, };
+
+export type AutoTagCondition = { "implementation": "genre" } & AutoTagTextValues | { "implementation": "keyword" } & AutoTagTextValues | { "implementation": "network" } & AutoTagTextValues | { "implementation": "studio" } & AutoTagTextValues | { "implementation": "original_country" } & AutoTagTextValues | { "implementation": "year" } & AutoTagRange | { "implementation": "runtime" } & AutoTagRange | { "implementation": "root_folder" } & AutoTagRootFolder | { "implementation": "original_language" } & AutoTagIntegerValues | { "implementation": "quality_profile" } & AutoTagIntegerValues | { "implementation": "series_type" } & AutoTagTextValues | { "implementation": "status" } & AutoTagTextValues | { "implementation": "minimum_availability" } & AutoTagTextValues | { "implementation": "monitored" } & AutoTagFlag | { "implementation": "collection" } & AutoTagIntegerValues;
+
+export type AutoTagFieldKind = "text_list" | "integer_list" | "integer" | "text" | "boolean" | "enum_list";
+
+export type AutoTagFlag = { value: boolean, };
+
+export type AutoTagInput = { name: string, remove_tags_automatically: boolean, tag_ids: Array<number>, specifications: Array<AutoTagSpecificationInput>, };
+
+export type AutoTagIntegerValues = { values: Array<number>, };
+
+export type AutoTagRange = { min?: number | null, max?: number | null, };
+
+export type AutoTagRootFolder = { path: string, };
+
+export type AutoTagSchemaEntry = { implementation: string, label: string, fields: Array<AutoTagSchemaField>, };
+
+export type AutoTagSchemaField = { name: string, label: string, kind: AutoTagFieldKind, required: boolean, options: Array<string>, };
+
+export type AutoTagSpecification = { id: number, name: string, negate: boolean, required: boolean, condition: AutoTagCondition, };
+
+export type AutoTagSpecificationInput = { name: string, negate: boolean, required: boolean, condition: AutoTagCondition, };
+
+export type AutoTagTextValues = { values: Array<string>, };
+
 export type BlocklistClearCommand = { id: string, name: BlocklistClearName, target: BlocklistClearTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_removed: number, };
 
 export type BlocklistClearInput = { target: BlocklistClearTarget, priority: CommandPriority, };
@@ -36,6 +62,16 @@ export type BlocklistSortDirection = "asc" | "desc";
 
 export type BlocklistTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
+export type CalendarDiagnostics = { invalid_dates: number, date_only_air_dates: number | null, };
+
+export type CalendarFeedQuery = { past_days?: number, future_days?: number, unmonitored?: boolean, tags?: string, specials?: boolean, release_types?: string, };
+
+export type CalendarPage<T> = { media_type: MediaDomain, start: string, end: string, first_date: string, end_date: string, include_unmonitored: boolean, include_specials: boolean, release_types: Array<MovieReleaseType>, tags: Array<number>, items: Array<T>, total: number, limit: number, evaluated_at: number, diagnostics: CalendarDiagnostics, };
+
+export type CalendarQuery = { start: string, end: string, unmonitored?: boolean, tags?: string, specials?: boolean, release_types?: string, };
+
+export type CalendarRuntimeSource = "series" | "episode";
+
 export type CandidateOrigin = { "kind": "rss" } | { "kind": "search", command_id: string, result_id: string, mode: SearchMode, };
 
 export type Capabilities = { max_limit: number, default_limit: number, search: SearchCapability, tv: SearchCapability, movies: SearchCapability, categories: Array<IndexerCategory>, };
@@ -57,6 +93,44 @@ export type ClientAttemptState = "selected" | "prepared" | "dispatching" | "defi
 export type ClientSelection = { "kind": "default", } | { "kind": "explicit", provider_id: string, provider_revision: number, };
 
 export type ClientTest = { api_version: string, application_version: string, domains: Array<MediaDomain>, missing_categories: Array<string>, queueing_enabled: boolean, };
+
+export type CollectionAssociation = { "state": "absent" } | { "state": "clear" } | { "state": "present", "value": CollectionRef };
+
+export type CollectionBulkPatch = { ids: Array<number>, patch: CollectionPatch, };
+
+export type CollectionMovie = { metadata_id: number, tmdb_id: number | null, title: string, year: number | null, 
+/**
+ * Library movie id when the movie is in the library; null for catalog-only members.
+ */
+movie_id: number | null, monitored: boolean | null, };
+
+export type CollectionPatch = { monitored?: boolean, search_on_add?: boolean, quality_profile_id?: number | null, root_folder_id?: number | null, minimum_availability?: MinimumAvailability | null, 
+/**
+ * Replaces the complete tag set applied to movies this collection adds.
+ */
+tag_ids?: Array<number>, 
+/**
+ * One-shot bulk action: set monitoring on movies of this collection already in the library.
+ */
+monitor_movies?: boolean, };
+
+export type CollectionQuery = { limit?: number, offset?: number, monitored?: boolean, q?: string, };
+
+export type CollectionRef = { tmdb_id: number, title: string, };
+
+export type CollectionRefreshCommand = { id: string, name: CollectionRefreshName, origin: CollectionRefreshOrigin, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, collections_checked: number, collections_failed: number, movies_added: number, 
+/**
+ * Added movies whose collection requested search-on-add. Counted, not submitted here.
+ */
+searches_pending: number, };
+
+export type CollectionRefreshInput = Record<symbol, never>;
+
+export type CollectionRefreshName = "refresh_collections";
+
+export type CollectionRefreshOrigin = "manual" | "automatic";
+
+export type CollectionRefreshQuery = { limit?: number, offset?: number, };
 
 export type ColonReplacement = "delete" | "dash" | "space_dash" | "space_dash_space" | "smart" | "custom";
 
@@ -180,6 +254,12 @@ export type EpisodeSeriesProjection = { runtime: number | null, id: number, tvdb
 
 export type EvaluatedRelease = { metadata: ReleaseMetadata, decision: ReleaseDecision, };
 
+export type FeedDomainTest = { media_type: MediaDomain, parsed: number, rejected: number, below_minimum_seeders: number, };
+
+export type FeedScope = { enable_rss?: boolean, minimum_seeders?: number | null, };
+
+export type FeedTest = { domains: Array<FeedDomainTest>, };
+
 export type FileBulk = { files: Array<FileUpdate>, };
 
 export type FileBulkDeleteInput = { file_ids: Array<number>, mode: FileDeletionMode, };
@@ -227,6 +307,10 @@ export type FilesystemMediaQuery = { path: string, media_type: MediaDomain, };
 export type FilesystemPath = { path: string, };
 
 export type FilesystemType = { type: FilesystemKind, };
+
+export type FolderRenamePreview = { media_type: MediaDomain, naming_revision: number, folder_format: string | null, ids: Array<number>, unchanged_count: number, items: Array<FolderRenamePreviewItem>, };
+
+export type FolderRenamePreviewItem = { series_id: number | null, movie_id: number | null, existing_path: string, new_path: string | null, status: RenameStatus, reasons: Array<RenameReason>, };
 
 export type HealthAdmission = { "outcome": "queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "coalesced_queued", command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, } | { "outcome": "pending", active_command_id: string, requested_scope: HealthScope, selection: Array<HealthSelectionToken>, pending: boolean, };
 
@@ -309,6 +393,10 @@ export type IndexerParameter = { name: string, value: string, };
 export type IndexerSearch = { "kind": "rss", media_type: MediaDomain, offset?: number, query_index?: number, limit?: number, } | { "kind": "tv", title: string, aliases?: Array<string>, tvdb_id?: number | null, tvmaze_id?: number | null, rage_id?: number | null, imdb_id?: string | null, tmdb_id?: number | null, numbering: TvNumbering, search_mode?: TvSearchMode, offset?: number, query_index?: number, limit?: number, } | { "kind": "movie", title: string, aliases?: Array<string>, year?: number | null, imdb_id?: string | null, tmdb_id?: number | null, offset?: number, query_index?: number, limit?: number, };
 
 export type IndexerTest = { capabilities: Capabilities, domains: Array<MediaDomain>, };
+
+export type LabelClientTest = { client_version: string, domains: Array<MediaDomain>, warnings: Array<LabelTestWarning>, };
+
+export type LabelTestWarning = "label_not_created";
 
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
 
@@ -398,11 +486,19 @@ export type Mode = "copy" | "move" | "hardlink";
 
 export type MonitorNewItems = "all" | "none";
 
+export type MovieCalendarEntry = { event_id: string, target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, release_type: MovieReleaseType, date: string, released_at: string, monitored: boolean, has_file: boolean, status: string | null, studio: string | null, runtime_minutes: number | null, };
+
+export type MovieCollection = { id: number, tmdb_id: number | null, title: string, overview: string | null, monitored: boolean, search_on_add: boolean, quality_profile_id: number | null, root_folder_id: number | null, root_folder_path: string | null, minimum_availability: string | null, tag_ids: Array<number>, last_info_sync: string | null, movie_count: number, library_movie_count: number, missing_movie_count: number, 
+/**
+ * Members are listed by the detail endpoint only; list responses carry an empty array.
+ */
+movies: Array<CollectionMovie>, };
+
 export type MovieCredit = { id: number, metadata_id: number, credit_tmdb_id: string, person_tmdb_id: number, person_name: string, department: string | null, job: string | null, character: string | null, order: number, type: CreditKind, images: Array<CreditImage>, };
 
 export type MovieCreditQuery = { limit?: number, offset?: number, movie_id?: number, metadata_id?: number, };
 
-export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, };
+export type MovieDetails = { studio: string | null, genres: Array<string> | null, keywords: Array<string> | null, tmdb_id: number, title: string, year: number | null, imdb_id: string | null, runtime: number | null, status: string | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, secondary_year: number | null, original_language: number | null, alternative_titles: Array<string> | null, credits: Array<CreditDetails> | null, collection: CollectionAssociation, };
 
 export type MovieFileResource = { movie_id: number, edition: string | null, original_file_path: string | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
@@ -418,9 +514,19 @@ export type MovieNamingExamplesQuery = { rename_enabled?: boolean, replace_illeg
 
 export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
 
+export type MovieNotificationScope = { triggers: MovieNotificationTriggers, 
+/**
+ * Movie tag IDs. Empty means every movie; otherwise a movie must carry one of them.
+ */
+tag_ids: Array<number>, };
+
+export type MovieNotificationTriggers = { on_grab: boolean, on_import: boolean, on_upgrade: boolean, on_rename: boolean, on_movie_added: boolean, on_movie_delete: boolean, on_movie_file_delete: boolean, on_movie_file_delete_for_upgrade: boolean, on_health_issue: boolean, include_health_warnings: boolean, on_health_restored: boolean, on_application_update: boolean, on_manual_interaction_required: boolean, };
+
 export type MovieParseResult = { title: string, parsed: ParsedRelease | null, movie: MatchedMovie | null, };
 
 export type MovieReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, };
+
+export type MovieReleaseType = "in_cinemas" | "digital" | "physical";
 
 export type MovieRenamePreview = { naming_revision: number, rename_enabled: boolean, standard_movie_format: string | null, movie_ids: Array<number>, files_considered: number, unchanged_count: number, unavailable_count: number, items: Array<MovieRenamePreviewItem>, };
 
@@ -444,7 +550,79 @@ export type NativeDeletionEvent = { id: string, deletion_id: string, event_type:
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
+export type Notification = { id: string, name: string, implementation: string, enabled: boolean, revision: number, settings: { [key in string]: NotificationSettingValue }, 
+/**
+ * Names of secrets that are configured; the values are never returned.
+ */
+secrets_configured: Array<string>, tv: TvNotificationScope | null, movies: MovieNotificationScope | null, created_at: number, updated_at: number, };
+
+export type NotificationDelivery = { id: number, event_sequence: number, notification_id: string, event_kind: string, media_type: MediaDomain | null, state: string, attempts: number, next_attempt_at: number, last_error: string | null, created_at: number, completed_at: number | null, };
+
+export type NotificationDeliveryList = { items: Array<NotificationDelivery>, };
+
+export type NotificationDomainTestResult = { media_type: MediaDomain, status: NotificationTestStatus, 
+/**
+ * Stable machine class; never contains remote bodies, URLs or secrets.
+ */
+error: string | null, };
+
+export type NotificationField = { name: string, label: string, kind: NotificationFieldKind, required: boolean, 
+/**
+ * Secret fields are submitted through `secrets`, stored encrypted and never returned.
+ */
+secret: boolean, help: string, default: NotificationSettingValue | null, options: Array<string>, min: number | null, max: number | null, max_length: number | null, };
+
+export type NotificationFieldKind = "text" | "url" | "number" | "boolean" | "select" | "path";
+
+export type NotificationImplementation = { implementation: string, label: string, description: string, kind: NotificationImplementationKind, domains: Array<MediaDomain>, fields: Array<NotificationField>, };
+
+export type NotificationImplementationKind = "message" | "structured" | "script" | "library_update";
+
+export type NotificationImplementationList = { items: Array<NotificationImplementation>, };
+
+export type NotificationInput = { name: string, implementation: string, enabled: boolean, 
+/**
+ * Non-secret settings keyed by the implementation schema field name.
+ */
+settings: { [key in string]: NotificationSettingValue }, 
+/**
+ * Write-only secrets. On update an absent key keeps the stored value and `null` clears it.
+ */
+secrets: { [key in string]: string | null }, tv?: TvNotificationScope, movies?: MovieNotificationScope, 
+/**
+ * Required on update; must equal the stored revision.
+ */
+revision?: number, };
+
+export type NotificationList = { items: Array<Notification>, };
+
+export type NotificationSettingValue = boolean | number | string;
+
+export type NotificationTestAllResult = { items: Array<NotificationTestResult>, };
+
+export type NotificationTestInput = { 
+/**
+ * A saved notification whose stored secrets fill any secret not supplied in the draft.
+ */
+existing_id?: string, draft: NotificationInput, };
+
+export type NotificationTestResult = { id: string | null, name: string, results: Array<NotificationDomainTestResult>, };
+
+export type NotificationTestStatus = "delivered" | "failed" | "skipped";
+
 export type Numbering = { "kind": "episodes", season: number, episodes: Array<number>, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "absolute", episode: number, };
+
+export type NzbgetPriority = "very_low" | "low" | "normal" | "high" | "very_high" | "force";
+
+export type NzbgetScope = { category: string, recent_priority?: NzbgetPriority, older_priority?: NzbgetPriority, 
+/**
+ * The job is added paused and must be resumed in NZBGet.
+ */
+add_paused?: boolean, tags?: Array<number>, };
+
+export type NzbgetTest = { nzbget_version: string, domains: Array<MediaDomain>, warnings: Array<NzbgetTestWarning>, };
+
+export type NzbgetTestWarning = "testing_version" | "short_history_retention";
 
 export type Operation = { id: string, target: MediaTarget, status: string, message: string, error_code: string | null, path_failure_code: string | null, recovery_required: boolean, };
 
@@ -482,13 +660,9 @@ export type ProviderBulkUpdate = { changes: ProviderChanges, media_type: MediaDo
 
 export type ProviderChanges = { enabled?: boolean | null, priority?: number | null, };
 
-export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
+export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, } | { "kind": "feed", cookie?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, 
-/**
- * Suggested endpoint shape; the RPC path `/rpc` is appended to it.
- */
-endpoint_hint: string, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "feed", tv: FeedScope, movies: FeedScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "nzbget_client", recent_priority: NzbgetPriority, older_priority: NzbgetPriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "label_torrent_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -502,7 +676,7 @@ export type ProviderFilesResult = { provider_id: string, revision: number, resul
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };
 
-export type ProviderImplementation = "newznab" | "qbittorrent" | "sabnzbd" | "torznab" | "transmission";
+export type ProviderImplementation = "newznab" | "nzbget" | "qbittorrent" | "sabnzbd" | "torrentrss" | "torznab" | "transmission" | "deluge" | "rtorrent" | "utorrent" | "aria2" | "flood" | "downloadstation";
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -526,13 +700,13 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
 export type ProviderTestObservation = { revision: number, tested_at: number, status: TestStatus, error_code: string | null, };
 
-export type ProviderTestOutcome = IndexerTest | ClientTest | SabnzbdTest | TransmissionTest;
+export type ProviderTestOutcome = IndexerTest | FeedTest | ClientTest | SabnzbdTest | NzbgetTest | TransmissionTest | LabelClientTest;
 
 export type ProviderTestResult = { provider_id: string, revision: number, tested_at: number, result: ProviderTestOutcome, };
 
@@ -633,6 +807,44 @@ export type ReleaseSearchInput = { provider_id: string, provider_revision: numbe
 export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: IndexerContinuation | null, };
 
 export type ReleaseTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
+
+export type RenameCommand = { id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+/**
+ * More changes existed than one run handles; run the command again to continue.
+ */
+bounded: boolean, };
+
+export type RenameCommandDetail = { items: Array<RenameItem>, id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+/**
+ * More changes existed than one run handles; run the command again to continue.
+ */
+bounded: boolean, };
+
+export type RenameEvent = { id: string, event_type: string, kind: RenameEventKind, owner: RenameOwner, file_id: number | null, command_id: string, old_path: string, new_path: string, sidecar_count: number, occurred_at: string, dispatched: boolean, };
+
+export type RenameEventKind = "file" | "folder";
+
+export type RenameEventQuery = { media_type?: MediaDomain, limit?: number, offset?: number, };
+
+export type RenameInput = { name: RenameName, target: RenameTarget, 
+/**
+ * Fence against configuration changes after the preview the user looked at.
+ */
+expected_naming_revision?: number, priority: CommandPriority, };
+
+export type RenameItem = { kind: RenameEventKind, series_id: number | null, movie_id: number | null, file_id: number | null, old_path: string, new_path: string, state: RenameItemState, error_code: string | null, sidecar_count: number, };
+
+export type RenameItemState = "planned" | "committed" | "failed" | "rolled_back";
+
+export type RenameName = "rename_files" | "rename_series" | "rename_movie" | "rename_series_folder" | "rename_movie_folder";
+
+export type RenameOwner = { "media_type": "tv", "id": number } | { "media_type": "movies", "id": number };
+
+export type RenameReason = "invalid_path" | "outside_owner_folder" | "missing_extension" | "invalid_file_facts" | "naming_render_failed" | "multi_episode_style_required" | "no_linked_episodes" | "invalid_episode_set" | "folder_format_unavailable" | "destination_in_use" | "duplicate_destination" | "destination_exists" | "source_missing" | "path_unsafe";
+
+export type RenameStatus = "change" | "unavailable" | "blocked";
+
+export type RenameTarget = { media_type: MediaDomain, series_ids: Array<number>, movie_ids: Array<number>, file_ids: Array<number>, };
 
 export type RescanBatch = { commands: Array<RescanCommand>, busy_target_ids: Array<number>, };
 
@@ -770,7 +982,7 @@ export type TagAssignment = { mode: TagAssignmentMode, ids: Array<number>, };
 
 export type TagAssignmentMode = "add" | "remove" | "replace";
 
-export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, download_client_ids: Array<string>, };
+export type TagDetail = { tag: Tag, in_use: boolean, owner_count: number, delay_profile_ids: Array<number>, release_profile_ids: Array<number>, excluded_release_profile_ids: Array<number>, download_client_ids: Array<string>, auto_tagging_ids: Array<number>, collection_ids: Array<number>, };
 
 export type TagInput = { label: string, };
 
@@ -779,6 +991,8 @@ export type TagOwners = { ids: Array<number>, total: number, limit: number, offs
 export type TagOwnersQuery = { limit?: number, offset?: number, };
 
 export type TestStatus = "never_tested" | "success" | "failure";
+
+export type TorrentLabelScope = { category: string, recent_priority?: TorrentQueuePriority, older_priority?: TorrentQueuePriority, add_paused?: boolean, tags?: Array<number>, };
 
 export type TorrentPlacement = { "strategy": "category", category: string, } | { "strategy": "directory", directory: string, };
 
@@ -789,6 +1003,8 @@ export type TransmissionScope = { placement: TorrentPlacement, recent_priority?:
 export type TransmissionTest = { transmission_version: string, rpc_version: number, domains: Array<MediaDomain>, labels_supported: boolean, warnings: Array<TransmissionTestWarning>, };
 
 export type TransmissionTestWarning = "labels_unsupported" | "queue_disabled";
+
+export type TvCalendarEntry = { event_id: string, target: MediaTarget, series_id: number, series_title: string, series_type: SeriesType | null, series_monitored: boolean, network: string | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, title: string, overview: string | null, finale_type: string | null, monitored: boolean, effective_monitored: boolean, air_date: string | null, starts_at: string, runtime_minutes: number | null, runtime_source: CalendarRuntimeSource | null, ends_at: string | null, has_file: boolean, };
 
 export type TvFileResource = { series_id: number, season_number: number | null, release_type: number | null, id: number, path: string, relative_path: string | null, quality: FileQuality | null, languages: Array<number> | null, size: number | null, date_added: string | null, release_group: string | null, indexer_flags: number | null, scene_name: null, media_info: MediaInfo | null, custom_formats: null, custom_format_score: null, quality_cutoff_not_met: null, };
 
@@ -802,11 +1018,23 @@ export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_
 
 export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
+export type TvNotificationScope = { triggers: TvNotificationTriggers, 
+/**
+ * TV tag IDs. Empty means every series; otherwise a series must carry one of them.
+ */
+tag_ids: Array<number>, };
+
+export type TvNotificationTriggers = { on_grab: boolean, on_import: boolean, on_upgrade: boolean, on_import_complete: boolean, on_rename: boolean, on_series_add: boolean, on_series_delete: boolean, on_episode_file_delete: boolean, on_episode_file_delete_for_upgrade: boolean, on_health_issue: boolean, include_health_warnings: boolean, on_health_restored: boolean, on_application_update: boolean, on_manual_interaction_required: boolean, };
+
 export type TvNumbering = { "kind": "episode", season: number, episode: number, } | { "kind": "season", season: number, } | { "kind": "daily", date: string, } | { "kind": "daily_season", year: number, } | { "kind": "special", episode_title: string, } | { "kind": "anime", absolute_episode: number, season?: number | null, episode?: number | null, } | { "kind": "anime_season", season: number, season_aliases?: Array<string>, };
 
 export type TvParseResult = { title: string, parsed: ParsedRelease | null, series: MatchedSeries | null, episodes: Array<MatchedEpisode>, };
 
 export type TvReleaseProfileInput = { name: string | null, enabled: boolean, required: Array<string>, ignored: Array<string>, tag_ids: Array<number>, indexers: Array<ReleaseProfileIndexer>, excluded_tag_ids: Array<number>, air_date_restriction: boolean, air_date_grace_period_days: number, allow_season_pack_without_all_episodes_aired: boolean, };
+
+export type TvRenamePreview = { naming_revision: number, rename_enabled: boolean, series_ids: Array<number>, season: number | null, files_considered: number, unchanged_count: number, unavailable_count: number, blocked_count: number, items: Array<TvRenamePreviewItem>, };
+
+export type TvRenamePreviewItem = { series_id: number, episode_file_id: number, season_number: number | null, episode_ids: Array<number>, episode_numbers: Array<number>, existing_path: string | null, new_path: string | null, status: RenameStatus, reasons: Array<RenameReason>, };
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 

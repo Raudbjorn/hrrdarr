@@ -104,10 +104,16 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
-    for i in [0, 1, 4, 5, 6] {
+    assert_eq!(version(&c).await?, 76); // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+    for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }
+    // 0068 appends the nullable minimum_seeders column to provider_scopes; every predecessor value stays exact.
+    let mut scopes = before[1].clone();
+    for row in &mut scopes {
+        row.push(libsql::Value::Null);
+    }
+    assert_eq!(rows(&c, queries[1]).await?, scopes);
     let mut commands = before[2].clone();
     for row in &mut commands {
         row.extend([

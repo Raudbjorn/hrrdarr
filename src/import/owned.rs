@@ -290,7 +290,8 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
             "Downloaded file no longer passes current import policy",
         )
     })?;
-    let destination = crate::naming::destination::resolve_owned_destination(
+    // Classified like the in-transaction recheck below: only a render failure is a conflict.
+    let destination = match crate::naming::destination::resolve_owned_destination(
         &c,
         &input.target,
         &preflight.root,
@@ -301,7 +302,23 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         &preflight.evidence,
     )
     .await
-    .map_err(|_| Error::conflict("preflight_changed", "Import naming could not be validated"))?;
+    {
+        Ok(destination) => destination,
+        Err(crate::naming::destination::DestinationError::Render(_)) => {
+            return Err(Error::conflict(
+                "preflight_changed",
+                "Import naming could not be validated",
+            ));
+        }
+        Err(crate::naming::destination::DestinationError::Db(e)) => return Err(Error::from(e)),
+        Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+            return Err(Error::unavailable(code));
+        }
+        Err(crate::naming::destination::DestinationError::Internal(reason)) => {
+            eprintln!("event=naming_destination_unavailable condition={reason}");
+            return Err(Error::internal());
+        }
+    };
     if destination != input.destination {
         return Err(Error::conflict(
             "preflight_changed",
@@ -374,6 +391,9 @@ pub(crate) async fn prepare_owned(db: Arc<Database>, input: OwnedImport) -> Resu
         Ok(destination) => Some(destination),
         Err(crate::naming::destination::DestinationError::Render(_)) => None,
         Err(crate::naming::destination::DestinationError::Db(e)) => return Err(Error::from(e)),
+        Err(crate::naming::destination::DestinationError::Unavailable(code)) => {
+            return Err(Error::unavailable(code));
+        }
         Err(crate::naming::destination::DestinationError::Internal(reason)) => {
             eprintln!("event=naming_destination_unavailable condition={reason}");
             return Err(Error::internal());

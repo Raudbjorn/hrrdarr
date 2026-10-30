@@ -12,6 +12,15 @@ use tokio::{
     time::Instant,
 };
 use uuid::Uuid;
+
+/// RFC 7617 `Authorization: Basic` value, shared by providers and notifications.
+pub fn basic_auth(user: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
 const MAX_OPERATIONS: usize = 8;
 const MAX_LANES: usize = 256;
 const LANE_IDLE: Duration = Duration::from_secs(60);
@@ -39,6 +48,8 @@ pub enum HttpRequestBody {
     },
     /// A serialized JSON document POSTed as `application/json` (bounded by [`MAX_JSON_BYTES`]).
     Json(Vec<u8>),
+    /// A serialized XML-RPC call POSTed as `text/xml` (bounded by [`MAX_JSON_BYTES`]).
+    Xml(Vec<u8>),
 }
 pub struct HttpResponse {
     pub status: u16,
@@ -318,7 +329,7 @@ impl HttpOperation<'_> {
             value.set_sensitive(true);
             header_map.insert(name, value);
         }
-        let length_limit = if matches!(body, HttpRequestBody::Json(_)) {
+        let length_limit = if matches!(body, HttpRequestBody::Json(_) | HttpRequestBody::Xml(_)) {
             MAX_JSON_BYTES as u64
         } else {
             MAX_MULTIPART_BYTES
@@ -373,6 +384,16 @@ impl HttpOperation<'_> {
                     .client
                     .post(url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+            }
+            HttpRequestBody::Xml(bytes) => {
+                if bytes.is_empty() || bytes.len() > MAX_JSON_BYTES {
+                    return Err(HttpError::InvalidRequest);
+                }
+                self.client
+                    .client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "text/xml")
                     .body(bytes)
             }
         }

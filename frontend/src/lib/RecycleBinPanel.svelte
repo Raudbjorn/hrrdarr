@@ -77,7 +77,7 @@
     <fieldset disabled={!saved||busy||loading||uncertain||stale}>
       <legend>{domain==='tv'?'TV':'Movie'} recycle bin</legend>
       <label>Recycle bin folder<input bind:value={draft.path} placeholder="/data/recycle" autocomplete="off" spellcheck="false" aria-describedby="recycle-path-hint"/></label>
-      <p id="recycle-path-hint">An absolute folder outside every root folder and library folder (TV and movies). It must already exist; Health reports a missing or unwritable folder. TV and movies may share one folder but cannot nest; shared folders must use the same cleanup days.</p>
+      <p id="recycle-path-hint">An absolute folder outside every root folder and library folder (TV and movies). It must already exist; Health reports a missing or unwritable folder. TV and movies may share one folder but cannot nest. A shared folder uses the longer cleanup period; 0 in either domain disables cleanup for both.</p>
       <label>Cleanup after (days)<input type="number" required min="0" max={MAX_CLEANUP_DAYS} step="1" bind:value={draft.cleanup_days} aria-describedby="recycle-days-hint"/></label>
       <p id="recycle-days-hint">Once a day, files in this folder older than this many days are permanently removed, then empty subfolders. Anything already in the folder counts, not only files hrrdarr moved there. 0 disables automatic cleanup. The first scheduled run is one day after choosing a folder.</p>
       <button>Save recycle bin settings</button>

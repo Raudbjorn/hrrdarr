@@ -5,7 +5,7 @@
 //! `provider_implementations` table with its kind/protocol, and add one arm to each match below
 //! and in `RefreshClient`. Grab, refresh, completed-download processing and health consumers do
 //! not name concrete clients.
-use super::{qbittorrent, sabnzbd, transmission};
+use super::{label_client, nzbget, qbittorrent, sabnzbd, transmission};
 
 /// What the grab pipeline hands to a client. The variant must match the client's protocol; a
 /// torrent source is shared by every torrent client (qBittorrent, Transmission).
@@ -31,21 +31,27 @@ impl ReleaseSource {
 pub(crate) enum PreparedSubmission {
     Torrent(qbittorrent::PreparedDownload),
     Usenet(sabnzbd::PreparedNzb),
+    Nzbget(nzbget::PreparedNzb),
     Transmission(transmission::PreparedTorrent),
+    Label(label_client::PreparedTorrent),
 }
 impl PreparedSubmission {
     pub(crate) fn identity(&self) -> &qbittorrent::SubmissionIdentity {
         match self {
             Self::Torrent(prepared) => prepared.identity(),
             Self::Usenet(prepared) => prepared.identity(),
+            Self::Nzbget(prepared) => prepared.identity(),
             Self::Transmission(prepared) => prepared.identity(),
+            Self::Label(prepared) => prepared.identity(),
         }
     }
     pub(crate) fn into_identity(self) -> qbittorrent::SubmissionIdentity {
         match self {
             Self::Torrent(prepared) => prepared.into_identity(),
             Self::Usenet(prepared) => prepared.into_identity(),
+            Self::Nzbget(prepared) => prepared.into_identity(),
             Self::Transmission(prepared) => prepared.into_identity(),
+            Self::Label(prepared) => prepared.into_identity(),
         }
     }
 }
@@ -181,5 +187,20 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.to_string(), "output depth limit");
+    }
+    #[test]
+    fn depth_limit_fails_closed() {
+        let root =
+            std::env::temp_dir().join(format!("hrrdarr-output-depth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut current = root.clone();
+        for depth in 0..MAX_OUTPUT_DEPTH {
+            current.push(format!("level-{depth}"));
+            std::fs::create_dir(&current).unwrap();
+        }
+
+        let result = list_local_output(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_err());
     }
 }

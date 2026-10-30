@@ -142,11 +142,17 @@ async fn run() -> Result<(), ProcessFailure> {
         eprintln!("event=command_worker_disabled code=local_ownership_required");
         None
     };
+    // The notification dispatcher owns no library file, so it runs in every server process: fan-out
+    // is idempotent (one delivery row per event and notification) and a delivery is claimed under
+    // a lease, so several processes over one remote database do not duplicate a send. The command
+    // worker stays gated on local ownership because it moves media files.
+    let notifier = hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone());
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
+    notifier.shutdown().await;
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -170,10 +176,13 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .with_state(state.clone())
         .merge(hrrdarr::search::router(state.db.clone(), refresh.clone()))
         .merge(hrrdarr::wanted::router(state.db.clone(), refresh.clone()))
+        .merge(hrrdarr::calendar::router(state.db.clone()))
         .merge(hrrdarr::qualities::router(state.db.clone()))
         .merge(hrrdarr::quality_profiles::router(state.db.clone()))
         .merge(hrrdarr::custom_formats::router(state.db.clone()))
         .merge(hrrdarr::tags::router(state.db.clone()))
+        .merge(hrrdarr::autotagging::router(state.db.clone()))
+        .merge(hrrdarr::collections::router(state.db.clone()))
         .merge(hrrdarr::revision_policy::router(state.db.clone()))
         .merge(hrrdarr::import_policy::router(state.db.clone()))
         .merge(hrrdarr::recycle_bin::router(state.db.clone()))
@@ -195,6 +204,10 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::remote_paths::router(state.db.clone()))
         .merge(hrrdarr::import::router(state.db.clone()))
         .merge(providers)
+        .merge(hrrdarr::notifications::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+        ))
         .merge(hrrdarr::commands::router(state.db.clone()))
         .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))

@@ -261,7 +261,7 @@ pub(super) async fn valid_target(
         IndexerOperation::Automatic => "enable_automatic_search",
         IndexerOperation::Interactive => "enable_interactive_search",
     };
-    let indexer_valid = c.query(&format!("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=? AND (?!='legacy_fixed' OR s.download_client_id IS NULL OR s.download_client_id=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.selection_kind.text(),t.client_id.map(|v|v.to_string())]).await?.next().await?.is_some();
+    let indexer_valid = c.query(&format!("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE s.{flag}=1 AND p.id=? AND p.revision=? AND p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss') AND s.media_type=? AND (?!='legacy_fixed' OR s.download_client_id IS NULL OR s.download_client_id=?)"),params![t.indexer_id.to_string(),t.indexer_revision,domain(t.media_type),t.selection_kind.text(),t.client_id.map(|v|v.to_string())]).await?.next().await?.is_some();
     if !indexer_valid {
         return Ok(false);
     }
@@ -545,6 +545,18 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
     let mut query_index = 0;
     let mut offset = 0;
     let mut release_bytes = 0usize;
+    // A generic feed is one document: request it whole instead of refetching per local page.
+    let feed = connection(db)
+        .await?
+        .query(
+            "SELECT 1 FROM providers WHERE id=? AND implementation='torrentrss'",
+            [t.indexer_id.to_string()],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    let limit = if feed { indexer::FEED_PAGE_LIMIT } else { 100 };
     for page_number in 0..10 {
         let page = client
             .raw_search(
@@ -555,7 +567,7 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
                     media_type: t.media_type,
                     offset,
                     query_index,
-                    limit: 100,
+                    limit,
                 },
             )
             .await;
@@ -568,7 +580,8 @@ async fn capture_feed(db: &Database, client: &RefreshClient, command: &RssComman
                 return Err(Error(StatusCode::BAD_GATEWAY, error.code));
             }
         };
-        if !page.warnings.is_empty() {
+        // Native Torznab/Newznab pages fail on any bad item; a generic feed drops bad items one by one.
+        if !page.warnings.is_empty() && !page.tolerates_item_warnings {
             return Err(Error(StatusCode::BAD_GATEWAY, "invalid_release"));
         }
         if releases.len() + page.items.len() > 1000 {
@@ -1521,10 +1534,10 @@ async fn process_candidate(
         Ok(prepared) => prepared,
         Err(error) => {
             if error.local_storage_failure {
-                if let Some(identity) = error.identity.as_ref() {
-                    if !retain_prepared_identity(&c, client, &p, identity, operation).await? {
-                        return Ok(());
-                    }
+                if let Some(identity) = error.identity.as_ref()
+                    && !retain_prepared_identity(&c, client, &p, identity, operation).await?
+                {
+                    return Ok(());
                 }
                 return Err(Error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2035,7 +2048,7 @@ async fn settle_due_error(c: &Connection, id: Uuid, error: Error) -> Result<()> 
     if matches!(current.as_str(), "submitting" | "reconciling") {
         return Err(error);
     }
-    candidate_state(&c, id, "rejected", Some(code), None).await?;
+    candidate_state(c, id, "rejected", Some(code), None).await?;
     Ok(())
 }
 pub(super) async fn run_due(db: &Database, client: &RefreshClient, id: Uuid) -> Result<()> {

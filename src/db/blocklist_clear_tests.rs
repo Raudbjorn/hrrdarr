@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 62); // Reasoning: latest is 0062 (0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry); historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 76); // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {
