@@ -111,7 +111,7 @@ pub(crate) async fn apply(
 }
 
 /// Scope replacement is temporary; reconcile only after the final configuration has been written.
-pub(super) async fn reconcile(c: &Connection, id: &str) -> Result<()> {
+pub(crate) async fn reconcile(c: &Connection, id: &str) -> Result<()> {
     if c.is_autocommit() {
         return Err(corrupt());
     }

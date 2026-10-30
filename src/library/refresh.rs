@@ -20,6 +20,7 @@ pub struct CapturedTarget {
 pub enum Details {
     Series(SeriesDetails),
     Movie(MovieDetails),
+    MovieWithCollection(crate::metadata::MovieWithCollection),
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -89,15 +90,31 @@ pub async fn apply(c: &Connection, captured: &CapturedTarget, details: Details) 
         {
             series(c, series_id, details).await?
         }
-        (Target::Movies { .. }, Details::Movie(details))
+        (Target::Movies { movie_id }, Details::Movie(details))
             if details.tmdb_id == captured.external_id =>
         {
-            movie(
+            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
+            let association = details.collection.clone();
+            let changed = movie(c, metadata_id, details).await?;
+            let associated =
+                crate::collections::repository::adopt(c, movie_id, metadata_id, association, None)
+                    .await?;
+            changed.max(u16::from(associated))
+        }
+        (Target::Movies { movie_id }, Details::MovieWithCollection(details))
+            if details.movie.tmdb_id == captured.external_id =>
+        {
+            let metadata_id = captured.metadata_id.ok_or(Error::TargetChanged)?;
+            let changed = movie(c, metadata_id, details.movie).await?;
+            let associated = crate::collections::repository::adopt(
                 c,
-                captured.metadata_id.ok_or(Error::TargetChanged)?,
-                details,
+                movie_id,
+                metadata_id,
+                details.collection,
+                None,
             )
-            .await?
+            .await?;
+            changed.max(u16::from(associated))
         }
         _ => return Err(Error::TargetChanged),
     };
@@ -205,7 +222,6 @@ pub(crate) async fn movie_facts(
     } else {
         None
     };
-    let collection_changed = crate::collections::associate(c, id, &detail.collection).await?;
     let credits_changed = match &detail.credits {
         Some(credits) => credits_replace(c, id, credits, replace).await?,
         None => false,
@@ -228,7 +244,7 @@ pub(crate) async fn movie_facts(
             .await?;
         }
     }
-    Ok(changed || aliases_changed || credits_changed || collection_changed)
+    Ok(changed || aliases_changed || credits_changed)
 }
 
 type CreditRow = (

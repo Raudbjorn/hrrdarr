@@ -6,6 +6,7 @@
 //! and in `RefreshClient`. Grab, refresh, completed-download processing and health consumers do
 //! not name concrete clients.
 use super::{label_client, nzbget, qbittorrent, sabnzbd, transmission};
+use std::time::{Duration, Instant};
 
 /// What the grab pipeline hands to a client. The variant must match the client's protocol; a
 /// torrent source is shared by every torrent client (qBittorrent, Transmission).
@@ -82,6 +83,8 @@ impl From<transmission::TransmissionDetails> for DownloadDetails {
 
 const MAX_OUTPUT_FILES: usize = 2048;
 const MAX_OUTPUT_DEPTH: usize = 6;
+const MAX_OUTPUT_ENTRIES: usize = 10_000;
+const OUTPUT_LISTING_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) enum LocalListing {
     /// Relative `/`-separated names and sizes beneath a directory output.
     Directory(Vec<(String, u64)>),
@@ -92,7 +95,28 @@ pub(crate) enum LocalListing {
 /// Bounded enumeration of a locally mapped completed output. Symlinks and special files are
 /// skipped; nothing is opened for reading. Must run on a blocking thread.
 pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<LocalListing> {
-    let metadata = match std::fs::symlink_metadata(root) {
+    list_local_output_until(root, Instant::now() + OUTPUT_LISTING_TIMEOUT)
+}
+
+fn list_local_output_until(
+    root: &std::path::Path,
+    deadline: Instant,
+) -> std::io::Result<LocalListing> {
+    // shortcut: filesystem calls cannot be preempted, use process isolation if mounts can hang.
+    let check_deadline = || {
+        if Instant::now() >= deadline {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "output listing deadline",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    let metadata = std::fs::symlink_metadata(root);
+    check_deadline()?;
+    let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LocalListing::Missing);
@@ -106,9 +130,16 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
         return Ok(LocalListing::Missing);
     }
     let mut files = Vec::new();
+    let mut visited = 0;
     let mut pending = vec![(root.to_path_buf(), String::new(), 0usize)];
     while let Some((directory, prefix, depth)) = pending.pop() {
+        check_deadline()?;
         for entry in std::fs::read_dir(&directory)? {
+            check_deadline()?;
+            if visited == MAX_OUTPUT_ENTRIES {
+                return Err(std::io::Error::other("output entry limit"));
+            }
+            visited += 1;
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -119,6 +150,7 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
                 format!("{prefix}/{name}")
             };
             let kind = entry.file_type()?;
+            check_deadline()?;
             if kind.is_dir() {
                 if depth + 1 >= MAX_OUTPUT_DEPTH {
                     // A directory below the cap hides files from the caller, and a partial
@@ -132,9 +164,11 @@ pub(crate) fn list_local_output(root: &std::path::Path) -> std::io::Result<Local
                 }
                 files.push((relative, entry.metadata()?.len()));
             }
+            check_deadline()?;
         }
     }
     files.sort();
+    check_deadline()?;
     Ok(LocalListing::Directory(files))
 }
 
@@ -202,5 +236,36 @@ mod tests {
         let result = list_local_output(&root);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn broad_directories_and_skipped_entries_consume_the_listing_budget() {
+        for directories in [true, false] {
+            let s = scratch();
+            for index in 0..=MAX_OUTPUT_ENTRIES {
+                let path = s.0.join(index.to_string());
+                if directories {
+                    std::fs::create_dir(path).unwrap();
+                } else {
+                    std::os::unix::fs::symlink("missing", path).unwrap();
+                }
+            }
+            // Neither case produces regular files, but both must bound traversal and its queue.
+            let error = match list_local_output(&s.0) {
+                Ok(_) => panic!("expected the entry budget to refuse an incomplete listing"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), "output entry limit");
+        }
+    }
+
+    #[test]
+    fn an_expired_deadline_refuses_even_an_empty_directory() {
+        let s = scratch();
+        let error = match list_local_output_until(&s.0, Instant::now()) {
+            Ok(_) => panic!("expected an expired listing to fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

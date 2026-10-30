@@ -265,7 +265,7 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
         "SELECT * FROM movies ORDER BY id",
         // Reasoning: 0065 appends collection policy columns; the predecessor columns are preserved exactly.
         "SELECT id,tmdb_id,title FROM movie_collections ORDER BY id",
-        "SELECT * FROM movie_collection_members ORDER BY collection_id,metadata_id",
+        "SELECT collection_id,metadata_id FROM movie_collection_members ORDER BY collection_id,metadata_id",
         "SELECT * FROM movie_alternative_titles ORDER BY metadata_id,title",
         "SELECT * FROM movie_files ORDER BY id",
         "SELECT * FROM file_metadata ORDER BY id",
@@ -316,7 +316,7 @@ async fn upgrade_witness(
     // and constraints are covered by db::download_client_registry_tests).
     let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(replace(sql,'+(SELECT count(*) FROM rename_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
         name IN ({predecessor_names}) AND
-        NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections')) AND
+        NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections','movie_collection_members')) AND
         name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
         NOT (type='table' AND name IN ('import_journal','download_processing')) AND
         name NOT IN ('processing_transition','rss_movie_target_owned','rss_episode_target_owned','same_path_admit') AND
@@ -337,6 +337,8 @@ async fn upgrade_witness(
     result.push(rows(c, "SELECT * FROM pragma_table_info('download_processing') WHERE name!='scan_command_id' ORDER BY cid").await?);
     // Compare every predecessor journal column definition exactly despite the additive column.
     result.push(rows(c, "SELECT * FROM pragma_table_info('import_journal') WHERE name!='path_failure_code' ORDER BY cid").await?);
+    // Reasoning: 0077 appends membership origin/revision; compare original columns, rows and FKs exactly.
+    result.push(rows(c, "SELECT * FROM pragma_table_info('movie_collection_members') WHERE name NOT IN ('origin','metadata_revision') ORDER BY cid").await?);
     Ok(result)
 }
 
@@ -555,7 +557,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -697,7 +699,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
     integrity(&c).await?;
     drop(c);

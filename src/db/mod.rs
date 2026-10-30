@@ -318,6 +318,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "review_integrity",
         include_str!("../../migrations/0076_review_integrity.sql"),
     ),
+    (
+        "collection_authority",
+        include_str!("../../migrations/0077_collection_authority.sql"),
+    ),
+    (
+        "provider_authority",
+        include_str!("../../migrations/0078_provider_authority.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

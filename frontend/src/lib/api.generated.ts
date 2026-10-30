@@ -98,17 +98,19 @@ export type CollectionAssociation = { "state": "absent" } | { "state": "clear" }
 
 export type CollectionBulkPatch = { ids: Array<number>, patch: CollectionPatch, };
 
-export type CollectionMovie = { metadata_id: number, tmdb_id: number | null, title: string, year: number | null, 
+export type CollectionMonitoring = "movie_only" | "movie_and_collection" | "none";
+
+export type CollectionMovie = { metadata_id: number, tmdb_id: number | null, title: string, year: number | null,
 /**
  * Library movie id when the movie is in the library; null for catalog-only members.
  */
 movie_id: number | null, monitored: boolean | null, };
 
-export type CollectionPatch = { monitored?: boolean, search_on_add?: boolean, quality_profile_id?: number | null, root_folder_id?: number | null, minimum_availability?: MinimumAvailability | null, 
+export type CollectionPatch = { monitored?: boolean, search_on_add?: boolean, quality_profile_id?: number | null, root_folder_id?: number | null, minimum_availability?: MinimumAvailability | null,
 /**
  * Replaces the complete tag set applied to movies this collection adds.
  */
-tag_ids?: Array<number>, 
+tag_ids?: Array<number>,
 /**
  * One-shot bulk action: set monitoring on movies of this collection already in the library.
  */
@@ -118,7 +120,7 @@ export type CollectionQuery = { limit?: number, offset?: number, monitored?: boo
 
 export type CollectionRef = { tmdb_id: number, title: string, };
 
-export type CollectionRefreshCommand = { id: string, name: CollectionRefreshName, origin: CollectionRefreshOrigin, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, collections_checked: number, collections_failed: number, movies_added: number, 
+export type CollectionRefreshCommand = { id: string, name: CollectionRefreshName, origin: CollectionRefreshOrigin, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, collections_checked: number, collections_failed: number, movies_added: number,
 /**
  * Added movies whose collection requested search-on-add. Counted, not submitted here.
  */
@@ -488,7 +490,7 @@ export type MonitorNewItems = "all" | "none";
 
 export type MovieCalendarEntry = { event_id: string, target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, release_type: MovieReleaseType, date: string, released_at: string, monitored: boolean, has_file: boolean, status: string | null, studio: string | null, runtime_minutes: number | null, };
 
-export type MovieCollection = { id: number, tmdb_id: number | null, title: string, overview: string | null, monitored: boolean, search_on_add: boolean, quality_profile_id: number | null, root_folder_id: number | null, root_folder_path: string | null, minimum_availability: string | null, tag_ids: Array<number>, last_info_sync: string | null, movie_count: number, library_movie_count: number, missing_movie_count: number, 
+export type MovieCollection = { id: number, tmdb_id: number | null, title: string, overview: string | null, monitored: boolean, settings_revision: number | null, search_on_add: boolean, quality_profile_id: number | null, root_folder_id: number | null, root_folder_path: string | null, minimum_availability: string | null, tag_ids: Array<number>, last_info_sync: string | null, movie_count: number, library_movie_count: number, missing_movie_count: number,
 /**
  * Members are listed by the detail endpoint only; list responses carry an empty array.
  */
@@ -504,7 +506,7 @@ export type MovieFileResource = { movie_id: number, edition: string | null, orig
 
 export type MovieIndexerScope = { enable_rss?: boolean, enable_automatic_search?: boolean, enable_interactive_search?: boolean, download_client_id?: string | null, categories: Array<number>, remove_year?: boolean, };
 
-export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, };
+export type MovieLookupAdd = { tmdb_id: number, path: string, settings?: LibraryPatch, monitor?: CollectionMonitoring, collection_expected_revision?: number | null, };
 
 export type MovieNamingConfig = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
 
@@ -514,7 +516,7 @@ export type MovieNamingExamplesQuery = { rename_enabled?: boolean, replace_illeg
 
 export type MovieNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_movie_format: string | null, movie_folder_format: string | null, };
 
-export type MovieNotificationScope = { triggers: MovieNotificationTriggers, 
+export type MovieNotificationScope = { triggers: MovieNotificationTriggers,
 /**
  * Movie tag IDs. Empty means every movie; otherwise a movie must carry one of them.
  */
@@ -550,7 +552,7 @@ export type NativeDeletionEvent = { id: string, deletion_id: string, event_type:
 
 export type NativeHistoryEvent = { id: string, event_type: HistoryEventType, target: MediaTarget, file: HistoricalFile, source: string, destination: string, size_bytes: number, sha256: string, imported_at: string, };
 
-export type Notification = { id: string, name: string, implementation: string, enabled: boolean, revision: number, settings: { [key in string]: NotificationSettingValue }, 
+export type Notification = { id: string, name: string, implementation: string, enabled: boolean, revision: number, settings: { [key in string]: NotificationSettingValue },
 /**
  * Names of secrets that are configured; the values are never returned.
  */
@@ -560,13 +562,13 @@ export type NotificationDelivery = { id: number, event_sequence: number, notific
 
 export type NotificationDeliveryList = { items: Array<NotificationDelivery>, };
 
-export type NotificationDomainTestResult = { media_type: MediaDomain, status: NotificationTestStatus, 
+export type NotificationDomainTestResult = { media_type: MediaDomain, status: NotificationTestStatus,
 /**
  * Stable machine class; never contains remote bodies, URLs or secrets.
  */
 error: string | null, };
 
-export type NotificationField = { name: string, label: string, kind: NotificationFieldKind, required: boolean, 
+export type NotificationField = { name: string, label: string, kind: NotificationFieldKind, required: boolean,
 /**
  * Secret fields are submitted through `secrets`, stored encrypted and never returned.
  */
@@ -580,15 +582,15 @@ export type NotificationImplementationKind = "message" | "structured" | "script"
 
 export type NotificationImplementationList = { items: Array<NotificationImplementation>, };
 
-export type NotificationInput = { name: string, implementation: string, enabled: boolean, 
+export type NotificationInput = { name: string, implementation: string, enabled: boolean,
 /**
  * Non-secret settings keyed by the implementation schema field name.
  */
-settings: { [key in string]: NotificationSettingValue }, 
+settings: { [key in string]: NotificationSettingValue },
 /**
  * Write-only secrets. On update an absent key keeps the stored value and `null` clears it.
  */
-secrets: { [key in string]: string | null }, tv?: TvNotificationScope, movies?: MovieNotificationScope, 
+secrets: { [key in string]: string | null }, tv?: TvNotificationScope, movies?: MovieNotificationScope,
 /**
  * Required on update; must equal the stored revision.
  */
@@ -600,7 +602,7 @@ export type NotificationSettingValue = boolean | number | string;
 
 export type NotificationTestAllResult = { items: Array<NotificationTestResult>, };
 
-export type NotificationTestInput = { 
+export type NotificationTestInput = {
 /**
  * A saved notification whose stored secrets fill any secret not supplied in the draft.
  */
@@ -614,7 +616,7 @@ export type Numbering = { "kind": "episodes", season: number, episodes: Array<nu
 
 export type NzbgetPriority = "very_low" | "low" | "normal" | "high" | "very_high" | "force";
 
-export type NzbgetScope = { category: string, recent_priority?: NzbgetPriority, older_priority?: NzbgetPriority, 
+export type NzbgetScope = { category: string, recent_priority?: NzbgetPriority, older_priority?: NzbgetPriority,
 /**
  * The job is added paused and must be resumed in NZBGet.
  */
@@ -808,13 +810,13 @@ export type ReleaseSearchPage = { items: Array<EvaluatedRelease>, next_query: In
 
 export type ReleaseTarget = { "media_type": "tv", series_id: number, episode_ids: Array<number>, } | { "media_type": "movies", movie_id: number, };
 
-export type RenameCommand = { id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+export type RenameCommand = { id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number,
 /**
  * More changes existed than one run handles; run the command again to continue.
  */
 bounded: boolean, };
 
-export type RenameCommandDetail = { items: Array<RenameItem>, id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number, 
+export type RenameCommandDetail = { items: Array<RenameItem>, id: string, name: RenameName, target: RenameTarget, expected_naming_revision: number | null, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, cancel_requested: boolean, items_renamed: number, items_unchanged: number, items_failed: number,
 /**
  * More changes existed than one run handles; run the command again to continue.
  */
@@ -826,7 +828,7 @@ export type RenameEventKind = "file" | "folder";
 
 export type RenameEventQuery = { media_type?: MediaDomain, limit?: number, offset?: number, };
 
-export type RenameInput = { name: RenameName, target: RenameTarget, 
+export type RenameInput = { name: RenameName, target: RenameTarget,
 /**
  * Fence against configuration changes after the preview the user looked at.
  */
@@ -964,9 +966,13 @@ export type SeriesType = "standard" | "daily" | "anime";
 
 export type SnapshotApplication = "sonarr" | "radarr";
 
-export type SnapshotOptions = { application: SnapshotApplication, dry_run?: boolean, import_providers?: boolean, };
+export type SnapshotOptions = { application: SnapshotApplication, dry_run?: boolean, import_providers?: boolean, allow_unmapped_providers?: boolean, };
 
-export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, policy: string, };
+export type SnapshotProviderConflict = { table: string, source_id: number, reason: SnapshotProviderConflictReason, candidates: number, blocking: boolean, };
+
+export type SnapshotProviderConflictReason = "ambiguous" | "differs" | "mapping_changed" | "client_unmapped";
+
+export type SnapshotReport = { application: SnapshotApplication, fingerprint: string, schema_version: number, dry_run: boolean, applied: boolean, mapped: number, duplicates: number, metadata_backfilled: number, conflicts: number, missing_file_records: number, unsupported: Array<SnapshotUnsupported>, provider_conflicts: Array<SnapshotProviderConflict>, policy: string, };
 
 export type SnapshotUnsupported = { table: string, rows: number, columns: Array<string>, };
 
@@ -1018,7 +1024,7 @@ export type TvNamingExamplesQuery = { rename_enabled?: boolean, replace_illegal_
 
 export type TvNamingUpdate = { revision: number, rename_enabled: boolean, replace_illegal_characters: boolean, colon_replacement: ColonReplacement, custom_colon_replacement: string | null, standard_episode_format: string | null, daily_episode_format: string | null, anime_episode_format: string | null, series_folder_format: string | null, season_folder_format: string | null, specials_folder_format: string | null, multi_episode_style: number | null, };
 
-export type TvNotificationScope = { triggers: TvNotificationTriggers, 
+export type TvNotificationScope = { triggers: TvNotificationTriggers,
 /**
  * TV tag IDs. Empty means every series; otherwise a series must carry one of them.
  */

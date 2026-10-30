@@ -90,6 +90,26 @@ test('API wrappers send explicit modes and validate domain-qualified responses',
   assert.equal(seen.length,before,'invalid requests must not reach the network');
 });
 
+test('bulk deletion accepts its 50-file bound independently of metadata page size',async()=>{
+  const seen=[];
+  await withFetch(async(path,options)=>{
+    const body=JSON.parse(options.body);
+    seen.push([path,body]);
+    return json({batch_id:'b',deletions:body.file_ids.map(file_id=>({file_id,media_type:'tv'}))});
+  },async()=>{
+    // Deletion batches are bounded at 50 even though metadata readback pages contain 25.
+    for(const count of [26,MAX_DELETE_FILES]){
+      const ids=Array.from({length:count},(_,i)=>i+1);
+      assert.equal((await deleteMediaFiles('tv',ids,'recycle')).ok,true);
+      assert.deepEqual(seen.at(-1),['/api/v1/tv/files/bulk',{file_ids:ids,mode:'recycle'}]);
+    }
+    for(const ids of [[],[1,1],[0],[1.5],[Number.MAX_SAFE_INTEGER+1],Array.from({length:MAX_DELETE_FILES+1},(_,i)=>i+1)]){
+      assert.equal((await deleteMediaFiles('tv',ids,'recycle')).ok,false);
+    }
+    assert.equal(seen.length,2,'invalid identities and oversized batches must not reach the network');
+  });
+});
+
 test('history renders native deletion events with recycle path or permanent note',()=>{
   const event=over=>({origin:'native_deletion',id:'h1',deletion_id:'d1',event_type:'file_deleted',reason:'manual',target:{media_type:'episode',id:4},file:{media_type:'tv',id:4},path:'/tv/S/a.mkv',recycle_path:'/r/S/a.mkv',deleted_at:'2026-10-17T00:00:00Z',...over});
   const recycled=describeEvent(event());

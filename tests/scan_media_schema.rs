@@ -149,7 +149,19 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
         } else {
             ""
         };
-        out.push(dump(c, &format!("SELECT * FROM {table}{filter} ORDER BY rowid")).await?);
+        // Reasoning: 0077/0078 append authority markers; compare every predecessor field.
+        let columns = if table == "snapshot_imports" {
+            "application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version,autotag_metadata_version,series_runtime_version,import_policy_version"
+        } else {
+            "*"
+        };
+        out.push(
+            dump(
+                c,
+                &format!("SELECT {columns} FROM {table}{filter} ORDER BY rowid"),
+            )
+            .await?,
+        );
     }
     Ok(out)
 }
@@ -162,7 +174,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

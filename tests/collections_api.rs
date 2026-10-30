@@ -480,7 +480,7 @@ async fn clear_removes_membership_and_unavailable_peer_fails_the_command() -> Re
         ),
         (Some(0), Some(1))
     );
-    // Explicit null on a refresh clears membership but keeps the collection and the movie.
+    // Explicit null clears membership and retires a collection with no library members; the movie remains.
     h.peer.lock().unwrap()["movie"]["101"] = film(101, "Saga One", 2001, Value::Null);
     let c = h.db.connect().await?;
     let detail = h.client.movie(101).await.unwrap();
@@ -497,7 +497,14 @@ async fn clear_removes_membership_and_unavailable_peer_fails_the_command() -> Re
             .await,
         0
     );
-    assert_eq!(h.scalar("SELECT count(*) FROM movie_collections").await, 1);
+    // Reasoning: main's lifecycle retirement retains removal intent instead of an empty live collection.
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collections").await, 0);
+    assert_eq!(
+        h.scalar("SELECT count(*) FROM movie_collection_settings")
+            .await,
+        0
+    );
+    assert_eq!(h.scalar("SELECT count(*) FROM movie_collection_intents WHERE tmdb_id=900 AND removed=1 AND removal_reason='metadata_missing'").await,1);
     assert_eq!(h.scalar("SELECT count(*) FROM movies").await, 1);
     h.finish().await;
     Ok(())
@@ -576,6 +583,55 @@ async fn a_rate_limited_refresh_is_requeued_and_completes_once_the_peer_recovers
         ),
         (Some(1), Some(0))
     );
+    h.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn collection_tag_readback_matches_the_accepted_capacity_and_exposes_revision()
+-> Result<(), Error> {
+    let h = harness().await?;
+    let c = h.db.connect().await?;
+    let tx = c.transaction().await?;
+    tx.execute(
+        "INSERT INTO movie_collections(id,title) VALUES(1,'Tags')",
+        (),
+    )
+    .await?;
+    for id in 1..=201 {
+        tx.execute(
+            "INSERT INTO tags(id,media_type,label) VALUES(?,'movies',?)",
+            libsql::params![id, format!("tag-{id}")],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    let path = "/api/v1/movies/collections/1";
+    let (_, before) = h.call("GET", path, None).await;
+    assert!(before["settings_revision"].is_null());
+    let ids: Vec<i64> = (1..=200).collect();
+    let (status, saved) = h.call("PUT", path, Some(json!({"tag_ids":ids}))).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(saved["tag_ids"], json!(ids));
+    assert_eq!(
+        saved["settings_revision"].as_i64(),
+        Some(
+            h.scalar(
+                "SELECT settings_revision FROM movie_collection_settings WHERE collection_id=1"
+            )
+            .await
+        )
+    );
+    let (_, readback) = h.call("GET", path, None).await;
+    assert_eq!(readback, saved);
+    let too_many: Vec<i64> = (1..=201).collect();
+    assert_eq!(
+        h.call("PUT", path, Some(json!({"tag_ids":too_many})))
+            .await
+            .0,
+        400
+    );
+    assert_eq!(h.call("GET", path, None).await.1, saved);
     h.finish().await;
     Ok(())
 }

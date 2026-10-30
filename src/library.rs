@@ -1277,6 +1277,11 @@ pub struct MovieLookupAdd {
     #[serde(default)]
     #[ts(as = "Option<Patch>", optional)]
     pub settings: Patch,
+    #[serde(default)]
+    #[ts(as = "Option<crate::collections::CollectionMonitoring>", optional)]
+    pub monitor: crate::collections::CollectionMonitoring,
+    #[ts(optional = nullable)]
+    pub collection_expected_revision: Option<i64>,
 }
 
 type LookupHttp<T> = std::result::Result<T, Response>;
@@ -1354,7 +1359,7 @@ async fn selected_tv(
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     no_query(query).map_err(IntoResponse::into_response)?;
     let input = body(payload).map_err(IntoResponse::into_response)?;
-    selected(ctx, input.tvdb_id, input.path, input.settings).await
+    selected(ctx, input.tvdb_id, input.path, input.settings, None).await
 }
 async fn selected_movie(
     State(ctx): State<MetadataContext>,
@@ -1363,13 +1368,44 @@ async fn selected_movie(
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     no_query(query).map_err(IntoResponse::into_response)?;
     let input = body(payload).map_err(IntoResponse::into_response)?;
-    selected(ctx, input.tmdb_id, input.path, input.settings).await
+    let mut settings = input.settings;
+    let enable = match input.monitor {
+        crate::collections::CollectionMonitoring::MovieAndCollection => {
+            settings.monitored = Change::Value(true);
+            Some(input.collection_expected_revision)
+        }
+        crate::collections::CollectionMonitoring::None => {
+            if input.collection_expected_revision.is_some() {
+                return Err(
+                    bad("Collection revision requires collection monitoring").into_response()
+                );
+            }
+            settings.monitored = Change::Value(false);
+            None
+        }
+        crate::collections::CollectionMonitoring::MovieOnly => {
+            if input.collection_expected_revision.is_some() {
+                return Err(
+                    bad("Collection revision requires collection monitoring").into_response()
+                );
+            }
+            None
+        }
+    };
+    if input
+        .collection_expected_revision
+        .is_some_and(|r| !(1..=9007199254740991).contains(&r))
+    {
+        return Err(bad("Invalid collection revision").into_response());
+    }
+    selected(ctx, input.tmdb_id, input.path, settings, enable).await
 }
 async fn selected(
     ctx: MetadataContext,
     external_id: i64,
     rawpath: String,
     settings: Patch,
+    collection_enable: Option<Option<i64>>,
 ) -> LookupHttp<(StatusCode, Json<LibraryItem>)> {
     if !(1..=9007199254740991).contains(&external_id) {
         return Err(bad("Invalid selected metadata identity").into_response());
@@ -1389,6 +1425,7 @@ async fn selected(
     let mut episodes = Vec::new();
     let mut monitoring = BTreeMap::new();
     let mut movie_facts = None;
+    let mut collection = crate::metadata::CollectionAssociation::Absent;
     let mut tv_facts = None;
     match ctx.domain {
         Domain::Tv => {
@@ -1426,9 +1463,11 @@ async fn selected(
         Domain::Movies => {
             let detail = ctx
                 .client
-                .movie(external_id)
+                .movie_with_collection(external_id)
                 .await
                 .map_err(IntoResponse::into_response)?;
+            collection = detail.collection;
+            let detail = detail.movie;
             req.title = Some(detail.title.clone());
             req.year = detail.year;
             req.tmdb_id = Some(detail.tmdb_id);
@@ -1459,6 +1498,9 @@ async fn selected(
         }
         if let Some(detail)=movie_facts {
             refresh::movie_facts(&tx,item.metadata_id.ok_or_else(conflict)?,&detail,false).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
+        }
+        if ctx.domain == Domain::Movies {
+            crate::collections::repository::adopt(&tx,item.id,item.metadata_id.ok_or_else(conflict)?,collection,collection_enable).await.map_err(|error|match error{refresh::Error::Storage=>Error(StatusCode::INTERNAL_SERVER_ERROR,"database_error","Library operation failed; no partial write committed"),_=>conflict()})?;
         }
         // Catalog facts now exist, so rules that depend on them can be evaluated for the new item.
         crate::autotagging::apply_item(&tx,ctx.domain,item.id).await.map_err(tag_error)?;

@@ -97,7 +97,7 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 76);
+    assert_eq!(version(&c).await?, 78); // Reasoning: collection/provider authority migrations follow the review guards.
     assert_eq!(scalar(&c, "SELECT count(*) FROM notification_deliveries WHERE attempts=2 AND next_attempt_at=10 AND lease_until=20 AND sent_parts='[\"acknowledged\"]' AND lease_owner IS NULL").await?, 1);
     assert!(
         c.execute("DELETE FROM quality_profiles WHERE id=900", ())
@@ -120,7 +120,7 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     assert_eq!(
         scalar(
             &c,
-            "SELECT quality_profile_id FROM movie_collections WHERE id=900"
+            "SELECT quality_profile_id FROM movie_collection_settings WHERE collection_id=900"
         )
         .await?,
         900
@@ -131,7 +131,7 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     )
     .await?;
     c.execute(
-        "UPDATE movie_collections SET quality_profile_id=NULL WHERE id=900",
+        "UPDATE movie_collection_settings SET quality_profile_id=NULL,settings_revision=settings_revision+1 WHERE collection_id=900",
         (),
     )
     .await?;
@@ -142,6 +142,6 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     drop(db);
     let reopened = Database::open_local(&path).await?;
     assert!(reopened.migration_backup().is_none());
-    assert_eq!(version(&reopened.connect().await?).await?, 76);
+    assert_eq!(version(&reopened.connect().await?).await?, 78); // Reasoning: collection/provider authority migrations follow the review guards.
     Ok(())
 }

@@ -44,12 +44,14 @@ impl Drop for Runtime {
     }
 }
 
+fn default_metadata() -> Result<Arc<crate::metadata::MetadataClient>> {
+    crate::metadata::MetadataClient::new()
+        .map(Arc::new)
+        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))
+}
+
 pub async fn start(db: Arc<Database>, client: RefreshClient) -> Result<Runtime> {
-    let metadata = Arc::new(
-        crate::metadata::MetadataClient::new()
-            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "metadata_unavailable"))?,
-    );
-    start_with_metadata(db, client, metadata).await
+    start_with_metadata(db, client, default_metadata()?).await
 }
 
 pub async fn start_with_metadata(
@@ -57,6 +59,63 @@ pub async fn start_with_metadata(
     client: RefreshClient,
     metadata: Arc<crate::metadata::MetadataClient>,
 ) -> Result<Runtime> {
+    let owner = acquire(&db, &client).await?;
+    let task = tokio::spawn(async move {
+        let _owner = owner;
+        // ponytail: one worker per locally owned DB; add weighted concurrency only with real jobs needing it.
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Terminal-history pruning is a worker-owned recurring job: bounded, idempotent and
+        // serialized with this loop's claims. Errors are logged inside and never propagate.
+        let mut housekeeping = now().ok().map(housekeeping::Schedule::new);
+        let housekeeping_policy = housekeeping::Policy::default();
+        loop {
+            tick.tick().await;
+            if let (Some(schedule), Ok(timestamp)) = (housekeeping.as_mut(), now()) {
+                housekeeping::tick(&db, schedule, &housekeeping_policy, timestamp).await;
+            }
+            // Failures are logged and recovered inside; the next tick retries.
+            let _ = iteration(&db, &client, &metadata).await;
+        }
+    });
+    Ok(Runtime { task: Some(task) })
+}
+
+/// Test seam: the background worker's ownership, startup recovery and iteration without its
+/// one-second cadence or housekeeping, so integration tests decide when a command is claimed.
+/// `step` calls are serialized: an overlapping iteration would recover (re-queue) the command
+/// the other one is running.
+#[doc(hidden)]
+pub struct Driver {
+    db: Arc<Database>,
+    client: RefreshClient,
+    metadata: Arc<crate::metadata::MetadataClient>,
+    gate: tokio::sync::Mutex<()>,
+    _owner: Owner,
+}
+#[doc(hidden)]
+pub async fn start_driven(db: Arc<Database>, client: RefreshClient) -> Result<Driver> {
+    let metadata = default_metadata()?;
+    let owner = acquire(&db, &client).await?;
+    Ok(Driver {
+        db,
+        client,
+        metadata,
+        gate: tokio::sync::Mutex::new(()),
+        _owner: owner,
+    })
+}
+impl Driver {
+    /// Runs one worker iteration; `Ok` reports whether a command was claimed. `Err` means the
+    /// iteration failed or timed out and its storage recovery already ran, as in the loop.
+    pub async fn step(&self) -> std::result::Result<bool, IterationFailed> {
+        let _gate = self.gate.lock().await;
+        iteration(&self.db, &self.client, &self.metadata).await
+    }
+}
+
+/// Validates local ownership, registers the single worker and recovers interrupted work.
+async fn acquire(db: &Arc<Database>, client: &RefreshClient) -> Result<Owner> {
     if !db.permits_local_imports() {
         return Err(Error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -98,49 +157,41 @@ pub async fn start_with_metadata(
     tokio::time::timeout(Duration::from_secs(10), recover_rss(&db, "interrupted"))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;
-    let task = tokio::spawn(async move {
-        let _owner = owner;
-        // ponytail: one worker per locally owned DB; add weighted concurrency only with real jobs needing it.
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Terminal-history pruning is a worker-owned recurring job: bounded, idempotent and
-        // serialized with this loop's claims. Errors are logged inside and never propagate.
-        let mut housekeeping = now().ok().map(housekeeping::Schedule::new);
-        let housekeeping_policy = housekeeping::Policy::default();
-        loop {
-            tick.tick().await;
-            if let (Some(schedule), Ok(timestamp)) = (housekeeping.as_mut(), now()) {
-                housekeeping::tick(&db, schedule, &housekeeping_policy, timestamp).await;
-            }
-            let result =
-                tokio::time::timeout(Duration::from_secs(45), step(&db, &client, &metadata)).await;
-            if !matches!(result, Ok(Ok(()))) {
-                eprintln!("event=command_worker_error code=storage_error");
-                if !matches!(
-                    tokio::time::timeout(
-                        Duration::from_secs(10),
-                        recover_rss(&db, "storage_error")
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    eprintln!("event=rss_recovery_error code=storage_error");
-                }
-                // The failed future is gone. External GETs can repeat; metadata facts and success
-                // commit together; local clears likewise commit tombstones and success together.
-                // Only uncommitted local effects retry. RSS recovery separately fences
-                // dispatched submissions into read-only reconciliation; attempts never reset.
-                if !matches!(
-                    tokio::time::timeout(Duration::from_secs(10), recover(&db, "storage_error"))
-                        .await,
-                    Ok(Ok(()))
-                ) {
-                    eprintln!("event=command_recovery_error code=storage_error");
-                }
-            }
-        }
-    });
-    Ok(Runtime { task: Some(task) })
+    Ok(owner)
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct IterationFailed;
+
+/// One bounded claim/run; storage failures are logged and recovered before returning `Err`.
+async fn iteration(
+    db: &Arc<Database>,
+    client: &RefreshClient,
+    metadata: &crate::metadata::MetadataClient,
+) -> std::result::Result<bool, IterationFailed> {
+    let result = tokio::time::timeout(Duration::from_secs(45), step(db, client, metadata)).await;
+    if let Ok(Ok(claimed)) = result {
+        return Ok(claimed);
+    }
+    eprintln!("event=command_worker_error code=storage_error");
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(10), recover_rss(db, "storage_error")).await,
+        Ok(Ok(()))
+    ) {
+        eprintln!("event=rss_recovery_error code=storage_error");
+    }
+    // The failed future is gone. External GETs can repeat; metadata facts and success
+    // commit together; local clears likewise commit tombstones and success together.
+    // Only uncommitted local effects retry. RSS recovery separately fences
+    // dispatched submissions into read-only reconciliation; attempts never reset.
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(10), recover(db, "storage_error")).await,
+        Ok(Ok(()))
+    ) {
+        eprintln!("event=command_recovery_error code=storage_error");
+    }
+    Err(IterationFailed)
 }
 async fn recover_rss(db: &Database, code: &str) -> Result<()> {
     rss::recover(&connection(db).await?, now()?, code).await
@@ -263,12 +314,22 @@ async fn step(
     db: &Arc<Database>,
     client: &RefreshClient,
     metadata_client: &crate::metadata::MetadataClient,
-) -> Result<()> {
+) -> Result<bool> {
     // A prior local storage failure can leave an interrupted claim. There is no other worker.
     recover(db, "storage_error").await?;
     let Some(command) = claim(db).await? else {
-        return Ok(());
+        return Ok(false);
     };
+    run_claimed(db, client, metadata_client, command)
+        .await
+        .map(|()| true)
+}
+async fn run_claimed(
+    db: &Arc<Database>,
+    client: &RefreshClient,
+    metadata_client: &crate::metadata::MetadataClient,
+    command: Claimed,
+) -> Result<()> {
     let command = match command {
         Claimed::Downloads(command) => command,
         Claimed::Metadata(command) => return metadata::run(db, metadata_client, command).await,
@@ -438,7 +499,7 @@ mod tests {
         (Scratch(path), db, c, provider)
     }
     async fn health_running_refresh(c: &Connection, provider: Uuid, media: MediaDomain) -> Command {
-        let cmd = enqueue(
+        let cmd = enqueue_origin(
             c,
             CommandInput {
                 name: CommandName::RefreshDownloads,
@@ -450,6 +511,7 @@ mod tests {
                 priority: CommandPriority::Normal,
             },
             1,
+            CommandOrigin::Automatic,
         )
         .await
         .unwrap();
@@ -614,6 +676,52 @@ mod tests {
         assert_eq!(scalar(&c, "SELECT count(*) FROM commands WHERE media_type='movies' AND origin='manual' AND manual_bypass=1").await, 1);
     }
     #[tokio::test]
+    async fn provider_writers_rebind_backoff_status_and_drop_unserved_domains() {
+        let (_scratch, _db, c, provider) = health_refresh_fixture().await;
+        let id = provider.to_string();
+        for media in ["tv", "movies"] {
+            c.execute("INSERT INTO download_client_status(provider_id,media_type,config_revision,escalation_level,initial_failure_at,last_failure_at,disabled_until)VALUES(?,?,1,2,100,200,500)",params![id.clone(),media]).await.unwrap();
+        }
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        tx.execute("UPDATE providers SET revision=2 WHERE id=?", [id.clone()])
+            .await
+            .unwrap();
+        tx.execute(
+            "DELETE FROM provider_scopes WHERE provider_id=? AND media_type='movies'",
+            [id.clone()],
+        )
+        .await
+        .unwrap();
+        crate::providers::backoff::reconcile(&tx, &id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // History survives the edit at the new revision; the removed domain loses its authority.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM download_client_status WHERE media_type='tv' AND config_revision=2 AND escalation_level=2 AND disabled_until=500").await, 1);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM download_client_status WHERE media_type='movies'"
+            )
+            .await,
+            0
+        );
+        // Ordinary status writes are accepted again at the rebound revision.
+        c.execute(
+            "UPDATE download_client_status SET escalation_level=3 WHERE provider_id=?",
+            [id.clone()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::providers::backoff::reconcile(&c, &id).await.is_err(),
+            "autocommit is rejected"
+        );
+    }
+    #[tokio::test]
     async fn health_refresh_exhaustion_keeps_snapshot_and_cancelled_callback_does_not_mark() {
         let (_scratch, db, c, provider) = health_refresh_fixture().await;
         c.execute("DELETE FROM health_checks WHERE scope='tv' AND check_key='download_client_communication'",()).await.unwrap();
@@ -685,7 +793,7 @@ mod tests {
         let provider: serde_json::Value =
             serde_json::from_str(&response.text().await.unwrap()).unwrap();
         let c = connection(&db).await.unwrap();
-        let command = enqueue(
+        let command = enqueue_origin(
             &c,
             CommandInput {
                 name: CommandName::RefreshDownloads,
@@ -697,6 +805,7 @@ mod tests {
                 priority: CommandPriority::Normal,
             },
             now().unwrap(),
+            CommandOrigin::Automatic,
         )
         .await
         .unwrap();

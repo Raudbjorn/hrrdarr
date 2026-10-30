@@ -1,7 +1,7 @@
 use hrrdarr::{
     db::{Database, Error},
     providers::CredentialKey,
-    snapshots::{self, Application},
+    snapshots::{self, Application, ProviderOptions, Report},
 };
 use libsql::{Connection, params};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,25 @@ async fn scalar(c: &Connection, sql: &str) -> i64 {
         .unwrap()
         .get(0)
         .unwrap()
+}
+async fn allowing_unmapped(
+    db: &Database,
+    app: Application,
+    bytes: Vec<u8>,
+    dry_run: bool,
+    key: Option<&CredentialKey>,
+) -> Result<Report, snapshots::ImportError> {
+    snapshots::import_with_provider_options(
+        db,
+        app,
+        bytes,
+        dry_run,
+        ProviderOptions {
+            key,
+            allow_unmapped: true,
+        },
+    )
+    .await
 }
 async fn destination(path: &Path) -> Database {
     let db = Database::open_local(path).await.unwrap();
@@ -246,11 +265,20 @@ async fn provider_reconstruction_is_opt_in_atomic_scoped_private_and_replay_safe
             .await?;
     assert!(!conflict.applied);
     assert_eq!(conflict.conflicts, 1);
+    assert_eq!(
+        serde_json::to_value(&conflict.provider_conflicts)?,
+        serde_json::json!([{"table":"Indexers","source_id":1,"reason":"mapping_changed","candidates":1,"blocking":true}])
+    );
     c.execute("DELETE FROM providers WHERE id=(SELECT provider_id FROM snapshot_provider_mappings WHERE application='radarr' AND source_table='DownloadClients' LIMIT 1)",()).await?;
     let conflict =
         snapshots::import_with_providers(&db, Application::Radarr, film, false, Some(&key)).await?;
     assert!(!conflict.applied);
     assert_eq!(conflict.conflicts, 1);
+    // A deleted mapped target is still blocking; zero candidates remain.
+    assert_eq!(
+        serde_json::to_value(&conflict.provider_conflicts)?,
+        serde_json::json!([{"table":"DownloadClients","source_id":1,"reason":"mapping_changed","candidates":0,"blocking":true}])
+    );
     assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 5);
     // Credential-free configurations require no key; source constructor defaults are explicit.
     let trusted_path = s.0.join("trusted.db");
@@ -370,8 +398,29 @@ async fn absent_and_malformed_snapshot_policy_is_conservative_and_atomic() -> Re
             Some(&key),
         )
         .await?;
+        // A changed export is a new fingerprint without a stored mapping: the differing indexer is a
+        // `differs` row, blocking by default and reported with its source ID.
+        let entry = |blocking: bool| serde_json::json!([{"table":"Indexers","source_id":1,"reason":"differs","candidates":1,"blocking":blocking}]);
         assert!(
-            !changed.applied && changed.conflicts > 0,
+            !changed.applied && changed.conflicts == 1,
+            "Changed source policies block by default: {changed:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&changed.provider_conflicts)?,
+            entry(true)
+        );
+        // Reasoning: with the explicit opt-in (#20) the rest of the import applies and only that row
+        // stays unmapped; the native scope is read directly to show it was not overwritten.
+        let allowed =
+            allowing_unmapped(&db, app, std::fs::read(&source_path)?, false, Some(&key)).await?;
+        assert!(allowed.applied && allowed.conflicts == 0, "{allowed:?}");
+        assert_eq!(
+            serde_json::to_value(&allowed.provider_conflicts)?,
+            entry(false)
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM provider_scopes WHERE implementation IN ('torznab','newznab') AND enable_rss=1").await,
+            0,
             "Changed source policies must not overwrite a native provider"
         );
         assert_eq!(
@@ -473,7 +522,8 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             scalar(&c, "SELECT sum(generation) FROM health_checks").await,
             before
         );
-        // A changed source association must conflict instead of overwriting the native binding.
+        // A changed source association is a `differs` row: blocking by default, unmapped with the opt-in,
+        // and never an overwrite of the native binding.
         let raw = libsql::Builder::new_local(&path).build().await?;
         let source = raw.connect()?;
         source
@@ -481,17 +531,44 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             .await?;
         drop(source);
         drop(raw);
+        let entry = |blocking: bool| serde_json::json!([{"table":"Indexers","source_id":1,"reason":"differs","candidates":1,"blocking":blocking}]);
         let changed =
             snapshots::import_with_providers(&db, app, std::fs::read(&path)?, false, Some(&key))
                 .await
                 .unwrap_or_else(|error| panic!("{label}: changed source association: {error:?}"));
-        assert!(!changed.applied && changed.conflicts == 1);
+        assert!(!changed.applied && changed.conflicts == 1, "{changed:?}");
         assert_eq!(
-            scalar(&c, "SELECT sum(generation) FROM health_checks").await,
-            before
+            serde_json::to_value(&changed.provider_conflicts)?,
+            entry(true)
         );
-        // A revisioned native association edit also conflicts with exact source replay.
+        let allowed = allowing_unmapped(&db, app, std::fs::read(&path)?, false, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: allowed changed association: {error:?}"));
+        assert!(allowed.applied && allowed.conflicts == 0, "{allowed:?}");
+        assert_eq!(
+            serde_json::to_value(&allowed.provider_conflicts)?,
+            entry(false)
+        );
+        let bound = format!(
+            "SELECT count(*) FROM provider_scopes WHERE implementation='torznab' AND media_type='{label}' AND download_client_id='{client}'"
+        );
+        assert_eq!(scalar(&c, &bound).await, 1, "{label}: native binding kept");
         let indexer:String=c.query("SELECT provider_id FROM snapshot_provider_mappings WHERE application=? AND fingerprint=? AND source_table='Indexers' AND source_id=1",params![if matches!(app,Application::Sonarr){"sonarr"}else{"radarr"},repeat.fingerprint.clone()]).await?.next().await?.unwrap().get(0)?;
+        // Reasoning: enabling a mapped provider is local operation, not configuration. It bumps the
+        // revision but must not strand replay (#20 review); exact replay still maps without conflict.
+        c.execute(
+            "UPDATE providers SET enabled=1, revision=revision+1 WHERE id=?",
+            [indexer.clone()],
+        )
+        .await?;
+        let replay = snapshots::import_with_providers(&db, app, bytes.clone(), false, Some(&key))
+            .await
+            .unwrap_or_else(|error| panic!("{label}: replay after enabling: {error:?}"));
+        assert!(
+            replay.applied && replay.conflicts == 0 && replay.provider_conflicts.is_empty(),
+            "{label}: {replay:?}"
+        );
+        // A native association edit changes reconstructed configuration, so replay reports it.
         let tx = c.transaction().await?;
         tx.execute(
             "UPDATE providers SET revision=revision+1 WHERE id=?",
@@ -508,6 +585,10 @@ async fn indexer_client_snapshots_remap_both_domains_and_preserve_unknown_intent
             .await
             .unwrap_or_else(|error| panic!("{label}: changed native association: {error:?}"));
         assert!(!repeat.applied && repeat.conflicts == 1);
+        assert_eq!(
+            serde_json::to_value(&repeat.provider_conflicts)?,
+            serde_json::json!([{"table":"Indexers","source_id":1,"reason":"mapping_changed","candidates":1,"blocking":true}])
+        );
         // Unknown positive intent is retained as unsupported, never reconstructed with NULL.
         let raw = libsql::Builder::new_local(&path).build().await?;
         let source = raw.connect()?;
@@ -735,6 +816,205 @@ async fn download_client_snapshot_tags_map_both_domains_and_never_drop_constrain
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_presence_difference_is_classified_without_the_key() -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        let path = scratch.0.join(format!("{label}.db"));
+        let credentialed = fixture(&path, app, false).await;
+        let db = destination(&scratch.0.join(format!("{label}-dest.db"))).await;
+        assert!(
+            snapshots::import_with_providers(&db, app, credentialed, false, Some(&key))
+                .await?
+                .applied
+        );
+        // A newer export of the same client endpoint without credentials needs no key itself.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let source = raw.connect()?;
+        let settings = if matches!(app, Application::Sonarr) {
+            r#"{"host":"client.example","port":8080,"useSsl":true,"urlBase":"/qbit"}"#
+        } else {
+            r#"{"host":"client.example","port":8080,"useSsl":true,"urlBase":"/qbit","movieCategory":"movies"}"#
+        };
+        source.execute("DELETE FROM Indexers", ()).await?;
+        source
+            .execute("UPDATE DownloadClients SET Settings=?", [settings])
+            .await?;
+        drop(source);
+        drop(raw);
+        // Reasoning: the destination candidate holds ciphertext and the source has none, so they
+        // differ without decrypting. Before the fix the importer decrypted first and failed with the
+        // key error; now the strict default reports a blocking `differs` and the opt-in applies.
+        let strict =
+            snapshots::import_with_providers(&db, app, std::fs::read(&path)?, false, None).await?;
+        assert!(
+            !strict.applied && strict.conflicts == 1,
+            "{label}: {strict:?}"
+        );
+        let report = allowing_unmapped(&db, app, std::fs::read(&path)?, false, None).await?;
+        assert!(
+            report.applied && report.conflicts == 0,
+            "{label}: {report:?}"
+        );
+        for (outcome, blocking) in [(&strict, true), (&report, false)] {
+            assert_eq!(
+                serde_json::to_value(&outcome.provider_conflicts)?,
+                serde_json::json!([{"table":"DownloadClients","source_id":1,"reason":"differs","candidates":1,"blocking":blocking}]),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            scalar(&db.connect().await?, "SELECT count(*) FROM providers WHERE implementation='qbittorrent' AND credentials IS NOT NULL").await,
+            1,
+            "{label}: the native client is untouched"
+        );
+    }
+    Ok(())
+}
+
+async fn edit(path: &Path, sql: &str) -> Vec<u8> {
+    let raw = libsql::Builder::new_local(path).build().await.unwrap();
+    raw.connect().unwrap().execute_batch(sql).await.unwrap();
+    drop(raw);
+    std::fs::read(path).unwrap()
+}
+
+#[tokio::test]
+async fn same_endpoint_siblings_ambiguity_enabled_matches_and_dry_runs() -> Result<(), Error> {
+    let _guard = IMPORT_LOCK.lock().await;
+    let scratch = Sandbox::new();
+    let key = CredentialKey::from_hex(&"ab".repeat(32)).unwrap();
+    for (app, label) in [(Application::Sonarr, "tv"), (Application::Radarr, "movies")] {
+        let path = scratch.0.join(format!("{label}.db"));
+        fixture(&path, app, false).await;
+        // Two source clients on one host:port ("qBit TV" and "qBit Anime"), each with a bound indexer.
+        let siblings = edit(&path, "INSERT INTO DownloadClients SELECT 2,'Client Anime',Implementation,ConfigContract,Settings,Priority,Enable FROM DownloadClients WHERE Id=1; ALTER TABLE Indexers ADD COLUMN DownloadClientId INTEGER DEFAULT 0; UPDATE Indexers SET DownloadClientId=Id WHERE Id IN (1,2);").await;
+        let db = destination(&scratch.0.join(format!("{label}-dest.db"))).await;
+        let c = db.connect().await?;
+        // Reasoning: row 2's candidate query used to see row 1's new provider and report `differs`,
+        // dropping row 2 and its indexer. A sibling's destination is never a candidate.
+        let report =
+            snapshots::import_with_providers(&db, app, siblings.clone(), false, Some(&key)).await?;
+        assert!(
+            report.applied && report.provider_conflicts.is_empty(),
+            "{label}: {report:?}"
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM providers WHERE implementation='qbittorrent'"
+            )
+            .await,
+            2
+        );
+        // Each source indexer is bound to its own source client's destination.
+        let bindings = "SELECT count(*) FROM provider_scopes i JOIN snapshot_provider_mappings mi ON mi.provider_id=i.provider_id AND mi.source_table='Indexers' JOIN snapshot_provider_mappings mc ON mc.provider_id=i.download_client_id AND mc.source_table='DownloadClients' AND mc.fingerprint=mi.fingerprint WHERE mc.source_id=mi.source_id";
+        assert_eq!(scalar(&c, bindings).await, 2, "{label}");
+        let rerun =
+            snapshots::import_with_providers(&db, app, siblings.clone(), false, Some(&key)).await?;
+        assert!(
+            rerun.applied && rerun.conflicts == 0 && rerun.mapped == 0,
+            "{label}: {rerun:?}"
+        );
+        // A newer export binds each sibling to its single exact match among the two candidates.
+        let newer = edit(&path, "CREATE TABLE Extra(Value TEXT);").await;
+        let reexport =
+            snapshots::import_with_providers(&db, app, newer.clone(), false, Some(&key)).await?;
+        assert!(
+            reexport.applied && reexport.provider_conflicts.is_empty() && reexport.mapped == 0,
+            "{label}: {reexport:?}"
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM providers").await, 4);
+
+        // An enabled (locally operated) exact match binds unchanged and is never duplicated.
+        c.execute("UPDATE providers SET enabled=1, revision=revision+1 WHERE implementation='qbittorrent'", ()).await?;
+        let enabled = edit(&path, "CREATE TABLE Extra2(Value TEXT);").await;
+        let report = snapshots::import_with_providers(&db, app, enabled, false, Some(&key)).await?;
+        assert!(
+            report.applied && report.provider_conflicts.is_empty() && report.mapped == 0,
+            "{label}: {report:?}"
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM providers WHERE enabled=1").await,
+            2,
+            "{label}: bound providers were not modified"
+        );
+
+        // Two identical source clients create two identical destinations; a later single-client
+        // export then exactly matches both, which is genuinely ambiguous.
+        let twins = edit(&path, "UPDATE DownloadClients SET Name='Client' WHERE Id=2; UPDATE Indexers SET DownloadClientId=0; CREATE TABLE Extra3(Value TEXT);").await;
+        let ambiguous_db = destination(&scratch.0.join(format!("{label}-twins.db"))).await;
+        assert!(
+            snapshots::import_with_providers(&ambiguous_db, app, twins, false, Some(&key))
+                .await?
+                .applied
+        );
+        let single = edit(
+            &path,
+            "DELETE FROM DownloadClients WHERE Id=2; CREATE TABLE Extra4(Value TEXT);",
+        )
+        .await;
+        let before = ambiguous_db.connect().await?;
+        let state = scalar(&before, "SELECT count(*) FROM snapshot_imports").await;
+        let entry = |blocking: bool| serde_json::json!([{"table":"DownloadClients","source_id":1,"reason":"ambiguous","candidates":2,"blocking":blocking}]);
+        // Dry runs report the same entries as the real run and write nothing, in both modes.
+        for dry_run in [true, false] {
+            let strict = snapshots::import_with_providers(
+                &ambiguous_db,
+                app,
+                single.clone(),
+                dry_run,
+                Some(&key),
+            )
+            .await?;
+            assert!(
+                !strict.applied && strict.conflicts == 1,
+                "{label}: {strict:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(&strict.provider_conflicts)?,
+                entry(true)
+            );
+            assert_eq!(
+                scalar(&before, "SELECT count(*) FROM snapshot_imports").await,
+                state
+            );
+        }
+        let preview =
+            allowing_unmapped(&ambiguous_db, app, single.clone(), true, Some(&key)).await?;
+        assert!(
+            !preview.applied && preview.conflicts == 0,
+            "{label}: {preview:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&preview.provider_conflicts)?,
+            entry(false)
+        );
+        assert_eq!(
+            scalar(&before, "SELECT count(*) FROM snapshot_imports").await,
+            state
+        );
+        let allowed = allowing_unmapped(&ambiguous_db, app, single, false, Some(&key)).await?;
+        assert!(allowed.applied, "{label}: {allowed:?}");
+        assert_eq!(
+            serde_json::to_value(&allowed.provider_conflicts)?,
+            entry(false)
+        );
+        assert_eq!(
+            scalar(
+                &before,
+                "SELECT count(*) FROM providers WHERE implementation='qbittorrent'"
+            )
+            .await,
+            2,
+            "{label}: no guessed mapping and no third copy"
+        );
     }
     Ok(())
 }

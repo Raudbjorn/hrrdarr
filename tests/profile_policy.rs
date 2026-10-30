@@ -553,7 +553,13 @@ async fn profile_drafts_defaults_and_deletion_are_scoped_atomic_and_preserve_set
         .unwrap();
         if media == "movies" {
             // A collection-only reference must block deletion even after library assignments clear.
-            c.execute("INSERT INTO movie_collections(id,title,quality_profile_id) VALUES(900,'Policy owner',?)", [profile["id"].as_i64().unwrap()]).await.unwrap();
+            c.execute(
+                "INSERT INTO movie_collections(id,title) VALUES(900,'Policy owner')",
+                (),
+            )
+            .await
+            .unwrap();
+            c.execute("INSERT INTO movie_collection_settings(collection_id,quality_profile_id) VALUES(900,?)", [profile["id"].as_i64().unwrap()]).await.unwrap();
             let (code, error) = request(&client, &base, "DELETE", &route, Value::Null).await;
             assert_eq!(code, 409);
             assert_eq!(error["error"]["code"], "profile_in_use");
@@ -562,7 +568,7 @@ async fn profile_drafts_defaults_and_deletion_are_scoped_atomic_and_preserve_set
                 profile
             );
             c.execute(
-                "UPDATE movie_collections SET quality_profile_id=NULL WHERE id=900",
+                "UPDATE movie_collection_settings SET quality_profile_id=NULL,settings_revision=settings_revision+1 WHERE collection_id=900",
                 (),
             )
             .await

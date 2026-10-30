@@ -96,14 +96,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 76); // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 27 } // Reasoning: twenty-seven migrations follow 49 through 76 (0076 review integrity, 0075 provider scope union, 0074 downloadstation registry, 0073 flood registry, 0072 aria2 registry, 0071 utorrent registry, 0070 rtorrent registry, 0069 deluge registry, 0068 torrent RSS indexer, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
+                    expected.len() + if *table == "health_checks" { 10 } else { 29 } // Reasoning: twenty-nine migrations follow 49 through 78 (0076 review integrity, 0075 provider scope union, 0074 downloadstation registry, 0073 flood registry, 0072 aria2 registry, 0071 utorrent registry, 0070 rtorrent registry, 0069 deluge registry, 0068 torrent RSS indexer, 0060 recycle bin, 0061 upgrade recycle, 0062 transmission registry, 0063 notifications); 0060 adds the two recycle_bin identities and 0054 through 0059 and 0061 through 0063 add none, so Health still gains ten rows.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.

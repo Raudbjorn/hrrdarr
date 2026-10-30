@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        76 // Reasoning: migration 0076 adds review integrity guards and lease ownership; historical prefixes stay fixed.
+        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -321,6 +321,8 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 // Reasoning: 0065 appends collection policy columns to movie_collections; its rows
                 // and predecessor columns are covered by tests/autotagging_metadata_schema.rs.
                 | "movie_collections"
+                // Reasoning: 0077 appends provenance; collection_schema preserves prior membership and FKs.
+                | "movie_collection_members"
         ) {
             continue;
         }
