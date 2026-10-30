@@ -764,6 +764,11 @@ async fn provider_api_validates_and_tests_downloadstation_configuration() {
         ("tv/sub", "movies"),
         ("tv label", "movies"),
         ("", "movies"),
+        // Directory categories must not resolve to the parent or common download root.
+        (".", "movies"),
+        ("..", "movies"),
+        ("tv", "."),
+        ("tv", ".."),
     ] {
         let (code, v) = create(labels(tv, movies), login.clone()).await;
         assert_eq!(code, 400, "{tv}/{movies}: {v}");

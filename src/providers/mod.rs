@@ -1043,7 +1043,10 @@ impl ProviderSettings {
                         })
                         .map_err(|_| bad())?;
                     }
-                    if !valid_torrent_label(&s.category) {
+                    if !valid_torrent_label(&s.category)
+                        || (matches!(self, Self::Aria2 { .. } | Self::Downloadstation { .. })
+                            && matches!(s.category.as_str(), "." | ".."))
+                    {
                         return Err(bad());
                     }
                 }
@@ -3381,6 +3384,33 @@ mod tests {
             assert!(serde_json::from_value::<ProviderSettings>(malformed).is_err());
         }
     }
+    #[test]
+    fn directory_client_categories_reject_dot_components_in_both_domains() {
+        for implementation in [
+            "aria2",
+            "downloadstation",
+            "deluge",
+            "rtorrent",
+            "utorrent",
+            "flood",
+        ] {
+            for media in ["tv", "movies"] {
+                for category in [".", "..", ".tv", "tv..", "tv"] {
+                    let mut value = serde_json::json!({"implementation":implementation,"endpoint":"http://127.0.0.1:1/","tv":null,"movies":null});
+                    value[media] = serde_json::json!({"category":category});
+                    let settings: ProviderSettings = serde_json::from_value(value).unwrap();
+                    let directory_escape = matches!(implementation, "aria2" | "downloadstation")
+                        && matches!(category, "." | "..");
+                    assert_eq!(
+                        settings.validate().is_ok(),
+                        !directory_escape,
+                        "{implementation} {media} {category}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn configuration_wire_and_domain_validation_are_closed() {
         let input = serde_json::json!({"revision":1,"name":"Indexer","enabled":true,"priority":1,"settings":{"implementation":"newznab","endpoint":"https://example.invalid/api","tv":null,"movies":{"categories":[2147483647]}}});

@@ -69,9 +69,11 @@ notification has the matching trigger for that domain.
 `notification_events` keeps the newest 2048 events. The worker (`notifications::start`, started by
 every server process) polls every 2 s: it fans events out to one
 `notification_deliveries` row per matching notification (enabled, domain, trigger flag, tag scope),
-then claims due deliveries under a 120 s lease and sends them (max 4 concurrent). The worker owns no
-library file: fan-out is idempotent and a delivery is leased, so processes that share one database
-(a remote deployment) do not duplicate a send. Each delivery
+then claims due deliveries under a 120 s lease and sends them (max 4 concurrent). A heartbeat renews
+the lease every 30 s, including time spent waiting for a delivery slot. Each claim has a unique owner
+token; renewal, acknowledged-request progress and completion writes require that token and an unexpired
+lease. Losing ownership or failing renewal stops the attempt, though a request already sent may still
+have arrived. The worker owns no library file, and fan-out is idempotent. Each delivery
 records the scope that matched (`media_type`): a system event (health, update) is rendered for that
 domain, so a notification whose movies scope asked for health events gets `radarr_*` variables and
 the movie app path even when its TV scope exists. When both scopes match, TV is used. Health
@@ -201,5 +203,6 @@ only to events that change files; other events are skipped.
 * Held deliveries of a disabled notification resume on re-enable however old they are, bounded only
   by the 2048-event outbox.
 * The dispatcher runs in every server process, including on a remote database. Fan-out is
-  idempotent and a delivery is claimed under a lease, but two live processes over one remote
-  database were not exercised.
+  idempotent and delivery leases are renewed and owner-fenced. Tests use competing dispatchers over
+  one local database; two live processes over a remote database were not exercised. Restart all
+  dispatchers when upgrading to migration 0076: older binaries do not honor the new owner token.

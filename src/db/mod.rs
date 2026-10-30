@@ -314,6 +314,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "provider_scope_union",
         include_str!("../../migrations/0075_provider_scope_union.sql"),
     ),
+    (
+        "review_integrity",
+        include_str!("../../migrations/0076_review_integrity.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -977,6 +981,8 @@ mod downloadstation_registry_tests;
 mod flood_registry_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
+mod review_integrity_tests;
 #[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]

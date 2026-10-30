@@ -19,6 +19,8 @@ the collection row, its policy and the movie.
   `quality_profile_id`, `root_folder_id`, `minimum_availability`, `tag_ids` (replace), `monitor_movies` (one-shot
   monitoring toggle for library members). Monitoring requires profile, root folder and availability (409
   `collection_policy_incomplete`; the invariant is also enforced by triggers). Profiles/roots/tags must be movie-domain.
+  A collection's assigned quality profile cannot be deleted (`409 profile_in_use`), even without library members;
+  clear or reassign the collection's profile first. Migration 0076 also guards direct database deletion and identity changes.
 * Monitoring a collection immediately adds its known missing members to the library at
   `<root>/<Title (Year)>` with the collection's profile, availability and tags (then AutoTagging). Existing paths,
   nested paths and existing library movies are skipped, never replaced.

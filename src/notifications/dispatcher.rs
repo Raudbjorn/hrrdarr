@@ -22,6 +22,8 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const FAN_OUT_BATCH: i64 = 64;
 const DELIVERY_BATCH: i64 = 16;
 const LEASE_SECONDS: i64 = 120;
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_ATTEMPTS: i64 = 5;
 const BACKOFF_BASE_SECONDS: i64 = 30;
 const BACKOFF_CAP_SECONDS: i64 = 6 * 60 * 60;
@@ -103,8 +105,61 @@ enum Outcome {
 /// The acknowledged requests of the delivery being attempted.
 struct Progress<'a> {
     c: &'a Connection,
-    delivery: i64,
+    claim: &'a Claim,
     sent: BTreeSet<String>,
+}
+
+struct Claim {
+    id: i64,
+    sequence: i64,
+    notification: String,
+    attempts: i64,
+    owner: String,
+}
+impl Claim {
+    async fn acquire(
+        c: &Connection,
+        id: i64,
+        sequence: i64,
+        notification: String,
+        attempts: i64,
+    ) -> Result<Option<Self>, libsql::Error> {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let t = now();
+        let changed = c.execute(
+            "UPDATE notification_deliveries SET lease_until=?1,lease_owner=?2 WHERE id=?3 AND state='pending' AND next_attempt_at<=?4 AND lease_until<=?4 AND attempts=?5",
+            params![t + LEASE_SECONDS, owner.clone(), id, t, attempts],
+        ).await?;
+        Ok((changed == 1).then_some(Self {
+            id,
+            sequence,
+            notification,
+            attempts,
+            owner,
+        }))
+    }
+
+    async fn renew(&self, c: &Connection) -> Result<bool, libsql::Error> {
+        let t = now();
+        Ok(c.execute(
+            "UPDATE notification_deliveries SET lease_until=?1 WHERE id=?2 AND lease_owner=?3 AND state='pending' AND lease_until>?4",
+            params![t + LEASE_SECONDS, self.id, self.owner.clone(), t],
+        ).await? == 1)
+    }
+}
+
+impl Progress<'_> {
+    async fn record(&mut self, part: String) -> Result<(), DeliveryError> {
+        let changed = self.c.execute(
+            "UPDATE notification_deliveries SET sent_parts=json_insert(sent_parts,'$[#]',?1) WHERE id=?2 AND lease_owner=?3 AND state='pending' AND lease_until>?4",
+            params![part.clone(), self.claim.id, self.claim.owner.clone(), now()],
+        ).await.map_err(|_| DeliveryError { code: "storage", retryable: true, retry_after: None })?;
+        if changed != 1 {
+            return Err(permanent("lease_lost"));
+        }
+        self.sent.insert(part);
+        Ok(())
+    }
 }
 
 impl Dispatcher {
@@ -165,19 +220,7 @@ impl Dispatcher {
                         continue;
                     }
                     self.transport.send(request).await?;
-                    progress
-                        .c
-                        .execute(
-                            "UPDATE notification_deliveries SET sent_parts=json_insert(sent_parts,'$[#]',?1) WHERE id=?2",
-                            params![part.clone(), progress.delivery],
-                        )
-                        .await
-                        .map_err(|_| DeliveryError {
-                            code: "storage",
-                            retryable: true,
-                            retry_after: None,
-                        })?;
-                    progress.sent.insert(part);
+                    progress.record(part).await?;
                 }
                 Ok(true)
             }
@@ -342,30 +385,24 @@ impl Dispatcher {
         let gate = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
         let mut tasks = tokio::task::JoinSet::new();
         for (id, sequence, notification, attempts) in claimed {
-            let lease = c
-                .execute(
-                    "UPDATE notification_deliveries SET lease_until=?1 WHERE id=?2 AND state='pending' AND lease_until<=?3",
-                    params![t + LEASE_SECONDS, id, t],
-                )
-                .await?;
-            if lease == 0 {
+            let Some(claim) = Claim::acquire(&c, id, sequence, notification, attempts).await?
+            else {
                 continue;
-            }
+            };
             let this = self.clone();
             let gate = gate.clone();
-            tasks.spawn(async move {
-                let Ok(_permit) = gate.acquire().await else {
-                    return false;
-                };
-                this.attempt(id, sequence, &notification, attempts)
-                    .await
-                    .is_ok()
-            });
+            tasks.spawn(async move { this.attempt(&claim, &gate, LEASE_RENEW_INTERVAL).await });
         }
         let mut done = 0;
         while let Some(result) = tasks.join_next().await {
-            if result.is_ok() {
-                done += 1;
+            match result {
+                Ok(Ok(true)) => done += 1,
+                Ok(Err(e)) => eprintln!(
+                    "event=notification_attempt_error kind={:?}",
+                    std::mem::discriminant(&e)
+                ),
+                Err(_) => eprintln!("event=notification_attempt_error kind=task_failed"),
+                Ok(Ok(false)) => (),
             }
         }
         Ok(done)
@@ -373,72 +410,118 @@ impl Dispatcher {
 
     async fn attempt(
         &self,
-        id: i64,
-        sequence: i64,
-        notification: &str,
-        attempts: i64,
-    ) -> Result<(), libsql::Error> {
+        claim: &Claim,
+        gate: &Semaphore,
+        renew_every: Duration,
+    ) -> Result<bool, libsql::Error> {
         let c = self.store.db.connect().await?;
-        let outcome = self.prepare_and_send(&c, id, sequence, notification).await;
-        let attempts = attempts + 1;
+        let work = async {
+            let _permit = gate
+                .acquire()
+                .await
+                .map_err(|_| permanent("delivery_unavailable"))?;
+            self.prepare_and_send(&c, claim).await
+        };
+        tokio::pin!(work);
+        let mut heartbeat = tokio::time::interval(renew_every);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                // The immediate first tick checks ownership before waiting for a delivery slot.
+                _ = heartbeat.tick() => {
+                    match tokio::time::timeout(LEASE_RENEW_TIMEOUT, claim.renew(&c)).await {
+                        Ok(Ok(true)) => (),
+                        Ok(Err(e)) => return Err(e),
+                        result => {
+                            let reason = if result.is_err() { "renewal_timeout" } else { "lease_lost" };
+                            eprintln!("event=notification_attempt_stopped delivery={} reason={reason}", claim.id);
+                            return Ok(false);
+                        }
+                    }
+                }
+                outcome = &mut work => break outcome,
+            }
+        };
+        self.settle(&c, claim, outcome).await
+    }
+
+    async fn settle(
+        &self,
+        c: &Connection,
+        claim: &Claim,
+        outcome: Result<Outcome, DeliveryError>,
+    ) -> Result<bool, libsql::Error> {
+        let attempts = claim.attempts + 1;
         let t = now();
-        match outcome {
-            Ok(Outcome::Held) => {
+        let guard = "WHERE id=?1 AND lease_owner=?2 AND state='pending' AND lease_until>?3";
+        let (changed, event, error) = match outcome {
+            Ok(Outcome::Held) => (
                 c.execute(
-                    "UPDATE notification_deliveries SET lease_until=0 WHERE id=?",
-                    [id],
-                )
-                .await?;
-                eprintln!("event=notification_held delivery={id} reason=notification_disabled");
-            }
-            Ok(Outcome::Done) => {
+                    &format!("UPDATE notification_deliveries SET lease_until=0,lease_owner=NULL {guard}"),
+                    params![claim.id, claim.owner.clone(), t],
+                ).await?,
+                "held",
+                "notification_disabled",
+            ),
+            Ok(Outcome::Done) => (
                 c.execute(
-                    "UPDATE notification_deliveries SET state='delivered',attempts=?,completed_at=?,lease_until=0,last_error=NULL WHERE id=?",
-                    params![attempts, t, id],
-                )
-                .await?;
-                eprintln!("event=notification_delivered delivery={id} attempts={attempts}");
-            }
+                    &format!("UPDATE notification_deliveries SET state='delivered',attempts=?4,completed_at=?3,lease_until=0,lease_owner=NULL,last_error=NULL {guard}"),
+                    params![claim.id, claim.owner.clone(), t, attempts],
+                ).await?,
+                "delivered",
+                "none",
+            ),
             Err(e) if e.retryable && attempts < MAX_ATTEMPTS => {
                 let delay = backoff_seconds(attempts).max(i64::from(e.retry_after.unwrap_or(0)));
-                c.execute(
-                    "UPDATE notification_deliveries SET attempts=?,next_attempt_at=?,lease_until=0,last_error=? WHERE id=?",
-                    params![attempts, t + delay, e.code, id],
+                (
+                    c.execute(
+                        &format!("UPDATE notification_deliveries SET attempts=?4,next_attempt_at=?5,lease_until=0,lease_owner=NULL,last_error=?6 {guard}"),
+                        params![claim.id, claim.owner.clone(), t, attempts, t + delay, e.code],
+                    ).await?,
+                    "retry",
+                    e.code,
                 )
-                .await?;
-                eprintln!(
-                    "event=notification_retry delivery={id} attempts={attempts} class={}",
-                    e.code
-                );
             }
-            Err(e) => {
+            Err(e) => (
                 c.execute(
-                    "UPDATE notification_deliveries SET state='failed',attempts=?,completed_at=?,lease_until=0,last_error=? WHERE id=?",
-                    params![attempts, t, e.code, id],
-                )
-                .await?;
-                eprintln!(
-                    "event=notification_failed delivery={id} attempts={attempts} class={}",
-                    e.code
-                );
-            }
+                    &format!("UPDATE notification_deliveries SET state='failed',attempts=?4,completed_at=?3,lease_until=0,lease_owner=NULL,last_error=?5 {guard}"),
+                    params![claim.id, claim.owner.clone(), t, attempts, e.code],
+                ).await?,
+                "failed",
+                e.code,
+            ),
+        };
+        if changed == 1 {
+            eprintln!(
+                "event=notification_{event} delivery={} attempts={} class={error}",
+                claim.id,
+                if event == "held" {
+                    claim.attempts
+                } else {
+                    attempts
+                }
+            );
+        } else {
+            eprintln!(
+                "event=notification_attempt_stopped delivery={} reason=lease_lost",
+                claim.id
+            );
         }
-        Ok(())
+        Ok(changed == 1)
     }
 
     async fn prepare_and_send(
         &self,
         c: &Connection,
-        delivery: i64,
-        sequence: i64,
-        notification: &str,
+        claim: &Claim,
     ) -> Result<Outcome, DeliveryError> {
         let storage = || DeliveryError {
             code: "storage",
             retryable: true,
             retry_after: None,
         };
-        let rt = match self.store.runtime(c, notification).await {
+        let rt = match self.store.runtime(c, &claim.notification).await {
             Ok(Some(rt)) => rt,
             Ok(None) => return Err(permanent("notification_removed")),
             Err(e) if e.status.is_server_error() && e.code == "notification_storage_error" => {
@@ -453,8 +536,8 @@ impl Dispatcher {
         let (domain, sent) = {
             let mut rows = c
                 .query(
-                    "SELECT media_type,sent_parts FROM notification_deliveries WHERE id=?",
-                    [delivery],
+                    "SELECT media_type,sent_parts FROM notification_deliveries WHERE id=?1 AND lease_owner=?2 AND state='pending' AND lease_until>?3",
+                    params![claim.id, claim.owner.clone(), now()],
                 )
                 .await
                 .map_err(|_| storage())?;
@@ -477,7 +560,7 @@ impl Dispatcher {
             let mut rows = c
                 .query(
                     "SELECT kind,scope,subject_id,payload_json,tag_ids_json FROM notification_events WHERE sequence=?",
-                    [sequence],
+                    [claim.sequence],
                 )
                 .await
                 .map_err(|_| storage())?;
@@ -491,7 +574,7 @@ impl Dispatcher {
                 .map_err(|_| storage())?
                 .and_then(|json| serde_json::from_str(&json).ok());
             EventRow {
-                sequence,
+                sequence: claim.sequence,
                 kind: EventKind::parse(&r.get::<String>(0).map_err(|_| storage())?)
                     .ok_or_else(|| permanent("event_invalid"))?,
                 scope: Scope::parse(&r.get::<String>(1).map_err(|_| storage())?)
@@ -510,7 +593,7 @@ impl Dispatcher {
         let message = events::build(c, &event, domain)
             .await
             .map_err(|_| storage())?;
-        let progress = Progress { c, delivery, sent };
+        let progress = Progress { c, claim, sent };
         self.send_tracked(&rt, &message, Some(progress)).await?;
         Ok(Outcome::Done)
     }
@@ -698,4 +781,259 @@ pub fn start(dispatcher: Dispatcher) -> Handle {
         }
     });
     Handle { stop, task }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, extract::State, routing::post};
+    use serde_json::json;
+    use tokio::sync::{mpsc, oneshot};
+
+    struct Fixture {
+        dir: std::path::PathBuf,
+        dispatcher: Dispatcher,
+        requests: mpsc::Receiver<oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    async fn blocked_request(
+        State(sender): State<mpsc::Sender<oneshot::Sender<()>>>,
+    ) -> &'static str {
+        let (release, wait) = oneshot::channel();
+        sender.send(release).await.unwrap();
+        let _ = wait.await;
+        "ok"
+    }
+    impl Fixture {
+        async fn new(domain: MediaDomain) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("notification-lease-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let db = Arc::new(Database::open_local(dir.join("db")).await.unwrap());
+            let dispatcher = Dispatcher::new(db, None, Transport::new().unwrap());
+            let (sender, requests) = mpsc::channel(4);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/", post(blocked_request))
+                        .with_state(sender),
+                )
+                .await
+                .unwrap();
+            });
+            let mut input = json!({"name":"Lease regression", "implementation":"ntfy", "enabled":true,
+                "settings":{"server_url":url,"topics":"alpha,beta,gamma"},"secrets":{}});
+            match domain {
+                MediaDomain::Tv => input["tv"] = json!({"triggers":{"on_series_add":true}}),
+                MediaDomain::Movies => {
+                    input["movies"] = json!({"triggers":{"on_movie_added":true}})
+                }
+            }
+            dispatcher
+                .store
+                .create(&serde_json::from_value(input).unwrap())
+                .await
+                .unwrap();
+            events::emit(
+                &dispatcher.store.db.connect().await.unwrap(),
+                EventKind::Add,
+                Scope::Domain(domain),
+                Some(1),
+                &json!({"title":"Fixture"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dispatcher.fan_out().await.unwrap(), 1);
+            Self {
+                dir,
+                dispatcher,
+                requests,
+                server,
+            }
+        }
+
+        async fn claim(&self) -> Claim {
+            let c = self.dispatcher.store.db.connect().await.unwrap();
+            let (id, sequence, notification, attempts) = {
+                let mut rows = c.query("SELECT id,event_sequence,notification_id,attempts FROM notification_deliveries", ()).await.unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                (
+                    row.get(0).unwrap(),
+                    row.get(1).unwrap(),
+                    row.get(2).unwrap(),
+                    row.get(3).unwrap(),
+                )
+            };
+            Claim::acquire(&c, id, sequence, notification, attempts)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }
+    async fn scalar(c: &Connection, sql: &str) -> i64 {
+        c.query(sql, ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    }
+    async fn wait_renewed(c: &Connection, previous: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scalar(c, "SELECT lease_until FROM notification_deliveries").await <= previous {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("lease heartbeat must run while work is blocked");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_covers_queued_and_multi_request_work_and_lost_owner_stops_sending() {
+        for domain in [MediaDomain::Tv, MediaDomain::Movies] {
+            let mut fixture = Fixture::new(domain).await;
+            let claim = fixture.claim().await;
+            let c = fixture.dispatcher.store.db.connect().await.unwrap();
+            // Renewal is tested before expiry; a one-second lease races wall-clock rounding.
+            let shortened_lease = now() + LEASE_SECONDS / 2;
+            c.execute(
+                "UPDATE notification_deliveries SET lease_until=?",
+                [shortened_lease],
+            )
+            .await
+            .unwrap();
+            let gate = Semaphore::new(0);
+            let competing = Dispatcher::new(
+                fixture.dispatcher.store.db.clone(),
+                None,
+                Transport::new().unwrap(),
+            );
+            let work = fixture
+                .dispatcher
+                .attempt(&claim, &gate, Duration::from_millis(10));
+            let exercise = async {
+                wait_renewed(&c, shortened_lease).await;
+                assert!(
+                    fixture.requests.try_recv().is_err(),
+                    "queued delivery has not sent yet"
+                );
+                assert_eq!(
+                    competing.deliver_due().await.unwrap(),
+                    0,
+                    "queued lease remains owned"
+                );
+                gate.add_permits(1);
+                let first = fixture.requests.recv().await.unwrap();
+                let shortened_lease = now() + LEASE_SECONDS / 2;
+                c.execute(
+                    "UPDATE notification_deliveries SET lease_until=?",
+                    [shortened_lease],
+                )
+                .await
+                .unwrap();
+                wait_renewed(&c, shortened_lease).await;
+                assert_eq!(
+                    competing.deliver_due().await.unwrap(),
+                    0,
+                    "running multi-request lease remains owned"
+                );
+                first.send(()).unwrap();
+                let second = fixture.requests.recv().await.unwrap();
+                assert_eq!(
+                    scalar(
+                        &c,
+                        "SELECT json_array_length(sent_parts) FROM notification_deliveries"
+                    )
+                    .await,
+                    1
+                );
+                // Simulate an expired owner being replaced while its HTTP response is in flight.
+                c.execute(
+                    "UPDATE notification_deliveries SET lease_owner='replacement',lease_until=?",
+                    [now() + LEASE_SECONDS],
+                )
+                .await
+                .unwrap();
+                let _ = second.send(());
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(work, exercise)
+            })
+            .await
+            .unwrap();
+            assert!(
+                !result.unwrap(),
+                "stale attempt cannot settle the replacement owner's work"
+            );
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "third request is not sent after ownership loss"
+            );
+            assert_eq!(scalar(&c, "SELECT state='pending' AND attempts=0 AND lease_owner='replacement' AND json_array_length(sent_parts)=1 FROM notification_deliveries").await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_or_replaced_claims_cannot_renew_record_or_settle() {
+        let fixture = Fixture::new(MediaDomain::Movies).await;
+        let claim = fixture.claim().await;
+        let c = fixture.dispatcher.store.db.connect().await.unwrap();
+        assert!(
+            Claim::acquire(&c, claim.id, claim.sequence, claim.notification.clone(), 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Expiration alone invalidates the old owner, even before a replacement claims the row.
+        c.execute("UPDATE notification_deliveries SET lease_until=0", ())
+            .await
+            .unwrap();
+        for replacement in [false, true] {
+            if replacement {
+                let next = fixture.claim().await;
+                assert_ne!(claim.owner, next.owner);
+            }
+            assert!(!claim.renew(&c).await.unwrap());
+            let mut progress = Progress {
+                c: &c,
+                claim: &claim,
+                sent: BTreeSet::new(),
+            };
+            assert_eq!(
+                progress.record("stale-part".into()).await.unwrap_err().code,
+                "lease_lost"
+            );
+            for outcome in [
+                Ok(Outcome::Held),
+                Ok(Outcome::Done),
+                Err(DeliveryError {
+                    code: "storage",
+                    retryable: true,
+                    retry_after: None,
+                }),
+                Err(permanent("invalid_url")),
+            ] {
+                assert!(
+                    !fixture
+                        .dispatcher
+                        .settle(&c, &claim, outcome)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert_eq!(scalar(&c, "SELECT state='pending' AND attempts=0 AND json_array_length(sent_parts)=0 AND completed_at IS NULL AND last_error IS NULL FROM notification_deliveries").await, 1);
+        }
+    }
 }
