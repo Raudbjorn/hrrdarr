@@ -180,7 +180,15 @@ async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() ->
         "SELECT * FROM movie_collection_tags ORDER BY collection_id,tag_id",
     )
     .await;
-    let before = preserved(&c).await;
+    let mut before = preserved(&c).await;
+    // 0079 appends nullable last-search timestamps; every predecessor field must stay exact.
+    const EPISODE_ROWS: usize = 2;
+    const MOVIE_ROWS: usize = 5;
+    for index in [EPISODE_ROWS, MOVIE_ROWS] {
+        for row in &mut before[index] {
+            row.push_str("|Null");
+        }
+    }
     drop(c);
     drop(raw);
     let db = Database::open_local(s.database()).await?;
