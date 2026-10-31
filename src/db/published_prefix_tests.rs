@@ -4,9 +4,9 @@
 use super::*;
 use std::path::PathBuf;
 
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = std::env::temp_dir().join(format!("hrrdarr-published-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -222,7 +222,10 @@ async fn published_prefix_upgrades_with_a_torrentrss_provider() -> Result<(), Er
     Ok(())
 }
 
-async fn published(path: &Path, count: usize) -> Result<(libsql::Database, Connection), Error> {
+pub(super) async fn published(
+    path: &Path,
+    count: usize,
+) -> Result<(libsql::Database, Connection), Error> {
     let raw = libsql::Builder::new_local(path).build().await?;
     let c = raw.connect()?;
     c.execute(HISTORY_SQL, ()).await?;
@@ -416,7 +419,7 @@ fn both_published_ledgers_remain_byte_identical() {
     }
 }
 
-async fn seed_lineage(
+pub(super) async fn seed_lineage(
     path: &Path,
     history: &[Migration],
     count: usize,
@@ -606,5 +609,52 @@ async fn mixed_or_tampered_lineages_fail_before_backup() -> Result<(), Error> {
             "invalid history must not create backups or migrate"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpublished_draft_ledger_is_rejected_with_recovery_guidance_and_left_untouched()
+-> Result<(), Error> {
+    let files = Scratch::new();
+    let path = files.0.join("db");
+    // The 49-row prefix shared by every lineage, then the draft head's version 50 (`indexer_backoff`
+    // where both published lineages have `torrent_rss_indexer`). Only the name matters here: any
+    // row that is not an exact published entry is rejected before a single statement runs.
+    let (raw, c) = seed_lineage(&path, MIGRATIONS, 49).await?;
+    c.execute(
+        "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(50,'indexer_backoff',?,?)",
+        params![checksum("-- draft"), "-- draft"],
+    )
+    .await?;
+    let before = scalar(&c, "SELECT count(*) FROM schema_migrations").await?;
+    drop(c);
+    drop(raw);
+    let message = Database::open_local(&path).await.err().unwrap().to_string();
+    for expected in [
+        "migration history mismatch at version 50",
+        "unpublished PR #31 draft ledger",
+        "no supported conversion",
+        "The database was not modified",
+        ".hrrdarr-migration-",
+        "snapshot importer",
+    ] {
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
+    assert!(
+        !std::fs::read_dir(&files.0)?.any(|entry| entry.is_ok_and(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".hrrdarr-migration-"))),
+        "a rejected history must not create a backup or migrate"
+    );
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
+        before
+    );
+    // A different name at version 50 gets the generic text, not the draft claim.
+    assert!(!history_mismatch(50, "something_else", 49).contains("draft"));
+    assert!(!history_mismatch(51, "indexer_backoff", 50).contains("draft"));
     Ok(())
 }

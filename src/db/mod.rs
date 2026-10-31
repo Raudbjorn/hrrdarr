@@ -573,6 +573,21 @@ fn hex(bytes: &[u8]) -> String {
 type Migration = (&'static str, &'static str);
 
 async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migration]), Error> {
+/// Fixed text only: the stored name is compared, never echoed. The database was not modified.
+fn history_mismatch(version: i64, name: &str, matched_rows: usize) -> String {
+    // Version 50 named `indexer_backoff` after an exact 49-row shared prefix is the unpublished
+    // PR #31 draft ledger (commit 1431d97). Recognising it only improves this message; it is still
+    // rejected and no conversion is attempted (issue #44).
+    let draft = if version == 50 && matched_rows == 49 && name == "indexer_backoff" {
+        " Version 50 is `indexer_backoff`, the unpublished PR #31 draft ledger (draft head 1431d97), which has no supported conversion."
+    } else {
+        ""
+    };
+    format!(
+        "migration history mismatch at version {version}; restore or reconcile the schema before startup.{draft} The database was not modified. Recovery: restore a backup taken before this history was written (pre-upgrade backups are kept in `.hrrdarr-migration-*` directories beside the database), or start a new database and re-import through the snapshot importer. Never edit `schema_migrations` by hand."
+    )
+}
+
     if scalar(
         conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
@@ -608,7 +623,7 @@ async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migrat
         main_matches &= matches(MIGRATIONS);
         legacy_matches &= matches(LEGACY_MIGRATIONS);
         if !main_matches && !legacy_matches {
-            return Err(format!("migration history mismatch at version {n}; restore or reconcile the schema before startup").into());
+            return Err(history_mismatch(n, &name, count).into());
         }
         count += 1;
     }
