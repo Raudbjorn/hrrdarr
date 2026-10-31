@@ -135,6 +135,9 @@ async fn run() -> Result<(), ProcessFailure> {
                 refresh,
                 state.metadata.clone(),
             )
+    if state.db.permits_local_imports() {
+        hrrdarr::import::log_probe_capability().await;
+    }
             .await
             .map_err(|e| ProcessFailure::at("command_worker", e))?,
         )

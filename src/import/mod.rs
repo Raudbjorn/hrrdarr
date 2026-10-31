@@ -710,6 +710,18 @@ pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
     }
     Ok(response)
 }
+/// Startup diagnostic for the installed media probe. Logs a closed state code only, never a path,
+/// version string or child output; a degraded probe leaves scans recording `probe_failed`.
+pub async fn log_probe_capability() {
+    let state = tokio::task::spawn_blocking(|| probe::capability(&AtomicBool::new(false)).code())
+        .await
+        .unwrap_or("check_aborted");
+    eprintln!(
+        "{}",
+        serde_json::json!({"level":if state == "ready" {"INFO"} else {"WARN"},
+        "component":"media_probe","event":"capability","state":state})
+    );
+}
 // ponytail: one import at a time per process; per-library workers when throughput requires it.
 static EXECUTING: AtomicBool = AtomicBool::new(false);
 /// Test-only serialisation for lib tests that reach the process-wide execution permit
