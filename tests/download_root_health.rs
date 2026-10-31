@@ -280,8 +280,18 @@ impl Fixture {
         assert_eq!(status, expected, "{method} {path}: {value}");
         value
     }
+    // Reasoning: 0077 brings the registry to 29 identities, so TV checks move to the second
+    // sixteen-row page; merge both pages (summary/lifecycle come from the first read).
     async fn health(&self) -> Value {
-        self.call("GET", "/api/v1/health", None, 200).await
+        let mut value = self.call("GET", "/api/v1/health", None, 200).await;
+        let second = self
+            .call("GET", "/api/v1/health?offset=16", None, 200)
+            .await;
+        for key in ["checks", "issues"] {
+            let rest = second[key].as_array().unwrap().clone();
+            value[key].as_array_mut().unwrap().extend(rest);
+        }
+        value
     }
     async fn settle(&self) -> Value {
         self.drive("root health must settle through owned worker", async || {

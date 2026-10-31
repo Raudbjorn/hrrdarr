@@ -51,7 +51,7 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -96,6 +96,6 @@ async fn delay_upgrade38_rollback_reopen_preserves_legacy_facts() -> Result<(), 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&reopened.connect().await?).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     Ok(())
 }

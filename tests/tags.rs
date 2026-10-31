@@ -530,3 +530,46 @@ async fn tags_snapshot_three_schemas_replay_local_edits_deletion_and_late_rollba
     assert!(rows.next().await.unwrap().is_none());
     assert_eq!(conn.query("SELECT count(DISTINCT destination_id) FROM snapshot_mappings WHERE destination_table='tags' AND source_id=7",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),2);
 }
+
+#[tokio::test]
+async fn provider_scope_tags_are_in_use_until_unassigned_in_both_domains() {
+    let s = Scratch::new();
+    let db = Arc::new(Database::open_local(s.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let provider = "00000000-0000-0000-0000-000000000001";
+    c.execute("INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint) VALUES(?,'torznab','Scoped indexer',1,1,1,1,'http://127.0.0.1:1/')", [provider]).await.unwrap();
+    let (base, _server) = server(db).await;
+    for media in ["tv", "movies"] {
+        c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,anime_standard_format_search,remove_year) VALUES(?,'torznab',?,'[5000]','[]',?,?)", libsql::params![provider, media, (media == "tv").then_some(0), (media == "movies").then_some(0)]).await.unwrap();
+        let path = format!("/api/v1/{media}/tags");
+        let (status, tag) = request(&base, "POST", &path, json!({"label":"provider-only"})).await;
+        assert_eq!(status, 201);
+        let id = tag["id"].as_i64().unwrap();
+        c.execute(
+            "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES(?,?,?)",
+            libsql::params![provider, media, id],
+        )
+        .await
+        .unwrap();
+        let detail_path = format!("{path}/detail/{id}");
+        let (status, detail) = request(&base, "GET", &detail_path, Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(detail["in_use"], true);
+        assert_eq!(detail["owner_count"], 0);
+        let tag_path = format!("{path}/{id}");
+        let (status, error) = request(&base, "DELETE", &tag_path, Value::Null).await;
+        assert_eq!(status, 409, "{error}");
+        assert_eq!(error["error"]["code"], "tag_in_use");
+        c.execute("DELETE FROM provider_scope_tags WHERE tag_id=?", [id])
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&base, "GET", &detail_path, Value::Null).await.1["in_use"],
+            false
+        );
+        assert_eq!(
+            request(&base, "DELETE", &tag_path, Value::Null).await.0,
+            204
+        );
+    }
+}

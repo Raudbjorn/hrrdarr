@@ -56,7 +56,7 @@ async fn removed_health_fresh_library_mutations_are_scoped_and_transactional() -
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("library.db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND startup=1 AND scheduled=1 AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND observed_generation IS NULL AND severity IS NULL").await?,2);
     assert_eq!(rows(&c,"SELECT scope,compatibility_type FROM health_checks WHERE check_key='removed_metadata' ORDER BY scope").await?,vec![vec![Value::Text("movies".into()),Value::Text("RemovedMovieCheck".into())],vec![Value::Text("tv".into()),Value::Text("RemovedSeriesCheck".into())]]);
     let siblings = rows(
@@ -372,7 +372,8 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     }
     // Reasoning: preserve predecessor (version<=45) health rows; exclude later registrations,
     // including the two 0053 path diagnostics and two 0060 recycle_bin identities covered by their migration tests.
-    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key").await?);
+    // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+    out.push(rows(c,"SELECT * FROM health_checks WHERE check_key NOT IN ('removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only') ORDER BY scope,check_key").await?);
     out.push(
         rows(
             c,
@@ -436,13 +437,22 @@ async fn removed_health_real45_upgrade_backup_late_failure_reopen() -> Result<()
     drop(bc);
     drop(copy);
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     // 0055 appends runtime=NULL; the snapshot witness projects schema45 fields.
     // Rollback and backup above still compare unmodified45.
     let mut upgraded = before.clone();
     for row in &mut upgraded[0] {
         row.push(Value::Null);
     }
+    // Reasoning: 0079 wanted_last_search appends a NULL native_last_search_at to episodes [2] and
+    // movies [5]; every predecessor column value stays exact.
+    for index in [2, 5] {
+        for row in &mut upgraded[index] {
+            row.push(Value::Null);
+        }
+    }
+    // snapshot_imports is witnessed through an explicit column projection, so later inactive
+    // markers (0055/56 and 0077/78 authority markers) never enter the comparison.
     assert_eq!(witness(&c).await?, upgraded);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key='removed_metadata' AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,2);
     assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('indexer_search','indexer_rss') AND generation=0 AND observed_generation IS NULL AND severity IS NULL AND pending_reasons=0").await?,4);

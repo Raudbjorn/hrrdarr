@@ -1201,7 +1201,10 @@ pub async fn details(
         let wanted = optional_bool(stat, "wanted")?.ok_or(QbitError::InvalidResponse)?;
         result.push(TorrentFile {
             index: index as u32,
-            name: rpc.redact(name.to_owned()),
+            // The private import path keeps the original remote name: the receipt evaluation and
+            // the source-file lookup join it to `save_path`. Redaction belongs to the public
+            // projections, exactly as in the qBittorrent client.
+            name: name.to_owned(),
             size_bytes: length,
             progress: if length == 0 {
                 1.0

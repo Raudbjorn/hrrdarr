@@ -28,6 +28,8 @@ A download belongs to a domain when its `dir` is `<aria2 default dir>/<label>` (
 
 `active` with all bytes present is `completed` (seeding), otherwise `downloading`; `waiting` is `queued`; `paused` is `paused`; `complete` is `completed`; `error` is `warning` / `error`; an active download with no known size is `queued` / `metadata`. File paths are made relative to `dir`; the save path is `dir`.
 
+Waiting and stopped downloads are enumerated in pages of 1,000, within a shared limit of 8,192 raw entries across all statuses and domains. Exceeding that limit returns `response_too_large`; an incomplete listing never establishes that a submission is absent. Pagination is not a snapshot of a concurrently changing aria2 queue.
+
 ## Submission
 
 Same flow as the other label clients (lookup by info hash first; never a second add). `addUri` (magnet) or `addTorrent` (base64 `.torrent`) with options `dir=<default>/<label>` and `pause=true` when the scope adds paused, then a best-effort `changePosition` to 0 for a `first` placement. The domain is part of the add, so a lost reply needs no repair: reconcile finds the download in the label folder by hash. `adopt` is not supported.

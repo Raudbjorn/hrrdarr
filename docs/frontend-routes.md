@@ -21,12 +21,13 @@ The UI uses dependency-free hash routing (`#/...`), implemented by the pure tabl
 | `#/wanted/cutoffunmet` | Wanted: cutoff unmet (TV/Movies switch) |
 | `#/calendar` | Calendar: month, week and agenda (TV/Movies/Both); see `docs/calendar-api.md` |
 | `#/system/health` | Health |
+| `#/system/backup` | Backup: list, create, download, delete, restore, policy; see `docs/backup.md` |
 | `#/system/rss` | RSS |
 | `#/add/import` | Import existing library |
 
 Parsing rules: one trailing slash and any `?query` are ignored; paths are case-sensitive; each segment is percent-decoded separately (malformed encoding or an encoded `/` is not-found, never an exception); hashes over 256 characters are rejected. Anything else shows the not-found page, which displays the path as bounded text with control characters replaced (Svelte text interpolation only, never HTML).
 
-The settings index links only sections that exist. Import lists, metadata, connect/notifications, UI settings, backup, updates and logs are listed as "Not available in this build" without links.
+The settings index links only sections that exist. Import lists, metadata, connect/notifications, UI settings, updates and logs are listed as "Not available in this build" without links.
 
 ## Verification status
 

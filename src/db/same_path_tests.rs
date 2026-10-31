@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     for op in &operations {
         let r = c
             .query(

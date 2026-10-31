@@ -204,6 +204,11 @@ pub async fn adopt(
         c.execute("INSERT INTO movie_collection_members(collection_id,metadata_id,origin,metadata_revision) VALUES(?,?,'discovery',?)",params![id,metadata_id,revision]).await?;
         changed = true;
     }
+    if changed {
+        crate::health::library_roots_changed(c)
+            .await
+            .map_err(|_| Error::Storage)?;
+    }
     Ok(changed)
 }
 
@@ -256,7 +261,14 @@ pub async fn cleanup_without_library(c: &Connection, id: i64) -> Result<bool> {
         [id],
     )
     .await?;
-    Ok(c.execute("DELETE FROM movie_collections WHERE id=?", [id])
+    let removed = c
+        .execute("DELETE FROM movie_collections WHERE id=?", [id])
         .await?
-        > 0)
+        > 0;
+    if removed {
+        crate::health::library_roots_changed(c)
+            .await
+            .map_err(|_| Error::Storage)?;
+    }
+    Ok(removed)
 }

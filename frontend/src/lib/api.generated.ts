@@ -36,6 +36,30 @@ export type AutoTagSpecificationInput = { name: string, negate: boolean, require
 
 export type AutoTagTextValues = { values: Array<string>, };
 
+export type BackupCommand = { id: string, name: BackupCommandName, backup_type: BackupCommandType, status: CommandStatus, attempts: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, backup_id: string | null, backup_name: string | null, size_bytes: number | null, pruned: number, };
+
+export type BackupCommandInput = Record<symbol, never>;
+
+export type BackupCommandName = "backup";
+
+export type BackupCommandQuery = { limit?: number, offset?: number, };
+
+export type BackupCommandType = "manual" | "scheduled";
+
+export type BackupDetail = { backup: BackupFile, manifest: BackupManifest, };
+
+export type BackupFile = { id: string, name: string, backup_type: BackupType, size_bytes: number, created_at: number, };
+
+export type BackupManifest = { format: number, application: string, application_version: string, backup_type: BackupType, created_at: number, backend: string, sqlite_version: string, schema_version: number, migrations: Array<ManifestMigration>, files: Array<ManifestFile>, includes: Array<string>, excludes: Array<string>, secrets: ManifestSecrets, };
+
+export type BackupQuery = { limit?: number, offset?: number, backup_type?: BackupType, };
+
+export type BackupSettings = { revision: number, folder: string | null, effective_folder: string | null, interval_days: number, retention_days: number, next_backup_at: number | null, };
+
+export type BackupSettingsUpdate = { revision: number, folder: string | null, interval_days: number, retention_days: number, };
+
+export type BackupType = "scheduled" | "manual" | "update";
+
 export type BlocklistClearCommand = { id: string, name: BlocklistClearName, target: BlocklistClearTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, records_removed: number, };
 
 export type BlocklistClearInput = { target: BlocklistClearTarget, priority: CommandPriority, };
@@ -432,6 +456,12 @@ export type LibraryUpdate = { id: number, patch: LibraryPatch, };
 
 export type LookupResult = { media_type: MediaDomain, external_id: number, title: string, year: number | null, imdb_id: string | null, };
 
+export type ManifestFile = { name: string, size: number, sha256: string, };
+
+export type ManifestMigration = { version: number, name: string, checksum: string, };
+
+export type ManifestSecrets = { encrypted_credentials: number, key_included: boolean, key_source: string, };
+
 export type ManualImportBatchInput = { operation_ids: Array<string>, priority: CommandPriority, };
 
 export type ManualImportCommand = { id: string, batch_id: string, operation_id: string, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, };
@@ -538,7 +568,7 @@ export type MovieRenamePreviewReason = "invalid_path" | "missing_extension" | "i
 
 export type MovieRenamePreviewStatus = "change" | "unavailable";
 
-export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+export type MovieWantedItem = { target: MediaTarget, metadata_id: number, title: string, year: number | null, tmdb_id: number | null, imdb_id: string | null, monitored: boolean, status: string | null, minimum_availability: MinimumAvailability | null, in_cinemas: string | null, digital_release: string | null, physical_release: string | null, availability: WantedMovieAvailability, last_search_time: string | null, last_search_source: WantedLastSearchSource | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
 
 export type MultiEpisodeExampleStatus = "rendered" | "preserved" | "needs_policy" | "invalid";
 
@@ -632,6 +662,8 @@ export type ParseQuery = { title: string, };
 
 export type ParsedRelease = { title: string, year: number | null, numbering: Numbering | null, quality_name: string | null, edition: string | null, revision: FileRevision | null, revision_marker: boolean, technical_start: number | null, };
 
+export type PendingRestore = { source: RestoreSource, backup_id: string | null, backup_name: string | null, backup_type: BackupType, backup_created_at: number, schema_version: number, application_version: string, staged_at: number, database_sha256: string, database_bytes: number, restart_required: boolean, };
+
 export type PresetScope = { "media_type": "tv", settings: TvIndexerScope, } | { "media_type": "movies", settings: MovieIndexerScope, };
 
 export type ProcessingInput = { provider_id: string, provider_revision: number, media_type: MediaDomain, receipt_ids: Array<string>, };
@@ -702,7 +734,7 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
@@ -862,6 +894,10 @@ export type Resolution = { input: string, output: string, mapping_id: number | n
 
 export type ResolveInput = { host: string, path: string, direction: Direction, };
 
+export type RestoreSource = "backup" | "upload";
+
+export type RestoreStatus = { pending: PendingRestore | null, };
+
 export type RevisionPolicy = { media_type: MediaDomain, mode: RevisionPolicyMode, revision: number, };
 
 export type RevisionPolicyMode = "prefer_and_upgrade" | "do_not_upgrade" | "do_not_prefer";
@@ -944,7 +980,7 @@ export type Score = { format_ids: Array<number>, score: number, };
 
 export type SearchCapability = { available: boolean, parameters: Array<string>, aggregate_ids: boolean, search_engine: SearchEngine, };
 
-export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_client_id: string | null, selected_client_attempts: Array<ClientAttempt>, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, };
+export type SearchCommand = { id: string, mode: SearchMode, target: MediaTarget, source: RssTarget, priority: CommandPriority, status: CommandStatus, attempts: number, next_attempt_at: number, created_at: number, started_at: number | null, completed_at: number | null, error_code: string | null, fetched: number, fetch_complete: boolean, selected_client_id: string | null, selected_client_attempts: Array<ClientAttempt>, selected_candidate_id: string | null, selected_candidate_status: string | null, selected_candidate_error_code: string | null, selected_candidate_reasons: Array<string>, dispatch_completed_at: number | null, };
 
 export type SearchCommandInput = { request_id: string, mode: SearchMode, target: MediaTarget, indexer_id: string, indexer_revision: number, client_selection?: ClientSelection, client_id?: string, client_revision?: number, priority: CommandPriority, };
 
@@ -1044,7 +1080,7 @@ export type TvRenamePreviewItem = { series_id: number, episode_file_id: number, 
 
 export type TvSearchMode = "default" | "ids" | "titles" | "both";
 
-export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
+export type TvWantedItem = { target: MediaTarget, series_id: number, series_title: string, series_monitored: boolean, series_type: SeriesType | null, season: number, season_monitored: boolean | null, number: number, absolute_episode_number: number | null, scene_season_number: number | null, scene_episode_number: number | null, scene_absolute_episode_number: number | null, title: string, monitored: boolean, effective_monitored: boolean, air_date: string | null, air_date_utc: string | null, aired_end_at: number | null, last_search_time: string | null, last_search_source: WantedLastSearchSource | null, profile_id: number | null, file: WantedFile | null, cutoff: WantedCutoff | null, };
 
 export type UnmappedFolder = { name: string, path: string, relative_path: string, };
 
@@ -1066,6 +1102,8 @@ export type WantedFile = { id: number, path: string, quality_id: number | null, 
 
 export type WantedKind = "missing" | "cutoff";
 
+export type WantedLastSearchSource = "native" | "imported";
+
 export type WantedMonitored = "monitored" | "unmonitored" | "all";
 
 export type WantedMovieAvailability = "available" | "unavailable" | "ungated";
@@ -1082,4 +1120,4 @@ export type WantedSearchReceipt = { request_id: string, media_type: MediaDomain,
 
 export type WantedSelection = { "kind": "ids", ids: Array<number>, } | { "kind": "all", monitored: WantedMonitored, availability?: WantedAvailability, };
 
-export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality";
+export type WantedSort = "air_date" | "series_title" | "title" | "year" | "in_cinemas" | "digital_release" | "physical_release" | "quality" | "last_search";

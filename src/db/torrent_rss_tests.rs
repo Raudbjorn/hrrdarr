@@ -266,8 +266,8 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        78
-    ); // Reasoning: 0078 provider_authority is the latest on a fresh database; 0068 (torrent RSS indexer) stays at version 68 below.
+        81
+    ); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     assert_eq!(
         text(&c, "SELECT name FROM schema_migrations WHERE version=68").await?,
         "torrent_rss_indexer"
@@ -335,8 +335,8 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            78
-        ); // Reasoning: on top of 67 the runner applies 0068 (torrent RSS indexer) and then the label-client lane's 0069 to 0074, 0075/0076 guards and 0077/0078 collection/provider authority, ending at 78.
+            81
+        ); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -348,7 +348,7 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..67], before[4].as_slice());
-        assert_eq!(history.len(), 78); // Reasoning: one history row per applied migration, 68 through 78, on top of the 67 that were already recorded.
+        assert_eq!(history.len(), 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,

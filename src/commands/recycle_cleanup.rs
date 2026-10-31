@@ -10,7 +10,8 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_REMOVALS: u64 = 10_000;
 // Keep the walk below the worker's 45 s step timeout.
 const RUN_SECONDS: u64 = 30;
-const BUSY_RETRY_SECONDS: i64 = 30;
+// The shared effect permit is held per operation; retry on the scan cleanup cadence.
+const BUSY_RETRY_SECONDS: i64 = 5;
 /// Returns the retention applied to one bin. A shared bin has no per-entry domain marker, so the
 /// longest retention wins; zero disables cleanup for the shared path.
 fn effective_cleanup_days(own: i64, other: Option<i64>, shared: bool) -> Option<i64> {

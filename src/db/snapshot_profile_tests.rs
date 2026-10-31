@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

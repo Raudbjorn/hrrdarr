@@ -7,6 +7,10 @@ assert.equal(new URL(origin).hostname,'127.0.0.1');
 const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE}:{})});
 try {
   const page=await browser.newPage();page.setDefaultTimeout(10000);
+  // Playwright (1.64, Chromium) drops a request that the app issues while page.unroute() turns Fetch
+  // interception off: it never reaches Vite or the API and the app times out. A context pass-through
+  // route keeps interception on for the whole run, so page route/unroute calls only change patterns.
+  await page.context().route('**/api/**',route=>route.fallback());
   const errors=[];page.on('pageerror',e=>{errors.push(e.message);console.error('Browser error:',e.message);});
   await page.goto(origin);
   await page.getByRole('button',{name:'Custom formats',exact:true}).click();

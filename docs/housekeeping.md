@@ -1,9 +1,9 @@
 # Command-history housekeeping
 
-`src/commands/housekeeping.rs` prunes terminal rows from the nine shared-capacity command
+`src/commands/housekeeping.rs` prunes terminal rows from the ten shared-capacity command
 tables: `commands`, `metadata_refresh_commands`, `blocklist_clear_commands`, `rss_commands`,
-`search_commands`, `manual_import_commands`, `quality_reset_commands`, `rescan_commands` and
-`recycle_bin_cleanup_commands` (0060).
+`search_commands`, `manual_import_commands`, `quality_reset_commands`, `rescan_commands`,
+`recycle_bin_cleanup_commands` (0060) and `rename_commands` (0065).
 Since migration 0033 only active rows count toward the 1024-row pool, so history never
 exhausts capacity; this job bounds disk use and query cost instead. `health_commands` already
 retains 128 terminal rows through its own triggers and is not touched.
@@ -41,10 +41,12 @@ Rows protected from deletion (verified against migrations and every reader of th
 | `rss_commands` | A referencing `rss_candidates` row is `pending`, `prepared`, `submitting`, `reconciling` or `needs_attention`. Settled candidates keep their own dedup/receipt state and tolerate `ON DELETE SET NULL`, the same path as the existing delete endpoint. |
 | `search_commands` | Any of its offers is selected, or unexpired. Expired unselected offers are deleted with the command (the `search_results` FK is `RESTRICT`). |
 | `manual_import_commands` | The operation's `import_journal` phase is neither `preview` nor `complete`. |
+| `rename_commands` | Deleting a terminal row cascades its `rename_items` and `rename_command_targets` journal rows. The durable `rename_events` outbox is retained separately and is not a foreign-key child. |
 | Others | Nothing references them and their dedup indexes are partial on active statuses, so terminal rows are pure history. |
 
 Terminal rows are not used for replay deduplication anywhere: dedup is the active-scope unique
-indexes plus candidate/hash-claim rows, which this job never deletes.
+indexes plus candidate/hash-claim rows, which this job never deletes. Rename deduplication is
+enforced in code over active commands only.
 
 ## Scheduling and recovery
 

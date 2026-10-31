@@ -145,15 +145,25 @@ async fn witness(c: &Connection) -> Result<Vec<Vec<Vec<Value>>>, Error> {
     ] {
         // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
         let filter = if table == "health_checks" {
-            " WHERE check_key!='recycle_bin'"
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            " WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         } else {
             ""
         };
-        // Reasoning: 0077/0078 append authority markers; compare every predecessor field.
-        let columns = if table == "snapshot_imports" {
-            "application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version,autotag_metadata_version,series_runtime_version,import_policy_version"
+        // Reasoning: 0077/78 append snapshot collection/provider markers and 0079 appends
+        // episodes/movies.native_last_search_at after this predecessor; every predecessor column
+        // stays in the witness and only those appended columns are excluded.
+        let columns = if matches!(table, "snapshot_imports" | "episodes" | "movies") {
+            let mut names = Vec::new();
+            let mut rows = c
+                .query(&format!("SELECT name FROM pragma_table_info('{table}') WHERE name NOT IN ('collection_version','provider_authority_version','native_last_search_at') ORDER BY cid"), ())
+                .await?;
+            while let Some(row) = rows.next().await? {
+                names.push(row.get::<String>(0)?);
+            }
+            names.join(",")
         } else {
-            "*"
+            "*".to_owned()
         };
         out.push(
             dump(
@@ -174,7 +184,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

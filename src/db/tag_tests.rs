@@ -73,7 +73,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version_of(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+            assert_eq!(version_of(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
             assert_eq!(
                 scalar(&c, "SELECT tag_version FROM snapshot_imports").await?,
                 0
@@ -141,7 +141,7 @@ async fn tags_schema36_rollback_reopen_archive_backfill_and_empty_local_edit() -
             drop(c);
             drop(db);
             let reopened = Database::open_local(&path).await?;
-            assert_eq!(version_of(&reopened.connect().await?).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+            assert_eq!(version_of(&reopened.connect().await?).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         }
     }
     Ok(())

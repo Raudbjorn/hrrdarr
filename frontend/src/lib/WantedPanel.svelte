@@ -6,7 +6,7 @@
   import type { ApiPage, ClientSelection, MediaDomain, MovieWantedItem, Provider, SearchCommand, TvWantedItem, WantedKind, WantedPage, WantedSearchInput, WantedSearchReceipt } from './api.generated';
   import { createWantedSearch, getSearchCommand, listProviders, listWanted, monitorEpisodes, monitorMovies } from './api';
   import { eligibleDownloadClient, indexerScope, isIndexer, mergeProviderPages } from './provider-draft';
-  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, monitoredLabel, receiptSummary, retainVisible, sameWantedWork, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
+  import { WANTED_PAGE_SIZES, MAX_WANTED_SEARCH_TARGETS, availabilityLabel, cutoffLabel, defaultOptions, episodeLabel, formatDate, lastSearchLabel, monitoredLabel, receiptSummary, retainVisible, sameWantedWork, searchBody, selectedIds, sortChoices, wantedQuery, type WantedOptions } from './wanted-view';
   type Item = TvWantedItem | MovieWantedItem;
   let { kind, onkind }: { kind: WantedKind; onkind: (kind: WantedKind) => void } = $props();
 
@@ -185,7 +185,7 @@
         <th scope="col"><input type="checkbox" aria-label="Select all on this page" checked={allVisibleSelected} disabled={busy || !visibleIds.length} onchange={toggleAll} /></th>
         {#if domain === 'tv'}<th scope="col">Series</th><th scope="col">Episode</th><th scope="col">Title</th><th scope="col">Air date</th>
         {:else}<th scope="col">Title</th><th scope="col">Year</th><th scope="col">Releases</th>{#if kind === 'missing'}<th scope="col">Availability</th>{/if}{/if}
-        <th scope="col">Monitoring</th>{#if kind === 'cutoff'}<th scope="col">Current quality</th>{/if}
+        <th scope="col">Last searched</th><th scope="col">Monitoring</th>{#if kind === 'cutoff'}<th scope="col">Current quality</th>{/if}
       </tr></thead>
       <tbody>
         {#each page.items as item (`${item.target.media_type}:${item.target.id}`)}
@@ -196,10 +196,11 @@
             {:else if movie(item)}
               <td>{item.title}</td><td>{item.year ?? 'Unknown'}</td><td><small>Cinemas {formatDate(item.in_cinemas)} · Digital {formatDate(item.digital_release)} · Physical {formatDate(item.physical_release)}</small></td>{#if kind === 'missing'}<td>{availabilityLabel(item)}</td>{/if}
             {/if}
+            <td>{#if item.last_search_time}<time datetime={item.last_search_time}>{lastSearchLabel(item)}</time>{:else}{lastSearchLabel(item)}{/if}</td>
             <td>{monitoredLabel(item)}</td>{#if kind === 'cutoff'}<td>{cutoffLabel(item)}{#if item.file}<small class="path">File {item.file.id}</small>{/if}</td>{/if}
           </tr>
         {:else}
-          <tr><td colspan={domain === 'tv' && kind === 'cutoff' ? 7 : 6}>{loading ? 'Loading…' : `Nothing ${kind === 'missing' ? 'missing' : 'below cutoff'} here.`}</td></tr>
+          <tr><td colspan={domain === 'tv' && kind === 'cutoff' ? 8 : 7}>{loading ? 'Loading…' : `Nothing ${kind === 'missing' ? 'missing' : 'below cutoff'} here.`}</td></tr>
         {/each}
       </tbody>
     </table></div>
@@ -216,7 +217,7 @@
 
   <section class="search" aria-label="Wanted search">
     <h2>Search</h2>
-    <p>Searches run as automatic user searches: the best accepted release is downloaded. User searches bypass background availability and delay rules.{domain === 'tv' ? ' Each episode is searched individually; season packs are not grouped yet.' : ''}</p>
+    <p>Searches run as automatic user searches: the best accepted release is downloaded. User searches bypass background availability and delay rules. Last searched updates once the indexer has been queried, even when it answers with an error; RSS sync and grabs do not change it.{domain === 'tv' ? ' Each episode is searched individually; season packs are not grouped yet.' : ''}</p>
     {#if providerLoading}<p role="status">Loading providers…</p>{/if}{#if providerError}<p role="alert" class="error">{providerError}</p>{/if}
     <fieldset disabled={searching || uncertain || pending !== null}>
       <legend>Search providers</legend>
@@ -231,7 +232,7 @@
     {#if confirmAll && page}
       <div role="alertdialog" aria-labelledby="wanted-confirm-title" aria-describedby="wanted-confirm-body" class="confirm">
         <h3 id="wanted-confirm-title">Search all {listName.toLowerCase()}?</h3>
-        <p id="wanted-confirm-body">This queues an automatic search for every current {page.monitored === 'all' ? '' : `${page.monitored} `}member of this list ({page.total} now; at most {MAX_WANTED_SEARCH_TARGETS}), not only this page. Targets already being searched are skipped. Requests larger than the limit or the free command capacity are refused as a whole.</p>
+        <p id="wanted-confirm-body">This queues an automatic search for every current {page.monitored === 'all' ? '' : `${page.monitored} `}member of this list ({page.total} now; at most {MAX_WANTED_SEARCH_TARGETS}), not only this page, oldest-searched first (never-searched targets first). Targets already being searched are skipped. Requests larger than the limit or the free command capacity are refused as a whole.</p>
         <button class="primary" disabled={!searchReady} onclick={searchAll}>Confirm search all</button><button onclick={() => { confirmAll = false; }}>Cancel search all</button>
       </div>
     {/if}

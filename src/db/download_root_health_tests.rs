@@ -66,9 +66,9 @@ async fn download_root_health_fresh_registry_uses_existing_startup_generation() 
     let scratch = Scratch::new();
     let db = Database::open_local(scratch.0.join("db")).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+    assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     // Two removed-metadata registry entries join the six previously seeded checks.
-    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
+    assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     new_registry(&c).await?;
     let tx = c.transaction().await?;
     let error = tx.execute("UPDATE health_checks SET generation=2 WHERE scope='tv' AND check_key='download_client_root_folder'", ()).await.unwrap_err();
@@ -128,7 +128,7 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies'); INSERT INTO root_folders(media_type,path)VALUES('tv','/unused/tv'),('movies','/unused/movies');").await?;
     // Exclude later registrations, including the two 0053 path diagnostics identities.
     let queries = [
-        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
+        "SELECT * FROM health_checks WHERE check_key NOT IN ('download_client_root_folder','removed_metadata','indexer_search','indexer_rss','indexer_download_client','indexer_status','indexer_failures','download_client_backoff','remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only') ORDER BY scope,check_key", // Reasoning: 0060 recycle_bin identities postdate schema 43 and are covered by migration tests.
         "SELECT * FROM health_lifecycle",
         "SELECT * FROM health_commands ORDER BY id",
         "SELECT * FROM health_command_checks ORDER BY command_id,scope,check_key",
@@ -136,8 +136,9 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
         "SELECT * FROM sqlite_sequence ORDER BY name,seq",
         // Metadata45 appends nullable facts; preserve every predecessor series column by name.
         "SELECT id,tvdb_id,title,year,path,poster,monitored,original_language FROM series ORDER BY id",
-        "SELECT * FROM episodes ORDER BY id",
-        "SELECT * FROM movies ORDER BY id",
+        // 0079 wanted_last_search appends native_last_search_at; preserve predecessor columns by name.
+        "SELECT id,series_id,season,number,title,episode_file_id,monitored,tvdb_id,air_date,air_date_utc,last_search_time,runtime,finale_type,overview,absolute_episode_number,scene_absolute_episode_number,scene_episode_number,scene_season_number,unverified_scene_numbering,images_json FROM episodes ORDER BY id",
+        "SELECT id,metadata_id,path,monitored FROM movies ORDER BY id",
         "SELECT * FROM root_folders ORDER BY id",
     ];
     let mut before = vec![];
@@ -180,8 +181,8 @@ async fn download_root_health_schema43_preserves_pending_observations_and_replay
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24); 0060 adds none.
+        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
         new_registry(&c).await?;
         for (query, expected) in queries.iter().zip(&before) {
             assert_eq!(&rows(&c, query).await?, expected, "upgrade/replay {query}");

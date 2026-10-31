@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        78 // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

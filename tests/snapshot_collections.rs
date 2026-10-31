@@ -632,3 +632,72 @@ async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved
         2
     );
 }
+
+#[tokio::test]
+async fn api_policy_edit_is_sticky_against_a_newer_backup() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let db = std::sync::Arc::new(Database::open_local(s.0.join("native.db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let first = source(&s, MODERN, "", None).await;
+    assert!(
+        snapshots::import(&db, Application::Radarr, first, false)
+            .await
+            .unwrap()
+            .applied
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collection_settings WHERE monitored=1 AND snapshot_owned=1 AND local_edit=0"
+        )
+        .await,
+        1
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = hrrdarr::collections::router(db.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let id = scalar(&c, "SELECT id FROM movie_collections").await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // Reasoning: the user turns search_on_add off through the API; that is a native policy edit.
+    let status = client
+        .put(format!("{base}/api/v1/movies/collections/{id}"))
+        .header("content-type", "application/json")
+        .body(r#"{"search_on_add":false}"#)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    server.abort();
+    assert_eq!(
+        scalar(&c, "SELECT local_edit FROM movie_collection_settings").await,
+        1
+    );
+    // A newer backup that would turn monitoring off must not override the native edit.
+    let newer = source(
+        &s,
+        MODERN,
+        "UPDATE Collections SET Monitored=0,SearchOnAdd=1;",
+        None,
+    )
+    .await;
+    let report = snapshots::import(&db, Application::Radarr, newer, false)
+        .await
+        .unwrap();
+    assert!(report.applied);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movie_collection_settings WHERE monitored=1 AND search_on_add=0 AND local_edit=1"
+        )
+        .await,
+        1
+    );
+    assert!(report.unsupported.iter().any(|u| {
+        u.columns
+            .iter()
+            .any(|m| m.contains("native collection intent retained"))
+    }));
+}

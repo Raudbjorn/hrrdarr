@@ -566,4 +566,37 @@ mod tests {
         assert_eq!(MoveError::CrossDevice.code(), "cross_device");
         assert_eq!(errno(rustix::io::Errno::EXIST), MoveError::Exists);
     }
+    #[test]
+    fn case_alias_journal_states_follow_directory_spelling() {
+        let d = scratch();
+        for kind in [Kind::File, Kind::Dir] {
+            let old = s(&d, "show");
+            let new = s(&d, "Show");
+            match kind {
+                Kind::File => std::fs::write(&old, b"a").unwrap(),
+                Kind::Dir => std::fs::create_dir(&old).unwrap(),
+            }
+            let ident = observe(&old, kind).unwrap();
+            // Simulate alias lookup on a case-insensitive mount; directory spelling is real.
+            let state = || classify_pair(&old, &new, ident, ident, ident.unwrap()).unwrap();
+            assert_eq!(state(), PairState::Source);
+            std::fs::rename(&old, &new).unwrap();
+            assert_eq!(state(), PairState::Moved);
+            std::fs::rename(&new, &old).unwrap();
+            assert_eq!(state(), PairState::Source);
+            if kind == Kind::File {
+                std::fs::hard_link(&old, &new).unwrap();
+                assert_eq!(
+                    pair_state(&old, &new, kind, ident.unwrap()).unwrap(),
+                    PairState::Anomaly
+                );
+                std::fs::remove_file(&new).unwrap();
+                std::fs::remove_file(&old).unwrap();
+            } else {
+                std::fs::remove_dir(&old).unwrap();
+            }
+            assert_eq!(state(), PairState::Anomaly);
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }

@@ -162,7 +162,7 @@ both domains. A domain with `cleanup_days=0` disables cleanup for the shared pat
 filesystem layout does not identify ownership per entry; use separate bins when independent
 retention or cleanup-disabled behavior is required. This is an hrrdarr rule: upstream keeps one
 global cleanup-days setting for the whole bin.
-Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 60 s); a bounded run reports
+Each run is bounded (depth 32, 100 000 entries, 10 000 removals, 30 s); a bounded run reports
 `bounded` and leaves the rest for the next run. Outcomes: `cleaned`, `not_configured`, `disabled`;
 a missing bin fails with `recycle_bin_unavailable`. Cleanup waits (retry) while a file operation
 holds the effect permit.

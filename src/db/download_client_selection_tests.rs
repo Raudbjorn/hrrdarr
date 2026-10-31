@@ -173,14 +173,15 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 78); // Reasoning: migrations 0077/0078 append collection/provider authority; historical prefixes stay fixed.
+        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {
                 " WHERE version<=51"
             } else if *table == "health_checks" {
                 // 0053 and 0059 add two identities each; all schema51 observations remain exact.
-                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin')"
+                // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only')"
             } else {
                 ""
             };

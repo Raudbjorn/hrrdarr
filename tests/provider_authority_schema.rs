@@ -175,7 +175,12 @@ async fn upgrade77_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     let c = raw.connect()?;
     c.execute("PRAGMA foreign_keys=ON", ()).await?;
     seed(&c).await?;
-    let before = witness(&c).await;
+    let mut before = witness(&c).await;
+    // 0079 appends a NULL movie last-search timestamp without changing predecessor fields.
+    const MOVIE_ROWS: usize = 5;
+    for row in &mut before[MOVIE_ROWS] {
+        row.push_str("|Null");
+    }
     drop(c);
     drop(raw);
     let db = Database::open_local(s.database()).await?;
@@ -200,7 +205,7 @@ async fn upgrade77_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        78 // Reasoning: provider authority is appended after collections authority 0077.
+        81 // Reasoning: Wanted, library-root health and Backup follow main provider authority at 78.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);
