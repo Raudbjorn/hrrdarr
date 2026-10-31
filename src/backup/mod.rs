@@ -24,7 +24,11 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Semaphore;
 
 pub use engine::{BackupFailure, BackupLimits, Published, create_backup, publish_update};
 pub use restore::{RestoreOutcome, apply_pending_restore};
@@ -43,6 +47,7 @@ pub const MAX_RETENTION_DAYS: i64 = 90;
 const MAX_REVISION: i64 = 9_007_199_254_740_991;
 const MAX_PATH_BYTES: usize = 4096;
 const REQUEST_SECONDS: u64 = 10;
+static INVENTORY_WORK: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -463,6 +468,30 @@ async fn bounded<T>(future: impl std::future::Future<Output = Result<T>>) -> Res
         .map_err(|_| timeout())?
 }
 
+/// The permit lives in the closure, including after its HTTP waiter times out or disconnects.
+async fn inventory<T: Send + 'static>(
+    work: impl FnOnce(Instant) -> std::io::Result<T> + Send + 'static,
+) -> Result<T> {
+    let permit = INVENTORY_WORK.acquire().await.map_err(|_| io_error())?;
+    let deadline = Instant::now() + Duration::from_secs(REQUEST_SECONDS);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // shortcut: a blocked filesystem syscall cannot be cancelled; process isolation is needed to terminate it.
+        work(deadline)
+    })
+    .await
+    .map_err(|_| io_error())?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::TimedOut => timeout(),
+        std::io::ErrorKind::FileTooLarge => Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backup_inventory_too_large",
+            "The backup inventory exceeds the listing limit; known backup ids remain addressable",
+        ),
+        _ => io_error(),
+    })
+}
+
 /// Resolves the configured folder and lists it (blocking I/O off the executor).
 async fn folder(db: &Database) -> Result<std::path::PathBuf> {
     let path = db_path(db)?;
@@ -485,10 +514,7 @@ async fn list(
     bounded(async {
         let folder = folder(&state.db).await?;
         let filter = q.backup_type;
-        let all = tokio::task::spawn_blocking(move || engine::list(&folder, filter))
-            .await
-            .map_err(|_| io_error())?
-            .map_err(|_| io_error())?;
+        let all = inventory(move |deadline| engine::list(&folder, filter, deadline)).await?;
         let total = all.len() as i64;
         let items = all
             .into_iter()
@@ -508,10 +534,8 @@ async fn list(
 async fn find(db: &Database, id: String) -> Result<(BackupFile, std::path::PathBuf)> {
     valid_id(&id)?;
     let folder = folder(db).await?;
-    tokio::task::spawn_blocking(move || engine::find(&folder, &id))
-        .await
-        .map_err(|_| io_error())?
-        .map_err(|_| io_error())?
+    inventory(move |deadline| engine::find(&folder, &id, deadline))
+        .await?
         .ok_or_else(not_found)
 }
 
@@ -795,5 +819,48 @@ mod tests {
         ] {
             assert!(valid_id(bad).is_err(), "{bad}");
         }
+    }
+    #[tokio::test]
+    async fn timed_out_inventory_holds_admission_until_blocking_work_finishes() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let request = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                inventory(move |_| {
+                    entered.send(()).unwrap();
+                    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(())
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.await.unwrap().is_err(), "the HTTP waiter timed out");
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for _ in 0..3 {
+            let called = called.clone();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    inventory(move |_| {
+                        called.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                )
+                .await
+                .is_err(),
+                "stalled work still owns the only slot"
+            );
+        }
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), inventory(|_| Ok(())))
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

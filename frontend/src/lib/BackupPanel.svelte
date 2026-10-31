@@ -7,7 +7,7 @@
   const POLL_MS=500,POLL_LIMIT=240;
   let backups=$state<BackupFile[]>([]),total=$state(0),offset=$state(0),listing=$state(false),listError=$state('');
   let command=$state<BackupCommand|null>(null),running=$state(false),commandError=$state('');
-  let pending=$state<PendingRestore|null>(null),pendingError=$state('');
+  let pending=$state<PendingRestore|null>(null),pendingError=$state(''),pendingUncertain=$state(false),pendingLoading=$state(true);
   type Confirm={kind:'delete';backup:BackupFile}|{kind:'restore';backup:BackupFile}|{kind:'upload';file:File};
   let confirm=$state<Confirm|null>(null);
   let acting=$state(false),actionError=$state(''),notice=$state('');
@@ -27,10 +27,14 @@
     backups=result.data.items;total=result.data.total;offset=nextOffset;
   }
   async function loadPending(){
+    if(acting)return;
+    pendingLoading=true;
     const result=await getPendingRestore();
     if(!alive)return;
-    if(!result.ok){pendingError=`Pending restore status could not be read: ${result.error}`;return;}
-    pendingError='';pending=result.data.pending;
+    pendingLoading=false;
+    if(!result.ok){pendingUncertain=true;pendingError=`Pending restore status could not be read: ${result.error}`;return;}
+    if(pendingUncertain)notice=result.data.pending?'Pending restore status checked. Review the staged restore below.':'No pending restore was found. Review the archive before trying again.';
+    pendingUncertain=false;pendingError='';pending=result.data.pending;
   }
   async function loadLatestCommand(){
     const result=await listBackupCommands(1);
@@ -73,11 +77,11 @@
     running=false;
     if(command?.status==='succeeded')await loadList(0);
   }
-  async function ask(next:Confirm){actionError='';notice='';confirm=next;await tick();confirmButton?.focus();}
+  async function ask(next:Confirm){if(acting||(next.kind!=='delete'&&(pendingLoading||pendingUncertain||pending)))return;actionError='';notice='';confirm=next;await tick();confirmButton?.focus();}
   function closeConfirm(){confirm=null;actionError='';}
   async function confirmAction(){
     const current=confirm;
-    if(!current||acting)return;
+    if(!current||acting||(current.kind!=='delete'&&(pendingLoading||pendingUncertain||pending)))return;
     acting=true;actionError='';notice='';
     if(current.kind==='delete'){
       const result=await deleteBackup(current.backup.id);
@@ -89,18 +93,29 @@
     const result=current.kind==='restore'?await restoreBackup(current.backup.id):await uploadRestore(current.file);
     if(!alive)return;
     acting=false;
-    if(!result.ok){actionError=restoreErrorMessage(result.code,`Restore was not staged: ${result.error}`);if(result.code==='restore_already_pending')await loadPending();return;}
-    confirm=null;pending=result.data;file=null;if(fileInput)fileInput.value='';
+    if(!result.ok){
+      if(result.status===undefined||result.status>=500){
+        // A failed response does not establish whether the persisted restore was published.
+        confirm=null;pendingUncertain=true;await loadPending();return;
+      }
+      actionError=restoreErrorMessage(result.code,`Restore was not staged: ${result.error}`);
+      if(result.code==='restore_already_pending'){confirm=null;await loadPending();}
+      return;
+    }
+    confirm=null;pendingUncertain=false;pendingError='';pending=result.data;file=null;if(fileInput)fileInput.value='';
     notice='Restore validated and staged. Restart hrrdarr to apply it.';
   }
   async function cancelRestore(){
-    if(acting)return;
+    if(acting||pendingLoading)return;
     acting=true;pendingError='';notice='';
     const result=await cancelPendingRestore();
     if(!alive)return;
     acting=false;
-    if(!result.ok&&result.code!=='restore_not_pending'){pendingError=`Pending restore was not cancelled: ${result.error}`;return;}
-    pending=null;notice='Pending restore cancelled. The current database stays in use.';
+    if(!result.ok&&result.code!=='restore_not_pending'){
+      if(result.status===undefined||result.status>=500){pendingUncertain=true;await loadPending();return;}
+      pendingError=`Pending restore was not cancelled: ${result.error}`;return;
+    }
+    pending=null;pendingUncertain=false;notice='Pending restore cancelled. The current database stays in use.';
   }
   function chooseUpload(){
     const check=checkUploadFile(file);
@@ -116,14 +131,19 @@
   {#if notice}<p role="status">{notice}</p>{/if}
 
   <section aria-label="Pending restore" aria-live="polite">
-    {#if pending}
+    {#if pendingUncertain}
+      <p role="alert">Restore status is unknown. A restore may already be staged and replace the database on restart. Check pending restore status or cancel it before restarting.</p>
+    {/if}
+    {#if pendingLoading}<p role="status">Checking pending restore status…</p>{/if}
+    {#if pending&&!pendingUncertain}
       <div class="pending">
         <h3>Restore pending — applies on restart</h3>
         <p>{describePending(pending)}</p>
         <p>Changes made before the restart are not kept in the restored database.</p>
-        <button disabled={acting} onclick={cancelRestore}>Cancel pending restore</button>
       </div>
     {/if}
+    {#if pending||pendingUncertain}<button disabled={acting||pendingLoading} onclick={cancelRestore}>Cancel pending restore</button>{/if}
+    {#if pendingUncertain||pendingError}<button disabled={acting||pendingLoading} onclick={loadPending}>Check pending restore status</button>{/if}
     {#if pendingError}<p role="alert">{pendingError}</p>{/if}
   </section>
 
@@ -148,7 +168,7 @@
             <td class="name">{backup.name}</td><td>{typeLabel(backup.backup_type)}</td><td>{formatTime(backup.created_at)}</td><td>{formatBytes(backup.size_bytes)}</td>
             <td class="actions">
               {#if downloadPath(backup)}<a href={downloadPath(backup)} download={backup.name} aria-label={`Download ${backup.name}`}>Download</a>{/if}
-              <button disabled={acting||!!pending} aria-label={`Restore ${backup.name}`} onclick={()=>ask({kind:'restore',backup})}>Restore</button>
+              <button disabled={acting||pendingLoading||pendingUncertain||!!pending} aria-label={`Restore ${backup.name}`} onclick={()=>ask({kind:'restore',backup})}>Restore</button>
               <button disabled={acting} aria-label={`Delete ${backup.name}`} onclick={()=>ask({kind:'delete',backup})}>Delete</button>
             </td>
           </tr>
@@ -164,8 +184,8 @@
 
   <section aria-label="Restore from file">
     <h3>Restore from file</h3>
-    <label>Backup archive<input bind:this={fileInput} type="file" accept=".zip,application/zip" disabled={acting||!!pending} onchange={event=>{file=(event.currentTarget as HTMLInputElement).files?.[0]??null;actionError='';}}/></label>
-    <button disabled={acting||!!pending||!file} onclick={chooseUpload}>Restore from file</button>
+    <label>Backup archive<input bind:this={fileInput} type="file" accept=".zip,application/zip" disabled={acting||pendingLoading||pendingUncertain||!!pending} onchange={event=>{file=(event.currentTarget as HTMLInputElement).files?.[0]??null;actionError='';}}/></label>
+    <button disabled={acting||pendingLoading||pendingUncertain||!!pending||!file} onclick={chooseUpload}>Restore from file</button>
     {#if pending}<p>Cancel the pending restore before staging another.</p>{/if}
   </section>
 

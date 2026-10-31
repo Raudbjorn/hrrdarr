@@ -12,8 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Directory scan bound per backup type; extra entries are ignored (and never pruned).
-pub(crate) const MAX_LISTED: usize = 1000;
+/// Maximum materialized inventory; overflow is an error, never a partial listing.
+pub(crate) const MAX_LISTED: usize = 100_000;
+const MAX_STAGING_ENTRIES: usize = 1000;
 const STAGING: &str = ".staging";
 const STALE_STAGING_SECONDS: u64 = 24 * 60 * 60;
 const NAME_PREFIX: &str = "hrrdarr_backup_";
@@ -187,7 +188,7 @@ fn prepare(folder: &Path, backup_type: BackupType) -> io::Result<(PathBuf, Stagi
     private_dir(&staging_root)?;
     // Crash leftovers only: other instances sharing the folder use fresh unique directories.
     if let Ok(entries) = fs::read_dir(&staging_root) {
-        for entry in entries.flatten().take(MAX_LISTED) {
+        for entry in entries.flatten().take(MAX_STAGING_ENTRIES) {
             let old = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -393,10 +394,25 @@ fn publish(partial: &Path, type_dir: &Path, created_at: i64) -> Result<String, B
     Err(PUBLISH)
 }
 
-/// Lists generated archives (regular files only; symlinks and other names are ignored).
-pub(crate) fn list(folder: &Path, filter: Option<BackupType>) -> io::Result<Vec<BackupFile>> {
-    let mut out = Vec::new();
+fn inventory_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "inventory deadline",
+        ));
+    }
+    Ok(())
+}
+
+/// Visits generated regular files without buffering directory contents; false stops the scan.
+fn scan(
+    folder: &Path,
+    filter: Option<BackupType>,
+    deadline: Instant,
+    mut visit: impl FnMut(BackupFile) -> io::Result<bool>,
+) -> io::Result<()> {
     for backup_type in BackupType::ALL {
+        inventory_deadline(deadline)?;
         if filter.is_some_and(|f| f != backup_type) {
             continue;
         }
@@ -407,7 +423,8 @@ pub(crate) fn list(folder: &Path, filter: Option<BackupType>) -> io::Result<Vec<
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         }
-        for entry in fs::read_dir(&dir)?.take(MAX_LISTED) {
+        for entry in fs::read_dir(&dir)? {
+            inventory_deadline(deadline)?;
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -418,31 +435,63 @@ pub(crate) fn list(folder: &Path, filter: Option<BackupType>) -> io::Result<Vec<
             if !entry.file_type()?.is_file() {
                 continue;
             }
-            out.push(BackupFile {
+            let backup = BackupFile {
                 id: backup_id(backup_type, &name),
                 size_bytes: entry.metadata()?.len(),
                 name,
                 backup_type,
                 created_at,
-            });
+            };
+            inventory_deadline(deadline)?;
+            if !visit(backup)? {
+                return Ok(());
+            }
         }
     }
+    inventory_deadline(deadline)
+}
+
+/// Complete sorted inventory or an explicit resource/deadline error.
+pub(crate) fn list(
+    folder: &Path,
+    filter: Option<BackupType>,
+    deadline: Instant,
+) -> io::Result<Vec<BackupFile>> {
+    let mut out = Vec::new();
+    scan(folder, filter, deadline, |backup| {
+        if out.len() == MAX_LISTED {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "inventory limit",
+            ));
+        }
+        out.push(backup);
+        Ok(true)
+    })?;
     out.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.name.cmp(&a.name))
     });
+    inventory_deadline(deadline)?;
     Ok(out)
 }
 
-pub(crate) fn find(folder: &Path, id: &str) -> io::Result<Option<(BackupFile, PathBuf)>> {
-    Ok(list(folder, None)?
-        .into_iter()
-        .find(|b| b.id == id)
-        .map(|b| {
-            let path = folder.join(b.backup_type.dir()).join(&b.name);
-            (b, path)
-        }))
+pub(crate) fn find(
+    folder: &Path,
+    id: &str,
+    deadline: Instant,
+) -> io::Result<Option<(BackupFile, PathBuf)>> {
+    let mut found = None;
+    scan(folder, None, deadline, |backup| {
+        if backup.id != id {
+            return Ok(true);
+        }
+        let path = folder.join(backup.backup_type.dir()).join(&backup.name);
+        found = Some((backup, path));
+        Ok(false)
+    })?;
+    Ok(found)
 }
 
 pub(crate) fn remove(path: &Path) -> io::Result<()> {
@@ -457,14 +506,25 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
 }
 
 /// Removes backups of one type older than the retention window, never `keep`.
-fn prune(folder: &Path, backup_type: BackupType, retention_days: i64, keep: &str, now: i64) -> u64 {
+fn prune(
+    folder: &Path,
+    backup_type: BackupType,
+    retention_days: i64,
+    keep: &str,
+    now: i64,
+    deadline: Instant,
+) -> u64 {
     let cutoff = now - retention_days * 86_400;
-    let Ok(all) = list(folder, Some(backup_type)) else {
+    let Ok(all) = list(folder, Some(backup_type), deadline) else {
         eprintln!("event=backup_prune_failed code=list");
         return 0;
     };
     let mut removed = 0;
     for backup in all {
+        if inventory_deadline(deadline).is_err() {
+            eprintln!("event=backup_prune_failed code=timeout");
+            break;
+        }
         if backup.name == keep || backup.created_at >= cutoff {
             continue;
         }
@@ -669,6 +729,7 @@ async fn run(
                 retention_days,
                 &backup.name,
                 now(),
+                deadline,
             )
         };
         Ok((backup, pruned))
@@ -751,6 +812,20 @@ mod tests {
         assert_ne!(
             backup_id(BackupType::Manual, &name),
             backup_id(BackupType::Scheduled, &name)
+        );
+    }
+    #[test]
+    fn expired_inventory_never_reports_a_missing_backup_or_empty_list() {
+        let absent = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            list(&absent, None, Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            find(&absent, &"0".repeat(32), Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
         );
     }
 }

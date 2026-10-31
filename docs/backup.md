@@ -84,15 +84,25 @@ interrupted command is failed, not retried.
 ## Listing, download and delete
 
 - `GET /api/v1/system/backups[?limit=1..100&offset&backup_type]` → `ApiPage<BackupFile>` sorted
-  newest first (at most 1000 files scanned per type).
+  newest first over the full inventory (up to 100,000 matching generated regular archives;
+  offsets through 100,000 are accepted). Larger inventories return 503
+  `backup_inventory_too_large`, with no partial totals.
 - `GET /api/v1/system/backups/{id}` → `{backup, manifest}`.
 - `GET /api/v1/system/backups/{id}/download` streams the archive (`application/zip`,
   `Content-Disposition: attachment`, `Cache-Control: no-store`).
 - `DELETE /api/v1/system/backups/{id}` removes one archive (204); the UI asks for confirmation.
 
 `id` is the first 32 hex digits of SHA-256 over `<type>/<name>`. It must match `^[0-9a-f]{32}$`
-(otherwise 400) and is resolved only by listing generated names of regular files inside the
-folder (otherwise 404). Clients never supply a path.
+(otherwise 400) and is resolved only against generated names of regular files inside the
+folder (otherwise 404). Known-ID lookup uses constant memory and works independently of the
+materialized listing cap. Clients never supply a path.
+
+Inventory requests share one process-wide scan permit. The ten-second HTTP timeout includes
+waiting for admission; each admitted scan has its own ten-second cooperative deadline.
+The blocking scan retains the permit until it actually
+finishes, even after an HTTP timeout or disconnect; subsequent scans cannot accumulate behind
+an abandoned scan. An operating-system filesystem call that blocks cannot be forcibly stopped.
+Retention scans also honor the existing backup deadline.
 
 ## Restore
 
@@ -122,12 +132,15 @@ response says `restart_required: true`.
 
 Before the database is opened, startup consumes the pending marker:
 
-1. Re-hash the staged database against the marker. A mismatch, an unreadable marker or a missing
+1. Acquire the persistent `.<db>.restore-lock` before inspecting pending state, including when
+   the live database is absent. A competing restore operation refuses to proceed. The same lock
+   protects staging, status reads and cancellation; it must not be removed or renamed.
+   Also refuse to replace a database held by a running application through its live database lock.
+2. Re-hash the staged database against the marker. A mismatch, an unreadable marker or a missing
    staged database (before anything moved) quarantines the candidate as
    `.<db>.restore-rejected-<stamp>-<rand>/`, logs `event=backup_restore_rejected` and starts on
    the unchanged live database.
-2. Refuse to proceed if another process holds the live database lock.
-3. Create `.<db>.restore-original-<stamp>-<rand>/`, record its name in the pending directory, move
+3. Record the name of `.<db>.restore-original-<stamp>-<rand>/` in the pending directory, create it, move
    the live database and its `-wal`/`-shm`/`-journal` companions into it, then rename the staged
    database into place, with directory `fsync`s between steps.
 4. Write `restore-applied.json` into the original directory and remove the pending directory.
@@ -136,8 +149,21 @@ Before the database is opened, startup consumes the pending marker:
 An interruption between steps resumes on the next start using the recorded original directory
 (no second original is created); if the candidate was already installed, the live file must match
 the recorded checksum or startup stops with instructions instead of opening an empty database.
+An interrupted `original.partial` marker is discarded and rewritten before any live files move;
+unexpected symlinks or nonregular marker files stop startup. The retention directory is created
+only after publishing its marker, so interrupted marker writes do not accumulate unused directories.
 The original directory is never removed automatically: it is the recoverable copy of the replaced
-state. To roll back, stop hrrdarr and move its `database.db*` files back.
+state. To roll back, stop every hrrdarr process using that database and keep it stopped throughout
+the replacement. Move the current live database **and all its existing `-wal`, `-shm` and
+`-journal` companions** to a separate recovery directory first. Then copy the retained original
+as one consistent set: `database.db` becomes the configured `HRRDARR_DATABASE_PATH` (default
+`hrrdarr.db`), and each retained `database.db-wal`, `database.db-shm` or `database.db-journal`
+becomes that configured path plus the matching suffix. For example, `/data/library.db` requires
+`database.db-wal` to become `/data/library.db-wal`. Leave absent original companions absent;
+never mix them with companions produced by the restored database. Retain both recovery copies
+until the rollback is verified, then restart hrrdarr. If an interrupted apply still has a pending
+directory, move that entire directory aside while stopped before restarting, so it cannot reapply
+the candidate over the rolled-back database. Leave the persistent restore lock file in place.
 
 The restored database contains its own policy rows, so a restored `folder` setting points where the
 source instance wrote backups; check it after restoring onto another host. The snapshot also

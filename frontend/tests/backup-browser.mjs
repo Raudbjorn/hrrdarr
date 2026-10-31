@@ -127,6 +127,92 @@ try{
  await pendingRegion.getByRole('button',{name:'Cancel pending restore',exact:true}).click();
  await until(pending,v=>v===null,'Upload restore cancelled');
 
+ // A transport/decoding failure cannot tell us whether the server published the restore.
+ // Exercise both staging APIs against the actual server, losing only their responses.
+ for(const scenario of [
+  {upload:false,committed:true,readFails:false,malformed:false},
+  {upload:true,committed:true,readFails:true,malformed:true},
+  {upload:false,committed:false,readFails:true,malformed:false},
+  {upload:false,committed:false,readFails:false,malformed:false},
+ ]){
+  const stagingPath=scenario.upload?'/api/v1/system/restore/upload':`/api/v1/system/backups/${byName(first).id}/restore`;
+  const stagingPattern=`**${stagingPath}`;
+  let writes=0;
+  await page.route(stagingPattern,async route=>{
+   assert.equal(route.request().method(),'POST');writes++;
+   if(scenario.committed)assert.equal((await route.fetch()).status(),202,'staging commits before its response is lost');
+   if(scenario.malformed)await route.fulfill({status:202,contentType:'application/json',body:'incomplete response'});
+   else await route.abort('failed');
+  });
+  const statusPattern='**/api/v1/system/restore';
+  if(scenario.readFails)await page.route(statusPattern,route=>route.request().method()==='GET'?route.abort('failed'):route.continue());
+  if(scenario.upload){
+   await fileInput.setInputFiles({name:'uncertain-backup.zip',mimeType:'application/zip',buffer:archiveBytes});
+   await panel.getByRole('button',{name:'Restore from file',exact:true}).click();
+  }else await table.getByRole('button',{name:`Restore ${first}`,exact:true}).click();
+  await panel.getByRole('alertdialog').getByRole('button',{name:'Confirm restore',exact:true}).click();
+  if(scenario.readFails){
+   await pendingRegion.getByRole('alert').filter({hasText:'Pending restore status could not be read:'}).waitFor();
+   await pendingRegion.getByRole('alert').filter({hasText:'Restore status is unknown.'}).waitFor();
+   assert.equal(await table.getByRole('button',{name:`Restore ${first}`,exact:true}).isDisabled(),true);
+   assert.equal(await fileInput.isDisabled(),true);
+   assert.equal(await panel.getByRole('button',{name:'Restore from file',exact:true}).isDisabled(),true);
+   await table.getByRole('button',{name:`Restore ${first}`,exact:true}).dispatchEvent('click');
+   assert.equal(await panel.getByRole('alertdialog').count(),0,'handler also refuses another uncertain restore');
+   assert.equal(writes,1);
+   assert.equal(!!(await pending()),scenario.committed,'persisted state is independent of the lost browser read');
+   assert.equal(await pendingRegion.getByRole('button',{name:'Cancel pending restore',exact:true}).isEnabled(),true);
+   await page.unroute(statusPattern);
+   if(scenario.committed){
+    await pendingRegion.getByRole('button',{name:'Check pending restore status',exact:true}).click();
+    await pendingRegion.getByRole('heading',{name:'Restore pending — applies on restart'}).waitFor();
+    assert.equal(await pendingRegion.getByText('Restore status is unknown.',{exact:false}).count(),0);
+   }
+  }else if(scenario.committed){
+   await pendingRegion.getByRole('heading',{name:'Restore pending — applies on restart'}).waitFor();
+  }else await panel.getByText('No pending restore was found. Review the archive before trying again.',{exact:true}).waitFor();
+  assert.equal(await panel.getByText('Restore was not staged:',{exact:false}).count(),0,'unknown response is never presented as definite failure');
+  assert.equal(!!(await pending()),scenario.committed);
+  await page.unroute(stagingPattern);
+  if(scenario.committed||scenario.readFails){
+   await pendingRegion.getByRole('button',{name:'Cancel pending restore',exact:true}).click();
+   await panel.getByText('Pending restore cancelled. The current database stays in use.',{exact:true}).waitFor();
+  }
+  assert.equal(await pending(),null);
+  await until(()=>table.getByRole('button',{name:`Restore ${first}`,exact:true}).isEnabled(),Boolean,'restore controls did not recover after reconciliation');
+ }
+
+ // Cancellation can also commit before its response is lost. Reconcile it rather than
+ // claiming a still-pending restore; if the read fails, retain uncertainty until explicitly checked.
+ for(const readFails of [false,true]){
+  await table.getByRole('button',{name:`Restore ${first}`,exact:true}).click();
+  await panel.getByRole('alertdialog').getByRole('button',{name:'Confirm restore',exact:true}).click();
+  await pendingRegion.getByRole('heading',{name:'Restore pending — applies on restart'}).waitFor();
+  const statusPattern='**/api/v1/system/restore';
+  await page.route(statusPattern,async route=>{
+   if(route.request().method()==='DELETE'){
+    assert.equal((await route.fetch()).status(),204);
+    await route.abort('failed');
+   }else if(readFails)await route.abort('failed');
+   else await route.continue();
+  });
+  await pendingRegion.getByRole('button',{name:'Cancel pending restore',exact:true}).click();
+  if(readFails){
+   await pendingRegion.getByRole('alert').filter({hasText:'Pending restore status could not be read:'}).waitFor();
+   await pendingRegion.getByRole('alert').filter({hasText:'Restore status is unknown.'}).waitFor();
+   assert.equal(await pendingRegion.getByRole('heading',{name:'Restore pending — applies on restart'}).count(),0,'stale pending record is not represented as confirmed');
+   assert.equal(await table.getByRole('button',{name:`Restore ${first}`,exact:true}).isDisabled(),true);
+   assert.equal(await pending(),null,'server cancellation committed despite lost response');
+   await page.unroute(statusPattern);
+   await pendingRegion.getByRole('button',{name:'Check pending restore status',exact:true}).click();
+  }
+  await panel.getByText('No pending restore was found. Review the archive before trying again.',{exact:true}).waitFor();
+  if(!readFails)await page.unroute(statusPattern);
+  assert.equal(await panel.getByText('Pending restore was not cancelled:',{exact:false}).count(),0);
+  assert.equal(await pending(),null);
+  await until(()=>table.getByRole('button',{name:`Restore ${first}`,exact:true}).isEnabled(),Boolean,'restore controls did not recover after cancellation reconciliation');
+ }
+
  // Settings: client and server validation, then a new folder receives the next backup.
  const folder=panel.getByLabel('Backup folder',{exact:true});
  await folder.fill('relative/backups');
@@ -158,5 +244,5 @@ try{
  await page.screenshot({path:join(artifacts,'backup-mobile.png'),fullPage:true});
  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'no horizontal overflow on mobile');
  assert.deepEqual(errors,[]);
- console.log(JSON.stringify({backup_browser:'passed',backups:[first,third],deleted:second}));
+ console.log(JSON.stringify({backup_browser:'passed',backups:[first,third],deleted:second,uncertain_staging_cases:4,uncertain_cancellation_cases:2}));
 }finally{await browser.close();}

@@ -914,9 +914,10 @@ async fn restore_refuses_corrupt_tampered_newer_and_traversal_inputs_without_liv
         );
         let (_, pending) = call(&a.origin(), "GET", "/api/v1/system/restore", None).await;
         assert_eq!(pending["pending"], Value::Null, "{label}: nothing staged");
+        // The permanent lock is ownership metadata, not leaked staging data.
         let leftovers: Vec<String> = names_in(&files.0)
             .into_iter()
-            .filter(|n| n.contains(".restore-"))
+            .filter(|n| n.contains(".restore-") && n != ".library.db.restore-lock")
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -939,7 +940,12 @@ async fn restore_refuses_corrupt_tampered_newer_and_traversal_inputs_without_liv
     )
     .await;
     assert_eq!(declared, 413);
-    assert!(names_in(&files.0).iter().all(|n| !n.contains(".restore-")));
+    // The stable lock intentionally survives; only unpublished restore data must be cleaned.
+    assert!(
+        names_in(&files.0)
+            .iter()
+            .all(|n| !n.contains(".restore-") || n == ".library.db.restore-lock")
+    );
     // The independently rebuilt archive is accepted, proving the cases above fail for the
     // tampering, not for the rebuild; it is cancelled explicitly.
     let (got, staged) = upload(&a.origin(), control, "application/zip").await;
@@ -1463,5 +1469,61 @@ async fn upgrade_publishes_an_update_backup_that_restores_and_remigrates() -> Re
     .await;
     assert_eq!(page["total"], 2);
     b.stop();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inventory_over_one_thousand_retains_pagination_and_id_operations() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let a = Instance::start(&files.db(), ApiLimits::default()).await;
+    let published =
+        backup::create_backup(&a.db, BackupType::Manual, BackupLimits::command()).await?;
+    let folder = files.0.join("Backups/manual");
+    let source = folder.join(&published.backup.name);
+    // Hard links keep this fixture small while exercising real directory enumeration and archives.
+    for n in 0..1002 {
+        std::fs::hard_link(&source, folder.join(old_name(2025, &format!("{n:08x}"))))?;
+        std::fs::write(folder.join(format!("foreign-{n}")), b"ignored")?;
+    }
+    let origin = a.origin();
+    let (status, first) = call(&origin, "GET", "/api/v1/system/backups?limit=100", None).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(
+        first["total"], 1003,
+        "foreign files cannot hide retained archives"
+    );
+    assert_eq!(first["items"][0]["id"], published.backup.id);
+    let (status, last) = call(
+        &origin,
+        "GET",
+        "/api/v1/system/backups?offset=1001&limit=100",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{last}");
+    assert_eq!(last["total"], 1003);
+    assert_eq!(last["items"].as_array().unwrap().len(), 2);
+    let id = last["items"][1]["id"].as_str().unwrap();
+    let path = format!("/api/v1/system/backups/{id}");
+    let (status, detail) = call(&origin, "GET", &path, None).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["backup"]["id"], id);
+    assert_eq!(download(&origin, id).await, std::fs::read(&source)?);
+    let (status, restore) = call(&origin, "POST", &format!("{path}/restore"), None).await;
+    assert_eq!(status, 202, "{restore}");
+    assert_eq!(restore["backup_id"], id);
+    assert_eq!(
+        call(&origin, "DELETE", "/api/v1/system/restore", None)
+            .await
+            .0,
+        204
+    );
+    assert_eq!(call(&origin, "DELETE", &path, None).await.0, 204);
+    assert_eq!(call(&origin, "GET", &path, None).await.0, 404);
+    assert!(
+        source.exists(),
+        "deleting one name preserves the original backup"
+    );
+    a.stop().await;
     Ok(())
 }

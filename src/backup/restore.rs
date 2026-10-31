@@ -5,6 +5,7 @@
 //! On-disk protocol next to `<dir>/<db>` (all private, same filesystem):
 //! - `.<db>.restore-staging-<uuid>/` work directory; removed on every failure.
 //! - `.<db>.restore-pending/{database.db,restore.json}` published by one directory rename.
+//! - `.<db>.restore-lock` is a persistent interprocess lock, never renamed or removed.
 //! - `.<db>.restore-pending/original` names the retention directory once moving has started,
 //!   so an interrupted apply resumes instead of creating a second original.
 //! - `.<db>.restore-original-<stamp>-<rand>/` the replaced database plus `restore-applied.json`.
@@ -331,6 +332,25 @@ impl Paths {
     fn pending(&self) -> PathBuf {
         self.dir.join(format!(".{}.restore-pending", self.base))
     }
+    fn lock(&self) -> io::Result<File> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        let file = options.open(self.dir.join(format!(".{}.restore-lock", self.base)))?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("restore lock is not a regular file"));
+        }
+        file.try_lock().map_err(io::Error::other)?;
+        // Keep this inode permanently: unlinking a released lock would let concurrent callers
+        // lock different inodes at the same path. The live database inode changes during apply.
+        Ok(file)
+    }
     fn unique(&self, kind: &str) -> PathBuf {
         let stamp = chrono::DateTime::from_timestamp(now(), 0)
             .map(|t| t.format("%Y%m%dT%H%M%SZ").to_string())
@@ -420,6 +440,7 @@ pub(crate) async fn stage(
     let paths = Paths::new(&db_path).map_err(|_| io_failure())?;
     let deadline = Instant::now() + limits.restore_budget;
     let _guard = RESTORE_LOCK.lock().await;
+    let _process_lock = paths.lock().map_err(|_| io_failure())?;
     let pending = paths.pending();
     if fs::symlink_metadata(&pending).is_ok() {
         return Err(already_pending());
@@ -493,6 +514,10 @@ pub(crate) async fn stage(
     let publish_to = pending.clone();
     let dir = paths.dir.clone();
     tokio::task::spawn_blocking(move || -> Result<(), Error> {
+        // Cancellation of the HTTP future must not release ownership or clean up the staging
+        // directory while this blocking publication is still running.
+        let _process_lock = _process_lock;
+        let mut staging = staging;
         // Any (even stray) companion files would be applied with the candidate; none may exist.
         for suffix in ["-wal", "-shm", "-journal"] {
             if fs::symlink_metadata(publish_from.join(format!("{DATABASE_NAME}{suffix}"))).is_ok() {
@@ -508,13 +533,11 @@ pub(crate) async fn stage(
             return Err(already_pending());
         }
         fs::rename(&publish_from, &publish_to).map_err(|_| already_pending())?;
+        staging.0 = None;
         sync_dir(&dir).map_err(|_| io_failure())
     })
     .await
     .map_err(|_| io_failure())??;
-    // Published: the staging directory now is the pending directory.
-    let mut staging = staging;
-    staging.0 = None;
     println!(
         "event=backup_restore_staged source={} schema_version={} backup_type={}",
         match record.source {
@@ -540,6 +563,7 @@ fn read_marker(path: &Path) -> io::Result<PendingRestore> {
 
 pub(crate) fn read_pending(db_path: &Path) -> Result<Option<PendingRestore>, Error> {
     let paths = Paths::new(db_path).map_err(|_| io_failure())?;
+    let _process_lock = paths.lock().map_err(|_| io_failure())?;
     match read_marker(&paths.pending().join("restore.json")) {
         Ok(record) => Ok(Some(record)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -554,6 +578,7 @@ pub(crate) fn read_pending(db_path: &Path) -> Result<Option<PendingRestore>, Err
 /// Explicit cancellation removes the staged candidate; live state is untouched.
 pub(crate) fn cancel_pending(db_path: &Path) -> Result<bool, Error> {
     let paths = Paths::new(db_path).map_err(|_| io_failure())?;
+    let _process_lock = paths.lock().map_err(|_| io_failure())?;
     let pending = paths.pending();
     match fs::symlink_metadata(&pending) {
         Ok(meta) if meta.is_dir() => {
@@ -619,6 +644,12 @@ fn quarantine(paths: &Paths, reason: &'static str) -> Result<RestoreOutcome, cra
 
 fn apply(db_path: &Path) -> Result<RestoreOutcome, crate::db::Error> {
     let paths = Paths::new(db_path)?;
+    // Lock before even looking for pending state. Another startup may temporarily have no
+    // live database, or may have just consumed pending state but not yet released ownership.
+    // This guard stays in the blocking task even if its async caller times out.
+    let _process_lock = paths
+        .lock()
+        .map_err(|e| format!("restore already owned or cannot be locked: {e}"))?;
     let pending = paths.pending();
     match fs::symlink_metadata(&pending) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RestoreOutcome::None),
@@ -628,7 +659,27 @@ fn apply(db_path: &Path) -> Result<RestoreOutcome, crate::db::Error> {
         }
         Ok(_) => {}
     }
-    let resumed = fs::read_to_string(pending.join("original")).ok();
+    let resumed = match fs::symlink_metadata(pending.join("original")) {
+        Ok(meta) if meta.is_file() => {
+            let mut name = String::new();
+            open_untrusted(&pending.join("original"))?
+                .take(MAX_MARKER_BYTES + 1)
+                .read_to_string(&mut name)?;
+            if name.len() as u64 > MAX_MARKER_BYTES {
+                return Err("pending restore original marker is too large".into());
+            }
+            let name = name.trim();
+            if name.contains(['/', '\\'])
+                || !name.starts_with(&format!(".{}.restore-original-", paths.base))
+            {
+                return Err("pending restore names an invalid original directory".into());
+            }
+            Some(name.to_owned())
+        }
+        Ok(_) => return Err("pending restore original marker is not a regular file".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
     let record = match read_marker(&pending.join("restore.json")) {
         Ok(record) => record,
         Err(_) if resumed.is_none() => return quarantine(&paths, "marker_invalid"),
@@ -660,32 +711,46 @@ fn apply(db_path: &Path) -> Result<RestoreOutcome, crate::db::Error> {
             );
         }
         let original = match &resumed {
-            Some(name) => {
-                let name = name.trim();
-                if name.contains('/')
-                    || !name.starts_with(&format!(".{}.restore-original-", paths.base))
-                {
-                    return Err("pending restore names an invalid original directory".into());
-                }
-                paths.dir.join(name)
-            }
+            Some(name) => paths.dir.join(name),
             None => {
+                // No original marker means no live files have moved. A crash may have left an
+                // empty/truncated unpublished marker; discard only a regular leaf, never follow
+                // a symlink or remove an unexpected directory.
+                let partial = pending.join("original.partial");
+                match fs::symlink_metadata(&partial) {
+                    Ok(meta) if meta.is_file() => fs::remove_file(&partial)?,
+                    Ok(_) => {
+                        return Err("pending restore partial marker is not a regular file".into());
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
                 let original = paths.unique("original");
-                private_dir(&original)?;
-                sync_dir(&paths.dir)?;
                 let name = original
                     .file_name()
                     .and_then(|n| n.to_str())
                     .ok_or("original directory name")?
                     .to_owned();
-                let mut file = create_private(&pending.join("original.partial"))?;
+                let mut file = create_private(&partial)?;
                 file.write_all(name.as_bytes())?;
                 file.sync_all()?;
-                fs::rename(pending.join("original.partial"), pending.join("original"))?;
+                fs::rename(partial, pending.join("original"))?;
                 sync_dir(&pending)?;
                 original
             }
         };
+        // Publish the marker before creating its directory, so repeated interrupted marker
+        // writes cannot accumulate unused originals. Resume also handles a published marker
+        // whose directory was not created yet, and refuses symlink/non-directory targets.
+        match private_dir(&original) {
+            Ok(()) => sync_dir(&paths.dir)?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::symlink_metadata(&original)?.is_dir() {
+                    return Err("pending restore original path is not a directory".into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
         // Retain the live database with every journal companion, then install the candidate.
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let from = paths.live(suffix);
@@ -744,6 +809,243 @@ pub async fn apply_pending_restore(db_path: &Path) -> Result<RestoreOutcome, cra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecoveryFixture(PathBuf);
+
+    impl RecoveryFixture {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("hrrdarr-recovery-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+        fn paths(&self) -> Paths {
+            Paths::new(&self.0.join("custom.db")).unwrap()
+        }
+        fn stage(&self) {
+            let paths = self.paths();
+            fs::create_dir(paths.pending()).unwrap();
+            // These are file-protocol tests: archive/database validation precedes publication.
+            let candidate = b"validated candidate";
+            fs::write(paths.pending().join(DATABASE_NAME), candidate).unwrap();
+            let record = PendingRestore {
+                source: RestoreSource::Upload,
+                backup_id: None,
+                backup_name: None,
+                backup_type: super::super::BackupType::Manual,
+                backup_created_at: 0,
+                schema_version: 1,
+                application_version: "test".into(),
+                staged_at: 0,
+                database_sha256: hex(
+                    ring::digest::digest(&ring::digest::SHA256, candidate).as_ref()
+                ),
+                database_bytes: candidate.len() as u64,
+                restart_required: true,
+            };
+            fs::write(
+                paths.pending().join("restore.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                fs::write(paths.live(suffix), format!("original{suffix}")).unwrap();
+            }
+        }
+        fn apply(&self) -> Result<RestoreOutcome, crate::db::Error> {
+            apply(&self.paths().live(""))
+        }
+        fn assert_applied(&self, original: &Path) {
+            assert_eq!(
+                fs::read(self.paths().live("")).unwrap(),
+                b"validated candidate"
+            );
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                assert_eq!(
+                    fs::read(original.join(format!("{DATABASE_NAME}{suffix}"))).unwrap(),
+                    format!("original{suffix}").as_bytes()
+                );
+                if !suffix.is_empty() {
+                    assert!(!self.paths().live(suffix).exists());
+                }
+            }
+            assert!(!self.paths().pending().exists());
+            assert!(original.join("restore-applied.json").is_file());
+            assert_eq!(self.apply().unwrap(), RestoreOutcome::None);
+        }
+    }
+    impl Drop for RecoveryFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unpublished_original_markers_resume_without_extra_retention_directories() {
+        for interrupted in [
+            "",
+            ".custom.db.restore-orig",
+            ".custom.db.restore-original-complete",
+        ] {
+            let fixture = RecoveryFixture::new();
+            fixture.stage();
+            fs::write(
+                fixture.paths().pending().join("original.partial"),
+                interrupted,
+            )
+            .unwrap();
+            let RestoreOutcome::Applied { original } = fixture.apply().unwrap() else {
+                panic!("not applied")
+            };
+            fixture.assert_applied(&original);
+            assert_eq!(
+                fs::read_dir(&fixture.0)
+                    .unwrap()
+                    .filter(|entry| entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".custom.db.restore-original-"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn published_original_marker_resumes_before_directory_creation() {
+        let fixture = RecoveryFixture::new();
+        fixture.stage();
+        let name = ".custom.db.restore-original-recorded";
+        fs::write(fixture.paths().pending().join("original"), name).unwrap();
+        let original = fixture.0.join(name);
+        assert!(!original.exists());
+        assert_eq!(
+            fixture.apply().unwrap(),
+            RestoreOutcome::Applied {
+                original: original.clone()
+            }
+        );
+        fixture.assert_applied(&original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_original_marker_types_preserve_live_and_candidate() {
+        for name in ["original.partial", "original"] {
+            for symlink in [false, true] {
+                let fixture = RecoveryFixture::new();
+                fixture.stage();
+                let marker = fixture.paths().pending().join(name);
+                let target = fixture.0.join("unrelated");
+                fs::write(&target, "keep me").unwrap();
+                if symlink {
+                    std::os::unix::fs::symlink(&target, &marker).unwrap();
+                } else {
+                    fs::create_dir(&marker).unwrap();
+                }
+                assert!(fixture.apply().is_err());
+                assert_eq!(fs::read(fixture.paths().live("")).unwrap(), b"original");
+                assert_eq!(
+                    fs::read(fixture.paths().pending().join(DATABASE_NAME)).unwrap(),
+                    b"validated candidate"
+                );
+                assert_eq!(fs::read(target).unwrap(), b"keep me");
+                assert!(fs::symlink_metadata(marker).is_ok());
+            }
+        }
+    }
+
+    // Invoked as a separate test process so the regression proves OS-level ownership.
+    #[test]
+    fn restore_lock_child_process() {
+        let Some(dir) = std::env::var_os("HRRDARR_TEST_RESTORE_LOCK_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let paths = Paths::new(&dir.join("custom.db")).unwrap();
+        let _lock = paths.lock().unwrap();
+        fs::write(dir.join("ready"), []).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("release").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not release test lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn concurrent_startup_is_refused_even_without_live_database_or_pending_marker() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fixture = RecoveryFixture::new();
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::restore::tests::restore_lock_child_process",
+                    "--nocapture",
+                ])
+                .env("HRRDARR_TEST_RESTORE_LOCK_DIR", &fixture.0)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.0.join("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "lock child exited early"
+            );
+            assert!(Instant::now() < deadline, "lock child did not become ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            fixture
+                .apply()
+                .unwrap_err()
+                .to_string()
+                .contains("restore already owned"),
+            "pending inspection is protected too"
+        );
+        assert!(read_pending(&fixture.paths().live("")).is_err());
+        assert!(cancel_pending(&fixture.paths().live("")).is_err());
+        fixture.stage();
+        let original = fixture.0.join(".custom.db.restore-original-retained");
+        fs::create_dir(&original).unwrap();
+        fs::write(
+            fixture.paths().pending().join("original"),
+            original.file_name().unwrap().as_encoded_bytes(),
+        )
+        .unwrap();
+        fs::rename(fixture.paths().live(""), original.join(DATABASE_NAME)).unwrap();
+        assert!(
+            fixture
+                .apply()
+                .unwrap_err()
+                .to_string()
+                .contains("restore already owned")
+        );
+        assert!(!fixture.paths().live("").exists());
+        assert_eq!(fs::read(original.join(DATABASE_NAME)).unwrap(), b"original");
+        assert!(fixture.paths().pending().join(DATABASE_NAME).is_file());
+        fs::write(fixture.0.join("release"), []).unwrap();
+        assert!(child.0.wait().unwrap().success());
+        assert_eq!(
+            fixture.apply().unwrap(),
+            RestoreOutcome::Applied {
+                original: original.clone()
+            }
+        );
+        fixture.assert_applied(&original);
+    }
 
     #[tokio::test]
     async fn streamed_uploads_stop_at_the_bound_without_a_declared_length() {
