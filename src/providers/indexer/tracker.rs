@@ -508,7 +508,7 @@ async fn fetch_rss(
                     extra,
                 ),
             );
-            let body = text_body(get(operation, &url, &params, &[]).await?)?;
+            let body = text_body(get(operation, &url, &params, &cookie_header(access)).await?)?;
             return cooldown(operation, parse_nzb_feed(&body, &base, t.domain));
         }
         TrackerKind::Iptorrents => {
@@ -614,17 +614,22 @@ fn nzb_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Result<
     }
     let published =
         feed::feed_date(&element_text(item, "pubDate").ok_or(IndexerError::InvalidResponse)?)?;
-    let enclosure = item
-        .children()
+    let mut enclosures = item.children().filter(|n| {
+        n.is_element()
+            && n.tag_name().name() == "enclosure"
+            && n.tag_name().namespace().is_none()
+            && n.attribute("url").is_some_and(|u| !u.trim().is_empty())
+            && !n
+                .attribute("type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("application/x-bittorrent"))
+    });
+    let enclosure = enclosures
+        .clone()
         .find(|n| {
-            n.is_element()
-                && n.tag_name().name() == "enclosure"
-                && n.tag_name().namespace().is_none()
-                && n.attribute("url").is_some_and(|u| !u.trim().is_empty())
-                && !n
-                    .attribute("type")
-                    .is_some_and(|t| t.eq_ignore_ascii_case("application/x-bittorrent"))
+            n.attribute("type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("application/x-nzb"))
         })
+        .or_else(|| enclosures.next())
         .ok_or(IndexerError::InvalidResponse)?;
     let url = base
         .join(enclosure.attribute("url").unwrap_or("").trim())
@@ -999,9 +1004,13 @@ fn parse_hdbits(
         .ok_or(IndexerError::InvalidResponse)?;
     rows_to_releases(rows.iter(), domain, |row| {
         let id = string(row, "id").ok_or(IndexerError::InvalidResponse)?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", &id)
+            .append_pair("passkey", passkey)
+            .finish();
         Ok(Row {
             kind: TrackerKind::Hdbits,
-            download_url: format!("{origin}/download.php?id={id}&passkey={passkey}"),
+            download_url: format!("{origin}/download.php?{query}"),
             info_url: Some(format!("{origin}/details.php?id={id}")),
             id,
             title: string(row, "name").ok_or(IndexerError::InvalidResponse)?,
@@ -1125,11 +1134,19 @@ fn parse_ptp(
                 )
             })
             .ok_or(IndexerError::InvalidResponse)?;
-        let download_url = format!(
-            "{origin}/torrents.php?action=download&id={id}&authkey={}&torrent_pass={}",
-            auth_key.as_deref().ok_or(IndexerError::InvalidResponse)?,
-            pass_key.as_deref().ok_or(IndexerError::InvalidResponse)?
-        );
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("action", "download")
+            .append_pair("id", &id)
+            .append_pair(
+                "authkey",
+                auth_key.as_deref().ok_or(IndexerError::InvalidResponse)?,
+            )
+            .append_pair(
+                "torrent_pass",
+                pass_key.as_deref().ok_or(IndexerError::InvalidResponse)?,
+            )
+            .finish();
+        let download_url = format!("{origin}/torrents.php?{query}");
         Ok(Row {
             kind: TrackerKind::Passthepopcorn,
             info_url: Some(format!(
@@ -1167,6 +1184,7 @@ fn parse_ptp(
             password: pass_key.as_deref(),
             ..IndexerAccess::default()
         },
+        None,
     );
     Ok((items, warnings))
 }
@@ -1322,6 +1340,21 @@ pub(super) async fn fetch(
     })
 }
 
+/// Only recognized protocol selectors are public; other feed parameters stay secret.
+pub(super) fn public_selector(kind: TrackerKind, name: &str, value: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match (kind, name) {
+        (TrackerKind::Nyaa, "page") => value == "rss",
+        (TrackerKind::Nyaa, "f") => matches!(value, "0" | "1" | "2"),
+        (TrackerKind::Nyaa, "c") => value
+            .split_once('_')
+            .is_some_and(|(category, subcategory)| digits(category) && digits(subcategory)),
+        (TrackerKind::Fanzub, "cat") => value == "anime",
+        (TrackerKind::Fanzub, "max") => digits(value),
+        _ => false,
+    }
+}
+
 /// One local page over the single fetched document, redacted of every credential value.
 pub(super) async fn raw_search(
     operation: &HttpOperation<'_>,
@@ -1336,7 +1369,11 @@ pub(super) async fn raw_search(
     let start = offset.min(total);
     let end = start.saturating_add(limit).min(total);
     items = items.drain(start as usize..end as usize).collect();
-    redact_secrets(&mut items, access);
+    redact_secrets(
+        &mut items,
+        access,
+        settings.tracker_parts().map(|(kind, _, _)| kind),
+    );
     Ok(RawIndexerPage {
         tolerates_item_warnings: true,
         warnings: if start == 0 {

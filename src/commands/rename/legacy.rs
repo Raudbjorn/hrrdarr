@@ -13,6 +13,25 @@ use super::*;
 const DEFAULT_LISTED: u16 = 25;
 const MAX_LISTED: u16 = 25;
 const MAX_SELECTED: usize = 25;
+/// Request deadlines cannot cancel a running filesystem probe. Keep its slot until the
+/// blocking closure exits, so repeated timed-out requests cannot fill the blocking pool.
+const MAX_ASSESSMENTS: usize = 4;
+static ASSESSMENTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_ASSESSMENTS);
+
+async fn blocking_assessment<T: Send + 'static>(
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let permit = ASSESSMENTS
+        .acquire()
+        .await
+        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "command_storage_error"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        probe()
+    })
+    .await
+    .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "command_storage_error"))
+}
 /// Exactly the class older binaries wrote; every other failed item is unrelated evidence.
 const LEGACY: &str = "i.state='failed' AND i.error_code='rollback_incomplete'";
 
@@ -281,9 +300,7 @@ async fn assess(c: &Connection, row: &libsql::Row) -> Result<(LegacyRenameItem, 
     }
     let journal = Arc::new(journal);
     let observed = journal.clone();
-    let (layout, error) = tokio::task::spawn_blocking(move || observe(&observed))
-        .await
-        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "command_storage_error"))?;
+    let (layout, error) = blocking_assessment(move || observe(&observed)).await?;
     let journal = Arc::into_inner(journal).ok_or_else(bad)?;
     item.layout = layout;
     item.layout_error = error.map(str::to_owned);
@@ -379,7 +396,7 @@ pub(super) async fn inventory(
     q: std::result::Result<Query<LegacyQuery>, QueryRejection>,
 ) -> Result<Json<ApiPage<LegacyRenameItem>>> {
     let q = q.map_err(|_| bad())?.0;
-    if !(1..=MAX_LISTED).contains(&q.limit) || q.offset > MAX_COMMANDS as u32 {
+    if !(1..=MAX_LISTED).contains(&q.limit) {
         return Err(bad());
     }
     let media = q.media_type.map(domain);
@@ -423,6 +440,10 @@ pub(super) async fn recover(
     if !distinct(&input.item_ids, MAX_SELECTED) {
         return Err(bad());
     }
+    // Keep owned imports/deletions from replacing a verified source between assessment
+    // and the transaction that retires or reopens its recovery evidence.
+    let _guard = crate::import::acquire_deletion_guard(&db, "legacy-recovery")
+        .map_err(|_| Error(StatusCode::CONFLICT, "import_busy"))?;
     let c = connection(&db).await?;
     let mut items = vec![];
     for id in &input.item_ids {
@@ -445,4 +466,89 @@ pub(super) async fn recover(
         dry_run: input.dry_run,
         items: report,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_assessments_keep_their_slots_until_blocking_work_exits() {
+        let mut releases = vec![];
+        for _ in 0..MAX_ASSESSMENTS {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (started, running) = tokio::sync::oneshot::channel();
+            let request = tokio::spawn(blocking_assessment(move || {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            tokio::time::timeout(Duration::from_secs(2), running)
+                .await
+                .unwrap()
+                .unwrap();
+            // Dropping a timed-out request cancels the await, but its filesystem closure
+            // is already running. Its capacity must not become available to a new request.
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            releases.push(release);
+        }
+        assert_eq!(ASSESSMENTS.available_permits(), 0);
+        let (started, mut running) = tokio::sync::oneshot::channel();
+        let next = tokio::spawn(blocking_assessment(move || started.send(()).unwrap()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut running)
+                .await
+                .is_err()
+        );
+        releases.pop().unwrap().send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        next.await.unwrap().unwrap();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        // Also prove all detached closures eventually return their slots.
+        let all = tokio::time::timeout(
+            Duration::from_secs(2),
+            ASSESSMENTS.acquire_many(MAX_ASSESSMENTS as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(all);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_an_active_file_effect_and_releases_its_guard_on_error() {
+        let path = std::env::temp_dir().join(format!("hrrdarr-legacy-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let db = Arc::new(Database::open_local(path.join("db")).await.unwrap());
+        let run = || {
+            recover(
+                State(db.clone()),
+                Ok(Query(Empty {})),
+                Ok(Json(LegacyRecoveryInput {
+                    dry_run: false,
+                    item_ids: vec![1],
+                })),
+            )
+        };
+        let guard = crate::import::acquire_deletion_guard(&db, "owned-replacement").unwrap();
+        let error = run().await.err().expect("replacement excludes recovery");
+        assert_eq!((error.0, error.1), (StatusCode::CONFLICT, "import_busy"));
+        drop(guard);
+        // With the permit free, admission reaches lookup. An error must release its guard.
+        let error = run().await.err().expect("fixture has no legacy item");
+        assert_eq!(
+            (error.0, error.1),
+            (StatusCode::NOT_FOUND, "rename_item_not_found")
+        );
+        let guard = crate::import::acquire_deletion_guard(&db, "next-replacement").unwrap();
+        drop(guard);
+        drop(db);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

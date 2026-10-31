@@ -805,3 +805,85 @@ async fn snapshot_provider_activation_supported_n_and_whole_catalog_unsupported(
         );
     }
 }
+
+#[tokio::test]
+async fn referenced_tracker_updates_preserve_required_scopes() {
+    let scratch = Scratch::new();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let (base, server) = server(db, "11").await;
+    for kind in [
+        "nyaa",
+        "fanzub",
+        "iptorrents",
+        "torrentleech",
+        "broadcasthenet",
+        "filelist",
+        "hdbits",
+        "passthepopcorn",
+        "torrentpotato",
+    ] {
+        let tv = !matches!(kind, "passthepopcorn" | "torrentpotato");
+        let movies = !matches!(kind, "fanzub" | "torrentleech" | "broadcasthenet");
+        let credentials = match kind {
+            "nyaa" | "fanzub" => Value::Null,
+            "iptorrents" => json!({"kind":"feed","cookie":"session=fixture"}),
+            "torrentleech" | "broadcasthenet" => json!({"kind":"api_key","api_key":"fixture"}),
+            _ => json!({"kind":"username_password","username":"fixture","password":"fixture"}),
+        };
+        let mut input = json!({"name":kind,"enabled":true,"priority":1,"settings":{"implementation":kind,"endpoint":"http://fixture.invalid/api","tv":if tv {json!({})} else {Value::Null},"movies":if movies {json!({})} else {Value::Null}},"credentials":credentials});
+        let (status, created) = request(&base, "POST", "/api/v1/providers", input.clone()).await;
+        assert_eq!(status, 201, "{kind}: {created}");
+        let id = created["id"].as_str().unwrap();
+        for domain in ["tv", "movies"] {
+            if (domain == "tv" && !tv) || (domain == "movies" && !movies) {
+                continue;
+            }
+            let mut reference = profile(domain);
+            reference["indexers"] = json!([{"kind":"provider","id":id}]);
+            let profile_path = format!("/api/v1/{domain}/release-profiles");
+            let (status, catalog) = request(&base, "GET", &profile_path, Value::Null).await;
+            assert_eq!(status, 200, "{catalog}");
+            let (status, response) = request(
+                &base,
+                "POST",
+                &profile_path,
+                json!({"revision":catalog["revision"],"profile":reference}),
+            )
+            .await;
+            assert_eq!(status, 201, "{kind}: {response}");
+        }
+        input["revision"] = json!(1);
+        input["enabled"] = json!(false);
+        input["credentials"] = match kind {
+            "nyaa" | "fanzub" | "iptorrents" => json!({"kind":"feed","cookie":"session=rotated"}),
+            "torrentleech" | "broadcasthenet" => json!({"kind":"api_key","api_key":"rotated"}),
+            _ => json!({"kind":"username_password","username":"fixture","password":"rotated"}),
+        };
+        input["settings"]["endpoint"] = json!("http://fixture.invalid/repaired");
+        let path = format!("/api/v1/providers/{id}");
+        let (status, updated) = request(&base, "PUT", &path, input.clone()).await;
+        assert_eq!(status, 200, "{kind}: {updated}");
+        input["revision"] = json!(2);
+        for domain in ["tv", "movies"] {
+            if (domain == "tv" && !tv) || (domain == "movies" && !movies) {
+                continue;
+            }
+            let mut removed = input.clone();
+            removed["settings"][domain] = Value::Null;
+            // Keep a valid scope shape so this exercises the reference guard, not shape validation.
+            if removed["settings"]["tv"].is_null() && removed["settings"]["movies"].is_null() {
+                continue;
+            }
+            let (status, rejected) = request(&base, "PUT", &path, removed).await;
+            assert_eq!(status, 409, "{kind}: {rejected}");
+            assert_eq!(rejected["error"]["code"], "provider_in_use");
+        }
+        assert_eq!(
+            request(&base, "DELETE", &format!("{path}?revision=2"), Value::Null)
+                .await
+                .0,
+            409
+        );
+    }
+    server.close().await;
+}

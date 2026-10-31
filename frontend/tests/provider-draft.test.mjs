@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseParameters,trackerCredentials,trackerDraft,trackerScope,TRACKERS,isTrackerImplementation,clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,mergeProviderPages,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
+import {eligibleInteractiveIndexer,parseParameters,trackerCredentials,trackerDraft,trackerScope,TRACKERS,isTrackerImplementation,clientAttemptLabel,eligibleDownloadClient,indexerOptions,indexerScope,isClientImplementation,isDownloadClient,isIndexer,matchesPendingProvider,mergeProviderPages,normalizeUrlBase,parseTransmissionEndpoint,protocolOf,transmissionEndpoint,transmissionPlacementConflict,transmissionPlacementProblem,transmissionRpcUrl,validTransmissionCategory,validTransmissionDirectory} from '../src/lib/provider-draft.ts';
 test('provider selections survive loading another page',()=>{
  const first={id:'indexer',revision:1,name:'Indexer',enabled:true,priority:1,has_credentials:true,settings:{implementation:'torznab',endpoint:'http://x',tv:{enable_automatic_search:true},movies:null}};
  const second={id:'client',revision:1,name:'Client',enabled:true,priority:1,has_credentials:true,settings:{implementation:'qbittorrent',endpoint:'http://x',tv:{category:'tv'},movies:null}};
@@ -236,4 +236,23 @@ test('tracker credentials are built from write-only fields only',()=>{
  assert.equal(parseParameters('a=1\nA=2'),null,'names are case-insensitively distinct');
  assert.equal(parseParameters(Array.from({length:17},(_,i)=>`p${i}=1`).join('\n')),null);
  assert.deepEqual(parseParameters(''),[]);
+});
+
+test('tracker feed editors preserve anonymous access and validate tracker-specific parameter names',()=>{
+ const secrets=(tvParameters='')=>({apiKey:'',username:'',password:'',cookie:'',tvParameters,movieParameters:''});
+ assert.equal(TRACKERS.fanzub.credential,'feed');
+ assert.deepEqual(trackerCredentials(TRACKERS.fanzub,secrets()),{credentials:null});
+ assert.deepEqual(trackerCredentials(TRACKERS.fanzub,secrets('cat=anime')),{credentials:{kind:'feed',tv_parameters:[{name:'cat',value:'anime'}],movie_parameters:[]}});
+ for(const kind of ['nyaa','fanzub'])assert.ok('problem' in trackerCredentials(TRACKERS[kind],secrets('48=')));
+ assert.deepEqual(trackerCredentials(TRACKERS.iptorrents,secrets('48=')),{credentials:{kind:'feed',tv_parameters:[{name:'48',value:''}],movie_parameters:[]}});
+});
+test('read-only release search offers enabled interactive tracker scopes and excludes feeds',()=>{
+ const provider=(implementation,tv={enable_interactive_search:true},movies=null,enabled=true)=>({enabled,settings:{implementation,tv,movies}});
+ for(const kind of ['nyaa','hdbits','torznab','newznab']){
+  assert.equal(eligibleInteractiveIndexer(provider(kind),'tv'),true);
+  assert.equal(eligibleInteractiveIndexer(provider(kind),'movies'),false);
+  assert.equal(eligibleInteractiveIndexer(provider(kind,{enable_interactive_search:false}),'tv'),false);
+  assert.equal(eligibleInteractiveIndexer(provider(kind,{},null,false),'tv'),false);
+ }
+ for(const kind of ['torrentrss','iptorrents','torrentleech','qbittorrent'])assert.equal(eligibleInteractiveIndexer(provider(kind,{}),'tv'),false);
 });

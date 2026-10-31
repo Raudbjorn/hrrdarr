@@ -20,12 +20,12 @@ export type IndexerImplementation='torznab'|'newznab'|'torrentrss'|TrackerImplem
 // Credential shape per tracker: nothing, a write-only feed bundle (cookie and query parameters), one API key,
 // or an account pair (user name plus passkey / API key).
 export type TrackerCredentialKind='none'|'feed'|'api_key'|'account';
-export type TrackerInfo={label:string;tv:boolean;movies:boolean;searchable:boolean;categorised:boolean;credential:TrackerCredentialKind;secretLabels:[string,string];hint:string;note:string};
+export type TrackerInfo={label:string;tv:boolean;movies:boolean;searchable:boolean;categorised:boolean;numericParameterNames?:boolean;credential:TrackerCredentialKind;secretLabels:[string,string];hint:string;note:string};
 // Mirrors the server's TrackerKind table; the server stays authoritative and rejects any mismatch.
 export const TRACKERS:Record<TrackerImplementation,TrackerInfo>={
  nyaa:{label:'Nyaa',tv:true,movies:true,searchable:true,categorised:false,credential:'feed',secretLabels:['',''],hint:'https://nyaa.si/',note:'RSS feed and text search. Optional feed parameters (for example c=1_2, f=0) override the defaults c=1_0 and f=1.'},
- fanzub:{label:'Fanzub (Usenet)',tv:true,movies:false,searchable:true,categorised:false,credential:'none',secretLabels:['',''],hint:'https://fanzub.com/rss',note:'Anime NZB feed and text search; pairs only with SABnzbd or NZBGet. TV only.'},
- iptorrents:{label:'IPTorrents',tv:true,movies:true,searchable:false,categorised:false,credential:'feed',secretLabels:['',''],hint:'https://iptorrents.com/t.rss',note:'RSS only. Put the account id (u), passkey (tp) and category numbers from your generated feed URL into the write-only feed parameters, one name=value per line (a bare category number is name=).'},
+ fanzub:{label:'Fanzub (Usenet)',tv:true,movies:false,searchable:true,categorised:false,credential:'feed',secretLabels:['',''],hint:'https://fanzub.com/rss',note:'Anime NZB feed and text search; pairs only with SABnzbd or NZBGet. TV only.'},
+ iptorrents:{label:'IPTorrents',tv:true,movies:true,searchable:false,categorised:false,numericParameterNames:true,credential:'feed',secretLabels:['',''],hint:'https://iptorrents.com/t.rss',note:'RSS only. Put the account id (u), passkey (tp) and category numbers from your generated feed URL into the write-only feed parameters, one name=value per line (a bare category number is name=).'},
  torrentleech:{label:'Torrentleech',tv:true,movies:false,searchable:false,categorised:false,credential:'api_key',secretLabels:['RSS key',''],hint:'https://rss.torrentleech.org',note:'RSS only. The RSS key is appended to the address as a path segment. TV only.'},
  broadcasthenet:{label:'BroadcastheNet',tv:true,movies:false,searchable:true,categorised:false,credential:'api_key',secretLabels:['API key',''],hint:'https://api.broadcasthe.net/',note:'JSON-RPC API with TVDB/TVRage/name search. TV only.'},
  filelist:{label:'FileList',tv:true,movies:true,searchable:true,categorised:true,credential:'account',secretLabels:['Username','Passkey'],hint:'https://filelist.io/api.php',note:'JSON API with IMDb or name search. Categories are FileList category ids.'},
@@ -50,6 +50,10 @@ export function indexerScope(provider:Provider|null,domain:MediaDomain):IndexerS
     return scope?{enable_rss:scope.enable_rss??true,enable_automatic_search:scope.enable_automatic_search??false,enable_interactive_search:scope.enable_interactive_search??false,download_client_id:null}:null;
   }
   return null;
+}
+export function eligibleInteractiveIndexer(provider:Provider,domain:MediaDomain):boolean {
+  const scope=indexerScope(provider,domain);
+  return provider.enabled&&isIndexer(provider)&&scope!==null&&scope.enable_interactive_search!==false;
 }
 export function indexerOptions(scope:TvIndexerScope|MovieIndexerScope|null|undefined) {
   return {enable_rss:scope?.enable_rss??true,enable_automatic_search:scope?.enable_automatic_search??true,enable_interactive_search:scope?.enable_interactive_search??true,download_client_id:scope?.download_client_id??null};
@@ -144,14 +148,14 @@ export function trackerScope(draft:TrackerDraft,info:TrackerInfo):{scope:Tracker
   return {scope:{enable_rss:draft.rss,enable_automatic_search:info.searchable?draft.automatic:false,enable_interactive_search:info.searchable?draft.interactive:false,minimum_seeders:minimumSeeders,categories}};
 }
 /** `name=value` per line (a bare `48` or `48=` is an empty value); null when a line is not a valid parameter. */
-export function parseParameters(text:string):IndexerParameter[]|null{
+export function parseParameters(text:string,allowNumericNames=false):IndexerParameter[]|null{
   const lines=text.split('\n').map(line=>line.trim()).filter(Boolean);
   if(lines.length>16)return null;
   const parameters:IndexerParameter[]=[];
   for(const line of lines){
     const at=line.indexOf('=');
     const name=at<0?line:line.slice(0,at).trim(),value=at<0?'':line.slice(at+1).trim();
-    if(!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)||value.length>1024||/[\u0000-\u001f\u007f]/.test(value)||parameters.some(item=>item.name.toLowerCase()===name.toLowerCase()))return null;
+    if(!(allowNumericNames?/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/:/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/).test(name)||value.length>1024||/[\u0000-\u001f\u007f]/.test(value)||parameters.some(item=>item.name.toLowerCase()===name.toLowerCase()))return null;
     parameters.push({name,value});
   }
   return parameters;
@@ -164,7 +168,7 @@ export function trackerCredentials(info:TrackerInfo,secrets:TrackerSecrets):{cre
     case 'api_key':return secrets.apiKey.trim()?{credentials:{kind:'api_key',api_key:secrets.apiKey.trim()}}:{problem:`${info.secretLabels[0]} is required.`};
     case 'account':return secrets.username.trim()&&secrets.password.trim()?{credentials:{kind:'username_password',username:secrets.username.trim(),password:secrets.password.trim()}}:{problem:`${info.secretLabels[0]} and ${info.secretLabels[1]} are required.`};
     case 'feed':{
-      const tv=parseParameters(secrets.tvParameters),movies=parseParameters(secrets.movieParameters),cookie=secrets.cookie.trim();
+      const tv=parseParameters(secrets.tvParameters,info.numericParameterNames),movies=parseParameters(secrets.movieParameters,info.numericParameterNames),cookie=secrets.cookie.trim();
       if(tv===null||movies===null)return {problem:'Feed parameters are name=value lines (at most 16, distinct names).'};
       if(cookie&&!/^[\u0020-\u007e]{1,4096}$/.test(cookie))return {problem:'The cookie must be printable ASCII.'};
       if(!cookie&&!tv.length&&!movies.length)return {credentials:null};

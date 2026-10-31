@@ -31,6 +31,8 @@ Nine tracker-specific indexers share one registry family, one settings shape (`T
 
 - One request per operation through the shared transport (SSRF policy, 1 MiB body cap, timeouts, redirects). Each tracker answers a single document that is paged locally; BTN and HDBits always request the same bounded 100-row document before filtering and local pagination.
 - Durable back-off: saved-provider search and RSS call `indexer_backoff::admit`; a 429 `Retry-After` is stored as `disabled_until` in `indexer_status`. The explicit test probe does not honour the cool-down but records its outcome.
+- Public Nyaa selectors (`page=rss`, numeric `c=<category>_<subcategory>`, `f=0/1/2`) and Fanzub selectors (`cat=anime`, numeric `max`) preserve release titles. Other feed parameters, cookies, API keys and passwords remain redacted.
+- Fanzub forwards its optional configured cookie on feed requests and prefers an NZB enclosure over other media. HDBits and PTP download credentials are encoded as query values.
 - Releases keep the passkey-carrying download locator private; the guid is `"{kind}:{id}"`. Categories map to the 5000 (TV) or 2000 (movie) root, 5070 for anime (Nyaa, Fanzub); BroadcastheNet resolution maps to 5030/5040/5045.
 - Malformed rows are dropped and counted as item warnings; an unusable document fails typed (`invalid_response`, `authentication`, `rate_limited`, ...).
 - Test, test-draft, bulk test, administration filters, health counts, release-profile indexer references and the `ProviderPanel` all treat trackers as indexers.

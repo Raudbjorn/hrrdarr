@@ -939,3 +939,53 @@ async fn rename_recovery_journals_and_legacy_incomplete_rollbacks_survive_prunin
         ("failed".into(), "rollback_incomplete".into(), 1)
     );
 }
+
+#[tokio::test]
+async fn nonpositive_batch_policy_preserves_history_receipts_and_targets() {
+    let f = fixture().await;
+    let history = seed(&f.c, "rescan_commands", "tv", 1, "cancelled", 1).await;
+    for domain in DOMAINS {
+        for _ in 0..2 {
+            let id = Uuid::new_v4().to_string();
+            f.c.execute("INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) VALUES(?,?,?,1,0,1,1,2)", params![id.clone(), domain, vec![0_u8; 32]]).await.unwrap();
+            f.c.execute("INSERT INTO wanted_search_receipt_targets(request_id,target_id,command_id) VALUES(?,1,?)", params![id, Uuid::new_v4().to_string()]).await.unwrap();
+        }
+    }
+    for batch_rows in [0, -1, i64::MIN] {
+        let invalid = Policy {
+            batch_rows,
+            ..policy(0, 0)
+        };
+        let error = housekeeping::prune(&f.db, &invalid, NOW).await.unwrap_err();
+        assert_eq!(error.to_string(), "invalid_housekeeping_policy");
+        assert!(exists(&f.c, "rescan_commands", &history).await);
+        assert_eq!(
+            scalar(&f.c, "SELECT count(*) FROM wanted_search_receipts").await,
+            4
+        );
+        assert_eq!(
+            scalar(&f.c, "SELECT count(*) FROM wanted_search_receipt_targets").await,
+            4
+        );
+    }
+    // A positive policy still prunes exactly its requested receipt batch per domain.
+    let valid = Policy {
+        batch_rows: 1,
+        max_batches: 1,
+        ..policy(0, 0)
+    };
+    let report = housekeeping::prune(&f.db, &valid, NOW).await.unwrap();
+    assert_eq!(report.failed_groups, 0);
+    for domain in DOMAINS {
+        assert_eq!(report.deleted_from("wanted_search_receipts", domain), 1);
+    }
+    assert_eq!(
+        scalar(&f.c, "SELECT count(*) FROM wanted_search_receipts").await,
+        2
+    );
+    assert_eq!(
+        scalar(&f.c, "SELECT count(*) FROM wanted_search_receipt_targets").await,
+        2
+    );
+    assert!(!exists(&f.c, "rescan_commands", &history).await);
+}

@@ -10,8 +10,10 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_REMOVALS: u64 = 10_000;
 // Keep the walk below the worker's 45 s step timeout.
 const RUN_SECONDS: u64 = 30;
-// The effect permit is held for one file operation; retry promptly after a collision.
-const BUSY_RETRY_SECONDS: i64 = 5;
+// An import can retain the effect permit for its entire multi-file transfer. Space the
+// three bounded attempts five minutes apart instead of exhausting them in ten seconds.
+// shortcut: ownership beyond ten minutes can still exhaust attempts; redesign waiting in #65.
+const BUSY_RETRY_SECONDS: i64 = 5 * 60;
 /// Returns the retention applied to one bin. A shared bin has no per-entry domain marker, so the
 /// longest retention wins; zero disables cleanup for the shared path.
 fn effective_cleanup_days(own: i64, other: Option<i64>, shared: bool) -> Option<i64> {
@@ -446,5 +448,71 @@ pub(super) async fn run(db: &Arc<Database>, command: RecycleBinCleanupCommand) -
             // A missing or unsafe bin does not heal by retrying; Health reports it (hc.036).
             settle(db, id, &format!("UPDATE recycle_bin_cleanup_commands SET status='failed',completed_at=?,error_code=?,bin_path=?,cleanup_days=? {running}"), params![now()?, code, bin, days, id.to_string()]).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn busy_file_effect_defers_cleanup_then_released_permit_allows_retry() {
+        let root = std::env::temp_dir().join(format!("hrrdarr-cleanup-busy-{}", Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let db = Arc::new(Database::open_local(root.join("db")).await.unwrap());
+        let c = db.connect().await.unwrap();
+        c.execute(
+            "UPDATE recycle_bin_settings SET path=?,cleanup_days=7 WHERE media_type='tv'",
+            [bin.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        let timestamp = now().unwrap();
+        let command = enqueue(
+            &c,
+            MediaDomain::Tv,
+            CommandPriority::Normal,
+            "manual",
+            timestamp,
+        )
+        .await
+        .unwrap();
+        let guard = crate::import::acquire_deletion_guard(&db, "ongoing-import").unwrap();
+        run(&db, claim(&c, command.id, timestamp).await.unwrap())
+            .await
+            .unwrap();
+        let waiting = read(&c, command.id).await.unwrap();
+        assert!(matches!(waiting.status, CommandStatus::RetryWait));
+        assert_eq!(waiting.error_code.as_deref(), Some("import_busy"));
+        assert_eq!(waiting.attempts, 1);
+        assert!(waiting.completed_at.is_none());
+        assert!(
+            waiting.next_attempt_at >= timestamp + 300,
+            "an ongoing transfer must not consume all three attempts in ten seconds"
+        );
+        assert!(waiting.next_attempt_at <= now().unwrap() + 300);
+        drop(guard);
+        // Drive the claim at its persisted readiness time without a five-minute sleep.
+        // This verifies the retry transition and real cleanup, not wall-clock scheduling.
+        run(
+            &db,
+            claim(&c, command.id, waiting.next_attempt_at)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let done = read(&c, command.id).await.unwrap();
+        assert!(matches!(done.status, CommandStatus::Succeeded));
+        assert!(matches!(
+            done.outcome,
+            Some(RecycleBinCleanupOutcome::Cleaned)
+        ));
+        assert_eq!(done.attempts, 2);
+        assert_eq!(done.files_removed, 0);
+        drop(c);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

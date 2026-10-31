@@ -257,6 +257,14 @@ async fn receipt_batch(c: &Connection, domain: &str, policy: &Policy, now: i64) 
 /// Runs one bounded pass over every table and domain. A failing group is reported and does
 /// not stop the others. Rerunning deletes only what remains eligible.
 pub async fn prune(db: &Database, policy: &Policy, now: i64) -> Result<Report> {
+    // SQLite treats a negative LIMIT as unbounded. Reject invalid policies before
+    // either command history or admission receipts can be changed.
+    if policy.batch_rows <= 0 {
+        return Err(Error(
+            StatusCode::BAD_REQUEST,
+            "invalid_housekeeping_policy",
+        ));
+    }
     let c = connection(db).await?;
     let started = Instant::now();
     let mut report = Report::default();

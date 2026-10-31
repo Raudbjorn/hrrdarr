@@ -376,7 +376,8 @@ async fn copy_collections(conn: &Connection) -> Result<Mapped, Error> {
     Ok(mapped)
 }
 
-/// A system event is rendered for the scope that matched at fan-out; TV wins when both do.
+/// Domain events retain their recorded scope. Terminal system deliveries use current scopes only
+/// as a historical display projection; pending system deliveries must be refused below.
 const DELIVERY_DOMAIN: &str = "CASE WHEN e.scope IN ('tv','movies') THEN e.scope ELSE COALESCE(\
     (SELECT s.media_type FROM old.notification_scopes s WHERE s.notification_id=d.notification_id \
       AND CASE e.kind WHEN 'health_issue' THEN s.on_health_issue WHEN 'health_restored' THEN s.on_health_restored \
@@ -384,6 +385,12 @@ const DELIVERY_DOMAIN: &str = "CASE WHEN e.scope IN ('tv','movies') THEN e.scope
     (SELECT s.media_type FROM old.notification_scopes s WHERE s.notification_id=d.notification_id ORDER BY s.media_type DESC LIMIT 1)) END";
 
 async fn copy_deliveries(conn: &Connection) -> Result<u64, Error> {
+    // The legacy row did not record its fan-out domain. Even one current scope cannot prove
+    // which scope existed when it was queued, so never resume a guessed system delivery.
+    let ambiguous = scalar(conn, "SELECT count(*) FROM old.notification_deliveries d JOIN old.notification_events e ON e.sequence=d.event_sequence WHERE d.state='pending' AND e.scope='system'").await?;
+    if ambiguous > 0 {
+        return Err(format!("{ambiguous} pending system notification deliveries have no recorded fan-out domain; conversion cannot safely resume them; no data was changed").into());
+    }
     let unassignable = scalar(
         conn,
         &format!(
@@ -484,31 +491,76 @@ async fn check(conn: &Connection, schema: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn reject_in_use(source: &Path) -> Result<(), Error> {
-    let meta = std::fs::symlink_metadata(source).map_err(|e| format!("cannot read source: {e}"))?;
-    if !meta.is_file() {
+/// Use the same advisory ownership lock as Database::open_local, without opening SQLite or
+/// recovering journals on the source. The caller retains this descriptor through publication.
+pub(super) fn lock_source(source: &Path) -> Result<std::fs::File, Error> {
+    let file = std::fs::File::from(rustix::fs::open(
+        source,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
         return Err("source must be a regular database file".into());
     }
-    let mut wal = source.as_os_str().to_owned();
-    wal.push("-wal");
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-        return Err("source has uncheckpointed write-ahead log data; stop the pre-merge instance cleanly and retry".into());
+    file.try_lock()
+        .map_err(|e| format!("source database already owned or cannot be locked: {e}"))?;
+    for (suffix, label) in [
+        ("-wal", "write-ahead log"),
+        ("-journal", "rollback journal"),
+    ] {
+        let mut path = source.as_os_str().to_owned();
+        path.push(suffix);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() == 0 => {}
+            Ok(_) => return Err(format!("source has nonempty or unsafe {label} data; stop the pre-merge instance cleanly and retry").into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect source {label}: {error}").into()),
+        }
     }
+    Ok(file)
+}
+
+/// The early destination check is only a diagnostic; publication itself must exclude races.
+pub(super) fn publish(built: &Path, destination: &Path) -> Result<(), Error> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        built,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
     Ok(())
 }
 
-async fn convert_in(source: &Path, work: &Path) -> Result<(PathBuf, ConversionReport), Error> {
+async fn convert_in(
+    source: &std::fs::File,
+    work: &Path,
+) -> Result<(PathBuf, ConversionReport), Error> {
     let copy = work.join("source.db");
     let target = work.join("converted.db");
-    let (from, to) = (source.to_path_buf(), copy.clone());
-    tokio::task::spawn_blocking(move || std::fs::copy(from, to)).await??;
+    // Clone the locked descriptor, not its pathname: copying cannot switch to an unlocked inode.
+    // A cancelled caller also leaves the ownership lock held until this blocking copy completes.
+    let (mut from, to) = (source.try_clone()?, copy.clone());
+    tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut to = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        std::io::copy(&mut from, &mut to)
+    })
+    .await??;
     let source_version = replay_to_premerge_head(&copy).await?;
     let db = Database::open_local(&target).await?;
     let conn = db.connect().await?;
     conn.execute("PRAGMA foreign_keys = OFF", ()).await?;
     conn.execute(
         "ATTACH DATABASE ?1 AS old",
-        [copy.to_string_lossy().into_owned()],
+        [copy
+            .to_str()
+            .ok_or("conversion work directory must have a UTF-8 path")?],
     )
     .await?;
     check(&conn, "old").await?;
@@ -593,7 +645,7 @@ async fn convert_in(source: &Path, work: &Path) -> Result<(PathBuf, ConversionRe
 }
 
 /// Convert the cleanly stopped pre-merge PR #32 database at `source` into a new database at
-/// `destination`. Never overwrites, never modifies `source`, and leaves no destination on failure.
+/// `destination`. Never overwrites, never modifies `source`, and never publishes a partial destination.
 pub async fn convert_premerge_pr32(
     source: &Path,
     destination: &Path,
@@ -601,7 +653,7 @@ pub async fn convert_premerge_pr32(
     if std::fs::symlink_metadata(destination).is_ok() {
         return Err("destination already exists; conversion never overwrites a database".into());
     }
-    reject_in_use(source)?;
+    let source_owner = lock_source(source)?;
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -620,7 +672,7 @@ pub async fn convert_premerge_pr32(
     })
     .await??;
     let result = async {
-        let (built, report) = convert_in(source, &work).await?;
+        let (built, report) = convert_in(&source_owner, &work).await?;
         let mut wal = built.as_os_str().to_owned();
         wal.push("-wal");
         if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
@@ -628,7 +680,7 @@ pub async fn convert_premerge_pr32(
         }
         // A converted database must open under the normal runner, with the current history intact.
         drop(Database::open_local(&built).await?);
-        std::fs::rename(&built, destination)?;
+        publish(&built, destination)?;
         Ok::<_, Error>(report)
     }
     .await;

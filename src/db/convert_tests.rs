@@ -114,22 +114,23 @@ async fn premerge(path: &Path, upto: usize) -> Result<libsql::Database, Error> {
 const NOTIFY_A: &str = "00000000-0000-4000-8000-00000000000a";
 const NOTIFY_B: &str = "00000000-0000-4000-8000-00000000000b";
 
-/// Notifications exist from the first divergent entry on. A: both scopes want health events (TV wins
-/// for system events); B: movies only. Delivery states cover every outcome.
+/// Pending deliveries use recorded event domains; system events are terminal because their
+/// historical fan-out domain is unavailable. Delivery states still cover every outcome.
 async fn populate_notifications(c: &Connection) -> Result<(), Error> {
     c.execute_batch(&format!(
         "INSERT INTO notifications(id,name,implementation,settings_json,created_at,updated_at) VALUES('{NOTIFY_A}','A','webhook','{{}}',1,1),('{NOTIFY_B}','B','webhook','{{}}',1,1);
          INSERT INTO notification_scopes(notification_id,media_type,on_health_issue,on_add) VALUES('{NOTIFY_A}','tv',1,0),('{NOTIFY_A}','movies',1,1),('{NOTIFY_B}','movies',0,0);
          UPDATE notification_scopes SET on_application_update=1 WHERE notification_id='{NOTIFY_B}';
          INSERT INTO notification_events(sequence,kind,scope,subject_id,payload_json,created_at) VALUES
-          (1,'add','movies',1,'{{}}',1),(2,'health_issue','system',NULL,'{{}}',2),(3,'application_update','system',NULL,'{{}}',3),(4,'add','movies',1,'{{}}',4);
+          (1,'add','movies',1,'{{}}',1),(2,'health_issue','tv',NULL,'{{}}',2),(3,'application_update','movies',NULL,'{{}}',3),(4,'add','movies',1,'{{}}',4),
+          (5,'health_issue','system',NULL,'{{}}',2),(6,'application_update','system',NULL,'{{}}',3);
          INSERT INTO notification_deliveries(event_sequence,notification_id,state,attempts,next_attempt_at,lease_until,last_error,created_at,completed_at) VALUES
           (1,'{NOTIFY_A}','pending',2,10,20,NULL,1,NULL),
           (2,'{NOTIFY_A}','pending',0,11,0,NULL,2,NULL),
           (3,'{NOTIFY_B}','pending',1,12,99,'http_500',3,NULL),
-          (2,'{NOTIFY_B}','delivered',1,13,0,NULL,2,5),
+          (5,'{NOTIFY_B}','delivered',1,13,0,NULL,2,5),
           (1,'{NOTIFY_B}','failed',16,14,0,'http_404',1,6),
-          (3,'{NOTIFY_A}','delivered',1,15,0,NULL,3,7);
+          (6,'{NOTIFY_A}','delivered',1,15,0,NULL,3,7);
          INSERT INTO notification_deliveries(event_sequence,notification_id,next_attempt_at,created_at) VALUES(4,'{NOTIFY_B}',1,1);
          DELETE FROM notification_deliveries WHERE id=7;"
     ))
@@ -416,10 +417,11 @@ async fn full_history_converts_populated_state_without_touching_the_source() -> 
     assert_eq!(count(&c, "SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=102 AND local_edit=1 AND revision=4").await?, 1);
     assert_eq!(count(&c, "SELECT count(*) FROM snapshot_imports WHERE application='radarr' AND collection_version=1 AND provider_authority_version=0").await?, 1);
 
-    // Notifications: pending stays pending, nothing is marked delivered, no event was invented.
+    // Notifications: the fixture now includes two separate terminal system events; pending
+    // deliveries retain recorded domains. Nothing is marked delivered or invented by conversion.
     assert_eq!(
         count(&c, "SELECT count(*) FROM notification_events").await?,
-        4
+        6
     );
     assert_eq!(
         count(&c, "SELECT count(*) FROM notification_deliveries").await?,
@@ -432,7 +434,7 @@ async fn full_history_converts_populated_state_without_touching_the_source() -> 
     assert_eq!(
         text(&c, &delivery(2, "media_type")).await?,
         "tv",
-        "TV wins when both scopes match"
+        "the pending delivery retains its recorded event scope"
     );
     assert_eq!(text(&c, &delivery(3, "media_type")).await?, "movies");
     assert_eq!(text(&c, &delivery(4, "media_type")).await?, "movies");
@@ -628,7 +630,8 @@ async fn unrecognized_state_is_refused_before_anything_is_written() -> Result<()
                     Ok(())
                 })
             },
-            "no scope",
+            // Pending system deliveries are ambiguous even before checking current scopes.
+            "no recorded fan-out domain",
         ),
     ];
     for (label, tamper, expected) in cases {
@@ -678,5 +681,108 @@ async fn unrecognized_state_is_refused_before_anything_is_written() -> Result<()
             .contains("never overwrites")
     );
     assert_eq!(std::fs::read(s.file("new.db"))?, b"occupied");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_system_deliveries_are_refused_regardless_of_current_scopes() -> Result<(), Error> {
+    for scopes in ["'tv'", "'movies'", "'tv','movies'"] {
+        let s = Scratch::new();
+        let source = s.file("old.db");
+        let raw = premerge(&source, 76).await?;
+        let c = raw.connect()?;
+        populate_notifications(&c).await?;
+        // Simulate scope changes after fan-out: neither one scope nor two establish its domain.
+        c.execute_batch(&format!("UPDATE notification_events SET scope='system' WHERE sequence=2;
+            DELETE FROM notification_scopes WHERE notification_id='{NOTIFY_A}' AND media_type NOT IN ({scopes});")).await?;
+        drop((c, raw));
+        let before = file_digest(&source).await?;
+        let error = convert_premerge_pr32(&source, &s.file("new.db"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no recorded fan-out domain"),
+            "{error}"
+        );
+        assert_eq!(file_digest(&source).await?, before);
+        assert_clean(&s, &["old.db"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_ownership_excludes_conversion_and_application_opens() -> Result<(), Error> {
+    let s = Scratch::new();
+    let source = s.file("old.db");
+    drop(premerge(&source, 76).await?);
+    let before = file_digest(&source).await?;
+    let owner = super::convert::lock_source(&source)?;
+    let error = Database::open_local(&source)
+        .await
+        .err()
+        .ok_or("application took owned source")?;
+    assert!(error.to_string().contains("already owned"), "{error}");
+    let error = convert_premerge_pr32(&source, &s.file("new.db"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already owned"), "{error}");
+    assert_eq!(file_digest(&source).await?, before);
+    assert_clean(&s, &["old.db"]);
+    drop(owner);
+    // Ownership is released on refusal/completion; an offline source can then convert normally.
+    convert_premerge_pr32(&source, &s.file("new.db")).await?;
+    assert_eq!(file_digest(&source).await?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_journal_is_refused_without_recovery_or_copy() -> Result<(), Error> {
+    let s = Scratch::new();
+    let source = s.file("old.db");
+    drop(premerge(&source, 76).await?);
+    let before = file_digest(&source).await?;
+    let journal = s.file("old.db-journal");
+    std::fs::write(&journal, b"unrecovered pages")?;
+    let error = convert_premerge_pr32(&source, &s.file("new.db"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("rollback journal"), "{error}");
+    assert_eq!(std::fs::read(&journal)?, b"unrecovered pages");
+    assert_eq!(file_digest(&source).await?, before);
+    assert_clean(&s, &["old.db", "old.db-journal"]);
+    std::fs::remove_file(&journal)?;
+    std::fs::create_dir(&journal)?;
+    assert!(
+        convert_premerge_pr32(&source, &s.file("new.db"))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn publication_never_replaces_a_destination_created_after_preflight() -> Result<(), Error> {
+    let s = Scratch::new();
+    let built = s.file("built.db");
+    let destination = s.file("new.db");
+    std::fs::write(&built, b"converted")?;
+    assert!(!destination.exists());
+    // The destination appears after the converter's initial existence check.
+    std::fs::write(&destination, b"another database")?;
+    assert!(super::convert::publish(&built, &destination).is_err());
+    assert_eq!(std::fs::read(&destination)?, b"another database");
+    assert_eq!(std::fs::read(&built)?, b"converted");
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&destination)?;
+        std::os::unix::fs::symlink(s.file("missing.db"), &destination)?;
+        assert!(super::convert::publish(&built, &destination).is_err());
+        assert!(
+            std::fs::symlink_metadata(&destination)?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!s.file("missing.db").exists());
+    }
     Ok(())
 }

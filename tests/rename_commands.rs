@@ -1197,3 +1197,51 @@ async fn legacy_failed_rollback_journals_reopen_only_on_explicit_request() -> R 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn legacy_inventory_can_reach_items_beyond_command_capacity() -> R {
+    let (_lock, _s, _db, c, api) = setup().await?;
+    for batch in 0..2 {
+        let id = uuid::Uuid::new_v4().to_string();
+        c.execute("INSERT INTO rename_commands(id,name,media_type,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'rename_series','tv',0,'queued',0,0,0)", [id.as_str()]).await?;
+        // Historical journals can outnumber active commands. Invalid identity evidence
+        // remains inventory-visible without requiring 1100 real filesystem fixtures.
+        c.execute("WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM n WHERE value<550) INSERT INTO rename_items(id,command_id,kind,series_id,file_id,old_path,new_path,identity_json,state,error_code) SELECT ?+value,?,'file',1,?+value,'/old/'||value,'/new/'||value,'{}','failed','rollback_incomplete' FROM n", params![batch*550, id.clone(), batch*550]).await?;
+        c.execute(
+            "UPDATE rename_commands SET status='failed',completed_at=1,error_code='items_failed',items_failed=550 WHERE id=?",
+            [id.as_str()],
+        )
+        .await?;
+    }
+    for offset in [1025, 1050, 1075] {
+        let page = api
+            .ok(
+                "GET",
+                &format!("/api/v1/rename/legacy-recovery?limit=25&offset={offset}"),
+                None,
+                200,
+            )
+            .await;
+        assert_eq!(page["total"], 1100);
+        assert_eq!(page["offset"], offset);
+        let ids: Vec<i64> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["item_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, ((offset + 1)..=(offset + 25)).collect::<Vec<_>>());
+    }
+    let page = api
+        .ok(
+            "GET",
+            "/api/v1/rename/legacy-recovery?offset=1100",
+            None,
+            200,
+        )
+        .await;
+    assert!(page["items"].as_array().unwrap().is_empty());
+    api.ok("GET", "/api/v1/rename/legacy-recovery?limit=26", None, 400)
+        .await;
+    Ok(())
+}

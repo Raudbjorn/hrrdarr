@@ -664,6 +664,12 @@ where
                 children,
             });
         }
+        // The bounded sweep may leave this UUID behind; no retained children remain to replay.
+        tx.execute(
+            "DELETE FROM wanted_search_receipts WHERE request_id=? AND expires_at<=?",
+            params![request_id.to_string(), timestamp],
+        )
+        .await?;
         preflight(&tx, client, source, mode).await?;
         let mut ids = select(&*tx, timestamp).await?;
         ids.sort_unstable();

@@ -373,6 +373,23 @@ fn hdbits_response_status_and_rows() {
         item.download_url,
         "https://hdb.example/download.php?id=9001&passkey=PRIVATE_PASSKEY"
     );
+    let special = "pass&extra=wrong#fragment +%é";
+    let (encoded, _) = parse_hdbits(
+        body.as_bytes(),
+        MediaDomain::Movies,
+        "https://hdb.example",
+        special,
+    )
+    .unwrap();
+    let locator = url::Url::parse(&encoded[0].download_url).unwrap();
+    assert!(locator.fragment().is_none());
+    assert_eq!(
+        locator.query_pairs().collect::<Vec<_>>(),
+        vec![
+            ("id".into(), "9001".into()),
+            ("passkey".into(), special.into())
+        ]
+    );
     assert_eq!(item.facts.torrent.as_ref().unwrap().internal, Some(true));
     assert_eq!(item.facts.scene, Some(false));
     assert_eq!(
@@ -487,7 +504,7 @@ fn fanzub_feed_yields_usenet_releases() {
     let base = url::Url::parse("https://fanzub.example/rss").unwrap();
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Fanzub</title>
       <item><title>[Group] Some Anime - 07 [720p]</title><link>https://fanzub.example/browse/771</link><guid isPermaLink="true">https://fanzub.example/browse/771</guid>
-        <pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><enclosure url="https://fanzub.example/nzb/771.nzb?x=1" length="367001600" type="application/x-nzb"/></item>
+        <pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><enclosure url="https://fanzub.example/cover.jpg" length="123" type="image/jpeg"/><enclosure url="https://fanzub.example/nzb/771.nzb?x=1" length="367001600" type="application/x-nzb"/></item>
       <item><title>No Enclosure</title><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate></item>
       <item><title>Torrent Only</title><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><enclosure url="https://fanzub.example/t.torrent" type="application/x-bittorrent" length="5"/></item>
     </channel></rss>"#;
@@ -501,6 +518,13 @@ fn fanzub_feed_yields_usenet_releases() {
         "an NZB release is not a torrent"
     );
     assert_eq!(item.download_url, "https://fanzub.example/nzb/771.nzb?x=1");
+    let fallback = xml.replace("application/x-nzb", "application/octet-stream");
+    let (fallback_items, _) = parse_nzb_feed(&fallback, &base, MediaDomain::Tv).unwrap();
+    assert_eq!(
+        fallback_items[0].download_url,
+        "https://fanzub.example/cover.jpg"
+    );
+    assert_eq!(fallback_items[0].metadata.size_bytes, Some(123));
     assert_eq!(
         item.facts.info_url.as_deref(),
         Some("https://fanzub.example/browse/771")
@@ -706,4 +730,83 @@ fn ptp_response_credentials_are_redacted_from_release_and_group_titles() {
                 .contains("authkey=RESPONSE_AUTH&torrent_pass=RESPONSE_PASS")
         );
     }
+}
+
+#[test]
+fn tracker_public_selectors_do_not_disable_secret_redaction() {
+    use crate::providers::IndexerParameter;
+    let title =
+        "Harbor.S01E02.1080p.1_2.rss.anime.100.API_SECRET.COOKIE_SECRET.PASS_SECRET.PARAM_SECRET";
+    let xml = format!(
+        r#"<rss><channel><item><title>{title}</title><pubDate>Mon, 01 Jan 2024 12:00:00 +0000</pubDate><enclosure url="https://fanzub.example/file.nzb" type="application/x-nzb"/></item></channel></rss>"#
+    );
+    for (kind, name, value, public) in [
+        (Some(TrackerKind::Nyaa), "f", "0", true),
+        (Some(TrackerKind::Nyaa), "c", "1_2", true),
+        (Some(TrackerKind::Nyaa), "page", "rss", true),
+        (Some(TrackerKind::Fanzub), "cat", "anime", true),
+        (Some(TrackerKind::Fanzub), "max", "100", true),
+        (Some(TrackerKind::Nyaa), "apikey", "0", false),
+        (Some(TrackerKind::Nyaa), "f", "PARAM_SECRET", false),
+        (Some(TrackerKind::Iptorrents), "f", "0", false),
+        (None, "f", "0", false),
+    ] {
+        let parameters = [
+            IndexerParameter {
+                name: name.into(),
+                value: value.into(),
+            },
+            IndexerParameter {
+                name: "token".into(),
+                value: "PARAM_SECRET".into(),
+            },
+        ];
+        let access = IndexerAccess {
+            api_key: Some("API_SECRET"),
+            cookie: Some("pass=COOKIE_SECRET"),
+            password: Some("PASS_SECRET"),
+            tv_parameters: &parameters,
+            ..IndexerAccess::default()
+        };
+        let (mut items, _) = parse_nzb_feed(
+            &xml,
+            &url::Url::parse("https://fanzub.example").unwrap(),
+            MediaDomain::Tv,
+        )
+        .unwrap();
+        redact_secrets(&mut items, &access, kind);
+        let actual = items[0].metadata.title.as_ref().unwrap();
+        let mut expected = title.to_string();
+        for secret in ["API_SECRET", "COOKIE_SECRET", "PASS_SECRET", "PARAM_SECRET"] {
+            expected = expected.replace(secret, "[redacted]");
+        }
+        if !public {
+            expected = expected.replace(value, "[redacted]");
+        }
+        assert_eq!(actual, &expected, "{name}={value}");
+    }
+}
+
+#[test]
+fn ptp_download_credentials_are_query_values() {
+    let auth = "auth&extra=wrong#fragment +%é";
+    let pass = "pass&other=wrong#fragment +%é";
+    let body = json!({"AuthKey":auth,"PassKey":pass,"Movies":[{"GroupId":"1","Torrents":[{"Id":"2","ReleaseName":"Harbor.2020.1080p","UploadTime":"2024-01-01 00:00:00"}]}]});
+    let (items, _) = parse_ptp(
+        body.to_string().as_bytes(),
+        MediaDomain::Movies,
+        "https://ptp.example",
+    )
+    .unwrap();
+    let locator = url::Url::parse(&items[0].download_url).unwrap();
+    assert!(locator.fragment().is_none());
+    assert_eq!(
+        locator.query_pairs().collect::<Vec<_>>(),
+        vec![
+            ("action".into(), "download".into()),
+            ("id".into(), "2".into()),
+            ("authkey".into(), auth.into()),
+            ("torrent_pass".into(), pass.into())
+        ]
+    );
 }

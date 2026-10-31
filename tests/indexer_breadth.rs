@@ -1876,3 +1876,53 @@ async fn bounded_json_pages_remain_stable_and_filter_before_local_pagination() {
         }
     }
 }
+
+#[tokio::test]
+async fn public_feed_selectors_preserve_titles_and_fanzub_sends_optional_cookie() {
+    let h = harness().await;
+    for (index, parameters, cookie, expected_title) in [
+        (
+            0,
+            json!([{"name":"f","value":"0"},{"name":"c","value":"1_2"}]),
+            Value::Null,
+            "Harbor.S01E01.1080p.WEB-DL",
+        ),
+        (
+            1,
+            json!([{"name":"max","value":"100"}]),
+            json!(COOKIE),
+            "Harbor.S01E01.720p.HDTV",
+        ),
+    ] {
+        let spec = &specs()[index];
+        let mut input = body(&h, spec);
+        input["credentials"] = json!({"kind":"feed","cookie":cookie,"tv_parameters":parameters});
+        let (code, provider) = request(&h.base, "POST", "/api/v1/providers", input).await;
+        assert_eq!(code, 201, "{provider}");
+        let (code, response) = request(
+            &h.base,
+            "POST",
+            &format!(
+                "/api/v1/providers/{}/search",
+                provider["id"].as_str().unwrap()
+            ),
+            json!({"kind":"rss","media_type":"tv","limit":10}),
+        )
+        .await;
+        assert_eq!(code, 200, "{response}");
+        assert_eq!(response["page"]["items"][0]["title"], expected_title);
+        let hits = h.state.hits(spec.path);
+        assert_eq!(hits.len(), 1);
+        if index == 0 {
+            assert_eq!(hits[0].query["f"], "0");
+            assert_eq!(hits[0].query["c"], "1_2");
+            assert!(!hits[0].headers.contains_key("cookie"));
+        } else {
+            assert_eq!(
+                hits[0].headers.get("cookie").map(String::as_str),
+                Some(COOKIE)
+            );
+            assert_eq!(hits[0].query["max"], "100");
+        }
+    }
+}

@@ -1,5 +1,5 @@
 //! Torznab/Newznab requests and bounded, namespace-aware XML responses.
-use super::{IndexerAccess, ProviderSettings, http::HttpError};
+use super::{IndexerAccess, ProviderSettings, TrackerKind, http::HttpError};
 use crate::api::MediaDomain;
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
@@ -2183,7 +2183,7 @@ pub(crate) async fn raw_search(
         None
     };
     let mut page = page;
-    redact_secrets(&mut page.items, access);
+    redact_secrets(&mut page.items, access, None);
     Ok(RawIndexerPage {
         tolerates_item_warnings: false,
         warnings: page.warnings,
@@ -2201,7 +2201,7 @@ pub(crate) async fn raw_search(
 
 const MIN_REDACTED_COOKIE_VALUE: usize = 8;
 /// Raw locators remain private, but metadata may later appear in decision receipts.
-fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
+fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>, tracker: Option<TrackerKind>) {
     // Individual cookie values are redacted too; short ones (ids, flags) are left alone,
     // since replacing e.g. "7" would corrupt release titles that later feed parsing.
     let cookie_values = access
@@ -2221,6 +2221,9 @@ fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
                 .tv_parameters
                 .iter()
                 .chain(access.movie_parameters)
+                .filter(|p| {
+                    !tracker.is_some_and(|kind| tracker::public_selector(kind, &p.name, &p.value))
+                })
                 .map(|p| p.value.as_str()),
         )
         .filter(|v| !v.is_empty())
@@ -2261,7 +2264,7 @@ async fn raw_feed(
     let start = (*offset).min(total);
     let end = start.saturating_add(*limit).min(total);
     items = items.drain(start as usize..end as usize).collect();
-    redact_secrets(&mut items, access);
+    redact_secrets(&mut items, access, None);
     Ok(RawIndexerPage {
         tolerates_item_warnings: true,
         warnings: if start == 0 { warnings } else { Vec::new() },

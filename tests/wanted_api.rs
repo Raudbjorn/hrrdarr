@@ -1277,3 +1277,41 @@ async fn concurrent_duplicates_capture_once_and_capacity_never_drops_unexpired_r
         "unexpired receipts all remain"
     );
 }
+
+#[tokio::test]
+async fn expired_empty_receipt_outside_sweep_can_be_readmitted() {
+    let app = app().await;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    for path in [TV, MOVIES] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = all_missing(&id, &indexer, &client);
+        let timestamp = now();
+        c.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) SELECT printf('00000000-0000-4000-8000-%012x',i),'tv',zeroblob(32),0,0,0,?1-100,?1-50 FROM n",
+            [timestamp],
+        ).await.unwrap();
+        c.execute(
+            "INSERT INTO wanted_search_receipts VALUES(?,?,zeroblob(32),0,0,0,?,?)",
+            libsql::params![
+                id,
+                if path == TV { "tv" } else { "movies" },
+                timestamp - 20,
+                timestamp - 10
+            ],
+        )
+        .await
+        .unwrap();
+        let (status, fresh) = request(&app.base, "POST", path, Some(body.clone())).await;
+        assert_eq!(status, 202, "{fresh}");
+        assert_eq!(fresh["replayed"], false);
+        assert_eq!(counts(&fresh), (Some(0), Some(0), Some(0)));
+        let (status, replay) = request(&app.base, "POST", path, Some(body)).await;
+        assert_eq!(status, 202, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(search_rows(&c).await, 0);
+        c.execute("DELETE FROM wanted_search_receipts", ())
+            .await
+            .unwrap();
+    }
+}

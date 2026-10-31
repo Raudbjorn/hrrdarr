@@ -92,6 +92,54 @@ async fn operator_converts_once_and_never_overwrites() -> Result<(), Error> {
         .arg("convert-premerge-pr32")
         .output()?;
     assert!(!usage.status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        // Unix path bytes are passed intact to conversion; only JSON display is lossy.
+        let raw_source = dir.join(std::ffi::OsString::from_vec(b"old-\xff.db".to_vec()));
+        let raw_destination = dir.join(std::ffi::OsString::from_vec(b"new-\xfe.db".to_vec()));
+        std::fs::copy(&source, &raw_source)?;
+        let output = run(&[&raw_source, &raw_destination])?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["source"], raw_source.to_string_lossy().as_ref());
+        assert_eq!(
+            report["destination"],
+            raw_destination.to_string_lossy().as_ref()
+        );
+        assert_eq!(std::fs::read(&raw_source)?, before);
+        let raw_parent = dir.join(std::ffi::OsString::from_vec(b"directory-\xff".to_vec()));
+        std::fs::create_dir(&raw_parent)?;
+        let unsupported = raw_parent.join("new.db");
+        let rejected = run(&[&source, &unsupported])?;
+        // The CLI accepts Unix bytes, but libSQL rejects non-UTF-8 working database paths.
+        // Keep that limitation explicit: report a conversion error, never panic or publish.
+        assert!(!rejected.status.success());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains("premerge_pr32_conversion_failed"), "{error}");
+        assert!(!error.contains("panicked"), "{error}");
+        assert!(!unsupported.exists());
+        assert_eq!(std::fs::read_dir(&raw_parent)?.count(), 0);
+        assert_eq!(std::fs::read(&source)?, before);
+        // libSQL requires UTF-8 paths, so inspect a byte-identical copy under an ASCII filename.
+        let inspect = dir.join("inspect.db");
+        std::fs::copy(&raw_destination, &inspect)?;
+        let db = Database::open_local(&inspect).await?;
+        let c = db.connect().await?;
+        assert_eq!(
+            c.query("SELECT name FROM quality_profiles WHERE id=60", ())
+                .await?
+                .next()
+                .await?
+                .ok_or("profile lost at non-UTF-8 destination")?
+                .get::<String>(0)?,
+            "Kept"
+        );
+    }
     drop(scratch);
     Ok(())
 }
