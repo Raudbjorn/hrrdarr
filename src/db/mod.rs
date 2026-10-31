@@ -332,6 +332,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "import_lists",
         include_str!("../../migrations/0080_import_lists.sql"),
     ),
+    (
+        "import_list_search",
+        include_str!("../../migrations/0084_import_list_search.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,

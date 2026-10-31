@@ -557,7 +557,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        79 // Import lists appends position 79 without changing main history.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -699,7 +699,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        79 // Import lists appends position 79 without changing main history.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     integrity(&c).await?;
     drop(c);

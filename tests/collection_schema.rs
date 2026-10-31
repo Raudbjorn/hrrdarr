@@ -198,7 +198,7 @@ async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() ->
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        79 // Reasoning: the merged runner appends collections and provider authority after the original 76 migrations.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     assert_eq!(rows(&c,"SELECT collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collection_settings WHERE collection_id=1").await, old_policy);
     assert_eq!(

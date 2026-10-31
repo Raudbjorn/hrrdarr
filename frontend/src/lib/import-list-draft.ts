@@ -181,9 +181,20 @@ export const ERROR_MESSAGES: Readonly<Record<string, string>> = {
   not_configured: 'The list needs more configuration before it can sync.',
   credentials_locked: 'Stored credentials could not be unlocked. Check the independently stored provider key.',
   key_unavailable: 'The provider key for stored credentials is unavailable.',
+  no_search_indexer: 'Enable an automatic-search indexer for this media type; the search will retry.',
+  search_on_add_target_limit: 'This addition exceeds the search target limit. Reduce its monitored episodes or enabled indexers.',
+  command_history_full: 'The search queue is full. The request will retry when capacity is available.',
+  provider_changed: 'Search provider settings changed. The request will retry with the current settings.',
 };
 export const describeError = (code: string | null | undefined): string =>
   !code ? '' : ERROR_MESSAGES[code] ?? 'The sync failed for an unrecognised reason.';
+
+/** Admission is not a completed search or download. */
+export function describeSearch(status: string | null, error: string | null): string {
+  if (status === 'admitted') return 'Search submitted. Check Activity for results.';
+  if (status === 'pending') return error ? `Search waiting: ${describeError(error)}` : 'Search waiting to start.';
+  return '';
+}
 
 /** Plain-language summary of a test outcome; never includes remote content. */
 export function describeTest(result: ImportListTestResult): string {

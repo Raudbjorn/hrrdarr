@@ -345,4 +345,8 @@ const LEGACY_MIGRATIONS: &[(&str, &str)] = &[
         "main_20261030_alignment",
         include_str!("../../migrations/0083_pr31_main_alignment.sql"),
     ),
+    (
+        "import_list_search",
+        include_str!("../../migrations/0084_import_list_search.sql"),
+    ),
 ];

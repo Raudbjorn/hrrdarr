@@ -205,7 +205,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        79 // Import lists appends position 79 without changing main history.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;

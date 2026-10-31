@@ -30,6 +30,8 @@ const LEASE_SECONDS: i64 = 180;
 /// Items added or settled per claim; the run is re-queued while more remain.
 pub const PASS_ITEMS: i64 = 25;
 const MAX_ATTEMPTS: i64 = 3;
+const SEARCH_REQUESTS_PER_TICK: i64 = 4;
+const SEARCH_RETRY_SECONDS: i64 = 60;
 const BACKOFF_BASE_SECONDS: i64 = 60;
 const FAILED_RETRY_SECONDS: i64 = 3600;
 const UNRESOLVED_RETRY_SECONDS: i64 = 86_400;
@@ -234,7 +236,38 @@ impl Engine {
             self.process(&run_id, &list_id, fetched).await?;
             done += 1;
         }
+        self.admit_searches().await?;
         Ok(done)
+    }
+
+    /// Admission has no network side effects. Each request is committed all-or-nothing, and
+    /// a capacity/configuration failure stays pending across restarts instead of losing a tail.
+    async fn admit_searches(&self) -> Result<()> {
+        let c = self.store.db.connect().await?;
+        let mut rows = c.query(
+            "SELECT addition_id FROM import_list_search_requests WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,addition_id LIMIT ?2",
+            params![now(), SEARCH_REQUESTS_PER_TICK],
+        ).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<i64>(0)?);
+        }
+        drop(rows);
+        for id in ids {
+            if let Err(error) = crate::commands::search::admit_import_list(
+                &self.store.db,
+                self.store.key.is_some(),
+                id,
+            )
+            .await
+            {
+                c.execute(
+                    "UPDATE import_list_search_requests SET next_attempt_at=?,error_code=? WHERE addition_id=? AND status='pending'",
+                    params![now() + SEARCH_RETRY_SECONDS, error.1, id],
+                ).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Runs claimed passes until no run is runnable (bounded), for tests and `sync now` callers.

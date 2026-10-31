@@ -123,7 +123,7 @@ async fn blocklist_clear_schema22_upgrade_rollback_reopen_scopes_and_shared_capa
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
     for (i, table) in tables.iter().enumerate() {
         let mut expected = before[i].clone();
         if *table == "commands" {

@@ -96,14 +96,20 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+        assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 30 } // Import lists adds one history row after the unchanged 78-entry main ledger; health registry is unchanged.
+                    // The new search outbox appends a ledger row without changing health seeds.
+                    expected.len()
+                        + if *table == "health_checks" {
+                            10
+                        } else {
+                            MIGRATIONS.len() - 49
+                        }
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.

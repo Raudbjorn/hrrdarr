@@ -392,23 +392,31 @@ fn wal_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Feed a file or stream into an existing digest without allocating for its total length.
+pub(super) fn update_digest(
+    mut source: impl Read,
+    digest: &mut ring::digest::Context,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; COPY_BUFFER_BYTES];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        digest.update(&buffer[..count]);
+    }
+}
+
 /// Digest of the database file followed by its write-ahead log, if any.
 fn source_digest(path: &Path) -> Result<String, Error> {
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     for file in [path.to_path_buf(), wal_path(path)] {
-        let mut source = match File::open(&file) {
+        let source = match File::open(&file) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && file != path => continue,
             Err(error) => return Err(format!("cannot read the source database: {error}").into()),
         };
-        let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
-        loop {
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
+        update_digest(source, &mut digest)?;
         digest.update(b"|");
     }
     Ok(sha256_hex(digest))
@@ -840,29 +848,32 @@ fn lock_source(path: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
-/// Puts `from` at `to` without ever replacing an existing file. A hard link is atomic; where the
-/// filesystem has none, the bytes are copied into an exclusively created file instead.
-pub(super) fn publish(from: &Path, to: &Path) -> std::io::Result<()> {
-    match std::fs::hard_link(from, to) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
-        Err(_) => {
-            let result = (|| {
-                let mut input = File::open(from)?;
-                let mut output = create_private_file(to)?;
-                std::io::copy(&mut input, &mut output)?;
-                output.sync_all()
-            })();
-            if let Err(error) = result {
-                // Only reached for a file this call created; an existing file fails at create_new.
-                if error.kind() != std::io::ErrorKind::AlreadyExists {
-                    let _ = std::fs::remove_file(to);
-                }
-                return Err(error);
+fn require_unused_output(to: &Path) -> std::io::Result<()> {
+    // SQLite can consume stale journals when the new database is first opened. Treat every
+    // sidecar entry, including a dangling symlink, as occupied without opening or deleting it.
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = to.as_os_str().to_os_string();
+        name.push(suffix);
+        match std::fs::symlink_metadata(PathBuf::from(name)) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "the output path or a SQLite sidecar already exists; neither is overwritten",
+                ));
             }
-            Ok(())
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+/// Publish complete bytes atomically without replacing an existing path; unsupported links fail closed.
+pub(super) fn publish(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Repeat preflight after conversion, just before publication. Offline use still requires
+    // excluding external writers: sidecar checks and the hard link are separate filesystem calls.
+    require_unused_output(to)?;
+    std::fs::hard_link(from, to)
 }
 
 /// Runs the conversion. `Err` is reserved for environment problems and data that cannot be
@@ -872,9 +883,7 @@ pub async fn run(options: &Options) -> Result<Report, Error> {
     let source = std::fs::canonicalize(&options.from)
         .map_err(|e| format!("cannot resolve the source database: {e}"))?;
     if let Some(to) = &options.to {
-        if to.exists() || std::fs::symlink_metadata(to).is_ok() {
-            return Err("the output path already exists; it is never overwritten".into());
-        }
+        require_unused_output(to)?;
         let parent = directory_of(to);
         let parent = std::fs::canonicalize(&parent)
             .map_err(|e| format!("the output directory is not usable: {e}"))?;
@@ -998,7 +1007,7 @@ async fn run_inner(
     File::open(&target_path)?.sync_all()?;
     let output_sha = sha256_hex({
         let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-        digest.update(&std::fs::read(&target_path)?);
+        update_digest(File::open(&target_path)?, &mut digest)?;
         digest
     });
 

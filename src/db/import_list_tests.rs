@@ -52,7 +52,11 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     c.execute("PRAGMA foreign_keys=OFF", ()).await?;
     let tx = c.transaction().await?;
     tx.execute(HISTORY_SQL, ()).await?;
-    let latest = MIGRATIONS.len() - 1;
+    // Keep testing the original import-lists boundary after newer migrations append.
+    let latest = MIGRATIONS
+        .iter()
+        .position(|(name, _)| *name == "import_lists")
+        .unwrap();
     assert_eq!(MIGRATIONS[latest].0, "import_lists");
     for (i, (name, sql)) in MIGRATIONS.iter().take(latest).enumerate() {
         tx.execute_batch(sql).await?;
@@ -83,7 +87,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 79); // Import lists follows the unchanged 78-entry main ledger.
+    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=9").await,
         1
@@ -94,7 +98,98 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(db);
     // Reopening is a no-op.
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 79); // Import lists follows the unchanged 78-entry main ledger.
+    assert_eq!(version(&db.connect().await?).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_outbox_upgrades_both_published_histories_atomically() -> Result<(), Error> {
+    use super::published_prefix_tests::{Scratch, seed_lineage};
+
+    async fn witness(c: &Connection, prefix: usize) -> Result<Vec<Vec<libsql::Value>>, Error> {
+        let mut values = Vec::new();
+        for sql in [
+            format!("SELECT * FROM schema_migrations WHERE version<={prefix} ORDER BY version"),
+            "SELECT * FROM import_list_additions ORDER BY id".into(),
+        ] {
+            let mut rows = c.query(&sql, ()).await?;
+            while let Some(row) = rows.next().await? {
+                values.push(
+                    (0..row.column_count())
+                        .map(|i| row.get_value(i))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+        }
+        Ok(values)
+    }
+
+    // Both deployed tips are immutable; the same outbox migration appends at different ordinals.
+    for (history, prefix) in [(MIGRATIONS, 79), (LEGACY_MIGRATIONS, 83)] {
+        let files = Scratch::new();
+        let path = files.0.join("db");
+        let (raw, c) = seed_lineage(&path, history, prefix).await?;
+        c.execute_batch(
+            "INSERT INTO series(id,tvdb_id,title,path) VALUES(1,101,'TV','/tv'),(2,102,'No search','/tv2');
+             INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,101,'Movie');
+             INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movie');
+             INSERT INTO import_list_additions(id,media_type,series_id,movie_id,list_name,external_id,search_requested,added_at) VALUES
+               (1,'tv',1,NULL,'Deleted TV list',101,1,100),
+               (2,'movies',NULL,1,'Deleted movie list',101,1,200),
+               (3,'tv',2,NULL,'No search list',102,0,300);",
+        )
+        .await?;
+        let before = witness(&c, prefix).await?;
+        c.execute(&format!("CREATE TRIGGER fail_outbox BEFORE INSERT ON schema_migrations WHEN NEW.version={} BEGIN SELECT RAISE(ABORT,'outbox fixture rollback'); END", prefix+1), ()).await?;
+        drop(c);
+        drop(raw);
+        assert!(
+            Database::open_local(&path)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rolled back")
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        assert_eq!(version(&c).await?, prefix);
+        assert_eq!(witness(&c, prefix).await?, before);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'import_list_search_%'"
+            )
+            .await,
+            0
+        );
+        c.execute("DROP TRIGGER fail_outbox", ()).await?;
+        drop(c);
+        drop(raw);
+
+        for reopen in 0..2 {
+            let db = Database::open_local(&path).await?;
+            let c = db.connect().await?;
+            assert_eq!(version(&c).await?, prefix + 1);
+            assert_eq!(db.migration_backup().is_some(), reopen == 0);
+            assert_eq!(
+                witness(&c, prefix).await?,
+                before,
+                "ledger and recorded user intent are unchanged"
+            );
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM import_list_search_requests").await,
+                2
+            );
+            assert_eq!(scalar(&c, "SELECT count(*) FROM import_list_search_requests WHERE status='pending' AND next_attempt_at=0 AND error_code IS NULL AND admitted_at IS NULL AND ((addition_id=1 AND created_at=100) OR (addition_id=2 AND created_at=200))").await, 2);
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM import_list_search_commands").await,
+                0,
+                "migration records pending intent without admitting work"
+            );
+            integrity(&c).await?;
+        }
+    }
     Ok(())
 }
 

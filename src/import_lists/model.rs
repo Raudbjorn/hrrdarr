@@ -270,6 +270,9 @@ pub struct Item {
     pub state: String,
     pub error_code: Option<String>,
     pub library_id: Option<i64>,
+    /// pending or admitted; admission queues durable commands, not a claim of search success.
+    pub search_status: Option<String>,
+    pub search_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]

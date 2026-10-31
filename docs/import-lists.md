@@ -102,6 +102,32 @@ control characters and a leading dot neutralised and bounded to 200 bytes; no di
 (library paths are declarations). The TV season monitor mode is applied to the seasons the catalog
 reports (specials are never monitored by `first_season` / `last_season`).
 
+### Search on add
+
+For a monitored add with `search_on_add=true`, the library transaction also records a durable
+search request. The list scheduler admits at most four requests per tick into the existing command
+worker: one automatic search per monitored episode/movie and enabled automatic-search indexer,
+using the normal download-client selection rules. A TV request includes only currently monitored
+series, seasons and episodes. An unmonitored add or a disabled search flag creates no request.
+
+Admission is atomic for the whole target/indexer capture. A missing provider key, no eligible
+indexer, or a full command pool leaves the request pending and retries after 60 seconds, including
+after process restart or deletion of the source list. A capture larger than the shared **1024
+command** bound remains pending with `search_on_add_target_limit`; chunked admission is tracked in [issue #67](https://github.com/Raudbjorn/hrrdarr/issues/67). It currently requires fewer monitored
+targets/indexers before it can be admitted. There is no partial admission or discarded tail.
+The request's durable admitted marker prevents repeated syncs, restart, or pruning completed
+command history from submitting the same add's searches again.
+
+The membership API exposes `search_status` (`pending`, `admitted`, or null when no request exists)
+and `search_error_code`. `admitted` means commands were queued; it does not claim a successful
+search or download. Command progress and results use the existing search command API.
+
+List searches retain background movie availability, monitoring and delay policies. A delayed
+selected offer becomes a durable pending candidate, whose normal submission pipeline rechecks
+policy and waits until its deadline. Explicit user-search exceptions never apply, even if the list
+or library provenance is removed after admission. These are targeted indexer searches, and every
+external request runs outside the admission transaction.
+
 Exclusions are keyed by TVDB id (TV) or TMDb id (movies) and are domain-scoped: TV 100 and movie
 100 are different rows.
 
@@ -134,11 +160,15 @@ fetch. Failure classes: `invalid_settings`, `authentication`, `rate_limited`, `t
 
 The registry is migration **file** `0080_import_lists.sql`. Filename prefixes are historical
 names, not execution ordinals. Fresh databases and the current main history through version 78
-finish at version **79**, which adds import lists. The earlier published main checkpoint through
+add import lists at version **79**, then durable search-on-add at **80**. The earlier published main checkpoint through
 versions 50–53 follows the preserved PR #31 history through version 82, then the compatibility
-bridge at **83**. Existing PR #31 version-82 databases take that same bridge to the current
+bridge at **83**, then search-on-add at **84**. Existing PR #31 version-82 databases take that same bridge to the current
 separate collection settings and shared provider authority model. Common prefixes through 49
 can follow the current main path.
+
+The new append-only file `0084_import_list_search.sql` adds the search admission outbox and
+background-command authority markers. Existing provenance rows with `search_requested=1` are
+backfilled as pending requests, including rows whose source list was deleted.
 
 `src/db/mod.rs` and `src/db/legacy_migrations.rs` define the two accepted execution histories.
 Every recorded name, SQL body and checksum must match one complete prefix; mixed or tampered
@@ -209,11 +239,9 @@ what it added. Only the Custom provider is exercised in the browser.
   public lists) is supported; the device-code flow and token refresh are not built, so an expired
   token must be replaced by hand. MyAnimeList / AniList / Plex / Simkl likewise use static
   credentials; no OAuth flow of any provider is exercised.
-* **Search-on-add records intent only.** The flag is stored on the list and on the provenance row
-  (`search_requested`), and the added item is monitored and therefore appears under Wanted, but no
-  search command is admitted: search commands are bound to one explicit indexer and client chosen by
-  a person, and there is no "search all indexers" command to reuse. Nothing claims an automatic
-  search ran.
+* **Search-on-add has a bounded admission limit.** Captures beyond 1024 target/indexer combinations
+  remain visibly pending until configuration or monitoring reduces the capture. Chunked admission
+  is not implemented. Fixture worker tests do not establish live indexer/download-client behavior.
 * **Not the whole Sonarr/Radarr surface.** Not built: CouchPotato (`lst.009`), RadarrList /
   RadarrList2 curated lists (`lst.011`), the Radarr discovery feed `GET /importlist/movie`
   (`api.050`), per-season monitoring copied from a source Sonarr, "tag existing items", list

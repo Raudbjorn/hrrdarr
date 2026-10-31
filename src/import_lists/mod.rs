@@ -89,6 +89,13 @@ pub async fn record_addition(
         ],
     )
     .await?;
+    if add.search_requested {
+        c.execute(
+            "INSERT INTO import_list_search_requests(addition_id,next_attempt_at,created_at) SELECT id,0,added_at FROM import_list_additions WHERE media_type=? AND (series_id=? OR movie_id=?)",
+            params![store::domain_name(media), series, movie],
+        )
+        .await?;
+    }
     Ok(())
 }
 

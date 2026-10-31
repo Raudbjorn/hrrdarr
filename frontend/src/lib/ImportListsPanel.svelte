@@ -2,7 +2,7 @@
   import {onMount} from 'svelte';
   import type {ImportList,ImportListImplementation,ImportListRun,ImportListItem,ImportListExclusion,MediaDomain,QualityProfileSummary,RootFolder,Tag} from './api.generated';
   import {listImportLists,getImportListSchema,createImportList,updateImportList,deleteImportList,testImportListDraft,testSavedImportList,syncImportList,syncAllImportLists,listImportListRuns,listImportListItems,listImportListExclusions,addImportListExclusion,deleteImportListExclusion,bulkDeleteImportListExclusions,listQualityProfiles,listRootFolders,listTags,IMPORT_LIST_ITEM_STATES,IMPORT_LIST_MAX_BULK_DELETE,type SettingsWriteState,type Result} from './api';
-  import {blankDraft,draftFromList,buildInput,buildExclusion,describeTest,describeRun,describeError,isRunActive,pollDelay,MAX_POLLS,formatTime,listStatus,monitorOptions,domainFields,supportedDomains,withDomain,pageCount,SERIES_TYPES,AVAILABILITIES,DOMAIN_LABELS,ITEM_STATE_LABELS,type ImportListDraft} from './import-list-draft';
+  import {blankDraft,draftFromList,buildInput,buildExclusion,describeTest,describeRun,describeError,describeSearch,isRunActive,pollDelay,MAX_POLLS,formatTime,listStatus,monitorOptions,domainFields,supportedDomains,withDomain,pageCount,SERIES_TYPES,AVAILABILITIES,DOMAIN_LABELS,ITEM_STATE_LABELS,type ImportListDraft} from './import-list-draft';
 
   const PAGE=25,LOOKUP_PAGE=50,LOOKUP_MAX_PAGES=20,RUN_HISTORY=10;
   type Lookups={profiles:Record<MediaDomain,QualityProfileSummary[]>;roots:Record<MediaDomain,RootFolder[]>;tags:Record<MediaDomain,Tag[]>};
@@ -333,9 +333,10 @@
               </label>
               {#if itemsLoading}<p role="status">Loading items…</p>{/if}
               {#if itemsError}<p role="alert">{itemsError}</p>{/if}
+              <button type="button" disabled={itemsLoading} onclick={()=>void loadItems()}>Refresh items</button>
               <ul aria-label="List items">
                 {#each itemRows as i (i.key)}
-                  <li>{i.title}{i.year?` (${i.year})`:''} <span class="badge">{ITEM_STATE_LABELS[i.state]??i.state}</span> <small>{itemIds(i)}</small>{#if i.error_code} <small>{describeError(i.error_code)}</small>{/if}</li>
+                  <li>{i.title}{i.year?` (${i.year})`:''} <span class="badge">{ITEM_STATE_LABELS[i.state]??i.state}</span> <small>{itemIds(i)}</small>{#if i.error_code} <small>{describeError(i.error_code)}</small>{/if}{#if i.search_status} <small>{describeSearch(i.search_status,i.search_error_code)}</small>{/if}</li>
                 {:else}{#if !itemsLoading}<li>No items{itemState?` in this state`:' recorded yet; sync the list to fetch them'}.</li>{/if}{/each}
               </ul>
               <div class="actions">

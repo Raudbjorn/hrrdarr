@@ -220,7 +220,7 @@ async fn converts_a_populated_draft_database_and_leaves_the_source_untouched() -
     );
 
     let (_raw, c) = open_plain(&out).await?;
-    // The application's own reader accepts it as the main lineage with nothing pending.
+    // The application's own reader accepts the pinned conversion target as the main lineage.
     let (version, history) = migration_history(&c).await?;
     assert_eq!(version, TARGET_VERSION);
     assert_eq!(history, MIGRATIONS);
@@ -350,10 +350,13 @@ async fn converts_a_populated_draft_database_and_leaves_the_source_untouched() -
         "the revision trigger must be live"
     );
 
-    // Opening it with the application runs no migration and takes no backup.
+    // Conversion stays pinned; startup applies any newer migrations and backs up populated data.
     drop(c);
     let db = Database::open_local(&out).await?;
-    assert!(db.backup.is_none());
+    assert_eq!(db.backup.is_some(), MIGRATIONS.len() > TARGET_VERSION);
+    let startup_conn = db.connect().await?;
+    assert_eq!(migration_history(&startup_conn).await?.0, MIGRATIONS.len());
+    drop(startup_conn);
     drop(db);
     assert!(leftovers(&files.0).is_empty());
 
@@ -596,6 +599,72 @@ async fn existing_or_identical_output_paths_are_refused() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn output_sidecars_are_refused_before_conversion_and_at_publication() -> Result<(), Error> {
+    let files = Scratch::new();
+    let source = files.0.join("source.db");
+    // Preflight must reject the occupied basename before even attempting to read SQLite data.
+    std::fs::write(&source, b"source untouched")?;
+    let output = files.0.join("output.db");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = files.0.join(format!("output.db{suffix}"));
+        std::fs::write(&sidecar, b"sidecar untouched")?;
+        let error = run(&Options {
+            from: source.clone(),
+            to: Some(output.clone()),
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("sidecar already exists"),
+            "{error}"
+        );
+        assert_eq!(
+            publish(&source, &output).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(&sidecar)?, b"sidecar untouched");
+        assert_eq!(std::fs::read(&source)?, b"source untouched");
+        std::fs::remove_file(sidecar)?;
+    }
+    assert!(leftovers(&files.0).is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn output_sidecar_symlinks_are_refused_without_touching_the_link_or_target() {
+    let files = Scratch::new();
+    let source = files.0.join("source.db");
+    let target = files.0.join("sidecar-target");
+    let output = files.0.join("output.db");
+    std::fs::write(&source, b"converted").unwrap();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = files.0.join(format!("output.db{suffix}"));
+        std::os::unix::fs::symlink(&target, &sidecar).unwrap();
+        for target_exists in [true, false] {
+            if target_exists {
+                std::fs::write(&target, b"keep me").unwrap();
+            } else {
+                std::fs::remove_file(&target).unwrap();
+            }
+            assert_eq!(
+                publish(&source, &output).unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_link(&sidecar).unwrap(), target);
+            if target_exists {
+                assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+            } else {
+                assert!(!target.exists());
+            }
+        }
+        std::fs::remove_file(sidecar).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_database_held_by_another_process_is_refused() -> Result<(), Error> {
     let files = Scratch::new();
     let draft = populated_draft(&files).await?;
@@ -746,4 +815,98 @@ fn publishing_never_replaces_an_existing_file() {
     let fresh = files.0.join("fresh");
     publish(&from, &fresh).unwrap();
     assert_eq!(std::fs::read(&fresh).unwrap(), b"converted");
+}
+
+#[test]
+fn failed_publication_preserves_the_destination_and_creates_nothing() {
+    let files = Scratch::new();
+    let missing = files.0.join("missing");
+    let destination = files.0.join("destination");
+    std::fs::write(&destination, b"keep me").unwrap();
+    assert!(publish(&missing, &destination).is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+    std::fs::remove_file(&destination).unwrap();
+    assert!(publish(&missing, &destination).is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn publishing_survives_process_exit_without_cleanup() {
+    const CHILD_STAGE: &str = "HRRDARR_PUBLISH_TEST_STAGE";
+    const CHILD_DIRECTORY: &str = "HRRDARR_PUBLISH_TEST_DIRECTORY";
+    if let Ok(stage) = std::env::var(CHILD_STAGE) {
+        let directory = std::path::PathBuf::from(std::env::var_os(CHILD_DIRECTORY).unwrap());
+        if stage == "before" {
+            std::process::exit(91);
+        }
+        publish(&directory.join("from"), &directory.join("published")).unwrap();
+        // Exit without Rust destructors: correctness must not depend on cleanup after publication.
+        std::process::exit(92);
+    }
+    let files = Scratch::new();
+    let bytes = vec![0xa5; 256 * 1024 + 17];
+    std::fs::write(files.0.join("from"), &bytes).unwrap();
+    for (stage, expected) in [("before", 91), ("after", 92)] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::draft_conversion_tests::publishing_survives_process_exit_without_cleanup",
+            ])
+            .env(CHILD_STAGE, stage)
+            .env(CHILD_DIRECTORY, &files.0)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(expected));
+        if stage == "before" {
+            assert!(!files.0.join("published").exists());
+        } else {
+            std::fs::remove_file(files.0.join("from")).unwrap();
+            assert_eq!(std::fs::read(files.0.join("published")).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn digest_streams_bounded_reads_and_propagates_read_errors() {
+    use std::io::Read;
+    struct BoundedReader {
+        remaining: usize,
+        reads: usize,
+    }
+    impl Read for BoundedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            assert!(buffer.len() <= 64 * 1024);
+            self.reads += 1;
+            let count = buffer.len().min(self.remaining);
+            buffer[..count].fill(0xa5);
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+    let size = 256 * 1024 + 17;
+    let mut reader = BoundedReader {
+        remaining: size,
+        reads: 0,
+    };
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    update_digest(&mut reader, &mut digest).unwrap();
+    assert_eq!(reader.remaining, 0);
+    assert!(reader.reads > 4);
+    assert_eq!(
+        digest.finish().as_ref(),
+        ring::digest::digest(&ring::digest::SHA256, &vec![0xa5; size]).as_ref()
+    );
+
+    struct FailedReader;
+    impl Read for FailedReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("read failed"))
+        }
+    }
+    let error = update_digest(
+        FailedReader,
+        &mut ring::digest::Context::new(&ring::digest::SHA256),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
 }

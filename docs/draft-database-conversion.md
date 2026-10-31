@@ -9,12 +9,30 @@ version 50. `hrrdarr` rejects it before running a statement and tells you so.
 It is offline, never modifies the source, and never overwrites anything.
 
 ```sh
-systemctl stop hrrdarr                                   # the tool takes the same lock the service does
+systemctl stop hrrdarr                                   # stop all other database writers/readers too
 hrrdarr convert-draft-database --from hrrdarr.db         # dry run: converts in scratch space, verifies, discards
 hrrdarr convert-draft-database --from hrrdarr.db --to hrrdarr.converted.db
-mv hrrdarr.db hrrdarr.draft.db && mv hrrdarr.converted.db hrrdarr.db
-systemctl start hrrdarr                                  # later main migrations apply as usual
 ```
+
+Keep the original `hrrdarr.db` and any `hrrdarr.db-wal`, `hrrdarr.db-shm`, or `hrrdarr.db-journal`
+sidecars together at their existing
+names for recovery; sidecars may contain committed data that is absent from the main file. Do not
+move only the main file or put the converted database under a basename with retained draft sidecars.
+
+Instead, change the service's existing `HRRDARR_DATABASE_PATH` configuration to the **absolute path**
+of `hrrdarr.converted.db`. Keep its parent directory writable by the service and keep the original
+provider encryption key/configuration. If you edited the systemd unit or a drop-in, run
+`systemctl daemon-reload`, then start the service:
+
+```sh
+systemctl start hrrdarr                                  # opens the converted path; later migrations apply as usual
+```
+
+Verify the configured database path and startup result before retiring any original files. This
+switch leaves the draft database and its sidecars intact and uses a distinct basename for the
+converted database. The output basename must have no existing database or sidecar, including a
+rollback journal; the converter refuses those paths. Keep all other processes away from that
+output basename until conversion and configuration are complete.
 
 Exit codes: `0` done, `1` error (nothing published), `3` the source is not a convertible draft
 database (nothing written but the report).
@@ -58,7 +76,9 @@ reason in the report:
    roots in the movies domain, member revisions, member and tag limits, directory-client categories).
    Data main would reject is refused rather than published.
 6. Checks the output with the application's own migration-history reader (79 rows, main lineage) and
-   publishes it with a no-clobber hard link, mode `0600`.
+   publishes it with a no-clobber hard link, mode `0600`. The destination filesystem must support
+   hard links; otherwise conversion fails without publishing a destination. There is no direct-copy
+   fallback that could expose a partially copied database.
 
 ## What is not preserved
 

@@ -209,7 +209,7 @@ async fn items(
     .await?;
     let mut rows = c
         .query(
-            "SELECT key,title,year,tvdb_id,tmdb_id,imdb_id,state,error_code,library_id FROM import_list_items WHERE list_id=?1 AND (?2 IS NULL OR state=?2) ORDER BY seq LIMIT ?3 OFFSET ?4",
+            "SELECT i.key,i.title,i.year,i.tvdb_id,i.tmdb_id,i.imdb_id,i.state,i.error_code,i.library_id,r.status,r.error_code FROM import_list_items i JOIN import_lists l ON l.id=i.list_id LEFT JOIN import_list_additions a ON a.list_id=i.list_id AND a.media_type=l.media_type AND ((a.media_type='tv' AND a.series_id=i.library_id) OR (a.media_type='movies' AND a.movie_id=i.library_id)) LEFT JOIN import_list_search_requests r ON r.addition_id=a.id WHERE i.list_id=?1 AND (?2 IS NULL OR i.state=?2) ORDER BY i.seq LIMIT ?3 OFFSET ?4",
             libsql::params![id, q.state.clone(), i64::from(limit), i64::from(offset)],
         )
         .await?;
@@ -225,6 +225,8 @@ async fn items(
             state: r.get(6)?,
             error_code: r.get(7)?,
             library_id: r.get(8)?,
+            search_status: r.get(9)?,
+            search_error_code: r.get(10)?,
         });
     }
     Ok(Json(ItemPage {

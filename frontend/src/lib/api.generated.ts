@@ -436,7 +436,11 @@ export type ImportListItem = { key: string, title: string, year: number | null, 
 /**
  * pending, added, existing, excluded, unresolved or failed.
  */
-state: string, error_code: string | null, library_id: number | null, };
+state: string, error_code: string | null, library_id: number | null,
+/**
+ * pending or admitted; admission queues durable commands, not a claim of search success.
+ */
+search_status: string | null, search_error_code: string | null, };
 
 export type ImportListItemPage = { items: Array<ImportListItem>, total: number, limit: number, offset: number, };
 

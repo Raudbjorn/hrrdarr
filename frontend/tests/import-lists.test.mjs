@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {blankDraft,draftFromList,buildInput,buildExclusion,describeTest,describeRun,describeError,monitorOptions,domainFields,withDomain,supportedDomains,listStatus,formatTime,pollDelay,isRunActive,ERROR_MESSAGES,validHttpUrl,pageCount} from '../src/lib/import-list-draft.ts';
+import {blankDraft,draftFromList,buildInput,buildExclusion,describeTest,describeRun,describeError,describeSearch,monitorOptions,domainFields,withDomain,supportedDomains,listStatus,formatTime,pollDelay,isRunActive,ERROR_MESSAGES,validHttpUrl,pageCount} from '../src/lib/import-list-draft.ts';
 import {listImportLists,getImportListSchema,createImportList,updateImportList,deleteImportList,testImportListDraft,testSavedImportList,syncImportList,syncAllImportLists,listImportListRuns,listImportListItems,listImportListExclusions,addImportListExclusion,deleteImportListExclusion,bulkDeleteImportListExclusions} from '../src/lib/api.ts';
 import {parseHash,hashFor,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS} from '../src/lib/routes.ts';
 
@@ -195,4 +195,12 @@ test('the panel and app wire the route without innerHTML',()=>{
   assert.equal(/innerHTML|\{@html/.test(panel),false);
   assert.match(app,/importListsVisited/);assert.match(app,/<ImportListsPanel \/>/);
   assert.match(panel,/Configured \(leave blank to keep\)/);
+});
+
+
+test('search admission distinguishes blocked requests from submitted work without claiming a download',()=>{
+  assert.equal(describeSearch(null,null),'');
+  assert.match(describeSearch('pending','no_search_indexer'),/Enable an automatic-search indexer/);
+  assert.match(describeSearch('pending','command_history_full'),/retry when capacity/);
+  assert.equal(describeSearch('admitted',null),'Search submitted. Check Activity for results.');
 });

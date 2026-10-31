@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        79 // Import lists appends position 79 without changing main history.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

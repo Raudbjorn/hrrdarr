@@ -47,15 +47,16 @@ Collection automatic additions also honor active `movie_import_exclusions`.
 
 `src/db/mod.rs` validates each accepted migration-history prefix before applying its matching
 upgrade path. Historical SQL/name/checksum records are retained; migration filename prefixes
-alone do not identify the schema version. Fresh/current-main databases finish at version 79;
+alone do not identify the schema version. Fresh/current-main databases finish at version 80;
 the earlier published main checkpoint and PR #31 history converge through the version-83
-bridge. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
+bridge, followed by the search-on-add outbox at version 84. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
 not establish production upgrade success.
 
 Upgrades from the earlier main checkpoint now preserve nullable `search_on_add` transactionally.
 Databases already upgraded to version 82 by `9d989d5` had NULL normalized to false; that lost
 definedness cannot be inferred during the bridge ([issue #50](https://github.com/Raudbjorn/hrrdarr/issues/50)).
-Arbitrary draft migration histories remain unsupported ([issue #44](https://github.com/Raudbjorn/hrrdarr/issues/44)).
+Startup still rejects unknown draft histories. The exact `1431d97` draft has an explicit
+[offline conversion command](draft-database-conversion.md); other draft histories remain unsupported.
 
 ## Snapshot reconstruction
 

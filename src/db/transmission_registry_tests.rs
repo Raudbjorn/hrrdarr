@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -285,6 +285,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 79); // Import lists appends position 79 without changing main history.
+    assert_eq!(version(&db.connect().await?).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Populated fixtures for the collection policy recovery: a published main v53 database with real
 //! nullable policy rows is taken through the real legacy history to version 82 (the published PR #31
-//! conversion, without the capture hook) and then through the current runner to version 83.
+//! conversion, without the capture hook) and then through the current runner, including the version-83 adapter.
 use super::collection_policy_recovery::*;
 use super::published_prefix_tests::{Scratch, published, seed_lineage};
 use super::*;
@@ -68,7 +68,7 @@ async fn advance(c: &Connection, from: usize, to: usize) -> Result<(), Error> {
 enum Upgrade {
     /// Published PR #31 runner only (version 82).
     PublishedOnly,
-    /// Published runner, then the current runner (version 83): the case this recovery serves.
+    /// Published runner, then the current runner: the case this recovery serves.
     ThroughPublished,
 }
 
@@ -265,11 +265,12 @@ async fn dry_run_reports_and_never_writes_the_database() -> Result<(), Error> {
             (3, "explicit_true_preserved"),
             (4, "local_edit_since_backup"),
             (5, "explicit_true_preserved"),
-            (6, "restorable"),
+            (6, "ambiguous"),
             (7, "restorable"),
         ])
     );
-    assert_eq!(report.counts["restorable"], 3);
+    // Row 6 already had local_edit=1: an exact match cannot exclude a later search-only edit.
+    assert_eq!(report.counts["restorable"], 2);
     assert_eq!(
         report.json["applied"], false,
         "a dry run says so in the audit file"
@@ -340,7 +341,7 @@ async fn apply_restores_only_proven_null_and_preserves_everything_else() -> Resu
 
     let report = run(&options(&f, &f.backup, true)).await?;
     assert_eq!(report.outcome, Outcome::Applied);
-    assert_eq!(report.restored, 3);
+    assert_eq!(report.restored, 2);
     assert_eq!(report.json["applied"], true);
 
     for (id, restored) in [
@@ -349,7 +350,7 @@ async fn apply_restores_only_proven_null_and_preserves_everything_else() -> Resu
         (3, false),
         (4, false),
         (5, false),
-        (6, true),
+        (6, false),
         (7, true),
     ] {
         let (soa, revision) = settings_row(&f.db, id).await?;
@@ -442,7 +443,7 @@ async fn apply_restores_only_proven_null_and_preserves_everything_else() -> Resu
 async fn apply_is_idempotent() -> Result<(), Error> {
     let f = fixture(Upgrade::ThroughPublished).await?;
     let first = run(&options(&f, &f.backup, true)).await?;
-    assert_eq!(first.restored, 3);
+    assert_eq!(first.restored, 2);
     let after_first = dump(&f.db).await?;
     let file_after_first = file_sha(&f.db);
 
@@ -450,7 +451,7 @@ async fn apply_is_idempotent() -> Result<(), Error> {
     assert_eq!(second.outcome, Outcome::Applied);
     assert_eq!(second.restored, 0);
     assert_eq!(second.counts["restorable"], 0);
-    assert_eq!(second.counts["already_null"], 3);
+    assert_eq!(second.counts["already_null"], 2);
     assert_eq!(
         decisions(&second),
         BTreeMap::from([
@@ -459,7 +460,7 @@ async fn apply_is_idempotent() -> Result<(), Error> {
             (3, "explicit_true_preserved"),
             (4, "local_edit_since_backup"),
             (5, "explicit_true_preserved"),
-            (6, "already_null"),
+            (6, "ambiguous"),
             (7, "already_null"),
         ])
     );
@@ -469,6 +470,76 @@ async fn apply_is_idempotent() -> Result<(), Error> {
         "second run changes nothing"
     );
     assert_eq!(file_sha(&f.db), file_after_first);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undetectable_search_only_edit_is_ambiguous_and_apply_preserves_intent()
+-> Result<(), Error> {
+    let f = fixture(Upgrade::PublishedOnly).await?;
+    let checkpoint_revision;
+    {
+        let raw = libsql::Builder::new_local(&f.db).build().await?;
+        let c = raw.connect()?;
+        // The fixture's tag inserts advanced the original revision; capture its actual value.
+        checkpoint_revision = scalar(
+            &c,
+            "SELECT checkpoint_settings_revision FROM movie_collections WHERE id=6",
+        )
+        .await?;
+        // Row 6 already had local_edit=1 in the nullable backup. Real inline-policy edits
+        // cannot advance its retained checkpoint revision, even when choosing false anew.
+        c.execute_batch(
+            "UPDATE movie_collections SET search_on_add=1,local_edit=1 WHERE id=6;
+             UPDATE movie_collections SET search_on_add=0,local_edit=1 WHERE id=6;
+             UPDATE movie_collections SET search_on_add=1,local_edit=1 WHERE id IN (1,7);",
+        )
+        .await?;
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM movie_collections WHERE id=6 AND search_on_add=0 AND local_edit=1").await?,
+            1,
+            "the later explicit false is indistinguishable from the backup conversion"
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT checkpoint_settings_revision FROM movie_collections WHERE id=6"
+            )
+            .await?,
+            checkpoint_revision,
+            "the real search-only edits leave the backup revision unchanged"
+        );
+    }
+    drop(Database::open_local(&f.db).await?);
+    let before = dump(&f.db).await?;
+    let before_file = file_sha(&f.db);
+    // Other candidates were explicitly changed above, so neither mode has a safe restore.
+    // The complete witness covers settings/revisions, tags, removal intents and the ledger.
+    for apply in [false, true] {
+        let report = run(&options(&f, &f.backup, apply)).await?;
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.counts["restorable"], 0);
+        let row = report
+            .entries
+            .iter()
+            .find(|e| e.collection_id == 6)
+            .unwrap();
+        assert_eq!(row.decision, Decision::Ambiguous);
+        assert_eq!(
+            row.reason,
+            "backup_row_already_had_local_edit_so_a_later_search_on_add_only_edit_is_undetectable"
+        );
+        assert_eq!(
+            row.live_revision, None,
+            "no conditional update is authorized"
+        );
+        assert_eq!(
+            settings_row(&f.db, 6).await?,
+            (Some(0), checkpoint_revision)
+        );
+        assert_eq!(dump(&f.db).await?, before);
+        assert_eq!(file_sha(&f.db), before_file);
+    }
     Ok(())
 }
 
@@ -494,11 +565,12 @@ async fn a_post_backup_edit_that_changes_a_compared_field_blocks_restore() -> Re
     let map = decisions(&report);
     assert_eq!(map[&1], "local_edit_since_backup");
     assert_eq!(map[&7], "local_edit_since_backup");
-    assert_eq!(map[&6], "restorable");
-    assert_eq!(report.restored, 1);
+    // The remaining matching row has ambiguous edit provenance and must also stay untouched.
+    assert_eq!(map[&6], "ambiguous");
+    assert_eq!(report.restored, 0);
     assert_eq!(settings_row(&f.db, 1).await?.0, Some(0));
     assert_eq!(settings_row(&f.db, 7).await?.0, Some(0));
-    assert_eq!(settings_row(&f.db, 6).await?.0, None);
+    assert_eq!(settings_row(&f.db, 6).await?.0, Some(0));
     Ok(())
 }
 
@@ -705,9 +777,9 @@ async fn apply_failure_rolls_back_completely_and_the_run_can_be_repeated() -> Re
     {
         let db = Database::open_local(&f.db).await?;
         let c = db.connect().await?;
-        // Row 1 is restored first; the failure on row 6 must undo it.
+        // Row 6 is now ambiguous; fail on restorable row 7 to still undo row 1's earlier update.
         c.execute(
-            "CREATE TRIGGER fixture_fail BEFORE UPDATE OF search_on_add ON movie_collection_settings WHEN NEW.collection_id=6 BEGIN SELECT RAISE(ABORT,'fixture failure'); END",
+            "CREATE TRIGGER fixture_fail BEFORE UPDATE OF search_on_add ON movie_collection_settings WHEN NEW.collection_id=7 BEGIN SELECT RAISE(ABORT,'fixture failure'); END",
             (),
         )
         .await?;
@@ -749,7 +821,7 @@ async fn apply_failure_rolls_back_completely_and_the_run_can_be_repeated() -> Re
             .await?;
     }
     let report = run(&options(&f, &f.backup, true)).await?;
-    assert_eq!(report.restored, 3);
+    assert_eq!(report.restored, 2);
     Ok(())
 }
 

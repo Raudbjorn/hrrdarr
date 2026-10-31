@@ -200,7 +200,7 @@ async fn upgrade77_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        79 // Reasoning: provider authority is appended after collections authority 0077.
+        80 // Search-on-add appends position 80; published prefixes remain unchanged.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);

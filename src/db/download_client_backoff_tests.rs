@@ -104,7 +104,7 @@ async fn backoff_upgrade50_rollback_reopen_preserves_authority() -> Result<(), E
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 79); // Import lists appends position 79 without changing main history.
+    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
     for i in [0, 4, 5, 6] {
         assert_eq!(rows(&c, queries[i]).await?, before[i]);
     }

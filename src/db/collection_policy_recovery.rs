@@ -14,12 +14,14 @@
 //!   private scratch directory, and only the copy is opened.
 //! * The backup must be an exact prefix of the published legacy migration ledger that still carries
 //!   the nullable column (versions 52 through 72), and the live ledger must be that same lineage
-//!   fully adapted (version 83). `schema_version` in the manifest is cross-checked, never trusted.
+//!   fully upgraded through the current legacy lineage. `schema_version` in the manifest is cross-checked, never trusted.
 //! * Collections are matched by BOTH the internal id and the TMDB collection id. Disagreement is
 //!   reported as ambiguous and never restored.
 //! * A row is restored only when the live settings equal, field for field, what the legacy
 //!   conversion plus the 0083 adapter deterministically produce from the backup row (revision,
 //!   monitoring, root, profile, availability, local edit, snapshot ownership and tags).
+//!   The backup must also have `local_edit = 0`: an already-set flag cannot reveal a later
+//!   search-on-add-only edit while the policy was stored inline.
 //! * Apply is one `BEGIN IMMEDIATE` transaction that re-plans from live data, updates only the
 //!   restorable rows, re-verifies, and rolls back completely on any failure. Foreign keys and the
 //!   `collection_settings_revision` trigger stay enabled; the trigger requires each restored row's
@@ -62,7 +64,7 @@ const REVISION_CONSEQUENCE: &str = "each restored collection's settings_revision
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
-    /// Backup NULL, live false, and live equals the deterministic conversion of the backup row.
+    /// Backup NULL with local_edit=0, live false, and live equals the backup's conversion.
     Restorable,
     /// Live is already NULL ("absent"); a repeat run lands here.
     AlreadyNull,
@@ -73,7 +75,7 @@ pub enum Decision {
     ExplicitTruePreserved,
     /// The live row differs from what the conversion yields, so someone edited it since.
     LocalEditSinceBackup,
-    /// Internal id and TMDB identity do not agree (or no TMDB identity exists); nothing restored.
+    /// Identity, nullable-policy validity or edit provenance cannot prove a safe restore.
     Ambiguous,
     /// The backup row has no counterpart collection in the live database.
     MissingInLive,
@@ -294,6 +296,16 @@ pub fn plan(backup: &Snapshot, live: &Snapshot) -> Vec<Entry> {
                 Decision::Ambiguous,
                 "monitored_collection_cannot_hold_absent_policy",
             )
+        } else if bs.local_edit != 0 {
+            // The inline policy had no revision counter for subsequent policy edits. Once
+            // local_edit was already set, choosing false later leaves the same facts as the
+            // lossy conversion. Matching fields therefore do not prove permission to restore.
+            entry(
+                id,
+                Some(tmdb),
+                Decision::Ambiguous,
+                "backup_row_already_had_local_edit_so_a_later_search_on_add_only_edit_is_undetectable",
+            )
         } else {
             let mut restorable = entry(
                 id,
@@ -302,11 +314,6 @@ pub fn plan(backup: &Snapshot, live: &Snapshot) -> Vec<Entry> {
                 "live_equals_conversion_of_backup_row",
             );
             restorable.live_revision = Some(ls.settings_revision);
-            if bs.local_edit == 1 {
-                restorable.caveat = Some(
-                    "backup_row_already_had_local_edit_so_a_later_search_on_add_only_edit_is_undetectable",
-                );
-            }
             restorable
         };
         entries.push(e);

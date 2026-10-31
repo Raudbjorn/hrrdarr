@@ -74,7 +74,7 @@ All of these must hold, otherwise every live false value is reported as
 3. Its `schema_migrations` ledger is an exact prefix of the published PR #31 history (name,
    checksum and SQL of every row) of 52 to 72 rows, so `search_on_add` was still nullable, and
    the manifest's `schema_version` equals the ledger's row count. The live ledger must be that
-   same history, complete (83 rows). A backup from the other (main) lineage, or one taken after
+   same history, complete (84 rows, including the version-83 bridge and search-on-add migration). A backup from the other (main) lineage, or one taken after
    the conversion, is rejected.
 
 ## Decisions
@@ -84,12 +84,12 @@ both directions; otherwise the row is `ambiguous` and not touched.
 
 | Decision | Meaning |
 | --- | --- |
-| `restorable` | Backup `NULL`, live `0`, and the live settings equal what the version-82 conversion plus the version 83 bridge yield from the backup row: same `settings_revision`, `monitored`, root folder, quality profile, minimum availability, `local_edit`, `snapshot_owned` and tag set. |
+| `restorable` | Backup `NULL` with `local_edit = 0`, live `0`, and the live settings equal what the version-82 conversion plus the version 83 bridge yield from the backup row: same `settings_revision`, `monitored`, root folder, quality profile, minimum availability, `local_edit`, `snapshot_owned` and tag set. |
 | `already_null` | Live is already `NULL`. A repeat run reports this and changes nothing. |
 | `explicit_false_preserved` | The backup recorded an explicit false; kept. |
 | `explicit_true_preserved` | The backup recorded an explicit true; kept. (An addition to the original list so a true value is not labelled false.) |
 | `local_edit_since_backup` | The live row differs from that conversion in a compared field (the `reason` names the first difference), so it was edited after the backup; kept. |
-| `ambiguous` | No TMDB identity in the backup, or the id and TMDB id point at different live rows, or a monitored row (a monitored collection cannot hold an absent value). |
+| `ambiguous` | No TMDB identity in the backup, or the id and TMDB id point at different live rows, or a monitored row (a monitored collection cannot hold an absent value), or matching settings whose backup already had `local_edit = 1` (later search-only edits cannot be detected). |
 | `missing_in_live` | The backup row has no counterpart collection in the live database. |
 | `unrecoverable_no_backup_provenance` | A live false that the backup does not cover (no usable backup, or no settings row for it in the backup). |
 
@@ -123,8 +123,8 @@ reserved before the database is touched, so an unwritable location fails early.
 * Collections created after the backup, or not in it.
 * A `search_on_add` value deliberately set to false after the backup, when the row already had
   `local_edit = 1` in the backup and nothing else about it changed. The compared fields cannot
-  show that edit. Such rows are `restorable` with a `caveat` in the report; review the dry run
-  before applying.
+  show that edit. All otherwise matching rows with `local_edit = 1` in the backup are therefore
+  `ambiguous` and remain unchanged, even with `--apply`. No automatic restore is safe for them.
 * Rows with a TMDB id missing in the backup, or whose id and TMDB id disagree.
 * Policy edits that were later reverted by hand to the same values: they are indistinguishable
   from no edit.
