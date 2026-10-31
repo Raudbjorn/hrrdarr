@@ -21,6 +21,13 @@ use hrrdarr::api::{LegacyError, SnapshotOptions};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Explicit offline maintenance command; it never starts the server or migrates.
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    if arguments.first().map(String::as_str)
+        == Some(hrrdarr::db::collection_policy_recovery::COMMAND)
+    {
+        return hrrdarr::db::collection_policy_recovery::run_cli(&arguments[1..]).await;
+    }
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -128,6 +135,9 @@ async fn run() -> Result<(), ProcessFailure> {
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     let app = host.apply(app, bound);
     println!("hrrdarr listening on http://{bound}");
+    if state.db.permits_local_imports() {
+        hrrdarr::import::log_probe_capability().await;
+    }
     let runtime = if state.db.permits_local_imports() {
         Some(
             hrrdarr::commands::start_with_metadata(
@@ -135,9 +145,6 @@ async fn run() -> Result<(), ProcessFailure> {
                 refresh,
                 state.metadata.clone(),
             )
-    if state.db.permits_local_imports() {
-        hrrdarr::import::log_probe_capability().await;
-    }
             .await
             .map_err(|e| ProcessFailure::at("command_worker", e))?,
         )

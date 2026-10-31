@@ -16,6 +16,7 @@ pub enum MediaTarget {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+pub mod collection_policy_recovery;
 pub mod custom_formats;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -572,7 +573,6 @@ fn hex(bytes: &[u8]) -> String {
 
 type Migration = (&'static str, &'static str);
 
-async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migration]), Error> {
 /// Fixed text only: the stored name is compared, never echoed. The database was not modified.
 fn history_mismatch(version: i64, name: &str, matched_rows: usize) -> String {
     // Version 50 named `indexer_backoff` after an exact 49-row shared prefix is the unpublished
@@ -588,6 +588,7 @@ fn history_mismatch(version: i64, name: &str, matched_rows: usize) -> String {
     )
 }
 
+async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migration]), Error> {
     if scalar(
         conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
@@ -1045,6 +1046,8 @@ mod transmission_registry_tests;
 mod utorrent_registry_tests;
 
 include!("legacy_migrations.rs");
+#[cfg(test)]
+mod collection_policy_recovery_tests;
 #[cfg(test)]
 mod import_list_tests;
 #[cfg(test)]

@@ -144,6 +144,18 @@ can follow the current main path.
 Every recorded name, SQL body and checksum must match one complete prefix; mixed or tampered
 histories are rejected. Historical SQL variants remain under `migrations/pr31/`.
 
+A database created by the unpublished PR #31 draft head `1431d97` has a different ledger from
+version 50 (`indexer_backoff` instead of `torrent_rss_indexer`) and is rejected before any
+statement runs, with a message that names this case. No conversion is provided for it: restore a
+backup taken before that history was written (`.hrrdarr-migration-*` directories beside the
+database) or start a new database and re-import through the snapshot importer. Issue #44 tracks
+whether an offline converter is ever needed; no database at that draft is known to exist.
+
+A database that already completed the published PR #31 version-82 conversion lost the difference
+between an absent and an explicit-false collection "search on add" setting. See
+[collection policy recovery](collection-policy-recovery.md) for the explicit, dry-run-first
+command that restores it from a matching pre-upgrade backup.
+
 The registry creates `import_lists`, `import_list_tags`, `import_list_exclusions`,
 `import_list_runs`, `import_list_items`, `import_list_additions`, and triggers for capacity,
 identity, revision, run retention and profile/root deletion.
