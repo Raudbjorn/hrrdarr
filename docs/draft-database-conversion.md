@@ -75,7 +75,8 @@ reason in the report:
    per-table row counts, and the cross-table facts main's triggers only enforce on write (collection
    roots in the movies domain, member revisions, member and tag limits, directory-client categories).
    Data main would reject is refused rather than published.
-6. Checks the output with the application's own migration-history reader (79 rows, main lineage) and
+6. Checks the output with the application's own migration-history reader (79 rows, the pinned
+   import-list lineage; normal startup upgrades it through version 83) and
    publishes it with a no-clobber hard link, mode `0600`. The destination filesystem must support
    hard links; otherwise conversion fails without publishing a destination. There is no direct-copy
    fallback that could expose a partially copied database.
