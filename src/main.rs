@@ -28,6 +28,9 @@ async fn main() -> std::process::ExitCode {
     {
         return hrrdarr::db::collection_policy_recovery::run_cli(&arguments[1..]).await;
     }
+    if arguments.first().map(String::as_str) == Some(hrrdarr::db::draft_conversion::COMMAND) {
+        return hrrdarr::db::draft_conversion::run_cli(&arguments[1..]).await;
+    }
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

@@ -477,21 +477,21 @@ pub struct BackupEvidence {
 }
 
 /// Removes the scratch directory on every exit path.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_dir_all(&self.0) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "{}",
-                    serde_json::json!({"level":"WARN","event":"collection_policy_recovery_scratch_not_removed","error_kind":format!("{:?}", error.kind())})
+                    serde_json::json!({"level":"WARN","event":"maintenance_scratch_not_removed","error_kind":format!("{:?}", error.kind())})
                 );
             }
         }
     }
 }
 
-fn private_directory(path: &Path) -> std::io::Result<()> {
+pub(super) fn private_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -501,7 +501,7 @@ fn private_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
-fn sha256_hex(digest: ring::digest::Context) -> String {
+pub(super) fn sha256_hex(digest: ring::digest::Context) -> String {
     hex(digest.finish().as_ref())
 }
 
@@ -713,16 +713,20 @@ pub struct RunReport {
     pub json: serde_json::Value,
 }
 
-fn unix_seconds() -> Result<u64, Error> {
+pub(super) fn unix_seconds() -> Result<u64, Error> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
 }
 
 /// Reserves the report name before the database is touched so an unwritable location fails early.
-fn reserve_report(directory: &Path, mode: &str) -> Result<(File, PathBuf), Error> {
+pub(super) fn reserve_report(
+    directory: &Path,
+    stem: &str,
+    mode: &str,
+) -> Result<(File, PathBuf), Error> {
     let path = directory.join(format!(
-        "hrrdarr-collection-policy-recovery-{mode}-{}-{}.json",
+        "hrrdarr-{stem}-{mode}-{}-{}.json",
         unix_seconds()?,
         uuid::Uuid::new_v4()
     ));
@@ -739,7 +743,7 @@ fn reserve_report(directory: &Path, mode: &str) -> Result<(File, PathBuf), Error
     Ok((file, path))
 }
 
-fn write_report(mut file: File, json: &serde_json::Value) -> Result<(), Error> {
+pub(super) fn write_report(mut file: File, json: &serde_json::Value) -> Result<(), Error> {
     file.write_all(serde_json::to_string_pretty(json)?.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -796,7 +800,7 @@ pub async fn run(options: &Options) -> Result<RunReport, Error> {
         }
     }
     // The report is reserved first and never placed inside the backup.
-    let (report_file, report_path) = reserve_report(&live_dir, mode)?;
+    let (report_file, report_path) = reserve_report(&live_dir, "collection-policy-recovery", mode)?;
     let result = run_inner(options, &live_dir).await;
     match result {
         Ok(mut report) => {

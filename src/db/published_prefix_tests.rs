@@ -613,27 +613,23 @@ async fn mixed_or_tampered_lineages_fail_before_backup() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn unpublished_draft_ledger_is_rejected_with_recovery_guidance_and_left_untouched()
+async fn unpublished_draft_ledger_is_rejected_pointing_at_the_converter_and_left_untouched()
 -> Result<(), Error> {
     let files = Scratch::new();
     let path = files.0.join("db");
-    // The 49-row prefix shared by every lineage, then the draft head's version 50 (`indexer_backoff`
-    // where both published lineages have `torrent_rss_indexer`). Only the name matters here: any
-    // row that is not an exact published entry is rejected before a single statement runs.
-    let (raw, c) = seed_lineage(&path, MIGRATIONS, 49).await?;
-    c.execute(
-        "INSERT INTO schema_migrations(version,name,checksum,sql) VALUES(50,'indexer_backoff',?,?)",
-        params![checksum("-- draft"), "-- draft"],
-    )
-    .await?;
+    // A real draft database, rebuilt from the migration files of draft head 1431d97. Its ledger is
+    // identical to main's through version 62, so the first mismatch is at 63 (`notifications`).
+    let (raw, c) = super::draft_conversion_tests::draft_database(&path).await?;
     let before = scalar(&c, "SELECT count(*) FROM schema_migrations").await?;
+    assert_eq!(before, 76);
     drop(c);
     drop(raw);
     let message = Database::open_local(&path).await.err().unwrap().to_string();
     for expected in [
-        "migration history mismatch at version 50",
+        "migration history mismatch at version 63",
         "unpublished PR #31 draft ledger",
-        "no supported conversion",
+        "convert-draft-database --from",
+        "docs/draft-database-conversion.md",
         "The database was not modified",
         ".hrrdarr-migration-",
         "snapshot importer",
@@ -653,8 +649,21 @@ async fn unpublished_draft_ledger_is_rejected_with_recovery_guidance_and_left_un
         scalar(&c, "SELECT count(*) FROM schema_migrations").await?,
         before
     );
-    // A different name at version 50 gets the generic text, not the draft claim.
-    assert!(!history_mismatch(50, "something_else", 49).contains("draft"));
-    assert!(!history_mismatch(51, "indexer_backoff", 50).contains("draft"));
+    // Only an exact draft row earns the draft hint; any other row gets the generic text.
+    let draft = super::draft_conversion::DRAFT_TAIL[13];
+    assert_eq!((draft.0, 50 + 13), ("notifications", 63));
+    assert!(history_mismatch(63, draft.0, draft.1).contains("convert-draft-database"));
+    for (version, name, checksum) in [
+        (63, "notifications", "not-the-draft-checksum"),
+        (63, "something_else", draft.1),
+        (49, draft.0, draft.1),
+        (77, draft.0, draft.1),
+        (-1, draft.0, draft.1),
+    ] {
+        assert!(
+            !history_mismatch(version, name, checksum).contains("draft"),
+            "{version} {name}"
+        );
+    }
     Ok(())
 }

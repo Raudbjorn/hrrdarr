@@ -145,11 +145,10 @@ Every recorded name, SQL body and checksum must match one complete prefix; mixed
 histories are rejected. Historical SQL variants remain under `migrations/pr31/`.
 
 A database created by the unpublished PR #31 draft head `1431d97` has a different ledger from
-version 50 (`indexer_backoff` instead of `torrent_rss_indexer`) and is rejected before any
-statement runs, with a message that names this case. No conversion is provided for it: restore a
-backup taken before that history was written (`.hrrdarr-migration-*` directories beside the
-database) or start a new database and re-import through the snapshot importer. Issue #44 tracks
-whether an offline converter is ever needed; no database at that draft is known to exist.
+the published one (from version 50) and from main (from version 63, `notifications`). Startup
+rejects it before any statement runs, with a message that says so. Convert it into a new database
+with the explicit, offline `hrrdarr convert-draft-database --from <draft database> --to <new
+database>`; the source is never modified. See [draft database conversion](draft-database-conversion.md).
 
 A database that already completed the published PR #31 version-82 conversion lost the difference
 between an absent and an explicit-false collection "search on add" setting. See

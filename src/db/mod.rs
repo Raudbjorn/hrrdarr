@@ -18,6 +18,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub mod collection_policy_recovery;
 pub mod custom_formats;
+pub mod draft_conversion;
 
 const MIGRATIONS: &[(&str, &str)] = &[
     (
@@ -573,13 +574,22 @@ fn hex(bytes: &[u8]) -> String {
 
 type Migration = (&'static str, &'static str);
 
-/// Fixed text only: the stored name is compared, never echoed. The database was not modified.
-fn history_mismatch(version: i64, name: &str, matched_rows: usize) -> String {
-    // Version 50 named `indexer_backoff` after an exact 49-row shared prefix is the unpublished
-    // PR #31 draft ledger (commit 1431d97). Recognising it only improves this message; it is still
-    // rejected and no conversion is attempted (issue #44).
-    let draft = if version == 50 && matched_rows == 49 && name == "indexer_backoff" {
-        " Version 50 is `indexer_backoff`, the unpublished PR #31 draft ledger (draft head 1431d97), which has no supported conversion."
+/// Fixed text only: the stored name and checksum are compared, never echoed. The database was not
+/// modified.
+fn history_mismatch(version: i64, name: &str, recorded_checksum: &str) -> String {
+    // The unpublished PR #31 draft ledger (draft head 1431d97) shares versions 1 through 62 with the
+    // main lineage and first differs at version 63. A row that is exactly the draft's row for its
+    // version only improves this message; startup still rejects it. `draft_conversion` builds a new,
+    // supported database from it (issue #44).
+    let draft = usize::try_from(version)
+        .ok()
+        .and_then(|v| v.checked_sub(50))
+        .and_then(|i| draft_conversion::DRAFT_TAIL.get(i))
+        .is_some_and(|&(draft_name, draft_checksum)| {
+            draft_name == name && draft_checksum == recorded_checksum
+        });
+    let draft = if draft {
+        " This row is part of the unpublished PR #31 draft ledger (draft head 1431d97). Convert it into a new database with `hrrdarr convert-draft-database --from <this database> --to <new database>` (see docs/draft-database-conversion.md); the source is never modified."
     } else {
         ""
     };
@@ -624,7 +634,7 @@ async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migrat
         main_matches &= matches(MIGRATIONS);
         legacy_matches &= matches(LEGACY_MIGRATIONS);
         if !main_matches && !legacy_matches {
-            return Err(history_mismatch(n, &name, count).into());
+            return Err(history_mismatch(n, &name, &recorded_checksum).into());
         }
         count += 1;
     }
@@ -1048,6 +1058,8 @@ mod utorrent_registry_tests;
 include!("legacy_migrations.rs");
 #[cfg(test)]
 mod collection_policy_recovery_tests;
+#[cfg(test)]
+mod draft_conversion_tests;
 #[cfg(test)]
 mod import_list_tests;
 #[cfg(test)]
