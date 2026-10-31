@@ -152,6 +152,22 @@ async fn list_searches_execute_for_both_domains_and_keep_background_policy_after
             .await,
         2
     );
+    // List searches record real dispatch for Wanted ordering while retaining background authority.
+    assert_eq!(
+        h.count("SELECT count(*) FROM search_commands WHERE dispatch_completed_at IS NOT NULL")
+            .await,
+        2
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM episodes WHERE native_last_search_at IS NOT NULL")
+            .await,
+        1
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM movies WHERE native_last_search_at IS NOT NULL")
+            .await,
+        1
+    );
     assert_eq!(h.count("SELECT count(*) FROM search_results s JOIN search_commands c ON c.id=s.command_id WHERE c.media_type='movies' AND s.decision_json LIKE '%movie_unavailable%'").await,1);
     assert_eq!(
         h.count("SELECT count(*) FROM rss_candidates WHERE media_type='movies'")

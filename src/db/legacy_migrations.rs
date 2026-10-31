@@ -349,4 +349,13 @@ const LEGACY_MIGRATIONS: &[(&str, &str)] = &[
         "import_list_search",
         include_str!("../../migrations/0084_import_list_search.sql"),
     ),
+    (
+        "wanted_last_search",
+        include_str!("../../migrations/0079_wanted_last_search.sql"),
+    ),
+    (
+        "library_root_health",
+        include_str!("../../migrations/0080_library_root_health.sql"),
+    ),
+    ("backups", include_str!("../../migrations/0081_backups.sql")),
 ];

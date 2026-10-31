@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert_eq!(
         count(
@@ -263,7 +263,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

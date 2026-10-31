@@ -419,7 +419,7 @@ fn both_published_ledgers_remain_byte_identical() {
     }
 }
 
-pub(super) async fn seed_lineage(
+pub(crate) async fn seed_lineage(
     path: &Path,
     history: &[Migration],
     count: usize,
@@ -664,6 +664,95 @@ async fn unpublished_draft_ledger_is_rejected_pointing_at_the_converter_and_left
             !history_mismatch(version, name, checksum).contains("draft"),
             "{version} {name}"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_published_tips_preserve_exact_ledgers_and_snapshot_identity() -> Result<(), Error> {
+    async fn rows(c: &Connection, table: &str) -> Result<Vec<Vec<libsql::Value>>, Error> {
+        let mut result = Vec::new();
+        let mut rows = c
+            .query(&format!("SELECT * FROM {table} ORDER BY version"), ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            result.push(
+                (0..row.column_count())
+                    .map(|i| row.get_value(i))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(result)
+    }
+    for (history, prefix) in [
+        (MIGRATIONS, 80),
+        (MAIN_MIGRATIONS, 81),
+        (LEGACY_MIGRATIONS, 84),
+    ] {
+        let files = Scratch::new();
+        let path = files.0.join("db");
+        let (raw, c) = seed_lineage(&path, history, prefix).await?;
+        c.execute_batch(
+            "INSERT INTO series(id,title,path) VALUES(1,'Retained','/tv/retained');
+            INSERT INTO movie_metadata(id,title) VALUES(1,'Retained movie');
+            INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/movies/retained');",
+        )
+        .await?;
+        let before = rows(&c, "schema_migrations").await?;
+        c.execute(&format!("CREATE TRIGGER reject_tail BEFORE INSERT ON schema_migrations WHEN NEW.version={} BEGIN SELECT RAISE(ABORT,'rollback fixture'); END",history.len()),()).await?;
+        drop(c);
+        drop(raw);
+        assert!(
+            Database::open_local(&path)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rolled back")
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        assert_eq!(rows(&c, "schema_migrations").await?, before);
+        c.execute("DROP TRIGGER reject_tail", ()).await?;
+        drop(c);
+        drop(raw);
+        for reopen in 0..2 {
+            let db = Database::open_local(&path).await?;
+            assert_eq!(db.migration_backup().is_some(), reopen == 0);
+            let c = db.connect().await?;
+            assert_eq!(migration_history(&c).await?, (history.len(), history));
+            assert_eq!(&rows(&c, "schema_migrations").await?[..prefix], before);
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM series WHERE id=1 AND title='Retained'"
+                )
+                .await?,
+                1
+            );
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM movies WHERE id=1 AND metadata_id=1"
+                )
+                .await?,
+                1
+            );
+            assert_eq!(scalar(&c, "SELECT count(*) FROM backup_settings").await?, 1);
+            assert_eq!(scalar(&c,"SELECT count(*) FROM health_checks WHERE check_key IN ('root_folder','collection_root_folder','mount_read_only')").await?,5);
+            let copy = files.0.join(format!("snapshot-{reopen}.db"));
+            vacuum_into(&c, &copy).await?;
+            let facts = inspect_snapshot(&copy, SnapshotOpen::ReadOnly).await?;
+            assert_eq!(facts.schema_version, history.len());
+            assert_eq!(
+                facts.migrations,
+                history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, sql))| (i + 1, *name, checksum(sql)))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
     Ok(())
 }

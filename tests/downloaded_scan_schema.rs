@@ -109,7 +109,8 @@ async fn witness_queries(c: &Connection) -> Result<Vec<String>, Error> {
             " WHERE version<=53"
         } else if name == "health_checks" {
             // Reasoning: 0060 registers recycle_bin identities after this predecessor; preserved rows stay exact.
-            " WHERE check_key!='recycle_bin'"
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            " WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         } else {
             ""
         };
@@ -205,7 +206,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -344,6 +345,9 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
                 " IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')",
                 "='qbittorrent'",
             )
+            // Reasoning: 0079 appends only these nullable columns; preserve predecessor DDL exactly.
+            .replace(", native_last_search_at INTEGER CHECK(native_last_search_at IS NULL OR (typeof(native_last_search_at)='integer' AND native_last_search_at BETWEEN 0 AND 9007199254740991))", "")
+            .replace(", dispatch_completed_at INTEGER CHECK(dispatch_completed_at IS NULL OR (typeof(dispatch_completed_at)='integer' AND dispatch_completed_at BETWEEN 0 AND 9007199254740991))", "")
             // Reasoning: 0068 admits the generic torrent RSS feed as an indexer in the RSS/search
             // admission guards (tests/torrent_rss.rs covers the admission itself); that widened
             // indexer predicate is the only other allocated change, so map it back to compare the rest.
@@ -372,7 +376,8 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     assert_eq!(
         scalar(
             &after,
-            "SELECT count(*) FROM health_checks WHERE check_key!='recycle_bin'"
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            "SELECT count(*) FROM health_checks WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only')"
         )
         .await?,
         22, // Reasoning: 0060 adds recycle_bin identities; 0054's scan itself adds none.

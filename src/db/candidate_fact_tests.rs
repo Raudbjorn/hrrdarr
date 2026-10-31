@@ -69,7 +69,7 @@ async fn candidate_comparison_facts_upgrade_rollback_submission_freeze_and_reope
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
+    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
     assert_eq!(
         scalar(
             &c,

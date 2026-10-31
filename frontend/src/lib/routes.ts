@@ -2,7 +2,7 @@
 export type ViewId =
   | 'library' | 'health' | 'providers' | 'activity' | 'blocklist' | 'rss' | 'qualities' | 'profiles'
   | 'naming' | 'import-existing' | 'custom-formats' | 'tags' | 'media-management' | 'general' | 'history'
-  | 'wanted-missing' | 'wanted-cutoff' | 'calendar' | 'collections' | 'autotagging' | 'notifications' | 'import-lists';
+  | 'wanted-missing' | 'wanted-cutoff' | 'calendar' | 'collections' | 'autotagging' | 'notifications' | 'import-lists' | 'backup';
 
 export type Route =
   | { kind: 'view'; view: ViewId }
@@ -17,6 +17,7 @@ export const SETTINGS_INDEX_PATH = '/settings';
 export const VIEW_PATHS: Readonly<Record<ViewId, string>> = {
   library: '/',
   health: '/system/health',
+  backup: '/system/backup',
   rss: '/system/rss',
   activity: '/activity/queue',
   blocklist: '/activity/blocklist',
@@ -60,7 +61,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 
 /** Listed as text only, never as links. */
 export const UNAVAILABLE_SECTIONS: readonly string[] = [
-  'Metadata', 'UI settings', 'Backup', 'Updates', 'Logs',
+  'Metadata', 'UI settings', 'Updates', 'Logs',
 ];
 
 const PATH_TO_VIEW = new Map<string, ViewId>(VIEW_IDS.map((v) => [VIEW_PATHS[v], v]));

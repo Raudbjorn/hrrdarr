@@ -122,39 +122,39 @@ async fn acquire(db: &Arc<Database>, client: &RefreshClient) -> Result<Owner> {
             "command_local_ownership_required",
         ));
     }
-    if !client.matches_database(&db) {
+    if !client.matches_database(db) {
         return Err(Error(StatusCode::CONFLICT, "command_database_mismatch"));
     }
     {
         let mut owners = OWNERS
             .lock()
             .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_owner_unavailable"))?;
-        if !owners.insert(Arc::as_ptr(&db) as usize) {
+        if !owners.insert(Arc::as_ptr(db) as usize) {
             return Err(Error(StatusCode::CONFLICT, "command_worker_active"));
         }
     }
     let owner = Owner(Some(db.clone()));
     tokio::time::timeout(
         Duration::from_secs(10),
-        crate::completed_download_handling::startup(&db),
+        crate::completed_download_handling::startup(db),
     )
     .await
     .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "cdh_timeout"))?
     .map_err(|e| Error(e.0, e.1))?;
-    tokio::time::timeout(Duration::from_secs(10), crate::health::startup(&db))
+    tokio::time::timeout(Duration::from_secs(10), crate::health::startup(db))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "health_timeout"))??;
-    tokio::time::timeout(Duration::from_secs(10), recover(&db, "interrupted"))
+    tokio::time::timeout(Duration::from_secs(10), recover(db, "interrupted"))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;
     // Interrupted explicit file deletions are finished or undone from their journal before any
     // new work runs. Bounded: one recovery pass, each row one transfer at most.
-    crate::recycle_bin::deletion::startup(&db)
+    crate::recycle_bin::deletion::startup(db)
         .await
         .map_err(|e| Error(e.0, e.1))?;
     // Interrupted rename groups are rolled forward or back from their journal.
-    rename::startup(&db).await?;
-    tokio::time::timeout(Duration::from_secs(10), recover_rss(&db, "interrupted"))
+    rename::startup(db).await?;
+    tokio::time::timeout(Duration::from_secs(10), recover_rss(db, "interrupted"))
         .await
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "command_storage_timeout"))??;
     Ok(owner)
@@ -211,6 +211,7 @@ async fn recover(db: &Database, code: &str) -> Result<()> {
     recycle_cleanup::recover(&c, timestamp, code).await?;
     collection_refresh::recover(&c, timestamp, code).await?;
     rename::recover(&c, timestamp, code).await?;
+    backup::recover(&c, timestamp, code).await?;
     crate::health::recover(&c, timestamp, code).await?;
     Ok(())
 }
@@ -261,6 +262,7 @@ enum Claimed {
     RecycleCleanup(recycle_cleanup::RecycleBinCleanupCommand),
     CollectionRefresh(collection_refresh::CollectionRefreshCommand),
     Rename(rename::RenameCommand),
+    Backup(backup::BackupCommand),
 }
 async fn claim(db: &Database) -> Result<Option<Claimed>> {
     let c = connection(db).await?;
@@ -276,6 +278,8 @@ async fn claim(db: &Database) -> Result<Option<Claimed>> {
         crate::health::sweep(&tx,timestamp).await?;
         recycle_cleanup::schedule_due(&tx,timestamp).await?;
         collection_refresh::schedule_due(&tx,timestamp).await?;
+        backup::schedule_due(&tx,timestamp).await?;
+        if let Some(command)=backup::claim_due(&tx,timestamp).await? {return Ok(Some(Claimed::Backup(command)))}
         let row=tx.query(&format!("SELECT id,kind FROM (SELECT id,0 kind,priority,created_at FROM commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND (origin!='automatic' OR manual_bypass=1 OR NOT EXISTS(SELECT 1 FROM download_client_status b WHERE b.provider_id=commands.provider_id AND b.media_type=commands.media_type AND b.config_revision=commands.provider_revision AND b.disabled_until>?)) UNION ALL SELECT id,1 kind,priority,created_at FROM metadata_refresh_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,2 kind,priority,created_at FROM blocklist_clear_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,3 kind,priority,created_at FROM rss_commands WHERE status IN ('queued','retry_wait','running') AND next_attempt_at<=? UNION ALL SELECT id,4 kind,0 priority,created_at FROM rss_candidates WHERE status IN ('pending','prepared','reconciling') AND (not_before IS NULL OR not_before<=?) AND (command_id IS NULL OR NOT EXISTS(SELECT 1 FROM rss_commands c WHERE c.id=rss_candidates.command_id AND c.status IN ('queued','running','retry_wait'))) UNION ALL SELECT candidate_id id,5 kind,0 priority,created_at FROM download_processing WHERE ((status='queued' AND NOT {reserved} AND NOT EXISTS(SELECT 1 FROM rescan_commands r JOIN rss_candidates c ON c.id=download_processing.candidate_id WHERE r.status IN ('queued','running','retry_wait') AND ((c.media_type='tv' AND r.media_type='tv' AND r.series_id=c.series_id) OR (c.media_type='movies' AND r.media_type='movies' AND r.movie_id=c.movie_id)))) OR (status='importing' AND (error_code IS NULL OR resume_requested=1))) AND next_attempt_at<=? UNION ALL SELECT id,6 kind,priority,created_at FROM search_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,7 kind,priority,created_at FROM manual_import_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM manual_import_commands r WHERE r.status='running') AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.id=manual_import_commands.operation_id AND EXISTS(SELECT 1 FROM rescan_commands r WHERE r.status IN ('queued','running','retry_wait') AND ((o.media_type='episode' AND r.media_type='tv' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=r.series_id)) OR (o.media_type='movie' AND r.media_type='movies' AND r.movie_id=o.movie_id)))) UNION ALL SELECT id,8 kind,priority,created_at FROM quality_reset_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,9 kind,priority,created_at FROM rescan_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM import_journal j JOIN operations o ON o.id=j.operation_id WHERE j.phase NOT IN ('preview','complete') AND ((rescan_commands.media_type='tv' AND o.media_type='episode' AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=o.episode_id AND e.series_id=rescan_commands.series_id)) OR (rescan_commands.media_type='movies' AND o.media_type='movie' AND o.movie_id=rescan_commands.movie_id))) AND NOT EXISTS(SELECT 1 FROM download_processing dp JOIN rss_candidates r ON r.id=dp.candidate_id WHERE dp.status IN ('checking','importing') AND ((rescan_commands.media_type='tv' AND r.media_type='tv' AND r.series_id=rescan_commands.series_id) OR (rescan_commands.media_type='movies' AND r.media_type='movies' AND r.movie_id=rescan_commands.movie_id))) UNION ALL SELECT id,10 kind,priority,created_at FROM health_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,11 kind,priority,ready_order_at created_at FROM downloaded_scan_commands WHERE (status IN ('queued','retry_wait') OR status='running') AND next_attempt_at<=? UNION ALL SELECT id,12 kind,priority,created_at FROM recycle_bin_cleanup_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,13 kind,priority,created_at FROM rename_commands WHERE status IN ('queued','retry_wait') AND next_attempt_at<=? UNION ALL SELECT id,14 kind,CASE WHEN origin='manual' THEN 0 ELSE -1 END priority,next_attempt_at created_at FROM collection_refresh_commands WHERE status='queued' AND next_attempt_at<=?) ORDER BY priority DESC,created_at,id LIMIT 1",reserved=processing::SCAN_RESERVED),params![timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp,timestamp]).await?.next().await?;
         let Some(row)=row else{return Ok(None)};
         let id=Uuid::parse_str(&row.get::<String>(0)?).map_err(|_|bad())?;
@@ -346,6 +350,7 @@ async fn run_claimed(
             return collection_refresh::run(db, metadata_client, command).await;
         }
         Claimed::Rename(command) => return rename::run(db, command).await,
+        Claimed::Backup(command) => return backup::run(db, command).await,
         Claimed::Health(command) => {
             return crate::health::run(db, client, command)
                 .await
@@ -1567,6 +1572,52 @@ mod tests {
             scalar(&c, "SELECT escalation_level FROM download_client_status").await,
             4
         );
+    }
+    #[tokio::test]
+    async fn collection_refresh_continuations_do_not_preempt_same_priority_work() {
+        let path = std::env::temp_dir().join(format!(
+            "hrrdarr-collection-refresh-fairness-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let _scratch = Scratch(path.clone());
+        let db = Database::open_local(path.join("db")).await.unwrap();
+        let c = db.connect().await.unwrap();
+        let refresh = Uuid::new_v4().to_string();
+        let reset = Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO collection_refresh_commands(id,name,origin,status,attempts,next_attempt_at,created_at) VALUES(?,'refresh_collections','manual','queued',0,1000,1000)",
+            [refresh.clone()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO quality_reset_commands(id,media_type,reset_titles,priority,status,attempts,next_attempt_at,created_at) VALUES(?,'tv',0,0,'queued',0,1000,2000)",
+            [reset.clone()],
+        )
+        .await
+        .unwrap();
+        let Some(Claimed::CollectionRefresh(first)) = claim(&db).await.unwrap() else {
+            panic!("older collection refresh must be first")
+        };
+        assert_eq!(first.id.to_string(), refresh);
+        collection_refresh::recover(&c, now().unwrap(), "interrupted")
+            .await
+            .unwrap();
+        let Some(Claimed::QualityReset(second)) = claim(&db).await.unwrap() else {
+            panic!("same-priority unrelated work must run between refresh claims")
+        };
+        assert_eq!(second.id.to_string(), reset);
+        c.execute(
+            "UPDATE quality_reset_commands SET status='cancelled',completed_at=1 WHERE id=?",
+            [reset],
+        )
+        .await
+        .unwrap();
+        let Some(Claimed::CollectionRefresh(third)) = claim(&db).await.unwrap() else {
+            panic!("collection refresh continues once nothing else is due")
+        };
+        assert_eq!(third.id.to_string(), refresh);
     }
     #[tokio::test]
     async fn scan_continuations_order_by_ready_time_so_same_priority_work_interleaves() {

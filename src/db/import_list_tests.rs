@@ -87,7 +87,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
+    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=9").await,
         1
@@ -98,7 +98,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(db);
     // Reopening is a no-op.
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
+    assert_eq!(version(&db.connect().await?).await?, 83); // Both published tails append without rewriting existing ledger entries.
     Ok(())
 }
 
@@ -125,7 +125,11 @@ async fn search_outbox_upgrades_both_published_histories_atomically() -> Result<
     }
 
     // Both deployed tips are immutable; the same outbox migration appends at different ordinals.
-    for (history, prefix) in [(MIGRATIONS, 79), (LEGACY_MIGRATIONS, 83)] {
+    for (history, prefix) in [
+        (MIGRATIONS, 79),
+        (MAIN_MIGRATIONS, 82),
+        (LEGACY_MIGRATIONS, 83),
+    ] {
         let files = Scratch::new();
         let path = files.0.join("db");
         let (raw, c) = seed_lineage(&path, history, prefix).await?;
@@ -170,7 +174,7 @@ async fn search_outbox_upgrades_both_published_histories_atomically() -> Result<
         for reopen in 0..2 {
             let db = Database::open_local(&path).await?;
             let c = db.connect().await?;
-            assert_eq!(version(&c).await?, prefix + 1);
+            assert_eq!(version(&c).await?, history.len()); // Upgrade also applies the other published tail.
             assert_eq!(db.migration_backup().is_some(), reopen == 0);
             assert_eq!(
                 witness(&c, prefix).await?,

@@ -956,6 +956,111 @@ async fn status_mapping_isolation_details_and_controls() {
     task.abort();
 }
 
+#[tokio::test]
+async fn paginated_shared_queues_reconcile_later_waiting_and_stopped_downloads() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    for (status, method) in [
+        ("paused", "aria2.tellWaiting"),
+        ("complete", "aria2.tellStopped"),
+    ] {
+        f.0.lock().unwrap().downloads.clear();
+        for n in 0..1002 {
+            f.put(dl(
+                &format!("{n:016x}"),
+                &format!("{n:040x}"),
+                "Queued",
+                if n % 2 == 0 {
+                    "/downloads/tv-hrr"
+                } else {
+                    "/downloads/movies-hrr"
+                },
+                status,
+            ));
+        }
+        for (domain, target, n) in [
+            (MediaDomain::Tv, MediaTarget::Episode(1), 1000),
+            (MediaDomain::Movies, MediaTarget::Movie(1), 1001),
+        ] {
+            let operation = client.operation(Uuid::new_v4()).unwrap();
+            let hash = format!("{n:040x}");
+            let prepared = label_client::prepare(
+                &operation,
+                &settings,
+                target,
+                AddSource::Magnet(magnet(&hash)),
+                false,
+                QbitOptions::default(),
+            )
+            .await
+            .unwrap();
+            f.clear();
+            assert_eq!(
+                label_client::reconcile(&operation, &settings, Some(&login()), prepared.identity())
+                    .await
+                    .unwrap(),
+                Reconciliation::Observed { hash: hash.clone() },
+                "later {status} rows in {domain:?} must not be treated as absent",
+            );
+            assert_eq!(
+                f.calls(method)
+                    .iter()
+                    .map(|p| p[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![json!(0), json!(1000)]
+            );
+            let mut request = query(domain);
+            request.offset = 500;
+            let page = label_client::query(&operation, &settings, Some(&login()), &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                page.items.len(),
+                1,
+                "each domain retains its 501st download"
+            );
+            assert_eq!(page.items[0].hash, hash);
+            assert_eq!(page.next_offset, None);
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn oversized_non_torrent_queue_is_an_error_not_an_absent_submission() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let operation = client.operation(Uuid::new_v4()).unwrap();
+    let prepared = label_client::prepare(
+        &operation,
+        &settings,
+        MediaTarget::Episode(1),
+        AddSource::Magnet(magnet("1111111111111111111111111111111111111111")),
+        false,
+        QbitOptions::default(),
+    )
+    .await
+    .unwrap();
+    // Skipped HTTP downloads still consume the enumeration budget.
+    for n in 0..8193 {
+        f.put(dl(
+            &format!("{n:016x}"),
+            "",
+            "plain.bin",
+            "/downloads",
+            "waiting",
+        ));
+    }
+    assert_eq!(
+        label_client::reconcile(&operation, &settings, Some(&login()), prepared.identity()).await,
+        Err(QbitError::Http(HttpError::ResponseTooLarge)),
+    );
+    assert_eq!(f.calls("aria2.tellWaiting").len(), 9);
+    task.abort();
+}
+
 /// Unrelated HTTP and torrent downloads still consume inventory windows.
 fn fill(f: &Fixture, count: u32, status: &str) {
     for n in 0..count {

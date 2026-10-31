@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseHash,hashFor,VIEW_IDS,VIEW_PATHS,SETTINGS_SECTIONS,UNAVAILABLE_SECTIONS,MAX_DISPLAY_LENGTH,MAX_HASH_LENGTH} from '../src/lib/routes.ts';
 
-const EXPECTED_VIEWS=['library','health','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','collections','autotagging','notifications','import-lists'];
+// Both import lists and System Backup are implemented after merging the feature branches.
+const EXPECTED_VIEWS=['library','health','backup','providers','activity','blocklist','rss','qualities','profiles','naming','import-existing','custom-formats','tags','media-management','general','history','wanted-missing','wanted-cutoff','calendar','collections','autotagging','notifications','import-lists'];
 
 test('table covers exactly the existing views',()=>{
   assert.deepEqual([...VIEW_IDS].sort(),[...EXPECTED_VIEWS].sort());
@@ -94,7 +95,8 @@ test('settings index lists only implemented views and no unavailable section',()
     assert.ok(VIEW_PATHS[s.view].startsWith('/settings/'),s.view);
     assert.equal(seen.has(s.view),false);seen.add(s.view);
   }
-  assert.deepEqual(UNAVAILABLE_SECTIONS,['Metadata','UI settings','Backup','Updates','Logs']);
+  // Backup has a system route; import lists has its own settings route.
+  assert.deepEqual(UNAVAILABLE_SECTIONS,['Metadata','UI settings','Updates','Logs']);
   const labels=SETTINGS_SECTIONS.map(s=>s.label.toLowerCase());
   for(const name of UNAVAILABLE_SECTIONS) assert.equal(labels.includes(name.toLowerCase()),false,name);
   for(const bad of ['importlists','metadata','ui','backup','updates','logs']) assert.equal(parseHash(`#/settings/${bad}`).kind,'not-found',bad);

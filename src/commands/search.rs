@@ -66,6 +66,9 @@ pub struct SearchCommand {
     pub selected_candidate_status: Option<String>,
     pub selected_candidate_error_code: Option<String>,
     pub selected_candidate_reasons: Vec<String>,
+    // Unix seconds when this command's indexer dispatch phase last completed (any attempt),
+    // including a caught indexer failure; `null` until an eligible indexer request was issued.
+    pub dispatch_completed_at: Option<i64>,
 }
 #[derive(Serialize, ts_rs::TS)]
 pub struct SearchResult {
@@ -117,7 +120,7 @@ struct Context {
     db: Arc<Database>,
     client: RefreshClient,
 }
-const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),c.selection_kind,(SELECT r.client_id FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),coalesce((SELECT json_group_array(json_object('ordinal',a.ordinal,'selection_round',a.selection_round,'client_id',a.client_id,'client_revision',a.client_revision,'state',a.state,'error_code',a.error_code,'created_at',a.created_at,'updated_at',a.updated_at)) FROM (SELECT a.* FROM rss_client_attempts a JOIN search_results s ON s.selected_candidate_id=a.candidate_id WHERE s.command_id=c.id ORDER BY a.ordinal) a),'[]')";
+const COLUMNS: &str = "c.id,c.mode,c.media_type,c.requested_episode_id,c.requested_movie_id,c.indexer_id,c.indexer_revision,c.client_id,c.client_revision,c.priority,c.status,c.attempts,c.next_attempt_at,c.created_at,c.started_at,c.completed_at,c.error_code,c.fetched,c.fetch_complete,(SELECT selected_candidate_id FROM search_results WHERE command_id=c.id AND selected_candidate_id IS NOT NULL),(SELECT r.status FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.error_code FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),(SELECT r.decision_reasons_json FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),c.selection_kind,(SELECT r.client_id FROM search_results s JOIN rss_candidates r ON r.id=s.selected_candidate_id WHERE s.command_id=c.id),coalesce((SELECT json_group_array(json_object('ordinal',a.ordinal,'selection_round',a.selection_round,'client_id',a.client_id,'client_revision',a.client_revision,'state',a.state,'error_code',a.error_code,'created_at',a.created_at,'updated_at',a.updated_at)) FROM (SELECT a.* FROM rss_client_attempts a JOIN search_results s ON s.selected_candidate_id=a.candidate_id WHERE s.command_id=c.id ORDER BY a.ordinal) a),'[]'),c.dispatch_completed_at";
 fn parse_mode(s: &str) -> Result<SearchMode> {
     match s {
         "automatic" => Ok(SearchMode::Automatic),
@@ -174,6 +177,7 @@ fn command_row(r: libsql::Row) -> Result<SearchCommand> {
             &r.get::<Option<String>>(22)?.unwrap_or_else(|| "[]".into()),
         )
         .map_err(|_| bad())?,
+        dispatch_completed_at: r.get(26)?,
     })
 }
 async fn read(c: &Connection, id: Uuid) -> Result<SearchCommand> {
@@ -604,6 +608,7 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 /// Children of one Wanted request share a 64-bit prefix derived from the request UUID alone,
 /// so an exact replay finds its original capture by an indexed range read. The suffix binds
 /// the canonical request digest and target; a different body under the same UUID conflicts.
+/// Version 1 children (admitted before ordered admission) are only read back for replay.
 fn child_id(request: Uuid, digest: &[u8; 32], media: MediaDomain, target: i64) -> Uuid {
     let prefix = sha256(&[b"hrrdarr-wanted-request-v1", request.as_bytes()]);
     let suffix = sha256(&[
@@ -620,8 +625,45 @@ fn child_id(request: Uuid, digest: &[u8; 32], media: MediaDomain, target: i64) -
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
 }
-fn child_range(request: Uuid) -> (String, String) {
-    let prefix = child_id(request, &[0; 32], MediaDomain::Tv, 0).to_string()[..18].to_owned();
+/// Version 2 children additionally carry their admission ordinal (oldest-searched-first,
+/// 0..1023) in the ten bits after the variant. Children of one request share the prefix, so
+/// the worker's `created_at,id` claim order runs them in admission order, and replay returns
+/// them in that order. The hashed suffix also binds the ordinal.
+fn ordered_child_id(
+    request: Uuid,
+    digest: &[u8; 32],
+    media: MediaDomain,
+    target: i64,
+    ordinal: u16,
+) -> Uuid {
+    let prefix = sha256(&[b"hrrdarr-wanted-request-v2", request.as_bytes()]);
+    let suffix = sha256(&[
+        b"hrrdarr-wanted-child-v2",
+        request.as_bytes(),
+        digest,
+        domain(media).as_bytes(),
+        &target.to_be_bytes(),
+        &ordinal.to_be_bytes(),
+    ]);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&prefix[..8]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = 0x80 | ((ordinal >> 4) as u8 & 0x3f);
+    bytes[9] = (((ordinal & 0x0f) as u8) << 4) | (suffix[0] & 0x0f);
+    bytes[10..].copy_from_slice(&suffix[1..7]);
+    Uuid::from_bytes(bytes)
+}
+fn child_ordinal(id: Uuid) -> u16 {
+    let bytes = id.as_bytes();
+    (u16::from(bytes[8] & 0x3f) << 4) | u16::from(bytes[9] >> 4)
+}
+fn child_range(request: Uuid, ordered: bool) -> (String, String) {
+    let id = if ordered {
+        ordered_child_id(request, &[0; 32], MediaDomain::Tv, 0, 0)
+    } else {
+        child_id(request, &[0; 32], MediaDomain::Tv, 0)
+    };
+    let prefix = id.to_string()[..18].to_owned();
     (
         format!("{prefix}-0000-000000000000"),
         format!("{prefix}-ffff-ffffffffffff"),
@@ -636,6 +678,8 @@ fn target_id(target: &MediaTarget) -> i64 {
 /// ordinary durable user-search commands (no batch table, no second worker). Whole requests
 /// beyond the target bound or the remaining shared pool are refused; nothing is partially
 /// admitted. `skip_active` omits targets that already have an active search command.
+/// `select` returns targets in admission order (Wanted: oldest-searched-first); duplicates
+/// keep their first position, and children are admitted, claimed and returned in that order.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_wanted<F>(
     db: &Database,
@@ -658,22 +702,35 @@ where
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome = async {
-        let (low, high) = child_range(request_id);
-        let mut rows = tx
-            .query(
-                &format!("SELECT {COLUMNS} FROM search_commands c WHERE c.id BETWEEN ? AND ? ORDER BY c.id LIMIT ?"),
-                params![low, high, MAX_WANTED_TARGETS as i64 + 1],
-            )
-            .await?;
         let mut existing = Vec::new();
-        while let Some(row) = rows.next().await? {
-            existing.push(command_row(row)?);
+        let mut ordered = true;
+        for version in [true, false] {
+            let (low, high) = child_range(request_id, version);
+            let mut rows = tx
+                .query(
+                    &format!("SELECT {COLUMNS} FROM search_commands c WHERE c.id BETWEEN ? AND ? ORDER BY c.id LIMIT ?"),
+                    params![low, high, MAX_WANTED_TARGETS as i64 + 1],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                existing.push(command_row(row)?);
+            }
+            drop(rows);
+            if !existing.is_empty() {
+                ordered = version;
+                break;
+            }
         }
-        drop(rows);
         if !existing.is_empty() {
             let mut children = Vec::with_capacity(existing.len());
             for command in existing {
-                if child_id(request_id, &digest, media, target_id(&command.target)) != command.id
+                let target = target_id(&command.target);
+                let expected = if ordered {
+                    ordered_child_id(request_id, &digest, media, target, child_ordinal(command.id))
+                } else {
+                    child_id(request_id, &digest, media, target)
+                };
+                if expected != command.id
                     || command.mode != mode
                     || !same_source(&command, source)
                     || command.priority.number() != priority.number()
@@ -685,7 +742,10 @@ where
                     command_id: command.id,
                 });
             }
-            children.sort_by_key(|child| target_id(&child.target));
+            // Ordered children already come back in admission order (`ORDER BY c.id`).
+            if !ordered {
+                children.sort_by_key(|child| target_id(&child.target));
+            }
             return Ok(WantedAdmission {
                 replayed: true,
                 matched: None,
@@ -696,8 +756,8 @@ where
         preflight(&tx, client, source, mode).await?;
         let timestamp = now()?;
         let mut ids = select(&*tx, timestamp).await?;
-        ids.sort_unstable();
-        ids.dedup();
+        let mut seen = std::collections::BTreeSet::new();
+        ids.retain(|id| seen.insert(*id));
         if ids.len() > MAX_WANTED_TARGETS {
             return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "wanted_search_target_limit"));
         }
@@ -726,13 +786,15 @@ where
             return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
         }
         let mut children = Vec::with_capacity(ids.len());
-        for id in &ids {
+        for (ordinal, id) in ids.iter().enumerate() {
             let target = match media {
                 MediaDomain::Tv => MediaTarget::Episode(*id),
                 MediaDomain::Movies => MediaTarget::Movie(*id),
             };
             let captured = identity(&tx, &target).await?;
-            let command_id = child_id(request_id, &digest, media, *id);
+            // Bounded above: at most MAX_WANTED_TARGETS (1024) children, so ordinal <= 1023.
+            let ordinal = u16::try_from(ordinal).map_err(|_| bad())?;
+            let command_id = ordered_child_id(request_id, &digest, media, *id, ordinal);
             insert(&tx, command_id, mode, &target, &captured, source, priority, timestamp).await?;
             children.push(WantedChild { target, command_id });
         }
@@ -751,9 +813,48 @@ where
 mod wanted_child_tests {
     use super::*;
     #[test]
+    fn ordered_children_sort_by_ordinal_and_bind_body_target_and_ordinal() {
+        let request = Uuid::new_v4();
+        let (low, high) = child_range(request, true);
+        let ids: Vec<Uuid> = [(900, 0), (3, 1), (7, 15), (1, 16), (2, 1023)]
+            .into_iter()
+            .map(|(target, ordinal)| {
+                ordered_child_id(request, &[1; 32], MediaDomain::Tv, target, ordinal)
+            })
+            .collect();
+        let text: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let mut sorted = text.clone();
+        sorted.sort();
+        assert_eq!(sorted, text, "string order is admission order");
+        for (id, ordinal) in ids.iter().zip([0, 1, 15, 16, 1023]) {
+            assert_eq!(child_ordinal(*id), ordinal);
+            let s = id.to_string();
+            assert!(low.as_str() <= s.as_str() && s.as_str() <= high.as_str());
+            assert_eq!(&s[14..15], "8");
+            assert!(
+                matches!(&s[19..20], "8" | "9" | "a" | "b"),
+                "RFC variant kept"
+            );
+        }
+        assert_ne!(
+            ordered_child_id(request, &[1; 32], MediaDomain::Tv, 3, 1),
+            ordered_child_id(request, &[2; 32], MediaDomain::Tv, 3, 1)
+        );
+        assert_ne!(
+            ordered_child_id(request, &[1; 32], MediaDomain::Tv, 3, 1),
+            ordered_child_id(request, &[1; 32], MediaDomain::Movies, 3, 1)
+        );
+        let (legacy_low, _) = child_range(request, false);
+        assert_ne!(
+            &legacy_low[..18],
+            &low[..18],
+            "v1 and v2 ranges never overlap"
+        );
+    }
+    #[test]
     fn children_share_a_request_prefix_and_bind_body_and_target() {
         let request = Uuid::new_v4();
-        let (low, high) = child_range(request);
+        let (low, high) = child_range(request, false);
         let a = child_id(request, &[1; 32], MediaDomain::Tv, 7).to_string();
         let b = child_id(request, &[1; 32], MediaDomain::Tv, 8).to_string();
         let c = child_id(request, &[2; 32], MediaDomain::Tv, 7).to_string();
@@ -905,13 +1006,14 @@ async fn grab(
     let c = connection(&s.db).await?;
     let mut operation = crate::search::operation_evidence()
         .map_err(|e| Error(StatusCode::SERVICE_UNAVAILABLE, e.0))?;
-    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await?
-        && let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
+    if let Some(row)=c.query("SELECT command_id,private_payload FROM search_results WHERE id=? AND selected_candidate_id IS NULL",[id.to_string()]).await?.next().await? {
+        if let Some(payload)=row.get::<Option<Vec<u8>>>(1)? {
             let command=read(&c,uuid(row.get::<String>(0)?)?).await?;
             let mut bytes=s.client.open_release(&envelope(id,&command),&payload).map_err(|e|Error(StatusCode::CONFLICT,e.code))?;
             let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::CONFLICT,"invalid_release"))?;
             evaluate(&c,&command,&release, &mut operation).await?;
         }
+    }
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
@@ -1035,6 +1137,7 @@ async fn fetch(
     db: &Database,
     client: &RefreshClient,
     command: &SearchCommand,
+    issued: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<Vec<u8>>> {
     let c = connection(db).await?;
     check_identity(&c, command).await?;
@@ -1051,11 +1154,12 @@ async fn fetch(
                 .await
                 .map_err(|e| decision_error(e, "invalid_search_target"))?;
         let page = match client
-            .raw_search(
+            .raw_search_observed(
                 &command.source.indexer_id.to_string(),
                 command.source.indexer_revision,
                 command.mode.operation(),
                 &request,
+                issued,
             )
             .await
         {
@@ -1142,20 +1246,73 @@ async fn publish(
  }.await;
     finish(tx, outcome).await
 }
+/// Native last-search producer. The dispatch phase is over once `fetch` returned or hit the
+/// command deadline; if at least one eligible indexer request was issued (success or a caught,
+/// classified indexer failure), the target's last-search fact and this command's dispatch
+/// progress are written in one transaction, before any release decision or grab. A command
+/// that is no longer running (cancelled while dispatching) records nothing.
+async fn record_dispatch(db: &Database, command: &SearchCommand) -> Result<bool> {
+    let c = connection(db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let timestamp = now()?;
+        let progressed = tx
+            .execute(
+                "UPDATE search_commands SET dispatch_completed_at=max(coalesce(dispatch_completed_at,0),?) WHERE id=? AND status='running'",
+                params![timestamp, command.id.to_string()],
+            )
+            .await?;
+        if progressed != 1 {
+            return Ok(false);
+        }
+        let (table, id) = match command.target {
+            MediaTarget::Episode(id) => ("episodes", id),
+            MediaTarget::Movie(id) => ("movies", id),
+        };
+        tx.execute(
+            &format!("UPDATE {table} SET native_last_search_at=max(coalesce(native_last_search_at,0),?) WHERE id=?"),
+            params![timestamp, id],
+        )
+        .await?;
+        Ok(true)
+    }
+    .await;
+    finish(tx, outcome).await
+}
 pub(super) async fn run(
     db: &Database,
     client: &RefreshClient,
     command: SearchCommand,
 ) -> Result<()> {
-    let outcome = match tokio::time::timeout(
+    let issued = std::sync::atomic::AtomicBool::new(false);
+    let fetched = match tokio::time::timeout(
         std::time::Duration::from_secs(35),
-        fetch(db, client, &command),
+        fetch(db, client, &command, &issued),
     )
     .await
     {
-        Ok(Ok(releases)) => publish(db, client, &command, releases).await,
-        Ok(Err(e)) => Err(e),
+        Ok(result) => result,
         Err(_) => Err(Error(StatusCode::GATEWAY_TIMEOUT, "refresh_timeout")),
+    };
+    // Pre-dispatch refusals (identity, provider revision/policy, backoff) issued nothing.
+    let recorded = if issued.load(std::sync::atomic::Ordering::SeqCst) {
+        record_dispatch(db, &command).await.map(|recorded| {
+            eprintln!(
+                "event=search_dispatch_completed command_id={} recorded={recorded} fetch_ok={}",
+                command.id,
+                fetched.is_ok()
+            );
+        })
+    } else {
+        Ok(())
+    };
+    let outcome = match (recorded, fetched) {
+        // The fact could not be stored with the command's progress: a retryable storage failure.
+        (Err(e), _) => Err(e),
+        (Ok(()), Ok(releases)) => publish(db, client, &command, releases).await,
+        (Ok(()), Err(e)) => Err(e),
     };
     if let Err(Error(_, code)) = outcome {
         settle_failure(db, &command, code).await?;

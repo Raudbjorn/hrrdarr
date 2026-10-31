@@ -65,6 +65,10 @@ Each native episode contains:
 - Numbering: nullable `absolute_episode_number`, `scene_absolute_episode_number`,
   `scene_episode_number`, `scene_season_number`, `unverified_scene_numbering`.
 
+Here `last_search_time` is the imported Sonarr snapshot value only. The native
+last-search fact written by search dispatch is a separate column and is exposed, merged
+with the imported value, by the [Wanted API](wanted-api.md#last-search).
+
 `has_file` describes a database association, not verified media existence. No media
 path is accessed. Absent catalog data stays null on prototype/schema upgrades;
 unknown dates, runtime or scene numbering are not given invented values.

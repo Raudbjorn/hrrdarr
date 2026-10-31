@@ -159,18 +159,24 @@ fetch. Failure classes: `invalid_settings`, `authentication`, `rate_limited`, `t
 ## Migration numbering
 
 The registry is migration **file** `0080_import_lists.sql`. Filename prefixes are historical
-names, not execution ordinals. Fresh databases and the current main history through version 78
-add import lists at version **79**, then durable search-on-add at **80**. The earlier published main checkpoint through
-versions 50–53 follows the preserved PR #31 history through version 82, then the compatibility
-bridge at **83**, then search-on-add at **84**. Existing PR #31 version-82 databases take that same bridge to the current
-separate collection settings and shared provider authority model. Common prefixes through 49
-can follow the current main path.
+names, not execution ordinals. Three exact published histories are supported:
+
+- Fresh databases and the PR history add import lists at **79** and search-on-add at **80**,
+  then append Wanted timestamps, library-root health and backups through **83**.
+- Main's published history retains Wanted timestamps, library-root health and backups at
+  **79–81**, then appends import lists and search-on-add through **83**.
+- The earlier main checkpoint through **50–53** and the legacy PR history retain their
+  collection compatibility bridge at **83** and search-on-add at **84**, then append
+  Wanted timestamps, library-root health and backups through **87**.
+
+Histories sharing a version number are distinguished by every recorded migration, not by
+that number alone. Common prefixes follow the fresh-database path.
 
 The new append-only file `0084_import_list_search.sql` adds the search admission outbox and
 background-command authority markers. Existing provenance rows with `search_requested=1` are
 backfilled as pending requests, including rows whose source list was deleted.
 
-`src/db/mod.rs` and `src/db/legacy_migrations.rs` define the two accepted execution histories.
+`src/db/mod.rs` and `src/db/legacy_migrations.rs` define the accepted execution histories.
 Every recorded name, SQL body and checksum must match one complete prefix; mixed or tampered
 histories are rejected. Historical SQL variants remain under `migrations/pr31/`.
 

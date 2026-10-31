@@ -544,7 +544,9 @@ async fn generations(c: &libsql::Connection) -> Vec<(String, String, i64)> {
 // Reasoning: 0053 adds scoped path diagnostics. Compare all eleven identities
 // per domain so unexpected sibling markers fail; client saves invalidate their path check too.
 // Reasoning: 0060 adds recycle_bin per domain; provider edits never mark it.
-const IDENTITIES: [(&str, &str); 24] = [
+// Reasoning: 0080 adds root_folder/mount_read_only per domain and movies collection_root_folder (24 -> 29); provider edits never mark them.
+const IDENTITIES: [(&str, &str); 29] = [
+    ("movies", "collection_root_folder"),
     ("movies", "completed_download_handling"),
     ("movies", "download_client_backoff"),
     ("movies", "download_client_communication"),
@@ -554,9 +556,11 @@ const IDENTITIES: [(&str, &str); 24] = [
     ("movies", "indexer_rss"),
     ("movies", "indexer_search"),
     ("movies", "indexer_status"),
+    ("movies", "mount_read_only"),
     ("movies", "recycle_bin"),
     ("movies", "remote_path_mapping"),
     ("movies", "removed_metadata"),
+    ("movies", "root_folder"),
     ("tv", "completed_download_handling"),
     ("tv", "download_client_backoff"),
     ("tv", "download_client_communication"),
@@ -566,9 +570,11 @@ const IDENTITIES: [(&str, &str); 24] = [
     ("tv", "indexer_rss"),
     ("tv", "indexer_search"),
     ("tv", "indexer_status"),
+    ("tv", "mount_read_only"),
     ("tv", "recycle_bin"),
     ("tv", "remote_path_mapping"),
     ("tv", "removed_metadata"),
+    ("tv", "root_folder"),
 ];
 /// Indexer edits invalidate capability, binding and backoff checks for their domain.
 fn indexer_keys(domains: &[&'static str]) -> Vec<(&'static str, &'static str)> {

@@ -74,7 +74,8 @@ token; renewal, acknowledged-request progress and completion writes require that
 lease. Losing ownership or failing renewal stops the attempt, though a request already sent may still
 have arrived. The worker owns no library file, and fan-out is idempotent. Each delivery
 records the scope that matched (`media_type`): a system event (health, update) is rendered for that
-domain, so a notification whose movies scope asked for health events gets `radarr_*` variables and
+domain. Retries retain the selected scope even after filters change. A notification whose movies
+scope asked for health events gets `radarr_*` variables and
 the movie app path even when its TV scope exists. When both scopes match, TV is used. Health
 warnings are gated by `include_health_warnings` in both directions: a restored transition carries
 the severity of the issue it clears, so an unannounced warning is not announced as restored.

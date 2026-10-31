@@ -15,12 +15,16 @@ const refresh=async()=>{await idle(health);await health.getByRole('button',{name
 const openHealth=async()=>{await nav.getByRole('button',{name:'Health',exact:true}).click();await idle(health);};
 const run=async scope=>{await health.getByLabel('Health scope').selectOption(scope);await idle(health);const reply=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/v1/health/commands'&&response.request().method()==='POST');await health.getByRole('button',{name:`Run ${scope} health checks`,exact:true}).click();const response=await reply;assert.equal(response.status(),202);return response.json();};
 // Reasoning: 0051 adds download_client_backoff to the nine existing keys per domain.
-const identities=['movies','tv'].flatMap(domain=>['completed_download_handling','download_client_backoff','download_client_communication','download_client_root_folder','indexer_download_client','indexer_failures','indexer_rss','indexer_search','indexer_status','recycle_bin','remote_path_mapping','removed_metadata'].map(key=>`${domain}:${key}`));
+// Reasoning: 0080 adds root_folder and mount_read_only per domain plus the movies-only collection_root_folder.
+const identities=['movies','tv'].flatMap(domain=>['completed_download_handling','download_client_backoff','download_client_communication','download_client_root_folder','indexer_download_client','indexer_failures','indexer_rss','indexer_search','indexer_status','mount_read_only','recycle_bin','remote_path_mapping','removed_metadata','root_folder'].map(key=>`${domain}:${key}`)).concat('movies:collection_root_folder').sort();
+const scopedChecks=domain=>domain==='tv'?14:15;
 const identity=check=>`${check.identity.scope}:${check.identity.check_key}`;
 const issueFor=(snapshot,domain,key)=>snapshot.issues.find(issue=>identity(issue)===`${domain}:${key}`);
-// Reasoning: migrations 0053 (remote_path_mapping) and 0059 (recycle_bin) register one check per domain each, so 24 checks exceed the API's sixteen-row page; aggregate both pages for registry assertions.
+// Reasoning: migrations 0053 (remote_path_mapping), 0059 (recycle_bin) and 0080 (five library root/mount checks) give 29 checks, exceeding the API's sixteen-row page; aggregate both pages for registry assertions.
 const fullHealth=async()=>{const first=await get('/api/v1/health');const second=await get('/api/v1/health?offset=16');return {...first,checks:[...first.checks,...second.checks],issues:[...first.issues,...second.issues]};};
-const current=async()=>{const snapshot=await until(fullHealth,snapshot=>snapshot.summary.current===24&&!snapshot.active_command,'All twenty-four scoped checks did not become current');assert.equal(snapshot.summary.total,24);assert.deepEqual(snapshot.checks.map(identity).sort(),identities);assert.deepEqual(snapshot.coverage.identities.map(value=>`${value.scope}:${value.check_key}`).sort(),identities);for(const check of snapshot.checks){assert.equal(check.evaluation,'current');assert.equal(check.last_error,null);}return snapshot;};
+const current=async()=>{const snapshot=await until(fullHealth,snapshot=>snapshot.summary.current===29&&!snapshot.active_command,'All twenty-nine scoped checks did not become current');assert.equal(snapshot.summary.total,29);assert.deepEqual(snapshot.checks.map(identity).sort(),identities);assert.deepEqual(snapshot.coverage.identities.map(value=>`${value.scope}:${value.check_key}`).sort(),identities);for(const check of snapshot.checks){assert.equal(check.evaluation,'current');assert.equal(check.last_error,null);}return snapshot;};
+// Reasoning: with 29 checks the all-scope first page (movies first) no longer reaches TV communication; rows are read in their own scope.
+const showScope=async scope=>{await health.getByLabel('Health scope').selectOption(scope);await idle(health);};
 const communicationRow=domain=>health.getByRole('article',{name:`${domain}:download_client_communication`,exact:true});
 const settings=async domain=>{await health.getByLabel('Health scope').selectOption('all');await idle(health);await health.getByRole('button',{name:`Open ${domain} completed-download settings`,exact:true}).click();await activity.getByText(`Opened ${domain} completed-download settings.`,{exact:true}).waitFor();await idle(activity);assert.equal(await master.getByLabel('Completed-download media').inputValue(),domain);};
 const save=async enabled=>{await idle(activity);await master.getByLabel('Enable completed-download handling',{exact:true}).setChecked(enabled);await master.getByRole('button',{name:'Save completed-download handling',exact:true}).click();await activity.getByText('Completed-download domain setting saved.',{exact:true}).waitFor();await idle(activity);};
@@ -28,10 +32,10 @@ const dismiss=async()=>{const buttons=health.getByRole('button',{name:/Dismiss r
 try{
  await page.goto(origin);await openHealth();let fresh=await current();assert.equal(fresh.issues.some(issue=>issue.identity.scope==='tv'&&issue.reason.startsWith('cdh_undefined')),true);assert.equal(issueFor(fresh,'movies','completed_download_handling'),undefined);await health.getByLabel('Health scope').selectOption('all');await idle(health);await refresh();
  for(const domain of ['tv','movies']){
-  const warning=issueFor(fresh,domain,'download_client_communication');assert.equal(warning.reason,'download_client_none_available');assert.equal(warning.severity,'warning');assert.equal(warning.compatibility_type,'DownloadClientCheck');
+  await showScope(domain);const warning=issueFor(fresh,domain,'download_client_communication');assert.equal(warning.reason,'download_client_none_available');assert.equal(warning.severity,'warning');assert.equal(warning.compatibility_type,'DownloadClientCheck');
   await communicationRow(domain).getByText(`warning: ${warning.message} (${warning.reason})`,{exact:true}).waitFor();assert.equal(await communicationRow(domain).getByRole('link',{name:'Check help'}).getAttribute('href'),`https://wiki.servarr.com/${domain==='tv'?'sonarr':'radarr'}/system#no-download-client-is-available`);
  }
- // Reasoning: scoped twelve-check tracking fits one UI page; all twenty-four cannot be verified on a sixteen-row page.
+ // Reasoning: scoped fourteen/fifteen-check tracking fits one UI page; all twenty-nine cannot be verified on a sixteen-row page.
  await run('movies');await current();await refresh();await health.getByText('Requested generations observed in the current epoch.',{exact:true}).waitFor();
  // First lazy Activity mount, both domains, equal-true explicit save and observed issue/restore.
  for(const domain of ['movies','tv']){
@@ -59,25 +63,25 @@ try{
  const provider=await created.json();
  // Real category-scoped item probes restore both no-client warnings; this is not an overlay.
  await run('all');let healthy=await current();await refresh();await dismiss();
- for(const domain of ['tv','movies']){assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
+ for(const domain of ['tv','movies']){await showScope(domain);assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
  // Mode1 returns503 only from the actual item-list endpoint, after successful auth/version.
  // CDH uses client_status (preferences/categories), not test_connection or item-list probing.
  // Item-only503 therefore leaves both CDH checks current/healthy and communication current/Error.
  assert.equal((await page.request.post(remote+'/fixture-mode?mode=1')).status(),204);await run('all');
  const failed=await until(fullHealth,snapshot=>!snapshot.active_command&&['tv','movies'].every(domain=>issueFor(snapshot,domain,'download_client_communication')?.reason==='download_client_communication_failed'),'Both scoped item-list failures were not published');
- // Reasoning: 0059 adds recycle_bin per domain (22 -> 24 total, 11 -> 12 per scope); counts below follow the registry.
- assert.equal(failed.summary.total,24);assert.deepEqual(failed.checks.map(identity).sort(),identities);for(const domain of ['tv','movies']){assert.equal(failed.checks.find(check=>identity(check)===`${domain}:completed_download_handling`).evaluation,'current');assert.equal(issueFor(failed,domain,'completed_download_handling'),undefined);}assert.equal(failed.summary.current,24);assert.equal(failed.summary.failed,0);// Reasoning: both absent-indexer errors remain alongside the two communication errors.
+ // Reasoning: 0080 adds five checks (24 -> 29 total; tv 14, movies 15 per scope); counts below follow the registry.
+ assert.equal(failed.summary.total,29);assert.deepEqual(failed.checks.map(identity).sort(),identities);for(const domain of ['tv','movies']){assert.equal(failed.checks.find(check=>identity(check)===`${domain}:completed_download_handling`).evaluation,'current');assert.equal(issueFor(failed,domain,'completed_download_handling'),undefined);}assert.equal(failed.summary.current,29);assert.equal(failed.summary.failed,0);// Reasoning: both absent-indexer errors remain alongside the two communication errors.
  // Reasoning: since 0053 each domain also reports remote_path_mapping path_output_local_unavailable, because the mock client advertises a save path that does not exist locally.
  assert.equal(failed.summary.non_ok,6);
  for(const domain of ['tv','movies']){
   const issue=issueFor(failed,domain,'download_client_communication');assert.equal(issue.severity,'error');assert.equal(issue.compatibility_type,'DownloadClientCheck');assert.equal(failed.checks.find(check=>identity(check)===`${domain}:download_client_communication`).evaluation,'current');
   assert.equal(issue.message,`Unable to retrieve items from download client Health browser client (${provider.id}). Review its connection, authentication and protocol settings.`);assert.equal(issue.message.includes('PRIVATE_FIXTURE'),false);assert.equal(issue.message.includes(remote),false);
   await health.getByLabel('Health scope').selectOption(domain);await idle(health);await refresh();
-  const scoped=await get(`/api/v1/health?scope=${domain}`);assert.equal(scoped.summary.total,12);assert.deepEqual(scoped.checks.map(identity).sort(),identities.filter(value=>value.startsWith(`${domain}:`)));
+  const scoped=await get(`/api/v1/health?scope=${domain}`);assert.equal(scoped.summary.total,scopedChecks(domain));assert.deepEqual(scoped.checks.map(identity).sort(),identities.filter(value=>value.startsWith(`${domain}:`)));
   await communicationRow(domain).getByText(`error: ${issue.message} (${issue.reason})`,{exact:true}).waitFor();assert.equal(await communicationRow(domain).getByRole('link',{name:'Check help'}).getAttribute('href'),`https://wiki.servarr.com/${domain==='tv'?'sonarr':'radarr'}/system#unable-to-communicate-with-download-client`);assert.equal(await communicationRow(domain==='tv'?'movies':'tv').count(),0);
  }
  assert.equal((await page.request.post(remote+'/fixture-mode?mode=0')).status(),204);await run('all');healthy=await current();await refresh();await dismiss();
- for(const domain of ['tv','movies']){assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
+ for(const domain of ['tv','movies']){await showScope(domain);assert.equal(issueFor(healthy,domain,'download_client_communication'),undefined);await communicationRow(domain).getByRole('heading',{name:`${domain}:download_client_communication — current`,exact:true}).waitFor();await communicationRow(domain).getByText('No cached issue on this check; evaluation state determines freshness.',{exact:true}).waitFor();}
  console.log('PASS actual API: ten scoped registry identities; TV/movie communication Warning→healthy→named-client Error→healthy; scoped help links; item-only failure leaves both CDH checks current/healthy');
  // Shared provider write and child policy write cannot be bypassed by Health navigation.
  await nav.getByRole('button',{name:'Providers',exact:true}).click();await page.getByRole('button').filter({hasText:'Health browser client'}).click();await page.getByLabel('Name',{exact:true}).fill('Health browser client edited');
@@ -165,4 +169,14 @@ try{
  console.log('PASS controlled overlays: unknown cancellation stays blocked for running/pruned readback,128-check/129-history boundaries,document visibility');
  assert.deepEqual(errors,[]);await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'Health should fit mobile viewport');
  console.log('PASS controlled overlays: six evaluation states, overlapping counters, unsafe links, empty pages/system, retained failures, stale response fencing, hidden polling, diagnostic gap; no page errors');
+ // Real hc.034/hc.035 detectors: the owned seed declares /owned-collections/{tv,movies} roots that do not exist on this host.
+ await page.setViewportSize({width:1280,height:900});const seeded=await page.request.post(origin+'/api/fixture/collections-seed',{data:{}});assert.equal(seeded.status(),200,await seeded.text());
+ const rootAdmission=await run('tv');const rootToken=rootAdmission.selection.find(token=>token.identity.check_key==='root_folder');assert.ok(rootToken,'TV admission must include root_folder');
+ const rooted=await until(()=>get('/api/v1/health?scope=tv'),s=>!s.active_command&&s.checks.some(check=>check.identity.check_key==='root_folder'&&check.evaluation==='current'&&check.observed_generation>=rootToken.generation),'TV root folder observation did not become current');
+ const rootIssue=issueFor(rooted,'tv','root_folder');assert.equal(rootIssue.severity,'error');assert.equal(rootIssue.reason,'root_folder_missing');assert.equal(rootIssue.compatibility_type,'RootFolderCheck');
+ assert.equal(rootIssue.message,'Missing root folder: /owned-collections/tv (not found; 1 series, e.g. Autotag Series). Restore the folder or its mount, correct its permissions, or move the affected series; hrrdarr never creates library root folders.');
+ assert.equal(issueFor(rooted,'tv','mount_read_only'),undefined,'An absent series folder has no backing mount to report');
+ await refresh();const rootRow=health.getByRole('article',{name:'tv:root_folder',exact:true});await rootRow.getByText(`error: ${rootIssue.message} (${rootIssue.reason})`,{exact:true}).waitFor();
+ assert.equal(await rootRow.getByRole('link',{name:'Check help'}).getAttribute('href'),'https://wiki.servarr.com/sonarr/system#missing-root-folder');assert.deepEqual(errors,[]);
+ console.log('PASS actual API: hc.034 missing TV root folder Error rendered with message and help link; hc.035 mount check healthy for an absent folder');
 }catch(error){console.error('PAGESTATE', (await page.locator('body').innerText()).slice(0,10000));console.error('PAGEERRORS',errors);throw error;}finally{for(const release of held)release();await page.unrouteAll({behavior:'wait'});await browser.close();}

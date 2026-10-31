@@ -62,7 +62,10 @@ async fn data_queries(c: &Connection) -> Result<Vec<(String, String)>, Error> {
         let filter = match name.as_str() {
             "schema_migrations" => " WHERE version<=52",
             // Reasoning: 0060 recycle_bin identities postdate this predecessor like 0053's own rows.
-            "health_checks" => " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin')",
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            "health_checks" => {
+                " WHERE check_key NOT IN ('remote_path_mapping','recycle_bin','root_folder','collection_root_folder','mount_read_only')"
+            }
             _ => "",
         };
         out.push((
@@ -212,7 +215,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let c = fresh.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks WHERE check_key='remote_path_mapping' AND startup=1 AND scheduled=1 AND compatibility_type='RemotePathMappingCheck' AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND severity IS NULL AND observed_generation IS NULL AND checked_at IS NULL").await?, 2);
     let path = scratch.0.join("upgrade");
@@ -241,7 +244,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let after = upgraded.connect().await?;
     assert_eq!(
         scalar(&after, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert_eq!(data_with(&after, &queries).await?, rows);
     assert_eq!(

@@ -107,6 +107,9 @@ pub enum WantedSort {
     DigitalRelease,
     PhysicalRelease,
     Quality,
+    /// Effective last search (later of native and imported). Never-searched rows order as
+    /// older than every timestamp: first ascending, last descending.
+    LastSearch,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +182,22 @@ pub struct WantedCutoff {
     pub threshold_rank: i64,
     pub basis: WantedCutoffBasis,
 }
+/// Which fact supplies `last_search_time`: a native search dispatch, or a value imported from
+/// a Sonarr snapshot (TV only) that is later than any native dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WantedLastSearchSource {
+    Native,
+    Imported,
+}
+fn last_search_source(value: Option<String>) -> Result<Option<WantedLastSearchSource>> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("native") => Ok(Some(WantedLastSearchSource::Native)),
+        Some("imported") => Ok(Some(WantedLastSearchSource::Imported)),
+        Some(_) => Err(state_invalid()),
+    }
+}
 #[derive(Serialize, ts_rs::TS)]
 pub struct TvWantedItem {
     pub target: MediaTarget,
@@ -200,8 +219,10 @@ pub struct TvWantedItem {
     pub air_date_utc: Option<String>,
     // Air time plus series runtime, Unix seconds; `null` when either fact is unknown.
     pub aired_end_at: Option<i64>,
-    // Imported snapshot fact only; native searches do not yet maintain it.
+    // Effective last search, RFC 3339 UTC seconds: the later of the native dispatch fact and
+    // an imported snapshot value; `null` when never searched (or the import is unparseable).
     pub last_search_time: Option<String>,
+    pub last_search_source: Option<WantedLastSearchSource>,
     pub profile_id: Option<i64>,
     pub file: Option<WantedFile>,
     pub cutoff: Option<WantedCutoff>,
@@ -230,6 +251,9 @@ pub struct MovieWantedItem {
     pub digital_release: Option<String>,
     pub physical_release: Option<String>,
     pub availability: WantedMovieAvailability,
+    // Native last search, RFC 3339 UTC seconds; `null` when never searched natively.
+    pub last_search_time: Option<String>,
+    pub last_search_source: Option<WantedLastSearchSource>,
     pub profile_id: Option<i64>,
     pub file: Option<WantedFile>,
     pub cutoff: Option<WantedCutoff>,
@@ -415,6 +439,7 @@ fn parse_query(raw: Option<&str>, media: MediaDomain, kind: WantedKind) -> Resul
                     (MediaDomain::Movies, _, "digital_release") => WantedSort::DigitalRelease,
                     (MediaDomain::Movies, _, "physical_release") => WantedSort::PhysicalRelease,
                     (_, WantedKind::Cutoff, "quality") => WantedSort::Quality,
+                    (_, _, "last_search") => WantedSort::LastSearch,
                     _ => return Err(invalid("sort is not supported for this Wanted list")),
                 }
             }
@@ -546,11 +571,35 @@ fn membership_sql(filter: &Filter, now: i64) -> String {
         }
     }
 }
+/// Effective last-search instant in Unix seconds. TV takes the later of the native dispatch
+/// fact and the imported snapshot text; movies have only the native fact.
+const TV_LAST_SEARCH: &str = "coalesce(max(e.native_last_search_at,unixepoch(e.last_search_time)),e.native_last_search_at,unixepoch(e.last_search_time))";
+const MOVIE_LAST_SEARCH: &str = "m.native_last_search_at";
+fn last_search_key(media: MediaDomain) -> (&'static str, &'static str) {
+    match media {
+        MediaDomain::Tv => (TV_LAST_SEARCH, "e.id"),
+        MediaDomain::Movies => (MOVIE_LAST_SEARCH, "m.id"),
+    }
+}
+/// Oldest-searched-first: never searched first, then oldest instant, ties by typed ID.
+fn oldest_first_sql(media: MediaDomain) -> String {
+    let (key, id) = last_search_key(media);
+    format!(" ORDER BY ({key}) IS NOT NULL,{key} ASC,{id}")
+}
 fn order_sql(media: MediaDomain, sort: WantedSort, direction: WantedDirection) -> String {
     let dir = match direction {
         WantedDirection::Asc => "ASC",
         WantedDirection::Desc => "DESC",
     };
+    if sort == WantedSort::LastSearch {
+        // Never searched counts as older than every instant (not as an unknown value), so it
+        // leads ascending (oldest-searched-first) and trails descending.
+        let (key, id) = last_search_key(media);
+        return match direction {
+            WantedDirection::Asc => oldest_first_sql(media),
+            WantedDirection::Desc => format!(" ORDER BY ({key}) IS NULL,{key} DESC,{id}"),
+        };
+    }
     let (key, ties) = match (media, sort) {
         (MediaDomain::Tv, WantedSort::SeriesTitle) => {
             ("lower(s.title)", "s.id,e.season,e.number,e.id")
@@ -571,8 +620,8 @@ fn order_sql(media: MediaDomain, sort: WantedSort, direction: WantedDirection) -
     // Unknown sort values stay last in either direction; ties are stable ascending typed IDs.
     format!(" ORDER BY ({key}) IS NULL,{key} {dir},{ties}")
 }
-const TV_COLUMNS: &str = "SELECT e.id,e.series_id,s.title,s.monitored,l.series_type,e.season,se.monitored,e.number,e.absolute_episode_number,e.scene_season_number,e.scene_episode_number,e.scene_absolute_episode_number,e.title,e.monitored,e.air_date,e.air_date_utc,(unixepoch(e.air_date_utc)+s.runtime*60),e.last_search_time,l.quality_profile_id,f.id,f.path,fm.quality_id,q.title,k.rank,k.threshold,k.basis";
-const MOVIE_COLUMNS: &str = "SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,l.minimum_availability,d.in_cinemas,d.digital_release,d.physical_release,l.quality_profile_id,f.id,f.path,fm.quality_id,q.title,k.rank,k.threshold,k.basis";
+const TV_COLUMNS: &str = "SELECT e.id,e.series_id,s.title,s.monitored,l.series_type,e.season,se.monitored,e.number,e.absolute_episode_number,e.scene_season_number,e.scene_episode_number,e.scene_absolute_episode_number,e.title,e.monitored,e.air_date,e.air_date_utc,(unixepoch(e.air_date_utc)+s.runtime*60),strftime('%Y-%m-%dT%H:%M:%SZ',coalesce(max(e.native_last_search_at,unixepoch(e.last_search_time)),e.native_last_search_at,unixepoch(e.last_search_time)),'unixepoch'),l.quality_profile_id,f.id,f.path,fm.quality_id,q.title,k.rank,k.threshold,k.basis,CASE WHEN e.native_last_search_at IS NOT NULL AND (unixepoch(e.last_search_time) IS NULL OR e.native_last_search_at>=unixepoch(e.last_search_time)) THEN 'native' WHEN unixepoch(e.last_search_time) IS NOT NULL THEN 'imported' END";
+const MOVIE_COLUMNS: &str = "SELECT m.id,d.id,d.title,d.year,d.tmdb_id,d.imdb_id,m.monitored,d.status,l.minimum_availability,d.in_cinemas,d.digital_release,d.physical_release,l.quality_profile_id,f.id,f.path,fm.quality_id,q.title,k.rank,k.threshold,k.basis,strftime('%Y-%m-%dT%H:%M:%SZ',m.native_last_search_at,'unixepoch'),CASE WHEN m.native_last_search_at IS NOT NULL THEN 'native' END";
 
 fn file(row: &libsql::Row, first: i32) -> Result<Option<WantedFile>> {
     let id = row.get::<Option<i64>>(first)?;
@@ -644,6 +693,7 @@ fn tv_item(row: &libsql::Row, kind: WantedKind) -> Result<TvWantedItem> {
         air_date_utc: row.get(15)?,
         aired_end_at: row.get(16)?,
         last_search_time: row.get(17)?,
+        last_search_source: last_search_source(row.get(26)?)?,
         profile_id: profile,
         file: file(row, 19)?,
         cutoff: cutoff(row, kind, profile, 23)?,
@@ -702,6 +752,8 @@ fn movie_item(
         digital_release: digital,
         physical_release: physical,
         availability,
+        last_search_time: row.get(20)?,
+        last_search_source: last_search_source(row.get(21)?)?,
         profile_id: profile,
         file: file(row, 13)?,
         cutoff: cutoff(row, kind, profile, 17)?,
@@ -890,8 +942,10 @@ async fn list(
     outcome
 }
 
-/// Every current list member under `filter`, at most `MAX_WANTED_TARGETS + 1` so the
-/// admission layer can refuse an over-capacity capture rather than truncate it.
+/// Every current list member under `filter`, oldest-searched-first (never searched first, ties
+/// by typed ID), at most `MAX_WANTED_TARGETS + 1` so the admission layer can refuse an
+/// over-capacity capture rather than truncate it. The order is total, so the read bound and the
+/// admission/claim order are deterministic.
 async fn capture(c: &Connection, filter: Filter, now: i64) -> Result<Vec<i64>> {
     let cte = ranks_cte(c, filter.media, filter.kind).await?;
     let from = from(filter.media);
@@ -904,7 +958,10 @@ async fn capture(c: &Connection, filter: Filter, now: i64) -> Result<Vec<i64>> {
         let delay = crate::search::movie_availability_delay(c)
             .await
             .map_err(|_| unavailable())?;
-        let sql = format!("{cte} {MOVIE_COLUMNS}{from} {filter_sql} ORDER BY m.id");
+        let sql = format!(
+            "{cte} {MOVIE_COLUMNS}{from} {filter_sql}{}",
+            oldest_first_sql(MediaDomain::Movies)
+        );
         let items = filtered_movies(c, &sql, &filter, now, delay).await?;
         return Ok(items
             .into_iter()
@@ -921,7 +978,8 @@ async fn capture(c: &Connection, filter: Filter, now: i64) -> Result<Vec<i64>> {
     let mut rows = c
         .query(
             &format!(
-                "{cte} SELECT {id}{from} {filter_sql} ORDER BY {id} LIMIT {}",
+                "{cte} SELECT {id}{from} {filter_sql}{} LIMIT {}",
+                oldest_first_sql(filter.media),
                 MAX_WANTED_TARGETS + 1
             ),
             (),
@@ -932,6 +990,32 @@ async fn capture(c: &Connection, filter: Filter, now: i64) -> Result<Vec<i64>> {
         ids.push(row.get::<i64>(0)?);
     }
     Ok(ids)
+}
+/// Explicit selections are admitted oldest-searched-first too. Unknown IDs order as never
+/// searched and still fail admission as a whole (`target_changed`).
+async fn order_explicit(c: &Connection, media: MediaDomain, ids: &[i64]) -> Result<Vec<i64>> {
+    let (join, order) = match media {
+        MediaDomain::Tv => (
+            "LEFT JOIN episodes e ON e.id=j.value",
+            format!(" ORDER BY ({TV_LAST_SEARCH}) IS NOT NULL,{TV_LAST_SEARCH} ASC,j.value"),
+        ),
+        MediaDomain::Movies => (
+            "LEFT JOIN movies m ON m.id=j.value",
+            format!(" ORDER BY ({MOVIE_LAST_SEARCH}) IS NOT NULL,{MOVIE_LAST_SEARCH} ASC,j.value"),
+        ),
+    };
+    let json = serde_json::to_string(ids).map_err(|_| state_invalid())?;
+    let mut rows = c
+        .query(
+            &format!("SELECT j.value FROM json_each(?) j {join}{order}"),
+            [json],
+        )
+        .await?;
+    let mut ordered = Vec::with_capacity(ids.len());
+    while let Some(row) = rows.next().await? {
+        ordered.push(row.get::<i64>(0)?);
+    }
+    Ok(ordered)
 }
 fn command_error(code: &'static str) -> commands::Error {
     commands::Error(StatusCode::BAD_REQUEST, code)
@@ -1013,7 +1097,12 @@ async fn search(
         ring::digest::digest(&ring::digest::SHA256, canonical.to_string().as_bytes()).as_ref(),
     );
     let explicit: Vec<i64> = match &input.selection {
-        WantedSelection::Ids { ids } => ids.clone(),
+        WantedSelection::Ids { ids } => ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         WantedSelection::All { .. } => Vec::new(),
     };
     let source = commands::rss::RssTargetInput {
@@ -1033,7 +1122,9 @@ async fn search(
         input.priority,
         skip_active,
         async move |c: &Connection, now: i64| match filter {
-            None => Ok(explicit),
+            None => order_explicit(c, media, &explicit)
+                .await
+                .map_err(|error| commands::Error(error.0, error.1)),
             Some(filter) => capture(c, filter, now)
                 .await
                 .map_err(|error| commands::Error(error.0, error.1)),
@@ -1138,6 +1229,46 @@ mod tests {
         .unwrap();
         assert_eq!(m.filter.availability, WantedAvailability::Unavailable);
         assert_eq!(m.sort, WantedSort::DigitalRelease);
+    }
+    #[test]
+    fn last_search_orders_never_searched_as_oldest_with_typed_ties() {
+        let asc = order_sql(
+            MediaDomain::Movies,
+            WantedSort::LastSearch,
+            WantedDirection::Asc,
+        );
+        assert_eq!(
+            asc,
+            " ORDER BY (m.native_last_search_at) IS NOT NULL,m.native_last_search_at ASC,m.id"
+        );
+        let desc = order_sql(
+            MediaDomain::Movies,
+            WantedSort::LastSearch,
+            WantedDirection::Desc,
+        );
+        assert_eq!(
+            desc,
+            " ORDER BY (m.native_last_search_at) IS NULL,m.native_last_search_at DESC,m.id"
+        );
+        assert!(
+            order_sql(
+                MediaDomain::Tv,
+                WantedSort::LastSearch,
+                WantedDirection::Asc
+            )
+            .ends_with(" ASC,e.id")
+        );
+        for (media, kind) in [
+            (MediaDomain::Tv, WantedKind::Missing),
+            (MediaDomain::Tv, WantedKind::Cutoff),
+            (MediaDomain::Movies, WantedKind::Missing),
+            (MediaDomain::Movies, WantedKind::Cutoff),
+        ] {
+            assert_eq!(
+                parse("sort=last_search", media, kind).unwrap().sort,
+                WantedSort::LastSearch
+            );
+        }
     }
     #[test]
     fn order_keeps_nulls_last_and_stable_typed_ties() {

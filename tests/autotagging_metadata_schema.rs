@@ -262,7 +262,8 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
     let mut out = Vec::new();
     for sql in [
         "SELECT id,tmdb_id,imdb_id,title,year,runtime,status,in_cinemas,digital_release,physical_release,secondary_year,original_language FROM movie_metadata ORDER BY id",
-        "SELECT * FROM movies ORDER BY id",
+        // Reasoning: 0079 wanted_last_search appends native_last_search_at; predecessor columns by name.
+        "SELECT id,metadata_id,path,monitored FROM movies ORDER BY id",
         // Reasoning: 0065 appends collection policy columns; the predecessor columns are preserved exactly.
         "SELECT id,tmdb_id,title FROM movie_collections ORDER BY id",
         "SELECT collection_id,metadata_id FROM movie_collection_members ORDER BY collection_id,metadata_id",
@@ -272,7 +273,7 @@ async fn witness_with_schema(c: &Connection, schema: &str) -> Result<Vec<Vec<Str
         "SELECT * FROM library_settings ORDER BY id",
         "SELECT id,tvdb_id,title,year,path,poster,monitored,original_language FROM series ORDER BY id",
         "SELECT * FROM seasons ORDER BY series_id,number",
-        "SELECT * FROM episodes ORDER BY id",
+        "SELECT id,series_id,season,number,title,episode_file_id,monitored,tvdb_id,air_date,air_date_utc,last_search_time,runtime,finale_type,overview,absolute_episode_number,scene_absolute_episode_number,scene_episode_number,scene_season_number,unverified_scene_numbering,images_json FROM episodes ORDER BY id",
         "SELECT * FROM episode_files ORDER BY id",
         "SELECT application,fingerprint,schema_version,imported_at,episode_metadata_version,history_version,profile_version,blocklist_version,custom_format_version,tag_version,revision_policy_version,delay_profile_version,release_profile_version,cdh_version FROM snapshot_imports ORDER BY application,fingerprint",
         "SELECT * FROM snapshot_mappings ORDER BY application,fingerprint,destination_table,source_id",
@@ -309,12 +310,16 @@ async fn upgrade_witness(
     predecessor_names: &str,
 ) -> Result<Vec<Vec<String>>, Error> {
     // Reasoning: 0052 rebuilds selection tables and guards; its dedicated upgrade test preserves their rows.
+    // 0077 appends the membership origin/revision columns, which rewrites that CREATE TABLE text; its predecessor
+    // columns and foreign keys are compared exactly by the rows and foreign_key_list witnesses.
     // 0053 appends one journal column and two indexes; preserve old columns separately below.
     // 0060 appends only the exact recycle bin cleanup capacity term, stripped like 0054's.
+    // 0079 wanted_last_search appends only the exact nullable native_last_search_at column to
+    // episodes and movies; strip that column text so every predecessor definition stays exact.
     // 0059 resolves client kind through provider_implementations: map only that predicate back
     // to the qBittorrent literal, and exclude the provider tables/guards it rebuilds (their rows
     // and constraints are covered by db::download_client_registry_tests).
-    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(replace(sql,'+(SELECT count(*) FROM rename_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent''') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
+    let mut result = witness_with_schema(c, &format!("SELECT type,name,tbl_name,replace(replace(replace(replace(replace(sql,'+(SELECT count(*) FROM rename_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM downloaded_scan_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),'+(SELECT count(*) FROM recycle_bin_cleanup_commands WHERE status IN (''queued'',''running'',''retry_wait''))',''),' IN (SELECT implementation FROM provider_implementations WHERE kind=''download_client'')','=''qbittorrent'''),', native_last_search_at INTEGER CHECK(native_last_search_at IS NULL OR (typeof(native_last_search_at)=''integer'' AND native_last_search_at BETWEEN 0 AND 9007199254740991))','') AS sql FROM ({PRESERVED_SCHEMA}) WHERE
         name IN ({predecessor_names}) AND
         NOT (type='table' AND name IN ('providers','provider_scopes','movie_collections','movie_collection_members')) AND
         name NOT IN ('cdh_scope_authority','provider_client_options_insert','provider_client_options_update','provider_scope_options_insert','provider_scope_options_update','provider_test_insert_owner','provider_test_update_owner') AND
@@ -557,7 +562,7 @@ async fn foundation_real_runner_upgrade_backup_reopen_preserves_predecessor() ->
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert_eq!(
         upgrade_witness(&c, &predecessor_names).await?,
@@ -699,7 +704,7 @@ async fn foundation_real_runner_late_failure_restores_schema_and_backup() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     integrity(&c).await?;
     drop(c);

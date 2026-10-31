@@ -1,5 +1,6 @@
 pub mod api;
 pub mod autotagging;
+pub mod backup;
 pub mod collections;
 pub mod credits;
 pub mod db;

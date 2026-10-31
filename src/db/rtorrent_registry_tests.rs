@@ -1,4 +1,4 @@
-//! Migration 0069 (rTorrent): the registry row on top of the label-family triggers from 0068.
+//! Migration 0070 (rTorrent): the registry row on top of the label-family triggers from 0069.
 use super::*;
 
 struct Scratch(PathBuf);

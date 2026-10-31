@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Search-on-add appends position 80; published prefixes remain unchanged.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);
@@ -227,7 +227,8 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
         health,
         dump(
             &c,
-            "SELECT * FROM health_checks WHERE check_key!='recycle_bin' ORDER BY check_key,scope"
+            // Reasoning: 0080 registers root_folder, collection_root_folder and mount_read_only after this predecessor; they are excluded like other later registrations.
+            "SELECT * FROM health_checks WHERE check_key NOT IN ('recycle_bin','root_folder','collection_root_folder','mount_read_only') ORDER BY check_key,scope"
         )
         .await?
     );

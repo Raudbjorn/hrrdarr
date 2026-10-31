@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 const MIN_VERSION: (u32, u32) = (1, 18);
-/// aria2 caps `tellWaiting`/`tellStopped` windows by the number of entries it keeps.
+/// Maximum entries requested in each waiting/stopped page.
 const WINDOW: usize = 1000;
 const STATUS_KEYS: [&str; 13] = [
     "gid",
@@ -115,50 +115,42 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
     fn folder(&self, label: &str) -> String {
         format!("{}/{label}", self.default_dir)
     }
-    /// Reads every window of an offset-paged listing. A listing that outgrows the resource bound
-    /// fails instead of being returned as if the first windows were the whole inventory.
-    async fn pages(&mut self, method: &str, keys: &Value) -> Result<Vec<Value>> {
-        let mut entries = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let page = self
-                .call(method, vec![json!(offset), json!(WINDOW), keys.clone()])
-                .await?;
-            let page = page.as_array().ok_or(QbitError::InvalidResponse)?;
-            entries.extend(page.iter().cloned());
-            if entries.len() > MAX_LISTED_TORRENTS {
-                return Err(HttpError::ResponseTooLarge.into());
-            }
-            if page.len() < WINDOW {
-                return Ok(entries);
-            }
-            offset += WINDOW;
-        }
-    }
     async fn all(&mut self) -> Result<Vec<RawTorrent>> {
-        let keys = json!(STATUS_KEYS);
-        let active = match self.call("aria2.tellActive", vec![keys.clone()]).await? {
-            Value::Array(entries) => entries,
-            _ => return Err(QbitError::InvalidResponse),
-        };
-        let waiting = self.pages("aria2.tellWaiting", &keys).await?;
-        let stopped = self.pages("aria2.tellStopped", &keys).await?;
         let mut out = Vec::new();
-        self.gids.clear();
-        for entry in active.iter().chain(&waiting).chain(&stopped) {
-            if let Some((gid, torrent)) = torrent(entry, &self.default_dir)? {
-                // A hash seen twice (for example a stopped result next to a restarted
-                // download) keeps the first, most active, entry.
-                if out.iter().any(|t: &RawTorrent| t.hash == torrent.hash) {
-                    continue;
+        let mut gids = BTreeMap::new();
+        let mut seen = 0;
+        for method in ["aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"] {
+            let mut offset = 0;
+            loop {
+                let params = if method == "aria2.tellActive" {
+                    vec![json!(STATUS_KEYS)]
+                } else {
+                    vec![json!(offset), json!(WINDOW), json!(STATUS_KEYS)]
+                };
+                let page = self.call(method, params).await?;
+                let entries = page.as_array().ok_or(QbitError::InvalidResponse)?;
+                // Count even skipped/duplicate rows so pagination is bounded for shared clients.
+                seen += entries.len();
+                if seen > MAX_LISTED_TORRENTS {
+                    return Err(HttpError::ResponseTooLarge.into());
                 }
-                self.gids.insert(torrent.hash.clone(), gid);
-                out.push(torrent);
+                for entry in entries {
+                    if let Some((gid, torrent)) = torrent(entry, &self.default_dir)? {
+                        // Keep the first, most active, entry when a hash appears in several lists.
+                        if gids.contains_key(&torrent.hash) {
+                            continue;
+                        }
+                        gids.insert(torrent.hash.clone(), gid);
+                        out.push(torrent);
+                    }
+                }
+                if method == "aria2.tellActive" || entries.len() < WINDOW {
+                    break;
+                }
+                offset += entries.len();
             }
         }
-        if out.len() > MAX_LISTED_TORRENTS {
-            return Err(HttpError::ResponseTooLarge.into());
-        }
+        self.gids = gids;
         Ok(out)
     }
     async fn gid(&mut self, hash: &str) -> Result<String> {

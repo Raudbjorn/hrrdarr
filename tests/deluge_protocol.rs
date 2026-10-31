@@ -944,6 +944,31 @@ async fn status_mapping_isolation_details_and_controls() {
             .collect::<Vec<_>>(),
         vec![("Seeding/Seeding.mkv", 1), ("Seeding/sample.mkv", 0)]
     );
+    // The private import path keeps the original remote name even when a credential is a
+    // substring of it. Only the public torrent projection is redacted.
+    let raw_name = format!("Seeding/{PASSWORD}.mkv");
+    {
+        let mut m = f.0.lock().unwrap();
+        let torrent = m
+            .torrents
+            .iter_mut()
+            .find(|(hash, _)| *hash == h(2))
+            .unwrap();
+        torrent.1["name"] = json!(format!("Seeding.{PASSWORD}"));
+        torrent.1["files"][0]["path"] = json!(raw_name);
+    }
+    let details = label_client::details(
+        &operation,
+        &settings,
+        Some(&login()),
+        &MediaTarget::Episode(1),
+        &h(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(details.files[0].name, raw_name);
+    assert!(!details.item.name.contains(PASSWORD));
+    assert!(details.item.name.contains("[redacted]"));
     assert_eq!(
         label_client::details(
             &operation,

@@ -31,8 +31,9 @@ Collection adoption retains local removal intent and protects it from stale snap
 returns the active one); `GET` list/detail. The worker also schedules it every 24 hours while collections exist.
 Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 parts) outside any transaction, then
 applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
-missing members are added. A run spans worker slices through a cursor and survives restarts. Collection refreshes compete
-with the other due command queues; continuations relinquish their place between slices. Per-collection fetch
+missing members are added. A run spans worker slices through a cursor and survives restarts. Automatic
+refreshes rank below ordinary commands; continuations yield through their ready timestamp, and
+transient rate limits retry with bounded delay. Per-collection fetch
 failures are counted; if nothing succeeded and the service was unavailable the command fails
 (`metadata_unavailable`). Migration `0067_collections.sql`.
 
@@ -47,9 +48,9 @@ Collection automatic additions also honor active `movie_import_exclusions`.
 
 `src/db/mod.rs` validates each accepted migration-history prefix before applying its matching
 upgrade path. Historical SQL/name/checksum records are retained; migration filename prefixes
-alone do not identify the schema version. Fresh/current-main databases finish at version 80;
+alone do not identify the schema version. Fresh/current-main databases finish at version 83;
 the earlier published main checkpoint and PR #31 history converge through the version-83
-bridge, followed by the search-on-add outbox at version 84. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
+bridge, followed by search-on-add, Wanted timestamps, root health and backups through version 87. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
 not establish production upgrade success.
 
 Upgrades from the earlier main checkpoint now preserve nullable `search_on_add` transactionally.

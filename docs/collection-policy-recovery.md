@@ -74,7 +74,7 @@ All of these must hold, otherwise every live false value is reported as
 3. Its `schema_migrations` ledger is an exact prefix of the published PR #31 history (name,
    checksum and SQL of every row) of 52 to 72 rows, so `search_on_add` was still nullable, and
    the manifest's `schema_version` equals the ledger's row count. The live ledger must be that
-   same history, complete (84 rows, including the version-83 bridge and search-on-add migration). A backup from the other (main) lineage, or one taken after
+   same history, complete (87 rows, including the version-83 bridge, search-on-add, Wanted timestamps, root health and backups). A backup from the other (main) lineage, or one taken after
    the conversion, is rejected.
 
 ## Decisions

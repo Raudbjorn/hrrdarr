@@ -81,7 +81,7 @@ async fn custom_format_upgrade_rollback_domains_bounds_and_reopen() -> Result<()
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Search-on-add appends position 80; published prefixes remain unchanged.
+    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
     assert_eq!(scalar(&c, "SELECT count(*) FROM custom_formats").await?, 0);
     assert_eq!(
         scalar(

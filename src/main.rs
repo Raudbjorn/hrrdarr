@@ -96,6 +96,28 @@ async fn run() -> Result<(), ProcessFailure> {
             .map_err(|e| ProcessFailure::at("database_open", e))?
     } else {
         let path = env::var("HRRDARR_DATABASE_PATH").unwrap_or_else(|_| "hrrdarr.db".into());
+        // A validated pending restore replaces the database before it is opened; the replaced
+        // database is retained beside it.
+        match hrrdarr::backup::apply_pending_restore(std::path::Path::new(&path))
+            .await
+            .map_err(|e| ProcessFailure::at("backup_restore", e))?
+        {
+            hrrdarr::backup::RestoreOutcome::None => {}
+            hrrdarr::backup::RestoreOutcome::Applied { original } => println!(
+                "event=backup_restore_applied original={}",
+                original.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            ),
+            hrrdarr::backup::RestoreOutcome::Rejected {
+                quarantined,
+                reason,
+            } => eprintln!(
+                "event=backup_restore_rejected code={reason} quarantined={}",
+                quarantined
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+            ),
+        }
         Database::open_local(path)
             .await
             .map_err(|e| ProcessFailure::at("database_open", e))?
@@ -104,8 +126,11 @@ async fn run() -> Result<(), ProcessFailure> {
         .await
         .map_err(|e| ProcessFailure::at("quality_profile_defaults", e))?;
     let db = Arc::new(db);
-    if db.migration_backup().is_some() {
+    if let Some(snapshot) = db.migration_backup() {
         println!("event=migration_backup_created");
+        // The recovery directory stays; this also publishes it as a typed `update` backup.
+        // Failure is logged by the engine and does not block startup.
+        let _ = hrrdarr::backup::publish_update(&db, snapshot).await;
     }
     let provider_key = match env::var("HRRDARR_PROVIDER_KEY") {
         Ok(value) => Some(Arc::new(
@@ -237,6 +262,7 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
             hrrdarr::import_lists::Deps::production(state.metadata.clone()),
         ))
         .merge(hrrdarr::commands::router(state.db.clone()))
+        .merge(hrrdarr::backup::router(state.db.clone()))
         .merge(hrrdarr::health::router(state.db.clone()))
         .merge(hrrdarr::history::router(state.db.clone()))
         .merge(hrrdarr::blocklist::router(state.db.clone()))

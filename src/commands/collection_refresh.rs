@@ -358,7 +358,7 @@ pub(super) async fn run(
     .await?;
     eprintln!(
         "event=collection_refresh_settled command_id={id} checked={} failed={} added={}",
-        total_checked + 0,
+        total_checked,
         total_failed,
         command.movies_added + added
     );

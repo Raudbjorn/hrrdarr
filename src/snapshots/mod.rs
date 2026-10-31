@@ -319,6 +319,10 @@ async fn import_inner(
         profiles::finish(&tx, prepared, &mut report).await?;
         tags::write(&tx, &tag_plan, &mut report).await?;
         collections::write(&tx, &collection_plan, &mut report).await?;
+        // Imported library items, root declarations and collection policy share this transaction.
+        crate::health::library_roots_changed(&tx)
+            .await
+            .map_err(|_| ImportError("snapshot health invalidation failed"))?;
         revision_policy::write(&tx, revision_policy_plan, &mut report).await?;
         import_policy::write(&tx, import_policy_plan.as_ref(), &mut report).await?;
         delay_profiles::write(&tx, delay_plan.as_ref(), &mut report).await?;
