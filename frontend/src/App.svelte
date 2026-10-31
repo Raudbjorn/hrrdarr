@@ -8,6 +8,7 @@
   import ImportPolicyPanel from './lib/ImportPolicyPanel.svelte';
   import RecycleBinPanel from './lib/RecycleBinPanel.svelte';
   import NotificationsPanel from './lib/NotificationsPanel.svelte';
+  import ImportListsPanel from './lib/ImportListsPanel.svelte';
   import TagsPanel from './lib/TagsPanel.svelte';
   import LibraryTagsPanel from './lib/LibraryTagsPanel.svelte';
   import CreateTags from './lib/CreateTags.svelte';
@@ -59,6 +60,7 @@
     else if (next === 'profiles') profilesVisited = true; else if (next === 'media-management') revisionVisited = true;
     else if (next === 'history') historyVisited = true; else if (next === 'general') generalVisited = true;
     else if (next === 'import-existing') importVisited = true; else if (next === 'notifications') notificationsVisited = true;
+    else if (next === 'import-lists') importListsVisited = true;
     view = next;
   }
   function applyHash() {
@@ -73,7 +75,7 @@
     showView(next);
   }
   let historyVisited=$state(false);
-  let generalVisited=$state(false), notificationsVisited=$state(false);
+  let generalVisited=$state(false), notificationsVisited=$state(false), importListsVisited=$state(false);
   // The panel keeps a live batch running across nav switches (hidden, not unmounted), so it must
   // not eagerly mount and hold a root-folder-scan permit before anyone visits it.
   let importVisited = $state(false), profilesVisited = $state(false), qualitiesVisited = $state(false), customFormatsVisited = $state(false);
@@ -269,7 +271,7 @@
 <svelte:head><title>hrrdarr · Library</title></svelte:head>
 <header class="masthead"><a href="#/" class="brand">hrrdarr</a><span>Media library</span></header>
 <main id="library">
-  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='wanted-missing'||view==='wanted-cutoff'} onclick={()=>navigate('wanted-missing')}>Wanted</button><button aria-pressed={view==='calendar'} onclick={()=>navigate('calendar')}>Calendar</button><button aria-pressed={view==='collections'} onclick={()=>navigate('collections')}>Collections</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='backup'} onclick={()=>navigate('backup')}>Backup</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='autotagging'} onclick={()=>navigate('autotagging')}>Auto tagging</button><button aria-pressed={view==='notifications'} onclick={()=>navigate('notifications')}>Connect</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
+  <nav class="app-nav" aria-label="Workspace"><button aria-pressed={view==='library'} onclick={()=>navigate('library')}>Library</button><button aria-pressed={view==='providers'} onclick={()=>navigate('providers')}>Providers</button><button aria-pressed={view==='activity'} onclick={()=>navigate('activity')}>Activity</button><button aria-pressed={view==='wanted-missing'||view==='wanted-cutoff'} onclick={()=>navigate('wanted-missing')}>Wanted</button><button aria-pressed={view==='calendar'} onclick={()=>navigate('calendar')}>Calendar</button><button aria-pressed={view==='collections'} onclick={()=>navigate('collections')}>Collections</button><button aria-pressed={view==='health'} onclick={()=>navigate('health')}>Health</button><button aria-pressed={view==='backup'} onclick={()=>navigate('backup')}>Backup</button><button aria-pressed={view==='blocklist'} onclick={()=>navigate('blocklist')}>Blocklist</button><button aria-pressed={view==='rss'} onclick={()=>navigate('rss')}>RSS</button><button aria-pressed={view==='tags'} onclick={()=>navigate('tags')}>Tags</button><button aria-pressed={view==='custom-formats'} onclick={()=>navigate('custom-formats')}>Custom formats</button><button aria-pressed={view==='qualities'} onclick={()=>navigate('qualities')}>Quality settings</button><button aria-pressed={view==='profiles'} onclick={()=>navigate('profiles')}>Profiles</button><button aria-pressed={view==='media-management'} onclick={()=>navigate('media-management')}>Media management</button><button aria-pressed={view==='history'} onclick={()=>navigate('history')}>History</button><button aria-pressed={view==='autotagging'} onclick={()=>navigate('autotagging')}>Auto tagging</button><button aria-pressed={view==='notifications'} onclick={()=>navigate('notifications')}>Connect</button><button aria-pressed={view==='import-lists'} onclick={()=>navigate('import-lists')}>Import lists</button><button aria-pressed={view==='general'} onclick={()=>navigate('general')}>General</button><button aria-pressed={view==='naming'} onclick={()=>navigate('naming')}>Naming</button><button aria-pressed={view==='import-existing'} onclick={()=>navigate('import-existing')}>Import existing</button><button aria-pressed={view==='settings-index'} onclick={()=>navigate('settings-index')}>Settings</button></nav>
   {#if view === 'settings-index'}<SettingsIndex />{/if}
   {#if view === 'not-found'}<NotFound path={notFoundPath} />{/if}
   {#if view === 'rss'}<RssPanel />{/if}
@@ -291,6 +293,7 @@
   {#if generalVisited}<div hidden={view!=='general'}><GeneralSettingsPanel /></div>{/if}
   {#if view === 'naming'}<NamingPanel />{/if}
   {#if importVisited}<div hidden={view !== 'import-existing'}><ImportExistingLibraryPanel /></div>{/if}
+  {#if importListsVisited}<div hidden={view!=='import-lists'}><h1>Import lists</h1><ImportListsPanel /></div>{/if}
   {#if notificationsVisited}<div hidden={view!=='notifications'}><h1>Connect</h1><NotificationsPanel {tagVersions} /></div>{/if}
   {#if tagsVisited}<div hidden={view!=='tags'}><TagsPanel relatedWrites={tagRelatedWithProviders} usageVersions={profileUsageVersion} ondelay={openDelay} onrelease={openRelease} onwrite={(scope,state)=>tagWrites={...tagWrites,[scope]:state}} onchange={scope=>tagVersions={...tagVersions,[scope]:tagVersions[scope]+1}} onowner={(scope,id)=>{if(libraryLocked)return;if(scope!==domain)changeDomain(scope);if(scope!==domain)return;view='library';void select(id);}} /></div>{/if}
   <div hidden={view !== 'library'}>

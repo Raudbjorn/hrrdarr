@@ -394,6 +394,124 @@ export type HostSettings = { authentication: HostAuthentication, configured_bind
 
 export type ImportInput = ManualImportRequest | ImportRequest;
 
+export type ImportList = { id: string, name: string, implementation: string, media_type: MediaDomain, enabled: boolean, enable_automatic_add: boolean, search_on_add: boolean, monitor: ImportListMonitor, quality_profile_id: number | null, root_folder_id: number | null, minimum_availability: MinimumAvailability | null, series_type: SeriesType | null, season_folder: boolean | null, interval_minutes: number, tag_ids: Array<number>, revision: number, settings: { [key in string]: ImportListSettingValue },
+/**
+ * Names of secrets that are configured; the values are never returned.
+ */
+secrets_configured: Array<string>, last_sync_at: number | null, last_success_at: number | null, last_error: string | null, created_at: number, updated_at: number, };
+
+export type ImportListCollection = { items: Array<ImportList>, };
+
+export type ImportListExclusion = { id: number, media_type: MediaDomain, external_id: number, title: string, year: number | null, created_at: number, };
+
+export type ImportListExclusionBulkDelete = { ids: Array<number>, };
+
+export type ImportListExclusionInput = { media_type: MediaDomain,
+/**
+ * TVDB id for TV, TMDb id for movies.
+ */
+external_id: number, title: string, year?: number, };
+
+export type ImportListExclusionPage = { items: Array<ImportListExclusion>, total: number, limit: number, offset: number, };
+
+export type ImportListField = { name: string, label: string, kind: ImportListFieldKind, required: boolean,
+/**
+ * Secret fields are submitted through `secrets`, stored encrypted and never returned.
+ */
+secret: boolean, help: string, default: ImportListSettingValue | null, options: Array<string>, min: number | null, max: number | null, max_length: number | null, };
+
+export type ImportListFieldKind = "text" | "url" | "number" | "boolean" | "select";
+
+export type ImportListImplementation = { implementation: string, label: string, description: string, domains: Array<MediaDomain>, default_interval_minutes: number, min_interval_minutes: number, fields: Array<ImportListField>, };
+
+export type ImportListImplementationCollection = { items: Array<ImportListImplementation>, };
+
+export type ImportListInput = { name: string, implementation: string, media_type: MediaDomain, enabled: boolean,
+/**
+ * Off: the list is fetched and its membership recorded, but nothing is added.
+ */
+enable_automatic_add: boolean, search_on_add: boolean, monitor: ImportListMonitor, quality_profile_id?: number, root_folder_id?: number,
+/**
+ * Movies only.
+ */
+minimum_availability?: MinimumAvailability,
+/**
+ * TV only; defaults to standard.
+ */
+series_type?: SeriesType,
+/**
+ * TV only; defaults to true.
+ */
+season_folder?: boolean,
+/**
+ * Minutes between scheduled syncs; defaults to the implementation default.
+ */
+interval_minutes?: number, tag_ids: Array<number>, settings: { [key in string]: ImportListSettingValue },
+/**
+ * On update an absent key keeps the stored value and `null` clears it.
+ */
+secrets: { [key in string]: string | null },
+/**
+ * Required on update; must equal the stored revision.
+ */
+revision?: number, };
+
+export type ImportListItem = { key: string, title: string, year: number | null, tvdb_id: number | null, tmdb_id: number | null, imdb_id: string | null,
+/**
+ * pending, added, existing, excluded, unresolved or failed.
+ */
+state: string, error_code: string | null, library_id: number | null,
+/**
+ * pending or admitted; admission queues durable commands, not a claim of search success.
+ */
+search_status: string | null, search_error_code: string | null, };
+
+export type ImportListItemPage = { items: Array<ImportListItem>, total: number, limit: number, offset: number, };
+
+export type ImportListMonitor = "all" | "none" | "first_season" | "last_season";
+
+export type ImportListRun = { id: string, list_id: string, media_type: MediaDomain,
+/**
+ * `manual` (Sync now) or `scheduled`.
+ */
+origin: string, status: ImportListRunStatus,
+/**
+ * The membership snapshot was fetched; later claims resume from it without refetching.
+ */
+fetched: boolean, attempts: number, items_fetched: number, added: number, existing: number, excluded: number, unresolved: number, failed: number,
+/**
+ * Items of the snapshot still waiting to be processed.
+ */
+pending: number, error_code: string | null, created_at: number, started_at: number | null, completed_at: number | null, };
+
+export type ImportListRunCollection = { items: Array<ImportListRun>, };
+
+export type ImportListRunStatus = "queued" | "running" | "succeeded" | "failed";
+
+export type ImportListSettingValue = boolean | number | string;
+
+export type ImportListSyncAll = { runs: Array<ImportListRun>,
+/**
+ * Lists skipped because they are disabled or already have an active run.
+ */
+skipped: number, };
+
+export type ImportListTestInput = {
+/**
+ * A saved list whose stored secrets fill any secret not supplied in the draft.
+ */
+existing_id?: string, draft: ImportListInput, };
+
+export type ImportListTestResult = { ok: boolean,
+/**
+ * Items the provider returned (the test fetches the same way a sync does, without adding).
+ */
+item_count: number | null,
+/**
+ * Stable machine class; never contains remote bodies, URLs or secrets.
+ */
+error: string | null, };
+
 export type ImportPolicy = { media_type: MediaDomain, revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
 
 export type ImportPolicyUpdate = { revision: number, skip_free_space_check_when_importing: boolean, minimum_free_space_mib: number, download_client_working_folders: string, };
@@ -734,7 +852,7 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 

@@ -634,6 +634,76 @@ async fn newer_backup_replaces_snapshot_policy_and_exclusions_but_not_unresolved
 }
 
 #[tokio::test]
+async fn snapshots_preserve_collection_intents_even_without_catalog_rows() {
+    let _guard = IMPORT_LOCK.lock().await;
+    let s = Scratch::new();
+    let bytes = source(&s, MODERN, "", None).await;
+    for (index, local_edit, removed, reason, existing) in [
+        (0, 1, 1, Some("user"), false),
+        (1, 0, 1, Some("metadata_missing"), false),
+        (2, 1, 0, None, false),
+        (3, 1, 0, None, true),
+    ] {
+        let db = Database::open_local(s.0.join(format!("intent-{index}.db")))
+            .await
+            .unwrap();
+        let c = db.connect().await.unwrap();
+        c.execute("INSERT INTO movie_collection_intents(tmdb_id,local_edit,removed,removal_reason)VALUES(900,?,?,?)",libsql::params![local_edit,removed,reason]).await.unwrap();
+        if existing {
+            c.execute(
+                "INSERT INTO movie_collections(tmdb_id,title)VALUES(900,'Native collection')",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let report = snapshots::import(&db, Application::Radarr, bytes.clone(), false)
+            .await
+            .unwrap();
+        assert!(report.applied);
+        assert!(report.unsupported.iter().any(|v| {
+            v.columns
+                .iter()
+                .any(|m| m.contains("native collection intent retained"))
+        }));
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM movie_collections").await,
+            i64::from(existing)
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM movie_collection_members").await,
+            0
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM movie_collection_settings WHERE monitored=1 OR snapshot_owned=1"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT revision FROM movie_collection_intents WHERE tmdb_id=900"
+            )
+            .await,
+            1
+        );
+        if existing {
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM movie_collections WHERE title='Native collection'"
+                )
+                .await,
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn api_policy_edit_is_sticky_against_a_newer_backup() {
     let _guard = IMPORT_LOCK.lock().await;
     let s = Scratch::new();
@@ -660,7 +730,7 @@ async fn api_policy_edit_is_sticky_against_a_newer_backup() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let id = scalar(&c, "SELECT id FROM movie_collections").await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    // Reasoning: the user turns search_on_add off through the API; that is a native policy edit.
+    // Reasoning: the API edit marks both separate settings and persistent intent, fencing newer backups.
     let status = client
         .put(format!("{base}/api/v1/movies/collections/{id}"))
         .header("content-type", "application/json")

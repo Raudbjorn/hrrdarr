@@ -156,6 +156,20 @@ impl Drop for Server {
         }
     }
 }
+// Owned import-list sources: JSON feeds the Custom provider reads, and an RSS feed.
+async fn list_feed(Path(name): Path<String>) -> Response {
+    match name.as_str() {
+        "tv" => Json(json!([{"tvdb_id":202,"title":"Search series 202"},{"tvdb_id":203,"title":"Search series 203"}])).into_response(),
+        "movies" => Json(json!([{"tmdb_id":202,"title":"Search movie 202","year":2021},{"tmdb_id":203,"title":"Search movie 203","year":2021}])).into_response(),
+        "rss" => (
+            [("content-type", "application/rss+xml")],
+            "<rss version=\"2.0\"><channel><item><title>Fixture series</title></item></channel></rss>",
+        )
+            .into_response(),
+        "broken" => (StatusCode::OK, "not json").into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 async fn serve(router: Router) -> (String, Server) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -1431,6 +1445,8 @@ async fn library_ui_fixture() {
             .unwrap(),
     );
     let (provider_origin, _providers) = serve(provider_router()).await;
+    let (list_origin, _list_feeds) =
+        serve(Router::new().route("/feed/{name}", get(list_feed))).await;
     let (alternate_provider_origin, alternate_providers) = serve(provider_router()).await;
     let key = Arc::new(providers::CredentialKey::from_hex(&"42".repeat(32)).unwrap());
     let (provider_routes, refresh) = providers::router_with_refresh(db.clone(), Some(key.clone()));
@@ -1453,11 +1469,19 @@ async fn library_ui_fixture() {
     }
     // Production starts the outbox worker next to the command worker; the fixture does the same.
     let _notifier = hrrdarr::notifications::start(db.clone(), Some(key.clone()));
+    // The import-list scheduler runs beside the command worker, as in production.
+    let list_deps = hrrdarr::import_lists::Deps::production(client.clone());
+    let _list_sync = hrrdarr::import_lists::start(db.clone(), Some(key.clone()), list_deps.clone());
     let (api, _api) = serve(
         library::router(db.clone())
             .merge(hrrdarr::notifications::router(
                 db.clone(),
                 Some(key.clone()),
+            ))
+            .merge(hrrdarr::import_lists::router(
+                db.clone(),
+                Some(key.clone()),
+                list_deps,
             ))
             .merge(
                 Router::new()
@@ -1552,7 +1576,7 @@ async fn library_ui_fixture() {
     let shutdown = scratch.0.join("shutdown");
     println!(
         "UI_FIXTURE {}",
-        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"downloaded_scan":scratch.0.join("downloaded-scan"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
+        json!({"api":api,"metadata":metadata_origin,"provider_origin":provider_origin,"list_origin":list_origin,"alternate_provider_origin":alternate_provider_origin,"scratch":scratch.0,"tv_path":tv,"movie_path":movies,"episode_source":incoming.join("episode.mkv"),"movie_source":incoming.join("movie.mkv"),"episode_destination":tv.join("pilot.mkv"),"downloaded_scan":scratch.0.join("downloaded-scan"),"movie_destination":movies.join("movie.mkv"),"shutdown":shutdown})
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
     while !shutdown.exists() && tokio::time::Instant::now() < deadline {
@@ -1565,5 +1589,6 @@ async fn library_ui_fixture() {
     }
     _metadata.stop().await;
     _providers.stop().await;
+    _list_feeds.stop().await;
     alternate_providers.stop().await;
 }

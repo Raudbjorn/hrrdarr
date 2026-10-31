@@ -184,7 +184,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

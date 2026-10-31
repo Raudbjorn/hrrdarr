@@ -578,6 +578,10 @@ async fn commit(db: &Database, j: &Journal) -> std::result::Result<RenameEvent, 
             let text = format!("{e:?}");
             if text.contains("UNIQUE") { "destination_in_use" } else { "storage_error" }
         };
+        // Recheck declarations under the write lock; a destination may be claimed after planning.
+        if j.kind == Kind::Dir && plan::folder_destination_in_use(&tx, &j.new, j.series_id, j.movie_id).await.map_err(owned)? {
+            return Err("destination_in_use");
+        }
         if j.kind == Kind::File {
             let table = if tv { "episode_files" } else { "movie_files" };
             let n = tx.execute(&format!("UPDATE {table} SET path=? WHERE id=? AND path=?"), params![j.new.clone(), j.file_id, j.old.clone()]).await.map_err(owned)?;

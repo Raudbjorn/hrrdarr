@@ -196,7 +196,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+    assert_eq!(version(&conn).await?, 83); // Both published tails append without rewriting existing ledger entries.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

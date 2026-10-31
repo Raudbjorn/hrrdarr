@@ -162,23 +162,38 @@ fn check_manifest(manifest: &BackupManifest) -> Result<(), Error> {
         ));
     }
     let version = manifest.schema_version as usize;
-    if version > db::latest_schema_version() {
+    if version > db::max_schema_version() {
         return Err(newer());
     }
-    let known = db::migration_history();
+    let known = db::known_migration_histories();
     if version == 0
         || manifest.migrations.len() != version
-        || manifest
-            .migrations
-            .iter()
-            .zip(known.iter())
-            .any(|(m, (v, name, sum))| {
-                m.version as usize != *v || m.name != *name || m.checksum != *sum
-            })
+        || !known.iter().any(|history| {
+            history.len() >= version
+                && manifest
+                    .migrations
+                    .iter()
+                    .zip(history.iter())
+                    .all(|(m, (v, name, sum))| {
+                        m.version as usize == *v && m.name == *name && m.checksum == *sum
+                    })
+        })
     {
         return Err(history());
     }
     Ok(())
+}
+
+fn snapshot_matches_manifest(facts: &db::SnapshotFacts, manifest: &BackupManifest) -> bool {
+    facts.schema_version == manifest.schema_version as usize
+        && facts.migrations.len() == manifest.migrations.len()
+        && facts
+            .migrations
+            .iter()
+            .zip(&manifest.migrations)
+            .all(|((v, name, sum), m)| {
+                *v == m.version as usize && *name == m.name && *sum == m.checksum
+            })
 }
 
 fn map_archive(error: archive::ArchiveError) -> Error {
@@ -490,7 +505,7 @@ pub(crate) async fn stage(
         SnapshotError::Integrity => integrity(),
         SnapshotError::Unreadable => invalid_archive("The backup database cannot be opened"),
     })?;
-    if facts.schema_version != manifest.schema_version as usize {
+    if !snapshot_matches_manifest(&facts, &manifest) {
         return Err(history());
     }
     if Instant::now() > deadline {
@@ -1069,7 +1084,7 @@ mod tests {
 
     #[test]
     fn manifests_must_match_this_builds_migration_prefix() {
-        let history = db::migration_history();
+        let history = db::known_migration_histories().remove(0);
         let mut manifest = BackupManifest {
             format: MANIFEST_FORMAT,
             application: super::super::APPLICATION.into(),
@@ -1113,10 +1128,108 @@ mod tests {
             check_manifest(&manifest).unwrap_err().code(),
             "backup_history_mismatch"
         );
-        manifest.schema_version = (db::latest_schema_version() + 1) as u32;
+        manifest.schema_version = (db::max_schema_version() + 1) as u32;
         assert_eq!(
             check_manifest(&manifest).unwrap_err().code(),
             "backup_schema_unsupported"
         );
+    }
+    #[tokio::test]
+    async fn backup_restore_preserves_each_published_history_and_rejects_crossed_manifests() {
+        for history in db::test_migration_histories() {
+            let dir = std::env::temp_dir()
+                .join(format!("hrrdarr-history-backup-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("database.db");
+            let (raw, c) = db::published_prefix_tests::seed_lineage(&path, history, history.len())
+                .await
+                .unwrap();
+            c.execute(
+                "INSERT INTO series(id,title,path) VALUES(1,'Before backup','/tv/kept')",
+                (),
+            )
+            .await
+            .unwrap();
+            drop(c);
+            drop(raw);
+            let database = db::Database::open_local(&path).await.unwrap();
+            let published = super::super::create_backup(
+                &database,
+                super::super::BackupType::Manual,
+                super::super::BackupLimits::startup(),
+            )
+            .await
+            .unwrap();
+            let archive_path = dir.join("Backups/manual").join(&published.backup.name);
+            let manifest = read_manifest(&archive_path).unwrap();
+            assert_eq!(manifest.schema_version as usize, history.len());
+            assert!(check_manifest(&manifest).is_ok());
+            let snapshot = dir.join("identity.db");
+            let c = database.connect().await.unwrap();
+            db::vacuum_into(&c, &snapshot).await.unwrap();
+            let facts = db::inspect_snapshot(&snapshot, SnapshotOpen::ReadOnly)
+                .await
+                .unwrap();
+            assert!(snapshot_matches_manifest(&facts, &manifest));
+            if history.len() == 83 {
+                let mut crossed = manifest.clone();
+                let other = db::known_migration_histories()
+                    .into_iter()
+                    .find(|h| h.len() == 83 && h[78].1 != manifest.migrations[78].name)
+                    .unwrap();
+                crossed.migrations = other
+                    .into_iter()
+                    .map(|(v, n, c)| super::super::ManifestMigration {
+                        version: v as u32,
+                        name: n.into(),
+                        checksum: c,
+                    })
+                    .collect();
+                assert!(
+                    check_manifest(&crossed).is_ok(),
+                    "both exact published histories are supported"
+                );
+                assert!(
+                    !snapshot_matches_manifest(&facts, &crossed),
+                    "same version does not establish the same history"
+                );
+            }
+            c.execute("UPDATE series SET title='After backup' WHERE id=1", ())
+                .await
+                .unwrap();
+            stage(
+                &database,
+                Source::Backup {
+                    backup: published.backup,
+                    path: archive_path,
+                },
+                super::super::ApiLimits::default(),
+            )
+            .await
+            .unwrap();
+            drop(c);
+            drop(database);
+            assert!(matches!(
+                apply_pending_restore(&path).await.unwrap(),
+                RestoreOutcome::Applied { .. }
+            ));
+            let restored = db::Database::open_local(&path).await.unwrap();
+            let c = restored.connect().await.unwrap();
+            assert_eq!(
+                c.query("SELECT title FROM series WHERE id=1", ())
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
+                "Before backup"
+            );
+            drop(c);
+            drop(restored);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

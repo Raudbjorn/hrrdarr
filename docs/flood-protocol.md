@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Flood/` i
 
 ## Configuration
 
-`ProviderSettings::Flood { endpoint, tv, movies }`, stored by migration 0073 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
+`ProviderSettings::Flood { endpoint, tv, movies }`, stored by migration file 0073 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is Flood's base URL including any URL base, for example `http://flood.example:3000`.
 - Each scope is the shared `TorrentLabelScope`; `category` is a Flood tag (1-64 of lowercase letters, digits, `.`, `_`, `-`; TV and movie tags must differ). `add_paused` adds the torrent stopped. `recent_priority`/`older_priority` are accepted and stored but not applied (see Controls).
@@ -16,7 +16,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Flood/` i
 
 ## Session and Test
 
-With credentials, each operation posts them to `/api/auth/authenticate` and sends the returned `jwt` cookie on every request; 400/401/403 is `authentication`. `POST /api/providers/{id}/test` and `test-draft` authenticate, require `isConnected: true` from `connection-test` (Flood up but disconnected from its client is a connection failure), read `directoryDefault` from `client/settings` and list the torrents. The reported version is the fixed text `Flood REST API` because Flood publishes none. Test never adds anything.
+With credentials, each operation posts them to `/api/auth/authenticate` and sends the returned `jwt` cookie on every request; 400/401/403 is `authentication`. `POST /api/v1/providers/{id}/test` and `POST /api/v1/providers/test-draft` authenticate, require `isConnected: true` from `connection-test` (Flood up but disconnected from its client is a connection failure), read `directoryDefault` from `client/settings` and list the torrents. The reported version is the fixed text `Flood REST API` because Flood publishes none. Test never adds anything.
 
 ## Ownership and status
 
@@ -34,4 +34,4 @@ Pause (`stop`), Resume (`start`) and Remove (`delete`, with `deleteData`), each 
 
 - Live Flood compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed Flood was contacted. Paths, JSON shapes (including the `directory` and `contents` path semantics for multi-file torrents) and the cookie name come from the API description, not a live run. The behaviour of the different backends behind Flood is not distinguished.
 - Queue placement (`first`), tag edits on existing torrents (PATCH), seeding limits and the health classifier are not implemented.
-- Migration 0073 is the 73rd entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).
+- Migration file `0073` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

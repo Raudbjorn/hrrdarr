@@ -127,7 +127,7 @@ async fn create(
     State(db): State<Arc<Database>>,
     input: std::result::Result<Json<CollectionRefreshInput>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CollectionRefreshCommand>)> {
-    input.map_err(|_| bad())?;
+    let _ = input.map_err(|_| bad())?;
     let c = connection(&db).await?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -327,7 +327,7 @@ pub(super) async fn run(
         .is_empty();
     if more && !gave_up {
         c.execute(
-            &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=? WHERE id=? AND status='running'"),
+            &format!("UPDATE collection_refresh_commands SET {progress},status='queued',next_attempt_at=max(next_attempt_at+1,?) WHERE id=? AND status='running'"),
             params![checked, failed, added, searches, cursor, now()?, id.to_string()],
         )
         .await?;

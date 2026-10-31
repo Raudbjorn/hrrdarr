@@ -56,6 +56,12 @@ entries sharing an inode remain a conflict. Cancel stops before the next item; f
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
 plan as unchanged.
 
+Folder destinations are checked against both declared series and movie paths, including equal
+paths and ancestor/descendant overlaps at directory boundaries. An absent destination directory
+does not make a declared path available. The commit transaction repeats this check; a newly
+claimed destination causes the existing journal recovery path to roll the move back. Equal
+numeric movie and series IDs remain distinct owners.
+
 ## OnRename seam
 
 Each committed rename inserts an immutable `rename_events` row (`event_type='rename'`, `kind`
@@ -79,5 +85,5 @@ transaction, then calls observers registered with
   (cause not established; observed-once).
 * Source-faithful Sonarr/Radarr runtime equivalence, V3 wire shapes, scene/absolute edge cases
   beyond the renderer's tested grammar, and extra-file tracking tables are not claimed.
-* The command pool admits `rename_commands`; the schema migration is file 0067 but sits at
-  position 63 on this branch, so merging needs renumbering with the other lanes.
+* The command pool admits `rename_commands`. Migration files and execution positions depend on
+  the validated history lineage; `src/db/mod.rs` defines the accepted prefixes and upgrade paths.

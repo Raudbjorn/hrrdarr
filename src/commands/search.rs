@@ -238,9 +238,28 @@ pub(crate) async fn authority(c: &Connection, id: Uuid) -> Result<SearchContext>
         CandidateOrigin::Search { command_id, .. } => {
             let command = read(c, command_id).await?;
             check_identity(c, &command).await?;
-            Ok(SearchContext::UserSearch)
+            decision_context(c, command_id).await
         }
     }
+}
+/// Provenance is independent of list/library lifetime: deleting either cannot promote a
+/// background command (or its candidate) into the explicit user-search policy exception.
+async fn decision_context(c: &Connection, id: Uuid) -> Result<SearchContext> {
+    Ok(
+        if c.query(
+            "SELECT 1 FROM import_list_search_commands WHERE command_id=?",
+            [id.to_string()],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some()
+        {
+            SearchContext::Rss
+        } else {
+            SearchContext::UserSearch
+        },
+    )
 }
 fn matches_target(requested: &MediaTarget, actual: &Option<crate::search::ReleaseTarget>) -> bool {
     match (requested, actual) {
@@ -292,12 +311,13 @@ async fn evaluate(
     release: &indexer::Release,
     operation: &mut crate::release_profile_terms::OperationEvidence,
 ) -> Result<ReleaseDecision> {
+    let context = decision_context(c, command.id).await?;
     let mut decision = crate::search::evaluate_with_evidence(
         c,
         command.source.media_type,
         command.source.indexer_id,
         release,
-        SearchContext::UserSearch,
+        context,
         now()?,
         operation,
     )
@@ -313,7 +333,9 @@ async fn evaluate(
     {
         decision.deny("unsupported_protocol")
     }
-    decision.not_before = None;
+    if context == SearchContext::UserSearch {
+        decision.not_before = None;
+    }
     Ok(decision)
 }
 fn envelope(id: Uuid, command: &SearchCommand) -> String {
@@ -471,6 +493,98 @@ async fn insert(
 
 /// Most targets one Wanted request may capture; it equals the shared active-command pool.
 pub(crate) const MAX_WANTED_TARGETS: usize = MAX_COMMANDS as usize;
+
+/// Admit one durable list-add intent using ordinary search commands and the existing worker.
+/// Capture all currently monitored targets and automatic-search indexers in one transaction.
+/// The outbox marker prevents re-admission even after completed command history is removed.
+pub(crate) async fn admit_import_list(
+    db: &Database,
+    key_available: bool,
+    addition_id: i64,
+) -> Result<()> {
+    let c = connection(db).await?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let outcome = async {
+        let Some(row) = tx.query(
+            "SELECT a.media_type,a.series_id,a.movie_id FROM import_list_search_requests r JOIN import_list_additions a ON a.id=r.addition_id WHERE r.addition_id=? AND r.status='pending'",
+            [addition_id],
+        ).await?.next().await? else { return Ok(()) };
+        let media = MediaDomain::parse(&row.get::<String>(0)?).map_err(|_| bad())?;
+        let mut targets = Vec::new();
+        match media {
+            MediaDomain::Tv => {
+                let mut rows = tx.query(
+                    "SELECT e.id FROM episodes e JOIN series s ON s.id=e.series_id JOIN seasons se ON se.series_id=e.series_id AND se.number=e.season WHERE s.id=? AND s.monitored=1 AND se.monitored=1 AND e.monitored=1 ORDER BY e.id LIMIT ?",
+                    params![row.get::<i64>(1)?, MAX_COMMANDS + 1],
+                ).await?;
+                while let Some(row) = rows.next().await? {
+                    targets.push(MediaTarget::Episode(row.get(0)?));
+                }
+            }
+            MediaDomain::Movies => {
+                let id: i64 = row.get(2)?;
+                if tx.query("SELECT 1 FROM movies WHERE id=? AND monitored=1", [id]).await?.next().await?.is_some() {
+                    targets.push(MediaTarget::Movie(id));
+                }
+            }
+        }
+        let timestamp = now()?;
+        if !targets.is_empty() {
+            if !key_available {
+                return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "key_unavailable"));
+            }
+            let mut rows = tx.query(
+                "SELECT p.id,p.revision FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=? AND s.enable_automatic_search=1 ORDER BY p.priority,p.id LIMIT ?",
+                params![domain(media), MAX_COMMANDS + 1],
+            ).await?;
+            let mut sources = Vec::new();
+            while let Some(row) = rows.next().await? {
+                sources.push(rss::RssTarget {
+                    media_type: media,
+                    indexer_id: uuid(row.get(0)?)?,
+                    indexer_revision: row.get(1)?,
+                    selection_kind: rss::SelectionKind::Default,
+                    client_id: None,
+                    client_revision: None,
+                });
+            }
+            drop(rows);
+            if sources.is_empty() {
+                return Err(Error(StatusCode::CONFLICT, "no_search_indexer"));
+            }
+            let count = targets.len().saturating_mul(sources.len());
+            if count > MAX_COMMANDS as usize {
+                return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "search_on_add_target_limit"));
+            }
+            if command_capacity(&tx).await? + count as i64 > MAX_COMMANDS {
+                return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
+            }
+            for target in targets {
+                let captured = identity(&tx, &target).await?;
+                for source in &sources {
+                    if !rss::valid_target(&tx, *source, crate::providers::IndexerOperation::Automatic).await? {
+                        return Err(Error(StatusCode::CONFLICT, "provider_changed"));
+                    }
+                    let id = Uuid::new_v4();
+                    insert(&tx, id, SearchMode::Automatic, &target, &captured, *source, CommandPriority::Normal, timestamp).await?;
+                    tx.execute(
+                        "INSERT INTO import_list_search_commands(command_id,addition_id) VALUES(?,?)",
+                        params![id.to_string(), addition_id],
+                    ).await?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE import_list_search_requests SET status='admitted',admitted_at=?,error_code=NULL WHERE addition_id=? AND status='pending'",
+            params![timestamp, addition_id],
+        ).await?;
+        Ok(())
+    }.await;
+    finish(tx, outcome).await
+}
+
 pub(crate) struct WantedChild {
     pub target: MediaTarget,
     pub command_id: Uuid,
@@ -969,7 +1083,10 @@ async fn select(
     bytes.fill(0);
     let release = release?;
     let decision = evaluate(c, command, &release, operation).await?;
-    if !matches!(decision.disposition, Disposition::Accept) {
+    if !matches!(decision.disposition, Disposition::Accept)
+        && !(decision.disposition == Disposition::Delay
+            && decision_context(c, command.id).await? == SearchContext::Rss)
+    {
         return Err(Error(StatusCode::CONFLICT, "release_rejected"));
     }
     let candidate_id = Uuid::new_v4();
@@ -1104,6 +1221,7 @@ async fn publish(
     let outcome=async{
  if !matches!(read(&tx,command.id).await?.status,CommandStatus::Running){return Ok(())}
  if !rss::valid_target(&tx,command.source, command.mode.operation()).await?{return Err(Error(StatusCode::CONFLICT,"provider_changed"))}check_identity(&tx,command).await?;
+ let background=decision_context(&tx,command.id).await? == SearchContext::Rss;
  let timestamp=now()?;let mut seen=std::collections::BTreeSet::new();let mut best:Option<(crate::search::revision::ReleasePreference,String,Uuid)>=None;let mut count=0;
  for mut bytes in releases {
  let release=indexer::decode_private(&bytes);bytes.fill(0);let release=release.map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;
@@ -1112,7 +1230,7 @@ async fn publish(
  let decision=evaluate(&tx,command,&release, &mut operation).await?;let id=Uuid::new_v4();
  let title=release.metadata.title.clone().filter(|s|!s.is_empty()).unwrap_or_else(||"(untitled release)".into());if title.len()>1024{return Err(Error(StatusCode::BAD_GATEWAY,"invalid_release"))}
  let metadata=serde_json::to_string(&release.metadata).map_err(|_|bad())?;let decision_json=serde_json::to_string(&decision).map_err(|_|bad())?;
- let payload=if matches!(decision.disposition,Disposition::Accept){
+ let payload=if matches!(decision.disposition,Disposition::Accept)||(background&&decision.disposition==Disposition::Delay){
  let preference=crate::search::revision::release_preference(&tx,command.source.media_type,&release,&decision).await.map_err(|error|decision_error(error,"invalid_release"))?;
  if best.as_ref().is_none_or(|(prior,f,_)|preference>*prior||(preference==*prior&&fingerprint<*f)){best=Some((preference,fingerprint.clone(),id));}
  let mut bytes=indexer::encode_private(release).map_err(|_|Error(StatusCode::BAD_GATEWAY,"invalid_release"))?;let payload=client.seal_release(&envelope(id,command),&bytes);bytes.fill(0);Some(payload.map_err(|e|Error(StatusCode::SERVICE_UNAVAILABLE,e.code))?)

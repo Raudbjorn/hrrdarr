@@ -74,4 +74,4 @@ endpoints and owned mock providers, including authentication failure/success,
 scoped setting preservation and stale revisions. Such checks do not establish live
 provider equivalence or complete settings parity. Draft testing, presets, discovered
 category selection, advanced scope editors, bulk operations, every remaining
-provider and full routes `ui.010`/`ui.013` remain required work. No new backend route is introduced. Migration 0052 supplies scoped eligibility tags and durable selection attempts and rounds. The provider transport directly references the already-locked Rust TLS dependency to distinguish certificate-trust failures without exposing private error text.
+provider and full routes `ui.010`/`ui.013` remain required work. No new backend route is introduced. Migration file `0052_download_client_selection.sql` supplies scoped eligibility tags and durable selection attempts and rounds. The provider transport directly references the already-locked Rust TLS dependency to distinguish certificate-trust failures without exposing private error text.

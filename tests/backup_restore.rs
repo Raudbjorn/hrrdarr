@@ -517,7 +517,15 @@ async fn manual_and_scheduled_backups_publish_verified_archives_without_key_mate
     let before = unix_now();
     assert!(a.driver.step().await.unwrap());
     let (_, commands) = call(&a.origin(), "GET", "/api/v1/system/backup-commands", None).await;
-    let scheduled = &commands["items"][0];
+    // Creation times have second precision; a manual command in the same second may sort first.
+    let scheduled: Vec<_> = commands["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|command| command["backup_type"] == "scheduled")
+        .collect();
+    assert_eq!(scheduled.len(), 1, "{commands}");
+    let scheduled = scheduled[0];
     assert_eq!(scheduled["backup_type"], "scheduled", "{commands}");
     assert_eq!(scheduled["status"], "succeeded", "{scheduled}");
     assert_eq!(scheduled["pruned"], 1);
@@ -759,14 +767,15 @@ async fn restore_refuses_corrupt_tampered_newer_and_traversal_inputs_without_liv
     let manifest: Value = serde_json::from_slice(&entries[0].1).unwrap();
     let database = entries[1].1.clone();
 
-    let edited_db = |sql: &'static str| {
+    let edited_db = |sql: &str| {
+        let sql = sql.to_owned();
         let path = files.0.join(format!("edit-{}.db", uuid::Uuid::new_v4()));
         let database = database.clone();
         async move {
             std::fs::write(&path, &database).unwrap();
             {
                 let copy = libsql::Builder::new_local(&path).build().await.unwrap();
-                copy.connect().unwrap().execute_batch(sql).await.unwrap();
+                copy.connect().unwrap().execute_batch(&sql).await.unwrap();
             }
             let bytes = std::fs::read(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
@@ -787,8 +796,8 @@ async fn restore_refuses_corrupt_tampered_newer_and_traversal_inputs_without_liv
     // it is used below only as a control.
     let control = with_manifest(&database, &|_| {});
     let orphan = edited_db("PRAGMA foreign_keys=OFF; INSERT INTO episodes(id,series_id,season,number,title) VALUES(99,999,1,1,'orphan');").await;
-    // Reasoning: one version past whatever this build's latest is, so appended migrations never collide.
-    let future = edited_db("INSERT INTO schema_migrations(version,name,checksum,sql) SELECT max(version)+1,'future','unknown','unknown' FROM schema_migrations;").await;
+    // Exceed every supported lineage, including the longer legacy ledger.
+    let future = edited_db(&format!("INSERT INTO schema_migrations(version,name,checksum,sql) VALUES({},'future','unknown','unknown');",hrrdarr::db::max_schema_version()+1)).await;
     let mut flipped = good.clone();
     let middle = good.len() / 2;
     flipped[middle] ^= 0xff;
@@ -851,8 +860,9 @@ async fn restore_refuses_corrupt_tampered_newer_and_traversal_inputs_without_liv
         (
             "newer manifest schema",
             with_manifest(&database, &|m| {
-                m["schema_version"] = json!(hrrdarr::db::latest_schema_version() + 1);
-                m["migrations"].as_array_mut().unwrap().push(json!({"version":hrrdarr::db::latest_schema_version()+1,"name":"future","checksum":"0"}));
+                // A version above the fresh ledger may still belong to the legacy lineage.
+                m["schema_version"] = json!(hrrdarr::db::max_schema_version() + 1);
+                m["migrations"].as_array_mut().unwrap().push(json!({"version":hrrdarr::db::max_schema_version()+1,"name":"future","checksum":"0"}));
             }),
             "application/zip",
             422,

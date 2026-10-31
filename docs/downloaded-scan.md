@@ -539,3 +539,23 @@ longer publish: publication and settlement are fenced by generation.
   the singleton engine); the
   media probe results depend on the installed `ffprobe` (an unavailable probe is recorded, not
   fatal, for sample-exempt formats).
+
+### Media probe dependency footprint
+
+The scan runs the installed `ffprobe` as a child with CPU 10 s, wall time 10 s, 64 open files, no
+core dumps, no file creation, 256 KiB of output, one thread, ffmpeg `-max_alloc` 64 MiB, a
+`file`-only protocol whitelist and a demuxer whitelist. The address-space cap (`RLIMIT_AS`) is
+**3 GiB**, not a media-memory limit: it counts every mapped shared object.
+
+Observed on one host (Arch `ffmpeg-full` 9.0.2, 369 `DT_NEEDED` libraries including the SVT
+encoders): `ffprobe -version` fails to load below roughly 1.4 GiB of address space, while probing
+the repository's WAV and WebM fixtures needs no more than that (peak RSS about 63 MiB). The earlier
+1 GiB cap therefore made that build unusable (`libSvtHevcEnc.so.1: failed to map segment`). A
+leaner ffprobe build needs far less. These figures are measurements from one host, not a
+compatibility guarantee for other builds.
+
+At startup the server logs one `media_probe` `capability` line whose `state` is `ready`,
+`executable_missing`, `loader_failed` (the dynamic loader exited 127 under the limits) or
+`start_failed`. It never contains paths, version text or child output. Stored scan observations
+keep the published reason set, so a loader failure is recorded as `probe_failed` and the startup
+line is the place to tell it apart from a media error.

@@ -254,9 +254,8 @@ fn manifest(
         backend: super::BACKEND.into(),
         sqlite_version: facts.sqlite_version.clone(),
         schema_version: facts.schema_version as u32,
-        migrations: db::migration_history()
+        migrations: facts.migrations.clone()
             .into_iter()
-            .take(facts.schema_version)
             .map(|(version, name, checksum)| ManifestMigration {
                 version: version as u32,
                 name: name.into(),

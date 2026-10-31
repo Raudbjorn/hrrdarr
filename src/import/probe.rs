@@ -15,6 +15,16 @@ use std::{
 };
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+// RLIMIT_AS counts every mapped library, not only media work. Measured on ffmpeg-full 9.0.2 (369
+// DT_NEEDED libraries, including the SVT encoders): `ffprobe -version` alone needs ~1.4 GiB of
+// address space and the fixture probes add no measurable amount (peak RSS ~63 MiB), so a 1 GiB cap
+// can never start that build. 3 GiB leaves ~2x loader headroom while ffmpeg's own `-max_alloc`,
+// one thread, and the CPU/wall/output limits still bound the media work. Host-specific figures.
+const ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+// The dynamic loader exits with 127 when a required shared object cannot be found or mapped.
+const LOADER_EXIT_CODE: i32 = 127;
+const LOADER_FAILED: &str = "probe_loader_failed";
+const CAPABILITY_WALL_TIME: Duration = Duration::from_secs(5);
 const MAX_WALL_TIME: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Only self-contained demuxers: no concat, playlists, image sequences or network protocols.
@@ -47,7 +57,9 @@ fn observe_with(
         return Ok(Observation::Unavailable(reason));
     }
     let held = inventory.open_file(index)?;
-    let measured = run(command, &held, deadline, cancel).and_then(|raw| parse(&raw));
+    let measured = run(command, &held, deadline, cancel)
+        .map_err(persisted_reason)
+        .and_then(|raw| parse(&raw));
     // A probe failure cannot hide a replaced path or modified inode.
     inventory.verify_open_file(index, &held)?;
     // Descriptor syscalls cannot be interrupted, but late observations are never published.
@@ -55,6 +67,57 @@ fn observe_with(
         Ok(value) => Observation::Measured(value),
         Err(reason) => Observation::Unavailable(reason),
     })
+}
+
+/// Reasons are stored in `downloaded_scan_children.decision_json`, whose published migration 0057
+/// accepts a closed set. Loader failure is surfaced by [`capability`], not as a new stored reason.
+fn persisted_reason(reason: &'static str) -> &'static str {
+    if reason == LOADER_FAILED {
+        "probe_failed"
+    } else {
+        reason
+    }
+}
+
+/// Result of starting the installed `ffprobe` under the production resource limits. Carries no
+/// path, version text or child output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Capability {
+    Ready,
+    Missing,
+    LoaderFailed,
+    Failed,
+}
+
+impl Capability {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Missing => "executable_missing",
+            Self::LoaderFailed => "loader_failed",
+            Self::Failed => "start_failed",
+        }
+    }
+}
+
+/// Startup diagnostic; invoke from a blocking worker. Distinguishes an absent executable, an
+/// installed binary the resource policy prevents from loading, and a working one.
+pub(crate) fn capability(cancel: &AtomicBool) -> Capability {
+    let mut command = Command::new("ffprobe");
+    command.arg("-version").env_remove("FFREPORT");
+    capability_with(&mut command, Instant::now() + CAPABILITY_WALL_TIME, cancel)
+}
+
+fn capability_with(command: &mut Command, deadline: Instant, cancel: &AtomicBool) -> Capability {
+    let Ok(null) = File::open("/dev/null") else {
+        return Capability::Failed;
+    };
+    match run(command, &null, deadline, cancel) {
+        Ok(out) if out.starts_with(b"ffprobe version") => Capability::Ready,
+        Err("probe_executable_missing") => Capability::Missing,
+        Err(LOADER_FAILED) => Capability::LoaderFailed,
+        _ => Capability::Failed,
+    }
 }
 
 fn command() -> Command {
@@ -114,7 +177,7 @@ fn run(
         command.pre_exec(|| {
             for (resource, cap) in [
                 (Resource::Cpu, 10),
-                (Resource::As, 1024 * 1024 * 1024),
+                (Resource::As, ADDRESS_SPACE_BYTES),
                 (Resource::Nofile, 64),
                 (Resource::Core, 0),
                 (Resource::Fsize, 0),
@@ -192,7 +255,11 @@ fn read_output(
         }
         if let Some(status) = child.try_wait().map_err(|_| "probe_wait_failed")? {
             if !status.success() {
-                return Err("probe_failed");
+                return Err(if status.code() == Some(LOADER_EXIT_CODE) {
+                    LOADER_FAILED
+                } else {
+                    "probe_failed"
+                });
             }
             if eof {
                 return Ok(output);
@@ -264,6 +331,64 @@ mod tests {
     }
 
     #[test]
+    fn capability_separates_missing_loader_failure_and_working_binary() {
+        let fixture = Fixture::new();
+        let cancel = AtomicBool::new(false);
+        // Child stderr is discarded, so a loader message naming private paths cannot be echoed.
+        for (mut cmd, expected) in [
+            (Command::new(fixture.0.join("absent")), Capability::Missing),
+            (
+                shell(
+                    "echo '/private/media.mkv: error while loading shared libraries' >&2; exit 127",
+                ),
+                Capability::LoaderFailed,
+            ),
+            (shell("exit 1"), Capability::Failed),
+            (shell("printf unrelated"), Capability::Failed),
+            (shell("printf 'ffprobe version test'"), Capability::Ready),
+        ] {
+            assert_eq!(capability_with(&mut cmd, deadline(), &cancel), expected);
+        }
+        let codes: Vec<_> = [
+            Capability::Ready,
+            Capability::Missing,
+            Capability::LoaderFailed,
+            Capability::Failed,
+        ]
+        .map(Capability::code)
+        .into();
+        assert_eq!(
+            codes,
+            [
+                "ready",
+                "executable_missing",
+                "loader_failed",
+                "start_failed"
+            ]
+        );
+    }
+
+    #[test]
+    fn loader_failure_is_stored_as_the_published_probe_failed_reason() {
+        let fixture = Fixture::new();
+        let inventory = fixture.inventory(b"unused");
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            run(
+                &mut shell("exit 127"),
+                &inventory.open_file(0).unwrap(),
+                deadline(),
+                &cancel
+            ),
+            Err(LOADER_FAILED)
+        );
+        assert!(matches!(
+            observe_with(&inventory, 0, deadline(), &cancel, &mut shell("exit 127")).unwrap(),
+            Observation::Unavailable("probe_failed")
+        ));
+    }
+
+    #[test]
     fn expired_or_cancelled_observation_never_spawns() {
         let fixture = Fixture::new();
         let inventory = fixture.inventory(b"unused");
@@ -330,13 +455,17 @@ mod tests {
         let file = inventory.open_file(0).unwrap();
         let before = getrlimit(Resource::Nofile);
         let raw = run(
-            &mut shell("ulimit -c; ulimit -f; ulimit -n"),
+            &mut shell("ulimit -c; ulimit -f; ulimit -n; ulimit -v"),
             &file,
             deadline(),
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(String::from_utf8(raw).unwrap(), "0\n0\n64\n");
+        // `ulimit -v` reports KiB: the address-space cap stays finite (see ADDRESS_SPACE_BYTES).
+        assert_eq!(
+            String::from_utf8(raw).unwrap(),
+            format!("0\n0\n64\n{}\n", ADDRESS_SPACE_BYTES / 1024)
+        );
         assert_eq!(getrlimit(Resource::Nofile), before);
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -374,6 +503,13 @@ mod tests {
         wav.resize(wav.len() + samples as usize * 2, 0);
         let inventory = fixture.inventory(&wav);
         let cancel = AtomicBool::new(false);
+        // An installed ffprobe the resource policy cannot start must fail here, not be skipped.
+        let capability = capability(&cancel);
+        assert!(
+            matches!(capability, Capability::Ready | Capability::Missing),
+            "installed ffprobe is unusable under the probe limits: {}",
+            capability.code()
+        );
         let observed = observe(&inventory, 0, deadline(), &cancel).unwrap();
         match observed {
             Observation::Measured(media) => {

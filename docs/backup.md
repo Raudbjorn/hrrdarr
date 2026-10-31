@@ -1,9 +1,10 @@
 # Backup and restore
 
-Migration `0081_backups.sql` (runner position 81, after `0080_library_root_health.sql`)
+Migration file `0081_backups.sql` (after `0080_library_root_health.sql`; runner position 81 on published main, 83 on the import-list history, or 87 on the legacy history)
 adds the backup policy singleton `backup_settings` and durable `Backup` command table.
-The migration prefix follows current main through version 78, then adds Wanted, library-root
-health and Backup. Archives live on disk; the database stores policy and command history.
+The accepted histories are described in [import-lists.md](import-lists.md#migration-numbering).
+Archives record the actual database ledger; restore validates that exact history, including when
+different supported histories share a version number. Archives live on disk; the database stores policy and command history.
 Incompatible older migration histories are rejected before writes; they require a separately
 validated upgrade/recovery path, not renumbering recorded migrations or deleting database state.
 The UI is System → Backup (`#/system/backup`).

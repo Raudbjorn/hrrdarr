@@ -8,17 +8,19 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Aria2/` i
 
 ## Configuration
 
-`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration 0072 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
+`ProviderSettings::Aria2 { endpoint, tv, movies }`, stored by migration file 0072 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is the full JSON-RPC URL; nothing is appended.
-- Each scope is the shared `TorrentLabelScope`. aria2 has no labels, so `category` names a subfolder of aria2's own download directory (1-64 of lowercase letters, digits, `.`, `_`, `-`; the complete names `.` and `..` are forbidden; TV and movie values must differ). Migration 0076 adds the directory-component guard for Aria2 and Download Station. `recent_priority`/`older_priority` (`first` moves a new download to the queue front), `add_paused` and `tags` behave as for the other clients.
+- Each scope is the shared `TorrentLabelScope`. aria2 has no labels, so `category` names a subfolder of aria2's own download directory (1-64 of lowercase letters, digits, `.`, `_`, `-`; the complete names `.` and `..` are forbidden; TV and movie values must differ). Migration file 0076 adds the directory-component guard for Aria2 and Download Station. `recent_priority`/`older_priority` (`first` moves a new download to the queue front), `add_paused` and `tags` behave as for the other clients.
 - Credentials are optional and are only `{"kind":"api_key"}`, the RPC secret sent as the leading `token:<secret>` parameter. `username_password` is rejected. The secret is redacted from projected strings.
 
-Before upgrading to migration 0076, correct any existing Aria2 or Download Station category equal to `.` or `..` using the previous version. The migration refuses those unsafe values transactionally and retains the pre-upgrade backup; it does not choose a replacement directory or leave an invalid provider inaccessible in the new API.
+Before upgrading to migration file 0076, correct any existing Aria2 or Download Station category equal to `.` or `..` using the previous version. The migration refuses those unsafe values transactionally and retains the pre-upgrade backup; it does not choose a replacement directory or leave an invalid provider inaccessible in the new API.
 
 ## Ownership
 
 A download belongs to a domain when its `dir` is `<aria2 default dir>/<label>` (default dir from `aria2.getGlobalOption`). Downloads elsewhere, in a deeper subfolder, without an info hash (HTTP/FTP) or that are metadata stubs with a non-empty `followedBy` are not listed. A hash that exists outside the domain's folder is a `ScopeConflict`; aria2's own duplicate refusal is never worked around.
+
+Waiting and stopped inventories are fetched in 1,000-entry windows, including unrelated HTTP/FTP downloads. Each paged inventory is bounded at 8,192 entries; exceeding that bound returns a resource-limit error instead of a successful partial inventory.
 
 ## Test
 
@@ -42,4 +44,4 @@ Pause, Resume, Priority (`changePosition`) and Remove (`remove`, falling back to
 
 - Live aria2 compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed aria2c was contacted. Field names, string typing and the `Unauthorized` error come from the RPC manual, not a live run.
 - WebSocket and XML-RPC transports, per-file selection, seeding limits (`seed-ratio`, `seed-time`) and the health classifier are not implemented.
-- Migration 0072 is the 72nd entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).
+- Migration file `0072` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

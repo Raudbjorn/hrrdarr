@@ -21,6 +21,16 @@ use hrrdarr::api::{LegacyError, SnapshotOptions};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Explicit offline maintenance command; it never starts the server or migrates.
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    if arguments.first().map(String::as_str)
+        == Some(hrrdarr::db::collection_policy_recovery::COMMAND)
+    {
+        return hrrdarr::db::collection_policy_recovery::run_cli(&arguments[1..]).await;
+    }
+    if arguments.first().map(String::as_str) == Some(hrrdarr::db::draft_conversion::COMMAND) {
+        return hrrdarr::db::draft_conversion::run_cli(&arguments[1..]).await;
+    }
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -153,6 +163,9 @@ async fn run() -> Result<(), ProcessFailure> {
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     let app = host.apply(app, bound);
     println!("hrrdarr listening on http://{bound}");
+    if state.db.permits_local_imports() {
+        hrrdarr::import::log_probe_capability().await;
+    }
     let runtime = if state.db.permits_local_imports() {
         Some(
             hrrdarr::commands::start_with_metadata(
@@ -172,12 +185,22 @@ async fn run() -> Result<(), ProcessFailure> {
     // a lease, so several processes over one remote database do not duplicate a send. The command
     // worker stays gated on local ownership because it moves media files.
     let notifier = hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone());
+    let list_sync = state.db.permits_local_imports().then(|| {
+        hrrdarr::import_lists::start(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
+        )
+    });
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
     notifier.shutdown().await;
+    if let Some(list_sync) = list_sync {
+        list_sync.shutdown().await;
+    }
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -232,6 +255,11 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::notifications::router(
             state.db.clone(),
             state.provider_key.clone(),
+        ))
+        .merge(hrrdarr::import_lists::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
         ))
         .merge(hrrdarr::commands::router(state.db.clone()))
         .merge(hrrdarr::backup::router(state.db.clone()))
