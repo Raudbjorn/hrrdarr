@@ -23,7 +23,10 @@ use hrrdarr::{
     },
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 const USER: &str = "nas-user";
@@ -48,6 +51,9 @@ fn torrent(name: &str) -> (Vec<u8>, String) {
         hash,
     )
 }
+
+/// (api, method, query parameters) of each wire request.
+type Call = (String, String, Vec<(String, String)>);
 
 #[derive(Clone)]
 struct Task {
@@ -84,26 +90,53 @@ struct Mock {
     config_destination: Option<&'static str>,
     tasks: Vec<Task>,
     /// (api, method, params) of every call after login.
-    calls: Vec<(String, String, Vec<(String, String)>)>,
+    calls: Vec<Call>,
     logins: u32,
     logouts: u32,
     next_id: u32,
     lose_add_response: bool,
     metainfo: Vec<(Vec<u8>, String)>,
     reject_sid: bool,
+    /// Folders that exist, as slash-joined paths without a leading slash. The first segment of
+    /// a File Station path must be a shared folder already present here.
+    folders: BTreeSet<String>,
+    /// Like a real NAS, task creation names a destination that must already exist (task error
+    /// 403) unless this is switched off.
+    strict_destinations: bool,
+    /// Fail every File Station `CreateFolder` call with this Synology error code.
+    folder_error: Option<i64>,
+    /// Create the folder but answer with a gateway error (an ambiguous outcome).
+    lose_folder_response: bool,
+    /// Answer `CreateFolder` with this path instead of the requested one.
+    folder_reply_path: Option<String>,
 }
 #[derive(Clone)]
 struct Fixture(Arc<Mutex<Mock>>);
 impl Fixture {
+    /// Download Station task/info calls with this method name.
     fn calls(&self, method: &str) -> Vec<Vec<(String, String)>> {
         self.0
             .lock()
             .unwrap()
             .calls
             .iter()
-            .filter(|(_, m, _)| m == method)
+            .filter(|(a, m, _)| m == method && a.starts_with("SYNO.DownloadStation"))
             .map(|(_, _, p)| p.clone())
             .collect()
+    }
+    /// File Station `CreateFolder` calls.
+    fn folder_calls(&self) -> Vec<Vec<(String, String)>> {
+        self.0
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(a, _, _)| a == "SYNO.FileStation.CreateFolder")
+            .map(|(_, _, p)| p.clone())
+            .collect()
+    }
+    fn has_folder(&self, path: &str) -> bool {
+        self.0.lock().unwrap().folders.contains(path)
     }
     fn clear(&self) {
         self.0.lock().unwrap().calls.clear();
@@ -242,8 +275,47 @@ async fn handler(
                 None => fail(404),
             }
         }
+        ("SYNO.FileStation.CreateFolder", "create") => {
+            assert_eq!(uri.path(), "/webapi/entry.cgi");
+            assert_eq!(
+                (param(&params, "version"), param(&params, "force_parent")),
+                ("2", "true"),
+                "an existing folder must be a success so a retry is harmless"
+            );
+            if let Some(code) = m.folder_error {
+                return fail(code);
+            }
+            let parent = param(&params, "folder_path").to_owned();
+            let name = param(&params, "name").to_owned();
+            let relative = parent.trim_start_matches('/');
+            let share = relative.split('/').next().unwrap_or("");
+            if !parent.starts_with('/') || !m.folders.contains(share) {
+                // No such shared folder: nothing may be created outside the shares.
+                return fail(408);
+            }
+            let full = format!("{relative}/{name}");
+            let mut prefix = String::new();
+            for segment in full.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(segment);
+                m.folders.insert(prefix.clone());
+            }
+            if m.lose_folder_response {
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+            let reply = m
+                .folder_reply_path
+                .clone()
+                .unwrap_or_else(|| format!("{parent}/{name}"));
+            good(json!({"folders":[{"isdir":true,"name":name,"path":reply}]}))
+        }
         ("SYNO.DownloadStation.Task", "create") => {
             let destination = param(&params, "destination").to_owned();
+            if m.strict_destinations && !m.folders.contains(destination.trim_start_matches('/')) {
+                return fail(403); // destination does not exist
+            }
             let hash = destination.rsplit('/').next().unwrap().to_owned();
             let (title, uri) = if multipart {
                 let found = m
@@ -294,6 +366,11 @@ async fn fixture() -> (Fixture, String, tokio::task::JoinHandle<()>) {
         lose_add_response: false,
         metainfo: vec![],
         reject_sid: false,
+        folders: BTreeSet::from([ROOT.to_owned()]),
+        strict_destinations: true,
+        folder_error: None,
+        lose_folder_response: false,
+        folder_reply_path: None,
     })));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     assert!(![5000, 5001].contains(&listener.local_addr().unwrap().port()));
@@ -924,5 +1001,224 @@ async fn byte_counts_are_read_as_documented_strings_and_malformed_values_fail_cl
         "got {:?}",
         result.map(|p| p.items.len())
     );
+    task.abort();
+}
+
+async fn prepared(
+    operation: &hrrdarr::providers::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    target: MediaTarget,
+    hash: &str,
+) -> label_client::PreparedTorrent {
+    label_client::prepare(
+        operation,
+        settings,
+        target,
+        AddSource::Magnet(magnet(hash)),
+        false,
+        QbitOptions::default(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The NAS rejects a task whose destination folder is absent (task error 403), so the wire
+/// must create `<root>/<label>/<hash>` first: once per submission, for both domains, with a
+/// magnet and an uploaded torrent alike, and without touching any other folder.
+#[tokio::test]
+async fn missing_destination_folders_are_provisioned_before_exactly_one_task_each() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let operation = client.operation(Uuid::new_v4()).unwrap();
+    let tv_hash = "0123456789abcdef0123456789abcdef01234567";
+    let (bytes, movie_hash) = torrent("Film.2020.1080p");
+    f.0.lock()
+        .unwrap()
+        .metainfo
+        .push((bytes.clone(), movie_hash.clone()));
+    // Only the shared folder exists: neither the label nor the hash folder.
+    assert!(!f.has_folder("downloads/tv-hrr") && !f.has_folder("downloads/movies-hrr"));
+    let tv = prepared(&operation, &settings, MediaTarget::Episode(9), tv_hash).await;
+    let movie = label_client::prepare(
+        &operation,
+        &settings,
+        MediaTarget::Movie(9),
+        AddSource::Torrent {
+            filename: "film.torrent".into(),
+            bytes,
+        },
+        false,
+        QbitOptions::default(),
+    )
+    .await
+    .unwrap();
+    f.clear();
+    for prepared in [tv, movie] {
+        assert!(matches!(
+            label_client::submit(&operation, &settings, Some(&login()), prepared)
+                .await
+                .unwrap(),
+            AddOutcome::Observed { .. }
+        ));
+    }
+    let folders = f.folder_calls();
+    assert_eq!(folders.len(), 2, "one provisioning call per submission");
+    assert_eq!(
+        (
+            param(&folders[0], "folder_path"),
+            param(&folders[0], "name"),
+            param(&folders[0], "force_parent")
+        ),
+        ("/downloads/tv-hrr", tv_hash, "true")
+    );
+    assert_eq!(
+        (
+            param(&folders[1], "folder_path"),
+            param(&folders[1], "name")
+        ),
+        ("/downloads/movies-hrr", movie_hash.as_str())
+    );
+    let creates = f.calls("create");
+    assert_eq!(creates.len(), 2, "exactly one task per domain");
+    // Domains stay isolated: each hash folder exists only below its own label.
+    assert!(
+        f.has_folder(&dest("tv-hrr", tv_hash)) && f.has_folder(&dest("movies-hrr", &movie_hash))
+    );
+    assert!(
+        !f.has_folder(&dest("movies-hrr", tv_hash)) && !f.has_folder(&dest("tv-hrr", &movie_hash))
+    );
+    assert_eq!(
+        f.0.lock().unwrap().folders.len(),
+        1 + 2 * 2,
+        "the share, two label folders and two hash folders; nothing else"
+    );
+    // A second torrent for a label that already exists reuses it and adds only its hash folder.
+    let second = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    f.clear();
+    let again = prepared(&operation, &settings, MediaTarget::Episode(10), second).await;
+    label_client::submit(&operation, &settings, Some(&login()), again)
+        .await
+        .unwrap();
+    assert_eq!(f.folder_calls().len(), 1);
+    assert_eq!(f.calls("create").len(), 1);
+    // Resubmitting an existing download finds it by hash first: no folder call, no second task.
+    f.clear();
+    let repeat = prepared(&operation, &settings, MediaTarget::Episode(10), second).await;
+    assert_eq!(
+        label_client::submit(&operation, &settings, Some(&login()), repeat)
+            .await
+            .unwrap(),
+        AddOutcome::AlreadyPresent {
+            hash: second.into()
+        }
+    );
+    assert!(f.folder_calls().is_empty() && f.calls("create").is_empty());
+    task.abort();
+}
+
+/// Every folder failure happens before the add is dispatched: bounded error, no task, and a
+/// later retry succeeds with exactly one task.
+#[tokio::test]
+async fn folder_failures_never_submit_and_a_retry_creates_one_task() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let operation = client.operation(Uuid::new_v4()).unwrap();
+    let hash = "9999999999999999999999999999999999999999";
+    for (code, expected) in [
+        (102, QbitError::UnsupportedFeature), // File Station API absent on this DSM
+        (103, QbitError::UnsupportedFeature),
+        (104, QbitError::UnsupportedFeature),
+        (105, QbitError::Http(HttpError::Authentication)), // no permission
+        (119, QbitError::Http(HttpError::Authentication)), // session id rejected
+        (407, QbitError::Http(HttpError::Authentication)), // operation not permitted
+        (408, QbitError::InvalidResponse),
+        (418, QbitError::InvalidResponse), // illegal name or path
+        (1100, QbitError::InvalidResponse),
+        (1101, QbitError::InvalidResponse),
+    ] {
+        f.0.lock().unwrap().folder_error = Some(code);
+        f.clear();
+        let attempt = prepared(&operation, &settings, MediaTarget::Episode(1), hash).await;
+        assert_eq!(
+            label_client::submit(&operation, &settings, Some(&login()), attempt)
+                .await
+                .unwrap_err(),
+            expected,
+            "folder error {code}"
+        );
+        assert!(f.calls("create").is_empty(), "no task after error {code}");
+        assert!(f.by_hash(hash).is_none());
+        assert!(!f.has_folder(&dest("tv-hrr", hash)));
+    }
+    // Ambiguous creation: the folder exists but the reply was lost.
+    {
+        let mut m = f.0.lock().unwrap();
+        m.folder_error = None;
+        m.lose_folder_response = true;
+    }
+    f.clear();
+    let attempt = prepared(&operation, &settings, MediaTarget::Episode(1), hash).await;
+    assert!(
+        label_client::submit(&operation, &settings, Some(&login()), attempt)
+            .await
+            .is_err()
+    );
+    assert!(f.has_folder(&dest("tv-hrr", hash)));
+    assert!(f.calls("create").is_empty() && f.by_hash(hash).is_none());
+    // Retry: the existing folder is a success and exactly one task is created.
+    f.0.lock().unwrap().lose_folder_response = false;
+    f.clear();
+    let retry = prepared(&operation, &settings, MediaTarget::Episode(1), hash).await;
+    assert_eq!(
+        label_client::submit(&operation, &settings, Some(&login()), retry)
+            .await
+            .unwrap(),
+        AddOutcome::Observed { hash: hash.into() }
+    );
+    assert_eq!(f.calls("create").len(), 1);
+    // A reply that names another location is refused rather than trusted.
+    let other = "8888888888888888888888888888888888888888";
+    f.0.lock().unwrap().folder_reply_path = Some("/downloads/elsewhere/x".into());
+    f.clear();
+    let attempt = prepared(&operation, &settings, MediaTarget::Episode(2), other).await;
+    assert_eq!(
+        label_client::submit(&operation, &settings, Some(&login()), attempt)
+            .await
+            .unwrap_err(),
+        QbitError::InvalidResponse
+    );
+    assert!(f.calls("create").is_empty());
+    task.abort();
+}
+
+/// The destination read from the NAS becomes part of a File Station path, so a segment that
+/// could climb out of it is refused before any call is made.
+#[tokio::test]
+async fn unsafe_default_destinations_are_refused_before_any_folder_call() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let operation = client.operation(Uuid::new_v4()).unwrap();
+    for root in ["downloads/../etc", "downloads/./x", "a\\b", "a//b"] {
+        f.0.lock().unwrap().config_destination = Some(root);
+        f.clear();
+        let attempt = prepared(
+            &operation,
+            &settings,
+            MediaTarget::Episode(1),
+            "7777777777777777777777777777777777777777",
+        )
+        .await;
+        assert_eq!(
+            label_client::submit(&operation, &settings, Some(&login()), attempt)
+                .await
+                .unwrap_err(),
+            QbitError::InvalidRequest,
+            "{root}"
+        );
+        assert!(f.folder_calls().is_empty() && f.calls("create").is_empty());
+    }
     task.abort();
 }

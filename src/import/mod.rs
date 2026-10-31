@@ -710,13 +710,13 @@ pub(crate) async fn status_in(c: &Connection, opid: &str) -> Result<Operation> {
     }
     Ok(response)
 }
-// ponytail: one import at a time per process; per-library workers when throughput requires it.
-static EXECUTING: AtomicBool = AtomicBool::new(false);
-/// Test-only serialisation for lib tests that reach the process-wide execution permit
-/// (import execution, file deletion, recycle cleanup). Parallel test threads would otherwise
-/// observe each other's permit as `import_busy`.
-#[cfg(test)]
-pub(crate) static PERMIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// ponytail: one import at a time per open database; per-library workers when throughput requires it.
+/// Active effect permits by [`Database::permit_id`], holding the owner key of each. A process has
+/// one application database, so this is the single process-wide permit in production; keying it
+/// by database keeps independent databases (every test opens its own) from observing each
+/// other's permit as `import_busy`.
+static PERMITS: std::sync::Mutex<std::collections::BTreeMap<u64, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 const MAX_FAILED_OWNED: usize = 1024; // Same cap as durable RSS receipts; no eviction of failed work.
 static FAILED_OWNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -742,7 +742,6 @@ fn latch_owned_failure(opid: &str) {
         }
     }
 }
-static ACTIVE_OPERATION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StartOwned {
     Started,
@@ -751,34 +750,45 @@ pub(crate) enum StartOwned {
     Complete,
 }
 struct Permit {
+    key: u64,
     _db: Option<Arc<Database>>,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
         // Release the worker's database ownership before publishing that it has finished.
         drop(self._db.take());
-        if let Ok(mut active) = ACTIVE_OPERATION.lock() {
-            *active = None;
+        if let Ok(mut permits) = PERMITS.lock() {
+            permits.remove(&self.key);
         }
-        EXECUTING.store(false, Ordering::Release);
     }
 }
 fn acquire(db: &Arc<Database>, opid: &str) -> Option<Arc<Permit>> {
-    let mut active = ACTIVE_OPERATION.lock().ok()?;
-    EXECUTING
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .ok()?;
-    *active = Some(opid.into());
+    let mut permits = PERMITS.lock().ok()?;
+    let key = db.permit_id();
+    if permits.contains_key(&key) {
+        return None;
+    }
+    permits.insert(key, opid.into());
     Some(Arc::new(Permit {
+        key,
         _db: Some(db.clone()),
     }))
 }
+/// Whether `operation_id` (a UUID, unique across databases) currently holds an effect permit.
 pub(crate) fn operation_active(operation_id: &str) -> Result<bool> {
-    Ok(ACTIVE_OPERATION
+    Ok(PERMITS
         .lock()
         .map_err(|_| Error::internal())?
-        .as_deref()
-        == Some(operation_id))
+        .values()
+        .any(|owner| owner == operation_id))
+}
+/// Whether the database with this [`Database::permit_id`] has an effect permit outstanding,
+/// whoever holds it. Takes the id so it can be asked after the database handle is dropped.
+#[cfg(test)]
+pub(crate) fn permit_held(permit_id: u64) -> bool {
+    PERMITS
+        .lock()
+        .is_ok_and(|permits| permits.contains_key(&permit_id))
 }
 pub(crate) struct ResumeGuard {
     _permit: Arc<Permit>,
@@ -917,8 +927,7 @@ pub(crate) async fn start_owned(db: Arc<Database>, opid: &str) -> Result<StartOw
         return Ok(StartOwned::Complete);
     }
     let Some(permit) = acquire(&db, opid) else {
-        let active = ACTIVE_OPERATION.lock().map_err(|_| Error::internal())?;
-        return Ok(if active.as_deref() == Some(opid) {
+        return Ok(if operation_active(opid)? {
             StartOwned::Active
         } else {
             StartOwned::Busy

@@ -816,7 +816,7 @@ mod tests {
         .unwrap();
         let metadata = crate::metadata::MetadataClient::new().unwrap();
         let mut work = Box::pin(step(&db, &client, &metadata));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::TEST_HANG_DETECTOR, async {
             tokio::select! {
                 result = &mut work => panic!("probe unexpectedly settled: {}", result.is_ok()),
                 _ = started.notified() => (),

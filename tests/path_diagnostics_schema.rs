@@ -215,7 +215,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let c = fresh.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks WHERE check_key='remote_path_mapping' AND startup=1 AND scheduled=1 AND compatibility_type='RemotePathMappingCheck' AND generation=0 AND pending_reasons=0 AND due_at IS NULL AND severity IS NULL AND observed_generation IS NULL AND checked_at IS NULL").await?, 2);
     let path = scratch.0.join("upgrade");
@@ -244,7 +244,7 @@ async fn schema53_fresh_actual52_upgrade_backup_and_reopen_preserve_existing_sta
     let after = upgraded.connect().await?;
     assert_eq!(
         scalar(&after, "SELECT max(version) FROM schema_migrations").await?,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(data_with(&after, &queries).await?, rows);
     assert_eq!(

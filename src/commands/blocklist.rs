@@ -359,7 +359,7 @@ mod tests {
             db = Arc::new(Database::open_local(&dbpath).await.unwrap());
             let (_, client) = crate::providers::router_with_refresh(db.clone(), None);
             let runtime = super::super::start(db.clone(), client).await.unwrap();
-            let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let done = tokio::time::timeout(crate::TEST_HANG_DETECTOR, async {
                 loop {
                     let current = read(&connection(&db).await.unwrap(), command.id)
                         .await

@@ -206,7 +206,7 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
     // Fresh databases include later series-runtime and import-policy migrations; the upgrade witness remains53->54.
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await?,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     let path = scratch.0.join("upgrade");
     let old = predecessor(&c, &path).await?;
@@ -336,6 +336,21 @@ async fn schema54_actual53_upgrade_backup_reopen_and_exact_admission_sql() -> Re
             .get(0)?;
         // Reasoning: 0058 otherwise changes only the client predicate, now resolved through the
         // provider_implementations registry (protocol-matched for RSS/search); map it back.
+        // Reasoning: 0090 widens only these indexer lists; preserve the remaining admission SQL exactly.
+        let actual = actual
+            .replace(
+                "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+                "p.implementation IN ('torznab','newznab','torrentrss')",
+            )
+            .replace(
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+                "p.implementation IN ('torznab','newznab')",
+            )
+            // Reasoning: 0090 also admits all nine trackers to indexer backoff, excluding torrentrss.
+            .replace(
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+                "p.implementation IN ('torznab','newznab')",
+            );
         let actual = actual
             .replace(
                 "p.implementation IN (SELECT c.implementation FROM provider_implementations c JOIN provider_implementations i ON i.protocol=c.protocol JOIN providers x ON x.implementation=i.implementation WHERE c.kind='download_client' AND x.id=NEW.indexer_id)",

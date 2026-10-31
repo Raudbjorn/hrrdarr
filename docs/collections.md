@@ -7,8 +7,8 @@ library.
 ## Adoption
 
 `MovieDetails` carries a tri-state `collection` association from the movie metadata service: absent preserves the
-stored membership, explicit `null` clears it, an object sets it. It is persisted by the shared fact writer (library
-add via lookup and metadata refresh) in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
+stored membership, explicit `null` clears it, an object sets it. It is persisted by the collection adoption repository during library
+add via lookup and metadata refresh, in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
 Collection adoption retains local removal intent and protects it from stale snapshot replay.
 
 ## API (`/api/v1/movies/collections`)
@@ -39,12 +39,12 @@ failures are counted; if nothing succeeded and the service was unavailable the c
 
 ## Schema integration
 
-Migrations 0001–0076 retain the PR branch history and checksums. Migration 0077 moves
+Migrations 0001–0076 retain the selected main history and checksums. Migration 0077 moves
 existing collection policy into `movie_collection_settings`, preserving meaningful
 local settings and tags, and adds metadata provenance, retained removal intent,
 exclusions and snapshot replay state. Migration 0078 adds provider authority state. Collection root health reads this settings authority;
 policy edits, adoption, cleanup and snapshot imports invalidate its checks in their write transaction.
-Databases from the divergent main migration history are not an accepted upgrade baseline.
+Databases from divergent migration histories are refused at startup; supported pre-merge PR #32 databases can be converted explicitly offline. See [migration compatibility](migration-compatibility.md).
 
 ## Snapshot reconstruction
 

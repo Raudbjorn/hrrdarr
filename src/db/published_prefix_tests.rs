@@ -46,7 +46,7 @@ async fn current_main_prefix_upgrades_without_rewriting_history_or_intents() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 81); // Main's 78 migrations plus Wanted, library health and Backup.
+    assert_eq!(version(&c).await?, 83); // Reasoning: main1–81 plus tracker breadth82 and Wanted receipts83.
     let recorded: serde_json::Value = serde_json::from_str(&history(&c).await?)?;
     assert_eq!(
         &recorded.as_array().unwrap()[..78],
@@ -61,7 +61,7 @@ async fn current_main_prefix_upgrades_without_rewriting_history_or_intents() -> 
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 81); // Reopening preserves the complete history.
+    assert_eq!(version(&reopened.connect().await?).await?, 83); // Reasoning: reopening preserves the complete main1–81 plus branch82–83 history.
     Ok(())
 }
 #[tokio::test]

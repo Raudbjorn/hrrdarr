@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(81)]] // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        vec![vec![libsql::Value::Integer(83)]] // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
@@ -148,8 +148,8 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     assert_eq!(
         rows(&c, "SELECT implementation,kind,protocol FROM provider_implementations ORDER BY implementation").await?,
         // Reasoning: the runner continues through 0062 (transmission) and 0068 (torrentrss), which append their rows; the
-        // four 0059 rows are unchanged.
-        [("aria2", "download_client", "torrent"), ("deluge", "download_client", "torrent"), ("downloadstation", "download_client", "torrent"), ("flood", "download_client", "torrent"), ("newznab", "indexer", "usenet"), ("nzbget", "download_client", "usenet"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torrentrss", "indexer", "torrent"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent"), ("utorrent", "download_client", "torrent")]
+        // four 0059 rows are unchanged; 0090 additionally registers the nine tracker indexers.
+        [("aria2", "download_client", "torrent"), ("broadcasthenet", "indexer", "torrent"), ("deluge", "download_client", "torrent"), ("downloadstation", "download_client", "torrent"), ("fanzub", "indexer", "usenet"), ("filelist", "indexer", "torrent"), ("flood", "download_client", "torrent"), ("hdbits", "indexer", "torrent"), ("iptorrents", "indexer", "torrent"), ("newznab", "indexer", "usenet"), ("nyaa", "indexer", "torrent"), ("nzbget", "download_client", "usenet"), ("passthepopcorn", "indexer", "torrent"), ("qbittorrent", "download_client", "torrent"), ("rtorrent", "download_client", "torrent"), ("sabnzbd", "download_client", "usenet"), ("torrentleech", "indexer", "torrent"), ("torrentpotato", "indexer", "torrent"), ("torrentrss", "indexer", "torrent"), ("torznab", "indexer", "torrent"), ("transmission", "download_client", "torrent"), ("utorrent", "download_client", "torrent")]
             .map(|(a, b, p)| vec![libsql::Value::Text(a.into()), libsql::Value::Text(b.into()), libsql::Value::Text(p.into())])
             .to_vec()
     );

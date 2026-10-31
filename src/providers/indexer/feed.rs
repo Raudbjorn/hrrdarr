@@ -177,7 +177,43 @@ fn resolve(base: &url::Url, value: &str) -> Result<String> {
     locator(joined.as_str(), true)
 }
 
-fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Result<Release> {
+/// Tracker-specific reading rules layered on the generic feed parser.
+#[derive(Clone, Copy, Default)]
+pub(super) struct FeedOptions {
+    /// Read the size from the item description ("Size: 1.4 GB" or a leading "1.4 GB; Category").
+    pub description_size: bool,
+    /// Category used when an item reports none, instead of the domain root.
+    pub default_category: Option<u32>,
+}
+
+/// The first size found in a human description: a `Size:` label or a leading `<size>;` segment.
+pub(super) fn description_size(description: &str) -> Option<u64> {
+    let text = html_escape::decode_html_entities(description);
+    let candidate = match text.to_ascii_lowercase().find("size:") {
+        Some(at) => &text[at + 5..],
+        None => text.split(';').next().unwrap_or(""),
+    };
+    let candidate = candidate.trim_start();
+    let number_end = candidate
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(candidate.len());
+    let (number, rest) = candidate.split_at(number_end);
+    let unit: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    byte_size(&format!("{number}{unit}"))
+        .ok()
+        .filter(|n| *n > 0)
+}
+
+fn parse_item(
+    item: Node<'_, '_>,
+    base: &url::Url,
+    domain: MediaDomain,
+    options: FeedOptions,
+) -> Result<Release> {
     let none: &[&str] = &[""];
     let ezrss: &[&str] = &[EZRSS];
     let nyaa: &[&str] = &[NYAA];
@@ -258,10 +294,18 @@ fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Resul
         .and_then(|n| n.attribute("length"))
         .map(byte_size)
         .transpose()?;
+    let described = if options.description_size {
+        field_text(item, none, "description")?
+            .as_deref()
+            .and_then(description_size)
+    } else {
+        None
+    };
     let size_bytes = attr_size
         .or(size_text.as_deref().map(byte_size).transpose()?)
         .or(enclosure_size)
-        .filter(|n| *n > 0);
+        .filter(|n| *n > 0)
+        .or(described);
 
     let seeders = match scalar(&attrs, "seeders")? {
         Some(v) => Some(count(v)?),
@@ -330,10 +374,10 @@ fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Resul
         .map(|value| super::category_id(Some(value)))
         .collect::<Result<Vec<_>>>()?;
     if categories.is_empty() {
-        categories.push(match domain {
+        categories.push(options.default_category.unwrap_or(match domain {
             MediaDomain::Tv => 5000,
             MediaDomain::Movies => 2000,
-        });
+        }));
     }
     let comments_url =
         field_text(item, none, "comments")?.and_then(|value| locator(&value, false).ok());
@@ -399,6 +443,15 @@ fn parse_item(item: Node<'_, '_>, base: &url::Url, domain: MediaDomain) -> Resul
 }
 
 pub(super) fn parse_feed(input: &str, base: &url::Url, domain: MediaDomain) -> Result<ParsedFeed> {
+    parse_feed_with(input, base, domain, FeedOptions::default())
+}
+
+pub(super) fn parse_feed_with(
+    input: &str,
+    base: &url::Url,
+    domain: MediaDomain,
+    options: FeedOptions,
+) -> Result<ParsedFeed> {
     let doc = xml(input.strip_prefix('\u{feff}').unwrap_or(input))?;
     let root = doc.root_element();
     if root.tag_name().name() != "rss" || root.tag_name().namespace().is_some() {
@@ -415,7 +468,7 @@ pub(super) fn parse_feed(input: &str, base: &url::Url, domain: MediaDomain) -> R
         }
         let index = raw as u32;
         raw += 1;
-        match parse_item(item, base, domain) {
+        match parse_item(item, base, domain, options) {
             Ok(release)
                 if release
                     .guid

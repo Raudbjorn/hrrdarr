@@ -493,8 +493,10 @@ fn individual_cookie_values_are_redacted_but_short_ids_are_not() {
         cookie: Some("uid=7; pass=secretTOKEN123"),
         tv_parameters: &[],
         movie_parameters: &[],
+        username: None,
+        password: None,
     };
-    super::super::redact_secrets(&mut items, &access);
+    super::super::redact_secrets(&mut items, &access, None);
     // Short values like uid=7 are not redacted: replacing "7" would corrupt S07E07.
     assert_eq!(
         items[0].metadata.title.as_deref(),

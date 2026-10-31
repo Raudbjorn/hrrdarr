@@ -18,6 +18,10 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_WALL_TIME: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Only self-contained demuxers: no concat, playlists, image sequences or network protocols.
+/// Address-space cap for the probe. This is virtual memory, not heap (`-max_alloc` bounds that):
+/// a current distribution ffprobe maps well over 1 GiB of shared libraries before it reads a byte
+/// (it needs about 1.5 GiB here), so a 1 GiB cap made every probe fail with `probe_failed`.
+const ADDRESS_SPACE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const FORMATS: &str = "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,avi,mpeg,mpegts,mpegvideo,m4v,h264,flv,asf,ogg,rm,wtv,ivf,wav,nsv,ty,pva,nuv,vivo,dv,flic";
 
 #[derive(Debug)]
@@ -114,7 +118,7 @@ fn run(
         command.pre_exec(|| {
             for (resource, cap) in [
                 (Resource::Cpu, 10),
-                (Resource::As, 1024 * 1024 * 1024),
+                (Resource::As, ADDRESS_SPACE_BYTES),
                 (Resource::Nofile, 64),
                 (Resource::Core, 0),
                 (Resource::Fsize, 0),

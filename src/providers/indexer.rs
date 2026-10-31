@@ -1,11 +1,12 @@
 //! Torznab/Newznab requests and bounded, namespace-aware XML responses.
-use super::{IndexerAccess, ProviderSettings, http::HttpError};
+use super::{IndexerAccess, ProviderSettings, TrackerKind, http::HttpError};
 use crate::api::MediaDomain;
 use roxmltree::{Document, Node, ParsingOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod feed;
+mod tracker;
 pub use feed::{FeedDomainTest, FeedTest};
 
 const XML_BYTES: usize = 1024 * 1024;
@@ -2034,7 +2035,27 @@ fn private_parameters(
     parameters.extend(private.iter().map(|p| (p.name.clone(), p.value.clone())));
     parameters
 }
-pub use feed::test as test_feed;
+/// Test of a feed-like indexer: the generic feed or a tracker, as the settings dictate.
+pub async fn test_feed(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> Result<FeedTest> {
+    if settings.tracker_parts().is_some() {
+        return tracker::test(operation, settings, access)
+            .await
+            .map_err(|(error, _)| error);
+    }
+    feed::test(operation, settings, access).await
+}
+/// A tracker test that names the failing domain so backoff stays scoped to it.
+pub(crate) async fn test_tracker_with_scope(
+    operation: &super::http::HttpOperation<'_>,
+    settings: &ProviderSettings,
+    access: &IndexerAccess<'_>,
+) -> std::result::Result<FeedTest, (IndexerError, Option<MediaDomain>)> {
+    tracker::test(operation, settings, access).await
+}
 pub async fn test(
     operation: &super::http::HttpOperation<'_>,
     settings: &ProviderSettings,
@@ -2112,6 +2133,9 @@ pub(crate) async fn raw_search(
     if matches!(settings, ProviderSettings::Torrentrss { .. }) {
         return raw_feed(operation, settings, access, request).await;
     }
+    if settings.tracker_parts().is_some() {
+        return tracker::raw_search(operation, settings, access, request).await;
+    }
     if !access.validate() {
         return Err(IndexerError::InvalidRequest);
     }
@@ -2159,7 +2183,7 @@ pub(crate) async fn raw_search(
         None
     };
     let mut page = page;
-    redact_secrets(&mut page.items, access);
+    redact_secrets(&mut page.items, access, None);
     Ok(RawIndexerPage {
         tolerates_item_warnings: false,
         warnings: page.warnings,
@@ -2177,7 +2201,7 @@ pub(crate) async fn raw_search(
 
 const MIN_REDACTED_COOKIE_VALUE: usize = 8;
 /// Raw locators remain private, but metadata may later appear in decision receipts.
-fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
+fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>, tracker: Option<TrackerKind>) {
     // Individual cookie values are redacted too; short ones (ids, flags) are left alone,
     // since replacing e.g. "7" would corrupt release titles that later feed parsing.
     let cookie_values = access
@@ -2190,12 +2214,16 @@ fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>) {
         .api_key
         .into_iter()
         .chain(access.cookie)
+        .chain(access.password)
         .chain(cookie_values)
         .chain(
             access
                 .tv_parameters
                 .iter()
                 .chain(access.movie_parameters)
+                .filter(|p| {
+                    !tracker.is_some_and(|kind| tracker::public_selector(kind, &p.name, &p.value))
+                })
                 .map(|p| p.value.as_str()),
         )
         .filter(|v| !v.is_empty())
@@ -2236,7 +2264,7 @@ async fn raw_feed(
     let start = (*offset).min(total);
     let end = start.saturating_add(*limit).min(total);
     items = items.drain(start as usize..end as usize).collect();
-    redact_secrets(&mut items, access);
+    redact_secrets(&mut items, access, None);
     Ok(RawIndexerPage {
         tolerates_item_warnings: true,
         warnings: if start == 0 { warnings } else { Vec::new() },

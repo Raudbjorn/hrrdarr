@@ -251,7 +251,7 @@ pub(super) async fn replacements() {
             })
             .await
             .unwrap();
-            while EXECUTING.load(Ordering::Acquire) {
+            while permit_held(db.permit_id()) {
                 tokio::task::yield_now().await;
             }
         } else {
@@ -423,7 +423,7 @@ pub(super) async fn replacements() {
     drop(held);
     c.execute_batch("CREATE TRIGGER injected_start_commit BEFORE UPDATE ON download_processing WHEN NEW.resume_requested=0 BEGIN SELECT RAISE(ABORT,'injected start checkpoint failure');END;").await.unwrap();
     assert!(start_owned(db.clone(), &op).await.is_err());
-    assert!(!EXECUTING.load(Ordering::Acquire));
+    assert!(!permit_held(db.permit_id()));
     let flag: i64 = c
         .query("SELECT resume_requested FROM download_processing", ())
         .await
@@ -443,7 +443,7 @@ pub(super) async fn replacements() {
         StartOwned::Started
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while EXECUTING.load(Ordering::Acquire) {
+        while permit_held(db.permit_id()) {
             tokio::task::yield_now().await;
         }
     })

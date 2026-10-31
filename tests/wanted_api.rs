@@ -586,7 +586,16 @@ async fn wanted_searches_admit_typed_existing_search_commands_atomically() {
     let (status, replay) = request(base, "POST", "/api/v1/tv/wanted/search", Some(body)).await;
     assert_eq!(status, 202);
     assert_eq!(replay["replayed"], true);
-    assert!(replay["matched"].is_null());
+    // Reasoning: the durable receipt (migration 0091) stores the original result counters, so a
+    // replay now reports them instead of null; null remains only for pre-receipt batches.
+    assert_eq!(
+        (
+            replay["matched"].as_i64(),
+            replay["skipped_active"].as_i64(),
+            replay["admitted"].as_i64()
+        ),
+        (Some(2), Some(0), Some(2))
+    );
     assert_eq!(replay["commands"], receipt["commands"]);
     let changed = search_body(
         &selected,
@@ -908,6 +917,419 @@ async fn search_all_refuses_whole_requests_over_target_or_pool_capacity() {
     );
 }
 
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+async fn receipts(c: &libsql::Connection) -> i64 {
+    scalar(c, "SELECT count(*) FROM wanted_search_receipts").await
+}
+async fn scalar(c: &libsql::Connection, sql: &str) -> i64 {
+    c.query(sql, ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+const TV: &str = "/api/v1/tv/wanted/search";
+const MOVIES: &str = "/api/v1/movies/wanted/search";
+fn all_missing(id: &str, indexer: &Value, client: &Value) -> Value {
+    search_body(
+        id,
+        "missing",
+        json!({"kind":"all","monitored":"monitored"}),
+        indexer,
+        client,
+    )
+}
+fn counts(receipt: &Value) -> (Option<i64>, Option<i64>, Option<i64>) {
+    (
+        receipt["matched"].as_i64(),
+        receipt["skipped_active"].as_i64(),
+        receipt["admitted"].as_i64(),
+    )
+}
+
+/// A search-all that matches nothing is an authoritative empty result: a retry replays it even
+/// after targets become eligible, and a changed body or another domain conflicts.
+#[tokio::test]
+async fn zero_match_admissions_persist_receipts_and_reject_changed_retries() {
+    let app = app().await;
+    let base = &app.base;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    let (tv_id, movie_id) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    let tv = all_missing(&tv_id, &indexer, &client);
+    let movies = all_missing(&movie_id, &indexer, &client);
+    for (path, body) in [(TV, &tv), (MOVIES, &movies)] {
+        let (status, receipt) = request(base, "POST", path, Some(body.clone())).await;
+        assert_eq!(status, 202, "{receipt}");
+        assert_eq!(receipt["replayed"], false);
+        assert_eq!(counts(&receipt), (Some(0), Some(0), Some(0)));
+        assert_eq!(receipt["commands"], json!([]));
+    }
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (0, 2));
+
+    // Targets become eligible in both domains; the retries must not capture them.
+    seed(&app).await;
+    for (path, body) in [(TV, &tv), (MOVIES, &movies)] {
+        let (status, replay) = request(base, "POST", path, Some(body.clone())).await;
+        assert_eq!(status, 202, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(counts(&replay), (Some(0), Some(0), Some(0)));
+        assert_eq!(replay["commands"], json!([]));
+    }
+    assert_eq!(search_rows(&c).await, 0, "retries created no commands");
+
+    // Changed kind, filter, priority, provider revision or client selection under the same UUID.
+    let mut priority = tv.clone();
+    priority["priority"] = json!("high");
+    let mut kind = tv.clone();
+    kind["kind"] = json!("cutoff");
+    let mut filter = tv.clone();
+    filter["selection"] = json!({"kind":"all","monitored":"all"});
+    let mut revision = tv.clone();
+    revision["indexer_revision"] = json!(indexer["revision"].as_i64().unwrap() + 1);
+    let mut selection = tv.clone();
+    selection["client_selection"] = json!({"kind":"default"});
+    for changed in [priority, kind, filter, revision, selection] {
+        let (status, error) = request(base, "POST", TV, Some(changed)).await;
+        assert_eq!(
+            (status, error["error"]["code"].as_str()),
+            (409, Some("command_conflict")),
+            "{error}"
+        );
+    }
+    // A UUID reused across media domains conflicts: the digest includes `media_type`.
+    let mut reused = tv.clone();
+    reused["request_id"] = json!(movie_id);
+    let (status, error) = request(base, "POST", TV, Some(reused)).await;
+    assert_eq!(
+        (status, error["error"]["code"].as_str()),
+        (409, Some("command_conflict"))
+    );
+    let mut reused = movies.clone();
+    reused["request_id"] = json!(tv_id);
+    let (status, error) = request(base, "POST", MOVIES, Some(reused)).await;
+    assert_eq!(
+        (status, error["error"]["code"].as_str()),
+        (409, Some("command_conflict"))
+    );
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (0, 2));
+
+    // Deleting the provider after admission does not turn the retry into a fresh capture.
+    let (status, _) = request(
+        base,
+        "DELETE",
+        &format!(
+            "/api/v1/providers/{}?revision={}",
+            indexer["id"].as_str().unwrap(),
+            indexer["revision"]
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(status, 200 | 204), "{status}");
+    let (status, replay) = request(base, "POST", TV, Some(tv.clone())).await;
+    assert_eq!(status, 202, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(search_rows(&c).await, 0);
+}
+
+/// Every matched target already being searched is also an authoritative result, bound to its
+/// own UUID: cancelling the first request's children later does not make the retry capture.
+#[tokio::test]
+async fn all_active_admissions_persist_receipts() {
+    let app = app().await;
+    seed(&app).await;
+    let base = &app.base;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    let (a, b) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    let (status, first) = request(base, "POST", TV, Some(all_missing(&a, &indexer, &client))).await;
+    assert_eq!(status, 202, "{first}");
+    assert_eq!(counts(&first), (Some(3), Some(0), Some(3)));
+    let body_b = all_missing(&b, &indexer, &client);
+    let (status, second) = request(base, "POST", TV, Some(body_b.clone())).await;
+    assert_eq!(status, 202, "{second}");
+    assert_eq!(counts(&second), (Some(3), Some(3), Some(0)));
+    assert_eq!(second["commands"], json!([]));
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (3, 2));
+
+    // Cancel A's children: they leave the active-target query, so a re-capture would admit.
+    for command in first["commands"].as_array().unwrap() {
+        let (status, cancelled) = request(
+            base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                command["command_id"].as_str().unwrap()
+            ),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, 200, "{cancelled}");
+    }
+    let (status, replay) = request(base, "POST", TV, Some(body_b.clone())).await;
+    assert_eq!(status, 202, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(counts(&replay), (Some(3), Some(3), Some(0)));
+    assert_eq!(replay["commands"], json!([]));
+    assert_eq!(search_rows(&c).await, 3, "no new children after the retry");
+    let mut changed = body_b;
+    changed["priority"] = json!("high");
+    let (status, error) = request(base, "POST", TV, Some(changed)).await;
+    assert_eq!(
+        (status, error["error"]["code"].as_str()),
+        (409, Some("command_conflict"))
+    );
+    assert_eq!(search_rows(&c).await, 3);
+}
+
+/// A non-empty receipt no longer depends on its child commands: terminal-history deletion and
+/// housekeeping leave replay intact until the receipt itself expires.
+#[tokio::test]
+async fn receipts_outlive_child_history_and_expire_explicitly() {
+    let app = app().await;
+    seed(&app).await;
+    let base = &app.base;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let body = search_body(
+        &id,
+        "missing",
+        json!({"kind":"ids","ids":[1,5]}),
+        &indexer,
+        &client,
+    );
+    let (status, original) = request(base, "POST", TV, Some(body.clone())).await;
+    assert_eq!(status, 202, "{original}");
+    for command in original["commands"].as_array().unwrap() {
+        request(
+            base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                command["command_id"].as_str().unwrap()
+            ),
+            Some(json!({})),
+        )
+        .await;
+    }
+    // Child history is pruned (the commands are terminal), receipt retained.
+    c.execute("DELETE FROM search_commands WHERE status='cancelled'", ())
+        .await
+        .unwrap();
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (0, 1));
+    let (status, replay) = request(base, "POST", TV, Some(body.clone())).await;
+    assert_eq!(status, 202, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(
+        replay["commands"], original["commands"],
+        "same identities as the original"
+    );
+    assert_eq!(
+        search_rows(&c).await,
+        0,
+        "a pruned child never causes new external work"
+    );
+
+    // Housekeeping keeps an unexpired receipt even far beyond command-history retention...
+    let policy = hrrdarr::commands::housekeeping::Policy {
+        retention_seconds: 1,
+        min_keep: 0,
+        ..Default::default()
+    };
+    let before_expiry = now() + 6 * 24 * 60 * 60;
+    let report = hrrdarr::commands::housekeeping::prune(&app.db, &policy, before_expiry)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted_from("wanted_search_receipts", "tv"), 0);
+    assert_eq!(receipts(&c).await, 1);
+    // ...and removes it, with its targets, only after the documented 7 days.
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM wanted_search_receipt_targets").await,
+        2
+    );
+    let after_expiry = now() + 7 * 24 * 60 * 60 + 5;
+    let report = hrrdarr::commands::housekeeping::prune(&app.db, &policy, after_expiry)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted_from("wanted_search_receipts", "tv"), 1);
+    assert_eq!(report.deleted_from("wanted_search_receipts", "movies"), 0);
+    assert_eq!(
+        (
+            receipts(&c).await,
+            scalar(&c, "SELECT count(*) FROM wanted_search_receipt_targets").await
+        ),
+        (0, 0)
+    );
+    // An expired identity is explicit: the UUID is a new request, not a replay of the old one.
+    let (status, fresh) = request(base, "POST", TV, Some(body)).await;
+    assert_eq!(status, 202, "{fresh}");
+    assert_eq!(fresh["replayed"], false);
+    assert_eq!(search_rows(&c).await, 2);
+}
+
+/// Concurrent duplicates capture once; a full store refuses instead of discarding an unexpired
+/// receipt, expired ones make room, and a refused admission leaves no receipt behind.
+#[tokio::test]
+async fn concurrent_duplicates_capture_once_and_capacity_never_drops_unexpired_receipts() {
+    let app = app().await;
+    seed(&app).await;
+    let base = app.base.clone();
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let body = all_missing(&id, &indexer, &client);
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (base, body) = (base.clone(), body.clone());
+        pending.spawn(async move { request(&base, "POST", TV, Some(body)).await });
+    }
+    let mut replies = Vec::new();
+    while let Some(reply) = pending.join_next().await {
+        replies.push(reply.unwrap());
+    }
+    assert!(
+        replies.iter().all(|(status, _)| *status == 202),
+        "{replies:?}"
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|(_, r)| r["replayed"] == false)
+            .count(),
+        1
+    );
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (3, 1));
+
+    // Storage refuses a receipt beyond 4096 unexpired ones (and 65536 admitted targets).
+    let t = now();
+    c.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4095) INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) SELECT printf('00000000-0000-4000-8000-%012x',i),'movies',zeroblob(32),0,0,0,?1,?1+1000 FROM n",
+        [t],
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipts(&c).await, 4096);
+    let raw = c
+        .execute(
+            "INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at)VALUES('11111111-1111-4111-8111-111111111111','tv',zeroblob(32),0,0,0,?1,?1+1000)",
+            [t],
+        )
+        .await;
+    assert!(raw.is_err());
+    // The API reports the full store and writes nothing: no receipt, no child commands.
+    let fresh = search_body(
+        &uuid::Uuid::new_v4().to_string(),
+        "missing",
+        json!({"kind":"ids","ids":[11]}),
+        &indexer,
+        &client,
+    );
+    let (status, error) = request(&base, "POST", TV, Some(fresh.clone())).await;
+    assert_eq!(
+        (status, error["error"]["code"].as_str()),
+        (429, Some("wanted_receipt_capacity"))
+    );
+    assert_eq!((search_rows(&c).await, receipts(&c).await), (3, 4096));
+    // The unexpired receipts are all still there and still authoritative.
+    let (status, replay) = request(&base, "POST", TV, Some(body)).await;
+    assert_eq!((status, replay["replayed"].as_bool()), (202, Some(true)));
+
+    // Expired receipts do not count and are swept at the next admission: ten synthetic receipts
+    // are replaced by expired ones, then the same request is admitted and they disappear.
+    c.execute("DELETE FROM wanted_search_receipts WHERE request_id BETWEEN '00000000-0000-4000-8000-000000000001' AND '00000000-0000-4000-8000-00000000000a'", ()).await.unwrap();
+    let removed = 4096 - receipts(&c).await;
+    assert_eq!(removed, 10);
+    c.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10) INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) SELECT printf('00000000-0000-4000-8000-%012x',i),'movies',zeroblob(32),0,0,0,?1,?2 FROM n",
+        [t - 100_000, t - 10],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(
+            &c,
+            &format!(
+                "SELECT count(*) FROM wanted_search_receipts WHERE expires_at<={}",
+                t - 10
+            )
+        )
+        .await,
+        10
+    );
+    let (status, receipt) = request(&base, "POST", TV, Some(fresh)).await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(receipt["replayed"], false);
+    assert_eq!(
+        scalar(
+            &c,
+            &format!(
+                "SELECT count(*) FROM wanted_search_receipts WHERE expires_at<={}",
+                t - 10
+            )
+        )
+        .await,
+        0,
+        "expired receipts were swept"
+    );
+    assert_eq!(
+        receipts(&c).await,
+        4096 - 10 + 1,
+        "unexpired receipts all remain"
+    );
+}
+
+#[tokio::test]
+async fn expired_empty_receipt_outside_sweep_can_be_readmitted() {
+    let app = app().await;
+    let (indexer, client) = providers(&app).await;
+    let c = app.db.connect().await.unwrap();
+    for path in [TV, MOVIES] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = all_missing(&id, &indexer, &client);
+        let timestamp = now();
+        c.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) SELECT printf('00000000-0000-4000-8000-%012x',i),'tv',zeroblob(32),0,0,0,?1-100,?1-50 FROM n",
+            [timestamp],
+        ).await.unwrap();
+        c.execute(
+            "INSERT INTO wanted_search_receipts VALUES(?,?,zeroblob(32),0,0,0,?,?)",
+            libsql::params![
+                id,
+                if path == TV { "tv" } else { "movies" },
+                timestamp - 20,
+                timestamp - 10
+            ],
+        )
+        .await
+        .unwrap();
+        let (status, fresh) = request(&app.base, "POST", path, Some(body.clone())).await;
+        assert_eq!(status, 202, "{fresh}");
+        assert_eq!(fresh["replayed"], false);
+        assert_eq!(counts(&fresh), (Some(0), Some(0), Some(0)));
+        let (status, replay) = request(&app.base, "POST", path, Some(body)).await;
+        assert_eq!(status, 202, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(search_rows(&c).await, 0);
+        c.execute("DELETE FROM wanted_search_receipts", ())
+            .await
+            .unwrap();
+    }
+}
+
 fn item_by_id(page: &Value, id: i64) -> Value {
     page["items"]
         .as_array()
@@ -1123,7 +1545,7 @@ async fn last_search_sort_and_oldest_first_admission_in_both_domains() {
         base,
         "POST",
         "/api/v1/movies/wanted/search",
-        Some(movie_all),
+        Some(movie_all.clone()),
     )
     .await;
     assert_eq!(status, 202, "{receipt}");
@@ -1135,6 +1557,10 @@ async fn last_search_sort_and_oldest_first_admission_in_both_domains() {
     let mut sorted = order.clone();
     sorted.sort();
     assert_eq!(sorted, order);
+    let (status, replay) = request(base, "POST", MOVIES, Some(movie_all)).await;
+    assert_eq!(status, 202, "{replay}");
+    // Receipt replay must retain oldest-first order even when numeric target IDs differ.
+    assert_eq!(replay["commands"], receipt["commands"]);
     let available = search_body(
         &uuid::Uuid::new_v4().to_string(),
         "missing",

@@ -16,7 +16,9 @@ pub enum MediaTarget {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+mod convert;
 pub mod custom_formats;
+pub use convert::{ConversionReport, convert_premerge_pr32, premerge_ledger};
 
 const MIGRATIONS: &[(&str, &str)] = &[
     (
@@ -335,6 +337,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0080_library_root_health.sql"),
     ),
     ("backups", include_str!("../../migrations/0081_backups.sql")),
+    // Keep main's published 1–81 prefix; branch migrations follow at 82 and 83.
+    (
+        "indexer_breadth",
+        include_str!("../../migrations/0090_indexer_breadth.sql"),
+    ),
+    (
+        "wanted_search_receipts",
+        include_str!("../../migrations/0091_wanted_search_receipts.sql"),
+    ),
 ];
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -445,11 +456,21 @@ pub struct Database {
     // Advisory ownership lasts for the application lifetime, including backup/migration.
     _owner: Option<File>,
     backup: Option<PathBuf>,
+    // Never reused within a process (unlike an address), so per-database state can be keyed by it.
+    permit_id: u64,
     // Local database file; absent for remote storage.
     path: Option<PathBuf>,
 }
+static NEXT_PERMIT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_permit_id() -> u64 {
+    NEXT_PERMIT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl Database {
+    /// Identity for state that is exclusive per open database (the import/file-effect permit).
+    pub(crate) fn permit_id(&self) -> u64 {
+        self.permit_id
+    }
     pub async fn open_local(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
         if path.as_os_str().is_empty() || path == Path::new(":memory:") {
@@ -478,6 +499,7 @@ impl Database {
             engine,
             _owner: Some(owner),
             backup: None,
+            permit_id: next_permit_id(),
             path: Some(path.clone()),
         };
         let conn = db.connect().await?;
@@ -493,6 +515,7 @@ impl Database {
             engine,
             _owner: None,
             backup: None,
+            permit_id: next_permit_id(),
             path: None,
         };
         migrate(db.connect().await?, None).await?;
@@ -1132,7 +1155,13 @@ mod indexer_policy_tests;
 mod indexer_client_tests;
 
 #[cfg(test)]
+mod convert_tests;
+#[cfg(test)]
 mod indexer_backoff_tests;
+#[cfg(test)]
+mod indexer_breadth_tests;
+#[cfg(test)]
+mod wanted_receipt_tests;
 
 #[cfg(test)]
 mod aria2_registry_tests;
@@ -1150,6 +1179,7 @@ mod downloadstation_registry_tests;
 mod flood_registry_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
+#[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]
 mod torrent_rss_tests;

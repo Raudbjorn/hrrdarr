@@ -196,16 +196,28 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
             assert_eq!(code, 200);
             let templates = schema["templates"].as_array().unwrap();
             // Reasoning: download clients are qBittorrent, SABnzbd (dlc.014), NZBGet (dlc.009) and
-            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013) uTorrent (dlc.017) Aria2 (dlc.002) Flood (dlc.006) and DownloadStation (dlc.005);
-            // indexers are Torznab, Newznab and the 0068 torrentrss feed.
-            assert_eq!(templates.len(), if kind == "indexer" { 3 } else { 10 });
+            // Transmission (dlc.015), Deluge (dlc.004), rTorrent (dlc.013), uTorrent (dlc.017), Aria2 (dlc.002), Flood (dlc.006) and DownloadStation (dlc.005); indexers are Torznab, Newznab, the 0068 torrentrss feed and the nine 0090 trackers (indexer breadth).
+            assert_eq!(templates.len(), if kind == "indexer" { 12 } else { 10 });
             assert_eq!(
                 templates
                     .iter()
                     .map(|t| t["implementation"].as_str().unwrap())
                     .collect::<Vec<_>>(),
                 if kind == "indexer" {
-                    vec!["newznab", "torznab", "torrentrss"]
+                    vec![
+                        "newznab",
+                        "torznab",
+                        "torrentrss",
+                        "nyaa",
+                        "fanzub",
+                        "iptorrents",
+                        "torrentleech",
+                        "broadcasthenet",
+                        "filelist",
+                        "hdbits",
+                        "passthepopcorn",
+                        "torrentpotato",
+                    ]
                 } else {
                     vec![
                         "qbittorrent",
@@ -232,6 +244,19 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                         json!({"enable_rss":true,"minimum_seeders":null})
                     );
                     assert_eq!(t["defaults"]["movies"], t["defaults"]["tv"]);
+                    assert_eq!(t["presets"], json!([]));
+                } else if t["defaults"]["kind"] == "tracker" {
+                    // Reasoning: tracker defaults carry resolved search flags (on only for searchable trackers),
+                    // tracker-native category ids only where the tracker has them, and a suggested endpoint.
+                    let implementation = t["implementation"].as_str().unwrap();
+                    let searchable = !matches!(implementation, "iptorrents" | "torrentleech");
+                    assert_eq!(t["defaults"]["tv"]["enable_interactive_search"], searchable);
+                    assert!(
+                        t["defaults"]["endpoint_hint"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("https://")
+                    );
                     assert_eq!(t["presets"], json!([]));
                 } else if kind == "indexer" {
                     assert_eq!(t["defaults"]["tv"]["categories"], json!([]));
@@ -276,7 +301,14 @@ async fn native_administration_is_atomic_scoped_bounded_and_secret_safe() -> Res
                     assert!(t["defaults"].get("category").is_none());
                 }
 
-                assert_eq!(t["supported_media"], json!(["tv", "movies"]));
+                // Reasoning: trackers serve only the domains their service has (BroadcastheNet, Fanzub and
+                // Torrentleech are TV only; PassThePopcorn and TorrentPotato are movie only).
+                let expected_media = match t["implementation"].as_str().unwrap() {
+                    "broadcasthenet" | "fanzub" | "torrentleech" => json!(["tv"]),
+                    "passthepopcorn" | "torrentpotato" => json!(["movies"]),
+                    _ => json!(["tv", "movies"]),
+                };
+                assert_eq!(t["supported_media"], expected_media);
                 assert!(t.get("endpoint").is_none());
                 assert!(!t.to_string().contains(PRIVATE));
             }

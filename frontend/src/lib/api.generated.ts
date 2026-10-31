@@ -424,11 +424,51 @@ export type LabelClientTest = { client_version: string, domains: Array<MediaDoma
 
 export type LabelTestWarning = "label_not_created";
 
+export type LegacyAction = "roll_forward" | "settle_restored";
+
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
 
 export type LegacyError = { error: string, };
 
+export type LegacyLayout = "at_source" | "moved" | "partial" | "conflict" | "unreadable" | "unknown";
+
+export type LegacyQuery = { media_type?: MediaDomain, limit?: number, offset?: number, };
+
+export type LegacyRecoveryInput = {
+/**
+ * Required, no default: a dry run lists the effects, `false` is the explicit opt-in.
+ */
+dry_run: boolean, item_ids: Array<number>, };
+
+export type LegacyRecoveryReport = { dry_run: boolean, items: Array<LegacyRenameItem>, };
+
+export type LegacyRefusal = "not_legacy" | "journal_invalid" | "owner_missing" | "database_path_changed" | "owner_busy" | "unsettled_journal" | "counter_inconsistent" | "layout_conflict" | "layout_unreadable";
+
+export type LegacyRenameItem = { item_id: number, command_id: string,
+/**
+ * `owner_id` is a series ID for `tv` and a movie ID for `movies`; never interchangeable.
+ */
+media_type: MediaDomain, owner_id: number, kind: RenameEventKind, file_id: number | null, old_path: string, new_path: string, device: number | null, inode: number | null, sidecars: Array<LegacySidecar>, layout: LegacyLayout, layout_error: string | null,
+/**
+ * The owning command's current `items_failed` (the old binary counted this attempt).
+ */
+command_items_failed: number,
+/**
+ * Present only when the item may be admitted.
+ */
+action: LegacyAction | null, refusal: LegacyRefusal | null,
+/**
+ * Change this transition makes to the command's `items_failed`.
+ */
+items_failed_delta: number,
+/**
+ * Set only by an executed (non-dry-run) request that committed the transition.
+ */
+reopened: boolean, };
+
 export type LegacySeries = { id: number, title: string, year: number | null, path: string, poster: string | null, };
+
+export type LegacySidecar = { old_path: string, new_path: string, device: number, inode: number, };
 
 export type LibraryBulk = { items: Array<LibraryUpdate>, };
 
@@ -696,7 +736,7 @@ export type ProviderChanges = { enabled?: boolean | null, priority?: number | nu
 
 export type ProviderCredentials = { "kind": "api_key", api_key: string, } | { "kind": "username_password", username: string, password: string, } | { "kind": "indexer", api_key?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, } | { "kind": "feed", cookie?: string | null, tv_parameters?: Array<IndexerParameter>, movie_parameters?: Array<IndexerParameter>, };
 
-export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "feed", tv: FeedScope, movies: FeedScope, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "nzbget_client", recent_priority: NzbgetPriority, older_priority: NzbgetPriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "label_torrent_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, };
+export type ProviderDefaults = { "kind": "indexer", tv: TvIndexerScope, movies: MovieIndexerScope, } | { "kind": "feed", tv: FeedScope, movies: FeedScope, } | { "kind": "tracker", tv: TrackerScope, movies: TrackerScope, endpoint_hint: string, } | { "kind": "download_client", imported_category: string | null, recent_priority: number, older_priority: number, initial_state: DownloadInitialState, content_layout: DownloadContentLayout, sequential_order: boolean, first_last_first: boolean, add_tags: boolean, tags: Array<number>, } | { "kind": "usenet_client", recent_priority: UsenetPriority, older_priority: UsenetPriority, tags: Array<number>, } | { "kind": "nzbget_client", recent_priority: NzbgetPriority, older_priority: NzbgetPriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "transmission_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, } | { "kind": "label_torrent_client", recent_priority: TorrentQueuePriority, older_priority: TorrentQueuePriority, add_paused: boolean, tags: Array<number>, endpoint_hint: string, };
 
 export type ProviderDownloadResult = { provider_id: string, revision: number, page: DownloadPage, };
 
@@ -710,7 +750,7 @@ export type ProviderFilesResult = { provider_id: string, revision: number, resul
 
 export type ProviderFilter = { media_type: MediaDomain, kind: ProviderKind, };
 
-export type ProviderImplementation = "newznab" | "nzbget" | "qbittorrent" | "sabnzbd" | "torrentrss" | "torznab" | "transmission" | "deluge" | "rtorrent" | "utorrent" | "aria2" | "flood" | "downloadstation";
+export type ProviderImplementation = "newznab" | "nzbget" | "qbittorrent" | "sabnzbd" | "torrentrss" | "nyaa" | "fanzub" | "iptorrents" | "torrentleech" | "broadcasthenet" | "filelist" | "hdbits" | "passthepopcorn" | "torrentpotato" | "torznab" | "transmission" | "deluge" | "rtorrent" | "utorrent" | "aria2" | "flood" | "downloadstation";
 
 export type ProviderInput = { name: string, enabled: boolean, priority: number, settings: ProviderSettings, credentials?: ProviderCredentials | null, };
 
@@ -734,7 +774,7 @@ export type ProviderSelection = { media_type: MediaDomain, kind: ProviderKind, i
 
 export type ProviderSelectionItem = { id: string, revision: number, };
 
-export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, };
+export type ProviderSettings = { "implementation": "torznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "newznab", endpoint: string, tv: TvIndexerScope | null, movies: MovieIndexerScope | null, } | { "implementation": "qbittorrent", endpoint: string, tv: DownloadScope | null, movies: DownloadScope | null, } | { "implementation": "sabnzbd", endpoint: string, tv: UsenetScope | null, movies: UsenetScope | null, } | { "implementation": "nzbget", endpoint: string, tv: NzbgetScope | null, movies: NzbgetScope | null, } | { "implementation": "transmission", endpoint: string, tv: TransmissionScope | null, movies: TransmissionScope | null, } | { "implementation": "nyaa", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "fanzub", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "iptorrents", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "torrentleech", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "broadcasthenet", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "filelist", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "hdbits", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "passthepopcorn", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "torrentpotato", endpoint: string, tv: TrackerScope | null, movies: TrackerScope | null, } | { "implementation": "deluge", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "rtorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "utorrent", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "aria2", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "flood", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "downloadstation", endpoint: string, tv: TorrentLabelScope | null, movies: TorrentLabelScope | null, } | { "implementation": "torrentrss", endpoint: string, tv: FeedScope | null, movies: FeedScope | null, };
 
 export type ProviderTemplate = { implementation: ProviderImplementation, supported_media: Array<MediaDomain>, enabled: boolean, priority: number, defaults: ProviderDefaults, presets: Array<ProviderPreset>, };
 
@@ -1039,6 +1079,8 @@ export type TorrentLabelScope = { category: string, recent_priority?: TorrentQue
 export type TorrentPlacement = { "strategy": "category", category: string, } | { "strategy": "directory", directory: string, };
 
 export type TorrentQueuePriority = "last" | "first";
+
+export type TrackerScope = { enable_rss?: boolean, enable_automatic_search?: boolean | null, enable_interactive_search?: boolean | null, minimum_seeders?: number | null, categories?: Array<number>, };
 
 export type TransmissionScope = { placement: TorrentPlacement, recent_priority?: TorrentQueuePriority, older_priority?: TorrentQueuePriority, add_paused?: boolean, tags?: Array<number>, };
 

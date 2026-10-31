@@ -21,6 +21,8 @@ retains 128 terminal rows through its own triggers and is not touched.
 | `BACKLOG_INTERVAL_SECONDS` | 60 s | Follow-up delay when a run stopped on a bound or a group failed. |
 | `STARTUP_DELAY_SECONDS` | 10 s | First run after worker start. |
 
+Custom policies must have a positive `batch_rows`; invalid values are rejected before any pruning.
+
 ## What is deleted, and what never is
 
 Only each table's actual terminal statuses: `succeeded`, `failed`, `cancelled`, plus `skipped`
@@ -39,10 +41,11 @@ Rows protected from deletion (verified against migrations and every reader of th
 | --- | --- |
 | `commands` | It is the `command_id` of a `download_refresh_snapshots` row (queue provenance). |
 | `rss_commands` | A referencing `rss_candidates` row is `pending`, `prepared`, `submitting`, `reconciling` or `needs_attention`. Settled candidates keep their own dedup/receipt state and tolerate `ON DELETE SET NULL`, the same path as the existing delete endpoint. |
+| `wanted_search_receipts` (not command history) | Pruned only when `expires_at` has passed (7 days after creation, not `retention_seconds`); an unexpired receipt is never selected, whatever the state of its child commands. Targets cascade. Admission also sweeps up to 256 expired receipts. |
 | `search_commands` | Any of its offers is selected, or unexpired. Expired unselected offers are deleted with the command (the `search_results` FK is `RESTRICT`). |
 | `manual_import_commands` | The operation's `import_journal` phase is neither `preview` nor `complete`. |
-| `rename_commands` | Deleting a terminal row cascades its `rename_items` and `rename_command_targets` journal rows. The durable `rename_events` outbox is retained separately and is not a foreign-key child. |
-| Others | Nothing references them and their dedup indexes are partial on active statuses, so terminal rows are pure history. |
+| `rename_commands` | A related `rename_items` row is `planned`, or is `failed` with `error_code='rollback_incomplete'`. Other terminal rename commands are eligible under the retention policy; deleting one cascades its item/target journal rows, while the separate `rename_events` outbox remains. |
+| Other command tables | Nothing references them and their dedup indexes are partial on active statuses, so terminal rows are pure history. |
 
 Terminal rows are not used for replay deduplication anywhere: dedup is the active-scope unique
 indexes plus candidate/hash-claim rows, which this job never deletes. Rename deduplication is
@@ -68,7 +71,9 @@ capacity-pool admit triggers and `COMMAND_CAPACITY_SQL` changes (a schema-migrat
 
 ## Pagination decision
 
-The list endpoints keep rejecting `offset > MAX_COMMANDS` (1024); the contract is unchanged.
+The command-history list endpoints keep rejecting `offset > MAX_COMMANDS` (1024); the contract is unchanged.
+The legacy rename recovery inventory is separate: it accepts the full `u32` offset range,
+with at most 25 assessed items per page, so protected recovery evidence remains discoverable.
 A hard row ceiling would delete rows inside the retention window, which this job must not do.
 Accepted residual: if a table accumulates more than 1024 terminal rows inside the 14-day window
 (or because of the keep floor), the older ones are unpageable until they age out and are pruned.

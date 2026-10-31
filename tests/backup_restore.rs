@@ -1391,15 +1391,17 @@ async fn upgrade_publishes_an_update_backup_that_restores_and_remigrates() -> Re
                 .unwrap();
             (row.get(0)?, row.get(1)?)
         };
-        // Reasoning: this fixture removes exactly the backups migration; if another migration is
-        // appended after it, rebase the fixture onto that migration's predecessor instead.
+        // Reasoning: receipts are now the last migration; removing only their empty tables
+        // reconstructs the preceding schema while retaining the backup engine under test.
         assert_eq!(
-            name, "backups",
-            "the backups migration must be the latest for this fixture"
+            name, "wanted_search_receipts",
+            "the receipt migration must be the latest for this fixture"
         );
         assert_eq!(version as usize, hrrdarr::db::latest_schema_version());
-        c.execute_batch("DROP TABLE backup_commands; DROP TABLE backup_settings;")
-            .await?;
+        c.execute_batch(
+            "DROP TABLE wanted_search_receipt_targets; DROP TABLE wanted_search_receipts;",
+        )
+        .await?;
         c.execute("DELETE FROM schema_migrations WHERE version=?1", [version])
             .await?;
     }

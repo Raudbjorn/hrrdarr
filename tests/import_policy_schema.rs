@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);
@@ -732,7 +732,8 @@ async fn snapshot_raw_cells_preserve_types_and_reject_invalid_or_hidden_oversize
     );
 
     for (i, (value, expected_error)) in [
-        ("CAST(X'610080' AS TEXT)", "invalid UTF-8 source text"),
+        // Reasoning: the shared UTF-8/UTF-16 decoder reports malformed text with one encoding error.
+        ("CAST(X'610080' AS TEXT)", "invalid source text encoding"),
         (
             "char(0)||printf('%1048576s','x')",
             "snapshot exceeds cell limit",

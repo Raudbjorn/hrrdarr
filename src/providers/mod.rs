@@ -172,7 +172,16 @@ pub(crate) fn indexer_operation_enabled(
             },
             MediaDomain::Movies,
         ) => (scope.enable_rss, false, false),
-        _ => return false,
+        // Tracker scopes carry resolved flags; RSS-only trackers store both search flags as false.
+        _ => match (provider.settings.tracker_parts(), domain) {
+            (Some((_, Some(scope), _)), MediaDomain::Tv)
+            | (Some((_, _, Some(scope))), MediaDomain::Movies) => (
+                scope.enable_rss,
+                scope.enable_automatic_search.unwrap_or(false),
+                scope.enable_interactive_search.unwrap_or(false),
+            ),
+            _ => return false,
+        },
     };
     match operation {
         IndexerOperation::Rss => flags.0,
@@ -250,6 +259,89 @@ pub struct FeedScope {
     pub minimum_seeders: Option<u32>,
 }
 pub(crate) const MAX_MINIMUM_SEEDERS: u32 = 1_000_000;
+/// A tracker scope (`nyaa`, `fanzub`, `iptorrents`, `torrentleech`, `broadcasthenet`, `filelist`,
+/// `hdbits`, `passthepopcorn`, `torrentpotato`). Scope presence is the domain opt-in. Search flags
+/// default to the tracker's capability (searchable trackers: on; RSS-only trackers: off) and an RSS-only
+/// tracker rejects an explicit `true`. Responses always carry the resolved booleans.
+#[derive(Clone, Deserialize, Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct TrackerScope {
+    #[serde(default = "enabled_by_default")]
+    #[ts(as = "Option<bool>", optional)]
+    pub enable_rss: bool,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub enable_automatic_search: Option<bool>,
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub enable_interactive_search: Option<bool>,
+    // Releases that report fewer seeders are skipped; releases that report none are kept.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub minimum_seeders: Option<u32>,
+    // Tracker-native category ids (FileList, HDBits). Empty selects the tracker default for the domain.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<u32>>", optional)]
+    pub categories: Vec<u32>,
+}
+/// The tracker implementations of the indexer-breadth family, in registry order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrackerKind {
+    Nyaa,
+    Fanzub,
+    Iptorrents,
+    Torrentleech,
+    Broadcasthenet,
+    Filelist,
+    Hdbits,
+    Passthepopcorn,
+    Torrentpotato,
+}
+impl TrackerKind {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Nyaa,
+        Self::Fanzub,
+        Self::Iptorrents,
+        Self::Torrentleech,
+        Self::Broadcasthenet,
+        Self::Filelist,
+        Self::Hdbits,
+        Self::Passthepopcorn,
+        Self::Torrentpotato,
+    ];
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Nyaa => "nyaa",
+            Self::Fanzub => "fanzub",
+            Self::Iptorrents => "iptorrents",
+            Self::Torrentleech => "torrentleech",
+            Self::Broadcasthenet => "broadcasthenet",
+            Self::Filelist => "filelist",
+            Self::Hdbits => "hdbits",
+            Self::Passthepopcorn => "passthepopcorn",
+            Self::Torrentpotato => "torrentpotato",
+        }
+    }
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+    /// Whether the tracker answers tvsearch/movie searches (an RSS-only feed does not).
+    pub(crate) fn searchable(self) -> bool {
+        !matches!(self, Self::Iptorrents | Self::Torrentleech)
+    }
+    /// Domains the tracker serves: (TV, movies).
+    pub(crate) fn domains(self) -> (bool, bool) {
+        match self {
+            Self::Fanzub | Self::Torrentleech | Self::Broadcasthenet => (true, false),
+            Self::Passthepopcorn | Self::Torrentpotato => (false, true),
+            _ => (true, true),
+        }
+    }
+    /// Whether scopes may select tracker-native category ids.
+    pub(crate) fn categorised(self) -> bool {
+        matches!(self, Self::Filelist | Self::Hdbits)
+    }
+}
 #[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadInitialState {
@@ -562,7 +654,8 @@ impl Protocol {
         match implementation {
             "torznab" | "torrentrss" | "qbittorrent" | "transmission" => Some(Self::Torrent),
             label if LABEL_IMPLEMENTATIONS.contains(&label) => Some(Self::Torrent),
-            "newznab" | "sabnzbd" | "nzbget" => Some(Self::Usenet),
+            "newznab" | "sabnzbd" | "nzbget" | "fanzub" => Some(Self::Usenet),
+            tracker if TrackerKind::from_name(tracker).is_some() => Some(Self::Torrent),
             _ => None,
         }
     }
@@ -617,12 +710,87 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TransmissionScope>,
     },
-    Torrentrss {
+    /// Endpoint is the Nyaa site base (for example `https://nyaa.si/`); the RSS feed and its search
+    /// are `<endpoint>?page=rss`. Optional feed parameters (for example `c`, `f`) are write-only.
+    Nyaa {
         endpoint: String,
         #[serde(deserialize_with = "required_nullable")]
-        tv: Option<FeedScope>,
+        tv: Option<TrackerScope>,
         #[serde(deserialize_with = "required_nullable")]
-        movies: Option<FeedScope>,
+        movies: Option<TrackerScope>,
+    },
+    /// Fanzub is a Usenet (NZB) indexer; endpoint is its RSS URL (for example `https://fanzub.com/rss`).
+    /// TV only.
+    Fanzub {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the IPTorrents RSS path (for example `https://iptorrents.com/t.rss`); the account id,
+    /// passkey and category selectors are write-only feed parameters. RSS only.
+    Iptorrents {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the Torrentleech RSS host (for example `https://rss.torrentleech.org`); the RSS key is
+    /// the write-only API key appended as a path segment. TV only, RSS only.
+    Torrentleech {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the BroadcastheNet JSON-RPC URL (for example `https://api.broadcasthe.net/`). The
+    /// write-only API key is the first RPC parameter. TV only.
+    Broadcasthenet {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the FileList API URL (for example `https://filelist.io/api.php`). The username and
+    /// passkey are write-only credentials sent as HTTP basic authentication.
+    Filelist {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the HDBits API URL (for example `https://hdbits.org/api/torrents`). The username and
+    /// passkey are write-only credentials sent in the JSON request body.
+    Hdbits {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the PassThePopcorn torrent search URL (for example
+    /// `https://passthepopcorn.me/torrents.php`). The API user and API key are write-only credentials
+    /// sent as request headers. Movies only.
+    Passthepopcorn {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
+    },
+    /// Endpoint is the TorrentPotato JSON URL. The user and passkey are write-only credentials sent as
+    /// query parameters. Movies only.
+    Torrentpotato {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<TrackerScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<TrackerScope>,
     },
     /// Endpoint is the Deluge Web UI base URL (the JSON-RPC API is `<endpoint>/json`). The
     /// credential is the Web UI password. Requires the Label plugin.
@@ -678,6 +846,13 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    Torrentrss {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<FeedScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<FeedScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -688,13 +863,22 @@ impl ProviderSettings {
             Self::Sabnzbd { .. } => "sabnzbd",
             Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
-            Self::Torrentrss { .. } => "torrentrss",
+            Self::Nyaa { .. } => "nyaa",
+            Self::Fanzub { .. } => "fanzub",
+            Self::Iptorrents { .. } => "iptorrents",
+            Self::Torrentleech { .. } => "torrentleech",
+            Self::Broadcasthenet { .. } => "broadcasthenet",
+            Self::Filelist { .. } => "filelist",
+            Self::Hdbits { .. } => "hdbits",
+            Self::Passthepopcorn { .. } => "passthepopcorn",
+            Self::Torrentpotato { .. } => "torrentpotato",
             Self::Deluge { .. } => "deluge",
             Self::Rtorrent { .. } => "rtorrent",
             Self::Utorrent { .. } => "utorrent",
             Self::Aria2 { .. } => "aria2",
             Self::Flood { .. } => "flood",
             Self::Downloadstation { .. } => "downloadstation",
+            Self::Torrentrss { .. } => "torrentrss",
         }
     }
     fn endpoint(&self) -> &str {
@@ -705,6 +889,15 @@ impl ProviderSettings {
             | Self::Sabnzbd { endpoint, .. }
             | Self::Nzbget { endpoint, .. }
             | Self::Transmission { endpoint, .. }
+            | Self::Nyaa { endpoint, .. }
+            | Self::Fanzub { endpoint, .. }
+            | Self::Iptorrents { endpoint, .. }
+            | Self::Torrentleech { endpoint, .. }
+            | Self::Broadcasthenet { endpoint, .. }
+            | Self::Filelist { endpoint, .. }
+            | Self::Hdbits { endpoint, .. }
+            | Self::Passthepopcorn { endpoint, .. }
+            | Self::Torrentpotato { endpoint, .. }
             | Self::Deluge { endpoint, .. }
             | Self::Rtorrent { endpoint, .. }
             | Self::Downloadstation { endpoint, .. }
@@ -718,6 +911,14 @@ impl ProviderSettings {
         match self {
             Self::Torznab { .. }
             | Self::Torrentrss { .. }
+            | Self::Nyaa { .. }
+            | Self::Iptorrents { .. }
+            | Self::Torrentleech { .. }
+            | Self::Broadcasthenet { .. }
+            | Self::Filelist { .. }
+            | Self::Hdbits { .. }
+            | Self::Passthepopcorn { .. }
+            | Self::Torrentpotato { .. }
             | Self::Qbittorrent { .. }
             | Self::Transmission { .. }
             | Self::Deluge { .. }
@@ -726,7 +927,10 @@ impl ProviderSettings {
             | Self::Flood { .. }
             | Self::Aria2 { .. }
             | Self::Utorrent { .. } => Protocol::Torrent,
-            Self::Newznab { .. } | Self::Sabnzbd { .. } | Self::Nzbget { .. } => Protocol::Usenet,
+            Self::Newznab { .. }
+            | Self::Fanzub { .. }
+            | Self::Sabnzbd { .. }
+            | Self::Nzbget { .. } => Protocol::Usenet,
         }
     }
     pub(crate) fn is_download_client(&self) -> bool {
@@ -737,6 +941,82 @@ impl ProviderSettings {
                 | Self::Nzbget { .. }
                 | Self::Transmission { .. }
         ) || self.is_label_torrent()
+    }
+    /// The tracker kind and its TV/movie scopes (one arm per tracker of the indexer-breadth family).
+    pub(crate) fn tracker_parts(
+        &self,
+    ) -> Option<(TrackerKind, &Option<TrackerScope>, &Option<TrackerScope>)> {
+        Some(match self {
+            Self::Nyaa { tv, movies, .. } => (TrackerKind::Nyaa, tv, movies),
+            Self::Fanzub { tv, movies, .. } => (TrackerKind::Fanzub, tv, movies),
+            Self::Iptorrents { tv, movies, .. } => (TrackerKind::Iptorrents, tv, movies),
+            Self::Torrentleech { tv, movies, .. } => (TrackerKind::Torrentleech, tv, movies),
+            Self::Broadcasthenet { tv, movies, .. } => (TrackerKind::Broadcasthenet, tv, movies),
+            Self::Filelist { tv, movies, .. } => (TrackerKind::Filelist, tv, movies),
+            Self::Hdbits { tv, movies, .. } => (TrackerKind::Hdbits, tv, movies),
+            Self::Passthepopcorn { tv, movies, .. } => (TrackerKind::Passthepopcorn, tv, movies),
+            Self::Torrentpotato { tv, movies, .. } => (TrackerKind::Torrentpotato, tv, movies),
+            _ => return None,
+        })
+    }
+    /// A tracker by registry name.
+    fn from_tracker_parts(
+        kind: TrackerKind,
+        endpoint: String,
+        tv: Option<TrackerScope>,
+        movies: Option<TrackerScope>,
+    ) -> Self {
+        match kind {
+            TrackerKind::Nyaa => Self::Nyaa {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Fanzub => Self::Fanzub {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Iptorrents => Self::Iptorrents {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Torrentleech => Self::Torrentleech {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Broadcasthenet => Self::Broadcasthenet {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Filelist => Self::Filelist {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Hdbits => Self::Hdbits {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Passthepopcorn => Self::Passthepopcorn {
+                endpoint,
+                tv,
+                movies,
+            },
+            TrackerKind::Torrentpotato => Self::Torrentpotato {
+                endpoint,
+                tv,
+                movies,
+            },
+        }
+    }
+    /// A generic feed or a tracker: an indexer without a capability document.
+    pub(crate) fn is_feed_like(&self) -> bool {
+        matches!(self, Self::Torrentrss { .. }) || self.tracker_parts().is_some()
     }
     /// The TV and movie scopes of a label-torrent client (one arm per client of the family).
     fn label_pair(&self) -> Option<(&Option<TorrentLabelScope>, &Option<TorrentLabelScope>)> {
@@ -907,6 +1187,38 @@ impl ProviderSettings {
                     .any(|s| s.minimum_seeders.is_some_and(|n| n > MAX_MINIMUM_SEEDERS))
                 {
                     return Err(bad());
+                }
+            }
+            Self::Nyaa { .. }
+            | Self::Fanzub { .. }
+            | Self::Iptorrents { .. }
+            | Self::Torrentleech { .. }
+            | Self::Broadcasthenet { .. }
+            | Self::Filelist { .. }
+            | Self::Hdbits { .. }
+            | Self::Passthepopcorn { .. }
+            | Self::Torrentpotato { .. } => {
+                let (kind, tv, movies) = self.tracker_parts().ok_or_else(bad)?;
+                let (serves_tv, serves_movies) = kind.domains();
+                if (tv.is_none() && movies.is_none())
+                    || (tv.is_some() && !serves_tv)
+                    || (movies.is_some() && !serves_movies)
+                {
+                    return Err(bad());
+                }
+                for s in tv.iter().chain(movies.iter()) {
+                    let stored_ids = s.categories.len() <= 64
+                        && s.categories.iter().all(|n| (1..=1_000_000).contains(n))
+                        && s.categories.iter().collect::<BTreeSet<_>>().len() == s.categories.len();
+                    if s.minimum_seeders.is_some_and(|n| n > MAX_MINIMUM_SEEDERS)
+                        || !stored_ids
+                        || (!s.categories.is_empty() && !kind.categorised())
+                        || (!kind.searchable()
+                            && (s.enable_automatic_search == Some(true)
+                                || s.enable_interactive_search == Some(true)))
+                    {
+                        return Err(bad());
+                    }
                 }
             }
             Self::Qbittorrent { tv, movies, .. } => {
@@ -2533,6 +2845,9 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
     let mut scopes=conn.query("SELECT media_type,categories,anime_categories,category,imported_category,recent_priority,older_priority,anime_standard_format_search,remove_year,initial_state,content_layout,sequential_order,first_last_first,add_tags,enable_rss,enable_automatic_search,enable_interactive_search,download_client_id,minimum_seeders FROM provider_scopes WHERE provider_id=?",[id]).await?;
     let mut tv_feed = None;
     let mut movie_feed = None;
+    let tracker_kind = TrackerKind::from_name(&implementation);
+    let mut tv_tracker = None;
+    let mut movie_tracker = None;
     let mut tv_index = None;
     let mut movie_index = None;
     let mut tv_client = None;
@@ -2567,6 +2882,36 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
                 tv_feed = Some(item)
             } else {
                 movie_feed = Some(item)
+            }
+        } else if tracker_kind.is_some() {
+            // The client binding is storage-guarded to NULL for trackers; anything else is corruption.
+            if scope.get::<Option<String>>(17)?.is_some() {
+                return Err(corrupt());
+            }
+            let options = conn
+                .query(
+                    "SELECT categories,minimum_seeders FROM tracker_scope_options WHERE provider_id=? AND media_type=?",
+                    params![id, media.clone()],
+                )
+                .await?
+                .next()
+                .await?
+                .ok_or_else(corrupt)?;
+            let item = TrackerScope {
+                enable_rss: stored_bool(scope.get(14)?)?,
+                enable_automatic_search: Some(stored_bool(scope.get(15)?)?),
+                enable_interactive_search: Some(stored_bool(scope.get(16)?)?),
+                minimum_seeders: options
+                    .get::<Option<i64>>(1)?
+                    .map(|n| u32::try_from(n).map_err(|_| corrupt()))
+                    .transpose()?,
+                categories: serde_json::from_str(&options.get::<String>(0)?)
+                    .map_err(|_| corrupt())?,
+            };
+            if media == "tv" {
+                tv_tracker = Some(item)
+            } else {
+                movie_tracker = Some(item)
             }
         } else if implementation == "transmission" {
             let directory: Option<String> = conn
@@ -2742,6 +3087,12 @@ async fn read(conn: &Connection, id: &str) -> Result<(Provider, Option<Vec<u8>>)
             tv: tv_torrent,
             movies: movie_torrent,
         },
+        _ if tracker_kind.is_some() => ProviderSettings::from_tracker_parts(
+            tracker_kind.ok_or_else(corrupt)?,
+            endpoint,
+            tv_tracker,
+            movie_tracker,
+        ),
         label => ProviderSettings::from_label_parts(label, endpoint, tv_label, movie_label)
             .ok_or_else(corrupt)?,
     };
@@ -2908,6 +3259,29 @@ async fn write_scopes(conn: &Connection, id: &str, settings: &ProviderSettings) 
                 conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_rss,enable_automatic_search,enable_interactive_search,minimum_seeders) VALUES(?,?,?,?,0,0,?)",params![id,implementation,domain,i64::from(s.enable_rss),s.minimum_seeders.map(i64::from)]).await?;
             }
         }
+        ProviderSettings::Nyaa { .. }
+        | ProviderSettings::Fanzub { .. }
+        | ProviderSettings::Iptorrents { .. }
+        | ProviderSettings::Torrentleech { .. }
+        | ProviderSettings::Broadcasthenet { .. }
+        | ProviderSettings::Filelist { .. }
+        | ProviderSettings::Hdbits { .. }
+        | ProviderSettings::Passthepopcorn { .. }
+        | ProviderSettings::Torrentpotato { .. } => {
+            let (kind, tv, movies) = settings.tracker_parts().ok_or_else(bad)?;
+            for (domain, s) in tv
+                .iter()
+                .map(|s| ("tv", s))
+                .chain(movies.iter().map(|s| ("movies", s)))
+            {
+                // RSS-only trackers store both search flags as 0 (storage-guarded).
+                let search =
+                    |flag: Option<bool>| i64::from(kind.searchable() && flag.unwrap_or(true));
+                conn.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_rss,enable_automatic_search,enable_interactive_search) VALUES(?,?,?,?,?,?)",params![id,implementation,domain,i64::from(s.enable_rss),search(s.enable_automatic_search),search(s.enable_interactive_search)]).await?;
+                let categories = serde_json::to_string(&s.categories).map_err(|_| bad())?;
+                conn.execute("INSERT INTO tracker_scope_options(provider_id,media_type,implementation,categories,minimum_seeders) VALUES(?,?,?,?,?)",params![id,domain,implementation,categories,s.minimum_seeders.map(i64::from)]).await?;
+            }
+        }
         ProviderSettings::Qbittorrent { tv, movies, .. } => {
             for (domain, s) in tv
                 .iter()
@@ -3047,6 +3421,18 @@ impl HealthConfigurationChanges {
                 }
                 // Feeds count toward the indexer capability checks (RSS) but are never bound.
                 ProviderSettings::Torrentrss { tv, movies, .. } => {
+                    (&mut self.indexers, tv.is_some(), movies.is_some())
+                }
+                ProviderSettings::Nyaa { .. }
+                | ProviderSettings::Fanzub { .. }
+                | ProviderSettings::Iptorrents { .. }
+                | ProviderSettings::Torrentleech { .. }
+                | ProviderSettings::Broadcasthenet { .. }
+                | ProviderSettings::Filelist { .. }
+                | ProviderSettings::Hdbits { .. }
+                | ProviderSettings::Passthepopcorn { .. }
+                | ProviderSettings::Torrentpotato { .. } => {
+                    let (_, tv, movies) = settings.tracker_parts().ok_or_else(corrupt)?;
                     (&mut self.indexers, tv.is_some(), movies.is_some())
                 }
                 ProviderSettings::Qbittorrent { tv, movies, .. } => {
@@ -3803,7 +4189,7 @@ async fn probe(
             .await
             .map(ProviderTestOutcome::DownloadClient)
             .map_err(qbit_error)
-    } else if matches!(settings, ProviderSettings::Torrentrss { .. }) {
+    } else if settings.is_feed_like() {
         indexer::test_feed(
             operation,
             settings,
@@ -3859,6 +4245,26 @@ async fn run_test(
                         .map(ProviderTestOutcome::Feed)
                         .map_err(|error| indexer_error(error, &operation)),
                     None,
+                    None,
+                )
+            } else if provider.settings.tracker_parts().is_some() {
+                // A tracker has no capability document: each configured scope is fetched and parsed.
+                // Its failures feed the shared durable indexer backoff like Torznab/Newznab.
+                let scoped = indexer::test_tracker_with_scope(
+                    &operation,
+                    &provider.settings,
+                    &IndexerAccess::from_credentials(&credentials),
+                )
+                .await;
+                let failed_domain = scoped.as_ref().err().and_then(|(_, domain)| *domain);
+                let result = scoped.map_err(|(error, _)| error);
+                let observation =
+                    indexer_backoff::observation(&result).map(|value| (value, failed_domain));
+                (
+                    result
+                        .map(ProviderTestOutcome::Feed)
+                        .map_err(|error| indexer_error(error, &operation)),
+                    observation,
                     None,
                 )
             } else if is_indexer {

@@ -251,6 +251,10 @@ pub struct IndexerAccess<'a> {
     pub cookie: Option<&'a str>,
     pub tv_parameters: &'a [IndexerParameter],
     pub movie_parameters: &'a [IndexerParameter],
+    /// Tracker API account (`filelist`, `hdbits`, `passthepopcorn`, `torrentpotato`): the user name and
+    /// the passkey / API key. Never logged, echoed or stored in releases.
+    pub username: Option<&'a str>,
+    pub password: Option<&'a str>,
 }
 impl<'a> IndexerAccess<'a> {
     pub(super) fn validate(&self) -> bool {
@@ -259,6 +263,18 @@ impl<'a> IndexerAccess<'a> {
         }) && self.cookie.is_none_or(valid_cookie)
             && valid_parameters(self.tv_parameters)
             && valid_parameters(self.movie_parameters)
+    }
+
+    /// Tracker requests: an API key (BroadcastheNet, Torrentleech), an account pair, a cookie and
+    /// feed-style parameters (numeric names allowed: IPTorrents selects categories with them).
+    pub(super) fn validate_tracker(&self) -> bool {
+        let text = |s: &str| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control);
+        self.api_key.is_none_or(text)
+            && self.username.is_none_or(text)
+            && self.password.is_none_or(text)
+            && self.cookie.is_none_or(valid_cookie)
+            && valid_tracker_parameters(self.tv_parameters)
+            && valid_tracker_parameters(self.movie_parameters)
     }
 
     /// Feed requests use the generic parameter rules and never an API key.
@@ -295,7 +311,12 @@ impl<'a> IndexerAccess<'a> {
                 movie_parameters,
                 ..Self::default()
             },
-            _ => Self::default(),
+            Some(Credentials::UsernamePassword { username, password }) => Self {
+                username: Some(username),
+                password: Some(password),
+                ..Self::default()
+            },
+            None => Self::default(),
         }
     }
 }
@@ -341,14 +362,26 @@ const TORZNAB_RESERVED: &[&str] = &[
     "id",
     "r",
 ];
+/// Tracker feeds additionally accept names that start with a digit (category selectors).
+fn valid_tracker_parameters(parameters: &[IndexerParameter]) -> bool {
+    valid_named_parameters(parameters, &[], true)
+}
 fn valid_parameters_except(parameters: &[IndexerParameter], reserved: &[&str]) -> bool {
+    valid_named_parameters(parameters, reserved, false)
+}
+fn valid_named_parameters(
+    parameters: &[IndexerParameter],
+    reserved: &[&str],
+    digit_first: bool,
+) -> bool {
     let mut names = std::collections::BTreeSet::new();
     parameters.len() <= 16
         && parameters.iter().all(|p| {
             let name = p.name.to_ascii_lowercase();
             !name.is_empty()
                 && name.len() <= 64
-                && name.as_bytes()[0].is_ascii_alphabetic()
+                && (name.as_bytes()[0].is_ascii_alphabetic()
+                    || (digit_first && name.as_bytes()[0].is_ascii_digit()))
                 && name
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
@@ -373,6 +406,13 @@ impl Credentials {
                     "transmission"
                         | "nzbget"
                         | "torrentrss"
+                        | "nyaa"
+                        | "fanzub"
+                        | "iptorrents"
+                        | "filelist"
+                        | "hdbits"
+                        | "passthepopcorn"
+                        | "torrentpotato"
                         | "rtorrent"
                         | "utorrent"
                         | "flood"
@@ -384,13 +424,20 @@ impl Credentials {
                 tv_parameters,
                 movie_parameters,
             } => {
-                implementation == "torrentrss"
-                    && cookie.as_deref().is_none_or(valid_cookie)
+                matches!(
+                    implementation,
+                    "torrentrss" | "nyaa" | "fanzub" | "iptorrents"
+                ) && cookie.as_deref().is_none_or(valid_cookie)
                     && (cookie.is_some()
                         || !tv_parameters.is_empty()
                         || !movie_parameters.is_empty())
-                    && valid_feed_parameters(tv_parameters)
-                    && valid_feed_parameters(movie_parameters)
+                    && if implementation == "iptorrents" {
+                        valid_tracker_parameters(tv_parameters)
+                            && valid_tracker_parameters(movie_parameters)
+                    } else {
+                        valid_feed_parameters(tv_parameters)
+                            && valid_feed_parameters(movie_parameters)
+                    }
             }
             Self::Indexer {
                 api_key,
@@ -411,6 +458,10 @@ impl Credentials {
                     "qbittorrent"
                         | "transmission"
                         | "nzbget"
+                        | "filelist"
+                        | "hdbits"
+                        | "passthepopcorn"
+                        | "torrentpotato"
                         | "rtorrent"
                         | "utorrent"
                         | "flood"

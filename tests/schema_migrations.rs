@@ -59,7 +59,6 @@ async fn fresh_relations_enforce_domain_ownership_and_catalog_membership() -> Re
         INSERT INTO movies (id,metadata_id,path) VALUES (1,1,'/movies/Film');
         INSERT INTO movie_files (id,movie_id,path,edition) VALUES (8,1,'/movies/Film/film.mkv','Extended');
         INSERT INTO movie_collections(id,tmdb_id,title) VALUES (1,30,'Collection');
-        -- Name relationship columns so provenance fields use their migration defaults.
         INSERT INTO movie_collection_members(collection_id,metadata_id) VALUES (1,1),(1,2);
         INSERT INTO operations VALUES ('tv','episode',1,NULL,'source','copy','dest','preview','');
         INSERT INTO operations VALUES ('film','movie',NULL,1,'source','copy','dest','preview','');").await?;
@@ -150,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -301,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Reasoning: 0081 Backup is the latest entry; the unknown-history probe must use future version 82.
+    // Reasoning: 0091 Wanted receipts is ordinal 83; the unknown-history probe must use future version 84.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (82,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (84,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -470,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -701,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -918,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1164,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1370,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -1557,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -2092,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2454,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2852,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -2953,13 +2952,20 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
                 "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
             },
         );
-        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
-        // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
-        // (feeds cannot search) and every other byte must still match exactly.
+        // Reasoning: reopening also applies migration 0068, which widens the RSS admission trigger's indexer
+        // implementation list to include torrentrss, and migration 0090 (indexer breadth), which widens it to
+        // the nine trackers and widens search_commands_admit to the seven searchable trackers (the RSS-only
+        // iptorrents and torrentleech cannot search). Every other byte must still match exactly.
         if name == "rss_commands_admit" {
             expected = expected.replace(
                 "p.implementation IN ('torznab','newznab')",
-                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            );
+        }
+        if name == "search_commands_admit" {
+            expected = expected.replace(
+                "p.implementation IN ('torznab','newznab')",
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
             );
         }
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
@@ -3299,7 +3305,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -3396,13 +3402,20 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
                 "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
             },
         );
-        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
-        // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
-        // (feeds cannot search) and every other byte must still match exactly.
+        // Reasoning: reopening also applies migration 0068, which widens the RSS admission trigger's indexer
+        // implementation list to include torrentrss, and migration 0090 (indexer breadth), which widens it to
+        // the nine trackers and widens search_commands_admit to the seven searchable trackers (the RSS-only
+        // iptorrents and torrentleech cannot search). Every other byte must still match exactly.
         if name == "rss_commands_admit" {
             expected = expected.replace(
                 "p.implementation IN ('torznab','newznab')",
-                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            );
+        }
+        if name == "search_commands_admit" {
+            expected = expected.replace(
+                "p.implementation IN ('torznab','newznab')",
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
             );
         }
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
@@ -4354,7 +4367,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.
@@ -4442,13 +4455,20 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
                 "p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client')"
             },
         );
-        // Reasoning: reopening also applies migration 0068, which widens only the RSS admission trigger's
-        // indexer implementation list to include torrentrss; search_commands_admit deliberately stays unchanged
-        // (feeds cannot search) and every other byte must still match exactly.
+        // Reasoning: reopening also applies migration 0068, which widens the RSS admission trigger's indexer
+        // implementation list to include torrentrss, and migration 0090 (indexer breadth), which widens it to
+        // the nine trackers and widens search_commands_admit to the seven searchable trackers (the RSS-only
+        // iptorrents and torrentleech cannot search). Every other byte must still match exactly.
         if name == "rss_commands_admit" {
             expected = expected.replace(
                 "p.implementation IN ('torznab','newznab')",
-                "p.implementation IN ('torznab','newznab','torrentrss')",
+                "p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
+            );
+        }
+        if name == "search_commands_admit" {
+            expected = expected.replace(
+                "p.implementation IN ('torznab','newznab')",
+                "p.implementation IN ('torznab','newznab','nyaa','fanzub','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",
             );
         }
         assert_eq!(sql, expected, "{name} drifted from a faithful DROP/CREATE");
@@ -4592,7 +4612,7 @@ async fn wanted_last_search_upgrade_preserves_rows_and_imported_facts() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT max(version) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -4649,7 +4669,7 @@ async fn wanted_last_search_upgrade_preserves_rows_and_imported_facts() -> Resul
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        81 // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     Ok(())
 }

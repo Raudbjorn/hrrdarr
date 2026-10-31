@@ -11,7 +11,7 @@ use axum::{
 use hrrdarr::{commands, db::Database, providers};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -19,6 +19,13 @@ use std::{
     },
     time::Duration,
 };
+
+/// Hang detector scale for waits on the real workers (issue #38). The suite runs scenarios side by
+/// side, each slowed several-fold by the others, so a window sized for an idle host expires without
+/// anything being wrong. A passing wait returns as soon as its state holds.
+fn hang(seconds: u64) -> Duration {
+    Duration::from_secs(seconds * 4)
+}
 
 const USER: &str = "owned-user";
 const PASSWORD: &str = "PRIVATE_NAS_PASSWORD";
@@ -96,6 +103,14 @@ struct Remote {
     adds: Mutex<Vec<(String, String)>>,
     lose_add_response: AtomicBool,
     password: Mutex<String>,
+    /// Existing folders as slash-joined paths without a leading slash; the `downloads` share is
+    /// the only one present at start. Task creation names a destination that must already exist,
+    /// like a real NAS (task error 403), so the grab path must provision it first.
+    folders: Mutex<BTreeSet<String>>,
+    /// (folder_path, name) of every File Station `CreateFolder` call.
+    folder_calls: Mutex<Vec<(String, String)>>,
+    /// Create the folder but answer with a gateway error: an ambiguous outcome.
+    lose_folder_response: AtomicBool,
 }
 struct Item {
     id: String,
@@ -166,6 +181,36 @@ fn nas(s: &Remote, path: &str, headers: &HeaderMap, body: &[u8]) -> Response {
     if get("_sid") != "ownedsid" {
         return fail(119);
     }
+    if get("api") == "SYNO.FileStation.CreateFolder" {
+        assert_eq!(
+            (path, get("method"), get("version"), get("force_parent")),
+            ("/webapi/entry.cgi", "create", "2", "true")
+        );
+        let (parent, name) = (get("folder_path").to_owned(), get("name").to_owned());
+        s.folder_calls
+            .lock()
+            .unwrap()
+            .push((parent.clone(), name.clone()));
+        let relative = parent.trim_start_matches('/');
+        let mut folders = s.folders.lock().unwrap();
+        if !parent.starts_with('/') || !folders.contains(relative.split('/').next().unwrap_or("")) {
+            return fail(408);
+        }
+        let mut prefix = String::new();
+        for segment in format!("{relative}/{name}").split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            folders.insert(prefix.clone());
+        }
+        if s.lose_folder_response.load(Ordering::SeqCst) {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        return good(
+            json!({"folders":[{"isdir":true,"name":name,"path":format!("{parent}/{name}")}]}),
+        );
+    }
     let mut tasks = s.tasks.lock().unwrap();
     match (path, get("api"), get("method")) {
         ("/webapi/DownloadStation/info.cgi", _, "getinfo") => {
@@ -188,6 +233,14 @@ fn nas(s: &Remote, path: &str, headers: &HeaderMap, body: &[u8]) -> Response {
             None => fail(404),
         },
         (_, _, "create") => {
+            if !s
+                .folders
+                .lock()
+                .unwrap()
+                .contains(get("destination").trim_start_matches('/'))
+            {
+                return fail(403); // destination does not exist
+            }
             s.adds.lock().unwrap().push((
                 if multipart { "file" } else { "uri" }.to_owned(),
                 get("destination").to_owned(),
@@ -318,7 +371,7 @@ async fn serve(app: axum::Router) -> (String, Server) {
 async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(6))
+        .timeout(hang(6))
         .build()
         .unwrap()
         .request(method.parse().unwrap(), format!("{base}{path}"))
@@ -372,6 +425,7 @@ async fn app(label: &str) -> App {
     let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
     let state = Arc::new(Remote::default());
     *state.password.lock().unwrap() = PASSWORD.into();
+    state.folders.lock().unwrap().insert("downloads".into());
     let (origin, upstream) = serve(
         axum::Router::new()
             .fallback(remote)
@@ -492,7 +546,7 @@ async fn enqueue(base: &str, target: Value) -> (u16, Value) {
     .await
 }
 async fn wait_command(base: &str, id: &Value, status: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         loop {
             let (code, v) = request(
                 base,
@@ -573,7 +627,7 @@ async fn torznab_to_downloadstation_grab_refresh_and_import_for_both_domains() {
     for command in &pending {
         wait_command(base, &command["id"], "succeeded").await;
     }
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(hang(90), async {
         loop {
             let (_, v) = request(base, "GET", "/api/v1/download-processing", Value::Null).await;
             if v["items"].as_array().is_some_and(|rows| {
@@ -592,6 +646,19 @@ async fn torznab_to_downloadstation_grab_refresh_and_import_for_both_domains() {
 
     let adds = app.state.adds.lock().unwrap().clone();
     assert_eq!(adds.len(), 2, "one add per domain");
+    // The mock NAS refuses a task whose destination folder is absent, so both domains reached
+    // their single add only because the hash folders were provisioned below their own label.
+    let mut provisioned = app.state.folder_calls.lock().unwrap().clone();
+    provisioned.sort();
+    let mut expected_folders = vec![
+        (
+            "/downloads/movies-hrrdarr".to_owned(),
+            MOVIE_HASH.to_owned(),
+        ),
+        ("/downloads/tv-hrrdarr".to_owned(), tv_torrent().1),
+    ];
+    expected_folders.sort();
+    assert_eq!(provisioned, expected_folders);
     let mut methods: Vec<&str> = adds.iter().map(|(m, _)| m.as_str()).collect();
     methods.sort();
     assert_eq!(
@@ -704,7 +771,7 @@ async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
             .await
             .unwrap();
     // Reconciliation runs after the bounded uncertainty delay, never immediately.
-    let receipt = tokio::time::timeout(Duration::from_secs(90), async {
+    let receipt = tokio::time::timeout(hang(90), async {
         loop {
             let (code, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             assert_eq!(code, 200, "{v}");
@@ -882,7 +949,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
         commands::start_with_metadata(app.db.clone(), app.client.clone(), app.metadata.clone())
             .await
             .unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(30), async {
+    let receipt = tokio::time::timeout(hang(30), async {
         loop {
             let (_, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             if let Some(item) = v["items"]
@@ -913,7 +980,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
             .await
             .unwrap();
     wait_command(base, &command["id"], "succeeded").await;
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         while app.state.adds.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -924,4 +991,65 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
     let adds = app.state.adds.lock().unwrap().clone();
     assert_eq!(adds.len(), 1);
     assert_eq!(adds[0].0, "file");
+}
+
+#[tokio::test]
+async fn interrupted_folder_creation_submits_nothing_and_is_never_reported_as_submitted() {
+    let app = app("folders").await;
+    let base = &app.base;
+    app.state.lose_folder_response.store(true, Ordering::SeqCst);
+    let (code, first) = enqueue(base, target(&app.indexer, &app.downloadstation, "movies")).await;
+    assert_eq!(code, 202, "{first}");
+    let runtime =
+        commands::start_with_metadata(app.db.clone(), app.client.clone(), app.metadata.clone())
+            .await
+            .unwrap();
+    // The folder call ran and its reply was lost: the folder may exist, but no task was sent.
+    tokio::time::timeout(hang(60), async {
+        while app.state.folder_calls.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the grab must attempt to provision the destination");
+    // This stored selection is the legacy fixed client, which the automation settles
+    // conservatively as an unconfirmed submission for any failure; it must then surface for
+    // reconciliation by info hash, never as an accepted or imported download.
+    let item = tokio::time::timeout(hang(60), async {
+        loop {
+            let (code, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
+            assert_eq!(code, 200, "{v}");
+            if let Some(item) = v["items"].as_array().and_then(|rows| rows.first())
+                && item["status"] != "pending"
+                && item["status"] != "prepared"
+                && item["status"] != "submitting"
+            {
+                return item.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("the failed provisioning must settle the candidate");
+    assert!(
+        matches!(
+            item["status"].as_str(),
+            Some("reconciling" | "needs_attention")
+        ),
+        "{item}"
+    );
+    assert_eq!(item["target"]["media_type"], "movies");
+    assert!(
+        app.state.adds.lock().unwrap().is_empty(),
+        "no add after an ambiguous folder result"
+    );
+    assert!(app.state.tasks.lock().unwrap().is_empty());
+    assert_eq!(
+        count(&app.db, "SELECT count(*) FROM import_history").await,
+        0
+    );
+    app.state
+        .lose_folder_response
+        .store(false, Ordering::SeqCst);
+    runtime.shutdown().await;
 }

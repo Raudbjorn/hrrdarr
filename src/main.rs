@@ -74,7 +74,42 @@ impl ProcessFailure {
     }
 }
 
+/// `hrrdarr convert-premerge-pr32 <source> <destination>`: explicit offline conversion (#47).
+async fn convert_command(args: &[std::ffi::OsString]) -> Result<(), ProcessFailure> {
+    let [source, destination] = args else {
+        eprintln!("usage: hrrdarr convert-premerge-pr32 <stopped-source.db> <new-destination.db>");
+        return Err(ProcessFailure::at(
+            "conversion_arguments",
+            "expected a source and a destination path",
+        ));
+    };
+    match hrrdarr::db::convert_premerge_pr32(source.as_ref(), destination.as_ref()).await {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::json!({"level":"INFO","event":"premerge_pr32_converted","source":source.to_string_lossy(),"destination":destination.to_string_lossy(),"report":report})
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // Operator-run and offline: the message names the unsupported state; it holds no secrets.
+            eprintln!(
+                "{}",
+                serde_json::json!({"level":"ERROR","event":"premerge_pr32_conversion_failed","source":source.to_string_lossy(),"error":error.to_string()})
+            );
+            Err(ProcessFailure::at("conversion", error))
+        }
+    }
+}
+
 async fn run() -> Result<(), ProcessFailure> {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "convert-premerge-pr32")
+    {
+        return convert_command(&args[1..]).await;
+    }
     // Validate host inputs before database migration or worker side effects.
     let host = hrrdarr::host::HostConfig::from_env()
         .map_err(|e| ProcessFailure::at("host_configuration", e))?;

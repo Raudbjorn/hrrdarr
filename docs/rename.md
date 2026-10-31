@@ -44,10 +44,13 @@ and each sidecar), move with `renameat2(RENAME_NOREPLACE)` through descriptor-re
 no-symlink directory walks (`src/rename/fsops.rs`, built on the recycle-bin/importer
 primitives), then commit the new path, journal state, event row and counters in one
 transaction. Sidecars (same stem followed by `.`, extensions srt ass ssa sub idx sup vtt nfo
-jpg jpeg png tbn, not tracked as media) move with the media file. Any failure rolls the whole
-group back. After a crash the journal row's true state is read back from the disk: all pairs at
-source or already moved roll forward; any anomaly rolls moved pairs back and records the item as
-failed. This runs at worker start and at the start of each run. Cross-device moves are refused
+jpg jpeg png tbn, not tracked as media) move with the media file. A failure attempts to roll the
+whole group back. If rollback cannot restore the layout, the item stays `planned` with
+`rollback_incomplete`, remains protected from history pruning, and stops that command attempt.
+After a crash the journal row's true state is read back from disk: all pairs at source or already
+moved roll forward; anomalies attempt rollback and become `rolled_back` only once restoration
+succeeds. Recovery runs at worker start and before each command, including terminal predecessors
+for the same TV/movie owners. Unresolved items are logged and retained for another recovery pass. Cross-device moves are refused
 (`EXDEV` -> `cross_device`), never copied. Case-only renames work on case-sensitive filesystems
 as ordinary renames and on case-insensitive ones via a plain rename when no distinct entry has
 the target name. When both path lookups return the recorded identity, journal recovery uses the
@@ -55,6 +58,49 @@ directory entry's exact spelling to distinguish the source from the destination;
 entries sharing an inode remain a conflict. Cancel stops before the next item; finished renames
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
 plan as unchanged.
+
+## Historical failed journals (`failed` / `rollback_incomplete`)
+
+Older binaries could settle an unrestorable group as `failed` with `rollback_incomplete` and
+count it in `items_failed` while the media sat at its new (or partly moved) path and the
+database still named the old path. Current code keeps such an item `planned`, but the historical
+rows are not selected by automatic recovery. They stay retained by housekeeping and are repaired
+only by an explicit request. The class is exactly `state='failed' AND error_code='rollback_incomplete'`;
+any other failed item (`destination_exists`, `target_changed`, ...) is unrelated evidence and
+is refused as `not_legacy`.
+
+* `GET /api/v1/rename/legacy-recovery[?media_type=tv|movies&limit=1..25&offset=]` is a read-only
+  inventory (one assessment per row, nothing is written).
+* `POST /api/v1/rename/legacy-recovery` with `{"dry_run": bool, "item_ids": [1..25 distinct]}`
+  assesses the selected rows and, only when `dry_run` is `false` (required, no default), applies the
+  admitted ones. An unknown item ID is 404 `rename_item_not_found` before anything is written.
+
+Each assessed item reports its typed owner (`media_type` + `owner_id`; a series and a movie with
+the same number stay distinct), the original and new path, the media identity (device/inode),
+every sidecar with its identity, the observed `layout` (`at_source`, `moved`, `partial`,
+`conflict`, `unreadable`), the owning command's `items_failed`, the `items_failed_delta` the
+transition would make, and either an `action` or a `refusal`:
+
+| Layout | Action / outcome |
+| --- | --- |
+| `moved` or `partial` | `roll_forward`: reopen as `planned` and decrement the command's `items_failed` once. The worker's existing journal recovery then moves any remaining pair and commits the database path, the rename event and `items_renamed` (or, if that forward move fails and rollback restores the layout, settles `rolled_back` and counts the failure again). |
+| `at_source` | `settle_restored`: the original layout is verified intact, so the row becomes `rolled_back` / `legacy_rollback_verified` without any media change; `items_failed` already counted it. |
+| `conflict`, `unreadable` | Refused (`layout_conflict`, `layout_unreadable` with the filesystem code in `layout_error`): an unrelated file at the old name, changed identity, a symlink or an unreadable path. Nothing is written; remove the obstacle and ask again. |
+
+Other refusals: `journal_invalid` (identity or sidecar JSON does not parse), `owner_missing`,
+`database_path_changed` (the file/series/movie row no longer names the old path), `owner_busy`
+(a queued, running or retrying rename command targets the owner), `unsettled_journal` (another
+planned journal overlaps the same file or folder), `counter_inconsistent` (`items_failed` is
+already 0, so it cannot be decremented without going negative).
+
+The transition is one Immediate transaction that is repeated against the database facts inside
+that transaction. It touches no media; filesystem effects stay with the single command worker
+under the import/deletion permit, which finishes reopened journals at its next start or before
+the next rename command for the same owner. Because the row can leave the legacy class only once,
+rerunning or retrying after an interruption cannot decrement a counter twice, drop a journal or
+duplicate an event. A reopened `planned` journal is protected from history pruning like any
+current recovery handle; once it settles as `committed` or `rolled_back` it no longer pins its
+command and is pruned normally, while unresolved legacy rows still pin theirs.
 
 ## OnRename seam
 
@@ -66,6 +112,14 @@ transaction, then calls observers registered with
 
 ## Not claimed
 
+* Historical `failed`/`rollback_incomplete` journals are repaired only by the explicit request
+  above ([issue #63](https://github.com/Raudbjorn/hrrdarr/issues/63)); nothing reopens them
+  automatically. Verified with owned fixture databases and files built to the old on-disk shape;
+  a binary from before the fix was not run to produce them, and evidence that older binaries
+  already deleted (pruned failed rows) cannot be reconstructed. The command history status of
+  an affected command (`failed`/`items_failed`) is not rewritten when its item is recovered; only the
+  counters and the journal row change. No production library or case-insensitive filesystem was
+  exercised.
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
   second filesystem was exercised. Case-insensitive filesystems were not exercised (the
   alias observations are simulated against real directory listings; file/folder moves and reverse
@@ -79,5 +133,5 @@ transaction, then calls observers registered with
   (cause not established; observed-once).
 * Source-faithful Sonarr/Radarr runtime equivalence, V3 wire shapes, scene/absolute edge cases
   beyond the renderer's tested grammar, and extra-file tracking tables are not claimed.
-* The command pool admits `rename_commands`; the schema migration is file 0067 but sits at
-  position 63 on this branch, so merging needs renumbering with the other lanes.
+* The command pool admits `rename_commands`; its schema is preserved from main as migration
+  `0065_rename_commands.sql` at ordinal 65.

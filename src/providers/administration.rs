@@ -15,7 +15,7 @@ const PREFLIGHT_SECONDS: u64 = 5;
 // ponytail: One process-wide batch avoids queued fan-out; replace with the durable command scheduler when it owns provider testing.
 static BATCH_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
-#[derive(Clone, Copy, Deserialize, Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Indexer,
@@ -23,6 +23,9 @@ pub enum ProviderKind {
 }
 impl ProviderKind {
     fn matches(self, settings: &ProviderSettings) -> bool {
+        if settings.tracker_parts().is_some() {
+            return self == Self::Indexer;
+        }
         matches!(
             (self, settings),
             (
@@ -72,6 +75,22 @@ impl ProviderFilter {
             (ProviderSettings::Torrentrss { tv, .. }, MediaDomain::Tv) => tv.is_some(),
             (ProviderSettings::Torrentrss { movies, .. }, MediaDomain::Movies) => movies.is_some(),
             (
+                settings @ (ProviderSettings::Nyaa { .. }
+                | ProviderSettings::Fanzub { .. }
+                | ProviderSettings::Iptorrents { .. }
+                | ProviderSettings::Torrentleech { .. }
+                | ProviderSettings::Broadcasthenet { .. }
+                | ProviderSettings::Filelist { .. }
+                | ProviderSettings::Hdbits { .. }
+                | ProviderSettings::Passthepopcorn { .. }
+                | ProviderSettings::Torrentpotato { .. }),
+                media,
+            ) => match (settings.tracker_parts(), media) {
+                (Some((_, tv, _)), MediaDomain::Tv) => tv.is_some(),
+                (Some((_, _, movies)), MediaDomain::Movies) => movies.is_some(),
+                _ => false,
+            },
+            (
                 settings @ (ProviderSettings::Qbittorrent { .. }
                 | ProviderSettings::Sabnzbd { .. }
                 | ProviderSettings::Nzbget { .. }
@@ -104,6 +123,12 @@ pub enum ProviderDefaults {
     Feed {
         tv: FeedScope,
         movies: FeedScope,
+    },
+    /// A tracker of the indexer-breadth family with the suggested endpoint shape.
+    Tracker {
+        tv: TrackerScope,
+        movies: TrackerScope,
+        endpoint_hint: String,
     },
     DownloadClient {
         imported_category: Option<String>,
@@ -154,6 +179,15 @@ pub enum ProviderImplementation {
     Qbittorrent,
     Sabnzbd,
     Torrentrss,
+    Nyaa,
+    Fanzub,
+    Iptorrents,
+    Torrentleech,
+    Broadcasthenet,
+    Filelist,
+    Hdbits,
+    Passthepopcorn,
+    Torrentpotato,
     Torznab,
     Transmission,
     Deluge,
@@ -212,6 +246,59 @@ fn preset_scope(media: MediaDomain, finder: bool) -> PresetScope {
         },
     }
 }
+fn tracker_template(kind: TrackerKind) -> ProviderTemplate {
+    let implementation = match kind {
+        TrackerKind::Nyaa => ProviderImplementation::Nyaa,
+        TrackerKind::Fanzub => ProviderImplementation::Fanzub,
+        TrackerKind::Iptorrents => ProviderImplementation::Iptorrents,
+        TrackerKind::Torrentleech => ProviderImplementation::Torrentleech,
+        TrackerKind::Broadcasthenet => ProviderImplementation::Broadcasthenet,
+        TrackerKind::Filelist => ProviderImplementation::Filelist,
+        TrackerKind::Hdbits => ProviderImplementation::Hdbits,
+        TrackerKind::Passthepopcorn => ProviderImplementation::Passthepopcorn,
+        TrackerKind::Torrentpotato => ProviderImplementation::Torrentpotato,
+    };
+    let (tv, movies) = kind.domains();
+    let scope = |media: MediaDomain| TrackerScope {
+        enable_rss: true,
+        enable_automatic_search: Some(kind.searchable()),
+        enable_interactive_search: Some(kind.searchable()),
+        minimum_seeders: None,
+        categories: match (kind, media) {
+            (TrackerKind::Filelist, MediaDomain::Tv) => vec![21, 23, 27],
+            (TrackerKind::Filelist, MediaDomain::Movies) => vec![1, 4, 6, 19],
+            (TrackerKind::Hdbits, MediaDomain::Tv) => vec![2],
+            (TrackerKind::Hdbits, MediaDomain::Movies) => vec![1],
+            _ => vec![],
+        },
+    };
+    let endpoint_hint = match kind {
+        TrackerKind::Nyaa => "https://nyaa.si/",
+        TrackerKind::Fanzub => "https://fanzub.com/rss",
+        TrackerKind::Iptorrents => "https://iptorrents.com/t.rss",
+        TrackerKind::Torrentleech => "https://rss.torrentleech.org",
+        TrackerKind::Broadcasthenet => "https://api.broadcasthe.net/",
+        TrackerKind::Filelist => "https://filelist.io/api.php",
+        TrackerKind::Hdbits => "https://hdbits.org/api/torrents",
+        TrackerKind::Passthepopcorn => "https://passthepopcorn.me/torrents.php",
+        TrackerKind::Torrentpotato => "https://tracker.example/potato",
+    };
+    ProviderTemplate {
+        implementation,
+        presets: vec![],
+        supported_media: [(MediaDomain::Tv, tv), (MediaDomain::Movies, movies)]
+            .into_iter()
+            .filter_map(|(media, served)| served.then_some(media))
+            .collect(),
+        enabled: false,
+        priority: 1,
+        defaults: ProviderDefaults::Tracker {
+            tv: scope(MediaDomain::Tv),
+            movies: scope(MediaDomain::Movies),
+            endpoint_hint: endpoint_hint.into(),
+        },
+    }
+}
 // Historical catalog metadata from both pinned references. No endpoint is contacted here.
 fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<ProviderPreset> {
     match implementation {
@@ -219,6 +306,15 @@ fn presets(implementation: &ProviderImplementation, media: MediaDomain) -> Vec<P
         | ProviderImplementation::Sabnzbd
         | ProviderImplementation::Nzbget
         | ProviderImplementation::Transmission
+        | ProviderImplementation::Nyaa
+        | ProviderImplementation::Fanzub
+        | ProviderImplementation::Iptorrents
+        | ProviderImplementation::Torrentleech
+        | ProviderImplementation::Broadcasthenet
+        | ProviderImplementation::Filelist
+        | ProviderImplementation::Hdbits
+        | ProviderImplementation::Passthepopcorn
+        | ProviderImplementation::Torrentpotato
         | ProviderImplementation::Deluge
         | ProviderImplementation::Rtorrent
         | ProviderImplementation::Downloadstation
@@ -371,6 +467,7 @@ pub(super) async fn schema(
                 },
             },
         }))
+        .chain(TrackerKind::ALL.into_iter().map(tracker_template))
         .collect(),
         ProviderKind::DownloadClient => vec![
             ProviderTemplate {

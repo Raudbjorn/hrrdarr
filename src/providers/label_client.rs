@@ -116,6 +116,16 @@ pub(crate) trait Wire {
     fn files(&mut self, hash: &str) -> impl Future<Output = Result<Vec<RawFile>>> + Send;
     /// Creates `label` if the client needs it declared first.
     fn ensure_label(&mut self, label: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Makes the destination the add will name exist, for clients that cannot create it. Runs
+    /// before the add is dispatched, so a failure is a definite non-submission and, being
+    /// idempotent, is safe to repeat on a retry.
+    fn prepare_destination(
+        &mut self,
+        _label: &str,
+        _hash: &str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Adds the torrent, then applies label, paused state and queue position.
     fn add(&mut self, request: &AddRequest<'_>) -> impl Future<Output = Result<AddReply>> + Send;
     fn control(&mut self, hash: &str, action: &Control) -> impl Future<Output = Result<()>> + Send;
@@ -555,6 +565,8 @@ async fn submit_inner<W: Wire>(
     // Declaring a label is idempotent and precedes the add, so a failure here is a definite
     // non-submission.
     wire.ensure_label(&configured.category).await?;
+    wire.prepare_destination(&configured.category, &hash)
+        .await?;
     let first = if recent {
         configured.recent_priority
     } else {

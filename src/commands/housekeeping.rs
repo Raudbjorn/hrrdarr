@@ -113,12 +113,12 @@ const TABLES: [Table; 10] = [
         domain: MEDIA,
         protect: "1",
     },
-    // Rename history (0067): items cascade with the command; events are retained separately.
+    // Preserve current recovery handles and legacy incomplete rollbacks awaiting explicit repair.
     Table {
         name: "rename_commands",
         terminal: TERMINAL,
         domain: MEDIA,
-        protect: "1",
+        protect: "NOT EXISTS(SELECT 1 FROM rename_items i WHERE i.command_id=t.id AND (i.state='planned' OR (i.state='failed' AND i.error_code='rollback_incomplete')))",
     },
 ];
 
@@ -236,9 +236,35 @@ async fn batch(
     finish(tx, result).await
 }
 
+/// Deletes one batch of expired Wanted admission receipts (targets cascade). An unexpired
+/// receipt is never selected, whatever the state of its child commands.
+async fn receipt_batch(c: &Connection, domain: &str, policy: &Policy, now: i64) -> Result<u64> {
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+    let result = async {
+        Ok(tx
+            .execute(
+                "DELETE FROM wanted_search_receipts WHERE request_id IN (SELECT request_id FROM wanted_search_receipts WHERE media_type=? AND expires_at<=? ORDER BY expires_at,request_id LIMIT ?)",
+                params![domain, now, policy.batch_rows],
+            )
+            .await?)
+    }
+    .await;
+    finish(tx, result).await
+}
+
 /// Runs one bounded pass over every table and domain. A failing group is reported and does
 /// not stop the others. Rerunning deletes only what remains eligible.
 pub async fn prune(db: &Database, policy: &Policy, now: i64) -> Result<Report> {
+    // SQLite treats a negative LIMIT as unbounded. Reject invalid policies before
+    // either command history or admission receipts can be changed.
+    if policy.batch_rows <= 0 {
+        return Err(Error(
+            StatusCode::BAD_REQUEST,
+            "invalid_housekeeping_policy",
+        ));
+    }
     let c = connection(db).await?;
     let started = Instant::now();
     let mut report = Report::default();
@@ -291,6 +317,52 @@ pub async fn prune(db: &Database, policy: &Policy, now: i64) -> Result<Report> {
             }
             report.groups.push(group);
         }
+    }
+    // Receipts are not command history: they expire on their own horizon, not `retention_seconds`.
+    for domain in DOMAINS {
+        let media_type = if domain == "tv" { "tv" } else { "movies" };
+        let mut group = GroupReport {
+            table: "wanted_search_receipts",
+            media_type,
+            deleted: 0,
+            failed: false,
+        };
+        let mut last_full = false;
+        for _ in 0..policy.max_batches {
+            if started.elapsed() >= policy.budget {
+                report.more_pending = true;
+                last_full = false;
+                break;
+            }
+            match receipt_batch(&c, domain, policy, now).await {
+                Ok(n) => {
+                    group.deleted += n;
+                    last_full = n >= policy.batch_rows as u64;
+                    if !last_full {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    group.failed = true;
+                    report.failed_groups += 1;
+                    last_full = false;
+                    eprintln!(
+                        "event=housekeeping_error table=wanted_search_receipts media_type={media_type} code=storage_error"
+                    );
+                    break;
+                }
+            }
+        }
+        if last_full {
+            report.more_pending = true;
+        }
+        if group.deleted > 0 {
+            eprintln!(
+                "event=housekeeping_pruned table=wanted_search_receipts media_type={media_type} rows={}",
+                group.deleted
+            );
+        }
+        report.groups.push(group);
     }
     Ok(report)
 }

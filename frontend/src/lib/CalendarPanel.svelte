@@ -26,7 +26,7 @@
   let clockMs = $state(Date.now());
   let copyNotice = $state(''), copyError = $state('');
   let grid = $state<HTMLElement | null>(null);
-  let readVersion = 0, alive = true;
+  let readVersion = 0, alive = true, pageQuery = '';
 
   const range = $derived(rangeFor(mode, anchor));
   const title = $derived(rangeTitle(mode, anchor));
@@ -58,6 +58,10 @@
   async function load() {
     const version = ++readVersion, r = range, opts = $state.snapshot(options), wantTv = showsTv, wantMovies = showsMovies;
     const mq = wantMovies ? movieQuery(r, opts) : null;
+    const query = JSON.stringify([r, opts, wantTv, wantMovies]);
+    if (query !== pageQuery) {
+      tvPage = null; moviePage = null; tvError = ''; movieError = ''; pageQuery = query;
+    }
     loading = true;
     const [tv, movies] = await Promise.all([
       wantTv ? listCalendar<TvCalendarEntry>('tv', tvQuery(r, opts)) : Promise.resolve(null),

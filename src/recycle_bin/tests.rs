@@ -181,8 +181,7 @@ async fn restart(db: Arc<Database>, path: &std::path::Path) -> Arc<Database> {
 
 #[tokio::test]
 async fn crash_between_move_and_commit_recovers_on_restart_in_both_domains() {
-    // Reasoning: file deletion takes the process-wide import permit; serialise with import tests.
-    let _permit_tests = crate::import::PERMIT_TEST_LOCK.lock().await;
+    // File deletion takes the effect permit of this test's own database, so no cross-test lock.
     let base = scratch_dir(&std::env::temp_dir(), "crash");
     let _scratch = Scratch(vec![base.clone()]);
     let dbpath = base.join("library.db");
@@ -280,8 +279,7 @@ async fn crash_between_move_and_commit_recovers_on_restart_in_both_domains() {
 
 #[tokio::test]
 async fn crash_before_rename_aborts_without_touching_disk_or_database() {
-    // Reasoning: file deletion takes the process-wide import permit; serialise with import tests.
-    let _permit_tests = crate::import::PERMIT_TEST_LOCK.lock().await;
+    // File deletion takes the effect permit of this test's own database, so no cross-test lock.
     // Simulates a crash after admission but before the effect: the journal row is admitted and the
     // file is still at its source. Recovery must abort, never delete.
     let base = scratch_dir(&std::env::temp_dir(), "abort");
@@ -309,8 +307,7 @@ async fn crash_before_rename_aborts_without_touching_disk_or_database() {
 
 #[tokio::test]
 async fn cross_device_recycle_copies_verifies_and_removes_source_after_commit() {
-    // Reasoning: file deletion takes the process-wide import permit; serialise with import tests.
-    let _permit_tests = crate::import::PERMIT_TEST_LOCK.lock().await;
+    // File deletion takes the effect permit of this test's own database, so no cross-test lock.
     let shm = std::path::Path::new("/dev/shm");
     let base = scratch_dir(&std::env::temp_dir(), "xdev");
     if !shm.is_dir()

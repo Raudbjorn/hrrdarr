@@ -596,7 +596,7 @@ async fn health_owned_probe_cancellation_timeout_and_worker_recovery() {
     let id = admit(&c, HealthScope::Tv, 101).await;
     let cmd = take(&c, id, 101).await;
     let mut work = Box::pin(run(&db, &client, cmd));
-    tokio::time::timeout(Duration::from_secs(5),async{tokio::select!{v=&mut work=>panic!("probe completed: {}",v.is_ok()),_=entered.notified()=>{}}}).await.unwrap();
+    tokio::time::timeout(crate::TEST_HANG_DETECTOR,async{tokio::select!{v=&mut work=>panic!("probe completed: {}",v.is_ok()),_=entered.notified()=>{}}}).await.unwrap();
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await
@@ -1120,7 +1120,10 @@ async fn communication_aggregate_deadline_retains_completed_results_and_releases
     let (_, client) = crate::providers::router_with_refresh(db.clone(), None);
     let id = admit(&c, HealthScope::Tv, 101).await;
     let cmd = take(&c, id, 101).await;
-    let work = run_with_deadline(&db, &client, cmd, Duration::from_secs(2));
+    // Reasoning: the aggregate deadline must outlast the checks that complete before the blocked
+    // one, or a starved host expires it before the probe is entered (observed under the parallel
+    // suite). The blocked request never answers, so the run still ends at the deadline.
+    let work = run_with_deadline(&db, &client, cmd, Duration::from_secs(10));
     tokio::pin!(work);
     tokio::select! {r=&mut work=>panic!("did not reach blocked CDH: {}",r.is_ok()),_=entered.notified()=>{}}
     work.await.unwrap();
