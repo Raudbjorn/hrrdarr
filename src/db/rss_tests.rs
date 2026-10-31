@@ -87,7 +87,7 @@ async fn rss_schema23_upgrade_rollback_intent_ownership_and_caps() -> Result<(),
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 79); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+    assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

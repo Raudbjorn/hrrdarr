@@ -174,7 +174,7 @@ async fn schema57_actual56_preserves_published_rows_rollback_backup_and_reopen()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

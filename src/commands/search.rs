@@ -467,6 +467,16 @@ async fn insert(
 
 /// Most targets one Wanted request may capture; it equals the shared active-command pool.
 pub(crate) const MAX_WANTED_TARGETS: usize = MAX_COMMANDS as usize;
+/// Wanted admission receipts (migration 0091 at ordinal 80) stay authoritative this long; after
+/// `expires_at` the request UUID is explicitly expired and may be admitted again. These literals
+/// are mirrored by the `wanted_search_receipts_admit` trigger.
+pub(crate) const WANTED_RECEIPT_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// Unexpired receipts, and unexpired admitted targets across them; a full store refuses new
+/// requests (429 `wanted_receipt_capacity`) instead of discarding an unexpired receipt.
+pub(crate) const WANTED_RECEIPT_MAX: i64 = 4096;
+pub(crate) const WANTED_RECEIPT_MAX_TARGETS: i64 = 65536;
+/// Expired receipts removed per sweep; the rest wait for the next admission or housekeeping run.
+pub(crate) const WANTED_RECEIPT_SWEEP: i64 = 256;
 pub(crate) struct WantedChild {
     pub target: MediaTarget,
     pub command_id: Uuid,
@@ -518,6 +528,71 @@ fn target_id(target: &MediaTarget) -> i64 {
         MediaTarget::Episode(id) | MediaTarget::Movie(id) => *id,
     }
 }
+/// Removes expired receipts (their targets cascade). Unexpired receipts are never touched.
+pub(crate) async fn sweep_wanted_receipts(c: &Connection, now: i64, limit: i64) -> Result<u64> {
+    Ok(c.execute(
+        "DELETE FROM wanted_search_receipts WHERE request_id IN (SELECT request_id FROM wanted_search_receipts WHERE expires_at<=? ORDER BY expires_at,request_id LIMIT ?)",
+        params![now, limit],
+    )
+    .await?)
+}
+/// The receipt for `request_id`, if one is still authoritative at `now`.
+async fn wanted_receipt(
+    c: &Connection,
+    request_id: Uuid,
+    digest: &[u8; 32],
+    media: MediaDomain,
+    now: i64,
+) -> Result<Option<WantedAdmission>> {
+    let Some(row) = c
+        .query(
+            "SELECT media_type,digest,matched,skipped_active FROM wanted_search_receipts WHERE request_id=? AND expires_at>?",
+            params![request_id.to_string(), now],
+        )
+        .await?
+        .next()
+        .await?
+    else {
+        return Ok(None);
+    };
+    let stored_media: String = row.get(0)?;
+    let stored_digest: Vec<u8> = row.get(1)?;
+    // The digest already binds the domain; the stored domain is checked as well so a corrupt or
+    // hand-edited receipt can never replay across domains.
+    if stored_media != domain(media) || stored_digest.as_slice() != digest.as_slice() {
+        return Err(conflict());
+    }
+    let (matched, skipped) = (row.get::<i64>(2)?, row.get::<i64>(3)?);
+    let mut rows = c
+        .query(
+            "SELECT target_id,command_id FROM wanted_search_receipt_targets WHERE request_id=? ORDER BY target_id LIMIT ?",
+            params![request_id.to_string(), MAX_WANTED_TARGETS as i64 + 1],
+        )
+        .await?;
+    let mut children = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id: i64 = row.get(0)?;
+        children.push(WantedChild {
+            target: match media {
+                MediaDomain::Tv => MediaTarget::Episode(id),
+                MediaDomain::Movies => MediaTarget::Movie(id),
+            },
+            command_id: Uuid::parse_str(&row.get::<String>(1)?).map_err(|_| bad())?,
+        });
+    }
+    if children.len() > MAX_WANTED_TARGETS || children.len() as i64 + skipped != matched {
+        return Err(Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "command_storage_error",
+        ));
+    }
+    Ok(Some(WantedAdmission {
+        replayed: true,
+        matched: Some(matched as u32),
+        skipped_active: Some(skipped as u32),
+        children,
+    }))
+}
 /// Atomically admits every target `select` captures inside one Immediate transaction as
 /// ordinary durable user-search commands (no batch table, no second worker). Whole requests
 /// beyond the target bound or the remaining shared pool are refused; nothing is partially
@@ -544,6 +619,16 @@ where
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let outcome = async {
+        let timestamp = now()?;
+        // The durable receipt is the authority and is consulted before anything else, so a
+        // retry never re-captures targets, re-reads providers or depends on child history.
+        if let Some(replay) = wanted_receipt(&tx, request_id, &digest, media, timestamp).await? {
+            return Ok(replay);
+        }
+        // Expired receipts make room before capacity is judged; unexpired ones never do.
+        sweep_wanted_receipts(&tx, timestamp, WANTED_RECEIPT_SWEEP).await?;
+        // Batches admitted before receipts existed (or whose receipt expired while child rows
+        // remain) are still replayed from their deterministic child commands.
         let (low, high) = child_range(request_id);
         let mut rows = tx
             .query(
@@ -580,7 +665,6 @@ where
             });
         }
         preflight(&tx, client, source, mode).await?;
-        let timestamp = now()?;
         let mut ids = select(&*tx, timestamp).await?;
         ids.sort_unstable();
         ids.dedup();
@@ -611,6 +695,20 @@ where
         if command_capacity(&tx).await? + ids.len() as i64 > MAX_COMMANDS {
             return Err(Error(StatusCode::TOO_MANY_REQUESTS, "command_history_full"));
         }
+        let live = tx
+            .query(
+                "SELECT count(*),coalesce(sum(admitted),0) FROM wanted_search_receipts WHERE expires_at>?",
+                [timestamp],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(bad)?;
+        if live.get::<i64>(0)? >= WANTED_RECEIPT_MAX
+            || live.get::<i64>(1)? + ids.len() as i64 > WANTED_RECEIPT_MAX_TARGETS
+        {
+            return Err(Error(StatusCode::TOO_MANY_REQUESTS, "wanted_receipt_capacity"));
+        }
         let mut children = Vec::with_capacity(ids.len());
         for id in &ids {
             let target = match media {
@@ -621,6 +719,29 @@ where
             let command_id = child_id(request_id, &digest, media, *id);
             insert(&tx, command_id, mode, &target, &captured, source, priority, timestamp).await?;
             children.push(WantedChild { target, command_id });
+        }
+        // Same transaction as the children: either the whole admission and its receipt exist, or
+        // neither does. An empty result is recorded like any other.
+        tx.execute(
+            "INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                request_id.to_string(),
+                domain(media),
+                digest.to_vec(),
+                matched as i64,
+                (matched - ids.len()) as i64,
+                ids.len() as i64,
+                timestamp,
+                timestamp + WANTED_RECEIPT_SECONDS
+            ],
+        )
+        .await?;
+        for child in &children {
+            tx.execute(
+                "INSERT INTO wanted_search_receipt_targets(request_id,target_id,command_id)VALUES(?,?,?)",
+                params![request_id.to_string(), target_id(&child.target), child.command_id.to_string()],
+            )
+            .await?;
         }
         Ok(WantedAdmission {
             replayed: false,

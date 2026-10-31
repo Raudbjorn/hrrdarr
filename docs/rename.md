@@ -59,6 +59,49 @@ entries sharing an inode remain a conflict. Cancel stops before the next item; f
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
 plan as unchanged.
 
+## Historical failed journals (`failed` / `rollback_incomplete`)
+
+Older binaries could settle an unrestorable group as `failed` with `rollback_incomplete` and
+count it in `items_failed` while the media sat at its new (or partly moved) path and the
+database still named the old path. Current code keeps such an item `planned`, but the historical
+rows are not selected by automatic recovery. They stay retained by housekeeping and are repaired
+only by an explicit request. The class is exactly `state='failed' AND error_code='rollback_incomplete'`;
+any other failed item (`destination_exists`, `target_changed`, ...) is unrelated evidence and
+is refused as `not_legacy`.
+
+* `GET /api/v1/rename/legacy-recovery[?media_type=tv|movies&limit=1..25&offset=]` is a read-only
+  inventory (one assessment per row, nothing is written).
+* `POST /api/v1/rename/legacy-recovery` with `{"dry_run": bool, "item_ids": [1..25 distinct]}`
+  assesses the selected rows and, only when `dry_run` is `false` (required, no default), applies the
+  admitted ones. An unknown item ID is 404 `rename_item_not_found` before anything is written.
+
+Each assessed item reports its typed owner (`media_type` + `owner_id`; a series and a movie with
+the same number stay distinct), the original and new path, the media identity (device/inode),
+every sidecar with its identity, the observed `layout` (`at_source`, `moved`, `partial`,
+`conflict`, `unreadable`), the owning command's `items_failed`, the `items_failed_delta` the
+transition would make, and either an `action` or a `refusal`:
+
+| Layout | Action / outcome |
+| --- | --- |
+| `moved` or `partial` | `roll_forward`: reopen as `planned` and decrement the command's `items_failed` once. The worker's existing journal recovery then moves any remaining pair and commits the database path, the rename event and `items_renamed` (or, if that forward move fails and rollback restores the layout, settles `rolled_back` and counts the failure again). |
+| `at_source` | `settle_restored`: the original layout is verified intact, so the row becomes `rolled_back` / `legacy_rollback_verified` without any media change; `items_failed` already counted it. |
+| `conflict`, `unreadable` | Refused (`layout_conflict`, `layout_unreadable` with the filesystem code in `layout_error`): an unrelated file at the old name, changed identity, a symlink or an unreadable path. Nothing is written; remove the obstacle and ask again. |
+
+Other refusals: `journal_invalid` (identity or sidecar JSON does not parse), `owner_missing`,
+`database_path_changed` (the file/series/movie row no longer names the old path), `owner_busy`
+(a queued, running or retrying rename command targets the owner), `unsettled_journal` (another
+planned journal overlaps the same file or folder), `counter_inconsistent` (`items_failed` is
+already 0, so it cannot be decremented without going negative).
+
+The transition is one Immediate transaction that is repeated against the database facts inside
+that transaction. It touches no media; filesystem effects stay with the single command worker
+under the import/deletion permit, which finishes reopened journals at its next start or before
+the next rename command for the same owner. Because the row can leave the legacy class only once,
+rerunning or retrying after an interruption cannot decrement a counter twice, drop a journal or
+duplicate an event. A reopened `planned` journal is protected from history pruning like any
+current recovery handle; once it settles as `committed` or `rolled_back` it no longer pins its
+command and is pruned normally, while unresolved legacy rows still pin theirs.
+
 ## OnRename seam
 
 Each committed rename inserts an immutable `rename_events` row (`event_type='rename'`, `kind`
@@ -69,11 +112,14 @@ transaction, then calls observers registered with
 
 ## Not claimed
 
-* Older binaries may already have stored unfinished rollbacks as `failed` with
-  `rollback_incomplete`. This change does not reopen those historical rows or repair their
-  counters. Their journals are retained by housekeeping as recovery evidence, but automatic
-  recovery applies only to `planned` journals. Historical recovery is tracked in
-  [issue #63](https://github.com/Raudbjorn/hrrdarr/issues/63).
+* Historical `failed`/`rollback_incomplete` journals are repaired only by the explicit request
+  above ([issue #63](https://github.com/Raudbjorn/hrrdarr/issues/63)); nothing reopens them
+  automatically. Verified with owned fixture databases and files built to the old on-disk shape;
+  a binary from before the fix was not run to produce them, and evidence that older binaries
+  already deleted (pruned failed rows) cannot be reconstructed. The command history status of
+  an affected command (`failed`/`items_failed`) is not rewritten when its item is recovered; only the
+  counters and the journal row change. No production library or case-insensitive filesystem was
+  exercised.
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
   second filesystem was exercised. Case-insensitive filesystems were not exercised (the
   alias observations are simulated against real directory listings; file/folder moves and reverse

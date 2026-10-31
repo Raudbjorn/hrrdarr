@@ -298,7 +298,7 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     integrity(&c).await?;
     assert_eq!(
         count(&c, "SELECT count(*) FROM schema_migrations").await?,
-        BREADTH_MIGRATION as i64 + 1
+        MIGRATIONS.len() as i64 // Reasoning: opening the 78-entry prior head applies 79 (breadth) and every later entry, so the history is the whole registry.
     );
     assert_eq!(
         c.query("SELECT name FROM schema_migrations WHERE version=79", ())
@@ -359,7 +359,7 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
             "SELECT count(*) FROM schema_migrations"
         )
         .await?,
-        BREADTH_MIGRATION as i64 + 1
+        MIGRATIONS.len() as i64 // Reasoning: opening the 78-entry prior head applies 79 (breadth) and every later entry, so the history is the whole registry.
     );
     Ok(())
 }

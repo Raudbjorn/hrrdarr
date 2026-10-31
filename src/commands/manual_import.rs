@@ -757,17 +757,11 @@ mod tests {
         ));
     }
     // Deliberately not covered here: run()'s own call into crate::import::execute() (the
-    // post-execute succeeded/failed-from-a-freshly-produced-journal-error branches). A prototype of
-    // both (one driving a real copy to completion, one forcing a fast real "target_changed" failure)
-    // was written and removed: crate::import::execute() holds a single process-wide execution
-    // permit (EXECUTING/ACTIVE_OPERATION in src/import/mod.rs) that src/import/tests.rs and
-    // src/import/owned_tests.rs's own tests never guard against either, and cargo test's default
-    // parallelism on this machine made either combination collide on a spurious `import_busy`
-    // reliably (reproduced 5/5 runs), not rarely -- failing tests outside this module's ownership.
-    // Closing this needs a lock shared across every real-execute()-calling test suite, which
-    // belongs in src/import/ (outside this module's file ownership), not a local one here. Real
-    // coverage of these branches is left to the separate testing-verification pass, ideally via an
-    // out-of-process integration test in the style of tests/download_processing.rs.
+    // post-execute succeeded/failed-from-a-freshly-produced-journal-error branches). Real coverage
+    // of these branches is left to the separate testing-verification pass, ideally via an
+    // out-of-process integration test in the style of tests/download_processing.rs. (An earlier
+    // prototype collided on `import_busy` because the effect permit was process-wide; it is now
+    // held per database, so that interference no longer applies to a test with its own database.)
     #[tokio::test]
     async fn run_settles_failed_immediately_for_a_pre_existing_journal_error_without_reexecuting() {
         let scratch = Scratch::new();

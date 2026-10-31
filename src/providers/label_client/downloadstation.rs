@@ -3,7 +3,8 @@
 //! id never appear in URLs. Download Station reports no info hash, so identity and domain are
 //! carried by the task's destination: `<default destination>/<label>/<info hash>`. A task whose
 //! magnet URI names a hash but whose destination is elsewhere is reported unlabelled, which the
-//! engine treats as a scope conflict.
+//! engine treats as a scope conflict. Download Station rejects a task whose destination does not
+//! exist (task error 403), so that folder is provisioned through File Station before the add.
 use super::{
     AddReply, AddRequest, MAX_FILES, MAX_LISTED_TORRENTS, RawFile, RawState, RawTorrent, Result,
     Wire, WireInfo, valid_hash,
@@ -20,12 +21,53 @@ const SESSION: &str = "DownloadStation";
 const AUTH_PATH: &str = "/webapi/auth.cgi";
 const TASK_PATH: &str = "/webapi/DownloadStation/task.cgi";
 const INFO_PATH: &str = "/webapi/DownloadStation/info.cgi";
+const ENTRY_PATH: &str = "/webapi/entry.cgi";
+const FOLDER_API: &str = "SYNO.FileStation.CreateFolder";
+const FOLDER_API_VERSION: u32 = 2;
+const MAX_SEGMENT_BYTES: usize = 255;
 const MAX_SID_BYTES: usize = 256;
 const VISIBLE_ATTEMPTS: u32 = 15;
 const VISIBLE_INTERVAL: Duration = Duration::from_millis(200);
 // Synology API error codes (common and task APIs).
 const SESSION_ERRORS: [i64; 5] = [105, 106, 107, 119, 120];
 const NO_SUCH_TASK: i64 = 404;
+// File Station: the requested API, method or version does not exist on this DSM.
+const FOLDER_API_UNAVAILABLE: [i64; 3] = [102, 103, 104];
+// File Station: this account may not create folders there (403-405 invalid user/group for the
+// operation, 407 operation not permitted). 105 is already a session/permission error above.
+const FOLDER_DENIED: [i64; 4] = [403, 404, 405, 407];
+
+/// Maps a non-session Synology error code of the task and info APIs.
+fn task_error(code: i64) -> QbitError {
+    if code == NO_SUCH_TASK {
+        QbitError::NotFound
+    } else {
+        QbitError::InvalidResponse
+    }
+}
+/// Maps a non-session error code of File Station's `CreateFolder`. Everything else (illegal
+/// name or path, read-only or full volume, 1100/1101 creation failures) is an unusable reply.
+fn folder_error(code: i64) -> QbitError {
+    if FOLDER_API_UNAVAILABLE.contains(&code) {
+        QbitError::UnsupportedFeature
+    } else if FOLDER_DENIED.contains(&code) {
+        HttpError::Authentication.into()
+    } else {
+        QbitError::InvalidResponse
+    }
+}
+/// One folder name below the shared folders. The engine already restricts labels and hashes;
+/// this guards the string that becomes a File Station path, including the destination read from
+/// the NAS, so no segment can climb out of or alias the configured destination.
+fn safe_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_SEGMENT_BYTES
+        && segment != "."
+        && segment != ".."
+        && !segment.chars().any(|c| {
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+}
 
 pub(crate) struct DownloadStationWire<'o, 'a> {
     operation: &'o HttpOperation<'a>,
@@ -68,6 +110,19 @@ impl<'o, 'a> DownloadStationWire<'o, 'a> {
         method: &str,
         extra: &[(&str, String)],
     ) -> Result<Value> {
+        self.call_mapped(path, api, version, method, extra, task_error)
+            .await
+    }
+    /// [`Self::call`] with the API's own mapping for error codes that are not session errors.
+    async fn call_mapped(
+        &mut self,
+        path: &str,
+        api: &str,
+        version: u32,
+        method: &str,
+        extra: &[(&str, String)],
+        classify: fn(i64) -> QbitError,
+    ) -> Result<Value> {
         let mut form = vec![
             ("api".to_owned(), api.to_owned()),
             ("version".to_owned(), version.to_string()),
@@ -86,9 +141,17 @@ impl<'o, 'a> DownloadStationWire<'o, 'a> {
                 HttpRequestBody::Form(form),
             )
             .await?;
-        self.parse(response.status, &response.body)
+        self.parse_with(response.status, &response.body, classify)
     }
     fn parse(&self, status: u16, body: &[u8]) -> Result<Value> {
+        self.parse_with(status, body, task_error)
+    }
+    fn parse_with(
+        &self,
+        status: u16,
+        body: &[u8],
+        classify: fn(i64) -> QbitError,
+    ) -> Result<Value> {
         if matches!(status, 401 | 403) {
             return Err(HttpError::Authentication.into());
         }
@@ -110,10 +173,8 @@ impl<'o, 'a> DownloadStationWire<'o, 'a> {
             .ok_or(QbitError::InvalidResponse)?;
         Err(if SESSION_ERRORS.contains(&code) {
             HttpError::Authentication.into()
-        } else if code == NO_SUCH_TASK {
-            QbitError::NotFound
         } else {
-            QbitError::InvalidResponse
+            classify(code)
         })
     }
     async fn login(&mut self) -> Result<()> {
@@ -398,6 +459,41 @@ impl Wire for DownloadStationWire<'_, '_> {
             .collect()
     }
     async fn ensure_label(&mut self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Creates `<default destination>/<label>/<info hash>` (and any missing parent) so the task
+    /// can name it. `force_parent` makes an existing folder a success, so repeating this after
+    /// an ambiguous attempt is harmless and never touches a sibling folder.
+    async fn prepare_destination(&mut self, label: &str, hash: &str) -> Result<()> {
+        if !safe_segment(label) || !valid_hash(hash) || !self.root.split('/').all(safe_segment) {
+            return Err(QbitError::InvalidRequest);
+        }
+        let parent = format!("/{}/{label}", self.root);
+        let data = self
+            .call_mapped(
+                ENTRY_PATH,
+                FOLDER_API,
+                FOLDER_API_VERSION,
+                "create",
+                &[
+                    ("folder_path", parent.clone()),
+                    ("name", hash.to_owned()),
+                    ("force_parent", "true".to_owned()),
+                ],
+                folder_error,
+            )
+            .await?;
+        // The reply must describe the folder that was asked for, never another location.
+        let expected = format!("{parent}/{hash}");
+        let created = data
+            .get("folders")
+            .and_then(Value::as_array)
+            .and_then(|folders| folders.first())
+            .and_then(|folder| folder.get("path"))
+            .and_then(Value::as_str);
+        if created.is_some_and(|path| path != expected) {
+            return Err(QbitError::InvalidResponse);
+        }
         Ok(())
     }
     async fn add(&mut self, request: &AddRequest<'_>) -> Result<AddReply> {

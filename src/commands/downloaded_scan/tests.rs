@@ -514,14 +514,29 @@ async fn retryable_failures_back_off_within_three_attempts_then_fail_terminally(
     for attempt in 1..=3 {
         let claimed = actual_claim(&db, id).await.unwrap();
         assert_eq!(claimed.attempts, attempt);
+        let before = now().unwrap();
         settle(&db, &claimed, Failure::Retry("scan_source_changed"))
             .await
             .unwrap();
+        let after = now().unwrap();
         let parent = snapshot(&db, id).await;
         assert_eq!(parent.error_code.as_deref(), Some("scan_source_changed"));
         if attempt < 3 {
             assert!(matches!(parent.status, CommandStatus::RetryWait));
-            assert!(parent.next_attempt_at > now().unwrap());
+            // Reasoning: the delay is 2^attempt plus a 0..=2 s jitter, added to the clock read
+            // inside `settle`. Comparing against a wall-clock read taken after more asynchronous
+            // work (the former `> now()`) fails whenever the host stalls for the delay; bounding
+            // the stored time by reads taken before and after `settle` keeps the backoff contract
+            // (at least 2^attempt seconds ahead, at most jitter beyond the latest read) without
+            // depending on how long the test itself took.
+            let delay = 1i64 << attempt;
+            assert!(
+                (before + delay..=after + delay + 2).contains(&parent.next_attempt_at),
+                "attempt {attempt}: next_attempt_at {} outside [{}, {}]",
+                parent.next_attempt_at,
+                before + delay,
+                after + delay + 2
+            );
             assert!(parent.completed_at.is_none());
         } else {
             assert!(matches!(parent.status, CommandStatus::Failed));

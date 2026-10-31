@@ -198,7 +198,7 @@ async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() ->
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        79 // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
     );
     assert_eq!(rows(&c,"SELECT collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collection_settings WHERE collection_id=1").await, old_policy);
     assert_eq!(

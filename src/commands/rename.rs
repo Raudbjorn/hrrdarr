@@ -18,6 +18,12 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+mod legacy;
+pub use legacy::{
+    LegacyAction, LegacyLayout, LegacyQuery, LegacyRecoveryInput, LegacyRecoveryReport,
+    LegacyRefusal, LegacyRenameItem, LegacySidecar,
+};
+
 /// Owners per command and explicitly selected files per command.
 const MAX_OWNERS: usize = 50;
 const MAX_FILES: usize = 200;
@@ -213,6 +219,10 @@ pub(super) fn router(db: Arc<Database>) -> Router {
         .route("/api/v1/rename/commands", get(list).post(create))
         .route("/api/v1/rename/commands/{id}", get(detail))
         .route("/api/v1/rename/commands/{id}/cancel", post(cancel))
+        .route(
+            "/api/v1/rename/legacy-recovery",
+            get(legacy::inventory).post(legacy::recover),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(request_deadline))
         .with_state(db)

@@ -748,3 +748,452 @@ async fn interrupted_groups_roll_forward_or_back_from_the_journal_at_startup() -
     );
     Ok(())
 }
+
+/// Older binaries settled an unrestorable group as `failed`/`rollback_incomplete` and counted it
+/// as a failed item. These rows are reopened only by an explicit, validated request; the media
+/// recovery itself is still the worker's journal recovery.
+#[tokio::test]
+async fn legacy_failed_rollback_journals_reopen_only_on_explicit_request() -> R {
+    use std::os::unix::fs::MetadataExt;
+    const TV_CMD: &str = "00000000-0000-4000-8000-0000000000a1";
+    const MOVIE_CMD: &str = "00000000-0000-4000-8000-0000000000a2";
+    let (_lock, s, db, c, api) = setup().await?;
+    // Series 1 and movie 1 deliberately share a numeric ID.
+    seed_series(&c, 1, "Show", &s.s("lib/Show"), Some(0)).await;
+    seed_movie(
+        &c,
+        1,
+        "Film",
+        &s.s("lib/Film"),
+        Some((1, &s.s("lib/Film/old.mkv"))),
+    )
+    .await;
+    for n in 1..=5 {
+        s.write(&format!("lib/Show/old{n}.mkv"));
+        seed_file(&c, n, 1, &s.s(&format!("lib/Show/old{n}.mkv"))).await;
+    }
+    s.write("lib/Show/old1.srt");
+    s.write("lib/Film/old.mkv");
+    let ident = |rel: &str| {
+        let m = std::fs::metadata(s.0.join(rel)).unwrap();
+        json!({"dev": m.dev() as i64, "ino": m.ino() as i64})
+    };
+    for (id, name, media) in [
+        (TV_CMD, "rename_series", "tv"),
+        (MOVIE_CMD, "rename_movie", "movies"),
+    ] {
+        c.execute("INSERT INTO rename_commands(id,name,media_type,priority,status,attempts,next_attempt_at,created_at) VALUES(?,?,?,0,'queued',0,0,0)", params![id, name, media]).await?;
+        c.execute(
+            &format!(
+                "INSERT INTO rename_command_targets(command_id,ordinal,{}) VALUES(?,0,1)",
+                if media == "tv" {
+                    "series_id"
+                } else {
+                    "movie_id"
+                }
+            ),
+            [id],
+        )
+        .await?;
+    }
+    // 1: media moved, sidecar not yet (partial). 2: media moved, unrelated file at the old name.
+    // 3: nothing moved (layout verifiably original). 4: unrelated failure, not the legacy class.
+    // 5: invalid identity evidence. Movie 1: media moved.
+    let (i1m, i1s) = (ident("lib/Show/old1.mkv"), ident("lib/Show/old1.srt"));
+    std::fs::rename(s.0.join("lib/Show/old1.mkv"), s.0.join("lib/Show/new1.mkv"))?;
+    let i2m = ident("lib/Show/old2.mkv");
+    std::fs::rename(s.0.join("lib/Show/old2.mkv"), s.0.join("lib/Show/new2.mkv"))?;
+    std::fs::write(s.0.join("lib/Show/old2.mkv"), b"intruder")?;
+    let i3m = ident("lib/Show/old3.mkv");
+    let i4m = ident("lib/Show/old4.mkv");
+    let imm = ident("lib/Film/old.mkv");
+    std::fs::rename(s.0.join("lib/Film/old.mkv"), s.0.join("lib/Film/new.mkv"))?;
+    let tv = |n: i64, ident: &Value, sidecars: Value, state: &str, code: &str| {
+        let (old, new) = (
+            s.s(&format!("lib/Show/old{n}.mkv")),
+            s.s(&format!("lib/Show/new{n}.mkv")),
+        );
+        (
+            n,
+            old,
+            new,
+            ident.to_string(),
+            sidecars.to_string(),
+            state.to_owned(),
+            code.to_owned(),
+        )
+    };
+    let side1 =
+        json!([{"old": s.s("lib/Show/old1.srt"), "new": s.s("lib/Show/new1.srt"), "ident": i1s}]);
+    for (n, old, new, identity, sidecars, state, code) in [
+        tv(1, &i1m, side1, "failed", "rollback_incomplete"),
+        tv(2, &i2m, json!([]), "failed", "rollback_incomplete"),
+        tv(3, &i3m, json!([]), "failed", "rollback_incomplete"),
+        tv(4, &i4m, json!([]), "failed", "destination_exists"),
+        tv(
+            5,
+            &json!({"unexpected": true}),
+            json!([]),
+            "failed",
+            "rollback_incomplete",
+        ),
+    ] {
+        c.execute("INSERT INTO rename_items(command_id,kind,series_id,file_id,old_path,new_path,identity_json,sidecars_json,state,error_code) VALUES(?,'file',1,?,?,?,?,?,?,?)",
+            params![TV_CMD, n, old, new, identity, sidecars, state, code]).await?;
+    }
+    c.execute("INSERT INTO rename_items(command_id,kind,movie_id,file_id,old_path,new_path,identity_json,sidecars_json,state,error_code) VALUES(?,'file',1,1,?,?,?,'[]','failed','rollback_incomplete')",
+        params![MOVIE_CMD, s.s("lib/Film/old.mkv"), s.s("lib/Film/new.mkv"), imm.to_string()]).await?;
+    // Valid transitions; the old binary counted each incomplete attempt as one failed item.
+    for (id, failed) in [(TV_CMD, 5), (MOVIE_CMD, 1)] {
+        c.execute(
+            "UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id=?",
+            [id],
+        )
+        .await?;
+        c.execute(
+            "UPDATE rename_commands SET items_failed=? WHERE id=?",
+            params![failed, id],
+        )
+        .await?;
+        c.execute("UPDATE rename_commands SET status='failed',completed_at=2,error_code='items_failed' WHERE id=?", [id]).await?;
+    }
+    let ids: Vec<i64> = {
+        let mut rows = c
+            .query("SELECT id FROM rename_items ORDER BY id", ())
+            .await?;
+        let mut v = vec![];
+        while let Some(r) = rows.next().await? {
+            v.push(r.get(0)?);
+        }
+        v
+    };
+    let (item1, item2, item3, item4, item5, movie) =
+        (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+    let snapshot = || async {
+        let mut rows = c
+            .query(
+                "SELECT state,coalesce(error_code,'') FROM rename_items ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut v = vec![];
+        while let Some(r) = rows.next().await.unwrap() {
+            v.push((r.get::<String>(0).unwrap(), r.get::<String>(1).unwrap()));
+        }
+        v
+    };
+    let counters = |id: &'static str| {
+        let c = c.clone();
+        async move {
+            let r = c
+                .query(
+                    "SELECT items_renamed,items_failed,status FROM rename_commands WHERE id=?",
+                    [id],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            (
+                r.get::<i64>(0).unwrap(),
+                r.get::<i64>(1).unwrap(),
+                r.get::<String>(2).unwrap(),
+            )
+        }
+    };
+    let before = snapshot().await;
+    let policy = commands::housekeeping::Policy {
+        retention_seconds: 1000,
+        min_keep: 0,
+        ..Default::default()
+    };
+
+    // The failed legacy class pins its command's history, but no new binary recovers it by itself.
+    assert_eq!(
+        commands::housekeeping::prune(&db, &policy, 2_000_000_000)
+            .await?
+            .deleted_from("rename_commands", "tv"),
+        0
+    );
+    worker(&db, &api).await.shutdown().await;
+    assert_eq!(
+        snapshot().await,
+        before,
+        "startup recovery ignores historical failed rows"
+    );
+
+    // Inventory lists exactly the legacy class (not item 4), typed per domain.
+    let page = api
+        .ok("GET", "/api/v1/rename/legacy-recovery", None, 200)
+        .await;
+    assert_eq!(page["total"], 5);
+    let listed: Vec<i64> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["item_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(listed, vec![item1, item2, item3, item5, movie]);
+    let tv_only = api
+        .ok(
+            "GET",
+            "/api/v1/rename/legacy-recovery?media_type=movies",
+            None,
+            200,
+        )
+        .await;
+    assert_eq!(tv_only["total"], 1);
+    assert_eq!(tv_only["items"][0]["media_type"], "movies");
+
+    // Dry run reports effects and changes nothing; the flag has no default.
+    let post = |dry: bool, items: Vec<i64>| json!({"dry_run": dry, "item_ids": items});
+    api.ok(
+        "POST",
+        "/api/v1/rename/legacy-recovery",
+        Some(json!({"item_ids": [item1]})),
+        400,
+    )
+    .await;
+    let dry = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(true, vec![item1, item2, item3, item4, item5, movie])),
+            200,
+        )
+        .await;
+    let by = |report: &Value, id: i64| {
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item_id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let one = by(&dry, item1);
+    assert_eq!(
+        (
+            one["layout"].as_str(),
+            one["action"].as_str(),
+            one["items_failed_delta"].as_i64(),
+            one["command_items_failed"].as_i64()
+        ),
+        (Some("partial"), Some("roll_forward"), Some(-1), Some(5))
+    );
+    assert_eq!(one["sidecars"][0]["new_path"], s.s("lib/Show/new1.srt"));
+    assert_eq!(one["reopened"], false);
+    assert_eq!(
+        (
+            by(&dry, item2)["layout"].as_str(),
+            by(&dry, item2)["refusal"].as_str()
+        ),
+        (Some("conflict"), Some("layout_conflict"))
+    );
+    assert_eq!(
+        (
+            by(&dry, item3)["layout"].as_str(),
+            by(&dry, item3)["action"].as_str()
+        ),
+        (Some("at_source"), Some("settle_restored"))
+    );
+    assert_eq!(by(&dry, item4)["refusal"], "not_legacy");
+    assert_eq!(by(&dry, item5)["refusal"], "journal_invalid");
+    let film = by(&dry, movie);
+    assert_eq!(
+        (
+            film["media_type"].as_str(),
+            film["owner_id"].as_i64(),
+            film["layout"].as_str()
+        ),
+        (Some("movies"), Some(1), Some("moved"))
+    );
+    assert_eq!(snapshot().await, before);
+    assert_eq!(counters(TV_CMD).await, (0, 5, "failed".into()));
+    assert!(!s.exists("lib/Show/new1.srt") && s.exists("lib/Show/new1.mkv"));
+
+    // Unknown IDs reject the whole request before any write.
+    api.ok(
+        "POST",
+        "/api/v1/rename/legacy-recovery",
+        Some(post(false, vec![item1, 999_999])),
+        404,
+    )
+    .await;
+    assert_eq!(snapshot().await, before);
+
+    // Explicit admission of the movie alone cannot touch the series that shares its ID.
+    let applied = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(false, vec![movie])),
+            200,
+        )
+        .await;
+    assert_eq!(by(&applied, movie)["reopened"], true);
+    assert_eq!(counters(MOVIE_CMD).await, (0, 0, "failed".into()));
+    assert_eq!(counters(TV_CMD).await, (0, 5, "failed".into()));
+    let rerun = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(false, vec![movie])),
+            200,
+        )
+        .await;
+    assert_eq!(
+        (
+            by(&rerun, movie)["refusal"].as_str(),
+            by(&rerun, movie)["reopened"].clone()
+        ),
+        (Some("not_legacy"), json!(false))
+    );
+    assert_eq!(
+        counters(MOVIE_CMD).await,
+        (0, 0, "failed".into()),
+        "a rerun cannot decrement twice"
+    );
+
+    // The series items: refused ones stay untouched, the verified-original one settles without a
+    // media change, the partial one reopens.
+    let applied = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(false, vec![item1, item2, item3, item4, item5])),
+            200,
+        )
+        .await;
+    assert_eq!(
+        [item1, item2, item3, item4, item5].map(|i| by(&applied, i)["reopened"].as_bool().unwrap()),
+        [true, false, true, false, false]
+    );
+    let after = snapshot().await;
+    assert_eq!(after[0], ("planned".into(), "rollback_incomplete".into()));
+    assert_eq!(after[1], ("failed".into(), "rollback_incomplete".into()));
+    assert_eq!(
+        after[2],
+        ("rolled_back".into(), "legacy_rollback_verified".into())
+    );
+    assert_eq!(after[3], ("failed".into(), "destination_exists".into()));
+    assert_eq!(after[4], ("failed".into(), "rollback_incomplete".into()));
+    assert_eq!(counters(TV_CMD).await, (0, 4, "failed".into()));
+    // Persisting the transition touched no media.
+    assert!(
+        !s.exists("lib/Show/new1.srt")
+            && s.exists("lib/Show/old1.srt")
+            && s.exists("lib/Show/new1.mkv")
+    );
+    // Reopened journals are protected as current recovery handles.
+    assert_eq!(
+        commands::housekeeping::prune(&db, &policy, 2_000_000_000)
+            .await?
+            .deleted_from("rename_commands", "movies"),
+        0
+    );
+
+    // The worker's existing journal recovery finishes both reopened groups.
+    worker(&db, &api).await.shutdown().await;
+    assert!(s.exists("lib/Show/new1.srt") && !s.exists("lib/Show/old1.srt"));
+    assert_eq!(
+        path_of(&c, "episode_files", 1).await,
+        s.s("lib/Show/new1.mkv")
+    );
+    assert_eq!(path_of(&c, "movie_files", 1).await, s.s("lib/Film/new.mkv"));
+    assert_eq!(
+        path_of(&c, "episode_files", 3).await,
+        s.s("lib/Show/old3.mkv")
+    );
+    assert_eq!(counters(MOVIE_CMD).await, (1, 0, "failed".into()));
+    assert_eq!(counters(TV_CMD).await, (1, 4, "failed".into()));
+    let events: i64 = c
+        .query("SELECT count(*) FROM rename_events", ())
+        .await?
+        .next()
+        .await?
+        .unwrap()
+        .get(0)?;
+    assert_eq!(
+        events, 2,
+        "one event per recovered rename, none for the settled item"
+    );
+    worker(&db, &api).await.shutdown().await;
+    assert_eq!(
+        counters(TV_CMD).await,
+        (1, 4, "failed".into()),
+        "repeated recovery is idempotent"
+    );
+
+    // The collision stays a refusal until the unrelated file is removed; then it is admissible.
+    let blocked = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(true, vec![item2])),
+            200,
+        )
+        .await;
+    assert_eq!(by(&blocked, item2)["refusal"], "layout_conflict");
+    assert_eq!(std::fs::read(s.0.join("lib/Show/old2.mkv"))?, b"intruder");
+    std::fs::remove_file(s.0.join("lib/Show/old2.mkv"))?;
+    let applied = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(false, vec![item2])),
+            200,
+        )
+        .await;
+    assert_eq!(by(&applied, item2)["reopened"], true);
+    worker(&db, &api).await.shutdown().await;
+    assert_eq!(
+        path_of(&c, "episode_files", 2).await,
+        s.s("lib/Show/new2.mkv")
+    );
+    assert_eq!(counters(TV_CMD).await, (2, 3, "failed".into()));
+
+    // A command that is still active for the owner blocks reopening; a counter that cannot be
+    // decremented is reported, not made negative.
+    c.execute(
+        "UPDATE rename_commands SET items_failed=0 WHERE id=?",
+        [TV_CMD],
+    )
+    .await?;
+    c.execute("UPDATE rename_items SET new_path=?,state='failed',error_code='rollback_incomplete' WHERE id=?", params![s.s("lib/Show/new4.mkv"), item4]).await?;
+    std::fs::rename(s.0.join("lib/Show/old4.mkv"), s.0.join("lib/Show/new4.mkv"))?;
+    let stuck = api
+        .ok(
+            "POST",
+            "/api/v1/rename/legacy-recovery",
+            Some(post(false, vec![item4])),
+            200,
+        )
+        .await;
+    assert_eq!(
+        (
+            by(&stuck, item4)["refusal"].as_str(),
+            by(&stuck, item4)["layout"].as_str()
+        ),
+        (Some("counter_inconsistent"), Some("moved"))
+    );
+    assert_eq!(counters(TV_CMD).await.1, 0);
+
+    // Resolved journals no longer pin history; the unresolved legacy rows still do.
+    assert_eq!(
+        commands::housekeeping::prune(&db, &policy, 2_000_000_000)
+            .await?
+            .deleted_from("rename_commands", "movies"),
+        1
+    );
+    assert_eq!(
+        commands::housekeeping::prune(&db, &policy, 2_000_000_000)
+            .await?
+            .deleted_from("rename_commands", "tv"),
+        0
+    );
+    Ok(())
+}

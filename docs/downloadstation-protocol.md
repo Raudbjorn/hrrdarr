@@ -10,7 +10,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/DownloadS
 
 Download Station reports tasks by its own ids (`dbid_...`) and never an info hash, while the engine identifies a download by hash across restarts. A magnet task does carry its hash in `additional.detail.uri`, but an uploaded `.torrent` does not. So each torrent is created with the destination `<default destination>/<label>/<info hash>` (relative to the shared folders, as DSM expects). A task belongs to a domain when its destination has exactly that shape, and its hash is the last component. A task elsewhere whose magnet URI names a hash is reported with no label, so a grab of a hash someone already added by hand is a visible `ScopeConflict` rather than a duplicate. Tasks with neither (plain HTTP downloads, other folders without a magnet) are ignored. The visible consequence is one folder per torrent below the domain folder on the NAS; the importer sees `/<destination>` as the save path and reads files relative to it.
 
-The client currently does not create these destination folders. Missing folders can make task creation fail; provisioning is tracked in [issue #45](https://github.com/Raudbjorn/hrrdarr/issues/45). Mock success does not establish real-NAS submission support.
+Download Station rejects task creation when the destination does not exist (task error 403 "Destination does not exist"), so the wire creates `<default destination>/<label>/<info hash>` first. See [Destination folders](#destination-folders). The mocks model that rejection; they do not establish real-NAS behavior.
 
 ## Configuration
 
@@ -34,11 +34,23 @@ Every operation logs in (`SYNO.API.Auth` version 6) and, whether it succeeded or
 
 Same flow as the other label clients (lookup by info hash first; never a second add). `create` with `uri` (magnet) or a multipart `file` upload (fields before the file) and the `destination`; the wire then waits until the task is listed (15 polls, 200 ms apart) and pauses it when the scope adds paused. A pause that fails after the create is `MutationUnknown`. The destination is part of the create request, so a lost reply needs no repair: reconcile finds the task by hash. `adopt` is not supported.
 
+## Destination folders
+
+Before the task is created (after the lookup-by-hash that finds an existing download, and before the add counts as dispatched) the wire calls File Station: `POST /webapi/entry.cgi` with `api=SYNO.FileStation.CreateFolder`, `version=2`, `method=create`, `folder_path=/<default destination>/<label>`, `name=<info hash>` and `force_parent=true`. `force_parent` creates the missing label folder and makes an already existing folder a success, so repeating the call after an interrupted or ambiguous attempt is harmless and never touches a sibling folder. Magnet and uploaded-torrent submissions use the same destination.
+
+- **Path safety.** The label is validated at configuration time and the hash must be a valid info hash; the default destination read from the NAS is re-checked segment by segment. An empty, `.`/`..`, control-character, backslash or reserved-character segment is refused (`invalid_request`) before any File Station call. A reply that names a folder other than the requested one is refused (`invalid_response`).
+- **Failure mapping** (all before the add, so the submission is a definite non-submission and no task exists): API, method or version absent (102-104) is `unsupported`; permission failures (105, 403-405, 407) and a rejected session (106, 107, 119, 120) are `authentication`; any other code (408 missing share, 414-420 name/path problems, 1100/1101, a full or read-only volume) and malformed replies are an invalid response; transport errors and timeouts are the usual transport outcomes. None of them is reported as a submission.
+- **Retries.** A lost folder reply leaves at most an empty folder. At the wire, the next attempt looks the hash up again, repeats the idempotent folder call and creates exactly one task (`tests/downloadstation_protocol.rs`). In the RSS grab path a failure here is a definite non-submission, but a candidate whose stored selection is the legacy fixed client is settled conservatively as an unconfirmed submission for any failure; it surfaces for reconciliation by hash and is never reported as accepted (`tests/downloadstation_automation.rs`). Task creation itself is unchanged: ambiguity after the create is `MutationUnknown` and is reconciled by hash, never resubmitted.
+- **Requirements on the NAS.** The account needs File Station access with write permission on the default destination's shared folder, and the shared folder must exist. The session is the one created with `session=DownloadStation`; this wire does not log in a second time for File Station.
+
 ## Controls
 
 Pause, Resume and Remove (`delete` with `force_complete=false`), each followed by a verifying read. Priority and deleting downloaded data are `unsupported_feature`: Download Station has no API for either. No API route or UI invokes controls yet.
 
 ## Not claimed
+
+- Folder provisioning was verified only against owned mocks that model shared-folder existence, `force_parent`, the documented File Station error codes and the task-creation 403. The File Station API name, version, path, parameters, the error-code table and the assumption that a `session=DownloadStation` session may call File Station come from Synology's documentation as understood here, not from a live DSM run; they were not checked on hardware, and `SYNO.API.Info` discovery of the folder API path is not performed. An account lacking File Station permission is reported as `authentication`, which does not distinguish it from bad credentials.
+- A file or folder that already exists at `<label>/<hash>` (for example a partial earlier download) is reused as is; nothing validates or cleans its contents.
 
 - Live DSM compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1 over plain HTTP; no NAS was contacted. API names, parameters, `additional` shapes, status strings (DSM may report numeric statuses on newer versions, which would map to `unknown`), error codes and the destination semantics (relative to shared folders) come from the documentation, not a live run.
 - The save path reported to the importer is the shared-folder path with a leading slash (for example `/downloads/tv/<hash>`); mapping it to the host's real volume path is the job of a remote path mapping. The real volume path is not read from DSM.

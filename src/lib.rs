@@ -61,3 +61,11 @@ pub mod calendar;
 
 pub mod notifications;
 pub mod rename;
+
+/// Upper bound for a test waiting on background work (a worker restart, a probe entering a
+/// blocked request) that takes about a second on an idle host. It is a hang detector, not a
+/// performance assertion: the lib suite runs one thread per core and every test opens a migrated
+/// database, so a window sized for an idle host expires under the starvation the suite creates
+/// for itself (tracked in issue #38). A passing test never waits for it.
+#[cfg(test)]
+pub(crate) const TEST_HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);

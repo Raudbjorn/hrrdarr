@@ -91,10 +91,9 @@ async fn count(db: &Database, table: &str) -> i64 {
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     durable_path_diagnostics().await;
-    // All execute() cases share the process-wide import permit. Keep this regression in the
-    // serial recovery test so unrelated scratch databases cannot race for that permit.
+    // These execute() cases share one scratch database each; the effect permit is per database,
+    // so unrelated tests (each with its own database) cannot make them observe `import_busy`.
     manual_hidden_extension_filename_preserves_explicit_mapping().await;
     owned_cases::replacements().await;
     same_path_cases::replacements().await;
@@ -261,14 +260,8 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     // its blocking filesystem job is alive (also the runtime-shutdown ownership boundary).
     let dir = Scratch::new();
     let db = dir.database().await;
-    assert!(
-        EXECUTING
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    );
-    let lease = Arc::new(Permit {
-        _db: Some(db.clone()),
-    });
+    let permit_id = db.permit_id();
+    let lease = acquire(&db, "lease-test").unwrap();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let task = tokio::spawn(async move {
@@ -287,10 +280,10 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     assert!(task.await.unwrap_err().is_cancelled());
     drop(db);
     assert!(Database::open_local(dir.0.join("db")).await.is_err());
-    assert!(EXECUTING.load(Ordering::Acquire));
+    assert!(permit_held(permit_id));
     release_tx.send(()).unwrap();
     let started = std::time::Instant::now();
-    while EXECUTING.load(Ordering::Acquire) {
+    while permit_held(permit_id) {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         tokio::task::yield_now().await;
     }

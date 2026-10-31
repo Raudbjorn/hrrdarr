@@ -266,8 +266,8 @@ async fn fresh_database_accepts_the_feed_implementation_and_keeps_native_guards(
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await?,
-        79
-    ); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+        80
+    ); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
     assert_eq!(
         text(&c, "SELECT name FROM schema_migrations WHERE version=68").await?,
         "torrent_rss_indexer"
@@ -335,8 +335,8 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         let c = db.connect().await?;
         assert_eq!(
             count(&c, "SELECT max(version) FROM schema_migrations").await?,
-            79
-        ); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+            80
+        ); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
         assert_eq!(rows(&c, "providers").await?, before[0]);
         // Only the appended nullable minimum_seeders column differs; every old value stays exact.
         let mut expected = before[1].clone();
@@ -348,7 +348,7 @@ async fn upgrade_from_67_preserves_populated_rows_children_and_foreign_keys() ->
         assert_eq!(rows(&c, "rss_schedules").await?, before[3]);
         let history = rows(&c, "schema_migrations").await?;
         assert_eq!(&history[..67], before[4].as_slice());
-        assert_eq!(history.len(), 79); // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+        assert_eq!(history.len(), 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
         assert_eq!(text(&c, "PRAGMA integrity_check").await?, "ok");
         assert_eq!(
             count(&c, "SELECT count(*) FROM pragma_foreign_key_check").await?,

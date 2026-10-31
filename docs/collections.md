@@ -41,7 +41,7 @@ Migrations 0001–0076 retain the PR branch history and checksums. Migration 007
 existing collection policy into `movie_collection_settings`, preserving meaningful
 local settings and tags, and adds metadata provenance, retained removal intent,
 exclusions and snapshot replay state. Migration 0078 adds provider authority state.
-Databases from the divergent main migration history are not an accepted upgrade baseline.
+Databases from the divergent main migration history are not an accepted upgrade baseline. Pre-merge PR #32 databases are refused at startup and converted explicitly offline; see `docs/migration-compatibility.md`.
 
 ## Snapshot reconstruction
 

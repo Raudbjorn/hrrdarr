@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(79)]] // Reasoning: indexer breadth is appended at ordinal 79 after unchanged main migrations 1–78.
+        vec![vec![libsql::Value::Integer(80)]] // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();

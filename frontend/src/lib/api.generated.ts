@@ -400,11 +400,51 @@ export type LabelClientTest = { client_version: string, domains: Array<MediaDoma
 
 export type LabelTestWarning = "label_not_created";
 
+export type LegacyAction = "roll_forward" | "settle_restored";
+
 export type LegacyEpisode = { id: number, series_id: number, season: number, number: number, title: string, file_path: string | null, };
 
 export type LegacyError = { error: string, };
 
+export type LegacyLayout = "at_source" | "moved" | "partial" | "conflict" | "unreadable" | "unknown";
+
+export type LegacyQuery = { media_type?: MediaDomain, limit?: number, offset?: number, };
+
+export type LegacyRecoveryInput = {
+/**
+ * Required, no default: a dry run lists the effects, `false` is the explicit opt-in.
+ */
+dry_run: boolean, item_ids: Array<number>, };
+
+export type LegacyRecoveryReport = { dry_run: boolean, items: Array<LegacyRenameItem>, };
+
+export type LegacyRefusal = "not_legacy" | "journal_invalid" | "owner_missing" | "database_path_changed" | "owner_busy" | "unsettled_journal" | "counter_inconsistent" | "layout_conflict" | "layout_unreadable";
+
+export type LegacyRenameItem = { item_id: number, command_id: string,
+/**
+ * `owner_id` is a series ID for `tv` and a movie ID for `movies`; never interchangeable.
+ */
+media_type: MediaDomain, owner_id: number, kind: RenameEventKind, file_id: number | null, old_path: string, new_path: string, device: number | null, inode: number | null, sidecars: Array<LegacySidecar>, layout: LegacyLayout, layout_error: string | null,
+/**
+ * The owning command's current `items_failed` (the old binary counted this attempt).
+ */
+command_items_failed: number,
+/**
+ * Present only when the item may be admitted.
+ */
+action: LegacyAction | null, refusal: LegacyRefusal | null,
+/**
+ * Change this transition makes to the command's `items_failed`.
+ */
+items_failed_delta: number,
+/**
+ * Set only by an executed (non-dry-run) request that committed the transition.
+ */
+reopened: boolean, };
+
 export type LegacySeries = { id: number, title: string, year: number | null, path: string, poster: string | null, };
+
+export type LegacySidecar = { old_path: string, new_path: string, device: number, inode: number, };
 
 export type LibraryBulk = { items: Array<LibraryUpdate>, };
 

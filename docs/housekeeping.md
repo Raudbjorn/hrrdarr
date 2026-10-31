@@ -39,6 +39,7 @@ Rows protected from deletion (verified against migrations and every reader of th
 | --- | --- |
 | `commands` | It is the `command_id` of a `download_refresh_snapshots` row (queue provenance). |
 | `rss_commands` | A referencing `rss_candidates` row is `pending`, `prepared`, `submitting`, `reconciling` or `needs_attention`. Settled candidates keep their own dedup/receipt state and tolerate `ON DELETE SET NULL`, the same path as the existing delete endpoint. |
+| `wanted_search_receipts` (not command history) | Pruned only when `expires_at` has passed (7 days after creation, not `retention_seconds`); an unexpired receipt is never selected, whatever the state of its child commands. Targets cascade. Admission also sweeps up to 256 expired receipts. |
 | `search_commands` | Any of its offers is selected, or unexpired. Expired unselected offers are deleted with the command (the `search_results` FK is `RESTRICT`). |
 | `manual_import_commands` | The operation's `import_journal` phase is neither `preview` nor `complete`. |
 | Others | Nothing references them and their dedup indexes are partial on active statuses, so terminal rows are pure history. |
