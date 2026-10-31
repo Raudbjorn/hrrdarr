@@ -126,7 +126,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     for (table, expected) in tables.iter().zip(&before) {
         let mut expected = expected.clone();
         if *table == "provider_scopes" {
@@ -245,7 +245,7 @@ async fn health_schema41_upgrade_rollback_preserves_rows_and_admission_predicate
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&db.connect().await?).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     Ok(())
 }
 #[tokio::test]
@@ -289,10 +289,10 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         (),
     )
     .await?;
-    // Reasoning: 0053 and 0059 give twelve TV identities; every admission retains generation1.
+    // Reasoning: 0053, 0060 and 0080 give fourteen TV identities; every admission retains generation1.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
+        14 // Reasoning: 0080 adds root_folder and mount_read_only to TV (12 -> 14).
     );
     assert_eq!(
         scalar(
@@ -300,7 +300,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_command_checks WHERE admitted_generation=1"
         )
         .await?,
-        12, // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
+        14, // Reasoning: 0080 adds root_folder and mount_read_only to TV (12 -> 14).
         "later dirty generation is not cancellation ownership"
     );
     c.execute(
@@ -463,7 +463,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
             "SELECT count(*) FROM health_checks WHERE scope='movies' AND severity=0"
         )
         .await?,
-        12 // Reasoning: 0053 adds one path diagnostics and 0060 one recycle_bin identity per domain (10 -> 12).
+        15 // Reasoning: 0080 adds root_folder, collection_root_folder and mount_read_only to movies (12 -> 15).
     );
     assert!(
         c.execute(
@@ -474,8 +474,8 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
         .is_err(),
         "byte ceiling, not scalar count"
     );
-    // Reasoning: 0053 and 0059 give 24 registry rows, leaving 104 slots within the 128 cap.
-    for i in 0..104 {
+    // Reasoning: 0080 brings the registry to 29 rows, leaving 99 slots within the 128 cap.
+    for i in 0..99 {
         c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system',?,0,0,'FutureCheck')",[format!("check_{i}")]).await?;
     }
     assert!(c.execute("INSERT INTO health_checks(scope,check_key,startup,scheduled,compatibility_type)VALUES('system','overflow',0,0,'FutureCheck')",()).await.is_err());
@@ -494,7 +494,7 @@ async fn health_constraints_membership_capacity_and_bounded_diagnostics() -> Res
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM health_command_checks").await?,
-        1536 // Reasoning: 0053 and 0059 give twelve TV identities: 128 retained commands * 12.
+        1792 // Reasoning: 0080 gives fourteen TV identities: 128 retained commands * 14.
     );
     // Migration43 requires explicit attempt provenance on all new diagnostic events.
     let event_command = uuid::Uuid::new_v4().to_string();
@@ -677,7 +677,7 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     // Existing states are unchanged; communication43 and root-health44 append their scoped registry pairs.
     for (table, expected) in tables[1..4].iter().zip(&original[1..4]) {
         assert_eq!(&rows(&c, table).await?, expected);
@@ -762,10 +762,10 @@ async fn health_communication_upgrade_rollback_reopen_and_attempt_identity() -> 
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
         assert_eq!(rows(&c, "health_transitions").await?, before);
         assert_eq!(rows(&c, "sqlite_sequence").await?, sequence);
-        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 24); // Reasoning:0053 adds two path diagnostics identities and 0060 two recycle_bin identities (20 -> 24).
+        assert_eq!(scalar(&c, "SELECT count(*) FROM health_checks").await?, 29); // Reasoning: 0080 adds root_folder and mount_read_only per domain plus movies collection_root_folder (24 -> 29).
     }
     Ok(())
 }

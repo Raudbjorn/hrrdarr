@@ -38,8 +38,8 @@ const SEARCHABLE: [&str; 7] = [
     "passthepopcorn",
     "torrentpotato",
 ];
-// Main's 78 published entries remain unchanged; tracker breadth is appended.
-const BREADTH_MIGRATION: usize = 78;
+// Main's 81 published entries remain unchanged; tracker breadth is appended.
+const BREADTH_MIGRATION: usize = 81;
 
 async fn count(c: &Connection, sql: &str) -> Result<i64, Error> {
     Ok(c.query(sql, ()).await?.next().await?.unwrap().get(0)?)
@@ -298,10 +298,10 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     integrity(&c).await?;
     assert_eq!(
         count(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64 // Reasoning: opening the 78-entry prior head applies 79 (breadth) and every later entry, so the history is the whole registry.
+        MIGRATIONS.len() as i64 // Reasoning: opening the 81-entry prior head applies 82 (breadth) and every later entry, so the history is the whole registry.
     );
     assert_eq!(
-        c.query("SELECT name FROM schema_migrations WHERE version=79", ())
+        c.query("SELECT name FROM schema_migrations WHERE version=82", ())
             .await?
             .next()
             .await?
@@ -359,7 +359,84 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
             "SELECT count(*) FROM schema_migrations"
         )
         .await?,
-        MIGRATIONS.len() as i64 // Reasoning: opening the 78-entry prior head applies 79 (breadth) and every later entry, so the history is the whole registry.
+        MIGRATIONS.len() as i64 // Reasoning: opening the 81-entry prior head applies 82 (breadth) and every later entry, so the history is the whole registry.
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn displaced_pr32_history_is_refused_without_changing_populated_state() -> Result<(), Error> {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("db");
+    let raw = libsql::Builder::new_local(&path).build().await?;
+    let c = raw.connect()?;
+    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
+    c.execute(HISTORY_SQL, ()).await?;
+    // Pin the two entries published by 3987479 before main acquired ordinals 79–81.
+    let displaced = [
+        (
+            "indexer_breadth",
+            include_str!("../../migrations/0090_indexer_breadth.sql"),
+        ),
+        (
+            "wanted_search_receipts",
+            include_str!("../../migrations/0091_wanted_search_receipts.sql"),
+        ),
+    ];
+    assert_eq!(
+        checksum(displaced[0].1),
+        "50673b8113cf6102a7356a346095d7ef9b15e045ccc7b0c76ca5d571dffcdc99"
+    );
+    assert_eq!(
+        checksum(displaced[1].1),
+        "491bd8399c1ecc1fc4c403e3c4196ac35166fc3551f1ccb96a513d22a863f8f6"
+    );
+    for (i, (name, sql)) in MIGRATIONS[..78].iter().chain(displaced.iter()).enumerate() {
+        c.execute_batch(sql).await?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
+            params![i as i64 + 1, *name, checksum(sql), *sql],
+        )
+        .await?;
+    }
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    tracker(&c, "nyaa", &[("tv", 1), ("movies", 1)]).await?;
+    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Retained TV','/owned/tv');
+        INSERT INTO seasons(series_id,number) VALUES(1,1);
+        INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Retained episode');
+        INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,101,'Retained movie');
+        INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/owned/movie');
+        INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) VALUES('00000000-0000-4000-8000-000000000001','tv',zeroblob(32),0,0,0,1000,2000);").await?;
+    integrity(&c).await?;
+    // The historical application used WAL too; do not mistake journal-mode setup for migration.
+    c.query("PRAGMA journal_mode=WAL", ()).await?.next().await?;
+    c.query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await?
+        .next()
+        .await?;
+    drop(c);
+    drop(raw);
+    let before = std::fs::read(&path)?;
+    for _ in 0..2 {
+        let error = Database::open_local(&path)
+            .await
+            .err()
+            .expect("displaced branch history needs explicit conversion");
+        assert!(
+            error
+                .to_string()
+                .contains("migration history mismatch at version 79"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read(&path)? == before,
+            "refusal changed the stopped database bytes"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&scratch.0)?.count(),
+        1,
+        "refusal must not create a migration backup"
     );
     Ok(())
 }

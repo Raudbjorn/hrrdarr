@@ -170,7 +170,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         count(
@@ -263,7 +263,7 @@ async fn migration_0047_fresh_and_upgrade_from_0046_preserve_data_and_enforce_sc
     let c = db.connect().await?;
     assert_eq!(
         count(&c, "SELECT max(version) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(count(&c, "SELECT count(*) FROM movie_credits").await, 0);
     assert_eq!(

@@ -166,14 +166,14 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 10 } else { 31 } // Reasoning: history grows from 49 to 80 (indexer breadth and Wanted receipts add no health rows).
+                    expected.len() + if *table == "health_checks" { 15 } else { 34 } // Reasoning: versions 50-83 add 34 history rows; 0080 adds five health identities to the ten added by 0050/51/53/60.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.
@@ -182,8 +182,9 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
                     row.push(libsql::Value::Null);
                 }
                 assert_eq!(actual, expected);
-            } else if *table == "series" {
-                // 0055 appends unknown runtime; every predecessor value remains exact.
+            } else if matches!(*table, "series" | "episodes" | "movies") {
+                // 0055 appends unknown runtime and 0079 a NULL episode/movie
+                // native_last_search_at; every predecessor value remains exact.
                 let mut expected = expected.clone();
                 for row in &mut expected {
                     row.push(libsql::Value::Null);

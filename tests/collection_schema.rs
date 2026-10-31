@@ -180,7 +180,15 @@ async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() ->
         "SELECT * FROM movie_collection_tags ORDER BY collection_id,tag_id",
     )
     .await;
-    let before = preserved(&c).await;
+    let mut before = preserved(&c).await;
+    // 0079 appends nullable last-search timestamps; every predecessor field must stay exact.
+    const EPISODE_ROWS: usize = 2;
+    const MOVIE_ROWS: usize = 5;
+    for index in [EPISODE_ROWS, MOVIE_ROWS] {
+        for row in &mut before[index] {
+            row.push_str("|Null");
+        }
+    }
     drop(c);
     drop(raw);
     let db = Database::open_local(s.database()).await?;
@@ -198,7 +206,7 @@ async fn upgrade76_preserves_both_domains_unknowns_and_multiple_memberships() ->
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        hrrdarr::db::latest_schema_version() as i64 // Reasoning: preserved authority migrations are followed by Wanted, root-health and backup migrations.
     );
     assert_eq!(rows(&c,"SELECT collection_id,monitored,search_on_add,quality_profile_id,root_folder_id,minimum_availability FROM movie_collection_settings WHERE collection_id=1").await, old_policy);
     assert_eq!(

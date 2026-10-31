@@ -417,6 +417,26 @@ async fn full_history_converts_populated_state_without_touching_the_source() -> 
     assert_eq!(count(&c, "SELECT count(*) FROM movie_import_exclusions WHERE tmdb_id=102 AND local_edit=1 AND revision=4").await?, 1);
     assert_eq!(count(&c, "SELECT count(*) FROM snapshot_imports WHERE application='radarr' AND collection_version=1 AND provider_authority_version=0").await?, 1);
 
+    // Main 0079 adds native facts absent from this history; conversion must not invent them.
+    for table in ["episodes", "movies"] {
+        assert_eq!(
+            count(
+                &c,
+                &format!("SELECT count(*) FROM {table} WHERE native_last_search_at IS NULL")
+            )
+            .await?,
+            1
+        );
+    }
+    assert_eq!(
+        count(
+            &c,
+            "SELECT count(*) FROM search_commands WHERE dispatch_completed_at IS NOT NULL"
+        )
+        .await?,
+        0
+    );
+
     // Notifications: the fixture now includes two separate terminal system events; pending
     // deliveries retain recorded domains. Nothing is marked delivered or invented by conversion.
     assert_eq!(

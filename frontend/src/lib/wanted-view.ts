@@ -19,7 +19,9 @@ export function sortChoices(domain: MediaDomain, kind: WantedKind): { value: Wan
     ? [{ value: 'air_date', label: 'Air date' }, { value: 'series_title', label: 'Series title' }]
     : [{ value: 'title', label: 'Title' }, { value: 'year', label: 'Year' }, { value: 'in_cinemas', label: 'In cinemas' },
        { value: 'digital_release', label: 'Digital release' }, { value: 'physical_release', label: 'Physical release' }];
-  return kind === 'cutoff' ? [...base, { value: 'quality', label: 'Current quality' }] : base;
+  // Ascending last search lists never-searched targets first (oldest-searched-first).
+  const searched = [...base, { value: 'last_search' as const, label: 'Last searched' }];
+  return kind === 'cutoff' ? [...searched, { value: 'quality', label: 'Current quality' }] : searched;
 }
 
 /** Only keys the server accepts for this list; defaults are sent explicitly for clarity. */
@@ -48,6 +50,19 @@ export function formatDate(value: string | null): string {
   if (!value) return 'Unknown';
   const parsed = Date.parse(value.includes('T') ? value : `${value.replace(' ', 'T')}Z`);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : 'Unknown';
+}
+
+/** Server sends RFC 3339 UTC seconds; shown as minute-precision UTC so it never depends on locale. */
+export function formatDateTime(value: string | null): string | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? `${new Date(parsed).toISOString().slice(0, 16).replace('T', ' ')} UTC` : null;
+}
+
+export function lastSearchLabel(item: TvWantedItem | MovieWantedItem): string {
+  const when = formatDateTime(item.last_search_time);
+  if (!when) return 'Never searched';
+  return item.last_search_source === 'imported' ? `${when} (imported)` : when;
 }
 
 export function availabilityLabel(item: MovieWantedItem): string {

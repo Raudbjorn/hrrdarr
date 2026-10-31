@@ -1,4 +1,4 @@
-//! Migration 0091 (Wanted search admission receipts, ordinal 80): storage guards, a populated
+//! Migration 0091 (Wanted search admission receipts, ordinal 83): storage guards, a populated
 //! upgrade from the previous head, rollback of a failed upgrade, and reopen durability.
 use super::*;
 
@@ -16,8 +16,8 @@ impl Drop for Scratch {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
 }
-// Ordinals 1-79 are the unchanged main history plus indexer breadth; receipts are appended.
-const RECEIPT_MIGRATION: usize = 79;
+// Ordinals 1-82 are the unchanged main history plus indexer breadth; receipts are appended.
+const RECEIPT_MIGRATION: usize = 82;
 
 async fn count(c: &Connection, sql: &str) -> Result<i64, Error> {
     Ok(c.query(sql, ()).await?.next().await?.unwrap().get(0)?)
@@ -321,7 +321,7 @@ async fn upgrade_from_the_previous_head_preserves_data_and_survives_reopen() -> 
         MIGRATIONS.len() as i64
     );
     assert_eq!(
-        c.query("SELECT name FROM schema_migrations WHERE version=80", ())
+        c.query("SELECT name FROM schema_migrations WHERE version=83", ())
             .await?
             .next()
             .await?
@@ -374,12 +374,12 @@ async fn failed_upgrade_rolls_back_and_leaves_a_usable_backup() -> Result<(), Er
     );
     drop(c);
     drop(raw);
-    // The pre-existing table makes migration 80 fail after its first statement succeeded.
+    // The pre-existing table makes migration 83 fail after its first statement succeeded.
     let error = match Database::open_local(&path).await {
         Ok(_) => panic!("upgrade must fail"),
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("migration 80"), "{error}");
+    assert!(error.contains("migration 83"), "{error}");
     assert!(error.contains("migration rolled back"), "{error}");
     assert!(error.contains("recovery backup:"), "{error}");
     let raw = libsql::Builder::new_local(&path).build().await?;

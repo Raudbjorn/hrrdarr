@@ -97,7 +97,7 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     assert_eq!(scalar(&c, "SELECT count(*) FROM notification_deliveries WHERE attempts=2 AND next_attempt_at=10 AND lease_until=20 AND sent_parts='[\"acknowledged\"]' AND lease_owner IS NULL").await?, 1);
     assert!(
         c.execute("DELETE FROM quality_profiles WHERE id=900", ())
@@ -142,6 +142,6 @@ async fn review_integrity_upgrade_preserves_rows_rolls_back_and_reopens() -> Res
     drop(db);
     let reopened = Database::open_local(&path).await?;
     assert!(reopened.migration_backup().is_none());
-    assert_eq!(version(&reopened.connect().await?).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&reopened.connect().await?).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     Ok(())
 }

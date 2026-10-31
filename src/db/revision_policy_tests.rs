@@ -46,7 +46,7 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     assert_eq!(
         c.query("SELECT revision_json FROM file_metadata", ())
             .await?
@@ -67,6 +67,6 @@ async fn revision_policy_upgrade37_rollback_and_reopen_preserves_facts() -> Resu
     drop(c);
     drop(db);
     let reopened = Database::open_local(&path).await?;
-    assert_eq!(version(&reopened.connect().await?).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&reopened.connect().await?).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     Ok(())
 }

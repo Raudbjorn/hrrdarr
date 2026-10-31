@@ -135,7 +135,7 @@ async fn snapshot_profile_schema19_backfill_rollback_reopen_and_intact_mapping_g
         let db = Database::open_local(&copy).await?;
         assert!(db.migration_backup().is_some());
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
         assert_eq!(
             scalar(&c, "SELECT count(*) FROM quality_profile_policies").await?,
             0

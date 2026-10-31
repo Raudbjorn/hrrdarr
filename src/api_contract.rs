@@ -84,6 +84,17 @@ pub fn render() -> String {
     registry.visit::<crate::api::ApiPage<crate::commands::collection_refresh::CollectionRefreshCommand>>();
     macro_rules! roots {($($ty:ty),* $(,)?)=>{$(registry.visit::<$ty>();)*};}
     roots!(
+        crate::backup::BackupQuery,
+        crate::api::ApiPage<crate::backup::BackupFile>,
+        crate::backup::BackupDetail,
+        crate::backup::BackupSettings,
+        crate::backup::BackupSettingsUpdate,
+        crate::backup::PendingRestore,
+        crate::backup::RestoreStatus,
+        crate::commands::backup::BackupCommandInput,
+        crate::commands::backup::ListParams,
+        crate::commands::backup::BackupCommand,
+        crate::api::ApiPage<crate::commands::backup::BackupCommand>,
         crate::custom_formats::Input,
         crate::custom_formats::Format,
         crate::custom_formats::Bulk,

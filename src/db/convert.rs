@@ -246,7 +246,19 @@ async fn plan(conn: &Connection) -> Result<Vec<String>, Error> {
             columns(conn, "old", table).await?,
             columns(conn, "main", table).await?,
         );
-        if old != new {
+        // Main 0079 adds facts the historical runner never recorded; preserve NULL defaults.
+        let appended = match table.as_str() {
+            "episodes" | "movies" => Some("native_last_search_at"),
+            "search_commands" => Some("dispatch_completed_at"),
+            _ => None,
+        };
+        let mut expected = old
+            .iter()
+            .map(String::as_str)
+            .chain(appended)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        if new.iter().map(String::as_str).collect::<Vec<_>>() != expected {
             return Err(format!(
                 "table {table} differs between the lineages and has no mapping; refusing to guess"
             )
@@ -266,7 +278,7 @@ fn column_list(columns: &[String]) -> String {
 }
 
 async fn copy_straight(conn: &Connection, table: &str) -> Result<(), Error> {
-    let list = column_list(&columns(conn, "main", table).await?);
+    let list = column_list(&columns(conn, "old", table).await?);
     // REPLACE keeps the seeded rows of migrations a shorter source never ran, and lets the source's
     // edits to rows both lineages seed (settings, definitions) win.
     conn.execute(

@@ -21,6 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
+pub mod backup;
 pub mod blocklist;
 pub mod collection_refresh;
 pub mod downloaded_scan;
@@ -427,6 +428,7 @@ pub fn router(db: Arc<Database>) -> Router {
     let downloaded_scan = downloaded_scan::router(db.clone());
     let recycle_cleanup = recycle_cleanup::router(db.clone());
     let collection_refresh = collection_refresh::router(db.clone());
+    let backup = backup::router(db.clone());
     let rename = rename::router(db.clone()).merge(crate::rename::events::router(db.clone()));
     Router::new()
         .route("/api/v1/commands", get(list).post(create))
@@ -454,6 +456,7 @@ pub fn router(db: Arc<Database>) -> Router {
         .merge(rename)
         .merge(downloaded_scan)
         .merge(collection_refresh)
+        .merge(backup)
 }
 async fn create(
     State(db): State<Arc<Database>>,

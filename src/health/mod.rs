@@ -17,6 +17,8 @@ mod client_backoff;
 mod download_roots;
 mod engine;
 mod indexers;
+mod library_roots;
+mod mounts;
 mod path_diagnostics;
 #[cfg(test)]
 pub(crate) use path_diagnostics::retained_path_diagnostic;
@@ -344,6 +346,21 @@ pub(crate) async fn recycle_bin_changed(c: &Connection, media: MediaDomain) -> R
         MediaDomain::Movies => HealthScope::Movies,
     };
     let keys = selection(c, scope, "check_key='recycle_bin'").await?;
+    mark(c, &keys, CONFIG, now()?).await
+}
+
+/// Root folder declarations change hc.034 best-root derivation and collection roots, both domains.
+/// Shares the authoritative root mutation's transaction; marking never touches the filesystem.
+pub(crate) async fn library_roots_changed(c: &Connection) -> Result<()> {
+    if c.is_autocommit() {
+        return Err(invariant());
+    }
+    let keys = selection(
+        c,
+        HealthScope::All,
+        "check_key IN ('root_folder','collection_root_folder')",
+    )
+    .await?;
     mark(c, &keys, CONFIG, now()?).await
 }
 

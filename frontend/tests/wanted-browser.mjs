@@ -39,6 +39,29 @@ async function admitted(click){
  const response=page.waitForResponse(r=>r.request().method()==='POST'&&/^\/api\/v1\/(tv|movies)\/wanted\/search$/.test(new URL(r.url()).pathname));
  await click();const reply=await response;assert.equal(reply.status(),202,await reply.text());return reply.json();
 }
+// Both failure boundaries retain the original TV endpoint and body, including search-all.
+async function uncertainAdmission(click, admittedBeforeLoss){
+ const endpoint='**/api/v1/tv/wanted/search';let originalBody,originalReceipt;
+ const loseResponse=async route=>{
+  originalBody=route.request().postDataJSON();
+  if(admittedBeforeLoss){const response=await route.fetch();assert.equal(response.status(),202);originalReceipt=await response.json();}
+  await route.abort('failed');
+ };
+ await page.route(endpoint,loseResponse);
+ try{
+  await click();
+  await search.getByRole('button',{name:'Retry same search request',exact:true}).waitFor();
+  const moviesSwitch=wanted.getByRole('navigation',{name:'Wanted media type'}).getByRole('button',{name:'Movies',exact:true});
+  assert.equal(await moviesSwitch.isDisabled(),true,'An uncertain TV request must prevent changing its target domain');
+  await moviesSwitch.dispatchEvent('click');
+  assert.equal(await moviesSwitch.getAttribute('aria-pressed'),'false','The handler also rejects domain changes while pending');
+ }finally{await page.unroute(endpoint,loseResponse);}
+ const request=page.waitForRequest(r=>r.method()==='POST'&&new URL(r.url()).pathname==='/api/v1/tv/wanted/search');
+ const receipt=await admitted(()=>search.getByRole('button',{name:'Retry same search request',exact:true}).click());
+ assert.deepEqual((await request).postDataJSON(),originalBody,'Retry preserves the exact request identity and selection');
+ assert.equal(receipt.replayed,admittedBeforeLoss);
+ return originalReceipt??receipt;
+}
 async function commandsFor(type,id){return (await api('get',`/api/v1/search/commands?target_type=${type}&target_id=${id}`)).items;}
 try{
  // Stop the shared worker first: admitted searches must stay queued in this owned fixture.
@@ -61,13 +84,27 @@ try{
  assert.ok(rows[2].includes('Wanted second'));
  assert.ok(!rows.join('\n').includes('Wanted future'),'Future episodes are not missing');
  await wanted.getByText('Showing 1–2 of 2 missing episodes.',{exact:false}).waitFor();
+ // Last searched column: native fact in UTC, never-searched explicit; the time is machine-readable.
+ assert.ok(rows[0].includes('Last searched'),rows[0]);
+ assert.ok(rows[1].includes('2023-11-14 22:13 UTC'),rows[1]);
+ assert.ok(rows[2].includes('Never searched'),rows[2]);
+ assert.equal(await table('Missing episodes').locator('time[datetime="2023-11-14T22:13:20Z"]').count(),1);
+ const sortBy=wanted.getByLabel('Sort by',{exact:true}),direction=wanted.getByLabel('Sort direction',{exact:true});
+ await sortBy.selectOption('last_search');
+ await until(async()=>(await rowsOf('Missing episodes')).slice(1).map(r=>r.includes('Wanted second')?'second':'pilot').join(),v=>v==='second,pilot','Never searched first ascending');
+ const tvSorted=await api('get','/api/v1/tv/wanted/missing?sort=last_search');
+ assert.deepEqual(tvSorted.items.map(i=>[i.target.id,i.last_search_time,i.last_search_source]),[[episodes.second,null,null],[episodes.pilot,'2023-11-14T22:13:20Z','native']]);
+ await direction.selectOption('desc');
+ await until(async()=>(await rowsOf('Missing episodes')).slice(1).map(r=>r.includes('Wanted second')?'second':'pilot').join(),v=>v==='pilot,second','Never searched last descending');
+ await direction.selectOption('asc');await sortBy.selectOption('air_date');
+ rows=await until(()=>rowsOf('Missing episodes'),r=>r.length===3&&r[1].includes('Wanted pilot'),'Air date sort restored');
  if(artifacts)await page.screenshot({path:join(artifacts,'wanted-tv-missing-desktop.png'),fullPage:true});
 
  // Keyboard selection, then search selected with default client selection.
  const pilot=table('Missing episodes').getByRole('checkbox',{name:/^Select Wanted Harbor S01E01 Wanted pilot$/});
  await pilot.focus();await page.keyboard.press('Space');assert.equal(await pilot.isChecked(),true);
  await chooseProviders(indexer);
- const selected=await admitted(()=>search.getByRole('button',{name:'Search selected (1)',exact:true}).click());
+ const selected=await uncertainAdmission(()=>search.getByRole('button',{name:'Search selected (1)',exact:true}).click(),false);
  assert.deepEqual(selected.commands.map(c=>c.target),[{media_type:'episode',id:episodes.pilot}]);
  await search.getByText('Queued 1 episode for automatic search; 1 matched.',{exact:true}).waitFor();
  let stored=await commandsFor('episode',episodes.pilot);
@@ -84,10 +121,11 @@ try{
  assert.equal(await confirm.count(),0);
  assert.equal((await commandsFor('episode',episodes.second)).length,0,'Cancelling confirmation admits nothing');
  await search.getByRole('button',{name:'Search all',exact:true}).click();
- const all=await admitted(()=>confirm.getByRole('button',{name:'Confirm search all',exact:true}).click());
+ const all=await uncertainAdmission(()=>confirm.getByRole('button',{name:'Confirm search all',exact:true}).click(),true);
  assert.deepEqual([all.matched,all.skipped_active,all.admitted],[2,1,1]);
  assert.deepEqual(all.commands.map(c=>c.target),[{media_type:'episode',id:episodes.second}]);
- await search.getByText('Queued 1 episode for automatic search; 2 matched; 1 skipped because a search is already active.',{exact:true}).waitFor();
+ // The retry returns the durable receipt, so its summary reports replay rather than fresh admission counts.
+ await search.getByText('Earlier identical request read back: 1 episode already queued for search.',{exact:true}).waitFor();
  assert.equal((await commandsFor('episode',episodes.pilot)).length,1);
  assert.equal((await commandsFor('episode',episodes.second)).length,1);
 
@@ -97,6 +135,7 @@ try{
  rows=await rowsOf('Cutoff unmet episodes');
  assert.equal(rows.length,2,rows.join('\n'));
  assert.ok(rows[1].includes('Wanted low quality')&&rows[1].includes('HDTV-720p'),rows[1]);
+ assert.ok(rows[1].includes('2024-01-01 00:00 UTC (imported)'),'Imported snapshot value is labelled as imported: '+rows[1]);
  assert.ok(!rows.join('\n').includes('Wanted good quality'));
  await wanted.getByLabel('Monitoring filter',{exact:true}).selectOption('unmonitored');
  await wanted.getByText('No cutoff unmet episodes for this filter.',{exact:false}).waitFor();
@@ -126,6 +165,15 @@ try{
  await until(async()=>(await rowsOf('Missing movies')).length,n=>n===2,'Availability filter');
  await wanted.getByLabel('Availability filter',{exact:true}).selectOption('all');
  await until(async()=>(await rowsOf('Missing movies')).length,n=>n===3,'Availability reset');
+ rows=await rowsOf('Missing movies');
+ assert.ok(rows[1].includes('2025-06-15 15:06 UTC'),'Movie fact is its own, not the equal-numbered episode\'s: '+rows[1]);
+ assert.ok(rows[2].includes('Never searched'),rows[2]);
+ await wanted.getByLabel('Sort by',{exact:true}).selectOption('last_search');
+ await until(async()=>(await rowsOf('Missing movies')).slice(1).map(r=>r.includes('Wanted Bravo')?'bravo':'alpha').join(),v=>v==='bravo,alpha','Movies: never searched first');
+ const sorted=await api('get','/api/v1/movies/wanted/missing?sort=last_search');
+ assert.deepEqual(sorted.items.map(i=>[i.target.id,i.last_search_source]),[[movies.bravo,null],[movies.alpha,'native']]);
+ await wanted.getByLabel('Sort by',{exact:true}).selectOption('title');
+ await until(async()=>(await rowsOf('Missing movies')).slice(1).map(r=>r.includes('Wanted Bravo')?'bravo':'alpha').join(),v=>v==='alpha,bravo','Title sort restored');
 
  // Selection actions use the existing monitoring writes and refresh membership.
  await table('Missing movies').getByRole('checkbox',{name:'Select Wanted Bravo (2099)',exact:true}).check();

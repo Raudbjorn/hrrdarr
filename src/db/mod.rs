@@ -328,12 +328,20 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "provider_authority",
         include_str!("../../migrations/0078_provider_authority.sql"),
     ),
-    // File 0090 extends the preserved main history at ordinal 79.
+    (
+        "wanted_last_search",
+        include_str!("../../migrations/0079_wanted_last_search.sql"),
+    ),
+    (
+        "library_root_health",
+        include_str!("../../migrations/0080_library_root_health.sql"),
+    ),
+    ("backups", include_str!("../../migrations/0081_backups.sql")),
+    // Keep main's published 1–81 prefix; branch migrations follow at 82 and 83.
     (
         "indexer_breadth",
         include_str!("../../migrations/0090_indexer_breadth.sql"),
     ),
-    // File 0091 follows at ordinal 80 for the same reason.
     (
         "wanted_search_receipts",
         include_str!("../../migrations/0091_wanted_search_receipts.sql"),
@@ -450,6 +458,8 @@ pub struct Database {
     backup: Option<PathBuf>,
     // Never reused within a process (unlike an address), so per-database state can be keyed by it.
     permit_id: u64,
+    // Local database file; absent for remote storage.
+    path: Option<PathBuf>,
 }
 static NEXT_PERMIT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn next_permit_id() -> u64 {
@@ -490,6 +500,7 @@ impl Database {
             _owner: Some(owner),
             backup: None,
             permit_id: next_permit_id(),
+            path: Some(path.clone()),
         };
         let conn = db.connect().await?;
         db.backup = migrate(conn, Some(&path)).await?;
@@ -505,6 +516,7 @@ impl Database {
             _owner: None,
             backup: None,
             permit_id: next_permit_id(),
+            path: None,
         };
         migrate(db.connect().await?, None).await?;
         Ok(db)
@@ -551,6 +563,11 @@ impl Database {
 
     pub fn migration_backup(&self) -> Option<&Path> {
         self.backup.as_deref()
+    }
+
+    /// The owned local database file; `None` for remote storage.
+    pub fn local_path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 }
 
@@ -806,11 +823,8 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
     // The exclusively created private directory prevents collisions and symlink replacement.
     // No manifest is published for a partial/invalid snapshot; such directories are retained.
     let snapshot = directory.join("database.db");
-    conn.execute(
-        "VACUUM main INTO ?1",
-        params![snapshot.to_str().ok_or("backup path is not UTF-8")?],
-    )
-    .await?;
+    vacuum_into(conn, &snapshot).await?;
+    // Pre-migration copies may be unversioned prototypes, so this keeps its own checks.
     let copy = libsql::Builder::new_local(&snapshot).build().await?;
     let copy_conn = copy.connect()?;
     integrity(&copy_conn).await?;
@@ -859,6 +873,147 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
     })
     .await??;
     Ok(directory)
+}
+
+/// Migration identity of this build, in runner order: (version, name, checksum).
+pub(crate) fn migration_history() -> Vec<(usize, &'static str, String)> {
+    MIGRATIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (name, sql))| (index + 1, *name, checksum(sql)))
+        .collect()
+}
+
+/// Latest schema version this build can open.
+pub fn latest_schema_version() -> usize {
+    MIGRATIONS.len()
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
+
+/// Consistent online copy of the main database (one read transaction; concurrent WAL writers
+/// continue). The target must not exist; the caller owns its private directory.
+pub(crate) async fn vacuum_into(conn: &Connection, target: &Path) -> Result<(), Error> {
+    conn.execute(
+        "VACUUM main INTO ?1",
+        params![target.to_str().ok_or("backup path is not UTF-8")?],
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotFacts {
+    pub schema_version: usize,
+    pub sqlite_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotOpen {
+    /// Untrusted candidates: never written.
+    ReadOnly,
+    /// Owned staging copies, converted to a self-contained rollback-journal file.
+    SelfContained,
+}
+
+#[derive(Debug)]
+pub(crate) enum SnapshotError {
+    /// The file could not be opened or queried as a database.
+    Unreadable,
+    /// integrity_check or foreign_key_check failed.
+    Integrity,
+    /// Migration history from a newer build.
+    Newer(i64),
+    /// Missing, unversioned or mismatched migration history.
+    History,
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable => f.write_str("snapshot is not a readable database"),
+            Self::Integrity => f.write_str("snapshot integrity check failed"),
+            Self::Newer(v) => write!(f, "snapshot schema version {v} is newer than this build"),
+            Self::History => f.write_str("snapshot migration history is not recognized"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// Opens a closed snapshot file and verifies integrity, foreign keys and that its migration
+/// history is a checksum-identical prefix of this build's. Never applies migrations.
+pub(crate) async fn inspect_snapshot(
+    path: &Path,
+    mode: SnapshotOpen,
+) -> Result<SnapshotFacts, SnapshotError> {
+    let mut builder = libsql::Builder::new_local(path);
+    if mode == SnapshotOpen::ReadOnly {
+        builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY);
+    } else {
+        builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_WRITE);
+    }
+    let copy = builder
+        .build()
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?;
+    let conn = copy.connect().map_err(|_| SnapshotError::Unreadable)?;
+    if mode == SnapshotOpen::SelfContained {
+        let journal: String = conn
+            .query("PRAGMA journal_mode=DELETE", ())
+            .await
+            .map_err(|_| SnapshotError::Unreadable)?
+            .next()
+            .await
+            .map_err(|_| SnapshotError::Unreadable)?
+            .ok_or(SnapshotError::Unreadable)?
+            .get(0)
+            .map_err(|_| SnapshotError::Unreadable)?;
+        if !journal.eq_ignore_ascii_case("delete") {
+            return Err(SnapshotError::Unreadable);
+        }
+    }
+    scalar(&conn, "SELECT count(*) FROM sqlite_schema")
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?;
+    integrity(&conn)
+        .await
+        .map_err(|_| SnapshotError::Integrity)?;
+    let has_history = scalar(
+        &conn,
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
+    )
+    .await
+    .map_err(|_| SnapshotError::Unreadable)?;
+    if has_history != 1 {
+        return Err(SnapshotError::History);
+    }
+    let newest = scalar(
+        &conn,
+        "SELECT coalesce(max(version),0) FROM schema_migrations",
+    )
+    .await
+    .map_err(|_| SnapshotError::History)?;
+    if newest > MIGRATIONS.len() as i64 {
+        return Err(SnapshotError::Newer(newest));
+    }
+    let schema_version = version(&conn).await.map_err(|_| SnapshotError::History)?;
+    let sqlite_version = conn
+        .query("SELECT sqlite_version()", ())
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?
+        .next()
+        .await
+        .map_err(|_| SnapshotError::Unreadable)?
+        .ok_or(SnapshotError::Unreadable)?
+        .get::<String>(0)
+        .map_err(|_| SnapshotError::Unreadable)?;
+    Ok(SnapshotFacts {
+        schema_version,
+        sqlite_version,
+    })
 }
 
 #[cfg(test)]
@@ -926,6 +1081,11 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
+
+#[cfg(test)]
+mod published_prefix_tests;
+#[cfg(test)]
+mod review_integrity_tests;
 
 #[cfg(test)]
 mod refresh_tests;
@@ -1019,8 +1179,6 @@ mod downloadstation_registry_tests;
 mod flood_registry_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
-#[cfg(test)]
-mod review_integrity_tests;
 #[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]

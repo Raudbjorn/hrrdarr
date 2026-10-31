@@ -44,11 +44,12 @@ Rows protected from deletion (verified against migrations and every reader of th
 | `wanted_search_receipts` (not command history) | Pruned only when `expires_at` has passed (7 days after creation, not `retention_seconds`); an unexpired receipt is never selected, whatever the state of its child commands. Targets cascade. Admission also sweeps up to 256 expired receipts. |
 | `search_commands` | Any of its offers is selected, or unexpired. Expired unselected offers are deleted with the command (the `search_results` FK is `RESTRICT`). |
 | `manual_import_commands` | The operation's `import_journal` phase is neither `preview` nor `complete`. |
-| `rename_commands` | A related `rename_items` row is `planned`, or is `failed` with `error_code='rollback_incomplete'`. Other terminal rename commands are eligible under the retention policy. |
+| `rename_commands` | A related `rename_items` row is `planned`, or is `failed` with `error_code='rollback_incomplete'`. Other terminal rename commands are eligible under the retention policy; deleting one cascades its item/target journal rows, while the separate `rename_events` outbox remains. |
 | Other command tables | Nothing references them and their dedup indexes are partial on active statuses, so terminal rows are pure history. |
 
 Terminal rows are not used for replay deduplication anywhere: dedup is the active-scope unique
-indexes plus candidate/hash-claim rows, which this job never deletes.
+indexes plus candidate/hash-claim rows, which this job never deletes. Rename deduplication is
+enforced in code over active commands only.
 
 ## Scheduling and recovery
 

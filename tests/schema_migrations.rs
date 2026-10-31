@@ -149,7 +149,7 @@ async fn prototype_upgrade_preserves_data_backups_restore_and_rerun_is_noop() ->
     let conn = db.connect().await?;
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episodes").await, 3);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM episode_files").await, 1);
@@ -300,14 +300,14 @@ async fn dump(conn: &Connection) -> Result<Vec<Vec<libsql::Value>>, Error> {
 
 #[tokio::test]
 async fn unknown_or_modified_history_is_rejected_without_new_backup() -> Result<(), Error> {
-    // Reasoning: 0091 wanted_search_receipts is at ordinal 80 after 0090 indexer_breadth at 79; the unknown-history probe must use future version 81.
+    // Reasoning: 0091 Wanted receipts is ordinal 83; the unknown-history probe must use future version 84.
     for sql in [
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
         "UPDATE schema_migrations SET sql=sql || '-- changed' WHERE version=1",
         "UPDATE schema_migrations SET name='different' WHERE version=1",
         "DELETE FROM schema_migrations WHERE version=1",
         "DELETE FROM schema_migrations",
-        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (81,'future','unknown','unknown')",
+        "INSERT INTO schema_migrations (version,name,checksum,sql) VALUES (84,'future','unknown','unknown')",
     ] {
         let files = Sandbox::new();
         let db = Database::open_local(files.db()).await?;
@@ -469,7 +469,7 @@ async fn import_journal_upgrade_rollback_domain_history_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM operations WHERE status='preview'").await,
@@ -700,7 +700,7 @@ async fn provider_configuration_upgrade_constraints_and_atomic_replacement() -> 
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -917,7 +917,7 @@ async fn provider_test_results_upgrade_revision_invalidation_and_reopen() -> Res
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 1);
     assert_eq!(
@@ -1163,7 +1163,7 @@ async fn indexer_scope_options_upgrade_rollback_constraints_and_reopen() -> Resu
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(scalar(&c,"SELECT count(*) FROM providers WHERE revision=1 AND credentials=zeroblob(29) AND endpoint='https://example.test/api' AND name=implementation").await,3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM provider_scopes").await, 6);
@@ -1369,7 +1369,7 @@ async fn qbittorrent_options_upgrade_ownership_rollback_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -1556,7 +1556,7 @@ async fn provider_snapshot_mapping_upgrade_rollback_and_reopen() -> Result<(), E
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -2091,7 +2091,7 @@ async fn naming_settings_upgrade_rollback_domain_checks_and_reopen() -> Result<(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2453,7 +2453,7 @@ async fn manual_import_commands_upgrade_rollback_ownership_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -2851,7 +2851,7 @@ async fn quality_reset_commands_upgrade_rollback_capacity_and_reopen() -> Result
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(
@@ -3305,7 +3305,7 @@ async fn rescan_commands_upgrade_rollback_mutual_exclusion_and_reopen() -> Resul
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE path='/tv/Kept'").await,
@@ -4367,7 +4367,7 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
     let c = db.connect().await?;
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM schema_migrations").await,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     // A real upgrade preserves prior data: all 1024 seeded rows (and the provider they reference)
     // survive untouched.
@@ -4538,5 +4538,138 @@ async fn command_capacity_migration33_active_only_upgrade_rollback_and_boundary(
         [uuid::Uuid::new_v4().to_string()],
     )
     .await?;
+    Ok(())
+}
+
+// Reasoning: version 79 adds native last-search facts after the unchanged main 78-migration prefix.
+// Upgrading an actual version-78 database keeps every existing row and imported TV text, starts every
+// native fact NULL and is a no-op on reopen.
+#[tokio::test]
+async fn wanted_last_search_upgrade_preserves_rows_and_imported_facts() -> Result<(), Error> {
+    let files = Sandbox::new();
+    let fresh = Database::open_local(files.0.join("fresh.db")).await?;
+    let source = fresh.connect().await?;
+    let raw = libsql::Builder::new_local(files.db()).build().await?;
+    let c = raw.connect()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(files.db(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    c.execute_batch("PRAGMA foreign_keys=OFF;CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,sql TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").await?;
+    let tx = c.transaction().await?;
+    let mut rows = source
+        .query(
+            "SELECT version,name,checksum,sql FROM schema_migrations WHERE version<=78 ORDER BY version",
+            (),
+        )
+        .await?;
+    let mut applied = 0;
+    while let Some(r) = rows.next().await? {
+        let sql: String = r.get(3)?;
+        tx.execute_batch(&sql).await?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
+            params![
+                r.get::<i64>(0)?,
+                r.get::<String>(1)?,
+                r.get::<String>(2)?,
+                sql
+            ],
+        )
+        .await?;
+        applied += 1;
+    }
+    drop(rows);
+    assert_eq!(applied, 78);
+    tx.execute_batch(
+        "INSERT INTO series(id,title,path) VALUES(1,'Harbor','/owned/tv');
+         INSERT INTO seasons(series_id,number) VALUES(1,1);
+         INSERT INTO episodes(id,series_id,season,number,title,last_search_time) VALUES
+          (1,1,1,1,'Imported','2023-11-14 22:13:20Z'),(2,1,1,2,'Never',NULL);
+         INSERT INTO movie_metadata(id,title,year) VALUES(1,'Harbor',2020);
+         INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/owned/movie');",
+    )
+    .await?;
+    tx.commit().await?;
+    c.execute("PRAGMA foreign_keys=ON", ()).await?;
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM pragma_table_info('episodes') WHERE name='native_last_search_at'"
+        )
+        .await,
+        0
+    );
+    drop(c);
+    drop(raw);
+
+    let db = Database::open_local(files.db()).await?;
+    assert!(
+        db.migration_backup().is_some(),
+        "upgrade publishes a backup"
+    );
+    let c = db.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT max(version) FROM schema_migrations").await,
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM episodes WHERE native_last_search_at IS NULL"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM movies WHERE native_last_search_at IS NULL"
+        )
+        .await,
+        1
+    );
+    let imported: Option<String> = c
+        .query("SELECT last_search_time FROM episodes WHERE id=1", ())
+        .await?
+        .next()
+        .await?
+        .ok_or("episode kept")?
+        .get(0)?;
+    assert_eq!(imported.as_deref(), Some("2023-11-14 22:13:20Z"));
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('search_commands_dispatch','search_commands_dispatch_admit')"
+        )
+        .await,
+        2
+    );
+    for sql in [
+        "UPDATE episodes SET native_last_search_at='2024-01-01' WHERE id=1",
+        "UPDATE episodes SET native_last_search_at=-1 WHERE id=1",
+        "UPDATE movies SET native_last_search_at=1.5 WHERE id=1",
+    ] {
+        assert!(c.execute(sql, ()).await.is_err(), "accepted {sql}");
+    }
+    c.execute(
+        "UPDATE movies SET native_last_search_at=1700000000 WHERE id=1",
+        (),
+    )
+    .await?;
+    drop(c);
+    drop(db);
+    let reopened = Database::open_local(files.db()).await?;
+    assert!(reopened.migration_backup().is_none(), "reopen is a no-op");
+    let c = reopened.connect().await?;
+    assert_eq!(
+        scalar(&c, "SELECT native_last_search_at FROM movies WHERE id=1").await,
+        1700000000
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM schema_migrations").await,
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
+    );
     Ok(())
 }

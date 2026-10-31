@@ -694,9 +694,7 @@ pub async fn matching(
         if out.iter().any(|(seen, _)| *seen == id) {
             continue;
         }
-        let Ok(domain) = MediaDomain::parse(&media) else {
-            continue;
-        };
+        let domain = MediaDomain::parse(&media).map_err(|_| libsql::Error::InvalidColumnType)?;
         if upgrade && !on_upgrade {
             continue;
         }

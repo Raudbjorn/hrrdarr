@@ -1,4 +1,4 @@
-//! Migration 0069 (Deluge): registry and scope rules, with the label-family guards from 0069.
+//! Migration 0069 (Deluge and the label-torrent family): registry row, replaced scope triggers
 //! and label uniqueness, exercised on a freshly migrated database and across reopen.
 use super::*;
 
@@ -44,7 +44,7 @@ async fn deluge_registry_scope_shape_options_and_labels_are_enforced() -> Result
             (row.get::<String>(0)?, row.get::<String>(1)?),
             ("download_client".into(), "torrent".into())
         );
-        // Reasoning: the runner continues through 0069 to 0074, which register the rest of the family
+        // Reasoning: the runner continues through 0070 to 0074, which register the rest of the family
         // (rTorrent, uTorrent, Aria2, Flood and Download Station), so a fresh database holds all of them.
         let mut rows = c
             .query(

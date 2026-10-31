@@ -2073,3 +2073,340 @@ async fn client_selection_input_is_closed_and_mixed_or_null_fields_are_rejected(
     assert!(state.indexer_requests.lock().unwrap().is_empty());
     assert!(state.adds.lock().unwrap().is_empty());
 }
+
+// Native last-search producer: the fact follows a completed indexer dispatch of a targeted
+// search (success or caught indexer failure), never admission, RSS, decisions or grab.
+async fn native_last_search(db: &Database, tv: bool) -> Option<i64> {
+    db.connect()
+        .await
+        .unwrap()
+        .query(
+            &format!(
+                "SELECT native_last_search_at FROM {} WHERE id=1",
+                if tv { "episodes" } else { "movies" }
+            ),
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+async fn command_row(base: &str, id: &Value) -> Value {
+    let (status, row) = request(
+        base,
+        "GET",
+        &format!("/api/v1/search/commands/{}", id.as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{row}");
+    row
+}
+async fn submit(base: &str, indexer: &Value, download: &Value, tv: bool, mode: &str) -> Value {
+    let (code, command) = request(
+        base,
+        "POST",
+        "/api/v1/search/commands",
+        input(indexer, download, tv, mode),
+    )
+    .await;
+    assert_eq!(code, 202, "{command}");
+    command["id"].clone()
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn native_last_search_follows_dispatch_not_admission_rss_decisions_or_grab() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let table = if tv { "episodes" } else { "movies" };
+        // Same monitoring exception as the authority test: user TV searches stay acceptable.
+        db.connect()
+            .await
+            .unwrap()
+            .execute("UPDATE series SET monitored=0", ())
+            .await
+            .unwrap();
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+
+        // Background RSS sync is not a targeted search and records no per-item fact.
+        let (status, rss) = request(&base, "POST", "/api/v1/rss/commands", json!({"target":{"media_type":if tv {"tv"}else{"movies"},"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_id":download["id"],"client_revision":download["revision"]},"priority":"normal"})).await;
+        assert_eq!(status, 202, "{rss}");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (_, row) = request(
+                    &base,
+                    "GET",
+                    &format!("/api/v1/rss/commands/{}", rss["id"].as_str().unwrap()),
+                    Value::Null,
+                )
+                .await;
+                if row["status"] == "succeeded" {
+                    break;
+                }
+                assert_ne!(row["status"], "failed", "{row}");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("RSS settlement deadline");
+        assert!(
+            !peer.offsets.lock().unwrap().is_empty(),
+            "RSS queried the peer"
+        );
+        assert_eq!(
+            (
+                native_last_search(&db, true).await,
+                native_last_search(&db, false).await
+            ),
+            (None, None)
+        );
+
+        // Admission and claim never record; the first indexer page is held in flight.
+        peer.mode.store(9, Ordering::SeqCst);
+        let before = unix_now();
+        let id = submit(&base, &indexer, &download, tv, "interactive").await;
+        tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+            .await
+            .expect("owned first search page held");
+        let running = command_row(&base, &id).await;
+        assert_eq!(running["status"], "running", "{running}");
+        assert!(running["dispatch_completed_at"].is_null());
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            None,
+            "claim is not dispatch"
+        );
+        peer.mode.store(0, Ordering::SeqCst);
+        peer.release.notify_one();
+        let done = settled(&base, &id).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        let at = native_last_search(&db, tv).await.expect("dispatch fact");
+        assert_eq!(
+            done["dispatch_completed_at"].as_i64(),
+            Some(at),
+            "fact and command progress commit together"
+        );
+        assert!(before <= at && at <= done["completed_at"].as_i64().unwrap());
+        assert_eq!(
+            native_last_search(&db, !tv).await,
+            None,
+            "the equal numeric target in the other domain is untouched"
+        );
+
+        // A grab of a retained offer never writes the fact.
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET native_last_search_at=1000 WHERE id=1"),
+                (),
+            )
+            .await
+            .unwrap();
+        let results = offers(&base, &id).await;
+        let accepted = results
+            .iter()
+            .find(|r| r["decision"]["disposition"] == "accept")
+            .unwrap_or_else(|| panic!("an accepted offer: {results:?}"));
+        let (code, candidate) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/results/{}/grab",
+                accepted["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+        assert!((200..300).contains(&code), "{candidate}");
+        observed(&base, candidate["id"].as_str().unwrap()).await;
+        assert_eq!(peer.adds.lock().unwrap().len(), 1);
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            Some(1000),
+            "grab wrote nothing"
+        );
+        assert_eq!(
+            command_row(&base, &id).await["dispatch_completed_at"],
+            done["dispatch_completed_at"]
+        );
+
+        // Decisions that reject every release (wrong categories) do not undo a completed
+        // dispatch: the fact is written before any decision runs.
+        peer.mode.store(1, Ordering::SeqCst);
+        let rejected = submit(&base, &indexer, &download, tv, "automatic").await;
+        let done = settled(&base, &rejected).await;
+        assert_eq!(done["status"], "failed", "{done}");
+        assert!(
+            matches!(
+                done["error_code"].as_str(),
+                Some("no_eligible_release" | "invalid_release")
+            ),
+            "{done}"
+        );
+        let at = native_last_search(&db, tv).await.unwrap();
+        assert!(at > 1000);
+        assert_eq!(done["dispatch_completed_at"].as_i64(), Some(at));
+        assert_eq!(peer.adds.lock().unwrap().len(), 1, "nothing grabbed");
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn caught_indexer_failure_records_but_refusal_or_cancel_before_completion_does_not() {
+    for tv in [true, false] {
+        let (_scratch, db, peer, base, server, remote_server, client, indexer, download) =
+            policy_fixture().await;
+        let media = if tv { "tv" } else { "movies" };
+        let table = if tv { "episodes" } else { "movies" };
+        // Cancelled before any claim, and a provider revision change while queued: neither
+        // issues an indexer request, so neither records.
+        let cancelled = submit(&base, &indexer, &download, tv, "interactive").await;
+        let (status, row) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                cancelled.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!((status, &row["status"]), (200, &json!("cancelled")));
+        let stale = submit(&base, &indexer, &download, tv, "interactive").await;
+        let indexer = policy_flags(&base, &indexer, media, true, true, true).await;
+        let runtime = commands::start(db.clone(), client).await.unwrap();
+        let done = settled(&base, &stale).await;
+        assert_eq!(
+            (done["status"].as_str(), done["error_code"].as_str()),
+            (Some("failed"), Some("provider_changed")),
+            "{done}"
+        );
+        assert!(done["dispatch_completed_at"].is_null());
+        assert!(peer.indexer_requests.lock().unwrap().is_empty());
+        assert_eq!(native_last_search(&db, tv).await, None);
+
+        // A continuation page fails with HTTP 401 after page zero was fetched: the dispatch
+        // ended with a caught, classified indexer failure and still records.
+        peer.mode.store(5, Ordering::SeqCst);
+        let failing = submit(&base, &indexer, &download, tv, "interactive").await;
+        let row = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row = command_row(&base, &failing).await;
+                if !row["dispatch_completed_at"].is_null()
+                    && matches!(row["status"].as_str(), Some("retry_wait" | "failed"))
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("caught failure settles");
+        assert_eq!(row["error_code"], "provider_unavailable", "{row}");
+        assert_eq!(row["fetch_complete"], false);
+        assert!(offers(&base, &failing).await.is_empty());
+        assert_eq!(
+            native_last_search(&db, tv).await,
+            row["dispatch_completed_at"].as_i64()
+        );
+        request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                failing.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        peer.mode.store(0, Ordering::SeqCst);
+        // Clear the failure backoff through the real provider Test, as the retry test does.
+        let (status, tested) = request(
+            &base,
+            "POST",
+            &format!("/api/v1/providers/{}/test", indexer["id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "{tested}");
+
+        // Cancelled while the first page is in flight: the completion is not recorded.
+        db.connect()
+            .await
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET native_last_search_at=NULL WHERE id=1"),
+                (),
+            )
+            .await
+            .unwrap();
+        peer.mode.store(9, Ordering::SeqCst);
+        let inflight = submit(&base, &indexer, &download, tv, "interactive").await;
+        tokio::time::timeout(Duration::from_secs(10), peer.started.notified())
+            .await
+            .expect("owned first search page held");
+        let (status, row) = request(
+            &base,
+            "POST",
+            &format!(
+                "/api/v1/search/commands/{}/cancel",
+                inflight.as_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            (status, &row["status"]),
+            (200, &json!("cancelled")),
+            "{row}"
+        );
+        peer.mode.store(0, Ordering::SeqCst);
+        peer.release.notify_one();
+        // The single worker runs commands one at a time: once the follow-up search for the
+        // equal-numbered target in the other domain settles, the cancelled run has finished.
+        let other = submit(&base, &indexer, &download, !tv, "interactive").await;
+        let done = settled(&base, &other).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(
+            native_last_search(&db, !tv).await,
+            done["dispatch_completed_at"].as_i64()
+        );
+        assert_eq!(native_last_search(&db, tv).await, None);
+        let row = command_row(&base, &inflight).await;
+        assert_eq!(row["status"], "cancelled");
+        assert!(row["dispatch_completed_at"].is_null(), "{row}");
+        let row = command_row(&base, &cancelled).await;
+        assert!(row["started_at"].is_null() && row["dispatch_completed_at"].is_null());
+        // Storage refuses a dispatch record outside a running command or moving backwards.
+        let c = db.connect().await.unwrap();
+        for (id, value) in [(&inflight, unix_now()), (&other, 1)] {
+            assert!(
+                c.execute(
+                    "UPDATE search_commands SET dispatch_completed_at=? WHERE id=?",
+                    libsql::params![value, id.as_str().unwrap()],
+                )
+                .await
+                .is_err(),
+                "terminal command accepted a dispatch record"
+            );
+        }
+        runtime.shutdown().await;
+        server.stop().await;
+        remote_server.stop().await;
+    }
+}

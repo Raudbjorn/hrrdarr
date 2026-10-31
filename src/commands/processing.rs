@@ -350,7 +350,7 @@ fn media(value: &ReleaseTarget) -> MediaDomain {
     }
 }
 async fn policy(c: &Connection, id: Uuid, media: MediaDomain) -> Result<ProcessingPolicy> {
-    // cdh_scope_authority is the reconciler's own projection (registry download-client kinds only), so reads cannot drift from it.
+    // cdh_scope_authority is the reconciler's own projection, so reads cannot drift from it.
     let provider=c.query("SELECT provider_revision,desired_enabled FROM cdh_scope_authority WHERE provider_id=? AND media_type=?",params![id.to_string(),domain(media)]).await?.next().await?.ok_or(Error(StatusCode::NOT_FOUND,"provider_not_found"))?;
     let revision: i64 = provider.get(0)?;
     let desired_enabled = provider.get::<i64>(1)? == 1;

@@ -26,11 +26,12 @@ function safeNumbers(value: unknown): boolean {
 
 async function request<T>(path: string, body?: unknown, method?: 'POST' | 'PUT' | 'DELETE', native = false, timeout = REQUEST_TIMEOUT_MS): Promise<Result<T>> {
   if (body && !safeNumbers(body)) return { ok: false, error: 'Request contains an unsafe integer.' };
+  return send<T>(path, body !== undefined ? { method: method ?? 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : method ? { method } : {}, method, native, timeout);
+}
+
+async function send<T>(path: string, init: RequestInit, method: string | undefined, native: boolean, timeout: number): Promise<Result<T>> {
   try {
-    const response = await fetch(path, {
-      signal: AbortSignal.timeout(timeout),
-      ...(body !== undefined ? { method: method ?? 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : method ? { method } : {}),
-    });
+    const response = await fetch(path, { signal: AbortSignal.timeout(timeout), ...init });
     if (method === 'DELETE' && response.status === 204) return { ok: true, data: undefined as T };
     const reader = response.body?.getReader();
     if (!reader) return { ok: false, error: `Empty API response (${response.status}).` };
@@ -283,6 +284,8 @@ export const getMovieNamingExamples = (query: MovieNamingExamplesQuery = {}) => 
 };
 
 export const listSearchCommands = (target:MediaTarget,offset=0) => validId(target.id) ? request<ApiPage<SearchCommand>>(`/api/v1/search/commands?target_type=${target.media_type}&target_id=${target.id}&limit=25&offset=${offset}`,undefined,undefined,true) : invalid<ApiPage<SearchCommand>>();
+/** All search commands, newest first; `query` comes from `searchActivityQuery`. */
+export const listAllSearchCommands = (query:string) => query.length <= 256 ? request<ApiPage<SearchCommand>>(`/api/v1/search/commands?${query}`,undefined,undefined,true) : Promise.resolve<Result<ApiPage<SearchCommand>>>({ok:false,error:'Invalid search command query.'});
 export const getSearchCommand = (id:string) => validOperation(id) ? request<SearchCommand>(`/api/v1/search/commands/${id}`,undefined,undefined,true) : invalidProvider<SearchCommand>();
 export const createSearchCommand = (input:SearchCommandInput) => validOperation(input.request_id)&&validId(input.target.id)&&validOperation(input.indexer_id)&&validId(input.indexer_revision)&&validClientSelection(input) ? request<SearchCommand>('/api/v1/search/commands',input,'POST',true) : invalidProvider<SearchCommand>();
 export const cancelSearchCommand = (id:string) => validOperation(id) ? request<SearchCommand>(`/api/v1/search/commands/${id}/cancel`,{},'POST',true) : invalidProvider<SearchCommand>();
@@ -600,3 +603,27 @@ export const testAllNotifications = () => request<NotificationTestAllResult>('/a
 export const listNotificationDeliveries = (limit = 20) => Number.isInteger(limit) && limit >= 1 && limit <= 200
   ? request<NotificationDeliveryList>(`/api/v1/notifications/deliveries?limit=${limit}`, undefined, undefined, true)
   : Promise.resolve<Result<NotificationDeliveryList>>({ ok: false, error: 'Limit must be 1 to 200.' });
+
+// System → Backup. Archives are addressed by opaque id only; uploads stream the raw archive body.
+import type { BackupFile, BackupDetail, BackupSettings, BackupSettingsUpdate, BackupCommand, PendingRestore, RestoreStatus } from './api.generated';
+import { validBackupId, BACKUP_PAGE_SIZE, MAX_UPLOAD_BYTES } from './backup-view.ts';
+const UPLOAD_TIMEOUT_MS = 10 * 60_000;
+const invalidBackup = <T>(): Result<T> => ({ ok: false, error: 'Backup id must be 32 lowercase hexadecimal characters.' });
+export const listBackups = (offset = 0, limit = BACKUP_PAGE_SIZE) => Number.isSafeInteger(offset) && offset >= 0 && Number.isInteger(limit) && limit >= 1 && limit <= 100
+  ? request<ApiPage<BackupFile>>(`/api/v1/system/backups?${new URLSearchParams({ limit: String(limit), offset: String(offset) })}`, undefined, undefined, true)
+  : Promise.resolve<Result<ApiPage<BackupFile>>>({ ok: false, error: 'Invalid backup page.' });
+export const getBackup = (id: string) => validBackupId(id) ? request<BackupDetail>(`/api/v1/system/backups/${id}`, undefined, undefined, true) : Promise.resolve(invalidBackup<BackupDetail>());
+export const deleteBackup = (id: string) => validBackupId(id) ? request<void>(`/api/v1/system/backups/${id}`, undefined, 'DELETE', true) : Promise.resolve(invalidBackup<void>());
+export const restoreBackup = (id: string) => validBackupId(id) ? request<PendingRestore>(`/api/v1/system/backups/${id}/restore`, undefined, 'POST', true, 5 * 60_000) : Promise.resolve(invalidBackup<PendingRestore>());
+export const getPendingRestore = () => request<RestoreStatus>('/api/v1/system/restore', undefined, undefined, true);
+export const cancelPendingRestore = () => request<void>('/api/v1/system/restore', undefined, 'DELETE', true);
+export const getBackupSettings = () => request<BackupSettings>('/api/v1/system/backup-settings', undefined, undefined, true);
+export const updateBackupSettings = (input: BackupSettingsUpdate) => request<BackupSettings>('/api/v1/system/backup-settings', input, 'PUT', true);
+export const createBackupCommand = () => request<BackupCommand>('/api/v1/system/backup-commands', {}, 'POST', true);
+export const listBackupCommands = (limit = 1) => Number.isInteger(limit) && limit >= 1 && limit <= 100
+  ? request<ApiPage<BackupCommand>>(`/api/v1/system/backup-commands?${new URLSearchParams({ limit: String(limit) })}`, undefined, undefined, true)
+  : Promise.resolve<Result<ApiPage<BackupCommand>>>({ ok: false, error: 'Invalid command page.' });
+export const getBackupCommand = (id: string) => validOperation(id) ? request<BackupCommand>(`/api/v1/system/backup-commands/${id}`, undefined, undefined, true) : Promise.resolve<Result<BackupCommand>>({ ok: false, error: 'Invalid command id.' });
+export const uploadRestore = (file: Blob) => file.size > 0 && file.size <= MAX_UPLOAD_BYTES
+  ? send<PendingRestore>('/api/v1/system/restore/upload', { method: 'POST', headers: { 'content-type': 'application/zip' }, body: file }, 'POST', true, UPLOAD_TIMEOUT_MS)
+  : Promise.resolve<Result<PendingRestore>>({ ok: false, error: 'Choose a non-empty backup archive of at most 4 GiB.' });

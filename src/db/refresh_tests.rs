@@ -196,7 +196,7 @@ async fn download_refresh_upgrade_rollback_and_reopen_preserve_prior_data() -> R
     assert!(db.migration_backup().is_some());
     let conn = db.connect().await?;
     // Opening the predecessor now also applies the History ordering index.
-    assert_eq!(version(&conn).await?, 80); // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+    assert_eq!(version(&conn).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     assert_eq!(
         scalar(&conn, "SELECT count(*) FROM series WHERE title='Preserved'").await?,
         1

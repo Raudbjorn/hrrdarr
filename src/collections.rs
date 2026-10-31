@@ -446,6 +446,9 @@ async fn apply_patch(tx: &Connection, id: i64, p: &Patch) -> Result<()> {
     if p.monitored == Some(true) {
         add_missing(tx, id).await?;
     }
+    crate::health::library_roots_changed(tx)
+        .await
+        .map_err(|e| Error(e.0, e.1, "Collection root health invalidation failed"))?;
     Ok(())
 }
 
@@ -650,7 +653,13 @@ pub(crate) async fn apply_graph(
         )
         .await?;
     }
-    add_missing(c, id).await
+    let added = add_missing(c, id).await?;
+    if added.0 > 0 {
+        crate::health::library_roots_changed(c)
+            .await
+            .map_err(|e| Error(e.0, e.1, "Collection root health invalidation failed"))?;
+    }
+    Ok(added)
 }
 
 /// Collections with a metadata identity after `cursor`, in id order.
@@ -685,6 +694,48 @@ mod tests {
         assert_eq!(folder_name("???", Some(2000)), "Untitled (2000)");
         assert!(folder_name(&"é".repeat(500), Some(1999)).len() <= 200 + 7);
     }
+    #[tokio::test]
+    async fn collection_policy_health_invalidation_commits_and_rolls_back_with_settings()
+    -> Result<(), crate::db::Error> {
+        let dir = std::env::temp_dir().join(format!(
+            "hrrdarr-collection-health-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir)?;
+        let db = crate::db::Database::open_local(dir.join("db")).await?;
+        let c = db.connect().await?;
+        c.execute_batch(
+            "INSERT INTO root_folders(id,media_type,path) VALUES(1,'movies','/movies');
+            INSERT INTO movie_collections(id,tmdb_id,title) VALUES(1,10,'Saga');",
+        )
+        .await?;
+        let patch = super::Patch {
+            root_folder_id: Some(Some(1)),
+            ..Default::default()
+        };
+        for commit in [false, true] {
+            let tx = c.transaction().await?;
+            super::apply_patch(&tx, 1, &patch).await.unwrap();
+            let invalidated: i64 = tx.query("SELECT count(*) FROM health_checks WHERE check_key IN ('root_folder','collection_root_folder') AND generation=1 AND pending_reasons=8",()).await?.next().await?.unwrap().get(0)?;
+            assert_eq!(
+                invalidated, 3,
+                "collection policy invalidates root checks in the same transaction"
+            );
+            if commit {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            let policy: i64 = c.query("SELECT count(*) FROM movie_collection_settings WHERE collection_id=1 AND root_folder_id=1",()).await?.next().await?.unwrap().get(0)?;
+            let health: i64 = c.query("SELECT count(*) FROM health_checks WHERE check_key IN ('root_folder','collection_root_folder') AND generation=1 AND pending_reasons=8",()).await?.next().await?.unwrap().get(0)?;
+            assert_eq!((policy, health), if commit { (1, 3) } else { (0, 0) });
+        }
+        drop(c);
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn complete_graph_at_capacity_can_refresh_and_replace_a_member()
     -> Result<(), crate::db::Error> {

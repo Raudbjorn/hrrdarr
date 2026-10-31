@@ -55,4 +55,4 @@ Pause, Resume and Remove (`delete` with `force_complete=false`), each followed b
 - Live DSM compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1 over plain HTTP; no NAS was contacted. API names, parameters, `additional` shapes, status strings (DSM may report numeric statuses on newer versions, which would map to `unknown`), error codes and the destination semantics (relative to shared folders) come from the documentation, not a live run.
 - The save path reported to the importer is the shared-folder path with a leading slash (for example `/downloads/tv/<hash>`); mapping it to the host's real volume path is the job of a remote path mapping. The real volume path is not read from DSM.
 - Two-factor accounts, queue placement, seeding limits and the health classifier are not implemented. The `SYNO.API.Info` path discovery is not performed; the documented fixed paths are used.
-- Migration 0074 is the 74th entry (the file number equals its array position).
+- Migration 0074 adds the registry entry; 0075 reinstalls the combined scope triggers and 0076 guards directory category components.

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import DownloadProcessingPanel from './DownloadProcessingPanel.svelte';
+  import SearchActivityPanel from './SearchActivityPanel.svelte';
   import type { ApiPage, Command, CommandStatus, CompletedDownloadHandling, ProcessingPolicy, MediaDomain, Provider, QueueSnapshot, RefreshSchedule, RefreshTarget } from './api.generated';
   import type {SettingsWriteState} from './api';
   import {isDownloadClient} from './provider-draft';
@@ -39,12 +40,13 @@
   function schedulePoll() {clearTimeout(timer); if (alive && active && !document.hidden) timer = setTimeout(() => void read(), 5000);}
   function editSchedule() {scheduleRevision = currentSchedule?.revision ?? null; scheduleEnabled = currentSchedule?.requested_enabled ?? currentSchedule?.enabled ?? false; interval = currentSchedule?.interval_seconds ?? 300; scheduleDirty = false; scheduleStale=false; scheduleProviderRevision=provider?.revision??null; scheduleReady = true; confirmDelete = null;}
   // A child policy write owns the readback slot; only its onreload (owned) may read until it settles.
-  // A deferred read re-arms the poll: a failed child write never calls onreload to restart it.
+  // A deferred read re-arms the poll: a failed child write never calls onreload to restart it, and a failed
+  // related (provider) write never bumps providerVersion, so neither would otherwise restart polling.
   async function read(reconcile = false, resetSchedule = false, owned = false) {
     // Reset before any early return so changeScope never sees the previous domain's readback.
     settingsRead = false;
-    if (!alive || !active || document.hidden || reading || mutating || relatedWrite==='busy') return false;
-    if (childWrite==='busy' && !owned) {schedulePoll(); return false;}
+    if (!alive || !active || document.hidden || reading || mutating) return false;
+    if (relatedWrite==='busy' || (childWrite==='busy' && !owned)) {schedulePoll(); return false;}
     const token = version; reading = true; clearTimeout(timer); readError = ''; let failed = false;
     const history = await listCommands({limit:25,offset:commandOffset,...(mediaFilter ? {media_type:mediaFilter as MediaDomain} : {}),...(statusFilter ? {status:statusFilter as CommandStatus} : {})});
     if (!alive || token !== version || document.hidden) {reading = false; schedulePoll(); return false;}
@@ -165,6 +167,7 @@
     {#if selectedCommand}<section aria-label="Command detail"><h3>{selectedCommand.name}: {selectedCommand.status}</h3><dl><dt>ID</dt><dd>{selectedCommand.id}</dd><dt>Target</dt><dd>{selectedCommand.target.media_type} / {selectedCommand.target.provider_id}</dd><dt>Provider revision</dt><dd>{selectedCommand.provider_revision}</dd><dt>Priority / attempts</dt><dd>{selectedCommand.priority} / {selectedCommand.attempts}</dd><dt>Created</dt><dd>{date(selectedCommand.created_at)}</dd><dt>Started</dt><dd>{date(selectedCommand.started_at)}</dd><dt>Completed</dt><dd>{date(selectedCommand.completed_at)}</dd><dt>Next attempt</dt><dd>{terminal(selectedCommand) ? 'No further attempt' : date(selectedCommand.next_attempt_at)}</dd><dt>Error</dt><dd>{selectedCommand.error_code ?? 'No recorded error'}</dd><dt>Admission</dt><dd>{selectedCommand.origin === 'legacy_unknown' ? 'Admission source not recorded' : selectedCommand.origin}{selectedCommand.manual_bypass ? ' — manual refresh requested' : ''}</dd><dt>Polling delay</dt><dd>{selectedCommand.suppression_reason === 'download_client_backoff' ? `Automatic polling delayed until ${date(selectedCommand.suppression_until)}. A manual refresh or provider Test can recover the client. New sends remain available.` : 'No active polling delay for this command.'}</dd><dt>Items observed</dt><dd>{selectedCommand.status === 'succeeded' ? selectedCommand.items_observed : 'No successful result from this command'}</dd></dl>{#if terminal(selectedCommand)}<button disabled={reading || locked} onclick={() => confirmDelete = 'command'}>Delete command history</button>{:else}<button disabled={reading || locked} onclick={() => mutate('cancel')}>Cancel command</button><p>Cancellation stops this refresh command, not client downloads.</p>{/if}</section>{/if}
     {#if confirmDelete === 'command'}<div class="confirmation"><p>Delete only terminal command {selectedCommand?.id}? Downloads and media remain intact.</p><button disabled={reading || locked} onclick={() => mutate('deleteCommand')}>Confirm delete history</button><button onclick={() => confirmDelete = null}>Keep history</button></div>{/if}
   </section>
+  <SearchActivityPanel {active} />
 </section>
 <style>
   .heading{display:flex;justify-content:space-between;align-items:start;gap:1rem}.surface{background:white;border:1px solid #cbd5de;padding:1.25rem;margin:1rem 0}.surface h2{margin-top:0}.controls{display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:1rem}.controls label{min-width:180px;flex:1}.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:.7rem;border-bottom:1px solid #dce3e9;vertical-align:top}small{display:block;overflow-wrap:anywhere;color:#596b7b}fieldset{display:grid;gap:.8rem;border:1px solid #cbd5de;padding:1rem;min-width:0}.check{display:flex;gap:.6rem;align-items:center}.check input{width:auto}li{margin:.7rem 0;overflow-wrap:anywhere}.confirmation{padding:1rem;border-left:3px solid #a12637;background:#fff0f2;margin-top:1rem}.actions{margin-top:1rem}.confirmation button{margin-right:.5rem}@media(max-width:700px){.heading{flex-wrap:wrap}.surface{padding:1rem}.controls{display:block}.controls label{margin-bottom:.7rem}}

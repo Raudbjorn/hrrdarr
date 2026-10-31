@@ -31,17 +31,20 @@ Collection adoption retains local removal intent and protects it from stale snap
 returns the active one); `GET` list/detail. The worker also schedules it every 24 hours while collections exist.
 Each collection graph is fetched (`movie/collection/{tmdbId}`, bounded, 1000 parts) outside any transaction, then
 applied atomically: title/overview/last sync, member set replaced (authoritative), and for monitored collections the
-missing members are added. A run spans worker slices through a cursor and survives restarts. Per-collection fetch
+missing members are added. A run spans worker slices through a cursor and survives restarts. Automatic
+refreshes rank below ordinary commands; continuations yield through their ready timestamp, and
+transient rate limits retry with bounded delay. Per-collection fetch
 failures are counted; if nothing succeeded and the service was unavailable the command fails
 (`metadata_unavailable`). Migration `0067_collections.sql`.
 
 ## Schema integration
 
-Migrations 0001–0076 retain the PR branch history and checksums. Migration 0077 moves
+Migrations 0001–0076 retain the selected main history and checksums. Migration 0077 moves
 existing collection policy into `movie_collection_settings`, preserving meaningful
 local settings and tags, and adds metadata provenance, retained removal intent,
-exclusions and snapshot replay state. Migration 0078 adds provider authority state.
-Databases from the divergent main migration history are not an accepted upgrade baseline. Pre-merge PR #32 databases are refused at startup and converted explicitly offline; see `docs/migration-compatibility.md`.
+exclusions and snapshot replay state. Migration 0078 adds provider authority state. Collection root health reads this settings authority;
+policy edits, adoption, cleanup and snapshot imports invalidate its checks in their write transaction.
+Databases from divergent migration histories are refused at startup; supported pre-merge PR #32 databases can be converted explicitly offline. See [migration compatibility](migration-compatibility.md).
 
 ## Snapshot reconstruction
 

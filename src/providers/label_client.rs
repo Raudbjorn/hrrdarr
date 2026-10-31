@@ -671,7 +671,11 @@ pub(crate) async fn details_with<W: Wire>(
         let done = file.downloaded_bytes.min(file.size_bytes);
         result.push(TorrentFile {
             index: index as u32,
-            name: wire.redact(file.path),
+            // The private import path keeps the original remote name. The receipt evaluation and
+            // the source-file lookup join this name to `save_path`, so a redaction marker here
+            // would send the import at a file that does not exist. Redaction belongs to the
+            // public projections, exactly as in the qBittorrent client.
+            name: file.path,
             size_bytes: file.size_bytes,
             progress: if file.size_bytes == 0 {
                 1.0

@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        80 // Reasoning: wanted search receipts are appended at ordinal 80 after the unchanged 1–79 history (main 1–78, indexer breadth 79).
+        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;
