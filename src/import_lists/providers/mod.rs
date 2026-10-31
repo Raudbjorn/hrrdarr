@@ -323,6 +323,9 @@ pub fn finish(media: MediaDomain, items: Vec<ListItem>) -> Fetched {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for item in items {
+        if item.year.is_some_and(|year| !(1..=9999).contains(&year)) {
+            return Err(FetchError::InvalidResponse);
+        }
         let usable = item.tvdb_id.is_some()
             || item.tmdb_id.is_some()
             || item.imdb_id.is_some()

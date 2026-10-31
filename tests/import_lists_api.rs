@@ -1344,6 +1344,42 @@ async fn rss_list_parses_release_titles_years_and_imdb_ids_and_rejects_non_feeds
 }
 
 #[tokio::test]
+async fn zero_year_feeds_fail_visibly_and_allow_another_sync_in_both_domains() {
+    let h = Harness::new().await;
+    for media in ["tv", "movies"] {
+        for (format, body) in [
+            (
+                "rss",
+                "<rss><channel><item><title>Movie (0000)</title></item></channel></rss>",
+            ),
+            (
+                "atom",
+                "<feed><entry><title>Movie [0000]</title></entry></feed>",
+            ),
+        ] {
+            h.feed.set("/zero.xml", 200, "application/xml", body);
+            let id = h
+                .create(h.input(
+                    &format!("zero {media} {format}"),
+                    "rss",
+                    media,
+                    json!({"url": format!("{}/zero.xml", h.feed_base)}),
+                ))
+                .await;
+            // An invalid year must settle the run before storage, releasing the active-run guard.
+            for _ in 0..2 {
+                let run = h.sync(&id).await;
+                assert_eq!(
+                    (run["status"].as_str(), run["error_code"].as_str()),
+                    (Some("failed"), Some("invalid_response")),
+                    "{media} {format}: {run}",
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn background_scheduler_syncs_due_lists_without_a_manual_trigger_and_shuts_down() {
     let h = Harness::new().await;
     h.meta.show(8001, "Background", None);
