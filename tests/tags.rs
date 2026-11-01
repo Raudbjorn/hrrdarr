@@ -49,7 +49,9 @@ async fn request(base: &str, method: &str, path: &str, v: Value) -> (u16, Value)
 async fn server(db: Arc<Database>) -> (String, Server) {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
-    let app = hrrdarr::tags::router(db.clone()).merge(hrrdarr::library::router(db));
+    let app = hrrdarr::tags::router(db.clone())
+        .merge(hrrdarr::providers::router(db.clone(), None))
+        .merge(hrrdarr::library::router(db));
     (
         base,
         Server(tokio::spawn(
@@ -529,6 +531,74 @@ async fn tags_snapshot_three_schemas_replay_local_edits_deletion_and_late_rollba
     );
     assert!(rows.next().await.unwrap().is_none());
     assert_eq!(conn.query("SELECT count(DISTINCT destination_id) FROM snapshot_mappings WHERE destination_table='tags' AND source_id=7",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),2);
+}
+
+#[tokio::test]
+async fn legacy_indexer_tags_survive_edits_and_prevent_deletion() {
+    let scratch = Scratch::new();
+    let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
+    let c = db.connect().await.unwrap();
+    let (base, _server) = server(db).await;
+    let config = json!({"name":"Indexer","enabled":true,"priority":1,"settings":{
+        "implementation":"torznab","endpoint":format!("{base}/unused"),
+        "tv":{"categories":[5000],"anime_categories":[]},"movies":{"categories":[2000]}
+    }});
+    let (status, provider) = request(&base, "POST", "/api/v1/providers", config.clone()).await;
+    assert_eq!(status, 201, "{provider}");
+    let provider_id = provider["id"].as_str().unwrap();
+    let mut tags = Vec::new();
+    for media in ["tv", "movies"] {
+        let path = format!("/api/v1/{media}/tags");
+        let (status, tag) = request(&base, "POST", &path, json!({"label":"legacy"})).await;
+        assert_eq!(status, 201);
+        let id = tag["id"].as_i64().unwrap();
+        c.execute(
+            "INSERT INTO provider_scope_tags(provider_id,media_type,tag_id) VALUES(?,?,?)",
+            libsql::params![provider_id, media, id],
+        )
+        .await
+        .unwrap();
+        tags.push((path, id));
+    }
+    let route = format!("/api/v1/providers/{provider_id}");
+    let mut edit = config;
+    edit["revision"] = provider["revision"].clone();
+    edit["name"] = json!("Renamed indexer");
+    let (status, updated) = request(&base, "PUT", &route, edit.clone()).await;
+    assert_eq!(status, 200, "{updated}");
+    for (path, id) in &tags {
+        let (status, detail) =
+            request(&base, "GET", &format!("{path}/detail/{id}"), Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(detail["in_use"], true);
+        let (status, error) = request(&base, "DELETE", &format!("{path}/{id}"), Value::Null).await;
+        assert_eq!(status, 409, "{error}");
+        assert_eq!(error["error"]["code"], "tag_in_use");
+    }
+    edit["revision"] = updated["revision"].clone();
+    edit["settings"]["movies"] = Value::Null;
+    let (status, updated) = request(&base, "PUT", &route, edit).await;
+    assert_eq!(status, 200, "{updated}");
+    // Removing a domain releases only that domain's tag assignment.
+    let (tv, tv_id) = &tags[0];
+    assert_eq!(
+        request(&base, "DELETE", &format!("{tv}/{tv_id}"), Value::Null)
+            .await
+            .0,
+        409
+    );
+    let (movies, movie_id) = &tags[1];
+    assert_eq!(
+        request(
+            &base,
+            "DELETE",
+            &format!("{movies}/{movie_id}"),
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
 }
 
 #[tokio::test]

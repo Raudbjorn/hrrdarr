@@ -50,3 +50,8 @@ Nine tracker-specific indexers share one registry family, one settings shape (`T
 - Category discovery is not supported for trackers; categories must be entered by hand. Snapshot import of Sonarr/Radarr tracker rows is not supported.
 - Live rate-limit behaviour, authentication renewal, pagination beyond one document, Atom feeds, relative dates and remote Turso are not covered.
 - The browser script (`frontend/tests/tracker-provider-browser.mjs`) covers HDBits and Nyaa only; the other seven trackers are covered by API tests and frontend helper unit tests, not by the browser.
+
+Account usernames are also redacted from public release titles and language metadata.
+Names of at least eight Unicode characters are removed as substrings; shorter names
+match only at Unicode alphanumeric boundaries so episode numbers and ordinary words
+are not corrupted. Private acquisition locators retain their required credentials.

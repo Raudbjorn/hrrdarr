@@ -1926,3 +1926,33 @@ async fn public_feed_selectors_preserve_titles_and_fanzub_sends_optional_cookie(
         }
     }
 }
+
+#[tokio::test]
+async fn account_tracker_search_metadata_redacts_echoed_usernames() {
+    let h = harness().await;
+    for (index, username) in [(5, "flist"), (6, "hdb"), (7, "ptpuser"), (8, "potuser")] {
+        let spec = &specs()[index];
+        let (code, provider) = request(&h.base, "POST", "/api/v1/providers", body(&h, spec)).await;
+        assert_eq!(code, 201, "{provider}");
+        let (code, response) = request(
+            &h.base,
+            "POST",
+            &format!(
+                "/api/v1/providers/{}/search",
+                provider["id"].as_str().unwrap()
+            ),
+            json!({"kind":"movie","title":username,"limit":10}),
+        )
+        .await;
+        assert_eq!(code, 200, "{response}");
+        let title = response["page"]["items"][0]["title"].as_str().unwrap();
+        assert!(
+            title.contains("[redacted]") && !title.contains(username),
+            "{title}"
+        );
+        assert!(
+            title.contains("1080p"),
+            "unrelated quality survives: {title}"
+        );
+    }
+}

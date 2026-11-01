@@ -143,3 +143,24 @@ async fn operator_converts_once_and_never_overwrites() -> Result<(), Error> {
     drop(scratch);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn other_maintenance_commands_reject_non_unicode_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    for command in ["recover-collection-policy", "convert-draft-database"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_hrrdarr"))
+            .arg(command)
+            .arg(std::ffi::OsString::from_vec(vec![0xff]))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("maintenance command arguments must be UTF-8"),
+            "{error}"
+        );
+        assert!(!error.contains("panicked"), "{error}");
+    }
+}

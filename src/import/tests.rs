@@ -74,6 +74,115 @@ async fn stage_and_publish(db: &Database, id: &str, record_publish: bool) -> (Pl
     }
     (plan, stage)
 }
+/// Longest any test waits for the database import permit (or an owned worker) to settle. These
+/// events take milliseconds; the bound only matters when a lease leaks or another test holds the
+/// permit, and then the panic names the owner and phase instead of spinning (issue #40).
+const PERMIT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const PERMIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+thread_local! {
+    // Each current-thread test runtime has independent phase diagnostics, like its database permit.
+    static PHASE: std::cell::RefCell<(&'static str, Option<std::time::Instant>)> = const {
+        std::cell::RefCell::new(("not_started", None))
+    };
+}
+fn phase(name: &'static str) {
+    PHASE.with(|phase| {
+        let mut current = phase.borrow_mut();
+        if let Some(since) = current.1 {
+            eprintln!("{}", serde_json::json!({"event":"import_test_phase","phase":current.0,"elapsed_ms":since.elapsed().as_millis()}));
+        }
+        *current = (name, Some(std::time::Instant::now()));
+    });
+}
+fn current_phase() -> &'static str {
+    PHASE.with(|phase| phase.borrow().0)
+}
+/// Describes who holds the permit, without private paths: the owning operation (or `foreign`
+/// when it is not this test's), the journal phase and how many database handles remain alive.
+async fn permit_diagnostics(
+    what: &str,
+    permit_id: u64,
+    db: Option<&Arc<Database>>,
+    operation: Option<&str>,
+    waited: std::time::Duration,
+) -> String {
+    let owner = PERMITS
+        .lock()
+        .map(|permits| permits.get(&permit_id).cloned())
+        .unwrap_or_else(|_| Some("poisoned".into()));
+    let ownership = match (&owner, operation) {
+        (None, _) => "none",
+        (Some(owner), Some(own)) if owner == own => "this_operation",
+        (Some(_), _) => "foreign_or_unrelated",
+    };
+    let journal = match (db, operation) {
+        (Some(db), Some(operation)) => match db.connect().await {
+            Ok(c) => match load(&c, operation).await {
+                Ok(r) => format!(
+                    "phase={} error={:?} path_failure={:?}",
+                    r.phase, r.error, r.path_failure
+                ),
+                Err(e) => format!("unreadable code={}", e.code()),
+            },
+            Err(_) => "connect_failed".into(),
+        },
+        _ => "not_applicable".into(),
+    };
+    format!(
+        "{what}: waited {} ms; test_phase={} executing={} permit_owner={:?} ownership={ownership} journal=[{journal}] db_handles={:?}",
+        waited.as_millis(),
+        current_phase(),
+        permit_held(permit_id),
+        owner,
+        db.map(Arc::strong_count),
+    )
+}
+/// Waits for the execution permit to be released, with a deadline and ownership diagnostics.
+async fn wait_permit_released(permit_id: u64, db: Option<&Arc<Database>>, operation: Option<&str>) {
+    let started = std::time::Instant::now();
+    while permit_held(permit_id) {
+        if started.elapsed() >= PERMIT_WAIT_BUDGET {
+            panic!(
+                "{}",
+                permit_diagnostics(
+                    "permit not released",
+                    permit_id,
+                    db,
+                    operation,
+                    started.elapsed()
+                )
+                .await
+            );
+        }
+        tokio::time::sleep(PERMIT_POLL).await;
+    }
+}
+/// Waits for an owned background import to report `complete` and then release the permit.
+async fn wait_owned_complete(db: &Arc<Database>, operation: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        let current = status(db.clone(), operation).await.unwrap();
+        assert!(current.error_code.is_none());
+        if current.status == "complete" {
+            break;
+        }
+        if started.elapsed() >= PERMIT_WAIT_BUDGET {
+            panic!(
+                "{}",
+                permit_diagnostics(
+                    "owned import not complete",
+                    db.permit_id(),
+                    Some(db),
+                    Some(operation),
+                    started.elapsed()
+                )
+                .await
+            );
+        }
+        tokio::time::sleep(PERMIT_POLL).await;
+    }
+    wait_permit_released(db.permit_id(), Some(db), Some(operation)).await;
+}
 async fn count(db: &Database, table: &str) -> i64 {
     db.connect()
         .await
@@ -89,15 +198,37 @@ async fn count(db: &Database, table: &str) -> i64 {
         .unwrap()
 }
 
+// The four sub-suites below once ran inside the restart test as one ~230 s silent aggregate (about
+// 215 s of it: durable_path_diagnostics 42 s, owned 67 s, same_path 72 s, recycle 33 s, observed
+// serially at load ~20; each opens dozens of freshly migrated databases). Each is now its own
+// test so libtest reports progress per suite. Each scratch database has its own permit. Budget: each suite < 120 s on an idle
+// host, < 300 s under heavy host load; the permit waits inside have their own 30 s deadlines.
+#[tokio::test]
+async fn durable_path_diagnostics_persist_each_failure_boundary() {
+    phase("durable_path_diagnostics");
+    durable_path_diagnostics().await;
+}
+#[tokio::test]
+async fn owned_replacements_preserve_originals_and_recover() {
+    phase("owned_replacements");
+    owned_cases::replacements().await;
+}
+#[tokio::test]
+async fn same_path_replacements_preserve_originals_and_recover() {
+    phase("same_path_replacements");
+    same_path_cases::replacements().await;
+}
+#[tokio::test]
+async fn recycle_upgrades_retire_originals_after_commit() {
+    phase("recycle_upgrades");
+    recycle_cases::upgrades().await;
+}
+
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
-    durable_path_diagnostics().await;
-    // These execute() cases share one scratch database each; the effect permit is per database,
-    // so unrelated tests (each with its own database) cannot make them observe `import_busy`.
+    phase("manual_hidden_extension_mapping");
     manual_hidden_extension_filename_preserves_explicit_mapping().await;
-    owned_cases::replacements().await;
-    same_path_cases::replacements().await;
-    recycle_cases::upgrades().await;
+    phase("restart_after_publication");
     // These use the real phase helpers and reopen the owned database between interruption and
     // execute. Boundary setup stops before the next journal write; it does not mock recovery.
     for movie in [false, true] {
@@ -123,6 +254,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
         assert_eq!(stage.size(), 22);
         drop(db);
     }
+    phase("interrupted_copy");
     // An interrupted copy can restart only after its private stage identity was recorded.
     let dir = Scratch::new();
     let db = dir.database().await;
@@ -147,6 +279,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
         b"verified-media-content"
     );
     drop(db);
+    phase("publication_transaction_failure");
     // Transaction failure after physical publication retains both files and no partial DB rows.
     let dir = Scratch::new();
     let db = dir.database().await;
@@ -170,6 +303,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     assert!(!std::path::Path::new(&dir.path("downloads/media")).exists());
     assert_eq!(count(&db, "import_history").await, 1);
     drop(db);
+    phase("changed_source_after_commit");
     // A changed source after DB commit is retained. Restoring the exact inode/content permits retry.
     let dir = Scratch::new();
     let db = dir.database().await;
@@ -199,6 +333,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     std::fs::rename(dir.path("downloads/original"), dir.path("downloads/media")).unwrap();
     assert_eq!(execute(db.clone(), &id).await.unwrap().status, "complete");
     drop(db);
+    phase("quarantine_without_checkpoint");
     // Quarantine rename completed, but source_retired was not checkpointed. Recovery finds the
     // verified quarantined inode, not the unrelated new file at the old source pathname.
     let dir = Scratch::new();
@@ -226,6 +361,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     );
     assert_eq!(count(&db, "import_history").await, 1);
     drop(db);
+    phase("retired_without_completion");
     // Source unlink and stage cleanup happened, but the completion checkpoint did not.
     let dir = Scratch::new();
     let db = dir.database().await;
@@ -256,6 +392,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     );
     assert_eq!(count(&db, "import_history").await, 1);
     drop(db);
+    phase("abort_keeps_lease");
     // Aborting the async waiter does not release the database owner or execution permit while
     // its blocking filesystem job is alive (also the runtime-shutdown ownership boundary).
     let dir = Scratch::new();
@@ -282,12 +419,9 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     assert!(Database::open_local(dir.0.join("db")).await.is_err());
     assert!(permit_held(permit_id));
     release_tx.send(()).unwrap();
-    let started = std::time::Instant::now();
-    while permit_held(permit_id) {
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        tokio::task::yield_now().await;
-    }
+    wait_permit_released(permit_id, None, None).await;
     drop(dir.database().await);
+    phase("rescan_conflict");
     // An active rescan for the same series must reject preview->staging as a transient conflict
     // (not a permanent journal failure) and must never persist `error_code` for it -- doing so
     // would make `manual_import::run` treat a self-resolving race as a durable terminal failure.
@@ -334,6 +468,7 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     .unwrap();
     drop(c);
     assert_eq!(execute(db.clone(), &id).await.unwrap().status, "complete");
+    phase("done");
 }
 
 #[tokio::test]

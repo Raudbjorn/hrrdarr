@@ -140,7 +140,7 @@ pub(super) async fn fixture(
 pub(super) async fn replacements() {
     linked_preview_retains_prior_path_diagnosis().await;
     custom_format_naming_changes_reject_before_journaling().await;
-    // Keep execute() regressions within the shared serial recovery test: its permit is global.
+    // These cases share one owned database at a time, retaining its effect permit through recovery.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
     legacy_revision_marker_conflict_preserves_sources().await;
@@ -239,21 +239,7 @@ pub(super) async fn replacements() {
                 start_owned(db.clone(), &op).await.unwrap(),
                 StartOwned::Started
             );
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let current = status(db.clone(), &op).await.unwrap();
-                    assert!(current.error_code.is_none());
-                    if current.status == "complete" {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            while permit_held(db.permit_id()) {
-                tokio::task::yield_now().await;
-            }
+            wait_owned_complete(&db, &op).await;
         } else {
             assert_eq!(execute(db.clone(), &op).await.unwrap().status, "complete");
         }
@@ -442,13 +428,7 @@ pub(super) async fn replacements() {
         start_owned(db.clone(), &op).await.unwrap(),
         StartOwned::Started
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while permit_held(db.permit_id()) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_permit_released(db.permit_id(), Some(&db), Some(&op)).await;
     assert_eq!(
         start_owned(db.clone(), &op).await.unwrap_err().code(),
         "resume_required"

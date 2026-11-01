@@ -169,7 +169,7 @@ are a separate server-validated workflow:
 | GET `/api/v1/tv/series/lookup/{id}` | Validated series details, seasons and episode catalog |
 | GET `/api/v1/movies/lookup/{id}` | Validated movie catalog details |
 | POST `/api/v1/tv/series/lookup` | `{tvdb_id,path,settings?}`; HTTP 201 library resource |
-| POST `/api/v1/movies/lookup` | `{tmdb_id,path,settings?}`; HTTP 201 library resource |
+| POST `/api/v1/movies/lookup` | `{tmdb_id,path,settings?,monitor?,collection_expected_revision?}`; HTTP 201 library resource |
 
 Lookup results include `media_type` so equal TV/movie external IDs remain distinct.
 POST accepts a canonical selected ID, never a caller-supplied title/episode payload
@@ -189,6 +189,12 @@ not reinterpret this initial graph. All nullable episode facts remain absent whe
 not supplied. TVDB identities, dates, absolute numbers, runtime, overview and finale
 type are retained where supported by existing columns; no file association is invented.
 TV IMDb metadata has no current series storage field and is not persisted.
+
+Movie selected add accepts `monitor`: `movie_only` (default), `movie_and_collection`, or `none`.
+`movie_and_collection` monitors the movie and enables its collection policy; an existing policy
+requires its current `collection_expected_revision`. That revision is rejected for the other
+monitoring modes. `none` creates the movie unmonitored. Import-list adds use the same catalog add
+transaction, including list exclusions and provenance, without implicitly enabling collection monitoring.
 
 Movie selected add uses the existing separate catalog/membership logic: exactly
 matching catalog facts can be adopted, while conflicting metadata or existing library

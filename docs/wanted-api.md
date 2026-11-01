@@ -68,7 +68,7 @@ All children are inserted in one Immediate transaction as ordinary `search_comma
 
 ### Durable receipts
 
-Every admission, **including one that matches nothing or whose matches are all already being searched**, writes a receipt in the same Immediate transaction as its children (migration `0091_wanted_search_receipts.sql`, ordinal 83): request UUID, canonical-body digest, domain, `matched` / `skipped_active` / `admitted` and the admitted target identities with their deterministic child command IDs (`wanted_search_receipts`, `wanted_search_receipt_targets`). Provider credentials and payloads are not stored; the digest binds provider, revision, client selection, kind, filter, priority and domain. A receipt and its children commit or roll back together, and duplicate UUIDs are serialized by the transaction.
+Every admission, **including one that matches nothing or whose matches are all already being searched**, writes a receipt in the same Immediate transaction as its children (migration `0091_wanted_search_receipts.sql`, at the end of each supported history; see [migration compatibility](migration-compatibility.md)): request UUID, canonical-body digest, domain, `matched` / `skipped_active` / `admitted` and the admitted target identities with their deterministic child command IDs (`wanted_search_receipts`, `wanted_search_receipt_targets`). Provider credentials and payloads are not stored; the digest binds provider, revision, client selection, kind, filter, priority and domain. A receipt and its children commit or roll back together, and duplicate UUIDs are serialized by the transaction.
 
 A retry authenticates against the receipt **before** selecting targets or reading providers:
 

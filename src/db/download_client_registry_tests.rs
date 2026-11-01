@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(83)]] // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
+        vec![vec![libsql::Value::Integer(85)]] // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();

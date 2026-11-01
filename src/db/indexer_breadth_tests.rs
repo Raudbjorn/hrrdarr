@@ -38,8 +38,8 @@ const SEARCHABLE: [&str; 7] = [
     "passthepopcorn",
     "torrentpotato",
 ];
-// Main's 81 published entries remain unchanged; tracker breadth is appended.
-const BREADTH_MIGRATION: usize = 81;
+// Main's 83 published entries remain unchanged; tracker breadth is appended.
+const BREADTH_MIGRATION: usize = 83;
 
 async fn count(c: &Connection, sql: &str) -> Result<i64, Error> {
     Ok(c.query(sql, ()).await?.next().await?.unwrap().get(0)?)
@@ -298,10 +298,10 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
     integrity(&c).await?;
     assert_eq!(
         count(&c, "SELECT count(*) FROM schema_migrations").await?,
-        MIGRATIONS.len() as i64 // Reasoning: opening the 81-entry prior head applies 82 (breadth) and every later entry, so the history is the whole registry.
+        MIGRATIONS.len() as i64 // Reasoning: opening the 83-entry prior head applies 84 (breadth) and every later entry, so the history is the whole registry.
     );
     assert_eq!(
-        c.query("SELECT name FROM schema_migrations WHERE version=82", ())
+        c.query("SELECT name FROM schema_migrations WHERE version=84", ())
             .await?
             .next()
             .await?
@@ -359,84 +359,168 @@ async fn upgrade_from_the_previous_head_preserves_data_and_applies_the_breadth_s
             "SELECT count(*) FROM schema_migrations"
         )
         .await?,
-        MIGRATIONS.len() as i64 // Reasoning: opening the 81-entry prior head applies 82 (breadth) and every later entry, so the history is the whole registry.
+        MIGRATIONS.len() as i64 // Reasoning: opening the 83-entry prior head applies 84 (breadth) and every later entry, so the history is the whole registry.
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn displaced_pr32_history_is_refused_without_changing_populated_state() -> Result<(), Error> {
-    let scratch = Scratch::new();
-    let path = scratch.0.join("db");
-    let raw = libsql::Builder::new_local(&path).build().await?;
-    let c = raw.connect()?;
-    c.execute("PRAGMA foreign_keys=OFF", ()).await?;
-    c.execute(HISTORY_SQL, ()).await?;
-    // Pin the two entries published by 3987479 before main acquired ordinals 79–81.
-    let displaced = [
-        (
-            "indexer_breadth",
-            include_str!("../../migrations/0090_indexer_breadth.sql"),
-        ),
-        (
-            "wanted_search_receipts",
-            include_str!("../../migrations/0091_wanted_search_receipts.sql"),
-        ),
-    ];
+async fn published_pr32_histories_upgrade_preserving_trackers_receipts_and_replay()
+-> Result<(), Error> {
+    use crate::{
+        api::MediaDomain,
+        commands::{CommandPriority, rss::RssTargetInput, search::admit_wanted},
+        providers,
+    };
+    use std::sync::Arc;
+    use uuid::Uuid;
+    // These are the exact tracker/receipt SQL bytes published by both PR #32 histories.
     assert_eq!(
-        checksum(displaced[0].1),
+        checksum(MIGRATIONS[83].1),
         "50673b8113cf6102a7356a346095d7ef9b15e045ccc7b0c76ca5d571dffcdc99"
     );
     assert_eq!(
-        checksum(displaced[1].1),
+        checksum(MIGRATIONS[84].1),
         "491bd8399c1ecc1fc4c403e3c4196ac35166fc3551f1ccb96a513d22a863f8f6"
     );
-    for (i, (name, sql)) in MIGRATIONS[..78].iter().chain(displaced.iter()).enumerate() {
-        c.execute_batch(sql).await?;
+    for (history, prefix, has_receipts) in [
+        (INDEXER_EARLY_MIGRATIONS, 79, false),
+        (INDEXER_EARLY_MIGRATIONS, 80, true),
+        (INDEXER_MAIN_MIGRATIONS, 82, false),
+        (INDEXER_MAIN_MIGRATIONS, 83, true),
+    ] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("db");
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        c.execute("PRAGMA foreign_keys=OFF", ()).await?;
+        c.execute(HISTORY_SQL, ()).await?;
+        for (i, (name, sql)) in history.iter().take(prefix).enumerate() {
+            c.execute_batch(sql).await?;
+            c.execute(
+                "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
+                params![i as i64 + 1, *name, checksum(sql), *sql],
+            )
+            .await?;
+        }
+        c.execute("PRAGMA foreign_keys=ON", ()).await?;
+        let tracker_id = tracker(&c, "nyaa", &[("tv", 1), ("movies", 1)]).await?;
+        c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Retained TV','/owned/tv');
+            INSERT INTO seasons(series_id,number) VALUES(1,1);
+            INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Retained episode');
+            INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,101,'Retained movie');
+            INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/owned/movie');").await?;
+        let request = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let command = [Uuid::new_v4(), Uuid::new_v4()];
+        if has_receipts {
+            for (i, media) in ["tv", "movies", "tv"].iter().enumerate() {
+                let admitted = i64::from(i < 2);
+                c.execute("INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) VALUES(?,?,zeroblob(32),?,0,?,1000,9007199254740991)",params![request[i].to_string(), *media, admitted, admitted]).await?;
+                if i < 2 {
+                    c.execute("INSERT INTO wanted_search_receipt_targets(request_id,target_id,command_id)VALUES(?,1,?)",params![request[i].to_string(),command[i].to_string()]).await?;
+                }
+            }
+        }
+        let before = rows(&c, "schema_migrations").await?;
+        let providers_before = rows(&c, "providers").await?;
+        let scopes_before = rows(&c, "provider_scopes").await?;
+        drop(c);
+        drop(raw);
+        for reopen in 0..2 {
+            let db = Arc::new(Database::open_local(&path).await?);
+            assert_eq!(db.migration_backup().is_some(), reopen == 0);
+            let c = db.connect().await?;
+            assert_eq!(migration_history(&c).await?, (history.len(), history));
+            assert_eq!(
+                &rows(&c, "schema_migrations").await?[..prefix],
+                before.as_slice()
+            );
+            assert_eq!(rows(&c, "providers").await?, providers_before);
+            assert_eq!(rows(&c, "provider_scopes").await?, scopes_before);
+            assert_eq!(
+                count(
+                    &c,
+                    "SELECT count(*) FROM tracker_scope_options WHERE implementation='nyaa'"
+                )
+                .await?,
+                2
+            );
+            assert_eq!(count(&c, "SELECT count(*) FROM episodes WHERE id=1 AND title='Retained episode' AND native_last_search_at IS NULL").await?, 1);
+            assert_eq!(count(&c, "SELECT count(*) FROM movies WHERE id=1 AND metadata_id=1 AND native_last_search_at IS NULL").await?, 1);
+            if has_receipts {
+                let (_router, client) = providers::router_with_refresh(db.clone(), None);
+                for (i, media) in [MediaDomain::Tv, MediaDomain::Movies, MediaDomain::Tv]
+                    .iter()
+                    .enumerate()
+                {
+                    let source = RssTargetInput {
+                        media_type: *media,
+                        indexer_id: Uuid::parse_str(&tracker_id)?,
+                        indexer_revision: 1,
+                        client_selection: Some(providers::ClientSelection::Default {}),
+                        client_id: None,
+                        client_revision: None,
+                    };
+                    let replay = admit_wanted(
+                        &db,
+                        &client,
+                        request[i],
+                        [0; 32],
+                        source,
+                        CommandPriority::Normal,
+                        true,
+                        async |_, _| panic!("a retained receipt must not recapture targets"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(replay.replayed);
+                    assert_eq!(replay.matched, Some(u32::from(i < 2)));
+                    assert_eq!(replay.children.len(), usize::from(i < 2));
+                    if i < 2 {
+                        assert_eq!(replay.children[0].command_id, command[i]);
+                        assert_eq!(
+                            replay.children[0].target,
+                            if i == 0 {
+                                MediaTarget::Episode(1)
+                            } else {
+                                MediaTarget::Movie(1)
+                            }
+                        );
+                    }
+                    let changed = admit_wanted(
+                        &db,
+                        &client,
+                        request[i],
+                        [1; 32],
+                        source,
+                        CommandPriority::Normal,
+                        true,
+                        async |_, _| panic!("changed receipt must conflict before recapture"),
+                    )
+                    .await;
+                    assert!(changed.is_err());
+                }
+            }
+            integrity(&c).await?;
+        }
+        // Exact-history recognition must never accept a similar but edited PR ledger.
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
         c.execute(
-            "INSERT INTO schema_migrations(version,name,checksum,sql)VALUES(?,?,?,?)",
-            params![i as i64 + 1, *name, checksum(sql), *sql],
+            "UPDATE schema_migrations SET sql=sql||' ' WHERE version=?",
+            [prefix as i64],
         )
         .await?;
-    }
-    c.execute("PRAGMA foreign_keys=ON", ()).await?;
-    tracker(&c, "nyaa", &[("tv", 1), ("movies", 1)]).await?;
-    c.execute_batch("INSERT INTO series(id,title,path) VALUES(1,'Retained TV','/owned/tv');
-        INSERT INTO seasons(series_id,number) VALUES(1,1);
-        INSERT INTO episodes(id,series_id,season,number,title) VALUES(1,1,1,1,'Retained episode');
-        INSERT INTO movie_metadata(id,tmdb_id,title) VALUES(1,101,'Retained movie');
-        INSERT INTO movies(id,metadata_id,path) VALUES(1,1,'/owned/movie');
-        INSERT INTO wanted_search_receipts(request_id,media_type,digest,matched,skipped_active,admitted,created_at,expires_at) VALUES('00000000-0000-4000-8000-000000000001','tv',zeroblob(32),0,0,0,1000,2000);").await?;
-    integrity(&c).await?;
-    // The historical application used WAL too; do not mistake journal-mode setup for migration.
-    c.query("PRAGMA journal_mode=WAL", ()).await?.next().await?;
-    c.query("PRAGMA wal_checkpoint(TRUNCATE)", ())
-        .await?
-        .next()
-        .await?;
-    drop(c);
-    drop(raw);
-    let before = std::fs::read(&path)?;
-    for _ in 0..2 {
-        let error = Database::open_local(&path)
-            .await
-            .err()
-            .expect("displaced branch history needs explicit conversion");
+        drop(c);
+        drop(raw);
         assert!(
-            error
+            Database::open_local(&path)
+                .await
+                .err()
+                .unwrap()
                 .to_string()
-                .contains("migration history mismatch at version 79"),
-            "{error}"
-        );
-        assert!(
-            std::fs::read(&path)? == before,
-            "refusal changed the stopped database bytes"
+                .contains("migration history mismatch")
         );
     }
-    assert_eq!(
-        std::fs::read_dir(&scratch.0)?.count(),
-        1,
-        "refusal must not create a migration backup"
-    );
     Ok(())
 }

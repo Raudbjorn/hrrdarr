@@ -60,6 +60,7 @@ pub mod wanted;
 
 pub mod calendar;
 
+pub mod import_lists;
 pub mod notifications;
 pub mod rename;
 

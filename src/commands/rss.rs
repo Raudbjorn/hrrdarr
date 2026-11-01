@@ -695,6 +695,7 @@ pub(super) async fn claim(c: &Connection, id: Uuid, timestamp: i64) -> Result<Rs
     read(c, id).await
 }
 async fn settle_error(db: &Database, command: &RssCommand, code: &str) -> Result<()> {
+    let raw = code;
     let code = match code {
         "provider_changed"
         | "provider_unavailable"
@@ -706,6 +707,13 @@ async fn settle_error(db: &Database, command: &RssCommand, code: &str) -> Result
         | "candidate_limit" => code,
         _ => "storage_error",
     };
+    if raw != code {
+        // The stored code is a closed set, so the originating internal code would otherwise be lost.
+        eprintln!(
+            "event=rss_command_error_mapped command_id={} raw_code={raw} stored_code={code}",
+            command.id
+        );
+    }
     let retry = matches!(code, "refresh_timeout" | "refresh_failed" | "storage_error")
         && command.attempts < 3;
     let c = connection(db).await?;

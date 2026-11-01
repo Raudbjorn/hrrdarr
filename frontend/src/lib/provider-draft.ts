@@ -147,13 +147,14 @@ export function trackerScope(draft:TrackerDraft,info:TrackerInfo):{scope:Tracker
   }
   return {scope:{enable_rss:draft.rss,enable_automatic_search:info.searchable?draft.automatic:false,enable_interactive_search:info.searchable?draft.interactive:false,minimum_seeders:minimumSeeders,categories}};
 }
-/** `name=value` per line (a bare `48` or `48=` is an empty value); null when a line is not a valid parameter. */
+/** `name=value` per line; IPTorrents also accepts bare numeric category flags such as `48`. */
 export function parseParameters(text:string,allowNumericNames=false):IndexerParameter[]|null{
   const lines=text.split('\n').map(line=>line.trim()).filter(Boolean);
   if(lines.length>16)return null;
   const parameters:IndexerParameter[]=[];
   for(const line of lines){
     const at=line.indexOf('=');
+    if(at<0&&!(allowNumericNames&&/^\d+$/.test(line)))return null;
     const name=at<0?line:line.slice(0,at).trim(),value=at<0?'':line.slice(at+1).trim();
     if(!(allowNumericNames?/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/:/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/).test(name)||value.length>1024||/[\u0000-\u001f\u007f]/.test(value)||parameters.some(item=>item.name.toLowerCase()===name.toLowerCase()))return null;
     parameters.push({name,value});

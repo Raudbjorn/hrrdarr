@@ -48,13 +48,28 @@ async fn scalar(c: &Connection, sql: &str) -> i64 {
         .get::<i64>(0)
         .unwrap()
 }
-/// Other library tests share the process-wide file-effect permit; retry only its refusal.
+/// A prior owned operation may still hold this database permit; retry only its refusal.
 async fn execute_owned(db: &Arc<Database>, op: &str) -> Result<Operation> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match execute(db.clone(), op).await {
             Err(e) if e.code() == "import_busy" && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(e) if e.code() == "import_busy" => {
+                // Out of budget: say who holds the permit instead of returning a bare refusal.
+                eprintln!(
+                    "{}",
+                    permit_diagnostics(
+                        "execute_owned out of budget",
+                        db.permit_id(),
+                        Some(db),
+                        Some(op),
+                        std::time::Duration::from_secs(30)
+                    )
+                    .await
+                );
+                return Err(e);
             }
             other => return other,
         }

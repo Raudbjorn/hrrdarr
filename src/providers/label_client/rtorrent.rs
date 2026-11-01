@@ -298,7 +298,7 @@ fn torrent(row: &Xv) -> Result<RawTorrent> {
     }
     let name = text(1, 1024)?;
     let directory = text(3, 4096)?;
-    let multi = int(4)? != 0;
+    let _ = int(4)?;
     let size = int(5)?.max(0) as u64;
     let complete = int(9)? != 0;
     let downloaded = if complete {
@@ -307,16 +307,8 @@ fn torrent(row: &Xv) -> Result<RawTorrent> {
         (int(6)?.max(0) as u64).min(size)
     };
     let message = text(11, 4096)?;
-    // A multi-file torrent's directory already includes its own name; the engine's file paths are
-    // relative to the folder that contains it.
-    let save_path = if multi {
-        match directory.rsplit_once('/') {
-            Some((parent, last)) if last == name && !parent.is_empty() => parent.to_owned(),
-            _ => directory,
-        }
-    } else {
-        directory
-    };
+    // f.path is relative to d.directory, whose final component may differ from d.name.
+    let save_path = directory;
     let state = if int(10)? != 0 {
         RawState::Checking
     } else if size == 0 {
@@ -391,14 +383,6 @@ impl Wire for RtorrentWire<'_, '_> {
     }
     async fn files(&mut self, hash: &str) -> Result<Vec<RawFile>> {
         let upper = hash.to_ascii_uppercase();
-        let name = self.call("d.name", &[Arg::Str(upper.clone())]).await?;
-        let name = name.text().ok_or(QbitError::InvalidResponse)?.to_owned();
-        let multi = self
-            .call("d.is_multi_file", &[Arg::Str(upper.clone())])
-            .await?
-            .int()
-            .ok_or(QbitError::InvalidResponse)?
-            != 0;
         let mut args = vec![Arg::Str(upper), Arg::s("")];
         args.extend(
             [
@@ -427,11 +411,7 @@ impl Wire for RtorrentWire<'_, '_> {
                 let done = cells[2].int().ok_or(QbitError::InvalidResponse)?.max(0) as f64;
                 let chunks = cells[3].int().ok_or(QbitError::InvalidResponse)?.max(0) as f64;
                 Ok(RawFile {
-                    path: if multi {
-                        format!("{name}/{path}")
-                    } else {
-                        path.to_owned()
-                    },
+                    path: path.to_owned(),
                     size_bytes: size,
                     downloaded_bytes: if chunks == 0.0 {
                         0

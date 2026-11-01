@@ -16,8 +16,10 @@ pub enum MediaTarget {
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+pub mod collection_policy_recovery;
 mod convert;
 pub mod custom_formats;
+pub mod draft_conversion;
 pub use convert::{ConversionReport, convert_premerge_pr32, premerge_ledger};
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -329,6 +331,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0078_provider_authority.sql"),
     ),
     (
+        "import_lists",
+        include_str!("../../migrations/0080_import_lists.sql"),
+    ),
+    (
+        "import_list_search",
+        include_str!("../../migrations/0084_import_list_search.sql"),
+    ),
+    (
         "wanted_last_search",
         include_str!("../../migrations/0079_wanted_last_search.sql"),
     ),
@@ -337,7 +347,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0080_library_root_health.sql"),
     ),
     ("backups", include_str!("../../migrations/0081_backups.sql")),
-    // Keep main's published 1–81 prefix; branch migrations follow at 82 and 83.
+    // Append to main's fresh-database history without rewriting its first 83 entries.
     (
         "indexer_breadth",
         include_str!("../../migrations/0090_indexer_breadth.sql"),
@@ -347,6 +357,63 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0091_wanted_search_receipts.sql"),
     ),
 ];
+// Main published Wanted/health/backups before this PR's two import-list migrations.
+const MAIN_MIGRATIONS: &[Migration] = &{
+    let mut history = [("", ""); 85];
+    let mut index = 0;
+    while index < 78 {
+        history[index] = MIGRATIONS[index];
+        index += 1;
+    }
+    history[78] = MIGRATIONS[80];
+    history[79] = MIGRATIONS[81];
+    history[80] = MIGRATIONS[82];
+    history[81] = MIGRATIONS[78];
+    history[82] = MIGRATIONS[79];
+    history[83] = MIGRATIONS[83];
+    history[84] = MIGRATIONS[84];
+    history
+};
+
+// PR #32's published main-merged history (8032213) keeps tracker/receipt ordinals 82–83.
+const INDEXER_MAIN_MIGRATIONS: &[Migration] = &{
+    let mut history = [("", ""); 85];
+    let mut index = 0;
+    while index < 81 {
+        history[index] = MAIN_MIGRATIONS[index];
+        index += 1;
+    }
+    history[81] = MIGRATIONS[83];
+    history[82] = MIGRATIONS[84];
+    history[83] = MIGRATIONS[78];
+    history[84] = MIGRATIONS[79];
+    history
+};
+// PR #32 before that merge (3987479) keeps tracker/receipt ordinals 79–80.
+const INDEXER_EARLY_MIGRATIONS: &[Migration] = &{
+    let mut history = [("", ""); 85];
+    let mut index = 0;
+    while index < 78 {
+        history[index] = MIGRATIONS[index];
+        index += 1;
+    }
+    history[78] = MIGRATIONS[83];
+    history[79] = MIGRATIONS[84];
+    history[80] = MIGRATIONS[80];
+    history[81] = MIGRATIONS[81];
+    history[82] = MIGRATIONS[82];
+    history[83] = MIGRATIONS[78];
+    history[84] = MIGRATIONS[79];
+    history
+};
+const HISTORIES: [&[Migration]; 5] = [
+    MIGRATIONS,
+    MAIN_MIGRATIONS,
+    LEGACY_MIGRATIONS,
+    INDEXER_MAIN_MIGRATIONS,
+    INDEXER_EARLY_MIGRATIONS,
+];
+
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
     sql TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)";
@@ -607,44 +674,105 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn version(conn: &Connection) -> Result<usize, Error> {
-    let exists = scalar(
+type Migration = (&'static str, &'static str);
+
+/// Fixed text only: the stored name and checksum are compared, never echoed. The database was not
+/// modified.
+fn history_mismatch(version: i64, name: &str, recorded_checksum: &str) -> String {
+    // The unpublished PR #31 draft ledger (draft head 1431d97) shares versions 1 through 62 with the
+    // main lineage and first differs at version 63. A row that is exactly the draft's row for its
+    // version only improves this message; startup still rejects it. `draft_conversion` builds a new,
+    // supported database from it (issue #44).
+    let draft = usize::try_from(version)
+        .ok()
+        .and_then(|v| v.checked_sub(50))
+        .and_then(|i| draft_conversion::DRAFT_TAIL.get(i))
+        .is_some_and(|&(draft_name, draft_checksum)| {
+            draft_name == name && draft_checksum == recorded_checksum
+        });
+    let draft = if draft {
+        " This row is part of the unpublished PR #31 draft ledger (draft head 1431d97). Convert it into a new database with `hrrdarr convert-draft-database --from <this database> --to <new database>` (see docs/draft-database-conversion.md); the source is never modified."
+    } else {
+        ""
+    };
+    format!(
+        "migration history mismatch at version {version}; restore or reconcile the schema before startup.{draft} The database was not modified. Recovery: restore a backup taken before this history was written (pre-upgrade backups are kept in `.hrrdarr-migration-*` directories beside the database), or start a new database and re-import through the snapshot importer. Never edit `schema_migrations` by hand."
+    )
+}
+
+async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migration]), Error> {
+    if scalar(
         conn,
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='schema_migrations'",
     )
-    .await?;
-    if exists == 0 {
+    .await?
+        == 0
+    {
         validate_prototype(conn).await?;
-        return Ok(0);
+        return Ok((0, MIGRATIONS));
     }
     let mut rows = conn
         .query(
-            "SELECT version, name, checksum, sql FROM schema_migrations ORDER BY version",
+            "SELECT version,name,checksum,sql FROM schema_migrations ORDER BY version",
             (),
         )
         .await?;
     let mut count = 0;
+    let mut main_matches = true;
+    let mut legacy_matches = true;
+    let mut incoming_matches = true;
+    let mut indexer_main_matches = true;
+    let mut indexer_early_matches = true;
     while let Some(row) = rows.next().await? {
         let n: i64 = row.get(0)?;
-        let Some(&(name, sql)) = MIGRATIONS.get(count) else {
-            return Err(format!(
-                "unknown migration version {n}; use the matching application version"
-            )
-            .into());
+        let name: String = row.get(1)?;
+        let recorded_checksum: String = row.get(2)?;
+        let recorded_sql: String = row.get(3)?;
+        let matches = |history: &[Migration]| {
+            history.get(count).is_some_and(|&(expected_name, sql)| {
+                n == (count + 1) as i64
+                    && name == expected_name
+                    && recorded_checksum == checksum(sql)
+                    && recorded_sql == sql
+            })
         };
-        if n != (count + 1) as i64
-            || row.get::<String>(1)? != name
-            || row.get::<String>(2)? != checksum(sql)
-            || row.get::<String>(3)? != sql
+        main_matches &= matches(MIGRATIONS);
+        legacy_matches &= matches(LEGACY_MIGRATIONS);
+        incoming_matches &= matches(MAIN_MIGRATIONS);
+        indexer_main_matches &= matches(INDEXER_MAIN_MIGRATIONS);
+        indexer_early_matches &= matches(INDEXER_EARLY_MIGRATIONS);
+        if !main_matches
+            && !legacy_matches
+            && !incoming_matches
+            && !indexer_main_matches
+            && !indexer_early_matches
         {
-            return Err(format!("migration history mismatch at version {n}; restore or reconcile the schema before startup").into());
+            return Err(history_mismatch(n, &name, &recorded_checksum).into());
         }
         count += 1;
     }
     if count == 0 {
         return Err("empty migration history is not a recognized schema".into());
     }
-    Ok(count)
+    // An exact shared prefix through 49 can safely continue along the current main lineage.
+    Ok((
+        count,
+        if main_matches {
+            MIGRATIONS
+        } else if incoming_matches {
+            MAIN_MIGRATIONS
+        } else if indexer_main_matches {
+            INDEXER_MAIN_MIGRATIONS
+        } else if indexer_early_matches {
+            INDEXER_EARLY_MIGRATIONS
+        } else {
+            LEGACY_MIGRATIONS
+        },
+    ))
+}
+
+async fn version(conn: &Connection) -> Result<usize, Error> {
+    Ok(migration_history(conn).await?.0)
 }
 
 async fn validate_prototype(conn: &Connection) -> Result<(), Error> {
@@ -735,8 +863,8 @@ async fn integrity(conn: &Connection) -> Result<(), Error> {
 
 async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<PathBuf>, Error> {
     integrity(&conn).await?;
-    let current = version(&conn).await?;
-    if current == MIGRATIONS.len() {
+    let (current, migrations) = migration_history(&conn).await?;
+    if current == migrations.len() {
         return Ok(None);
     }
     let path = local_path.ok_or("pending remote schema migrations require a verified remote backup/recovery strategy; database unchanged")?;
@@ -761,10 +889,19 @@ async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<P
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .await?;
     let result: Result<(), Error> = async {
-        if version(&tx).await? != current { return Err("schema changed during migration preflight".into()); }
+        let (checked_version, checked_migrations)=migration_history(&tx).await?;
+        if checked_version != current || migrations != checked_migrations { return Err("schema changed during migration preflight".into()); }
         if current == 0 { tx.execute(HISTORY_SQL, ()).await?; }
-        for (index, &(name, sql)) in MIGRATIONS.iter().enumerate().skip(current) {
+        for (index, &(name, sql)) in migrations.iter().enumerate().skip(current) {
             if index == 1 { validate_legacy_paths(&tx).await?; }
+            // Keep nullable source authority before the immutable PR31 migration normalizes it.
+            if name == "collections_checkpoint_supersede" {
+                tx.execute_batch("CREATE TEMP TABLE pr31_absent_search_on_add AS SELECT collection_id FROM movie_collection_settings WHERE search_on_add IS NULL").await?;
+            }
+            // Published alignment SQL guesses a system domain; never resume an unrecorded route.
+            if name == "main_20261030_alignment" && scalar(&tx, "SELECT count(*) FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence WHERE d.state='pending' AND e.scope='system'").await? > 0 {
+                return Err("pending system notification deliveries have no recorded fan-out domain; current scopes cannot establish historical routing; refusing legacy alignment".into());
+            }
             tx.execute_batch(sql).await.map_err(|e| format!("migration {} ({name}) failed; reconcile legacy relationships before retrying: {e}", index + 1))?;
             integrity(&tx).await?;
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
@@ -875,18 +1012,31 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
     Ok(directory)
 }
 
-/// Migration identity of this build, in runner order: (version, name, checksum).
-pub(crate) fn migration_history() -> Vec<(usize, &'static str, String)> {
-    MIGRATIONS
-        .iter()
-        .enumerate()
-        .map(|(index, (name, sql))| (index + 1, *name, checksum(sql)))
+/// Recognized immutable histories, in runner order: (version, name, checksum).
+pub(crate) fn known_migration_histories() -> Vec<Vec<(usize, &'static str, String)>> {
+    HISTORIES
+        .into_iter()
+        .map(|history| {
+            history
+                .iter()
+                .enumerate()
+                .map(|(index, (name, sql))| (index + 1, *name, checksum(sql)))
+                .collect()
+        })
         .collect()
 }
 
-/// Latest schema version this build can open.
+/// Latest schema version for a fresh database.
 pub fn latest_schema_version() -> usize {
     MIGRATIONS.len()
+}
+
+/// Largest recorded version among all supported published histories.
+pub fn max_schema_version() -> usize {
+    MIGRATIONS
+        .len()
+        .max(MAIN_MIGRATIONS.len())
+        .max(LEGACY_MIGRATIONS.len())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -907,6 +1057,7 @@ pub(crate) async fn vacuum_into(conn: &Connection, target: &Path) -> Result<(), 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SnapshotFacts {
     pub schema_version: usize,
+    pub migrations: Vec<(usize, &'static str, String)>,
     pub sqlite_version: String,
 }
 
@@ -996,10 +1147,18 @@ pub(crate) async fn inspect_snapshot(
     )
     .await
     .map_err(|_| SnapshotError::History)?;
-    if newest > MIGRATIONS.len() as i64 {
+    if newest > max_schema_version() as i64 {
         return Err(SnapshotError::Newer(newest));
     }
-    let schema_version = version(&conn).await.map_err(|_| SnapshotError::History)?;
+    let (schema_version, history) = migration_history(&conn)
+        .await
+        .map_err(|_| SnapshotError::History)?;
+    let migrations = history
+        .iter()
+        .take(schema_version)
+        .enumerate()
+        .map(|(i, (name, sql))| (i + 1, *name, checksum(sql)))
+        .collect();
     let sqlite_version = conn
         .query("SELECT sqlite_version()", ())
         .await
@@ -1012,6 +1171,7 @@ pub(crate) async fn inspect_snapshot(
         .map_err(|_| SnapshotError::Unreadable)?;
     Ok(SnapshotFacts {
         schema_version,
+        migrations,
         sqlite_version,
     })
 }
@@ -1083,7 +1243,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod published_prefix_tests;
+pub(crate) mod published_prefix_tests;
 #[cfg(test)]
 mod review_integrity_tests;
 
@@ -1179,6 +1339,7 @@ mod downloadstation_registry_tests;
 mod flood_registry_tests;
 #[cfg(test)]
 mod nzbget_registry_tests;
+
 #[cfg(test)]
 mod rtorrent_registry_tests;
 #[cfg(test)]
@@ -1187,3 +1348,16 @@ mod torrent_rss_tests;
 mod transmission_registry_tests;
 #[cfg(test)]
 mod utorrent_registry_tests;
+
+include!("legacy_migrations.rs");
+#[cfg(test)]
+mod collection_policy_recovery_tests;
+#[cfg(test)]
+mod draft_conversion_tests;
+#[cfg(test)]
+mod import_list_tests;
+
+#[cfg(test)]
+pub(crate) fn test_migration_histories() -> [&'static [Migration]; 5] {
+    HISTORIES
+}

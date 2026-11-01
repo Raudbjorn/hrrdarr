@@ -1061,12 +1061,16 @@ async fn oversized_non_torrent_queue_is_an_error_not_an_absent_submission() {
     task.abort();
 }
 
-/// Foreign downloads (outside every label folder) that only fill the listing windows.
+/// Unrelated HTTP and torrent downloads still consume inventory windows.
 fn fill(f: &Fixture, count: u32, status: &str) {
     for n in 0..count {
         f.put(dl(
             &format!("{:016x}", 0x1000 + n),
-            &format!("{:040x}", 0x1000 + n),
+            &if n % 2 == 0 {
+                String::new()
+            } else {
+                format!("{:040x}", 0x1000 + n)
+            },
             "Filler",
             "/downloads/other",
             status,
@@ -1122,6 +1126,17 @@ async fn listings_page_through_every_window_and_fail_beyond_the_resource_bound()
             .any(|p| p[0].as_u64() == Some(1000)),
         "the second stopped window is requested"
     );
+    // The per-hash path must find the completed torrent past the first window too.
+    let late_details = label_client::details(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &MediaTarget::Episode(1),
+        &format!("{:040}", 2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(late_details.item.name, "LateDone");
     // Past the resource bound the inventory is refused instead of returned partially.
     fill(&f, 7000, "waiting");
     let result = label_client::query(
@@ -1135,5 +1150,16 @@ async fn listings_page_through_every_window_and_fail_beyond_the_resource_bound()
         matches!(result, Err(QbitError::Http(HttpError::ResponseTooLarge))),
         "an oversized listing must fail closed"
     );
+    assert!(matches!(
+        label_client::details(
+            &client.operation(Uuid::new_v4()).unwrap(),
+            &settings,
+            Some(&login()),
+            &MediaTarget::Episode(1),
+            &format!("{:040}", 2),
+        )
+        .await,
+        Err(QbitError::Http(HttpError::ResponseTooLarge))
+    ));
     task.abort();
 }

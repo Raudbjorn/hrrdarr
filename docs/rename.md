@@ -59,6 +59,12 @@ entries sharing an inode remain a conflict. Cancel stops before the next item; f
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
 plan as unchanged.
 
+Folder destinations are checked against both declared series and movie paths, including equal
+paths and ancestor/descendant overlaps at directory boundaries. An absent destination directory
+does not make a declared path available. The commit transaction repeats this check; a newly
+claimed destination causes the existing journal recovery path to roll the move back. Equal
+numeric movie and series IDs remain distinct owners.
+
 ## Historical failed journals (`failed` / `rollback_incomplete`)
 
 Older binaries could settle an unrestorable group as `failed` with `rollback_incomplete` and
@@ -133,5 +139,5 @@ transaction, then calls observers registered with
   (cause not established; observed-once).
 * Source-faithful Sonarr/Radarr runtime equivalence, V3 wire shapes, scene/absolute edge cases
   beyond the renderer's tested grammar, and extra-file tracking tables are not claimed.
-* The command pool admits `rename_commands`; its schema is preserved from main as migration
-  `0065_rename_commands.sql` at ordinal 65.
+* The command pool admits `rename_commands`. Migration files and execution positions depend on
+  the validated history lineage; `src/db/mod.rs` defines the accepted prefixes and upgrade paths.

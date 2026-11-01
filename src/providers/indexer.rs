@@ -2200,8 +2200,46 @@ pub(crate) async fn raw_search(
 }
 
 const MIN_REDACTED_COOKIE_VALUE: usize = 8;
+const MIN_USERNAME_SUBSTRING_CHARS: usize = 8;
+fn redact_username(text: &str, username: &str) -> String {
+    if username.chars().count() >= MIN_USERNAME_SUBSTRING_CHARS {
+        return text.replace(username, "[redacted]");
+    }
+    let mut redacted = String::with_capacity(text.len());
+    let mut previous = 0;
+    for (start, matched) in text.match_indices(username) {
+        let end = start + matched.len();
+        // Short account names are tokens: replacing `7` inside S07E07 would break matching.
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        redacted.push_str(&text[previous..start]);
+        redacted.push_str("[redacted]");
+        previous = end;
+    }
+    redacted.push_str(&text[previous..]);
+    redacted
+}
 /// Raw locators remain private, but metadata may later appear in decision receipts.
 fn redact_secrets(items: &mut [Release], access: &IndexerAccess<'_>, tracker: Option<TrackerKind>) {
+    if let Some(username) = access.username.filter(|username| !username.is_empty()) {
+        for item in items.iter_mut() {
+            if let Some(title) = &mut item.metadata.title {
+                *title = redact_username(title, username);
+            }
+            for language in &mut item.metadata.languages {
+                *language = redact_username(language, username);
+            }
+        }
+    }
     // Individual cookie values are redacted too; short ones (ids, flags) are left alone,
     // since replacing e.g. "7" would corrupt release titles that later feed parsing.
     let cookie_values = access

@@ -256,3 +256,13 @@ test('read-only release search offers enabled interactive tracker scopes and exc
  }
  for(const kind of ['torrentrss','iptorrents','torrentleech','qbittorrent'])assert.equal(eligibleInteractiveIndexer(provider(kind,{}),'tv'),false);
 });
+
+test('feed parameters require equals except for IPTorrents numeric category flags',()=>{
+ for(const text of ['token','token value','48'])assert.equal(parseParameters(text),null);
+ assert.deepEqual(parseParameters('token='),[{name:'token',value:''}]);
+ assert.deepEqual(parseParameters('48',true),[{name:'48',value:''}]);
+ assert.deepEqual(parseParameters('48=',true),[{name:'48',value:''}]);
+ for(const text of ['token','48abc'])assert.equal(parseParameters(text,true),null);
+ const secrets={apiKey:'',username:'',password:'',cookie:'',tvParameters:'token',movieParameters:''};
+ for(const kind of ['nyaa','fanzub','iptorrents'])assert.ok('problem' in trackerCredentials(TRACKERS[kind],secrets));
+});

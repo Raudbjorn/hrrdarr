@@ -44,7 +44,8 @@ async fn failure(c: &Connection, id: &str, media: &str, revision: i64) -> Result
 }
 
 #[tokio::test]
-async fn published_torrent_rss_history_is_rejected_without_changing_data() -> Result<(), Error> {
+async fn published_torrent_rss_history_upgrades_without_losing_populated_data() -> Result<(), Error>
+{
     let scratch = Scratch::new();
     let path = scratch.0.join("db");
     let raw = libsql::Builder::new_local(&path).build().await?;
@@ -75,39 +76,46 @@ async fn published_torrent_rss_history_is_rejected_without_changing_data() -> Re
     c.execute("INSERT INTO provider_scopes(provider_id,implementation,media_type,enable_automatic_search,enable_interactive_search,minimum_seeders)VALUES(?,'torrentrss','tv',0,0,3)", [feed]).await?;
     c.execute_batch("INSERT INTO series(id,title,path)VALUES(1,'TV','/tv'); INSERT INTO seasons VALUES(1,1,1); INSERT INTO episodes(id,series_id,season,number,title)VALUES(1,1,1,1,'Pilot'); INSERT INTO movie_metadata(id,title)VALUES(1,'Movie'); INSERT INTO movies(id,metadata_id,path)VALUES(1,1,'/movies');").await?;
     integrity(&c).await?;
-    let tables = [
-        "sqlite_schema",
-        "schema_migrations",
-        "providers",
-        "provider_scopes",
-        "series",
-        "episodes",
-        "movie_metadata",
-        "movies",
-    ];
-    let mut before = Vec::new();
-    for table in tables {
-        before.push(rows(&c, table).await?);
-    }
+    let history_before = rows(&c, "schema_migrations").await?;
+    let providers_before = rows(&c, "providers").await?;
+    let scopes_before = rows(&c, "provider_scopes").await?;
+    assert_eq!(
+        published, LEGACY_MIGRATIONS[49],
+        "exact 6298f0e SQL identity"
+    );
     drop(c);
     drop(raw);
-    // This records the unresolved upgrade blocker, not successful compatibility. Replace the
-    // refusal assertion with preservation checks once a complete reconciliation is delivered.
-    for _ in 0..2 {
-        let error = match Database::open_local(&path).await {
-            Ok(_) => panic!("published history unexpectedly accepted without reconciliation"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("migration history mismatch at version 50")
+    // Main now supplies semantic bridges for this exact published prefix; refusal is obsolete.
+    for reopen in 0..2 {
+        let db = Database::open_local(&path).await?;
+        assert_eq!(db.migration_backup().is_some(), reopen == 0);
+        let c = db.connect().await?;
+        assert_eq!(
+            migration_history(&c).await?,
+            (LEGACY_MIGRATIONS.len(), LEGACY_MIGRATIONS)
         );
-        let raw = libsql::Builder::new_local(&path).build().await?;
-        let c = raw.connect()?;
-        for (table, expected) in tables.iter().zip(&before) {
-            assert_eq!(&rows(&c, table).await?, expected, "changed {table}");
-        }
+        assert_eq!(
+            &rows(&c, "schema_migrations").await?[..50],
+            history_before.as_slice()
+        );
+        assert_eq!(rows(&c, "providers").await?, providers_before);
+        assert_eq!(rows(&c, "provider_scopes").await?, scopes_before);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM episodes WHERE id=1 AND title='Pilot' AND series_id=1"
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM movies WHERE id=1 AND metadata_id=1 AND path='/movies'"
+            )
+            .await?,
+            1
+        );
         integrity(&c).await?;
     }
     Ok(())
@@ -166,14 +174,19 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 83); // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
+        assert_eq!(version(&c).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 15 } else { 34 } // Reasoning: versions 50-83 add 34 history rows; 0080 adds five health identities to the ten added by 0050/51/53/60.
+                    expected.len()
+                        + if *table == "health_checks" {
+                            15
+                        } else {
+                            MIGRATIONS.len() - 49
+                        } // The merged health migration adds five identities; all old ledger rows stay exact.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.

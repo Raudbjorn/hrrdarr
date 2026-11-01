@@ -1,41 +1,47 @@
 # Migration compatibility for the merged indexer branch
 
-The selected upgrade baseline is main at
-`7c5a05d` (the merged backup/restore main). Its first 81 migration identities and
-SQL are preserved byte for byte. The nine-tracker migration file
-`0090_indexer_breadth.sql` is appended at ordinal 82, followed by
-`0091_wanted_search_receipts.sql` at ordinal 83. File numbering and persisted
-ordinal are distinct; the runner requires a contiguous history.
+The selected main baseline is `023d355` (PR #31 import lists). Its accepted
+migration histories remain byte-for-byte prefixes of the merged histories.
+The runner recognizes every recorded ordinal, name, SQL body and checksum;
+a version number alone does not select a history. Existing records are never
+renumbered or rewritten. Unknown or mixed histories are refused.
 
-## Supported baseline and historical blockers
+## Supported histories
 
-Fresh databases and databases carrying the selected main history can apply the
-appended tracker and receipt migrations. This does not reconcile other historical ledgers:
-
-| Historical source | First divergence from the merged registry | Status |
+| Source history | Preserved entries and appended work | Final version |
 | --- | --- | --- |
-| Original main `6298f0e0d1403c68c1b4e7e61c2ba5d44eba2c50` | Version 50: `torrent_rss_indexer` versus `indexer_backoff` | Rejected before migration writes; conversion remains tracked in [#35](https://github.com/Raudbjorn/hrrdarr/issues/35). |
-| Earlier merged PR #32 `3987479d1326d003cb39e7f35a2df5b20cbde61a` | Version 79: tracker breadth versus main’s Wanted timestamps | Refused before migration writes; conversion tracked in [#68](https://github.com/Raudbjorn/hrrdarr/issues/68). |
-| Pre-merge PR #32 `eb08c2ba9adf0df14dd7be2fb6d933f26ffb3889` | Version 63: different `notifications` SQL/checksum; later ordinals also differ | Rejected at startup before migration writes. Convert explicitly offline with `hrrdarr convert-premerge-pr32` ([#47](https://github.com/Raudbjorn/hrrdarr/issues/47), below). |
+| Fresh/current import-list history | Main's 83 entries; tracker breadth at 84 and Wanted receipts at 85 | 85 |
+| Main with Wanted/root-health/backups at 79–81 | Existing main entries through 83, including import lists and search-on-add; tracker/receipts at 84–85 | 85 |
+| Original published main `6298f0e` through 50–53, or the accepted legacy PR #31 history | Historical entries retained through the semantic collection/provider bridge and main additions at 87; tracker/receipts at 88–89 | 89 |
+| PR #32 `3987479`, tracker/receipts at 79–80 | Existing entries retained; Wanted timestamps, root health, backups, import lists and search-on-add appended through 85 | 85 |
+| PR #32 `8032213`, tracker/receipts at 82–83 | Existing entries retained; import lists and search-on-add appended at 84–85 | 85 |
 
-Do not delete or rewrite migration-history rows to bypass these checks. The
-underlying schemas and persisted policy differ, not only their version numbers.
-The original PR #32 analysis remains available at
-[its reviewed commit](https://github.com/Raudbjorn/hrrdarr/blob/eb08c2ba9adf0df14dd7be2fb6d933f26ffb3889/docs/migration-compatibility.md).
+The supported histories converge to compatible application schemas while keeping
+their own ledger identities. The normal transactional runner validates a backup
+before applying pending migrations. The two PR #32 histories now upgrade normally;
+there is no need to rewrite their ledger or use the older offline converter
+([#68](https://github.com/Raudbjorn/hrrdarr/issues/68)).
 
-Current main's migrations 77 and 78 introduce collection and provider authority.
-Collection policy lives in `movie_collection_settings`, removal intent in
-`movie_collection_intents`, and provider authority has dedicated tags, status and
-selection-cursor tables. The pre-merge PR instead added collection snapshot
-fields at ordinal 69 and used a different notification delivery shape. Retaining
-unused legacy tables would not preserve the meaning of their settings.
+Before the legacy notification alignment runs, pending system deliveries without a
+recorded historical domain cause an explicit refusal. The migration transaction
+rolls back and its validated backup remains available; published SQL is unchanged.
+Databases already past that alignment can still contain domains inferred by older
+code, which need a separate audit rather than another migration-ledger rewrite
+([#82](https://github.com/Raudbjorn/hrrdarr/issues/82)).
 
-Main entries 79–81 add Wanted search timestamps, library-root health and backup
-commands. The earlier merged PR #32 history through `3987479` instead stored
-tracker breadth at 79 and Wanted receipts at 80. That lineage is also refused
-before migration writes; the older `convert-premerge-pr32` command does not
-accept it. Explicit conversion is tracked in
-[#68](https://github.com/Raudbjorn/hrrdarr/issues/68).
+Original-main compatibility uses the explicit reconciliation introduced by main,
+including collection settings, removal intent, provider authority and nullable
+search-on-add preservation. Populated SQL fixtures verify these paths; execution
+of the pinned historical application binaries is still a separate evidence
+requirement in [#35](https://github.com/Raudbjorn/hrrdarr/issues/35). Previously
+normalized NULL search-on-add values cannot be inferred; see
+[collection policy recovery](collection-policy-recovery.md) and
+[#50](https://github.com/Raudbjorn/hrrdarr/issues/50).
+
+The older pre-merge PR #32 `eb08c2b` ledger differs at notifications version 63
+and later entries. It remains refused at startup and requires the explicit
+converter below. The separate unpublished PR #31 `1431d97` draft uses the
+[other offline converter](draft-database-conversion.md).
 
 ## Converting a pre-merge PR #32 database
 
@@ -101,8 +107,8 @@ AUTOINCREMENT counters never move backwards past ids the source issued.
   Broader path support is tracked in [#66](https://github.com/Raudbjorn/hrrdarr/issues/66).
 - A multi-request notification that was partly sent before conversion may be
   re-sent in full; the source holds no evidence of which parts succeeded.
-- Other lineages (original main, [#35](https://github.com/Raudbjorn/hrrdarr/issues/35))
-  are not converted.
+- This command accepts only its pinned pre-merge PR #32 source. Other supported
+  histories upgrade through the normal runner; unknown histories remain refused.
 - The converter does not verify filesystem or media state, and was not run
   against a remote (Turso) database; it is local-file only.
 
@@ -139,17 +145,17 @@ cargo test --locked --lib convert_tests
 cargo test --locked --test premerge_conversion_cli
 ```
 
-`db::indexer_backoff_tests::published_torrent_rss_history_is_rejected_without_changing_data`
-constructs the unchanged first 49 entries plus the exact original-main migration
-50, then checks repeated startup refusal and unchanged schema/history/provider/
-TV/movie rows. Its SQL fixture is copied verbatim from the original commit into
-`tests/fixtures/migrations/6298f0e_0050_torrent_rss_indexer.sql`.
+Original-main compatibility is covered by `db::published_prefix_tests` and the
+pinned version-50 fixture in `db::indexer_backoff_tests`. The PR #32 history tests
+in `db::indexer_breadth_tests` cover both earlier migration orders, populated
+tracker scopes, equal TV/movie IDs, empty and nonempty receipts, receipt replay,
+changed-body refusal, reopen and tampered-history rejection.
 
 ```sh
-cargo test --locked --lib published_torrent_rss_history_is_rejected_without_changing_data
+cargo test --locked --lib published_prefix_tests
+cargo test --locked --lib indexer_backoff_tests
+cargo test --locked --lib indexer_breadth_tests
 ```
 
-That test protects refusal behavior. It does not repair historical upgrades or
-exercise the complete original-main version-53 schema. The tracker schema tests
-separately cover the selected main-to-tracker upgrade. Neither establishes live
-provider compatibility or filesystem/media recovery.
+These are isolated SQL-reconstructed databases. They do not establish production
+upgrade success, historical-runner equivalence, or filesystem/media recovery.

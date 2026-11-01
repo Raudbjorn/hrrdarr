@@ -21,6 +21,26 @@ use hrrdarr::api::{LegacyError, SnapshotOptions};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Explicit offline maintenance command; it never starts the server or migrates.
+    // Preserve byte-named operands for the pre-merge converter dispatched by run().
+    let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| {
+        arg == hrrdarr::db::collection_policy_recovery::COMMAND
+            || arg == hrrdarr::db::draft_conversion::COMMAND
+    }) {
+        let Ok(arguments) = arguments
+            .into_iter()
+            .map(|arg| arg.into_string())
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            eprintln!("maintenance command arguments must be UTF-8");
+            return std::process::ExitCode::FAILURE;
+        };
+        if arguments[0] == hrrdarr::db::collection_policy_recovery::COMMAND {
+            return hrrdarr::db::collection_policy_recovery::run_cli(&arguments[1..]).await;
+        }
+        return hrrdarr::db::draft_conversion::run_cli(&arguments[1..]).await;
+    }
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -188,6 +208,9 @@ async fn run() -> Result<(), ProcessFailure> {
         .map_err(|e| ProcessFailure::at("listener_bind", e))?;
     let app = host.apply(app, bound);
     println!("hrrdarr listening on http://{bound}");
+    if state.db.permits_local_imports() {
+        hrrdarr::import::log_probe_capability().await;
+    }
     let runtime = if state.db.permits_local_imports() {
         Some(
             hrrdarr::commands::start_with_metadata(
@@ -207,12 +230,22 @@ async fn run() -> Result<(), ProcessFailure> {
     // a lease, so several processes over one remote database do not duplicate a send. The command
     // worker stays gated on local ownership because it moves media files.
     let notifier = hrrdarr::notifications::start(state.db.clone(), state.provider_key.clone());
+    let list_sync = state.db.permits_local_imports().then(|| {
+        hrrdarr::import_lists::start(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
+        )
+    });
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await;
     notifier.shutdown().await;
+    if let Some(list_sync) = list_sync {
+        list_sync.shutdown().await;
+    }
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
     }
@@ -267,6 +300,11 @@ fn router_parts(state: Arc<AppState>) -> (Router, hrrdarr::providers::RefreshCli
         .merge(hrrdarr::notifications::router(
             state.db.clone(),
             state.provider_key.clone(),
+        ))
+        .merge(hrrdarr::import_lists::router(
+            state.db.clone(),
+            state.provider_key.clone(),
+            hrrdarr::import_lists::Deps::production(state.metadata.clone()),
         ))
         .merge(hrrdarr::commands::router(state.db.clone()))
         .merge(hrrdarr::backup::router(state.db.clone()))

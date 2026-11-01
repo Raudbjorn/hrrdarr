@@ -156,7 +156,7 @@ async fn schema56_actual55_rollback_backup_reopen_and_constraints() -> Result<()
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        83 // Reasoning: main history 1–81 is preserved; tracker breadth and Wanted receipts append at 82–83.
+        85 // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     );
     let defaults = dump(&fc, "SELECT * FROM import_policies ORDER BY media_type").await?;
     assert_eq!(defaults.len(), 2);

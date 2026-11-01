@@ -2,7 +2,7 @@
 
 Deluge is a torrent download client for TV and movies. It talks to the Deluge Web UI's JSON-RPC (`POST <endpoint>/json`) through the same bounded provider transport as the other clients and shares the torrent path with qBittorrent and Transmission: protocol-aware client selection (Torznab indexers only), the durable submission journal, info-hash reconciliation, download refresh snapshots, completed-download processing, remote path mapping and import.
 
-Deluge is the first client on the shared **label-torrent engine** (`src/providers/label_client.rs`). The engine owns ownership-by-label, the never-double-submit flow, status mapping, completed-download facts, output-root facts and controls; a protocol implements only the `Wire` trait (`src/providers/label_client/deluge.rs`). Migration 0069 prepares the scope triggers and the label unique index for the whole family (`deluge`, `rtorrent`, `utorrent`, `flood`, `aria2`, `downloadstation`), so later members add only a registry row.
+Deluge is the first client on the shared **label-torrent engine** (`src/providers/label_client.rs`). The engine owns ownership-by-label, the never-double-submit flow, status mapping, completed-download facts, output-root facts and controls; a protocol implements only the `Wire` trait (`src/providers/label_client/deluge.rs`). migration file 0069 prepares the scope triggers and the label unique index for the whole family (`deluge`, `rtorrent`, `utorrent`, `flood`, `aria2`, `downloadstation`), so later members add only a registry row.
 
 Protocol source: Deluge's published Web UI / core / Label plugin RPC (`auth.login`, `web.connected`, `web.get_hosts`, `web.connect`, `daemon.get_version`, `core.get_config_value`, `core.get_torrents_status`, `core.get_torrent_status`, `core.add_torrent_magnet`, `core.add_torrent_file`, `core.pause_torrent`, `core.resume_torrent`, `core.remove_torrent`, `core.queue_top`, `core.queue_bottom`, `label.get_labels`, `label.add`, `label.set_torrent`). The mocks in `tests/deluge_protocol.rs`, `tests/deluge_automation.rs` and `frontend/tests/deluge-provider-browser.mjs` are written from that interface. None of this is evidence from a live-client run.
 
@@ -10,7 +10,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/Deluge/` 
 
 ## Configuration
 
-`ProviderSettings::Deluge { endpoint, tv, movies }`, stored by migration 0069.
+`ProviderSettings::Deluge { endpoint, tv, movies }`, stored by migration file 0069.
 
 - `endpoint` is the Web UI base URL, including any URL base, for example `http://deluge.example:8112`. The client appends `/json`.
 - Each scope (`TorrentLabelScope`) has `category` (the Deluge label: 1-64 of lowercase letters, digits, `.`, `_`, `-`, the only characters the Label plugin accepts), `recent_priority` and `older_priority` (`last` or `first`; `first` moves a new torrent to the top of the queue), `add_paused` and optional eligibility `tags`.
@@ -52,4 +52,4 @@ Seeding limits from the release (`QbitOptions`) are not applied; Deluge's per-to
 - Deluge 1.3 and 2.x differences (for example `daemon.info`, the null reply for a duplicate magnet) were taken from the interface description, not observed.
 - The Label plugin's own move-completed and auto-add rules are not read or managed; completed-download handling relies on the torrent's reported save path.
 - Seeding limits, import-complete labels, imported-category handling and the health classifier (still reports kind Other) are not implemented.
-- Migration 0069 is the 69th entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).
+- Migration file `0069` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.
