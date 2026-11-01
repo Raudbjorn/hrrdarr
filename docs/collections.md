@@ -20,7 +20,7 @@ Collection adoption retains local removal intent and protects it from stale snap
   monitoring toggle for library members). Monitoring requires profile, root folder and availability (409
   `collection_policy_incomplete`; the invariant is also enforced by triggers). Profiles/roots/tags must be movie-domain.
   A collection's assigned quality profile cannot be deleted (`409 profile_in_use`), even without library members;
-  clear or reassign the collection's profile first. Migration 0077 preserves that guard on the shared collection settings table.
+  clear or reassign the collection's profile first. The guard applies to the separate collection settings table.
 * Monitoring a collection immediately adds its known missing members to the library at
   `<root>/<Title (Year)>` with the collection's profile, availability and tags (then AutoTagging). Existing paths,
   nested paths and existing library movies are skipped, never replaced.
@@ -39,12 +39,25 @@ failures are counted; if nothing succeeded and the service was unavailable the c
 
 ## Schema integration
 
-Migrations 0001–0076 retain the PR branch history and checksums. Migration 0077 moves
-existing collection policy into `movie_collection_settings`, preserving meaningful
-local settings and tags, and adds metadata provenance, retained removal intent,
-exclusions and snapshot replay state. Migration 0078 adds provider authority state. Collection root health reads this settings authority;
-policy edits, adoption, cleanup and snapshot imports invalidate its checks in their write transaction.
-Databases from the divergent main migration history are not an accepted upgrade baseline.
+Collection policy lives in `movie_collection_settings`, separate from catalog facts. Settings
+revisions, tags, snapshot ownership and local-edit markers survive the supported upgrade paths.
+`movie_collection_intents` retains removal and local-edit intent independently of catalog rows:
+user removals suppress rediscovery and automatic additions; fresh metadata may restore a
+`metadata_missing` removal while retaining the local-edit fence against stale snapshots.
+Collection automatic additions also honor active `movie_import_exclusions`.
+
+`src/db/mod.rs` validates each accepted migration-history prefix before applying its matching
+upgrade path. Historical SQL/name/checksum records are retained; migration filename prefixes
+alone do not identify the schema version. Fresh/current-main databases finish at version 83;
+the earlier published main checkpoint and PR #31 history converge through the version-83
+bridge, followed by search-on-add, Wanted timestamps, root health and backups through version 87. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
+not establish production upgrade success.
+
+Upgrades from the earlier main checkpoint now preserve nullable `search_on_add` transactionally.
+Databases already upgraded to version 82 by `9d989d5` had NULL normalized to false; that lost
+definedness cannot be inferred during the bridge ([issue #50](https://github.com/Raudbjorn/hrrdarr/issues/50)).
+Startup still rejects unknown draft histories. The exact `1431d97` draft has an explicit
+[offline conversion command](draft-database-conversion.md); other draft histories remain unsupported.
 
 ## Snapshot reconstruction
 

@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -273,7 +273,14 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!(
+                "{method} {path}: request failed (timeout={}, connect={}); {}",
+                e.is_timeout(),
+                e.is_connect(),
+                phase_report()
+            )
+        });
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
     assert!(
@@ -322,33 +329,164 @@ async fn enqueue(base: &str, target: Value) -> Value {
     assert_eq!(code, 202, "{v}");
     v
 }
-async fn wait_status(base: &str, path: &str, status: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let (code, v) = request(base, "GET", path, Value::Null).await;
-            assert_eq!(code, 200, "{v}");
-            if v["status"] == status {
-                return v;
-            }
-            if v["status"] == "blocked"
-                || v["status"] == "failed"
-                || (v["status"] == "importing"
-                    && !v["error_code"].is_null()
-                    && v["resume_requested"] != true)
-            {
-                panic!("unexpected terminal: {v}")
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
+// Real-timer scenario budgets. The inherited 60 s schedule makes each variant take roughly 90 s
+// of wall time on an idle host (two ~60 s waits overlap the import and restart phases); both
+// variants together were observed at ~187 s serially. A variant that exceeds FLOW_BUDGET failed
+// or stalled, and the panic names the phase instead of waiting for an outer harness timeout.
+const FLOW_BUDGET: Duration = Duration::from_secs(300);
+const IMPORT_BUDGET: Duration = Duration::from_secs(90);
+const RESTART_BUDGET: Duration = Duration::from_secs(90);
+const COMMAND_BUDGET: Duration = Duration::from_secs(30);
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+static PHASE: Mutex<(&str, Option<Instant>)> = Mutex::new(("not_started", None));
+/// Starts a named phase and reports how long the previous one took (stderr; `--nocapture`).
+fn phase(name: &'static str) {
+    let mut current = PHASE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(since) = current.1 {
+        eprintln!(
+            "{}",
+            json!({"event":"cdh_phase","phase":current.0,"elapsed_ms":since.elapsed().as_millis()})
+        );
+    }
+    *current = (name, Some(Instant::now()));
+}
+fn phase_report() -> String {
+    let current = PHASE.lock().unwrap_or_else(|p| p.into_inner());
+    format!(
+        "phase={} in_phase_ms={}",
+        current.0,
+        current.1.map_or(0, |since| since.elapsed().as_millis())
+    )
+}
+/// Polls `step` until it yields a value. On budget exhaustion it panics with the phase, elapsed
+/// time and the last observed state, so a stall is attributable without a debugger. States must be
+/// built from whitelisted fields (`pick`), never raw payloads.
+async fn poll_until<T, Fut: std::future::Future<Output = Result<T, String>>>(
+    what: &str,
+    budget: Duration,
+    mut step: impl FnMut() -> Fut,
+) -> T {
+    let started = Instant::now();
+    loop {
+        match step().await {
+            Ok(value) => return value,
+            Err(state) if started.elapsed() >= budget => panic!(
+                "{what}: unmet after {} ms (budget {} ms); {}; last state: {state}",
+                started.elapsed().as_millis(),
+                budget.as_millis(),
+                phase_report()
+            ),
+            Err(_) => tokio::time::sleep(POLL_INTERVAL).await,
         }
+    }
+}
+/// Keeps only fields that name a state or reason, never ids, paths or release text.
+fn pick(row: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in [
+        "status",
+        "error_code",
+        "resume_requested",
+        "reasons",
+        "media_type",
+    ] {
+        if let Some(value) = row.get(key) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+fn processing_state(v: &Value) -> String {
+    let rows: Vec<Value> = v["items"]
+        .as_array()
+        .map(|rows| rows.iter().map(pick).collect())
+        .unwrap_or_default();
+    format!("download-processing {}", Value::Array(rows))
+}
+async fn command_states(db: &hrrdarr::db::Database) -> String {
+    let mut out = Vec::new();
+    for table in ["rss_commands", "search_commands"] {
+        let Ok(c) = db.connect().await else { break };
+        let Ok(mut rows) = c
+            .query(
+                &format!("SELECT status,count(*) FROM {table} GROUP BY status"),
+                (),
+            )
+            .await
+        else {
+            continue;
+        };
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(format!(
+                "{table}.{}={}",
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<i64>(1).unwrap_or(-1)
+            ));
+        }
+    }
+    out.join(",")
+}
+async fn wait_status(base: &str, path: &str, status: &str) -> Value {
+    let (base, path, status) = (base.to_owned(), path.to_owned(), status.to_owned());
+    poll_until("command status", COMMAND_BUDGET, || async {
+        let (code, v) = request(&base, "GET", &path, Value::Null).await;
+        assert_eq!(code, 200, "{v}");
+        if v["status"] == status.as_str() {
+            return Ok(v);
+        }
+        if v["status"] == "blocked"
+            || v["status"] == "failed"
+            || (v["status"] == "importing"
+                && !v["error_code"].is_null()
+                && v["resume_requested"] != true)
+        {
+            panic!("unexpected terminal: {v}")
+        }
+        Err(format!("wanted {status}; {}", pick(&v)))
     })
     .await
-    .expect("processing deadline")
 }
-#[tokio::test]
-async fn default_cdh_rss_and_search_both_domains_without_policy_or_schedule_writes() {
-    // One serial lease owner, as in the existing import integration fixtures.
-    for search in [false, true] {
-        default_flow(search).await;
+#[test]
+fn default_cdh_rss_and_search_both_domains_without_policy_or_schedule_writes() {
+    // An explicit runtime so teardown (aborted workers, blocking filesystem jobs) has its own
+    // finite boundary instead of the implicit unbounded drop of `#[tokio::test]`.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            // One serial lease owner, as in the existing import integration fixtures.
+            for search in [false, true] {
+                let started = Instant::now();
+                tokio::time::timeout(FLOW_BUDGET, default_flow(search))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "default flow (search={search}) exceeded {} s; {}",
+                            FLOW_BUDGET.as_secs(),
+                            phase_report()
+                        )
+                    });
+                phase("variant_done");
+                eprintln!(
+                    "{}",
+                    json!({"event":"cdh_variant","search":search,"elapsed_ms":started.elapsed().as_millis()})
+                );
+            }
+        })
+    }));
+    let teardown = Instant::now();
+    runtime.shutdown_timeout(TEARDOWN_BUDGET);
+    assert!(
+        teardown.elapsed() < TEARDOWN_BUDGET,
+        "runtime teardown did not drain blocking work within {} s; {}",
+        TEARDOWN_BUDGET.as_secs(),
+        phase_report()
+    );
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
 async fn default_flow(search: bool) {
@@ -475,6 +613,11 @@ async fn default_flow(search: bool) {
         sources.push(media_source);
     }
 
+    phase(if search {
+        "search_variant_setup"
+    } else {
+        "rss_variant_setup"
+    });
     // Finish both client downloads in the owned mock; only scheduled observation can admit imports.
     state.completed.store(1, Ordering::SeqCst);
     let mut commands_pending = Vec::new();
@@ -488,6 +631,7 @@ async fn default_flow(search: bool) {
         };
         commands_pending.push(command);
     }
+    phase("command_worker_start_and_enqueue_drain");
     let runtime = commands::start_with_metadata(db.clone(), client.clone(), metadata.clone())
         .await
         .unwrap();
@@ -504,22 +648,27 @@ async fn default_flow(search: bool) {
         .await;
     }
     // The real inherited60s interval is retained; no deadline/row injection or manual refresh.
-    tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
+    phase("initial_scheduled_import");
+    poll_until(
+        "default scheduled imports must finish",
+        IMPORT_BUDGET,
+        || async {
             let (_, v) = request(&base, "GET", "/api/v1/download-processing", Value::Null).await;
-            if v["items"].as_array().is_some_and(|rows| {
-                rows.len() == 2 && rows.iter().all(|r| r["status"] == "imported")
-            }) {
-                break;
-            }
             if let Some(rows) = v["items"].as_array() {
                 assert!(!rows.iter().any(|r| r["status"] == "blocked"), "{v}");
+                if rows.len() == 2 && rows.iter().all(|r| r["status"] == "imported") {
+                    return Ok(());
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("default scheduled imports must finish");
+            Err(format!(
+                "{}; commands {}",
+                processing_state(&v),
+                command_states(&db).await
+            ))
+        },
+    )
+    .await;
+    phase("post_import_assertions");
     for (i, name) in [
         "Harbor.S01E01.1080p.WEB-DL.mkv",
         "Harbor.2020.1080p.WEB-DL.mkv",
@@ -579,7 +728,10 @@ async fn default_flow(search: bool) {
     assert_eq!(state.adds.lock().unwrap().len(), 2);
     assert_eq!(c.query("SELECT count(*) FROM download_processing_policies WHERE enabled=1 AND enabled_override IS NULL",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),2);
     assert_eq!(c.query("SELECT count(*) FROM download_refresh_schedules WHERE intent='inherited' AND interval_seconds=60 AND last_run_at IS NOT NULL",()).await.unwrap().next().await.unwrap().unwrap().get::<i64>(0).unwrap(),2);
-    runtime.shutdown().await;
+    phase("first_worker_shutdown");
+    tokio::time::timeout(TEARDOWN_BUDGET, runtime.shutdown())
+        .await
+        .unwrap_or_else(|_| panic!("first command worker did not join; {}", phase_report()));
     // Freeze the baseline after the old worker has joined; its final refresh cannot satisfy restart evidence.
     let mut prior_observations = Vec::new();
     for media in ["tv", "movies"] {
@@ -600,9 +752,13 @@ async fn default_flow(search: bool) {
         .await
         .unwrap();
     // Require new successful periodic observations in both domains after restart, not just startup.
-    tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
+    phase("restart_periodic_observation");
+    poll_until(
+        "both inherited schedules must actually refresh after restart",
+        RESTART_BUDGET,
+        || async {
             let mut settled = true;
+            let mut seen = Vec::new();
             for (i, media) in ["tv", "movies"].iter().enumerate() {
                 let (code, value) = request(
                     &base,
@@ -615,16 +771,23 @@ async fn default_flow(search: bool) {
                 )
                 .await;
                 assert_eq!(code, 200, "{value}");
-                settled &= value["command_id"] != prior_observations[i];
+                let advanced = value["command_id"] != prior_observations[i];
+                seen.push(format!("{media}_advanced={advanced}"));
+                settled &= advanced;
             }
             if settled {
-                break;
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}; commands {}",
+                    seen.join(","),
+                    command_states(&db).await
+                ))
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("both inherited schedules must actually refresh after restart");
+        },
+    )
+    .await;
+    phase("post_restart_assertions");
     let (_, after_imports) =
         request(&base, "GET", "/api/v1/download-processing", Value::Null).await;
     for old in before_imports["items"].as_array().unwrap() {
@@ -654,7 +817,12 @@ async fn default_flow(search: bool) {
             .unwrap(),
         2
     );
-    restarted.shutdown().await;
-    _api.stop().await;
-    _upstream.stop().await;
+    phase("final_shutdown");
+    tokio::time::timeout(TEARDOWN_BUDGET, async {
+        restarted.shutdown().await;
+        _api.stop().await;
+        _upstream.stop().await;
+    })
+    .await
+    .unwrap_or_else(|_| panic!("final shutdown did not complete; {}", phase_report()));
 }

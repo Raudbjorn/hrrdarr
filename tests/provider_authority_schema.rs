@@ -205,7 +205,7 @@ async fn upgrade77_preserves_test_evidence_domains_and_reopens() -> Result<(), E
     );
     assert_eq!(
         number(&c, "SELECT max(version) FROM schema_migrations").await,
-        81 // Reasoning: Wanted, library-root health and Backup follow main provider authority at 78.
+        83 // Both published tails append without rewriting existing ledger entries.
     );
     assert!(rows(&c, "PRAGMA foreign_key_check").await.is_empty());
     drop(c);

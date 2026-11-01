@@ -761,6 +761,15 @@ pub(crate) async fn compute_tv(
 
 // ---- folders -------------------------------------------------------------------------------
 
+pub(crate) async fn folder_destination_in_use(
+    c: &Connection,
+    path: &str,
+    series_id: Option<i64>,
+    movie_id: Option<i64>,
+) -> libsql::Result<bool> {
+    Ok(c.query("SELECT 1 FROM (SELECT rtrim(path,'/') AS path FROM series WHERE id IS NOT ?2 UNION ALL SELECT rtrim(path,'/') AS path FROM movies WHERE id IS NOT ?3) WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||'/' OR substr(?1,1,length(path)+1)=path||'/' LIMIT 1", libsql::params![path.trim_end_matches('/'), series_id, movie_id]).await?.next().await?.is_some())
+}
+
 async fn render_folder(c: &Connection, domain: MediaDomain, ids: &[i64]) -> Result<FolderComputed> {
     let (revision, format, replace, colon_text, custom) = {
         let d = if domain == MediaDomain::Tv {
@@ -883,26 +892,13 @@ async fn render_folder(c: &Connection, domain: MediaDomain, ids: &[i64]) -> Resu
             *seen.entry(n.clone()).or_default() += 1;
         }
     }
-    let table = if domain == MediaDomain::Tv {
-        "series"
-    } else {
-        "movies"
-    };
     for f in &mut folders {
         let Some(n) = f.new_abs.clone() else { continue };
         if seen[&n] > 1 {
             f.status = Some(RenameStatus::Blocked);
             f.reasons.push(RenameReason::DuplicateDestination);
         }
-        let used = c
-            .query(
-                &format!("SELECT 1 FROM {table} WHERE path=? AND id!=?"),
-                libsql::params![n.clone(), f.series_id.or(f.movie_id).unwrap_or(0)],
-            )
-            .await?
-            .next()
-            .await?
-            .is_some();
+        let used = folder_destination_in_use(c, &n, f.series_id, f.movie_id).await?;
         if used {
             f.status = Some(RenameStatus::Blocked);
             f.reasons.push(RenameReason::DestinationInUse);

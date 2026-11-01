@@ -617,13 +617,6 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TransmissionScope>,
     },
-    Torrentrss {
-        endpoint: String,
-        #[serde(deserialize_with = "required_nullable")]
-        tv: Option<FeedScope>,
-        #[serde(deserialize_with = "required_nullable")]
-        movies: Option<FeedScope>,
-    },
     /// Endpoint is the Deluge Web UI base URL (the JSON-RPC API is `<endpoint>/json`). The
     /// credential is the Web UI password. Requires the Label plugin.
     Deluge {
@@ -678,6 +671,13 @@ pub enum ProviderSettings {
         #[serde(deserialize_with = "required_nullable")]
         movies: Option<TorrentLabelScope>,
     },
+    Torrentrss {
+        endpoint: String,
+        #[serde(deserialize_with = "required_nullable")]
+        tv: Option<FeedScope>,
+        #[serde(deserialize_with = "required_nullable")]
+        movies: Option<FeedScope>,
+    },
 }
 impl ProviderSettings {
     fn implementation(&self) -> &'static str {
@@ -688,13 +688,13 @@ impl ProviderSettings {
             Self::Sabnzbd { .. } => "sabnzbd",
             Self::Nzbget { .. } => "nzbget",
             Self::Transmission { .. } => "transmission",
-            Self::Torrentrss { .. } => "torrentrss",
             Self::Deluge { .. } => "deluge",
             Self::Rtorrent { .. } => "rtorrent",
             Self::Utorrent { .. } => "utorrent",
             Self::Aria2 { .. } => "aria2",
             Self::Flood { .. } => "flood",
             Self::Downloadstation { .. } => "downloadstation",
+            Self::Torrentrss { .. } => "torrentrss",
         }
     }
     fn endpoint(&self) -> &str {

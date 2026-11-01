@@ -239,21 +239,7 @@ pub(super) async fn replacements() {
                 start_owned(db.clone(), &op).await.unwrap(),
                 StartOwned::Started
             );
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let current = status(db.clone(), &op).await.unwrap();
-                    assert!(current.error_code.is_none());
-                    if current.status == "complete" {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            while EXECUTING.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
+            wait_owned_complete(&db, &op).await;
         } else {
             assert_eq!(execute(db.clone(), &op).await.unwrap().status, "complete");
         }
@@ -442,13 +428,7 @@ pub(super) async fn replacements() {
         start_owned(db.clone(), &op).await.unwrap(),
         StartOwned::Started
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while EXECUTING.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_permit_released(Some(&db), Some(&op)).await;
     assert_eq!(
         start_owned(db.clone(), &op).await.unwrap_err().code(),
         "resume_required"

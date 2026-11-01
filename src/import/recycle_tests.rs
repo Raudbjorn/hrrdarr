@@ -56,6 +56,20 @@ async fn execute_owned(db: &Arc<Database>, op: &str) -> Result<Operation> {
             Err(e) if e.code() == "import_busy" && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await
             }
+            Err(e) if e.code() == "import_busy" => {
+                // Out of budget: say who holds the permit instead of returning a bare refusal.
+                eprintln!(
+                    "{}",
+                    permit_diagnostics(
+                        "execute_owned out of budget",
+                        Some(db),
+                        Some(op),
+                        std::time::Duration::from_secs(30)
+                    )
+                    .await
+                );
+                return Err(e);
+            }
             other => return other,
         }
     }

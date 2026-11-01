@@ -128,7 +128,7 @@ async fn registry_upgrade58_preserves_provider_rows_rolls_back_and_enforces_prot
     let c = db.connect().await?;
     assert_eq!(
         rows(&c, "SELECT max(version) FROM schema_migrations").await?,
-        vec![vec![libsql::Value::Integer(81)]] // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        vec![vec![libsql::Value::Integer(83)]] // Both published tails append without rewriting existing ledger entries.
     );
     for (index, (sql, expected)) in TABLES.iter().zip(&before).enumerate() {
         let mut expected = expected.clone();

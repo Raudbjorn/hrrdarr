@@ -462,8 +462,8 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
             ));
         }
     }
-    // Shared provider and notification scopes also protect referenced tags.
-    let provider_scoped = c
+    // Provider and notification scope assignments also prevent deletion.
+    let provider_or_notification_scoped = c
         .query(
             "SELECT 1 FROM notification_tags WHERE tag_id=?1 UNION ALL SELECT 1 FROM provider_scope_tags WHERE tag_id=?1 LIMIT 1",
             [t.id],
@@ -473,7 +473,7 @@ async fn usage(c: &Connection, t: Tag) -> Result<Detail> {
         .await?
         .is_some();
     Ok(Detail {
-        in_use: provider_scoped
+        in_use: provider_or_notification_scoped
             || !download_client_ids.is_empty()
             || !collection_ids.is_empty()
             || !auto_tagging_ids.is_empty()

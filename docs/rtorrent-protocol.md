@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/RTorrent/
 
 ## Configuration
 
-`ProviderSettings::Rtorrent { endpoint, tv, movies }`, stored by migration 0070 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
+`ProviderSettings::Rtorrent { endpoint, tv, movies }`, stored by migration file 0070 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is the full XML-RPC URL, for example `http://rtorrent.example/RPC2`; nothing is appended.
 - Each scope is the shared `TorrentLabelScope`: `category` (the label: 1-64 of lowercase letters, digits, `.`, `_`, `-`), `recent_priority`/`older_priority` (`last` or `first`; `first` loads the torrent with `d.priority.set=3`, high), `add_paused` and optional eligibility `tags`. TV and movie labels must differ.
@@ -22,7 +22,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/RTorrent/
 
 `d.multicall2` over the `main` view (all torrents; the engine filters by the URL-decoded `d.custom1`). Hashing is `queued`; size 0 is a magnet awaiting metadata (`queued` / `metadata`); a non-empty `d.message` is `warning` / `error` unless it begins `Tracker:` (tracker notes are not torrent errors); stopped is `paused` (or `completed` once complete); complete and started is `completed`; active is `downloading`; started but inactive is `queued`. `d.ratio` is in thousandths. rTorrent reports no ETA or seeding time, so those are absent.
 
-The save path is `d.directory`, except that a multi-file torrent's directory already ends with its own name, so the parent is used; file paths from `f.multicall` are then prefixed with the torrent name for multi-file torrents so they are relative to the save path (a single-file torrent's path is its name).
+The save path is `d.directory` and file paths are the unchanged relative `f.path` values from `f.multicall`. The [rTorrent command reference](https://rtorrent-docs.readthedocs.io/en/latest/cmd-ref.html#f-path) defines that pair: a multi-file root renamed through `d.directory_base.set` can differ from `d.name`, so the display name is never added to file paths.
 
 ## Submission
 
@@ -38,4 +38,4 @@ Pause (`d.stop`), Resume (`d.start`), Priority (`d.priority.set` 3 or 2) and Rem
 - Direct SCGI (without an HTTP front end) is not supported.
 - Seeding limits, ruTorrent label semantics beyond `d.custom1`, a configured download directory per label and the health classifier are not implemented.
 - The label alphabet is the shared lowercase family rule even though ruTorrent allows more; existing labels with other characters cannot be configured.
-- Migration 0070 is the 70th entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).
+- Migration file `0070` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

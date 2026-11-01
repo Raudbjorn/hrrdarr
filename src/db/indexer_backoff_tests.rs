@@ -96,14 +96,19 @@ async fn indexer_backoff_upgrade49_rollback_and_reopen_preserve_existing_state()
     for _ in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 81); // Reasoning: main migrations 1-78 stay fixed; Wanted 0079, library-root health 0080 and Backup 0081 append three entries.
+        assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
         for (table, expected) in tables.iter().zip(&before) {
             let actual = rows(&c, table).await?;
             if matches!(*table, "health_checks" | "schema_migrations") {
                 assert_eq!(&actual[..expected.len()], expected);
                 assert_eq!(
                     actual.len(),
-                    expected.len() + if *table == "health_checks" { 15 } else { 32 } // Reasoning: versions 50-81 add 32 history rows; 0080 adds five health identities to the ten added by 0050/51/53/60.
+                    expected.len()
+                        + if *table == "health_checks" {
+                            15
+                        } else {
+                            MIGRATIONS.len() - 49
+                        } // The merged health migration adds five identities; all old ledger rows stay exact.
                 );
             } else if *table == "provider_scopes" {
                 // 0068 appends the nullable minimum_seeders column; every predecessor value stays exact.

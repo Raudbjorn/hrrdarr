@@ -38,9 +38,8 @@ Responses list only `secrets_configured` names. On update an omitted secret is k
 it (not allowed for required secrets). Without the key, creating a notification that has secrets
 fails with 503; secretless implementations (for example Kodi without a password) still work.
 Errors, logs, the delivery journal and the test results never contain URLs, tokens or response bodies.
-The one exception is custom-script output: a script's stdout (DEBUG) and stderr (WARN) are logged as the
-script wrote them, clipped to 2 KiB, so a script that echoes its arguments, environment or an event's
-content puts that in the process log. Scripts must not print secrets.
+Custom-script diagnostics record only the stream name and captured byte count; script paths and
+stdout/stderr text are excluded because they can contain private event data or secrets.
 
 ### Validation
 
@@ -153,8 +152,8 @@ timeout, output capped at 8 KiB per stream. Exit status 0 is success. When the s
 times out its whole process group is killed, so work it backgrounds (`cmd &`) does not outlive the
 event; a script that must leave a daemon behind has to detach it (`setsid`) and close its output.
 Output still open 0.5 s after that is cut off.
-stdout is logged at DEBUG and stderr at WARN for both domains (Sonarr logs stderr as an error,
-Radarr as information; hrrdarr deliberately uses one middle level).
+Only captured byte counts are logged: stdout at DEBUG and stderr at WARN for both domains.
+The script path and captured text never enter runtime logs.
 
 TV events use `sonarr_*`, movie events `radarr_*`. Every event sets `<app>_eventtype`,
 `<app>_instancename` (`hrrdarr`) and `<app>_applicationurl` (empty). Implemented subset of the

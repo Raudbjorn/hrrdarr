@@ -492,7 +492,7 @@ fn folder_name(title: &str, year: Option<i64>) -> String {
 pub(crate) async fn add_missing(c: &Connection, id: i64) -> Result<(i64, i64)> {
     let Some(row) = c
         .query(
-            "SELECT c.quality_profile_id,r.path,c.minimum_availability,c.search_on_add FROM movie_collection_settings c JOIN root_folders r ON r.id=c.root_folder_id AND r.media_type='movies' WHERE c.collection_id=? AND c.monitored=1 AND c.quality_profile_id IS NOT NULL AND c.minimum_availability IS NOT NULL",
+            "SELECT c.quality_profile_id,r.path,c.minimum_availability,c.search_on_add FROM movie_collection_settings c JOIN root_folders r ON r.id=c.root_folder_id AND r.media_type='movies' WHERE c.collection_id=? AND c.monitored=1 AND c.quality_profile_id IS NOT NULL AND c.minimum_availability IS NOT NULL AND NOT EXISTS(SELECT 1 FROM movie_collection_intents i JOIN movie_collections m ON m.tmdb_id=i.tmdb_id WHERE m.id=c.collection_id AND i.removed=1)",
             [id],
         )
         .await?
@@ -573,6 +573,15 @@ pub(crate) async fn add_missing(c: &Connection, id: i64) -> Result<(i64, i64)> {
     Ok((added, if search { added } else { 0 }))
 }
 
+// User removals survive rediscovery; lifecycle removals may be restored by fresh metadata.
+async fn restore_discovered_collection(c: &Connection, tmdb_id: i64) -> libsql::Result<bool> {
+    if c.query("SELECT 1 FROM movie_collection_intents WHERE tmdb_id=? AND removed=1 AND removal_reason='user'", [tmdb_id]).await?.next().await?.is_some() {
+        return Ok(false);
+    }
+    c.execute("UPDATE movie_collection_intents SET removed=0,removal_reason=NULL,revision=revision+1 WHERE tmdb_id=? AND removed=1 AND removal_reason='metadata_missing'", [tmdb_id]).await?;
+    Ok(true)
+}
+
 /// Applies a fetched collection graph. Returns (movies added, searches pending).
 pub(crate) async fn apply_graph(
     c: &Connection,
@@ -592,6 +601,9 @@ pub(crate) async fn apply_graph(
             "collection_changed",
             "Collection identity changed during refresh",
         ));
+    }
+    if !restore_discovered_collection(c, graph.tmdb_id).await? {
+        return Ok((0, 0));
     }
     c.execute(
         "UPDATE movie_collections SET title=?,overview=?,last_info_sync=strftime('%Y-%m-%dT%H:%M:%SZ','now'),metadata_revision=metadata_revision+1,graph_complete=1 WHERE id=?",
@@ -670,7 +682,7 @@ pub(crate) async fn refreshable(
 ) -> Result<Vec<(i64, i64)>> {
     let mut rows = c
         .query(
-            "SELECT id,tmdb_id FROM movie_collections WHERE tmdb_id IS NOT NULL AND id>? ORDER BY id LIMIT ?",
+            "SELECT id,tmdb_id FROM movie_collections c WHERE tmdb_id IS NOT NULL AND id>? AND NOT EXISTS(SELECT 1 FROM movie_collection_intents i WHERE i.tmdb_id=c.tmdb_id AND i.removed=1 AND i.removal_reason='user') ORDER BY id LIMIT ?",
             params![cursor, limit],
         )
         .await?;

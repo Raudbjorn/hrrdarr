@@ -8,7 +8,7 @@ Requirements were inventoried from `src/NzbDrone.Core/Download/Clients/UTorrent/
 
 ## Configuration
 
-`ProviderSettings::Utorrent { endpoint, tv, movies }`, stored by migration 0071 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
+`ProviderSettings::Utorrent { endpoint, tv, movies }`, stored by migration file 0071 (registry row only; the scope triggers and unique label index came with 0069, and 0075 reinstalls the trigger set with every lane's implementations).
 
 - `endpoint` is the Web UI base including `/gui`, for example `http://utorrent.example:8080/gui`.
 - Each scope is the shared `TorrentLabelScope`: `category` (the label: 1-64 of lowercase letters, digits, `.`, `_`, `-`), `recent_priority`/`older_priority` (`last` or `first`; `first` moves a new torrent to the queue top), `add_paused` and optional eligibility `tags`. TV and movie labels must differ.
@@ -41,4 +41,4 @@ Pause (`pause`), Resume (`unpause` then `start`), Priority (`queuetop`/`queuebot
 - Live uTorrent compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed uTorrent or BitTorrent Web UI was contacted. Row positions, status bits and action names come from the API description, not a live run, and no minimum build is enforced beyond the field being present.
 - The newer "uTorrent Web" (non-`/gui`) API and the relocation of completed torrents are not handled; the root download path is used as reported.
 - Seeding limits, torrent-level priorities and the health classifier are not implemented.
-- Migration 0071 is the 71st entry (0065-0068 come from the rename, auto-tagging, collections and torrent RSS lanes; 0075 later reinstalls the provider scope triggers with every lane's implementations).
+- Migration file `0071` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

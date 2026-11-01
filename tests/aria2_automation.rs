@@ -2,6 +2,7 @@
 //! release -> grab -> addTorrent/addUri into a label subfolder -> tellStopped refresh -> completed handoff ->
 //! import, for one multi-file TV episode (`.torrent` upload) and one single-file movie (magnet)
 //! that share native ID 1. No live services or real media are used.
+mod stall_watchdog;
 use axum::{
     body::Bytes,
     extract::{OriginalUri, State},
@@ -313,20 +314,50 @@ async fn serve(app: axum::Router) -> (String, Server) {
         })),
     )
 }
-async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
-    let response = reqwest::Client::builder()
+// These tests share process-wide admission gates (for example the two-slot release-term CPU gate,
+// which answers `release_term_busy` instead of queueing). Run in parallel, one test's RSS command
+// is refused and settles `storage_error` with a 30 s retry_wait, which outlasts a 30 s poll budget
+// (observed as 3 of 4 passing with the binding test's rejection never appearing, issue #60).
+// Serialising keeps every command on its first attempt; each test still owns its runtime and DB.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+thread_local! {
+    // One client per test thread (each test owns its runtime thread). Building a rustls client costs
+    // ~50 ms of CPU, which on a shared single-thread runtime competed with the very workers a poll
+    // was waiting for; the 6 s deadline itself is unchanged.
+    static CLIENT: reqwest::Client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(6))
+        .timeout(REQUEST_TIMEOUT)
         .build()
-        .unwrap()
+        .unwrap();
+}
+async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
+    let started = std::time::Instant::now();
+    let client = CLIENT.with(reqwest::Client::clone);
+    let built = started.elapsed();
+    let response = client
         .request(method.parse().unwrap(), format!("{base}{path}"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|e| {
+            // Separates client construction, transport and executor/handler stalls (issue #60).
+            panic!(
+                "{method} {path}: request failed after {} ms (client_build_ms={}, timeout={}, connect={}); {}",
+                started.elapsed().as_millis(),
+                built.as_millis(),
+                e.is_timeout(),
+                e.is_connect(),
+                stall_watchdog::report()
+            )
+        });
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
+    stall_watchdog::note_client_call(
+        &format!("{method} {path} client_build_ms={}", built.as_millis()),
+        started.elapsed(),
+    );
     for private in ["PRIVATE_RSS_GUID", "PRIVATE_RSS_LOCATOR", SECRET] {
         assert!(
             !text.contains(private),
@@ -355,6 +386,7 @@ struct App {
     sab: Value,
     roots: Vec<PathBuf>,
     _servers: (Server, Server),
+    _watchdog: stall_watchdog::Watchdog,
 }
 fn aria2_settings(origin: &str) -> Value {
     json!({"implementation":"aria2","endpoint":format!("{origin}/jsonrpc"),
@@ -362,6 +394,12 @@ fn aria2_settings(origin: &str) -> Value {
         "movies":{"category":"movies-hrrdarr","recent_priority":"last","older_priority":"first"}})
 }
 async fn app(label: &str) -> App {
+    app_with(label, true).await
+}
+/// `usenet` adds the SABnzbd provider that exists only to prove releases never cross protocols.
+/// Its mock answers 404, so every refresh of it fails and retries; tests that never address it
+/// omit it so that unrelated retry churn and commits cannot share their timing (issue #60).
+async fn app_with(label: &str, usenet: bool) -> App {
     let scratch = Scratch(
         std::env::temp_dir().join(format!("hrrdarr-aria2-{label}-{}", uuid::Uuid::new_v4())),
     );
@@ -396,7 +434,9 @@ async fn app(label: &str) -> App {
             metadata.clone(),
         ))
         .merge(hrrdarr::remote_paths::router(db.clone()))
-        .merge(hrrdarr::history::router(db.clone()));
+        .merge(hrrdarr::history::router(db.clone()))
+        .layer(axum::middleware::from_fn(stall_watchdog::track));
+    let watchdog = stall_watchdog::Watchdog::start();
     let (base, api) = serve(router).await;
     let c = db.connect().await.unwrap();
     // Profiles are configuration fixtures; targets, receipts, imports and history use real producers.
@@ -411,12 +451,14 @@ async fn app(label: &str) -> App {
             aria2_settings(&origin),
             json!({"kind":"api_key","api_key":SECRET}),
         ),
-        // A usenet client exists only to prove releases never cross protocols.
+    ]
+    .into_iter()
+    .chain(usenet.then(|| {
         (
             json!({"implementation":"sabnzbd","endpoint":format!("{origin}/sabnzbd"),"tv":{"category":"tv"},"movies":{"category":"movies"}}),
             Value::Null,
-        ),
-    ] {
+        )
+    })) {
         let mut body = json!({"name":"owned","enabled":true,"priority":1,"settings":settings});
         if !credentials.is_null() {
             body["credentials"] = credentials;
@@ -460,7 +502,11 @@ async fn app(label: &str) -> App {
         assert_eq!(code, 201, "{v}");
         roots.push(root);
     }
-    let sab = created.remove(2);
+    let sab = if usenet {
+        created.remove(2)
+    } else {
+        Value::Null
+    };
     let aria2 = created.remove(1);
     App {
         _scratch: scratch,
@@ -474,6 +520,7 @@ async fn app(label: &str) -> App {
         sab,
         roots,
         _servers: (upstream, api),
+        _watchdog: watchdog,
     }
 }
 fn target(indexer: &Value, client: &Value, media: &str) -> Value {
@@ -487,6 +534,66 @@ async fn enqueue(base: &str, target: Value) -> (u16, Value) {
         json!({"target":target,"priority":"high"}),
     )
     .await
+}
+/// Candidate/command state for timeout panics: statuses and error codes only, no ids or payloads.
+async fn command_states(db: &Database) -> String {
+    let mut out = Vec::new();
+    // `next_attempt_at` is unix seconds; report the remaining wait so a backoff outlasting the
+    // test budget is visible as such.
+    for table in ["rss_commands", "search_commands"] {
+        let Ok(c) = db.connect().await else { break };
+        let Ok(mut rows) = c
+            .query(
+                &format!(
+                    "SELECT status,coalesce(error_code,'none'),attempts,max(0,next_attempt_at-unixepoch()) FROM {table}"
+                ),
+                (),
+            )
+            .await
+        else {
+            continue;
+        };
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(format!(
+                "{table}[{} error={} attempts={} next_in_s={}]",
+                row.get::<String>(0).unwrap_or_default(),
+                row.get::<String>(1).unwrap_or_default(),
+                row.get::<i64>(2).unwrap_or(-1),
+                row.get::<i64>(3).unwrap_or(-1)
+            ));
+        }
+    }
+    out.join(",")
+}
+/// Polls the candidate list until one has a wanted status. On budget exhaustion it names the last
+/// candidate states, command states, executor lag and slow handlers instead of `Elapsed(())`.
+async fn wait_candidate(app: &App, what: &str, budget: Duration, wanted: &[&str]) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let (_, v) = request(&app.base, "GET", "/api/v1/rss/candidates", Value::Null).await;
+        let items = v["items"].as_array().cloned().unwrap_or_default();
+        if let Some(item) = items
+            .iter()
+            .find(|i| wanted.contains(&i["status"].as_str().unwrap_or("")))
+        {
+            return item.clone();
+        }
+        if started.elapsed() >= budget {
+            let seen: Vec<_> = items
+                .iter()
+                .map(|i| format!("{}/{}", i["status"], i["error_code"]))
+                .collect();
+            panic!(
+                "{what}: no candidate in {wanted:?} after {} ms; candidates=[{}]; commands={}; adds={}; {}",
+                started.elapsed().as_millis(),
+                seen.join(","),
+                command_states(&app.db).await,
+                app.state.adds.lock().unwrap().len(),
+                stall_watchdog::report()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
 }
 async fn wait_command(base: &str, id: &Value, status: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -523,6 +630,7 @@ async fn count(db: &Database, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn torznab_to_aria2_grab_refresh_and_import_for_both_domains() {
+    let _serial = SERIAL.lock().await;
     let app = app("flow").await;
     let base = &app.base.clone();
     let id = app.aria2["id"].as_str().unwrap().to_owned();
@@ -691,7 +799,8 @@ async fn torznab_to_aria2_grab_refresh_and_import_for_both_domains() {
 
 #[tokio::test]
 async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
-    let app = app("lost").await;
+    let _serial = SERIAL.lock().await;
+    let app = app_with("lost", false).await;
     let base = &app.base;
     app.state.lose_add_response.store(true, Ordering::SeqCst);
     let (code, command) = enqueue(base, target(&app.indexer, &app.aria2, "movies")).await;
@@ -701,28 +810,13 @@ async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
             .await
             .unwrap();
     // Reconciliation runs after the bounded uncertainty delay, never immediately.
-    let receipt = tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
-            let (code, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
-            assert_eq!(code, 200, "{v}");
-            if let Some(item) = v["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|v| v["status"] == "needs_attention")
-            {
-                return item.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "an unconfirmed add must surface for attention; adds={}",
-            app.state.adds.lock().unwrap().len()
-        )
-    });
+    let receipt = wait_candidate(
+        &app,
+        "an unconfirmed add must surface for attention",
+        Duration::from_secs(90),
+        &["needs_attention"],
+    )
+    .await;
     // The torrent was found by its info hash, but an uncertain add is never silently promoted.
     assert_eq!(receipt["error_code"], "presence_unconfirmed");
     assert_eq!(receipt["target"]["media_type"], "movies");
@@ -741,6 +835,7 @@ async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
 
 #[tokio::test]
 async fn provider_api_validates_and_tests_aria2_configuration() {
+    let _serial = SERIAL.lock().await;
     let app = app("config").await;
     let base = &app.base;
     let origin = app.state.origin.lock().unwrap().clone();
@@ -865,6 +960,7 @@ async fn provider_api_validates_and_tests_aria2_configuration() {
 
 #[tokio::test]
 async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submission() {
+    let _serial = SERIAL.lock().await;
     let app = app("binding").await;
     let base = &app.base;
     // A Torznab preference for the usenet client is stored, not erased.
@@ -879,22 +975,13 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
         commands::start_with_metadata(app.db.clone(), app.client.clone(), app.metadata.clone())
             .await
             .unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let (_, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
-            if let Some(item) = v["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|v| v["status"] == "rejected" || v["status"] == "needs_attention")
-            {
-                return item.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-    })
-    .await
-    .expect("the cross-protocol preference must be a visible rejection");
+    let receipt = wait_candidate(
+        &app,
+        "the cross-protocol preference must be a visible rejection",
+        Duration::from_secs(30),
+        &["rejected", "needs_attention"],
+    )
+    .await;
     assert_eq!(receipt["status"], "rejected", "{receipt}");
     assert_eq!(receipt["error_code"], "unsupported_target", "{receipt}");
     runtime.shutdown().await;
