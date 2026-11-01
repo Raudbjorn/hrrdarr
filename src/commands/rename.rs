@@ -481,6 +481,8 @@ fn forward(j: &Journal) -> std::result::Result<(), &'static str> {
                 fsops::move_path(&j.root, &old, &new, kind, ident).map_err(|e| e.code())?
             }
             Ok(PairState::Moved) => {}
+            Ok(PairState::Transit) => fsops::settle_transit(&j.root, &old, &new, kind, ident, true)
+                .map_err(|e| e.code())?,
             Ok(PairState::Anomaly) => return Err("filesystem_conflict"),
             Err(e) => return Err(e.code()),
         }
@@ -493,9 +495,14 @@ fn rollback(j: &Journal) -> bool {
     for (i, (old, new, ident)) in j.pairs().into_iter().enumerate().rev() {
         let kind = if i == 0 { j.kind } else { Kind::File };
         match fsops::pair_state(&old, &new, kind, ident) {
-            Ok(PairState::Source) => {}
+            // Already at its original spelling; make sure that is durable before `rolled_back` is
+            // recorded (a compensating rename in `rename_case_only` is not synced).
+            Ok(PairState::Source) => restored &= fsops::sync_parent(&j.root, &old).is_ok(),
             Ok(PairState::Moved) => {
                 restored &= fsops::move_path(&j.root, &new, &old, kind, ident).is_ok();
+            }
+            Ok(PairState::Transit) => {
+                restored &= fsops::settle_transit(&j.root, &old, &new, kind, ident, false).is_ok();
             }
             _ => restored = false,
         }

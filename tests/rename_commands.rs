@@ -815,3 +815,579 @@ async fn folder_rename_recovery_rechecks_declarations_before_committing() -> R {
     }
     Ok(())
 }
+
+// ---- Real case-insensitive filesystem (issue #49) ----
+//
+// Reasoning: the unit tests above simulate alias lookups on a case-sensitive filesystem. These
+// tests run the real command, journal and recovery paths on a directory that really folds case.
+// They are `#[ignore]`d because they need a disposable case-insensitive directory; run them with
+//   tests/support/with-casefold-dir.sh cargo test --locked --test rename_commands \
+//       real_casefold -- --ignored --test-threads=1 --nocapture
+// Without `HRRDARR_CASEFOLD_DIR` (or when the capability probe fails) they FAIL with an
+// "UNSUPPORTED" message; they never pass by silently falling back to a case-sensitive directory.
+const CASEFOLD_ENV: &str = "HRRDARR_CASEFOLD_DIR";
+
+/// Proves the directory folds case and records what it is, or says why it does not.
+fn casefold_evidence(dir: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let probe = dir.join("probe.mkv");
+    std::fs::write(&probe, b"x").map_err(|e| format!("cannot write the fixture: {e}"))?;
+    let result = (|| {
+        let alias = std::fs::metadata(dir.join("PROBE.MKV"))
+            .map_err(|_| "an upper-case lookup does not resolve the lower-case entry")?;
+        let real = std::fs::metadata(&probe).map_err(|e| e.to_string())?;
+        if (alias.dev(), alias.ino()) != (real.dev(), real.ino()) {
+            return Err("alias and entry have different identities".to_owned());
+        }
+        let listing: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        if listing != ["probe.mkv"] {
+            return Err(format!(
+                "enumeration shows more than the original spelling: {listing:?}"
+            ));
+        }
+        match std::fs::hard_link(&probe, dir.join("PROBE.MKV")) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            other => return Err(format!("a second spelling could be created: {other:?}")),
+        }
+        // The mount that holds the directory, for the evidence record.
+        let canonical = dir.canonicalize().map_err(|e| e.to_string())?;
+        let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mount = info
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<_> = l.split(' ').collect();
+                let at = f.iter().position(|x| *x == "-")?;
+                canonical
+                    .starts_with(f.get(4)?)
+                    .then(|| (f[4].len(), format!("{} on {} ({})", f[at + 1], f[4], f[5])))
+            })
+            .max()
+            .map(|(_, m)| m)
+            .unwrap_or_else(|| "mount not found".into());
+        Ok(format!(
+            "device {} inode {}; {mount}; alias lookup resolves the same inode; enumeration keeps the original spelling; a second spelling cannot be linked",
+            real.dev(),
+            real.ino()
+        ))
+    })();
+    let _ = std::fs::remove_file(&probe);
+    result
+}
+
+/// A library root below a verified case-insensitive directory; removed on drop.
+struct Fold(PathBuf);
+impl Fold {
+    fn provision() -> Self {
+        let base = std::env::var_os(CASEFOLD_ENV).map(PathBuf::from).unwrap_or_else(|| {
+            panic!(
+                "UNSUPPORTED: {CASEFOLD_ENV} is not set. Provision a disposable case-insensitive directory, e.g. \
+                 tests/support/with-casefold-dir.sh cargo test --locked --test rename_commands real_casefold -- --ignored"
+            )
+        });
+        let root = base.join(format!("run-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap_or_else(|e| panic!("UNSUPPORTED: {base:?}: {e}"));
+        match casefold_evidence(&root) {
+            Ok(evidence) => eprintln!("casefold evidence: {evidence}"),
+            Err(why) => {
+                let _ = std::fs::remove_dir_all(&root);
+                panic!("UNSUPPORTED: {base:?} is not a case-insensitive directory: {why}");
+            }
+        }
+        Self(root)
+    }
+    fn s(&self, rel: &str) -> String {
+        format!("{}/{rel}", self.0.display())
+    }
+    fn write(&self, rel: &str) {
+        let p = self.0.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, rel.as_bytes()).unwrap();
+    }
+    /// Exact on-disk spellings (what enumeration reports, never what a lookup resolves).
+    fn names(&self, rel: &str) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(self.0.join(rel))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+    /// What the on-disk entry is called, found by case-insensitive comparison.
+    fn spelled(&self, rel_dir: &str, name: &str) -> Option<String> {
+        self.names(rel_dir)
+            .into_iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+    }
+    fn ident(&self, rel: &str) -> Value {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(self.0.join(rel)).unwrap();
+        json!({"dev": m.dev() as i64, "ino": m.ino() as i64})
+    }
+    /// Test-side stand-in for an effective case change (what an interrupted run leaves behind).
+    fn force_case(&self, dir: &str, from: &str, to: &str) {
+        let d = self.0.join(dir);
+        let tmp = d.join("force-case-tmp");
+        std::fs::rename(d.join(from), &tmp).unwrap();
+        std::fs::rename(&tmp, d.join(to)).unwrap();
+    }
+    /// Leaves the entry under the transit name the recovery code looks for.
+    fn into_transit(&self, dir: &str, from: &str) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(self.0.join(dir).join(from)).unwrap();
+        let name = hrrdarr::rename::case_transit_name(m.dev(), m.ino());
+        std::fs::rename(self.0.join(dir).join(from), self.0.join(dir).join(name)).unwrap();
+    }
+}
+impl Drop for Fold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+async fn setup_fold() -> R<(
+    tokio::sync::MutexGuard<'static, ()>,
+    Scratch,
+    Fold,
+    Arc<Database>,
+    Connection,
+    Api,
+)> {
+    let (lock, s, db, c, api) = setup().await?;
+    Ok((lock, s, Fold::provision(), db, c, api))
+}
+async fn event_total(api: &Api) -> i64 {
+    api.ok("GET", "/api/v1/rename/events", None, 200).await["total"]
+        .as_i64()
+        .unwrap()
+}
+async fn run_rename(api: &Api, name: &str, owner: &str, id: i64) -> Value {
+    let domain = if owner == "series_ids" {
+        "tv"
+    } else {
+        "movies"
+    };
+    let done = command(
+        api,
+        json!({"name":name,"target":{"media_type":domain,owner:[id]},"priority":"normal"}),
+    )
+    .await;
+    assert_eq!(done["status"], "succeeded", "{name}: {done}");
+    done
+}
+
+#[tokio::test]
+#[ignore = "needs a real case-insensitive directory: tests/support/with-casefold-dir.sh"]
+async fn real_casefold_case_only_renames_run_forward_and_back_for_tv_and_movies() -> R {
+    let (_lock, _db_dir, f, db, c, api) = setup_fold().await?;
+    seed_series(&c, 1, "Show", &f.s("show"), Some(0)).await;
+    f.write("show/ep.mkv");
+    f.write("show/ep.srt");
+    seed_file(&c, 1, 1, &f.s("show/ep.mkv")).await;
+    seed_episode(&c, 1, 1, 1, 1, "One", Some(1)).await;
+    seed_movie(
+        &c,
+        1,
+        "Film",
+        &f.s("film"),
+        Some((1, &f.s("film/FILM.mkv"))),
+    )
+    .await;
+    f.write("film/FILM.mkv");
+    f.write("film/FILM.srt");
+    naming_tv(&c, true, "EP", None, None).await;
+    naming_movies(&c, true, "{Movie Title}", Some("{Movie Title}")).await;
+    let runtime = worker(&db, &api).await;
+    let mut events = event_total(&api).await;
+
+    // TV file + sidecar: ep -> EP, then back. The kernel treats renameat("ep.mkv", "EP.mkv") as a
+    // same-inode no-op here, so a "successful" rename must still change the stored spelling.
+    let done = run_rename(&api, "rename_series", "series_ids", 1).await;
+    assert_eq!(done["items_renamed"], 1, "{done}");
+    assert_eq!(
+        f.names("show"),
+        ["EP.mkv", "EP.srt"],
+        "disk spelling after forward"
+    );
+    assert_eq!(path_of(&c, "episode_files", 1).await, f.s("show/EP.mkv"));
+    assert_eq!(event_total(&api).await, events + 1);
+    events += 1;
+    let again = run_rename(&api, "rename_series", "series_ids", 1).await;
+    assert_eq!(
+        (
+            again["items_renamed"].as_i64(),
+            again["items_unchanged"].as_i64()
+        ),
+        (Some(0), Some(1))
+    );
+    assert_eq!(event_total(&api).await, events, "a retry records nothing");
+    naming_tv(&c, true, "ep", None, None).await;
+    let done = run_rename(&api, "rename_series", "series_ids", 1).await;
+    assert_eq!(done["items_renamed"], 1, "{done}");
+    assert_eq!(
+        f.names("show"),
+        ["ep.mkv", "ep.srt"],
+        "disk spelling after reverse"
+    );
+    assert_eq!(path_of(&c, "episode_files", 1).await, f.s("show/ep.mkv"));
+    events += 1;
+
+    // TV folder: show -> Show -> show (the file path prefix follows in the same transaction).
+    for (title, spelling) in [("Show", "Show"), ("show", "show")] {
+        c.execute("UPDATE series SET title=? WHERE id=1", [title])
+            .await?;
+        let done = run_rename(&api, "rename_series_folder", "series_ids", 1).await;
+        assert_eq!(done["items_renamed"], 1, "{done}");
+        assert_eq!(
+            f.spelled("", "show").as_deref(),
+            Some(spelling),
+            "series folder spelling"
+        );
+        assert_eq!(path_of(&c, "series", 1).await, f.s(spelling));
+        assert_eq!(
+            path_of(&c, "episode_files", 1).await,
+            f.s(&format!("{spelling}/ep.mkv"))
+        );
+        assert_eq!(
+            f.names(spelling),
+            ["ep.mkv", "ep.srt"],
+            "contents survive the folder rename"
+        );
+        events += 1;
+        assert_eq!(event_total(&api).await, events);
+    }
+
+    // Movies: the same, file then folder, through Film -> FILM -> film.
+    for title in ["Film", "FILM", "film"] {
+        c.execute("UPDATE movie_metadata SET title=? WHERE id=1001", [title])
+            .await?;
+        let done = run_rename(&api, "rename_movie", "movie_ids", 1).await;
+        let folder = f.spelled("", "film").unwrap();
+        assert_eq!(
+            done["items_renamed"].as_i64().unwrap() + done["items_unchanged"].as_i64().unwrap(),
+            1,
+            "{done}"
+        );
+        assert_eq!(
+            f.names(&folder),
+            [format!("{title}.mkv"), format!("{title}.srt")],
+            "movie file + sidecar"
+        );
+        assert_eq!(
+            path_of(&c, "movie_files", 1).await,
+            f.s(&format!("{folder}/{title}.mkv"))
+        );
+        run_rename(&api, "rename_movie_folder", "movie_ids", 1).await;
+        assert_eq!(
+            f.spelled("", "film").as_deref(),
+            Some(title),
+            "movie folder spelling"
+        );
+        assert_eq!(path_of(&c, "movies", 1).await, f.s(title));
+        assert_eq!(
+            path_of(&c, "movie_files", 1).await,
+            f.s(&format!("{title}/{title}.mkv"))
+        );
+    }
+    runtime.shutdown().await;
+    Ok(())
+}
+
+/// Journals a group exactly as an interrupted run leaves it: `planned`, in a cancelled command.
+#[allow(clippy::too_many_arguments)]
+async fn plant_journal(
+    c: &Connection,
+    n: u32,
+    movie: bool,
+    owner: i64,
+    folder: bool,
+    file: Option<i64>,
+    (old, new): (&str, &str),
+    ident: &Value,
+    sidecars: Value,
+) {
+    let id = format!("00000000-0000-4000-8000-{n:012}");
+    let (name, domain, column) = match (movie, folder) {
+        (false, false) => ("rename_series", "tv", "series_id"),
+        (false, true) => ("rename_series_folder", "tv", "series_id"),
+        (true, false) => ("rename_movie", "movies", "movie_id"),
+        (true, true) => ("rename_movie_folder", "movies", "movie_id"),
+    };
+    c.execute("INSERT INTO rename_commands(id,name,media_type,priority,status,attempts,next_attempt_at,created_at) VALUES(?,?,?,0,'queued',0,0,0)", params![id.clone(), name, domain]).await.unwrap();
+    c.execute(
+        &format!("INSERT INTO rename_command_targets(command_id,ordinal,{column}) VALUES(?,0,?)"),
+        params![id.clone(), owner],
+    )
+    .await
+    .unwrap();
+    c.execute(&format!("INSERT INTO rename_items(command_id,kind,{column},file_id,old_path,new_path,identity_json,sidecars_json,state) VALUES(?,?,?,?,?,?,?,?,'planned')"),
+        params![id.clone(), if folder { "folder" } else { "file" }, owner, file, old, new, ident.to_string(), sidecars.to_string()]).await.unwrap();
+    // Worker start re-queues interrupted commands; a cancelled one stays put, so only journal
+    // recovery (which ignores the command's status) acts on the planted item.
+    for sql in [
+        "UPDATE rename_commands SET status='running',attempts=1,started_at=1 WHERE id=?",
+        "UPDATE rename_commands SET status='cancelled',completed_at=2 WHERE id=?",
+    ] {
+        c.execute(sql, [id.clone()]).await.unwrap();
+    }
+}
+async fn journal_states(c: &Connection) -> Vec<(i64, String, Option<String>)> {
+    let mut rows = c
+        .query("SELECT COALESCE(series_id,movie_id)+CASE WHEN movie_id IS NULL THEN 0 ELSE 100 END,state,error_code FROM rename_items ORDER BY id", ())
+        .await
+        .unwrap();
+    let mut v = vec![];
+    while let Some(r) = rows.next().await.unwrap() {
+        v.push((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()));
+    }
+    v
+}
+
+#[tokio::test]
+#[ignore = "needs a real case-insensitive directory: tests/support/with-casefold-dir.sh"]
+async fn real_casefold_interrupted_case_only_renames_recover_from_the_journal() -> R {
+    let (_lock, _db_dir, f, db, c, api) = setup_fold().await?;
+    // Series 1-4: file groups; 5-6: folders; movie 1: a movie file group.
+    for k in 1..=4 {
+        seed_series(&c, k, "Show", &f.s(&format!("s{k}")), Some(0)).await;
+        f.write(&format!("s{k}/ep.mkv"));
+        f.write(&format!("s{k}/ep.srt"));
+        seed_file(&c, k, k, &f.s(&format!("s{k}/ep.mkv"))).await;
+    }
+    for k in 5..=6 {
+        seed_series(&c, k, "Show", &f.s(&format!("t{k}")), Some(0)).await;
+        f.write(&format!("t{k}/ep.mkv"));
+        seed_file(&c, k, k, &f.s(&format!("t{k}/ep.mkv"))).await;
+    }
+    seed_movie(&c, 1, "Film", &f.s("film"), Some((7, &f.s("film/m.mkv")))).await;
+    f.write("film/m.mkv");
+    f.write("film/m.srt");
+    let group = |k: u32| {
+        let dir = format!("s{k}");
+        (
+            f.ident(&format!("{dir}/ep.mkv")),
+            f.ident(&format!("{dir}/ep.srt")),
+            dir,
+        )
+    };
+    let sidecar = |dir: &str, ident: &Value| json!([{"old": f.s(&format!("{dir}/ep.srt")), "new": f.s(&format!("{dir}/EP.srt")), "ident": ident}]);
+    let paths = |dir: &str| (f.s(&format!("{dir}/ep.mkv")), f.s(&format!("{dir}/EP.mkv")));
+
+    // 1. Crash right after the journal intent: nothing moved yet.
+    let (m, s, dir) = group(1);
+    let (o, n) = paths(&dir);
+    plant_journal(
+        &c,
+        1,
+        false,
+        1,
+        false,
+        Some(1),
+        (&o, &n),
+        &m,
+        sidecar(&dir, &s),
+    )
+    .await;
+    // 2. Crash after the filesystem renames, before the database commit.
+    let (m, s, dir) = group(2);
+    let (o, n) = paths(&dir);
+    plant_journal(
+        &c,
+        2,
+        false,
+        2,
+        false,
+        Some(2),
+        (&o, &n),
+        &m,
+        sidecar(&dir, &s),
+    )
+    .await;
+    f.force_case(&dir, "ep.mkv", "EP.mkv");
+    f.force_case(&dir, "ep.srt", "EP.srt");
+    // 3. Crash between the two steps of the media file's rename: parked, sidecar not started.
+    let (m, s, dir) = group(3);
+    let (o, n) = paths(&dir);
+    plant_journal(
+        &c,
+        3,
+        false,
+        3,
+        false,
+        Some(3),
+        (&o, &n),
+        &m,
+        sidecar(&dir, &s),
+    )
+    .await;
+    f.into_transit(&dir, "ep.mkv");
+    // 4. A rollback that starts from a parked media file while the sidecar was replaced by an
+    // unrelated file: the media returns to its original spelling, the intruder is never touched.
+    let (m, s, dir) = group(4);
+    let (o, n) = paths(&dir);
+    plant_journal(
+        &c,
+        4,
+        false,
+        4,
+        false,
+        Some(4),
+        (&o, &n),
+        &m,
+        sidecar(&dir, &s),
+    )
+    .await;
+    f.into_transit(&dir, "ep.mkv");
+    std::fs::remove_file(f.0.join("s4/ep.srt"))?;
+    std::fs::write(f.0.join("s4/ep.srt"), b"intruder")?;
+    // 5. A folder renamed on disk, database not yet committed; 6. a folder parked in transit.
+    let (o, n) = (f.s("t5"), f.s("T5"));
+    plant_journal(
+        &c,
+        5,
+        false,
+        5,
+        true,
+        None,
+        (&o, &n),
+        &f.ident("t5"),
+        json!([]),
+    )
+    .await;
+    f.force_case("", "t5", "T5");
+    let (o, n) = (f.s("t6"), f.s("T6"));
+    plant_journal(
+        &c,
+        6,
+        false,
+        6,
+        true,
+        None,
+        (&o, &n),
+        &f.ident("t6"),
+        json!([]),
+    )
+    .await;
+    f.into_transit("", "t6");
+    // 7. A movie file parked in transit with its sidecar not started.
+    let (o, n) = (f.s("film/m.mkv"), f.s("film/M.mkv"));
+    let side = json!([{"old": f.s("film/m.srt"), "new": f.s("film/M.srt"), "ident": f.ident("film/m.srt")}]);
+    plant_journal(
+        &c,
+        7,
+        true,
+        1,
+        false,
+        Some(7),
+        (&o, &n),
+        &f.ident("film/m.mkv"),
+        side,
+    )
+    .await;
+    f.into_transit("film", "m.mkv");
+
+    // Worker start resolves every journal row from what is really on disk.
+    let runtime = worker(&db, &api).await;
+    let states = journal_states(&c).await;
+    let committed = |owner: i64| (owner, "committed".to_owned(), None);
+    assert_eq!(
+        states,
+        vec![
+            committed(1),
+            committed(2),
+            committed(3),
+            (4, "failed".into(), Some("rollback_incomplete".into())),
+            committed(5),
+            committed(6),
+            committed(101),
+        ],
+        "journal outcomes"
+    );
+    for k in 1..=3 {
+        assert_eq!(
+            f.names(&format!("s{k}")),
+            ["EP.mkv", "EP.srt"],
+            "series {k} spelling"
+        );
+        assert_eq!(
+            path_of(&c, "episode_files", k).await,
+            f.s(&format!("s{k}/EP.mkv"))
+        );
+    }
+    assert_eq!(
+        f.names("s4"),
+        ["ep.mkv", "ep.srt"],
+        "rolled back to the original spelling"
+    );
+    assert_eq!(path_of(&c, "episode_files", 4).await, f.s("s4/ep.mkv"));
+    assert_eq!(
+        std::fs::read(f.0.join("s4/ep.srt"))?,
+        b"intruder",
+        "unrelated entry untouched"
+    );
+    for (k, folder) in [(5, "T5"), (6, "T6")] {
+        assert_eq!(f.spelled("", &format!("t{k}")).as_deref(), Some(folder));
+        assert_eq!(path_of(&c, "series", k).await, f.s(folder));
+        assert_eq!(
+            path_of(&c, "episode_files", k).await,
+            f.s(&format!("{folder}/ep.mkv"))
+        );
+        assert_eq!(f.names(folder), ["ep.mkv"]);
+    }
+    assert_eq!(f.names("film"), ["M.mkv", "M.srt"]);
+    assert_eq!(path_of(&c, "movie_files", 7).await, f.s("film/M.mkv"));
+    assert!(
+        f.names("")
+            .iter()
+            .chain(f.names("s3").iter())
+            .all(|n| !n.starts_with(".hrrdarr-case-")),
+        "no parked entry is left behind"
+    );
+    assert_eq!(
+        event_total(&api).await,
+        6,
+        "one event per committed item, none for the rollback"
+    );
+
+    // A second restart finds nothing planned: recovery is idempotent.
+    runtime.shutdown().await;
+    let runtime = worker(&db, &api).await;
+    assert_eq!(journal_states(&c).await, states);
+    assert_eq!(event_total(&api).await, 6);
+    assert_eq!(f.names("s4"), ["ep.mkv", "ep.srt"]);
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hardlinked_case_variants_on_a_case_sensitive_directory_stay_a_protected_conflict() -> R {
+    use std::os::unix::fs::MetadataExt;
+    let (_lock, s, db, c, api) = setup().await?;
+    seed_series(&c, 1, "Show", &s.s("lib/Show"), Some(0)).await;
+    s.write("lib/Show/ep.mkv");
+    std::fs::hard_link(s.0.join("lib/Show/ep.mkv"), s.0.join("lib/Show/EP.mkv"))?;
+    seed_file(&c, 1, 1, &s.s("lib/Show/ep.mkv")).await;
+    seed_episode(&c, 1, 1, 1, 1, "One", Some(1)).await;
+    naming_tv(&c, true, "EP", None, None).await;
+    // Two distinct names of one inode: a lookup of either spelling answers with the same
+    // identity, which must never be mistaken for a case-insensitive alias.
+    let ino = |rel: &str| std::fs::metadata(s.0.join(rel)).map(|m| m.ino());
+    assert_eq!(ino("lib/Show/ep.mkv")?, ino("lib/Show/EP.mkv")?);
+    let runtime = worker(&db, &api).await;
+    let done = command(&api, json!({"name":"rename_series","target":{"media_type":"tv","series_ids":[1]},"priority":"normal"})).await;
+    assert_ne!(done["items"][0]["state"], "committed", "{done}");
+    assert_eq!(done["items_renamed"], 0, "{done}");
+    let mut names: Vec<_> = std::fs::read_dir(s.0.join("lib/Show"))?
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["EP.mkv", "ep.mkv"], "both entries survive");
+    assert_eq!(
+        path_of(&c, "episode_files", 1).await,
+        s.s("lib/Show/ep.mkv")
+    );
+    assert_eq!(event_total(&api).await, 0);
+    runtime.shutdown().await;
+    Ok(())
+}

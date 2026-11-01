@@ -13,11 +13,14 @@ use crate::providers::{
     qbittorrent::{AddSource, Control, QbitError},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MIN_VERSION: (u32, u32) = (1, 18);
 /// Maximum entries requested in each waiting/stopped page.
 const WINDOW: usize = 1000;
+/// Most passes over the queue for one lookup; each pass is itself bounded by
+/// `MAX_LISTED_TORRENTS`, and the operation deadline still applies.
+const MAX_SCANS: usize = 4;
 const STATUS_KEYS: [&str; 13] = [
     "gid",
     "status",
@@ -115,9 +118,11 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
     fn folder(&self, label: &str) -> String {
         format!("{}/{label}", self.default_dir)
     }
-    async fn all(&mut self) -> Result<Vec<RawTorrent>> {
-        let mut out = Vec::new();
-        let mut gids = BTreeMap::new();
+    /// One pass over active, waiting and stopped downloads. aria2 offers no snapshot: the three
+    /// lists are read by separate requests and the paged ones by offset, so queue churn between
+    /// requests can shift an unvisited download behind the next offset or move it between lists.
+    async fn scan(&mut self) -> Result<Scan> {
+        let mut scan = Scan::default();
         let mut seen = 0;
         for method in ["aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"] {
             let mut offset = 0;
@@ -135,13 +140,14 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
                     return Err(HttpError::ResponseTooLarge.into());
                 }
                 for entry in entries {
+                    scan.note(method, entry);
                     if let Some((gid, torrent)) = torrent(entry, &self.default_dir)? {
                         // Keep the first, most active, entry when a hash appears in several lists.
-                        if gids.contains_key(&torrent.hash) {
+                        if scan.gids.contains_key(&torrent.hash) {
                             continue;
                         }
-                        gids.insert(torrent.hash.clone(), gid);
-                        out.push(torrent);
+                        scan.gids.insert(torrent.hash.clone(), gid);
+                        scan.torrents.push(torrent);
                     }
                 }
                 if method == "aria2.tellActive" || entries.len() < WINDOW {
@@ -150,14 +156,84 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
                 offset += entries.len();
             }
         }
-        self.gids = gids;
-        Ok(out)
+        Ok(scan)
+    }
+    /// Scans until one can be trusted, at most `MAX_SCANS` times. `wanted` is the hash the caller
+    /// is looking for, or `None` for a full listing. A scan that lists the wanted hash under a GID
+    /// listed once is trusted at once: presence is not undone by churn elsewhere. Every other scan
+    /// (a full listing, or the hash not seen) is trusted only when it has no GID listed twice (the
+    /// queue moved under the pagination) and the next scan lists exactly the same GIDs in the same
+    /// order, because a download hidden by a shift or a list transition shows up in the rescan and
+    /// changes the sequence. Anything else is `Unstable`, never an incomplete or empty answer.
+    async fn settled(&mut self, wanted: Option<&str>) -> Result<Scan> {
+        let mut previous: Option<Vec<String>> = None;
+        for _ in 0..MAX_SCANS {
+            let scan = self.scan().await?;
+            if wanted.is_some_and(|hash| {
+                scan.gids
+                    .get(hash)
+                    .is_some_and(|gid| !scan.duplicated.contains(gid))
+            }) {
+                self.gids = scan.gids.clone();
+                return Ok(scan);
+            }
+            if scan.churned {
+                previous = None;
+                continue;
+            }
+            if previous.as_ref() == Some(&scan.order) {
+                self.gids = scan.gids.clone();
+                return Ok(scan);
+            }
+            previous = Some(scan.order);
+        }
+        Err(QbitError::Unstable)
+    }
+    async fn all(&mut self) -> Result<Vec<RawTorrent>> {
+        Ok(self.settled(None).await?.torrents)
+    }
+    /// The torrent and its GID, or `None` only for a confirmed absence.
+    async fn find(&mut self, hash: &str) -> Result<Option<(String, RawTorrent)>> {
+        let mut scan = self.settled(Some(hash)).await?;
+        let Some(gid) = scan.gids.remove(hash) else {
+            return Ok(None);
+        };
+        Ok(scan
+            .torrents
+            .into_iter()
+            .find(|t| t.hash == hash)
+            .map(|t| (gid, t)))
     }
     async fn gid(&mut self, hash: &str) -> Result<String> {
-        if !self.gids.contains_key(hash) {
-            self.all().await?;
+        if let Some(gid) = self.gids.get(hash) {
+            return Ok(gid.clone());
         }
-        self.gids.get(hash).cloned().ok_or(QbitError::NotFound)
+        Ok(self.find(hash).await?.ok_or(QbitError::NotFound)?.0)
+    }
+}
+
+/// What one pass over the three lists saw.
+#[derive(Default)]
+struct Scan {
+    torrents: Vec<RawTorrent>,
+    /// info hash -> GID for the torrents kept.
+    gids: BTreeMap<String, String>,
+    /// `<list>:<gid>` of every raw row in order, including rows that are skipped.
+    order: Vec<String>,
+    /// A GID was listed twice, so the queue changed while it was being read.
+    churned: bool,
+    /// The GIDs that were listed more than once.
+    duplicated: BTreeSet<String>,
+    listed: BTreeSet<String>,
+}
+impl Scan {
+    fn note(&mut self, method: &str, entry: &Value) {
+        let gid = entry.get("gid").and_then(Value::as_str).unwrap_or("");
+        self.order.push(format!("{method}:{gid}"));
+        if !gid.is_empty() && !self.listed.insert(gid.to_owned()) {
+            self.duplicated.insert(gid.to_owned());
+            self.churned = true;
+        }
     }
 }
 
@@ -298,11 +374,11 @@ impl Wire for Aria2Wire<'_, '_> {
         self.all().await
     }
     async fn get(&mut self, hash: &str) -> Result<Option<RawTorrent>> {
-        Ok(self.all().await?.into_iter().find(|t| t.hash == hash))
+        Ok(self.find(hash).await?.map(|(_, torrent)| torrent))
     }
     async fn files(&mut self, hash: &str) -> Result<Vec<RawFile>> {
-        let gid = self.gid(hash).await?;
-        let dir = self.get(hash).await?.ok_or(QbitError::NotFound)?.save_path;
+        let (gid, torrent) = self.find(hash).await?.ok_or(QbitError::NotFound)?;
+        let dir = torrent.save_path;
         let status = self
             .call("aria2.tellStatus", vec![json!(gid), json!(["files"])])
             .await?;

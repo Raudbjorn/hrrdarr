@@ -30,7 +30,17 @@ Waiting and stopped inventories are fetched in 1,000-entry windows, including un
 
 `active` with all bytes present is `completed` (seeding), otherwise `downloading`; `waiting` is `queued`; `paused` is `paused`; `complete` is `completed`; `error` is `warning` / `error`; an active download with no known size is `queued` / `metadata`. File paths are made relative to `dir`; the save path is `dir`.
 
-Waiting and stopped downloads are enumerated in pages of 1,000, within a shared limit of 8,192 raw entries across all statuses and domains. Exceeding that limit returns `response_too_large`; an incomplete listing never establishes that a submission is absent. Pagination is not a snapshot of a concurrently changing aria2 queue.
+Waiting and stopped downloads are enumerated in pages of 1,000, within a shared limit of 8,192 raw entries across all statuses and domains. Exceeding that limit returns `response_too_large`; an incomplete listing never establishes that a submission is absent.
+
+### Queue churn
+
+aria2 gives no snapshot: active, waiting and stopped downloads are three requests and the last two are read by offset. A download can therefore be missed although it exists, either because an earlier entry left (or moved behind) the offset between two windows, or because it moved from waiting to active after the active list was read. The wire handles this with the `tell*` results alone, without extra RPC calls:
+
+- A GID that appears twice in one pass proves the queue moved under the pagination, so that pass is discarded.
+- A pass that does not contain the wanted info hash is trusted only when the **next pass lists exactly the same GIDs in the same order**. A hidden download shows up in the rescan and changes the sequence; an unrelated change is simply absorbed by one more pass.
+- At most four passes are made per lookup (each still bounded by the 8,192-row limit and the operation deadline). If no pass settles, the lookup fails with the retryable `listing_unstable` error (`QbitError::Unstable`), which reconciliation retries on its existing schedule and never maps to `not_observed`. A found download needs a single pass: presence is observed, not inferred. The same duplicate-GID check applies to plain listings, which are retried and fail as `listing_unstable` rather than return a shifted inventory. Controls resolve GIDs through the same lookup.
+
+What this establishes, and what it does not: two consecutive internally consistent passes with identical GID order are strong evidence, not an atomic snapshot. Changes that leave the ordered GID sequence identical across both passes cannot be seen from the listings (a target hidden by a shift in both passes while every row that was read stays the same, which GID uniqueness makes implausible but not impossible). Absence is therefore "the two scans agree", not proof against a live, rapidly changing queue.
 
 ## Submission
 
@@ -42,6 +52,7 @@ Pause, Resume, Priority (`changePosition`) and Remove (`remove`, falling back to
 
 ## Not claimed
 
+- The churn regressions in `tests/aria2_protocol.rs` inject removals, moves, list transitions and non-settling churn between requests of an owned mock. They show the handling is deterministic and bounded; they are not evidence of how often a live aria2 shifts its queue or that its offset pagination behaves as modelled. `system.multicall`, `aria2.getGlobalStat` counters and GID-based `tellStatus` correlation were considered and not used: counts alone miss remove-plus-add pairs, and a stored GID is not part of the submission identity.
 - Live aria2 compatibility was not exercised. Every observation comes from owned mocks on 127.0.0.1; no installed aria2c was contacted. Field names, string typing and the `Unauthorized` error come from the RPC manual, not a live run.
 - WebSocket and XML-RPC transports, per-file selection, seeding limits (`seed-ratio`, `seed-time`) and the health classifier are not implemented.
 - Migration file `0072` is ordered by the applicable history in `src/db/mod.rs`; its filename prefix is not a universal schema version.

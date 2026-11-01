@@ -23,6 +23,9 @@ pub enum QbitError {
     Rejected,
     UnsafeRetention,
     MutationUnknown,
+    /// The client's queue kept changing while it was enumerated, so the listing proves neither
+    /// presence nor absence. Retryable; never evidence that a download is missing.
+    Unstable,
 }
 impl From<HttpError> for QbitError {
     fn from(value: HttpError) -> Self {

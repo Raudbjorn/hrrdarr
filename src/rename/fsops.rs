@@ -86,6 +86,15 @@ impl Ident {
         }
     }
 }
+/// Where an entry is parked for the middle of a two-step case-only rename. It depends only on
+/// the journalled identity, so recovery can find the entry without any extra journal field, and
+/// it stays short enough for any name length.
+pub(crate) fn transit_name(ident: Ident) -> String {
+    format!(
+        ".hrrdarr-case-{:x}-{:x}",
+        ident.dev as u64, ident.ino as u64
+    )
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     File,
@@ -239,6 +248,67 @@ fn destination_parent(root: &str, parent: &str) -> R<File> {
     }
     Ok(dir)
 }
+/// Renames `on` to `nn` inside `dir` where the names differ only by case. Never replaces a
+/// distinct entry.
+fn rename_case_only(dir: &File, on: &str, nn: &str, expect: Ident) -> R<()> {
+    if names(dir)?.iter().any(|n| n == nn) {
+        return Err(MoveError::Exists);
+    }
+    match stat_in(dir, nn)? {
+        // Nothing answers to the new name: an ordinary rename in a case-sensitive directory.
+        None => fs::renameat_with(dir, on, dir, nn, RenameFlags::NOREPLACE).map_err(errno),
+        // The new spelling resolves to this very entry: the directory folds case. There the
+        // kernel treats renameat(old, new) as a same-inode no-op that succeeds without changing
+        // the stored spelling, so the entry is parked under a recoverable name in between.
+        Some(alias) if Ident::of(&alias) == expect => {
+            let parked = transit_name(expect);
+            fs::renameat_with(dir, on, dir, &parked, RenameFlags::NOREPLACE).map_err(errno)?;
+            if let Err(e) = fs::renameat_with(dir, &parked, dir, nn, RenameFlags::NOREPLACE) {
+                // Restore the original spelling before reporting; recovery handles a failure here.
+                let _ = fs::renameat_with(dir, &parked, dir, on, RenameFlags::NOREPLACE);
+                return Err(errno(e));
+            }
+            Ok(())
+        }
+        Some(_) => Err(MoveError::Exists),
+    }
+}
+/// Flushes the directory holding `path`, so a rename already made there survives a crash.
+pub(crate) fn sync_parent(root: &str, path: &str) -> R<()> {
+    if !within(root, path) {
+        return Err(MoveError::Unsafe);
+    }
+    let (parent, _) = parent_and_name(path)?;
+    open_dir(&parent)?.sync_all().map_err(|_| MoveError::Io)
+}
+/// Finishes (`forward`) or undoes an interrupted two-step case-only rename: the entry sits under
+/// its parked name and is moved to the new or the original spelling.
+pub(crate) fn settle_transit(
+    root: &str,
+    old: &str,
+    new: &str,
+    kind: Kind,
+    expect: Ident,
+    forward: bool,
+) -> R<()> {
+    if !within(root, old) || !within(root, new) {
+        return Err(MoveError::Unsafe);
+    }
+    let (op, on) = parent_and_name(old)?;
+    let (_, nn) = parent_and_name(new)?;
+    let dir = open_dir(&op)?;
+    let parked = transit_name(expect);
+    let s = stat_in(&dir, &parked)?.ok_or(MoveError::Missing)?;
+    if !kind_ok(&s, kind) {
+        return Err(MoveError::NotRegular);
+    }
+    if Ident::of(&s) != expect {
+        return Err(MoveError::Changed);
+    }
+    let target = if forward { &nn } else { &on };
+    fs::renameat_with(&dir, &parked, &dir, target, RenameFlags::NOREPLACE).map_err(errno)?;
+    dir.sync_all().map_err(|_| MoveError::Io)
+}
 /// Moves `old` to `new` if `old` still has identity `expect`. Never replaces an existing entry
 /// except the case-only same-entry rename on case-insensitive filesystems.
 pub(crate) fn move_path(root: &str, old: &str, new: &str, kind: Kind, expect: Ident) -> R<()> {
@@ -256,19 +326,11 @@ pub(crate) fn move_path(root: &str, old: &str, new: &str, kind: Kind, expect: Id
         return Err(MoveError::Changed);
     }
     let nd = destination_parent(root, &np)?;
-    let flags = if op == np && on != nn && on.to_lowercase() == nn.to_lowercase() {
-        let listing = names(&nd)?;
-        if listing.iter().any(|n| *n == nn) {
-            return Err(MoveError::Exists);
-        }
-        RenameFlags::empty()
+    if op == np && on != nn && on.to_lowercase() == nn.to_lowercase() {
+        rename_case_only(&nd, &on, &nn, expect)?;
     } else {
-        RenameFlags::NOREPLACE
-    };
-    if flags.is_empty() {
-        fs::renameat(&od, on.as_str(), &nd, nn.as_str()).map_err(errno)?;
-    } else {
-        fs::renameat_with(&od, on.as_str(), &nd, nn.as_str(), flags).map_err(errno)?;
+        fs::renameat_with(&od, on.as_str(), &nd, nn.as_str(), RenameFlags::NOREPLACE)
+            .map_err(errno)?;
     }
     od.sync_all().map_err(|_| MoveError::Io)?;
     if op != np {
@@ -282,6 +344,9 @@ pub(crate) enum PairState {
     Source,
     /// New entry spelling present with the recorded identity and no distinct old entry.
     Moved,
+    /// Neither spelling resolves, but the entry is parked under its transit name: a case-only
+    /// rename was interrupted between its two steps.
+    Transit,
     Anomaly,
 }
 pub(crate) fn pair_state(old: &str, new: &str, kind: Kind, expect: Ident) -> R<PairState> {
@@ -299,6 +364,23 @@ fn classify_pair(
     Ok(match (o, n) {
         (Some(i), None) if i == expect => PairState::Source,
         (None, Some(i)) if i == expect => PairState::Moved,
+        (None, None) => {
+            let (op, on) = parent_and_name(old)?;
+            let (np, nn) = parent_and_name(new)?;
+            if op != np || on == nn || on.to_lowercase() != nn.to_lowercase() {
+                return Ok(PairState::Anomaly);
+            }
+            let kind_of = |s: &fs::Stat| FileType::from_raw_mode(s.st_mode);
+            match stat_in(&open_dir(&op)?, &transit_name(expect))? {
+                Some(s)
+                    if Ident::of(&s) == expect
+                        && matches!(kind_of(&s), FileType::RegularFile | FileType::Directory) =>
+                {
+                    PairState::Transit
+                }
+                _ => PairState::Anomaly,
+            }
+        }
         (Some(o), Some(n)) if o == expect && n == expect => {
             let (op, on) = parent_and_name(old)?;
             let (np, nn) = parent_and_name(new)?;
@@ -558,6 +640,51 @@ mod tests {
         std::fs::remove_file(&old).unwrap();
         std::fs::remove_file(&new).unwrap();
         assert_eq!(classify(), Ok(PairState::Anomaly));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn parked_entry_is_a_transit_state_that_settles_forward_or_back() {
+        // Works on any filesystem: only the parked name matters, not case folding.
+        let d = scratch();
+        for kind in [Kind::File, Kind::Dir] {
+            let (old, new) = (s(&d, "show"), s(&d, "Show"));
+            match kind {
+                Kind::File => std::fs::write(&old, b"a").unwrap(),
+                Kind::Dir => std::fs::create_dir(&old).unwrap(),
+            }
+            let ident = observe(&old, kind).unwrap().unwrap();
+            let parked = s(&d, &transit_name(ident));
+            let state = || pair_state(&old, &new, kind, ident).unwrap();
+            assert_eq!(state(), PairState::Source);
+            // Neither spelling resolves and nothing is parked: not a transit.
+            std::fs::rename(&old, &parked).unwrap();
+            assert_eq!(state(), PairState::Transit);
+            settle_transit(d.to_str().unwrap(), &old, &new, kind, ident, false).unwrap();
+            assert_eq!(state(), PairState::Source);
+            std::fs::rename(&old, &parked).unwrap();
+            settle_transit(d.to_str().unwrap(), &old, &new, kind, ident, true).unwrap();
+            assert_eq!(state(), PairState::Moved);
+            // A parked name that holds a different entry is never adopted.
+            std::fs::rename(&new, &old).unwrap();
+            std::fs::rename(&old, &parked).unwrap();
+            let other = Ident {
+                ino: ident.ino ^ 1,
+                ..ident
+            };
+            assert_eq!(
+                pair_state(&old, &new, kind, other).unwrap(),
+                PairState::Anomaly
+            );
+            assert_eq!(
+                settle_transit(d.to_str().unwrap(), &old, &new, kind, other, true),
+                Err(MoveError::Missing)
+            );
+            std::fs::rename(&parked, &old).unwrap();
+            match kind {
+                Kind::File => std::fs::remove_file(&old).unwrap(),
+                Kind::Dir => std::fs::remove_dir(&old).unwrap(),
+            }
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
