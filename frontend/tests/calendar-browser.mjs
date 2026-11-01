@@ -132,7 +132,20 @@ try{
 
  // Release-type filter is server-side and keeps the other type of the same movie.
  await showMonthOf(today);
+ const movieReads=url=>url.pathname==='/api/v1/movies/calendar';
+ let releaseMovieRead;
+ const heldMovieRead=new Promise(resolve=>{releaseMovieRead=resolve;});
+ await page.route(movieReads,async route=>{await heldMovieRead;await route.continue();});
  await cal.getByRole('group',{name:'Movie release types'}).getByRole('checkbox',{name:'In cinemas'}).uncheck();
+ try{
+  await cal.getByRole('status').filter({hasText:'Loading calendar'}).waitFor();
+  // The new filter is already visible, so neither domain may retain the previous query's rows.
+  assert.equal(await cal.locator('li.entry').count(),0,'Previous query entries remain visible during a replacement read');
+  assert.equal(await cal.getByRole('note').filter({hasText:'episode has an air date'}).count(),0,'Previous query diagnostics remain visible');
+ }finally{releaseMovieRead();}
+ await busy();
+ await page.unroute(movieReads);
+
  await until(()=>cellText(today),t=>!t.includes('In cinemas')&&t.includes('Digital release'),'In cinemas filtered');
  const movieFeedLink=await cal.getByLabel('Movies feed link',{exact:true}).inputValue();
  assert.equal(new URL(movieFeedLink).pathname,'/feed/v1/calendar/movies.ics');

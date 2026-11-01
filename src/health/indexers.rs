@@ -22,7 +22,7 @@ pub(super) async fn evaluate_status(
     };
     let c = db.connect().await.map_err(|_| "storage_error")?;
     let row = c.query(
-        "SELECT count(*),COALESCE(sum(CASE WHEN b.disabled_until>?2 AND ((?2-b.initial_failure_at>=?3)=?4) THEN 1 ELSE 0 END),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id LEFT JOIN indexer_status b ON b.provider_id=p.id AND b.media_type=s.media_type AND b.config_revision=p.revision WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab') AND s.media_type=?1 AND (s.enable_rss=1 OR s.enable_automatic_search=1 OR s.enable_interactive_search=1)",
+        "SELECT count(*),COALESCE(sum(CASE WHEN b.disabled_until>?2 AND ((?2-b.initial_failure_at>=?3)=?4) THEN 1 ELSE 0 END),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id LEFT JOIN indexer_status b ON b.provider_id=p.id AND b.media_type=s.media_type AND b.config_revision=p.revision WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato') AND s.media_type=?1 AND (s.enable_rss=1 OR s.enable_automatic_search=1 OR s.enable_interactive_search=1)",
         params![media,timestamp,PERSISTENT_FAILURE_SECONDS,persistent],
     ).await.map_err(|_| "storage_error")?.next().await.map_err(|_| "storage_error")?.ok_or("check_failed")?;
     let total: i64 = row.get(0).map_err(|_| "storage_error")?;
@@ -68,7 +68,7 @@ pub(super) async fn evaluate_status(
 
 /// Counts use the same eligibility predicate as command admission: master enable,
 /// native implementation and the domain scope's per-operation flag.
-const COUNTS: &str = "SELECT count(*),COALESCE(sum(s.enable_rss),0),COALESCE(sum(s.enable_automatic_search),0),COALESCE(sum(s.enable_interactive_search),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss') AND s.media_type=?";
+const COUNTS: &str = "SELECT count(*),COALESCE(sum(s.enable_rss),0),COALESCE(sum(s.enable_automatic_search),0),COALESCE(sum(s.enable_interactive_search),0) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato') AND s.media_type=?";
 
 pub(super) async fn evaluate(
     db: &Database,

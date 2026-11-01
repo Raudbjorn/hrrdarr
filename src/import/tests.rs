@@ -74,44 +74,41 @@ async fn stage_and_publish(db: &Database, id: &str, record_publish: bool) -> (Pl
     }
     (plan, stage)
 }
-/// Longest any test waits for the process-wide import permit (or an owned worker) to settle. These
+/// Longest any test waits for the database import permit (or an owned worker) to settle. These
 /// events take milliseconds; the bound only matters when a lease leaks or another test holds the
 /// permit, and then the panic names the owner and phase instead of spinning (issue #40).
 const PERMIT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 const PERMIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-static PHASE: std::sync::Mutex<(&str, Option<std::time::Instant>)> =
-    std::sync::Mutex::new(("not_started", None));
-/// Starts a named phase of a long aggregate test and reports the elapsed time of the previous one
-/// on stderr (visible with `--nocapture` or on failure). Carries no paths or payloads.
+thread_local! {
+    // Each current-thread test runtime has independent phase diagnostics, like its database permit.
+    static PHASE: std::cell::RefCell<(&'static str, Option<std::time::Instant>)> = const {
+        std::cell::RefCell::new(("not_started", None))
+    };
+}
 fn phase(name: &'static str) {
-    let mut current = PHASE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(since) = current.1 {
-        eprintln!(
-            "{}",
-            serde_json::json!({"event":"import_test_phase","phase":current.0,"elapsed_ms":since.elapsed().as_millis()})
-        );
-    }
-    *current = (name, Some(std::time::Instant::now()));
+    PHASE.with(|phase| {
+        let mut current = phase.borrow_mut();
+        if let Some(since) = current.1 {
+            eprintln!("{}", serde_json::json!({"event":"import_test_phase","phase":current.0,"elapsed_ms":since.elapsed().as_millis()}));
+        }
+        *current = (name, Some(std::time::Instant::now()));
+    });
 }
 fn current_phase() -> &'static str {
-    PHASE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .0
+    PHASE.with(|phase| phase.borrow().0)
 }
 /// Describes who holds the permit, without private paths: the owning operation (or `foreign`
 /// when it is not this test's), the journal phase and how many database handles remain alive.
 async fn permit_diagnostics(
     what: &str,
+    permit_id: u64,
     db: Option<&Arc<Database>>,
     operation: Option<&str>,
     waited: std::time::Duration,
 ) -> String {
-    let owner = ACTIVE_OPERATION
+    let owner = PERMITS
         .lock()
-        .map(|active| active.clone())
+        .map(|permits| permits.get(&permit_id).cloned())
         .unwrap_or_else(|_| Some("poisoned".into()));
     let ownership = match (&owner, operation) {
         (None, _) => "none",
@@ -135,19 +132,26 @@ async fn permit_diagnostics(
         "{what}: waited {} ms; test_phase={} executing={} permit_owner={:?} ownership={ownership} journal=[{journal}] db_handles={:?}",
         waited.as_millis(),
         current_phase(),
-        EXECUTING.load(Ordering::Acquire),
+        permit_held(permit_id),
         owner,
         db.map(Arc::strong_count),
     )
 }
 /// Waits for the execution permit to be released, with a deadline and ownership diagnostics.
-async fn wait_permit_released(db: Option<&Arc<Database>>, operation: Option<&str>) {
+async fn wait_permit_released(permit_id: u64, db: Option<&Arc<Database>>, operation: Option<&str>) {
     let started = std::time::Instant::now();
-    while EXECUTING.load(Ordering::Acquire) {
+    while permit_held(permit_id) {
         if started.elapsed() >= PERMIT_WAIT_BUDGET {
             panic!(
                 "{}",
-                permit_diagnostics("permit not released", db, operation, started.elapsed()).await
+                permit_diagnostics(
+                    "permit not released",
+                    permit_id,
+                    db,
+                    operation,
+                    started.elapsed()
+                )
+                .await
             );
         }
         tokio::time::sleep(PERMIT_POLL).await;
@@ -167,6 +171,7 @@ async fn wait_owned_complete(db: &Arc<Database>, operation: &str) {
                 "{}",
                 permit_diagnostics(
                     "owned import not complete",
+                    db.permit_id(),
                     Some(db),
                     Some(operation),
                     started.elapsed()
@@ -176,7 +181,7 @@ async fn wait_owned_complete(db: &Arc<Database>, operation: &str) {
         }
         tokio::time::sleep(PERMIT_POLL).await;
     }
-    wait_permit_released(Some(db), Some(operation)).await;
+    wait_permit_released(db.permit_id(), Some(db), Some(operation)).await;
 }
 async fn count(db: &Database, table: &str) -> i64 {
     db.connect()
@@ -196,39 +201,31 @@ async fn count(db: &Database, table: &str) -> i64 {
 // The four sub-suites below once ran inside the restart test as one ~230 s silent aggregate (about
 // 215 s of it: durable_path_diagnostics 42 s, owned 67 s, same_path 72 s, recycle 33 s, observed
 // serially at load ~20; each opens dozens of freshly migrated databases). Each is now its own
-// test so libtest reports progress per suite. They still serialise on PERMIT_TEST_LOCK because
-// every `execute` shares the process-wide import permit. Budget: each suite < 120 s on an idle
+// test so libtest reports progress per suite. Each scratch database has its own permit. Budget: each suite < 120 s on an idle
 // host, < 300 s under heavy host load; the permit waits inside have their own 30 s deadlines.
 #[tokio::test]
 async fn durable_path_diagnostics_persist_each_failure_boundary() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     phase("durable_path_diagnostics");
     durable_path_diagnostics().await;
 }
 #[tokio::test]
 async fn owned_replacements_preserve_originals_and_recover() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     phase("owned_replacements");
     owned_cases::replacements().await;
 }
 #[tokio::test]
 async fn same_path_replacements_preserve_originals_and_recover() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     phase("same_path_replacements");
     same_path_cases::replacements().await;
 }
 #[tokio::test]
 async fn recycle_upgrades_retire_originals_after_commit() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
     phase("recycle_upgrades");
     recycle_cases::upgrades().await;
 }
 
 #[tokio::test]
 async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources() {
-    let _permit_tests = super::PERMIT_TEST_LOCK.lock().await;
-    // All execute() cases share the process-wide import permit. Keep this regression in the
-    // serial recovery test so unrelated scratch databases cannot race for that permit.
     phase("manual_hidden_extension_mapping");
     manual_hidden_extension_filename_preserves_explicit_mapping().await;
     phase("restart_after_publication");
@@ -400,14 +397,8 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     // its blocking filesystem job is alive (also the runtime-shutdown ownership boundary).
     let dir = Scratch::new();
     let db = dir.database().await;
-    assert!(
-        EXECUTING
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    );
-    let lease = Arc::new(Permit {
-        _db: Some(db.clone()),
-    });
+    let permit_id = db.permit_id();
+    let lease = acquire(&db, "lease-test").unwrap();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let task = tokio::spawn(async move {
@@ -426,9 +417,9 @@ async fn restart_recovers_publication_commit_and_cleanup_without_losing_sources(
     assert!(task.await.unwrap_err().is_cancelled());
     drop(db);
     assert!(Database::open_local(dir.0.join("db")).await.is_err());
-    assert!(EXECUTING.load(Ordering::Acquire));
+    assert!(permit_held(permit_id));
     release_tx.send(()).unwrap();
-    wait_permit_released(None, None).await;
+    wait_permit_released(permit_id, None, None).await;
     drop(dir.database().await);
     phase("rescan_conflict");
     // An active rescan for the same series must reject preview->staging as a transient conflict

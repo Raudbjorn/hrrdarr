@@ -50,6 +50,7 @@ reason in the report:
 | `not_the_draft_ledger` | A row differs from the draft ledger, or the history is longer. |
 | `draft_ledger_incomplete` | The draft build never finished migrating (between versions 63 and 75). Run the draft build once to finish, then convert. |
 | `draft_schema_differs` | The draft ledger over a schema that was changed outside the migrations. |
+| `pending_system_delivery` | A pending system notification has no recorded fan-out domain; current scopes cannot safely reconstruct it. No output is published. |
 
 ## How it converts
 
@@ -68,15 +69,17 @@ reason in the report:
      root, profile and availability is stored unmonitored.
    - **Collection members** are stamped with their collection's `metadata_revision`, which the main
      triggers require; `graph_complete` starts at 0.
-   - **Notification deliveries** gain `media_type` (the event's scope, else TV when the notification
-     has a TV scope, else movies), `sent_parts = '[]'` and no lease (migration 0083).
+   - **Notification deliveries** gain `media_type` from a domain event’s recorded scope,
+     `sent_parts = '[]'` and no lease. Pending system events are refused: current notification
+     scopes cannot prove the historical fan-out domain. Terminal system rows use current scopes
+     (TV first) only as a display projection, not evidence of historical routing.
    - **Snapshot imports** gain `provider_authority_version = 0`.
 5. Verifies: schema equals a freshly migrated reference, `PRAGMA integrity_check`, foreign keys,
    per-table row counts, and the cross-table facts main's triggers only enforce on write (collection
    roots in the movies domain, member revisions, member and tag limits, directory-client categories).
    Data main would reject is refused rather than published.
 6. Checks the output with the application's own migration-history reader (79 rows, the pinned
-   import-list lineage; normal startup upgrades it through version 83) and
+   import-list lineage; normal startup upgrades it through version 85) and
    publishes it with a no-clobber hard link, mode `0600`. The destination filesystem must support
    hard links; otherwise conversion fails without publishing a destination. There is no direct-copy
    fallback that could expose a partially copied database.

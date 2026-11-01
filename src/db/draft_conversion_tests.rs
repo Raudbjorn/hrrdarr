@@ -332,7 +332,7 @@ async fn converts_a_populated_draft_database_and_leaves_the_source_untouched() -
         0
     );
 
-    // Notification deliveries gain the delivery scope (migration 0083).
+    // These pending events carry recorded TV/movie scopes; no historical system domain is guessed.
     assert_eq!(settings("SELECT count(*) FROM notification_deliveries WHERE id=1 AND media_type='movies' AND sent_parts='[]' AND lease_owner IS NULL AND next_attempt_at=5").await?, 1);
     assert_eq!(settings("SELECT count(*) FROM notification_deliveries WHERE id=2 AND media_type='tv' AND attempts=2").await?, 1);
     // Snapshot import bookkeeping keeps its versions; the new authority marker starts at 0.
@@ -495,6 +495,27 @@ async fn expect_rejection(files: &Scratch, draft: &Path, expected: Rejection) ->
     );
     assert_eq!(file_digest(draft), before);
     assert!(leftovers(&files.0).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_system_deliveries_are_refused_regardless_of_current_scopes() -> Result<(), Error> {
+    for scopes in ["tv", "movies", "both", "none"] {
+        let files = Scratch::new();
+        let draft = populated_draft(&files).await?;
+        {
+            let (_raw, c) = open_plain(&draft).await?;
+            c.execute("DELETE FROM notification_scopes WHERE notification_id='22222222-2222-4222-8222-222222222222'", ()).await?;
+            for media in ["tv", "movies"] {
+                if scopes == media || scopes == "both" {
+                    c.execute("INSERT INTO notification_scopes(notification_id,media_type,on_health_issue)VALUES('22222222-2222-4222-8222-222222222222',?,1)", [media]).await?;
+                }
+            }
+            c.execute_batch("INSERT INTO notification_events(sequence,kind,scope,payload_json,created_at)VALUES(3,'health_issue','system','{}',3);
+                INSERT INTO notification_deliveries(id,event_sequence,notification_id,state,attempts,next_attempt_at,created_at)VALUES(3,3,'22222222-2222-4222-8222-222222222222','pending',0,3,3);").await?;
+        }
+        expect_rejection(&files, &draft, Rejection::PendingSystemDelivery).await?;
+    }
     Ok(())
 }
 

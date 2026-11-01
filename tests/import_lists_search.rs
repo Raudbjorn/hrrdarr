@@ -334,3 +334,40 @@ async fn oversized_search_capture_remains_pending_without_partial_admission() {
     assert_eq!(items[0]["search_status"], "pending");
     assert_eq!(items[0]["search_error_code"], "search_on_add_target_limit");
 }
+
+#[tokio::test]
+async fn list_search_admission_includes_searchable_trackers_for_both_domains() {
+    let h = Harness::new().await;
+    h.meta.show(101, "Show", Some(2020));
+    h.meta.movie(201, "Film", Some(2020), None);
+    let (base, _api, _client) = provider_api(&h).await;
+    for (name, implementation, enabled, automatic) in [
+        ("tracker", "nyaa", true, true),
+        ("disabled", "nyaa", false, true),
+        ("rss-only", "iptorrents", true, false),
+    ] {
+        let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap()
+            .post(format!("{base}/api/v1/providers"))
+            .header("content-type", "application/json")
+            .body(json!({"name":name,"enabled":enabled,"priority":1,"settings":{"implementation":implementation,"endpoint":h.feed_base,
+                "tv":{"enable_rss":true,"enable_automatic_search":automatic,"enable_interactive_search":automatic},
+                "movies":{"enable_rss":true,"enable_automatic_search":automatic,"enable_interactive_search":automatic}}}).to_string())
+            .send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status.as_u16(), 201, "{body}");
+    }
+    let tv = list(&h, "tv", true, "first_season").await;
+    let movie = list(&h, "movies", true, "all").await;
+    for id in [tv, movie] {
+        assert_eq!(h.sync(&id).await["status"], "succeeded");
+        assert_eq!(h.items(&id, "added").await[0]["search_status"], "admitted");
+    }
+    assert_eq!(h.count("SELECT count(*) FROM search_commands").await, 2);
+    assert_eq!(h.count("SELECT count(*) FROM search_commands c JOIN providers p ON p.id=c.indexer_id WHERE p.name='tracker'").await, 2);
+    assert_eq!(
+        h.count("SELECT count(DISTINCT media_type) FROM search_commands")
+            .await,
+        2
+    );
+}

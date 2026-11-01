@@ -391,8 +391,34 @@ async fn populated_published_authority_survives_rollback_upgrade_and_reopen() ->
 }
 
 #[test]
-fn both_published_ledgers_remain_byte_identical() {
+fn all_published_ledgers_remain_byte_identical() {
     for (history, count, expected) in [
+        // Exact published names/SQL at main023d355 and PR #32's 8032213/3987479 tips.
+        (
+            MIGRATIONS,
+            83,
+            "9b6d1040a6e6a8ac7066aeea2481d3cae05783f5d0d2d8e5d9692ca7b24fa922",
+        ),
+        (
+            MAIN_MIGRATIONS,
+            83,
+            "fd2c287c6e7655e0c1d1bdb7760a05d72e7633f46de43ada2f5d6a49e18f3bb1",
+        ),
+        (
+            LEGACY_MIGRATIONS,
+            87,
+            "3bb886d85b46ef9a5593255fc4b8bb607ccddca8517d6fa7274d114fb02550fc",
+        ),
+        (
+            INDEXER_MAIN_MIGRATIONS,
+            83,
+            "16484486471c0efa5fd9d5d01372cc1c98b12b34d3228df8aec5370c9e8fa580",
+        ),
+        (
+            INDEXER_EARLY_MIGRATIONS,
+            80,
+            "7737052086431291411c39276112ec56337049dd330f437fab346ae016b88b5e",
+        ),
         (
             MIGRATIONS,
             78,
@@ -414,7 +440,7 @@ fn both_published_ledgers_remain_byte_identical() {
         assert_eq!(
             checksum(&bytes),
             expected,
-            "published names and SQL from b34874c / 9d989d5 must never change"
+            "published names and SQL must never change"
         );
     }
 }
@@ -466,7 +492,7 @@ async fn both_lineage_tips_preserve_delivery_progress_policy_and_atomicity() -> 
             INSERT INTO movie_collection_intents(tmdb_id,revision,local_edit,removed,removal_reason) VALUES(44,7,1,1,'user');
             INSERT INTO notifications(id,name,implementation,settings_json,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000001','Both','webhook','{}',1,1),('00000000-0000-4000-8000-000000000002','Movies','webhook','{}',1,1);
             INSERT INTO notification_scopes(notification_id,media_type) VALUES('00000000-0000-4000-8000-000000000001','tv'),('00000000-0000-4000-8000-000000000001','movies'),('00000000-0000-4000-8000-000000000002','movies');
-            INSERT INTO notification_events(sequence,kind,scope,payload_json,created_at,fanned_out) VALUES(1,'health_issue','tv','{}',1,1),(2,'health_issue','movies','{}',1,1),(3,'health_issue','system','{}',1,1),(4,'health_issue','system','{}',1,1);").await?;
+            INSERT INTO notification_events(sequence,kind,scope,payload_json,created_at,fanned_out) VALUES(1,'health_issue','tv','{}',1,1),(2,'health_issue','movies','{}',1,1),(3,'health_issue','system','{}',1,1),(4,'health_issue','movies','{}',1,1);").await?;
         if count == 82 {
             c.execute("UPDATE movie_collections SET monitored=1,root_folder_id=1,quality_profile_id=1,minimum_availability='released',search_on_add=1,local_edit=1,snapshot_owned=1,checkpoint_settings_revision=6 WHERE id=1",()).await?;
         } else {
@@ -477,6 +503,7 @@ async fn both_lineage_tips_preserve_delivery_progress_policy_and_atomicity() -> 
             (),
         )
         .await?;
+        // Pending event 4 now has a recorded domain; only terminal event 3 may use a display projection.
         for (event, state, domain) in [
             (1, "pending", "tv"),
             (2, "delivered", "movies"),
@@ -688,6 +715,8 @@ async fn all_published_tips_preserve_exact_ledgers_and_snapshot_identity() -> Re
         (MIGRATIONS, 80),
         (MAIN_MIGRATIONS, 81),
         (LEGACY_MIGRATIONS, 84),
+        (INDEXER_MAIN_MIGRATIONS, 83),
+        (INDEXER_EARLY_MIGRATIONS, 80),
     ] {
         let files = Scratch::new();
         let path = files.0.join("db");
@@ -753,6 +782,63 @@ async fn all_published_tips_preserve_exact_ledgers_and_snapshot_identity() -> Re
                     .collect::<Vec<_>>()
             );
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_alignment_refuses_pending_system_routes_and_preserves_backup() -> Result<(), Error>
+{
+    for scopes in ["tv", "movies", "both", "none"] {
+        let files = Scratch::new();
+        let path = files.0.join("db");
+        let (raw, c) = seed_lineage(&path, LEGACY_MIGRATIONS, 82).await?;
+        c.execute_batch("INSERT INTO notifications(id,name,implementation,settings_json,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000001','Retained','webhook','{}',1,1);
+            INSERT INTO notification_events(sequence,kind,scope,payload_json,created_at,fanned_out) VALUES(1,'health_issue','system','{}',1,1);
+            INSERT INTO notification_deliveries(id,event_sequence,notification_id,state,attempts,next_attempt_at,created_at) VALUES(1,1,'00000000-0000-4000-8000-000000000001','pending',2,10,1);").await?;
+        for media in ["tv", "movies"] {
+            if scopes == media || scopes == "both" {
+                c.execute("INSERT INTO notification_scopes(notification_id,media_type,on_health_issue) VALUES('00000000-0000-4000-8000-000000000001',?,1)", [media]).await?;
+            }
+        }
+        let schema_before = draft_conversion::schema_digest(&c).await?;
+        let deliveries_before = delivery_rows(&c).await?;
+        drop(c);
+        drop(raw);
+        let error = Database::open_local(&path).await.err().unwrap().to_string();
+        assert!(
+            error.contains("no recorded fan-out domain")
+                && error.contains("migration rolled back")
+                && error.contains("recovery backup:"),
+            "{error}"
+        );
+        let raw = libsql::Builder::new_local(&path).build().await?;
+        let c = raw.connect()?;
+        assert_eq!(migration_history(&c).await?, (82, LEGACY_MIGRATIONS));
+        assert_eq!(draft_conversion::schema_digest(&c).await?, schema_before);
+        assert_eq!(delivery_rows(&c).await?, deliveries_before);
+        integrity(&c).await?;
+        drop(c);
+        drop(raw);
+        let backups = std::fs::read_dir(&files.0)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".hrrdarr-migration-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].path().join("manifest.json").is_file());
+        let copy = libsql::Builder::new_local(backups[0].path().join("database.db"))
+            .build()
+            .await?;
+        let c = copy.connect()?;
+        assert_eq!(migration_history(&c).await?, (82, LEGACY_MIGRATIONS));
+        assert_eq!(draft_conversion::schema_digest(&c).await?, schema_before);
+        assert_eq!(delivery_rows(&c).await?, deliveries_before);
+        integrity(&c).await?;
     }
     Ok(())
 }

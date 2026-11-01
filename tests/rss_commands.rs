@@ -14,13 +14,27 @@ use std::{
     },
     time::Duration,
 };
+
+/// Hang detector scale for waits on the real workers (issue #38). The suite runs scenarios side by
+/// side, each slowed several-fold by the others, so a window sized for an idle host expires without
+/// anything being wrong. A passing wait returns as soon as its state holds.
+fn hang(seconds: u64) -> Duration {
+    Duration::from_secs(seconds * 4)
+}
 struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-struct Server(tokio::task::JoinHandle<()>);
+/// Scenarios that drive the real one-step-per-second workers at once. All 31 run in one process, and
+/// side by side they starve each other's workers and HTTP mocks (issue #38); a few at a time keep
+/// every scenario near its idle-host speed. The permit lives as long as the scenario's server.
+static SCENARIOS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
+struct Server(
+    tokio::task::JoinHandle<()>,
+    Option<tokio::sync::SemaphorePermit<'static>>,
+);
 impl Server {
     async fn stop(mut self) {
         self.0.abort();
@@ -299,15 +313,16 @@ async fn serve(app: axum::Router) -> (String, Server) {
     let base = format!("http://{}", listener.local_addr().unwrap());
     (
         base,
-        Server(tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap()
-        })),
+        Server(
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            None,
+        ),
     )
 }
 async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(6))
+        .timeout(hang(6))
         .build()
         .unwrap()
         .request(method.parse().unwrap(), format!("{base}{path}"))
@@ -337,9 +352,10 @@ async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Val
     )
 }
 async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
+    let permit = SCENARIOS.acquire().await.unwrap();
     let key = Arc::new(providers::CredentialKey::from_hex(&"11".repeat(32)).unwrap());
     let (router, client) = providers::router_with_refresh(db.clone(), Some(key));
-    let (base, server) = serve(
+    let (base, mut server) = serve(
         router
             .merge(commands::router(db.clone()))
             .merge(hrrdarr::search::router(db.clone(), client.clone()))
@@ -347,10 +363,11 @@ async fn app(db: Arc<Database>) -> (String, Server, providers::RefreshClient) {
             .merge(hrrdarr::release_profiles::router(db)),
     )
     .await;
+    server.1 = Some(permit);
     (base, server, client)
 }
 async fn until(base: &str, id: &Value) -> Value {
-    tokio::time::timeout(Duration::from_secs(18), async {
+    tokio::time::timeout(hang(18), async {
         loop {
             let (code, v) = request(
                 base,
@@ -509,7 +526,7 @@ async fn rss_grabs_both_domains_and_replay_does_not_duplicate_submissions() {
     runtime.shutdown().await;
 }
 async fn receipt_until(base: &str, status: &str) -> Value {
-    let outcome = tokio::time::timeout(Duration::from_secs(12), async {
+    let outcome = tokio::time::timeout(hang(12), async {
         loop {
             let (code, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             assert_eq!(code, 200, "{v}");
@@ -690,7 +707,7 @@ async fn interrupted_submission_reopens_with_typed_identity_and_only_reconciles(
         };
         let command = enqueue(&base, requested).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+        tokio::time::timeout(hang(12), state.started.notified())
             .await
             .unwrap();
         let (_, before) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
@@ -714,7 +731,7 @@ async fn interrupted_submission_reopens_with_typed_identity_and_only_reconciles(
         let receipt = if mode == 1 {
             receipt_until(&base, "needs_attention").await
         } else {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(hang(10), async {
                 loop {
                     let v = receipt_until(&base, "reconciling").await;
                     if v["attempts"] == 2 {
@@ -740,7 +757,7 @@ async fn interrupted_submission_reopens_with_typed_identity_and_only_reconciles(
         if mode == 1 {
             assert_eq!(receipt["error_code"], "presence_unconfirmed");
         } else {
-            let final_receipt = tokio::time::timeout(Duration::from_secs(75), async {
+            let final_receipt = tokio::time::timeout(hang(75), async {
                 loop {
                     let (_, v) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
                     let v = &v["items"][0];
@@ -817,7 +834,7 @@ async fn local_policy_rechecked_after_preparation_and_postsubmit_failure_recover
         };
         let command = enqueue(&base, request_target).await;
         let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+        tokio::time::timeout(hang(12), state.started.notified())
             .await
             .unwrap();
         let c = db.connect().await.unwrap();
@@ -885,7 +902,7 @@ async fn local_policy_rechecked_after_preparation_and_postsubmit_failure_recover
             let responder = tokio::spawn(async move {
                 // Pending preparation and prepared revalidation each read /torrent.
                 for _ in 0..2 {
-                    tokio::time::timeout(Duration::from_secs(12), barriers.started.notified())
+                    tokio::time::timeout(hang(12), barriers.started.notified())
                         .await
                         .unwrap();
                     barriers.release.notify_one();
@@ -1018,7 +1035,7 @@ async fn rejected_availability_is_reevaluated_and_schedules_are_revision_fenced(
         .await
         .unwrap();
     let _ = receipt_until(&base, "observed").await;
-    tokio::time::timeout(Duration::from_secs(12), async {
+    tokio::time::timeout(hang(12), async {
         loop {
             if state.adds.lock().unwrap().len() == 2 {
                 break;
@@ -1081,7 +1098,7 @@ async fn pure_v2_remote_handles_keep_both_queue_associations() {
         assert_eq!(done["observed"], 1, "{done}");
         let(code,refresh)=request(&base,"POST","/api/v1/commands",json!({"name":"refresh_downloads","target":{"media_type":media,"provider_id":download["id"]},"provider_revision":download["revision"],"priority":"normal"})).await;
         assert_eq!(code, 202, "{refresh}");
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(hang(10), async {
             loop {
                 let (_, v) = request(
                     &base,
@@ -1209,7 +1226,7 @@ async fn delayed_payloads_are_private_and_missing_key_rejects_without_starvation
     // Claims order equal priorities by whole-second created_at, then UUID, not
     // admission order. Establish the strict age assumed by the assertion below
     // through the real clock/API rather than bypassing immutable timestamps.
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(hang(10), async {
         loop {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1238,7 +1255,7 @@ async fn delayed_payloads_are_private_and_missing_key_rejects_without_starvation
         );
     }
     let runtime = commands::start(db.clone(), client).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(hang(10), async {
         loop {
             let (code, v) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             assert_eq!(code, 200, "{v}");
@@ -1370,7 +1387,7 @@ async fn rate_limit_due_time_survives_retry_without_feed_or_mutation_hammering()
     let (indexer, download) = providers(&base, &remote_base).await;
     let command = enqueue(&base, target(&indexer, &download, "tv")).await;
     let runtime = commands::start(db.clone(), client).await.unwrap();
-    let delayed = tokio::time::timeout(Duration::from_secs(8), async {
+    let delayed = tokio::time::timeout(hang(8), async {
         loop {
             let (_, v) = request(
                 &base,
@@ -1611,11 +1628,11 @@ async fn prepared_owner_still_rechecks_increased_delay_before_post() {
         save_delay(&base, media, 0).await;
         let command = enqueue(&base, target(&indexer, &download, media)).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+        tokio::time::timeout(hang(12), state.started.notified())
             .await
             .unwrap();
         state.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+        tokio::time::timeout(hang(12), state.started.notified())
             .await
             .unwrap();
         let prepared = receipt_until(&base, "prepared").await;
@@ -1709,7 +1726,7 @@ async fn release_restriction_change_during_preparation_never_posts() {
         let (indexer, download) = providers(&base, &remote_base).await;
         let command = enqueue(&base, target(&indexer, &download, media)).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), state.started.notified())
+        tokio::time::timeout(hang(12), state.started.notified())
             .await
             .unwrap();
         let c = db.connect().await.unwrap();
@@ -1756,7 +1773,7 @@ async fn release_restriction_change_during_preparation_never_posts() {
             .unwrap()
             .as_secs() as i64;
         state.release.notify_one();
-        let retry = tokio::time::timeout(Duration::from_secs(12), async {
+        let retry = tokio::time::timeout(hang(12), async {
             loop {
                 let (code, value) = request(
                     &base,
@@ -1815,7 +1832,7 @@ async fn release_restriction_change_during_preparation_never_posts() {
             // Observe the actual 30-second automatic retry without a settings wake.
             // This separate bound includes that backoff; existing request/receipt
             // timeouts remain unchanged for all immediate-settlement scenarios.
-            tokio::time::timeout(Duration::from_secs(45), async {
+            tokio::time::timeout(hang(45), async {
                 loop {
                     let (code, values) =
                         request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
@@ -1900,7 +1917,7 @@ async fn indexer_policy_rss_schedule_and_queued_revision_send_no_http() {
             .unwrap();
         let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
         assert_eq!(until(&base, &queued["id"]).await["status"], "failed");
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(hang(10), async {
             loop {
                 let (_, rows) = request(&base, "GET", "/api/v1/rss/schedules", Value::Null).await;
                 if rows[0]["enabled"] == false {
@@ -1957,7 +1974,7 @@ async fn indexer_policy_retry_wait_feed_never_reuses_changed_revision() {
         let (indexer, download) = providers(&base, &remote_base).await;
         let runtime = commands::start(db.clone(), client.clone()).await.unwrap();
         let command = enqueue(&base, target(&indexer, &download, media)).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(hang(10), async {
             loop {
                 let (_, row) = request(
                     &base,
@@ -2055,7 +2072,7 @@ async fn client_binding_fences_rss_admission_schedules_and_prepared_dispatch() {
             if preparing {
                 peer.mode.store(4, Ordering::SeqCst);
                 runtime = Some(commands::start(db.clone(), client.clone()).await.unwrap());
-                tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+                tokio::time::timeout(hang(12), peer.started.notified())
                     .await
                     .expect("torrent preparation boundary");
             }
@@ -2082,7 +2099,7 @@ async fn client_binding_fences_rss_admission_schedules_and_prepared_dispatch() {
             } else {
                 assert_eq!(done["status"], "failed", "{done}");
             }
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(hang(10), async {
                 loop {
                     let (_, schedules) =
                         request(&base, "GET", "/api/v1/rss/schedules", Value::Null).await;
@@ -2376,7 +2393,7 @@ async fn unavailable_default_retry_stays_strict_until_client_block_expires() {
         let db = Arc::new(Database::open_local(scratch.0.join("db")).await.unwrap());
         let (base, _server, client) = app(db.clone()).await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(hang(10), async {
             loop {
                 let receipt = receipt_until(&base, "pending").await;
                 if receipt["not_before"].as_i64().is_some_and(|v| v > 0) {
@@ -2520,7 +2537,7 @@ async fn tv_default_client_revision_change_during_preparation_uses_safe_alternat
         )
         .await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), first.started.notified())
+        tokio::time::timeout(hang(12), first.started.notified())
             .await
             .unwrap();
         let (code,changed)=request(&base,"PUT",&format!("/api/v1/providers/{}",first_client["id"].as_str().unwrap()),json!({"revision":first_client["revision"],"name":"changed while preparing","enabled":true,"priority":1,"settings":first_client["settings"]})).await;
@@ -2528,7 +2545,7 @@ async fn tv_default_client_revision_change_during_preparation_uses_safe_alternat
         first.release.notify_one();
         // Fallback re-fetches only the retained release URL; immutable payload SHA
         // must match before the alternate can post those prepared torrent bytes.
-        tokio::time::timeout(Duration::from_secs(12), first.started.notified())
+        tokio::time::timeout(hang(12), first.started.notified())
             .await
             .unwrap();
         first.release.notify_one();
@@ -2704,7 +2721,7 @@ async fn default_tv_post_add_read_failure_retains_original_client_without_altern
     first.mode.store(0, Ordering::SeqCst);
     // Reconciliation owns its attempt/deadline transition. Wait for the real
     // thirty-second retry instead of editing that invariant in the fixture.
-    let settled = tokio::time::timeout(Duration::from_secs(45), async {
+    let settled = tokio::time::timeout(hang(45), async {
         loop {
             let (_, page) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             let current = page["items"]
@@ -2882,7 +2899,7 @@ async fn worker_rotation_advances_movies_on_choice_and_tv_only_on_success() {
                 tokio::join!(enqueue(&base, left_target), enqueue(&base, right_target));
             until(&base, &left_command["id"]).await;
             until(&base, &right_command["id"]).await;
-            let receipts = tokio::time::timeout(Duration::from_secs(12), async {
+            let receipts = tokio::time::timeout(hang(12), async {
                 loop {
                     let (_, page) =
                         request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
@@ -2972,7 +2989,7 @@ async fn worker_rotation_advances_movies_on_choice_and_tv_only_on_success() {
 
 // Wait for a real worker failure transition, not the initially admitted pending row.
 async fn unavailable_receipt(base: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(18), async {
+    tokio::time::timeout(hang(18), async {
         loop {
             let (_, page) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             if let Some(row) = page["items"].as_array().unwrap().iter().find(|r| {
@@ -3322,7 +3339,7 @@ async fn interactive_default_failure_does_not_acquire_automatic_retry_authority(
         let (code,command)=request(&base,"POST","/api/v1/search/commands",json!({"request_id":uuid::Uuid::new_v4(),"mode":"interactive","target":{"media_type":if media=="tv" {"episode"}else{"movie"},"id":1},"indexer_id":indexer["id"],"indexer_revision":indexer["revision"],"client_selection":{"kind":"default"},"priority":"normal"})).await;
         assert_eq!(code, 202, "{command}");
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(18), async {
+        let result = tokio::time::timeout(hang(18), async {
             loop {
                 let (_, results) = request(
                     &base,
@@ -3414,7 +3431,7 @@ async fn selection_capacity_change_during_preparation_is_terminal_without_fallba
         )
         .await;
         let runtime = commands::start(db.clone(), client).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(12), selected.started.notified())
+        tokio::time::timeout(hang(12), selected.started.notified())
             .await
             .unwrap();
         // Real selection captured the two-client configuration. While its first
@@ -3548,7 +3565,7 @@ async fn preparation_local_storage_failure_preserves_attempt_and_fetched_byte_an
         }
         let runtime = commands::start(db.clone(), client).await.unwrap();
         if after_fetch {
-            tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+            tokio::time::timeout(hang(12), peer.started.notified())
                 .await
                 .unwrap();
             c.execute("UPDATE provider_lookup_fault SET enabled=1", ())
@@ -3556,7 +3573,7 @@ async fn preparation_local_storage_failure_preserves_attempt_and_fetched_byte_an
                 .unwrap();
             peer.release.notify_one();
         }
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(hang(12), async {
             loop {
                 if c.query(
                     "SELECT 1 FROM rss_commands WHERE id=? AND error_code='storage_error'",
@@ -3638,7 +3655,7 @@ async fn preparation_local_storage_failure_preserves_attempt_and_fetched_byte_an
         assert_eq!(row.get::<i64>(1).unwrap(), expiry);
         drop(row);
         if !after_fetch {
-            tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+            tokio::time::timeout(hang(12), peer.started.notified())
                 .await
                 .unwrap();
             peer.release.notify_one();
@@ -3765,7 +3782,7 @@ async fn safe_submission_storage_failure_reopens_same_attempt_without_alternativ
         }
         let runtime = commands::start(db.clone(), client).await.unwrap();
         if after_safe_result {
-            tokio::time::timeout(Duration::from_secs(12), peer.started.notified())
+            tokio::time::timeout(hang(12), peer.started.notified())
                 .await
                 .unwrap();
             // A probe from an unrelated startup check cannot stand in for the
@@ -3785,7 +3802,7 @@ async fn safe_submission_storage_failure_reopens_same_attempt_without_alternativ
                 .unwrap();
             peer.release.notify_one();
         }
-        let receipt = tokio::time::timeout(Duration::from_secs(12), async {
+        let receipt = tokio::time::timeout(hang(12), async {
             loop {
                 let (_, page) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
                 if let Some(row) = page["items"]
@@ -3864,7 +3881,7 @@ async fn safe_submission_storage_failure_reopens_same_attempt_without_alternativ
         } else {
             "observed"
         };
-        let result = tokio::time::timeout(Duration::from_secs(45), async {
+        let result = tokio::time::timeout(hang(45), async {
             loop {
                 let (_, page) = request(&base, "GET", "/api/v1/rss/candidates", Value::Null).await;
                 if let Some(row) = page["items"]

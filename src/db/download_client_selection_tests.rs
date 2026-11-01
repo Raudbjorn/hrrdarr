@@ -173,7 +173,7 @@ async fn selection_upgrade51_preserves_legacy_children_and_late_failure_rolls_ba
     for reopen in 0..2 {
         let db = Database::open_local(&path).await?;
         let c = db.connect().await?;
-        assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
+        assert_eq!(version(&c).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
         assert_eq!(scalar(&c, "PRAGMA foreign_keys").await?, 1);
         for ((table, cols), expected) in tables.iter().zip(&columns).zip(&before) {
             let suffix = if *table == "schema_migrations" {

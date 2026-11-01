@@ -7,8 +7,8 @@ library.
 ## Adoption
 
 `MovieDetails` carries a tri-state `collection` association from the movie metadata service: absent preserves the
-stored membership, explicit `null` clears it, an object sets it. It is persisted by the shared fact writer (library
-add via lookup and metadata refresh) in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
+stored membership, explicit `null` clears it, an object sets it. It is persisted by the collection adoption repository during library
+add via lookup and metadata refresh, in the same transaction. New associations replace identified prior memberships; unidentified legacy memberships are preserved.
 Collection adoption retains local removal intent and protects it from stale snapshot replay.
 
 ## API (`/api/v1/movies/collections`)
@@ -48,9 +48,9 @@ Collection automatic additions also honor active `movie_import_exclusions`.
 
 `src/db/mod.rs` validates each accepted migration-history prefix before applying its matching
 upgrade path. Historical SQL/name/checksum records are retained; migration filename prefixes
-alone do not identify the schema version. Fresh/current-main databases finish at version 83;
+alone do not identify the schema version. Fresh/current-main databases finish at version 85;
 the earlier published main checkpoint and PR #31 history converge through the version-83
-bridge, followed by search-on-add, Wanted timestamps, root health and backups through version 87. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
+bridge, followed by search-on-add, Wanted timestamps, root health and backups through version 87, then tracker breadth and Wanted receipts through 89. See [import-lists.md](import-lists.md#migration-numbering) for the accepted histories. Isolated database fixtures exercise upgrades; they do
 not establish production upgrade success.
 
 Upgrades from the earlier main checkpoint now preserve nullable `search_on_add` transactionally.
@@ -58,6 +58,8 @@ Databases already upgraded to version 82 by `9d989d5` had NULL normalized to fal
 definedness cannot be inferred during the bridge ([issue #50](https://github.com/Raudbjorn/hrrdarr/issues/50)).
 Startup still rejects unknown draft histories. The exact `1431d97` draft has an explicit
 [offline conversion command](draft-database-conversion.md); other draft histories remain unsupported.
+
+Additional PR #32 histories and its explicit offline converter are documented in [migration compatibility](migration-compatibility.md).
 
 ## Snapshot reconstruction
 

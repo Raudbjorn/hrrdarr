@@ -151,7 +151,7 @@ async fn schema55_actual54_backup_rollback_reopen_preserve_both_domains() -> Res
     let fc = fresh.connect().await?;
     assert_eq!(
         scalar(&fc, "SELECT max(version) FROM schema_migrations").await?,
-        83 // Both published tails append without rewriting existing ledger entries.
+        85 // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     );
     let path = s.0.join("old.db");
     let old = predecessor(&fc, &path).await?;

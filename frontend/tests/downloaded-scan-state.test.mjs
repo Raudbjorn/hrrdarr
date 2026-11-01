@@ -258,9 +258,10 @@ test('"Scan remaining files" is a new reviewed request naming the settled incomp
 test('tracking choices are download clients configured for the library type only', () => {
   const settings = (implementation, tv, movies) => ({implementation, endpoint: 'http://x', tv, movies});
   const providers = [
-    {id: id(20), name: 'Indexer', settings: settings('torznab', {}, {})},
-    // The expanded registry includes RSS indexers; only actual download clients may track scans.
-    {id: id(23), name: 'RSS indexer', settings: settings('torrentrss', {}, {})},
+    // Every indexer has a valid UUID and domain settings: only its kind excludes it.
+    ...['torznab', 'newznab', 'torrentrss', 'nyaa', 'fanzub', 'iptorrents', 'torrentleech',
+      'broadcasthenet', 'filelist', 'hdbits', 'passthepopcorn', 'torrentpotato'].map((kind, i) =>
+      ({id: id(30 + i), name: kind, settings: settings(kind, {}, {})})),
     {id: id(24), name: 'NZBGet', settings: settings('nzbget', null, {category: 'movies'})},
     {id: id(21), name: 'TV client', settings: settings('qbittorrent', {category: 'tv'}, null)},
     {id: id(22), name: 'Both', settings: settings('qbittorrent', {category: 'tv'}, {category: 'movies'})},
@@ -268,4 +269,8 @@ test('tracking choices are download clients configured for the library type only
   ];
   assert.deepEqual(trackingProviders(providers, 'tv').map(p => p.name), ['TV client', 'Both']);
   assert.deepEqual(trackingProviders(providers, 'movies').map(p => p.name), ['NZBGet', 'Both']);
+  for (const kind of ['qbittorrent', 'sabnzbd', 'nzbget', 'transmission', 'deluge', 'rtorrent', 'utorrent', 'aria2', 'flood', 'downloadstation']) {
+    const client = {id: id(50), name: kind, settings: settings(kind, {}, {})};
+    for (const domain of ['tv', 'movies']) assert.deepEqual(trackingProviders([client], domain), [client]);
+  }
 });

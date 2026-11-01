@@ -159,7 +159,7 @@ fetch. Failure classes: `invalid_settings`, `authentication`, `rate_limited`, `t
 ## Migration numbering
 
 The registry is migration **file** `0080_import_lists.sql`. Filename prefixes are historical
-names, not execution ordinals. Three exact published histories are supported:
+names, not execution ordinals. The three histories published by main are retained:
 
 - Fresh databases and the PR history add import lists at **79** and search-on-add at **80**,
   then append Wanted timestamps, library-root health and backups through **83**.
@@ -168,6 +168,10 @@ names, not execution ordinals. Three exact published histories are supported:
 - The earlier main checkpoint through **50–53** and the legacy PR history retain their
   collection compatibility bridge at **83** and search-on-add at **84**, then append
   Wanted timestamps, library-root health and backups through **87**.
+
+Tracker breadth and durable Wanted receipts now append to these histories, finishing at
+85 or 89. Two earlier PR #32 histories are also recognized without changing their existing
+tracker/receipt ordinals; see [migration compatibility](migration-compatibility.md).
 
 Histories sharing a version number are distinguished by every recorded migration, not by
 that number alone. Common prefixes follow the fresh-database path.

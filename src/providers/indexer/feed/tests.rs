@@ -493,8 +493,10 @@ fn individual_cookie_values_are_redacted_but_short_ids_are_not() {
         cookie: Some("uid=7; pass=secretTOKEN123"),
         tv_parameters: &[],
         movie_parameters: &[],
+        username: None,
+        password: None,
     };
-    super::super::redact_secrets(&mut items, &access);
+    super::super::redact_secrets(&mut items, &access, None);
     // Short values like uid=7 are not redacted: replacing "7" would corrupt S07E07.
     assert_eq!(
         items[0].metadata.title.as_deref(),
@@ -511,4 +513,57 @@ fn namespaced_title_and_guid_extensions_are_ignored() {
     );
     assert_eq!(release.metadata.title.as_deref(), Some("Show.S01E01"));
     assert_eq!(release.guid.as_deref(), Some("g-1"));
+}
+
+#[test]
+fn account_names_are_redacted_without_corrupting_short_title_tokens() {
+    for (username, title, expected) in [
+        (
+            "PRIVATE_ACCOUNT",
+            "Show.S07E07.prefixPRIVATE_ACCOUNTsuffix",
+            "Show.S07E07.prefix[redacted]suffix",
+        ),
+        (
+            "7",
+            "Show.S07E07.1080p.user=7.[7]",
+            "Show.S07E07.1080p.user=[redacted].[[redacted]]",
+        ),
+        ("en", "French.720p.user=en", "French.720p.user=[redacted]"),
+        ("é", "Série.é.720p", "Série.[redacted].720p"),
+        ("", "Show.S07E07", "Show.S07E07"),
+    ] {
+        let mut items = vec![one(&format!(
+            r#"<item><title>{title}</title><pubDate>2024-01-01T12:00:00Z</pubDate><link>https://tracker.example/dl/a.torrent</link></item>"#
+        ))];
+        items[0].metadata.languages = vec![format!("user={username}"), "French".into()];
+        let access = crate::providers::credentials::IndexerAccess {
+            username: Some(username),
+            ..Default::default()
+        };
+        for kind in [
+            None,
+            Some(crate::providers::TrackerKind::Filelist),
+            Some(crate::providers::TrackerKind::Hdbits),
+            Some(crate::providers::TrackerKind::Passthepopcorn),
+            Some(crate::providers::TrackerKind::Torrentpotato),
+        ] {
+            items[0].metadata.title = Some(title.into());
+            items[0].metadata.languages[0] = format!("user={username}");
+            super::super::redact_secrets(&mut items, &access, kind);
+            assert_eq!(items[0].metadata.title.as_deref(), Some(expected));
+            assert_eq!(
+                items[0].metadata.languages[0],
+                if username.is_empty() {
+                    "user="
+                } else {
+                    "user=[redacted]"
+                }
+            );
+            assert_eq!(items[0].metadata.languages[1], "French");
+            assert_eq!(
+                items[0].download_url,
+                "https://tracker.example/dl/a.torrent"
+            );
+        }
+    }
 }

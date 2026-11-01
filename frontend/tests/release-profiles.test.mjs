@@ -1,4 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';
+import {TRACKERS} from '../src/lib/provider-draft.ts';
 import {fromInput,toInput,validate,moveTerm,eligible,referenceKey} from '../src/lib/release-profile-draft.ts';
 import {createReleaseProfile,updateReleaseProfile,deleteReleaseProfile,listReleaseProfiles,getReleaseProfileSchema} from '../src/lib/api.ts';
 const movie={name:null,enabled:true,required:[' WEB ','WEB','multi\nline'],ignored:['CAM'],tag_ids:[],indexers:[]};
@@ -7,3 +8,19 @@ test('release drafts preserve exact terms, null versus empty names and domain fi
 test('release validation counts UTF8 and disjoint tags without rewriting',()=>{const d=fromInput('tv',tv);d.value.required=['ø'.repeat(1025)];assert.ok(validate(d,[]));d.value.required=['ø'.repeat(1024)];assert.equal(validate(d,[]),'');d.value.tag_ids=[1];d.value.excluded_tag_ids=[1];assert.ok(validate(d,[{id:1}]));d.value.excluded_tag_ids=[];assert.equal(validate(d,[{id:1}]),'');d.value.ignored=[' \n '];assert.ok(validate(d,[{id:1}]));});
 test('unresolved references remain exact disabled identities; scoped disabled providers are selectable',()=>{const ref={kind:'unresolved_source',application:'sonarr',fingerprint:'a'.repeat(64),source_id:77};const d=fromInput('tv',{...tv,enabled:false,indexers:[ref]});assert.deepEqual(toInput(d).indexers,[ref]);assert.equal(validate(d,[]),'');d.value.enabled=true;assert.ok(validate(d,[]));assert.equal(referenceKey(ref),`source:sonarr:${'a'.repeat(64)}:77`);assert.ok(eligible({enabled:false,settings:{implementation:'torznab',tv:{},movies:null}},'tv'));assert.equal(eligible({settings:{implementation:'qbittorrent',tv:{}}},'tv'),false);assert.equal(eligible({settings:{implementation:'newznab',tv:null,movies:{}}},'tv'),false);d.domain='movies';d.value.indexers=[{kind:'provider',id:'one'},{kind:'provider',id:'two'}];assert.ok(validate(d,[]));});
 test('release API preserves scoped CAS and catalog delete; unresolved create never writes',async()=>{const original=globalThis.fetch,calls=[];globalThis.fetch=async(path,options)=>{calls.push({path,...options});return new Response(JSON.stringify({media_type:'tv',revision:2,profiles:[]}),{status:200,headers:{'content-type':'application/json'}});};try{await listReleaseProfiles('tv');await getReleaseProfileSchema('movies');await createReleaseProfile('tv',{revision:1,profile:tv});await updateReleaseProfile('movies',7,{revision:4,profile:movie});const result=await deleteReleaseProfile('tv',7,5);assert.equal(result.ok,true);assert.equal(calls[4].path,'/api/v1/tv/release-profiles/7?revision=5');assert.equal(calls[4].method,'DELETE');assert.deepEqual(JSON.parse(calls[3].body),{revision:4,profile:movie});const n=calls.length;assert.equal((await createReleaseProfile('tv',{revision:1,profile:{...tv,indexers:[{kind:'unresolved_source'}]}})).ok,false);assert.equal((await deleteReleaseProfile('tv',-1,1)).ok,false);assert.equal(calls.length,n);}finally{globalThis.fetch=original;}});
+
+test('existing tracker profile references stay editable with their configured media scope',()=>{
+ const kinds=['nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato','torrentrss'];
+ for(const kind of kinds)for(const domain of ['tv','movies']){
+  if(kind!=='torrentrss'&&!TRACKERS[kind][domain])continue;
+  const provider={id:'c0000000-0000-4000-8000-000000000001',enabled:false,settings:{implementation:kind,tv:null,movies:null,[domain]:{}}};
+  // Profile restrictions remain valid for disabled and RSS-only providers; search eligibility is separate.
+  assert.equal(eligible(provider,domain),true,`${kind}/${domain}`);
+  assert.equal(eligible(provider,domain==='tv'?'movies':'tv'),false);
+  const reference={kind:'provider',id:provider.id};
+  const draft=fromInput(domain,{...(domain==='tv'?tv:movie),indexers:[reference]});
+  draft.unnamed=false;draft.name='Edited tracker profile';
+  assert.equal(validate(draft,[]),'');
+  assert.deepEqual(toInput(draft).indexers,[reference]);
+ }
+});

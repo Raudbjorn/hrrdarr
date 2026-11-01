@@ -140,7 +140,7 @@ pub(super) async fn fixture(
 pub(super) async fn replacements() {
     linked_preview_retains_prior_path_diagnosis().await;
     custom_format_naming_changes_reject_before_journaling().await;
-    // Keep execute() regressions within the shared serial recovery test: its permit is global.
+    // These cases share one owned database at a time, retaining its effect permit through recovery.
     changed_original_title_or_format_policy_prevents_owned_replacement().await;
     legacy_owned_journals_revalidate_current_policy_before_recovery().await;
     legacy_revision_marker_conflict_preserves_sources().await;
@@ -409,7 +409,7 @@ pub(super) async fn replacements() {
     drop(held);
     c.execute_batch("CREATE TRIGGER injected_start_commit BEFORE UPDATE ON download_processing WHEN NEW.resume_requested=0 BEGIN SELECT RAISE(ABORT,'injected start checkpoint failure');END;").await.unwrap();
     assert!(start_owned(db.clone(), &op).await.is_err());
-    assert!(!EXECUTING.load(Ordering::Acquire));
+    assert!(!permit_held(db.permit_id()));
     let flag: i64 = c
         .query("SELECT resume_requested FROM download_processing", ())
         .await
@@ -428,7 +428,7 @@ pub(super) async fn replacements() {
         start_owned(db.clone(), &op).await.unwrap(),
         StartOwned::Started
     );
-    wait_permit_released(Some(&db), Some(&op)).await;
+    wait_permit_released(db.permit_id(), Some(&db), Some(&op)).await;
     assert_eq!(
         start_owned(db.clone(), &op).await.unwrap_err().code(),
         "resume_required"

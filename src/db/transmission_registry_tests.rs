@@ -123,7 +123,7 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // The real runner applies 0062; existing provider rows are untouched and checks pass.
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&c).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     for (index, (sql, expected)) in TABLES[..5].iter().zip(&before).enumerate() {
         let mut expected = expected.clone();
         if index == 1 {
@@ -138,15 +138,25 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     // all appended rows, ordered by implementation name.
     let mut registry = before[5].clone();
     for (name, kind, protocol) in [
-        ("aria2", "download_client", "torrent"),
         ("deluge", "download_client", "torrent"),
-        ("downloadstation", "download_client", "torrent"),
-        ("flood", "download_client", "torrent"),
-        ("nzbget", "download_client", "usenet"),
         ("rtorrent", "download_client", "torrent"),
-        ("torrentrss", "indexer", "torrent"),
-        ("transmission", "download_client", "torrent"),
         ("utorrent", "download_client", "torrent"),
+        ("aria2", "download_client", "torrent"),
+        ("flood", "download_client", "torrent"),
+        ("downloadstation", "download_client", "torrent"),
+        ("nzbget", "download_client", "usenet"),
+        ("transmission", "download_client", "torrent"),
+        ("torrentrss", "indexer", "torrent"),
+        // Reasoning: 0090 (indexer breadth) registers the nine tracker indexers; Fanzub is Usenet.
+        ("nyaa", "indexer", "torrent"),
+        ("fanzub", "indexer", "usenet"),
+        ("iptorrents", "indexer", "torrent"),
+        ("torrentleech", "indexer", "torrent"),
+        ("broadcasthenet", "indexer", "torrent"),
+        ("filelist", "indexer", "torrent"),
+        ("hdbits", "indexer", "torrent"),
+        ("passthepopcorn", "indexer", "torrent"),
+        ("torrentpotato", "indexer", "torrent"),
     ] {
         registry.push(vec![
             libsql::Value::Text(name.into()),
@@ -285,6 +295,6 @@ async fn transmission_upgrade61_preserves_rows_rolls_back_and_enforces_placement
     drop(c);
     drop(db);
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&db.connect().await?).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     Ok(())
 }

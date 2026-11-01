@@ -21,6 +21,13 @@ use std::{
     time::Duration,
 };
 
+/// Hang detector scale for waits on the real workers (issue #38). The suite runs scenarios side by
+/// side, each slowed several-fold by the others, so a window sized for an idle host expires without
+/// anything being wrong. A passing wait returns as soon as its state holds.
+fn hang(seconds: u64) -> Duration {
+    Duration::from_secs(seconds * 4)
+}
+
 const SECRET: &str = "PRIVATE_ARIA2_SECRET";
 const FILE_BYTES: usize = 1_048_576;
 const MOVIE_HASH: &str = "2222222222222222222222222222222222222222";
@@ -324,10 +331,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 thread_local! {
     // One client per test thread (each test owns its runtime thread). Building a rustls client costs
     // ~50 ms of CPU, which on a shared single-thread runtime competed with the very workers a poll
-    // was waiting for; the 6 s deadline itself is unchanged.
+    // was waiting for; the request deadline keeps the same host-load allowance as other waits.
     static CLIENT: reqwest::Client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(hang(REQUEST_TIMEOUT.as_secs()))
         .build()
         .unwrap();
 }
@@ -596,7 +603,7 @@ async fn wait_candidate(app: &App, what: &str, budget: Duration, wanted: &[&str]
     }
 }
 async fn wait_command(base: &str, id: &Value, status: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         loop {
             let (code, v) = request(
                 base,
@@ -678,7 +685,7 @@ async fn torznab_to_aria2_grab_refresh_and_import_for_both_domains() {
     for command in &pending {
         wait_command(base, &command["id"], "succeeded").await;
     }
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(hang(90), async {
         loop {
             let (_, v) = request(base, "GET", "/api/v1/download-processing", Value::Null).await;
             if v["items"].as_array().is_some_and(|rows| {
@@ -813,7 +820,7 @@ async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
     let receipt = wait_candidate(
         &app,
         "an unconfirmed add must surface for attention",
-        Duration::from_secs(90),
+        hang(90),
         &["needs_attention"],
     )
     .await;
@@ -978,7 +985,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
     let receipt = wait_candidate(
         &app,
         "the cross-protocol preference must be a visible rejection",
-        Duration::from_secs(30),
+        hang(30),
         &["rejected", "needs_attention"],
     )
     .await;
@@ -997,7 +1004,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
             .await
             .unwrap();
     wait_command(base, &command["id"], "succeeded").await;
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         while app.state.adds.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }

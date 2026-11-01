@@ -100,7 +100,7 @@ async fn blocklist_schema21_backfill_rollback_reopen_and_complete_target_constra
     let db = Database::open_local(&path).await?;
     assert!(db.migration_backup().is_some());
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&c).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     assert_eq!(
         c.query("SELECT id FROM commands", ())
             .await?

@@ -15,6 +15,11 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Hang detector for polling the real one-step-per-second worker, not a performance bound: one
+/// scenario needs ~25 s of ticks on an idle host, so a 30 s window expired whenever the suite ran
+/// its scenarios side by side (issue #38). A passing wait returns as soon as its state holds.
+const WAIT: Duration = Duration::from_secs(120);
+
 struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -126,7 +131,7 @@ impl Harness {
         relative: &str,
         done: impl Fn(&Value) -> bool,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(WAIT, async {
             loop {
                 let page = self.children(domain, id, "?limit=100").await;
                 if let Some(child) = by_path(&page).get(relative) {
@@ -159,7 +164,7 @@ impl Harness {
     async fn call(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
         let mut request = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap()
             .request(method.parse().unwrap(), format!("{}{path}", self.base));
@@ -205,7 +210,7 @@ impl Harness {
     }
     /// Polls the real worker until the predicate holds for the command detail.
     async fn wait(&self, domain: &str, id: Uuid, done: impl Fn(&Value) -> bool) -> Value {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(WAIT, async {
             loop {
                 let (code, v) = self.get(domain, id).await;
                 assert_eq!(code, 200, "{v}");

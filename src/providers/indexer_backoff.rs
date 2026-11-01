@@ -56,7 +56,12 @@ pub(super) fn has_scope(settings: &ProviderSettings, media: MediaDomain) -> bool
             ProviderSettings::Torznab { movies, .. } | ProviderSettings::Newznab { movies, .. },
             MediaDomain::Movies,
         ) => movies.is_some(),
-        _ => false,
+        // Trackers share the durable backoff with Torznab/Newznab, scoped per configured domain.
+        (settings, media) => match (settings.tracker_parts(), media) {
+            (Some((_, tv, _)), MediaDomain::Tv) => tv.is_some(),
+            (Some((_, _, movies)), MediaDomain::Movies) => movies.is_some(),
+            _ => false,
+        },
     }
 }
 
@@ -77,7 +82,7 @@ pub(super) fn now() -> Result<i64> {
 }
 
 pub(super) async fn admit(db: &Database, provider: &Provider, media: MediaDomain) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
+    // A plain RSS feed has no durable backoff authority (unlike Torznab/Newznab and trackers);
     // it keeps the transport's in-memory rate-limit cooldown instead.
     if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
         return Ok(());
@@ -99,7 +104,7 @@ pub(super) async fn record(
     media: MediaDomain,
     observation: Option<Observation>,
 ) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
+    // A plain RSS feed has no durable backoff authority (unlike Torznab/Newznab and trackers);
     // it keeps the transport's in-memory rate-limit cooldown instead.
     if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
         return Ok(());
@@ -120,7 +125,7 @@ pub(super) async fn apply(
     observation: Option<Observation>,
     timestamp: i64,
 ) -> Result<()> {
-    // A plain RSS feed has no durable backoff authority (indexer_status is torznab/newznab only);
+    // A plain RSS feed has no durable backoff authority (unlike Torznab/Newznab and trackers);
     // it keeps the transport's in-memory rate-limit cooldown instead.
     if matches!(provider.settings, ProviderSettings::Torrentrss { .. }) {
         return Ok(());

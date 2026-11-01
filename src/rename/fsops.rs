@@ -481,7 +481,15 @@ mod tests {
         })
         .unwrap();
         assert!(tracked.is_empty());
+        assert_eq!(
+            pair_state(&s(&d, "show.mkv"), &s(&d, "Show.mkv"), Kind::File, a),
+            Ok(PairState::Source)
+        );
         move_path(&root, &s(&d, "show.mkv"), &s(&d, "Show.mkv"), Kind::File, a).unwrap();
+        assert_eq!(
+            pair_state(&s(&d, "show.mkv"), &s(&d, "Show.mkv"), Kind::File, a),
+            Ok(PairState::Moved)
+        );
         let names: Vec<_> = std::fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -528,6 +536,16 @@ mod tests {
         );
         assert_eq!(
             classify_pair(&old, &s(&d, "other.mkv"), Some(ident), Some(ident), ident),
+            Ok(PairState::Anomaly)
+        );
+        assert_eq!(
+            classify_pair(
+                &old,
+                &s(&d, "other/Show.mkv"),
+                Some(ident),
+                Some(ident),
+                ident
+            ),
             Ok(PairState::Anomaly)
         );
         assert_eq!(

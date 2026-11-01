@@ -485,8 +485,9 @@ async fn validate_references(c: &Connection, m: MediaDomain, v: &Definition) -> 
         }
     }
     for reference in &v.indexers {
-        if let IndexerReference::Provider { id } = reference
-            && c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab','torrentrss')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
+        if let IndexerReference::Provider { id } = reference {
+            if c.query("SELECT 1 FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.id=? AND s.media_type=? AND p.implementation IN ('torznab','newznab','torrentrss','nyaa','fanzub','iptorrents','torrentleech','broadcasthenet','filelist','hdbits','passthepopcorn','torrentpotato')",params![id.to_string(),domain(m)]).await?.next().await?.is_none(){return Err(Error(StatusCode::CONFLICT,"release_profile_indexer_unavailable"))}
+        }
     }
     Ok(())
 }
@@ -732,7 +733,16 @@ pub(crate) async fn provider_scopes_allowed(
                     _ => false,
                 }
             }
-            _ => false,
+            Some(settings) => {
+                settings
+                    .tracker_parts()
+                    .is_some_and(|(_, tv, movies)| match media.as_str() {
+                        "tv" => tv.is_some(),
+                        "movies" => movies.is_some(),
+                        _ => false,
+                    })
+            }
+            None => false,
         };
         if !supported {
             return Err(Error(StatusCode::CONFLICT, "provider_in_use"));

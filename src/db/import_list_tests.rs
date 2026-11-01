@@ -87,7 +87,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&c).await?, 85); // Reasoning: tracker breadth and Wanted receipts append to the preserved main history.
     assert_eq!(
         scalar(&c, "SELECT count(*) FROM series WHERE tvdb_id=9").await,
         1
@@ -98,7 +98,7 @@ async fn import_lists_upgrade_from_previous_schema_is_atomic_and_preserves_rows(
     drop(db);
     // Reopening is a no-op.
     let db = Database::open_local(&path).await?;
-    assert_eq!(version(&db.connect().await?).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&db.connect().await?).await?, 85); // Reasoning: tracker breadth and Wanted receipts append to the preserved main history.
     Ok(())
 }
 

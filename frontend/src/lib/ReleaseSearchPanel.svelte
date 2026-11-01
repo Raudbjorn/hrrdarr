@@ -3,12 +3,13 @@
   import SearchGrabPanel from './SearchGrabPanel.svelte';
   import type { ApiPage, Provider, MediaTarget, ReleaseSearchPage, IndexerContinuation, MediaDomain } from './api.generated';
   import { listProviders, searchReleases } from './api';
+  import { eligibleInteractiveIndexer } from './provider-draft';
   let {target,onsettings}: {target:MediaTarget;onsettings:(domain:MediaDomain)=>void} = $props();
   const domain = $derived(target.media_type === 'episode' ? 'tv' : 'movies');
   let providers: ApiPage<Provider> | null = $state(null), chosen: Provider | null = $state(null), providerId = $state('');
   let result: ReleaseSearchPage | null = $state(null), busy = $state(false), loading = $state(false), error = $state('');
   let alive = true;
-  const eligible = (provider:Provider) => provider.enabled && (provider.settings.implementation === 'torznab' || provider.settings.implementation === 'newznab') && provider.settings[domain] !== null;
+  const eligible = (provider:Provider) => eligibleInteractiveIndexer(provider,domain);
   async function loadProviders(offset=0) {
     loading=true; error=''; chosen=null; providerId=''; result=null;
     const response=await listProviders(offset);

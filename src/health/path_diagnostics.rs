@@ -277,7 +277,7 @@ async fn snapshot(c: &Connection, domain: MediaDomain) -> Result<Option<Evidence
         unknown: None,
         providers: Vec::new(),
     };
-    let mut rows=tx.query("SELECT substr(CAST(p.id AS BLOB),1,37),p.revision,substr(CAST(p.implementation AS BLOB),1,65) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation NOT IN ('torznab','newznab') ORDER BY p.id LIMIT 257",[media]).await.map_err(|_|"storage_error")?;
+    let mut rows=tx.query("SELECT substr(CAST(p.id AS BLOB),1,37),p.revision,substr(CAST(p.implementation AS BLOB),1,65) FROM providers p JOIN provider_scopes s ON s.provider_id=p.id WHERE p.enabled=1 AND s.media_type=? AND p.implementation IN (SELECT implementation FROM provider_implementations WHERE kind='download_client') ORDER BY p.id LIMIT 257",[media]).await.map_err(|_|"storage_error")?;
     let mut provider_count = 0;
     while let Some(row) = rows.next().await.map_err(|_| "storage_error")? {
         provider_count += 1;

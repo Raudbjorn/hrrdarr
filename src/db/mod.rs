@@ -17,8 +17,10 @@ pub enum MediaTarget {
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub mod collection_policy_recovery;
+mod convert;
 pub mod custom_formats;
 pub mod draft_conversion;
+pub use convert::{ConversionReport, convert_premerge_pr32, premerge_ledger};
 
 const MIGRATIONS: &[(&str, &str)] = &[
     (
@@ -345,10 +347,19 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0080_library_root_health.sql"),
     ),
     ("backups", include_str!("../../migrations/0081_backups.sql")),
+    // Append to main's fresh-database history without rewriting its first 83 entries.
+    (
+        "indexer_breadth",
+        include_str!("../../migrations/0090_indexer_breadth.sql"),
+    ),
+    (
+        "wanted_search_receipts",
+        include_str!("../../migrations/0091_wanted_search_receipts.sql"),
+    ),
 ];
 // Main published Wanted/health/backups before this PR's two import-list migrations.
 const MAIN_MIGRATIONS: &[Migration] = &{
-    let mut history = [("", ""); 83];
+    let mut history = [("", ""); 85];
     let mut index = 0;
     while index < 78 {
         history[index] = MIGRATIONS[index];
@@ -359,8 +370,49 @@ const MAIN_MIGRATIONS: &[Migration] = &{
     history[80] = MIGRATIONS[82];
     history[81] = MIGRATIONS[78];
     history[82] = MIGRATIONS[79];
+    history[83] = MIGRATIONS[83];
+    history[84] = MIGRATIONS[84];
     history
 };
+
+// PR #32's published main-merged history (8032213) keeps tracker/receipt ordinals 82–83.
+const INDEXER_MAIN_MIGRATIONS: &[Migration] = &{
+    let mut history = [("", ""); 85];
+    let mut index = 0;
+    while index < 81 {
+        history[index] = MAIN_MIGRATIONS[index];
+        index += 1;
+    }
+    history[81] = MIGRATIONS[83];
+    history[82] = MIGRATIONS[84];
+    history[83] = MIGRATIONS[78];
+    history[84] = MIGRATIONS[79];
+    history
+};
+// PR #32 before that merge (3987479) keeps tracker/receipt ordinals 79–80.
+const INDEXER_EARLY_MIGRATIONS: &[Migration] = &{
+    let mut history = [("", ""); 85];
+    let mut index = 0;
+    while index < 78 {
+        history[index] = MIGRATIONS[index];
+        index += 1;
+    }
+    history[78] = MIGRATIONS[83];
+    history[79] = MIGRATIONS[84];
+    history[80] = MIGRATIONS[80];
+    history[81] = MIGRATIONS[81];
+    history[82] = MIGRATIONS[82];
+    history[83] = MIGRATIONS[78];
+    history[84] = MIGRATIONS[79];
+    history
+};
+const HISTORIES: [&[Migration]; 5] = [
+    MIGRATIONS,
+    MAIN_MIGRATIONS,
+    LEGACY_MIGRATIONS,
+    INDEXER_MAIN_MIGRATIONS,
+    INDEXER_EARLY_MIGRATIONS,
+];
 
 const HISTORY_SQL: &str = "CREATE TABLE schema_migrations (
     version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
@@ -471,11 +523,21 @@ pub struct Database {
     // Advisory ownership lasts for the application lifetime, including backup/migration.
     _owner: Option<File>,
     backup: Option<PathBuf>,
+    // Never reused within a process (unlike an address), so per-database state can be keyed by it.
+    permit_id: u64,
     // Local database file; absent for remote storage.
     path: Option<PathBuf>,
 }
+static NEXT_PERMIT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_permit_id() -> u64 {
+    NEXT_PERMIT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl Database {
+    /// Identity for state that is exclusive per open database (the import/file-effect permit).
+    pub(crate) fn permit_id(&self) -> u64 {
+        self.permit_id
+    }
     pub async fn open_local(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
         if path.as_os_str().is_empty() || path == Path::new(":memory:") {
@@ -504,6 +566,7 @@ impl Database {
             engine,
             _owner: Some(owner),
             backup: None,
+            permit_id: next_permit_id(),
             path: Some(path.clone()),
         };
         let conn = db.connect().await?;
@@ -519,6 +582,7 @@ impl Database {
             engine,
             _owner: None,
             backup: None,
+            permit_id: next_permit_id(),
             path: None,
         };
         migrate(db.connect().await?, None).await?;
@@ -657,6 +721,8 @@ async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migrat
     let mut main_matches = true;
     let mut legacy_matches = true;
     let mut incoming_matches = true;
+    let mut indexer_main_matches = true;
+    let mut indexer_early_matches = true;
     while let Some(row) = rows.next().await? {
         let n: i64 = row.get(0)?;
         let name: String = row.get(1)?;
@@ -673,7 +739,14 @@ async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migrat
         main_matches &= matches(MIGRATIONS);
         legacy_matches &= matches(LEGACY_MIGRATIONS);
         incoming_matches &= matches(MAIN_MIGRATIONS);
-        if !main_matches && !legacy_matches && !incoming_matches {
+        indexer_main_matches &= matches(INDEXER_MAIN_MIGRATIONS);
+        indexer_early_matches &= matches(INDEXER_EARLY_MIGRATIONS);
+        if !main_matches
+            && !legacy_matches
+            && !incoming_matches
+            && !indexer_main_matches
+            && !indexer_early_matches
+        {
             return Err(history_mismatch(n, &name, &recorded_checksum).into());
         }
         count += 1;
@@ -688,6 +761,10 @@ async fn migration_history(conn: &Connection) -> Result<(usize, &'static [Migrat
             MIGRATIONS
         } else if incoming_matches {
             MAIN_MIGRATIONS
+        } else if indexer_main_matches {
+            INDEXER_MAIN_MIGRATIONS
+        } else if indexer_early_matches {
+            INDEXER_EARLY_MIGRATIONS
         } else {
             LEGACY_MIGRATIONS
         },
@@ -821,6 +898,10 @@ async fn migrate(conn: Connection, local_path: Option<&Path>) -> Result<Option<P
             if name == "collections_checkpoint_supersede" {
                 tx.execute_batch("CREATE TEMP TABLE pr31_absent_search_on_add AS SELECT collection_id FROM movie_collection_settings WHERE search_on_add IS NULL").await?;
             }
+            // Published alignment SQL guesses a system domain; never resume an unrecorded route.
+            if name == "main_20261030_alignment" && scalar(&tx, "SELECT count(*) FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence WHERE d.state='pending' AND e.scope='system'").await? > 0 {
+                return Err("pending system notification deliveries have no recorded fan-out domain; current scopes cannot establish historical routing; refusing legacy alignment".into());
+            }
             tx.execute_batch(sql).await.map_err(|e| format!("migration {} ({name}) failed; reconcile legacy relationships before retrying: {e}", index + 1))?;
             integrity(&tx).await?;
             tx.execute("INSERT INTO schema_migrations (version, name, checksum, sql) VALUES (?1, ?2, ?3, ?4)",
@@ -933,7 +1014,7 @@ async fn backup(conn: &Connection, path: &Path) -> Result<PathBuf, Error> {
 
 /// Recognized immutable histories, in runner order: (version, name, checksum).
 pub(crate) fn known_migration_histories() -> Vec<Vec<(usize, &'static str, String)>> {
-    [MIGRATIONS, MAIN_MIGRATIONS, LEGACY_MIGRATIONS]
+    HISTORIES
         .into_iter()
         .map(|history| {
             history
@@ -1234,7 +1315,13 @@ mod indexer_policy_tests;
 mod indexer_client_tests;
 
 #[cfg(test)]
+mod convert_tests;
+#[cfg(test)]
 mod indexer_backoff_tests;
+#[cfg(test)]
+mod indexer_breadth_tests;
+#[cfg(test)]
+mod wanted_receipt_tests;
 
 #[cfg(test)]
 mod aria2_registry_tests;
@@ -1271,6 +1358,6 @@ mod draft_conversion_tests;
 mod import_list_tests;
 
 #[cfg(test)]
-pub(crate) fn test_migration_histories() -> [&'static [Migration]; 3] {
-    [MIGRATIONS, MAIN_MIGRATIONS, LEGACY_MIGRATIONS]
+pub(crate) fn test_migration_histories() -> [&'static [Migration]; 5] {
+    HISTORIES
 }

@@ -214,8 +214,8 @@ const RULES: [Rule; 3] = [
             "(SELECT c.metadata_revision FROM draft.movie_collections c WHERE c.id = d.collection_id)",
         )],
     },
-    // Mirrors migration 0083: a delivery renders for the scope that matched at fan-out; a system
-    // event uses the scope of the notification, TV first. No acknowledged parts, no claim.
+    // Pending system deliveries are refused before transfer; terminal system domains are only
+    // display projections of current scopes. No acknowledged parts or claim are invented.
     Rule {
         table: "notification_deliveries",
         retired: &[],
@@ -257,6 +257,7 @@ pub enum Rejection {
     NotTheDraftLedger,
     DraftLedgerIncomplete,
     DraftSchemaDiffers,
+    PendingSystemDelivery,
 }
 
 impl Rejection {
@@ -274,6 +275,9 @@ impl Rejection {
             }
             Rejection::DraftSchemaDiffers => {
                 "the migration history is the draft ledger but the schema is not the draft schema; it was changed outside the migrations"
+            }
+            Rejection::PendingSystemDelivery => {
+                "pending system notification deliveries have no recorded fan-out domain; current scopes cannot establish historical routing, so conversion is refused"
             }
         }
     }
@@ -382,6 +386,10 @@ async fn classify_source(conn: &Connection) -> Result<Option<Rejection>, Error> 
     }
     if schema_digest(conn).await? != DRAFT_SCHEMA_SHA256 {
         return Ok(Some(Rejection::DraftSchemaDiffers));
+    }
+    // Even one current scope cannot prove the domain that existed when a system event was queued.
+    if scalar(conn, "SELECT count(*) FROM notification_deliveries d JOIN notification_events e ON e.sequence=d.event_sequence WHERE d.state='pending' AND e.scope='system'").await? > 0 {
+        return Ok(Some(Rejection::PendingSystemDelivery));
     }
     Ok(None)
 }

@@ -70,7 +70,7 @@ async fn same_path_schema27_upgrade_rollback_exchange_and_commit_guards() -> Res
     drop(raw);
     let db = Database::open_local(&path).await?;
     let c = db.connect().await?;
-    assert_eq!(version(&c).await?, 83); // Both published tails append without rewriting existing ledger entries.
+    assert_eq!(version(&c).await?, 85); // Reasoning: preserved main histories append tracker breadth and Wanted receipts; fresh history is 85.
     for op in &operations {
         let r = c
             .query(

@@ -45,13 +45,16 @@ async fn deleting_collection_defaults_disables_policy_and_provider_tags_stay_in_
     c.execute_batch(
         "INSERT INTO quality_profiles(id,media_type,name)VALUES(1,'movies','Movie profile');
          INSERT INTO root_folders(id,media_type,path)VALUES(1,'movies','/movies');
-         INSERT INTO tags(id,media_type,label)VALUES(1,'movies','collection'),(2,'movies','indexer');
+         INSERT INTO tags(id,media_type,label)VALUES(1,'movies','collection'),(2,'movies','indexer'),(3,'movies','client');
          INSERT INTO movie_collections(id,tmdb_id,title)VALUES(1,55,'Collection');
          INSERT INTO movie_collection_settings(collection_id,root_folder_id,quality_profile_id,minimum_availability,search_on_add,monitored)VALUES(1,1,1,'released',0,1);
          INSERT INTO movie_collection_tags(collection_id,tag_id)VALUES(1,1); -- trigger: settings_revision 1 -> 2
          INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES('00000000-0000-0000-0000-000000000001','torznab','Indexer',1,1,1,1,'http://127.0.0.1:1/');
          INSERT INTO provider_scopes(provider_id,implementation,media_type,categories,anime_categories,remove_year)VALUES('00000000-0000-0000-0000-000000000001','torznab','movies','[2000]','[]',0);
-         INSERT INTO provider_scope_tags(provider_id,media_type,tag_id)VALUES('00000000-0000-0000-0000-000000000001','movies',2);",
+         INSERT INTO provider_scope_tags(provider_id,media_type,tag_id)VALUES('00000000-0000-0000-0000-000000000001','movies',2);
+         INSERT INTO providers(id,implementation,name,enabled,priority,revision,settings_version,endpoint)VALUES('00000000-0000-0000-0000-000000000002','qbittorrent','Client',1,1,1,1,'http://127.0.0.1:1/');
+         INSERT INTO provider_scopes(provider_id,implementation,media_type,category,recent_priority,older_priority,initial_state,content_layout,sequential_order,first_last_first,add_tags)VALUES('00000000-0000-0000-0000-000000000002','qbittorrent','movies','movies',0,0,'started','default',0,0,0);
+         INSERT INTO download_client_tags(provider_id,media_type,tag_id)VALUES('00000000-0000-0000-0000-000000000002','movies',3);",
     )
     .await
     .unwrap();
@@ -94,5 +97,8 @@ async fn deleting_collection_defaults_disables_policy_and_provider_tags_stay_in_
     // A provider scope tag is an assignment: conflict, not a storage failure.
     assert_eq!(delete(&client, &base, "/api/v1/movies/tags/2").await, 409);
     assert_eq!(number(&c, "SELECT count(*) FROM tags WHERE id=2").await, 1);
+    // Download-client tags retain the same deletion protection as provider authority tags.
+    assert_eq!(delete(&client, &base, "/api/v1/movies/tags/3").await, 409);
+    assert_eq!(number(&c, "SELECT count(*) FROM tags WHERE id=3").await, 1);
     server.abort();
 }

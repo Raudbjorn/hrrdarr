@@ -358,4 +358,12 @@ const LEGACY_MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../migrations/0080_library_root_health.sql"),
     ),
     ("backups", include_str!("../../migrations/0081_backups.sql")),
+    (
+        "indexer_breadth",
+        include_str!("../../migrations/0090_indexer_breadth.sql"),
+    ),
+    (
+        "wanted_search_receipts",
+        include_str!("../../migrations/0091_wanted_search_receipts.sql"),
+    ),
 ];

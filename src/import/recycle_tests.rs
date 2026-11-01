@@ -48,7 +48,7 @@ async fn scalar(c: &Connection, sql: &str) -> i64 {
         .get::<i64>(0)
         .unwrap()
 }
-/// Other library tests share the process-wide file-effect permit; retry only its refusal.
+/// A prior owned operation may still hold this database permit; retry only its refusal.
 async fn execute_owned(db: &Arc<Database>, op: &str) -> Result<Operation> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -62,6 +62,7 @@ async fn execute_owned(db: &Arc<Database>, op: &str) -> Result<Operation> {
                     "{}",
                     permit_diagnostics(
                         "execute_owned out of budget",
+                        db.permit_id(),
                         Some(db),
                         Some(op),
                         std::time::Duration::from_secs(30)

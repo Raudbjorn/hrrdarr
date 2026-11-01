@@ -378,6 +378,7 @@ async fn owned_http_requests_authentication_and_redaction() {
                 cookie: None,
                 tv_parameters: &tv_private,
                 movie_parameters: &movie_private,
+                ..Default::default()
             },
         )
         .await
@@ -391,6 +392,7 @@ async fn owned_http_requests_authentication_and_redaction() {
                 cookie: None,
                 tv_parameters: &tv_private,
                 movie_parameters: &movie_private,
+                ..Default::default()
             },
             &tv(TvNumbering::Episode {
                 season: 0,
@@ -417,7 +419,8 @@ async fn owned_http_requests_authentication_and_redaction() {
                     api_key: None,
                     cookie: None,
                     tv_parameters: &[],
-                    movie_parameters: &[]
+                    movie_parameters: &[],
+                    ..Default::default()
                 }
             )
             .await,
@@ -509,6 +512,7 @@ async fn fallback_alias_cursors_and_errors_keep_query_scope() {
         cookie: None,
         tv_parameters: &[],
         movie_parameters: &[],
+        ..Default::default()
     };
     for kind in ["torznab", "newznab"] {
         for domain in ["tv", "movie"] {
@@ -1173,6 +1177,7 @@ async fn category_discovery_is_caps_only_bounded_and_preserves_advertised_choice
         cookie: None,
         tv_parameters: &tv,
         movie_parameters: &movies,
+        ..Default::default()
     };
     // Both implementations share the caps protocol; configuration discriminators do not alter it.
     for kind in ["torznab", "newznab"] {

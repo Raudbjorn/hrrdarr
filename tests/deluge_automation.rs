@@ -19,6 +19,13 @@ use std::{
     time::Duration,
 };
 
+/// Hang detector scale for waits on the real workers (issue #38). The suite runs scenarios side by
+/// side, each slowed several-fold by the others, so a window sized for an idle host expires without
+/// anything being wrong. A passing wait returns as soon as its state holds.
+fn hang(seconds: u64) -> Duration {
+    Duration::from_secs(seconds * 4)
+}
+
 const PASSWORD: &str = "PRIVATE_DELUGE_SECRET";
 const SESSION: &str = "owned-session-token";
 const FILE_BYTES: usize = 1_048_576;
@@ -307,7 +314,7 @@ async fn serve(app: axum::Router) -> (String, Server) {
 async fn request(base: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(6))
+        .timeout(hang(6))
         .build()
         .unwrap()
         .request(method.parse().unwrap(), format!("{base}{path}"))
@@ -480,7 +487,7 @@ async fn enqueue(base: &str, target: Value) -> (u16, Value) {
     .await
 }
 async fn wait_command(base: &str, id: &Value, status: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         loop {
             let (code, v) = request(
                 base,
@@ -561,7 +568,7 @@ async fn torznab_to_deluge_grab_refresh_and_import_for_both_domains() {
     for command in &pending {
         wait_command(base, &command["id"], "succeeded").await;
     }
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(hang(90), async {
         loop {
             let (_, v) = request(base, "GET", "/api/v1/download-processing", Value::Null).await;
             if v["items"].as_array().is_some_and(|rows| {
@@ -699,7 +706,7 @@ async fn lost_torrent_add_response_is_reconciled_without_a_second_submission() {
             .await
             .unwrap();
     // Reconciliation runs after the bounded uncertainty delay, never immediately.
-    let receipt = tokio::time::timeout(Duration::from_secs(90), async {
+    let receipt = tokio::time::timeout(hang(90), async {
         loop {
             let (code, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             assert_eq!(code, 200, "{v}");
@@ -872,7 +879,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
         commands::start_with_metadata(app.db.clone(), app.client.clone(), app.metadata.clone())
             .await
             .unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(30), async {
+    let receipt = tokio::time::timeout(hang(30), async {
         loop {
             let (_, v) = request(base, "GET", "/api/v1/rss/candidates", Value::Null).await;
             if let Some(item) = v["items"]
@@ -903,7 +910,7 @@ async fn stored_cross_protocol_binding_is_rejected_at_dispatch_without_submissio
             .await
             .unwrap();
     wait_command(base, &command["id"], "succeeded").await;
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(hang(30), async {
         while app.state.adds.lock().unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
