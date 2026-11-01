@@ -56,7 +56,11 @@ through a parked name, because on such a directory `renameat(old, new)` is a sam
 returns success without changing the stored spelling. The parked name `.hrrdarr-case-<dev>-<ino>`
 (hex, from the journalled identity) lets journal recovery tell the interrupted state apart: neither
 spelling resolves, the parked entry has the recorded identity, and recovery completes it (roll
-forward) or returns it to the original spelling (rollback). Two distinct entries sharing an inode
+forward) or returns it to the original spelling (rollback). If the restoring rename itself cannot complete
+(the filesystem stays unwritable), the item ends `failed` with `rollback_incomplete` like any other
+incomplete rollback and is not retried automatically: rename the entry named `.hrrdarr-case-*` in
+that directory back by hand. A rollback that finds the original spelling in place flushes the
+directory before `rolled_back` is recorded. Two distinct entries sharing an inode
 remain a conflict. When both path lookups return the recorded identity, recovery uses the
 directory entry's exact spelling to distinguish source from destination. Cancel stops before the next item; finished renames
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then

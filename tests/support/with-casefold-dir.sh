@@ -16,14 +16,19 @@ fi
 exec unshare --user --map-root-user --mount sh -c '
     set -eu
     base=$(mktemp -d "${TMPDIR:-/tmp}/hrrdarr-casefold.XXXXXX")
+    cleanup() {
+        cd /
+        umount "$base" 2>/dev/null || true
+        rmdir "$base"
+    }
+    trap cleanup EXIT
+    trap "exit 130" INT
+    trap "exit 143" TERM HUP
     mount -t tmpfs -o casefold,size=64m tmpfs "$base"
     mkdir "$base/library"
     chattr +F "$base/library"
     export HRRDARR_CASEFOLD_DIR="$base/library"
     status=0
     "$@" || status=$?
-    cd /
-    umount "$base"
-    rmdir "$base"
     exit "$status"
 ' sh "$@"

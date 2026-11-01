@@ -1311,6 +1311,9 @@ async fn an_earlier_entry_leaving_between_pages_does_not_hide_a_waiting_or_stopp
 async fn a_download_starting_between_the_active_and_waiting_reads_is_still_observed() {
     let (f, endpoint, task) = fixture().await;
     for (domain, _, dir, hash) in targets() {
+        // Hook ordinals count the fixture's cumulative call log; start each domain from zero so
+        // its transition really fires.
+        f.clear();
         // Both domains share the client; the other domain's queued download is unaffected.
         for (_, _, other_dir, other_hash) in targets().iter().filter(|t| t.3 != hash) {
             f.put(dl(
@@ -1333,9 +1336,46 @@ async fn a_download_starting_between_the_active_and_waiting_reads_is_still_obser
             Ok(Reconciliation::Observed { hash: hash.into() }),
             "waiting -> active transition in {domain:?}"
         );
+        assert!(
+            f.calls("aria2.tellActive").len() >= 2,
+            "the promotion hook fired and the queue was read again in {domain:?}"
+        );
         f.0.lock().unwrap().hooks.clear();
         f.0.lock().unwrap().downloads.clear();
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_full_listing_after_an_earlier_entry_leaves_still_includes_the_late_entry() {
+    let (f, endpoint, task) = fixture().await;
+    let settings = settings(&endpoint);
+    let client = HttpClient::new().unwrap();
+    let (_, _, dir, hash) = targets().into_iter().next().unwrap();
+    late_target(&f, "waiting", dir, hash);
+    // The first row leaves after the first window was read: the target slides to index 999 and
+    // the second window is empty, so that pass lists 1,000 rows without a duplicate GID. The
+    // listing must not be returned on that evidence alone.
+    f.after("aria2.tellWaiting", 1, |downloads| {
+        downloads.remove(0);
+    });
+    let page = label_client::query(
+        &client.operation(Uuid::new_v4()).unwrap(),
+        &settings,
+        Some(&login()),
+        &query(MediaDomain::Tv),
+    )
+    .await
+    .unwrap();
+    assert!(
+        page.items.iter().any(|i| i.name == "LateTarget"),
+        "the late entry is listed"
+    );
+    assert!(
+        f.calls("aria2.tellWaiting").len() >= 4,
+        "two matching passes were read: {}",
+        f.calls("aria2.tellWaiting").len()
+    );
     task.abort();
 }
 

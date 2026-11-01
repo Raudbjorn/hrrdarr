@@ -158,22 +158,28 @@ impl<'o, 'a> Aria2Wire<'o, 'a> {
         }
         Ok(scan)
     }
-    /// Scans until one is free of churn evidence (a GID listed twice means the queue moved under
-    /// the pagination), at most `MAX_SCANS` times. `absent` is a hash the caller is looking for:
-    /// a scan without it is trusted only when the next scan lists exactly the same GIDs in the
-    /// same order, because a download hidden by a shift or a list transition shows up in the
-    /// rescan and changes the sequence. Anything else is `Unstable`, never an empty answer.
-    async fn settled(&mut self, absent: Option<&str>) -> Result<Scan> {
+    /// Scans until one can be trusted, at most `MAX_SCANS` times. `wanted` is the hash the caller
+    /// is looking for, or `None` for a full listing. A scan that lists the wanted hash under a GID
+    /// listed once is trusted at once: presence is not undone by churn elsewhere. Every other scan
+    /// (a full listing, or the hash not seen) is trusted only when it has no GID listed twice (the
+    /// queue moved under the pagination) and the next scan lists exactly the same GIDs in the same
+    /// order, because a download hidden by a shift or a list transition shows up in the rescan and
+    /// changes the sequence. Anything else is `Unstable`, never an incomplete or empty answer.
+    async fn settled(&mut self, wanted: Option<&str>) -> Result<Scan> {
         let mut previous: Option<Vec<String>> = None;
         for _ in 0..MAX_SCANS {
             let scan = self.scan().await?;
+            if wanted.is_some_and(|hash| {
+                scan.gids
+                    .get(hash)
+                    .is_some_and(|gid| !scan.duplicated.contains(gid))
+            }) {
+                self.gids = scan.gids.clone();
+                return Ok(scan);
+            }
             if scan.churned {
                 previous = None;
                 continue;
-            }
-            if absent.is_none_or(|hash| scan.gids.contains_key(hash)) {
-                self.gids = scan.gids.clone();
-                return Ok(scan);
             }
             if previous.as_ref() == Some(&scan.order) {
                 self.gids = scan.gids.clone();
@@ -216,6 +222,8 @@ struct Scan {
     order: Vec<String>,
     /// A GID was listed twice, so the queue changed while it was being read.
     churned: bool,
+    /// The GIDs that were listed more than once.
+    duplicated: BTreeSet<String>,
     listed: BTreeSet<String>,
 }
 impl Scan {
@@ -223,6 +231,7 @@ impl Scan {
         let gid = entry.get("gid").and_then(Value::as_str).unwrap_or("");
         self.order.push(format!("{method}:{gid}"));
         if !gid.is_empty() && !self.listed.insert(gid.to_owned()) {
+            self.duplicated.insert(gid.to_owned());
             self.churned = true;
         }
     }

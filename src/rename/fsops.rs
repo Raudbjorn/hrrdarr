@@ -273,6 +273,14 @@ fn rename_case_only(dir: &File, on: &str, nn: &str, expect: Ident) -> R<()> {
         Some(_) => Err(MoveError::Exists),
     }
 }
+/// Flushes the directory holding `path`, so a rename already made there survives a crash.
+pub(crate) fn sync_parent(root: &str, path: &str) -> R<()> {
+    if !within(root, path) {
+        return Err(MoveError::Unsafe);
+    }
+    let (parent, _) = parent_and_name(path)?;
+    open_dir(&parent)?.sync_all().map_err(|_| MoveError::Io)
+}
 /// Finishes (`forward`) or undoes an interrupted two-step case-only rename: the entry sits under
 /// its parked name and is moved to the new or the original spelling.
 pub(crate) fn settle_transit(
