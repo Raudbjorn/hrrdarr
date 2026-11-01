@@ -103,6 +103,14 @@ struct Mock {
     next_gid: u32,
     lose_add_response: bool,
     metainfo: Vec<(String, String)>,
+    hooks: Vec<Hook>,
+}
+/// Queue churn injected after the `nth` call of `method` is answered (counted in the call log,
+/// so `Fixture::clear` restarts the count). The answered call reflects the state before it.
+struct Hook {
+    method: &'static str,
+    nth: usize,
+    action: Box<dyn FnMut(&mut Vec<Dl>) + Send>,
 }
 #[derive(Clone)]
 struct Fixture(Arc<Mutex<Mock>>);
@@ -128,6 +136,18 @@ impl Fixture {
     }
     fn clear(&self) {
         self.0.lock().unwrap().calls.clear();
+    }
+    fn after(
+        &self,
+        method: &'static str,
+        nth: usize,
+        action: impl FnMut(&mut Vec<Dl>) + Send + 'static,
+    ) {
+        self.0.lock().unwrap().hooks.push(Hook {
+            method,
+            nth,
+            action: Box::new(action),
+        });
     }
     fn by_hash(&self, hash: &str) -> Dl {
         self.0
@@ -203,7 +223,7 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
         params.remove(0);
     }
     m.calls.push((method.clone(), params.clone()));
-    match method.as_str() {
+    let response = match method.as_str() {
         "aria2.getVersion" => ok(json!({"version":m.version,"enabledFeatures":["BitTorrent"]})),
         "aria2.getGlobalOption" => ok(json!({"dir":DEFAULT_DIR,"max-concurrent-downloads":"5"})),
         "aria2.tellActive" => ok(json!(
@@ -310,7 +330,19 @@ async fn handler(State(f): State<Fixture>, body: Bytes) -> Response {
             ok(json!(gid))
         }
         _ => err("Unknown method", 1),
+    };
+    let served = m
+        .calls
+        .iter()
+        .filter(|(called, _)| *called == method)
+        .count();
+    let mock = &mut *m;
+    for hook in mock.hooks.iter_mut() {
+        if hook.method == method && hook.nth == served {
+            (hook.action)(&mut mock.downloads);
+        }
     }
+    response
 }
 async fn fixture() -> (Fixture, String, tokio::task::JoinHandle<()>) {
     let fixture = Fixture(Arc::new(Mutex::new(Mock {
@@ -321,6 +353,7 @@ async fn fixture() -> (Fixture, String, tokio::task::JoinHandle<()>) {
         next_gid: 0,
         lose_add_response: false,
         metainfo: vec![],
+        hooks: vec![],
     })));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     assert_ne!(listener.local_addr().unwrap().port(), 6800);
@@ -1061,11 +1094,19 @@ async fn oversized_non_torrent_queue_is_an_error_not_an_absent_submission() {
     task.abort();
 }
 
-/// Unrelated HTTP and torrent downloads still consume inventory windows.
+/// GIDs are unique per aria2 download; fixtures must not reuse one across rows or lists.
+fn next_gid() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x1_0000_0000);
+    format!(
+        "{:016x}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+/// Unrelated HTTP and torrent downloads (outside every label folder) still consume inventory windows.
 fn fill(f: &Fixture, count: u32, status: &str) {
     for n in 0..count {
         f.put(dl(
-            &format!("{:016x}", 0x1000 + n),
+            &next_gid(),
             &if n % 2 == 0 {
                 String::new()
             } else {
@@ -1161,5 +1202,226 @@ async fn listings_page_through_every_window_and_fail_beyond_the_resource_bound()
         .await,
         Err(QbitError::Http(HttpError::ResponseTooLarge))
     ));
+    task.abort();
+}
+
+// ---- Queue churn while paginating (issue #48) ----
+// Reasoning: aria2 pagination is offset-based and the three lists are separate requests. A
+// download that moves behind an already-read offset, or into a list that was already read, is
+// missing from that pass although it exists. These mocks inject exactly that churn between
+// requests; the mock is written from aria2's RPC manual, not recorded from a live aria2c, so
+// they show the handling is deterministic, not that a live aria2 queue behaves this way.
+fn targets() -> [(MediaDomain, MediaTarget, &'static str, &'static str); 2] {
+    [
+        (
+            MediaDomain::Tv,
+            MediaTarget::Episode(1),
+            "/downloads/tv-hrr",
+            "00000000000000000000000000000000000000a1",
+        ),
+        (
+            MediaDomain::Movies,
+            MediaTarget::Movie(1),
+            "/downloads/movies-hrr",
+            "00000000000000000000000000000000000000b2",
+        ),
+    ]
+}
+/// 1,000 foreign rows of `status` followed by the target at index 1,000 (the second window).
+fn late_target(f: &Fixture, status: &str, dir: &str, hash: &str) {
+    f.0.lock().unwrap().downloads.clear();
+    f.clear();
+    fill(f, 1000, status);
+    let mut target = dl("00000000000000a1", hash, "LateTarget", dir, status);
+    target.completed = if status == "complete" {
+        target.total
+    } else {
+        0
+    };
+    f.put(target);
+}
+/// Reconciles the target whose info hash is `hash` (one of `targets()`).
+async fn reconcile_hash(endpoint: &str, hash: &str) -> Result<Reconciliation, QbitError> {
+    let target = targets()
+        .into_iter()
+        .find(|t| t.3 == hash)
+        .map(|t| t.1)
+        .unwrap();
+    let settings = settings(endpoint);
+    let client = HttpClient::new().unwrap();
+    let operation = client.operation(Uuid::new_v4()).unwrap();
+    let prepared = label_client::prepare(
+        &operation,
+        &settings,
+        target,
+        AddSource::Magnet(magnet(hash)),
+        false,
+        QbitOptions::default(),
+    )
+    .await
+    .unwrap();
+    label_client::reconcile(&operation, &settings, Some(&login()), prepared.identity()).await
+}
+
+#[tokio::test]
+async fn an_earlier_entry_leaving_between_pages_does_not_hide_a_waiting_or_stopped_target() {
+    let (f, endpoint, task) = fixture().await;
+    for (status, method) in [
+        ("waiting", "aria2.tellWaiting"),
+        ("complete", "aria2.tellStopped"),
+    ] {
+        for (domain, _, dir, hash) in targets() {
+            // Removal (a finished result pruned, a waiting download cancelled): the target
+            // slides to index 999 after the first window was read, so the second window is empty.
+            late_target(&f, status, dir, hash);
+            f.after(method, 1, |downloads| {
+                downloads.remove(0);
+            });
+            assert_eq!(
+                reconcile_hash(&endpoint, hash).await,
+                Ok(Reconciliation::Observed { hash: hash.into() }),
+                "{status} removal in {domain:?}: absence must not be concluded from the first scan"
+            );
+            assert!(
+                f.calls(method).len() >= 3,
+                "the queue was scanned again after the shift: {}",
+                f.calls(method).len()
+            );
+            f.0.lock().unwrap().hooks.clear();
+
+            // Move to the end (changePosition POS_END): the moved row is listed twice, which is
+            // itself proof the queue shifted under the pagination.
+            late_target(&f, status, dir, hash);
+            f.after(method, 1, |downloads| {
+                let first = downloads.remove(0);
+                downloads.push(first);
+            });
+            assert_eq!(
+                reconcile_hash(&endpoint, hash).await,
+                Ok(Reconciliation::Observed { hash: hash.into() }),
+                "{status} move in {domain:?}"
+            );
+            f.0.lock().unwrap().hooks.clear();
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_download_starting_between_the_active_and_waiting_reads_is_still_observed() {
+    let (f, endpoint, task) = fixture().await;
+    for (domain, _, dir, hash) in targets() {
+        // Both domains share the client; the other domain's queued download is unaffected.
+        for (_, _, other_dir, other_hash) in targets().iter().filter(|t| t.3 != hash) {
+            f.put(dl(
+                "00000000000000c3",
+                other_hash,
+                "Neighbour",
+                other_dir,
+                "active",
+            ));
+        }
+        f.put(dl("00000000000000a1", hash, "Starting", dir, "waiting"));
+        // The queue promotes the target after `tellActive` was answered and before `tellWaiting`.
+        f.after("aria2.tellActive", 1, |downloads| {
+            for d in downloads.iter_mut().filter(|d| d.name == "Starting") {
+                d.status = "active".into();
+            }
+        });
+        assert_eq!(
+            reconcile_hash(&endpoint, hash).await,
+            Ok(Reconciliation::Observed { hash: hash.into() }),
+            "waiting -> active transition in {domain:?}"
+        );
+        f.0.lock().unwrap().hooks.clear();
+        f.0.lock().unwrap().downloads.clear();
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn churn_that_never_settles_is_a_bounded_retryable_error_not_a_confirmed_absence() {
+    let (f, endpoint, task) = fixture().await;
+    let (_, _, dir, hash) = targets().into_iter().next().unwrap();
+    late_target(&f, "waiting", dir, hash);
+    // Every pass hides the target the same way: the first window is read with the target at
+    // 1,000, an earlier row leaves, and a new row is queued at the front before the next pass.
+    for pass in 1..=8 {
+        f.after("aria2.tellWaiting", 2 * pass - 1, |downloads| {
+            downloads.remove(0);
+        });
+        f.after("aria2.tellWaiting", 2 * pass, |downloads| {
+            downloads.insert(
+                0,
+                dl(
+                    &next_gid(),
+                    &format!("{:040x}", downloads.len() + 0x9000),
+                    "Newcomer",
+                    "/downloads/other",
+                    "waiting",
+                ),
+            );
+        });
+    }
+    assert_eq!(
+        reconcile_hash(&endpoint, hash).await,
+        Err(QbitError::Unstable)
+    );
+    // Four passes of two windows: the retry budget, not a polling loop.
+    assert_eq!(f.calls("aria2.tellWaiting").len(), 8);
+    assert!(f.calls("aria2.addUri").is_empty() && f.calls("aria2.addTorrent").is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn stable_absence_is_confirmed_by_an_identical_rescan_and_unrelated_churn_is_tolerated() {
+    let (f, endpoint, task) = fixture().await;
+    let (_, _, dir, hash) = targets().into_iter().next().unwrap();
+    f.put(dl(
+        "00000000000000d4",
+        "00000000000000000000000000000000000000d4",
+        "Other",
+        "/downloads/other",
+        "active",
+    ));
+    f.clear();
+    assert_eq!(
+        reconcile_hash(&endpoint, hash).await,
+        Ok(Reconciliation::NotObserved),
+        "a quiet queue without the target is absent"
+    );
+    assert_eq!(
+        f.calls("aria2.tellActive").len(),
+        2,
+        "absence needs the second identical scan"
+    );
+
+    // An unrelated download is added after the first pass: the second pass differs, the third
+    // agrees with it, and absence is then confirmed rather than reported as unstable.
+    f.clear();
+    f.after("aria2.tellStopped", 1, |downloads| {
+        downloads.push(dl(
+            "00000000000000e5",
+            "00000000000000000000000000000000000000e5",
+            "Unrelated",
+            "/downloads/other",
+            "waiting",
+        ));
+    });
+    assert_eq!(
+        reconcile_hash(&endpoint, hash).await,
+        Ok(Reconciliation::NotObserved)
+    );
+    assert_eq!(f.calls("aria2.tellActive").len(), 3);
+    f.0.lock().unwrap().hooks.clear();
+
+    // A present target needs a single pass: presence is observed, never inferred.
+    f.put(dl("00000000000000a1", hash, "Here", dir, "active"));
+    f.clear();
+    assert_eq!(
+        reconcile_hash(&endpoint, hash).await,
+        Ok(Reconciliation::Observed { hash: hash.into() })
+    );
+    assert_eq!(f.calls("aria2.tellActive").len(), 1);
     task.abort();
 }

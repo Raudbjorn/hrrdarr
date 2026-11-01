@@ -1444,7 +1444,8 @@ fn communication_error(error: qbittorrent::QbitError) -> CommunicationProbeError
         | Q::ScopeConflict
         | Q::UnsupportedFeature
         | Q::UnsafeRetention
-        | Q::MutationUnknown => Unevaluated("check_failed"),
+        | Q::MutationUnknown
+        | Q::Unstable => Unevaluated("check_failed"),
         Q::Http(
             H::Authentication
             | H::RateLimited { .. }
@@ -3335,6 +3336,21 @@ async fn finish<T>(tx: libsql::Transaction, outcome: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    /// An unstable enumeration is retried by candidate reconciliation, which only treats a
+    /// non-retryable error or `NotObserved` as a stopping point; it must stay distinguishable
+    /// from both (issue #48).
+    #[test]
+    fn unstable_client_listing_is_a_retryable_error() {
+        let (error, category) = super::qbit_error(super::qbittorrent::QbitError::Unstable);
+        assert_eq!(category, "transport_error");
+        assert!(matches!(
+            error,
+            super::Error::Plain(_, "listing_unstable", _)
+        ));
+        let refresh = super::refresh_error(error);
+        assert!(refresh.retryable, "{}", refresh.code);
+        assert_ne!(refresh.code, "provider_unavailable");
+    }
     #[test]
     fn download_root_namespace_requires_posix_or_explicit_mapping() {
         assert_eq!(super::local_download_root("/"), Some("/".into()));
@@ -4205,6 +4221,16 @@ fn qbit_error(error: qbittorrent::QbitError) -> (Error, &'static str) {
         Q::InvalidResponse | Q::Rejected | Q::MutationUnknown => {
             http_error(http::HttpError::InvalidResponse)
         }
+        // Retryable (a 502 maps to `refresh_failed`) and distinct from every absence outcome.
+        Q::Unstable => (
+            Error::Plain(
+                StatusCode::BAD_GATEWAY,
+                "listing_unstable",
+                "The download client's queue kept changing while it was listed; retry later",
+            ),
+            // The stored test-result category set is constrained (migration 0010).
+            "transport_error",
+        ),
     }
 }
 

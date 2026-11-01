@@ -48,11 +48,17 @@ jpg jpeg png tbn, not tracked as media) move with the media file. Any failure ro
 group back. After a crash the journal row's true state is read back from the disk: all pairs at
 source or already moved roll forward; any anomaly rolls moved pairs back and records the item as
 failed. This runs at worker start and at the start of each run. Cross-device moves are refused
-(`EXDEV` -> `cross_device`), never copied. Case-only renames work on case-sensitive filesystems
-as ordinary renames and on case-insensitive ones via a plain rename when no distinct entry has
-the target name. When both path lookups return the recorded identity, journal recovery uses the
-directory entry's exact spelling to distinguish the source from the destination; two distinct
-entries sharing an inode remain a conflict. Cancel stops before the next item; finished renames
+(`EXDEV` -> `cross_device`), never copied. Case-only renames (names that differ only by case, same directory) have three paths: when no
+entry answers to the new name it is an ordinary `RENAME_NOREPLACE` rename; when a distinct entry
+already has the new spelling it is refused (`destination_exists`); and when the new spelling
+resolves to the very same entry (a case-folding directory) the entry is renamed in two steps
+through a parked name, because on such a directory `renameat(old, new)` is a same-inode no-op that
+returns success without changing the stored spelling. The parked name `.hrrdarr-case-<dev>-<ino>`
+(hex, from the journalled identity) lets journal recovery tell the interrupted state apart: neither
+spelling resolves, the parked entry has the recorded identity, and recovery completes it (roll
+forward) or returns it to the original spelling (rollback). Two distinct entries sharing an inode
+remain a conflict. When both path lookups return the recorded identity, recovery uses the
+directory entry's exact spelling to distinguish source from destination. Cancel stops before the next item; finished renames
 stay. A run handles at most 1000 items (`bounded`); rerunning continues, since renamed files then
 plan as unchanged.
 
@@ -73,9 +79,19 @@ transaction, then calls observers registered with
 ## Not claimed
 
 * Cross-device refusal is mapped from `EXDEV` and unit-checked by code mapping only; no real
-  second filesystem was exercised. Case-insensitive filesystems were not exercised (the
-  alias observations are simulated against real directory listings; file/folder moves and reverse
-  moves are tested on a case-sensitive filesystem).
+  second filesystem was exercised.
+* Case-insensitive behavior was exercised on one real filesystem only: Linux 7.3.0-rc5 tmpfs
+  mounted with `casefold`, with `chattr +F` on the library directory, inside a private user and
+  mount namespace (`tests/support/with-casefold-dir.sh`; no root, no host mount). The tests
+  `real_casefold_*` in `tests/rename_commands.rs` are `#[ignore]`d and fail with `UNSUPPORTED`
+  when `HRRDARR_CASEFOLD_DIR` is not provisioned or its capability probe fails (alias lookup
+  resolves the same inode, enumeration keeps one spelling, a second spelling cannot be linked).
+  They cover forward and reverse case-only file+sidecar and folder renames for TV and movies,
+  retries, and journal recovery after the intent, after the filesystem rename, between the two
+  steps, and a rollback that starts from a parked entry. ext4/f2fs casefold, vfat/exFAT/NTFS,
+  network filesystems, Unicode normalization differences and macOS were not exercised, nor was a
+  crash at an arbitrary instruction: interruptions are the on-disk states a crash would leave,
+  built by the test, not a killed process.
 * Journalled moves are atomic renames, not the importer's stage/copy/hash pipeline; file
   bytes are not hashed. Identity is device+inode.
 * Empty source folders are not removed; other tables holding paths under a renamed folder (for
